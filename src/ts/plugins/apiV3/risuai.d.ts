@@ -250,6 +250,22 @@ type ScriptMode = 'display' | 'output' | 'input' | 'process';
 type ReplacerType = 'beforeRequest' | 'afterRequest';
 
 /**
+ * Argument passed to chat lifecycle listeners
+ */
+type ChatOutputListenerArg = {
+    /** Current character */
+    char: any;
+    /** Current chat */
+    chat: any;
+    /** Index of the character in the database. Use with `setCharacterToIndex`. */
+    characterIndex: number;
+    /** Index of the chat within the character. Use with `setChatToIndex`. */
+    chatIndex: number;
+    /** Index of the generated message in the chat */
+    messageIndex: number;
+};
+
+/**
  * Risuai Plugin definition
  */
 interface RisuPlugin {
@@ -1783,6 +1799,56 @@ interface RisuaiPluginAPI {
     removeRisuReplacer(
         type: ReplacerType,
         func: Function
+    ): Promise<void>;
+
+    // ========== Chat Listeners ==========
+
+    /**
+     * Adds a listener that fires after the chat is updated with a model output.
+     * Mirrors the Lua trigger 'output' mode so v3 plugins can react to a finished
+     * message at the same point in the lifecycle.
+     *
+     * The listener runs once per output event after streaming completes and after
+     * `runTrigger('output')` has finished. Listeners are awaited sequentially. A slow
+     * listener delays the remaining chat flow; use return-early patterns inside the
+     * listener if you want to spawn background work without blocking.
+     *
+     * The listener receives plain snapshots of `char` and `chat`, matching the
+     * convention of `getCharacterFromIndex` / `getChatFromIndex`. Mutations to those
+     * snapshots do not propagate back to the host. To persist changes from background
+     * work, use `characterIndex`, `chatIndex`, and `messageIndex` with APIs such as
+     * `setChatToIndex`.
+     *
+     * The `characterIndex` and `chatIndex` are captured when the listener fires,
+     * so background work can locate the original chat even if the user navigates elsewhere.
+     *
+     * Modes:
+     * - 'output': fires after an AI message is appended to the chat
+     *
+     * @param mode - Listener mode
+     * @param func - Listener function. Receives the current character, chat, and generated message index.
+     *
+     * @example
+     * ```typescript
+     * await risuai.addRisuChatListener('output', async ({ chat, messageIndex }) => {
+     *   const message = chat.message[messageIndex];
+     *   console.log('Model said:', message.data);
+     * });
+     * ```
+     */
+    addRisuChatListener(
+        mode: 'output',
+        func: (arg: ChatOutputListenerArg) => void | Promise<void>
+    ): Promise<void>;
+
+    /**
+     * Removes a chat listener.
+     * @param mode - Listener mode
+     * @param func - Listener function to remove
+     */
+    removeRisuChatListener(
+        mode: 'output',
+        func: (arg: ChatOutputListenerArg) => void | Promise<void>
     ): Promise<void>;
 
     // ========== Body Interceptors ==========
