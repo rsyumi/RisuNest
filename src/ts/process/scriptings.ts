@@ -49,6 +49,14 @@ let ScriptingEngines = new Map<string, ScriptingEngineState>()
 let luaFactoryPromise: Promise<void> | null = null;
 let pendingEngineCreations = new Map<string, Promise<ScriptingEngineState>>();
 
+function hashScriptCode(code: string) {
+    let hash = 0
+    for(let i = 0; i < code.length; i++){
+        hash = Math.imul(31, hash) + code.charCodeAt(i) | 0
+    }
+    return (hash >>> 0).toString(36)
+}
+
 export async function runScripted(code:string, arg:{
     char?:character|groupChat|simpleCharacterArgument,
     chat?:Chat
@@ -58,6 +66,7 @@ export async function runScripted(code:string, arg:{
     lowLevelAccess?: boolean,
     meta?: object,
     mode?: string,
+    engineKey?: string,
     type?: 'lua'|'py'
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
@@ -67,6 +76,7 @@ export async function runScripted(code:string, arg:{
     const getVar = arg.getVar ?? getChatVar
     const meta = arg.meta ?? {}
     const mode = arg.mode ?? 'manual'
+    const engineKey = arg.engineKey ?? `${type}:${mode}:${hashScriptCode(code)}`
 
     let chat = arg.chat ?? getCurrentChat()
     let stopSending = false
@@ -75,7 +85,7 @@ export async function runScripted(code:string, arg:{
     if(type === 'lua'){
         await ensureLuaFactory()
     }
-    let ScriptingEngineState = await getOrCreateEngineState(mode, type);
+    let ScriptingEngineState = await getOrCreateEngineState(engineKey, type);
     
     return await ScriptingEngineState.mutex.runExclusive(async () => {
         ScriptingEngineState.chat = chat
@@ -85,7 +95,7 @@ export async function runScripted(code:string, arg:{
             let declareAPI:(name: string, func:Function) => void
 
             if(ScriptingEngineState.type === 'lua'){
-                console.log('Creating new Lua engine for mode:', mode)
+                console.log('Creating new Lua engine for:', engineKey)
                 ScriptingEngineState.engine?.global.close()
                 ScriptingEngineState.code = code
                 ScriptingEngineState.engine = await luaFactory.createEngine({injectObjects: true})
@@ -95,7 +105,7 @@ export async function runScripted(code:string, arg:{
                 }
             }
             if(ScriptingEngineState.type === 'py'){
-                console.log('Creating new Pyodide context for mode:', mode)
+                console.log('Creating new Pyodide context for:', engineKey)
                 ScriptingEngineState.pyodide?.close()
                 ScriptingEngineState.pyodide = new PyodideContext()
                 declareAPI = (name:string, func:Function) => {
@@ -162,6 +172,27 @@ export async function runScripted(code:string, arg:{
                     time: chat.time ?? 0
                 }
                 return JSON.stringify(data)
+            })
+
+            declareAPI('getChatData', (id:string, index:number) => {
+                const chat = ScriptingEngineState.chat.message.at(index)
+                return chat?.data ?? ''
+            })
+
+            declareAPI('getChatRole', (id:string, index:number) => {
+                const chat = ScriptingEngineState.chat.message.at(index)
+                return chat?.role ?? ''
+            })
+
+            declareAPI('getRecentChatsMain', (id:string, count:number) => {
+                const chats = ScriptingEngineState.chat.message
+                const safeCount = Math.max(0, Math.floor(count || 0))
+                const start = Math.max(0, chats.length - safeCount)
+                return JSON.stringify(chats.slice(start).map((v) => ({
+                    role: v.role,
+                    data: v.data,
+                    time: v.time ?? 0,
+                })))
             })
 
             declareAPI('setChat', (id:string, index:number, value:string) => {
@@ -1225,6 +1256,10 @@ end
 
 function getFullChat(id)
     return json.decode(getFullChatMain(id))
+end
+
+function getRecentChats(id, count)
+    return json.decode(getRecentChatsMain(id, count))
 end
 
 function setFullChat(id, value)
