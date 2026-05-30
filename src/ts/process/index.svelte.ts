@@ -46,8 +46,16 @@ export interface OpenAIChat{
     cachePoint?: boolean
 }
 
+function findMessageIndexByChatId(chat: Chat, chatId?: string){
+    if(!chatId){
+        return -1
+    }
+
+    return chat.message.findIndex((message) => message.chatId === chatId)
+}
+
 async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number){
-    if(pluginV2.chatOutput.size === 0 || messageIndex < 0){
+    if(pluginV2.chatOutput.size === 0){
         return
     }
 
@@ -1558,7 +1566,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let prefix = ''
         if(arg.continue){
             msgIndex -= 1
-            prefix = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data
+            const outputMessage = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
+            prefix = outputMessage.data
         }
         else{
             DBState.db.characters[selectedChar].chats[selectedChat].message.push({
@@ -1571,6 +1580,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 chatId: generationId,
             })
         }
+        const outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId
         DBState.db.characters[selectedChar].chats[selectedChat].isStreaming = true
         DBState.db.characters[selectedChar].reloadKeys += 1
         let lastResponseChunk:{[key:string]:string} = {}
@@ -1635,15 +1645,27 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
         }
-        await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, currentChat.message.length - 1)
-        const inlayr = runInlayScreen(currentChar, currentChat.message[msgIndex].data)
-        currentChat.message[msgIndex].data = inlayr.text
         DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
-        if(inlayr.promise){
-            const t = await inlayr.promise
-            currentChat.message[msgIndex].data = t
+        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+        const inlayMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+        const outputMessage = currentChat.message[inlayMessageIndex]
+        if(outputMessage){
+            const inlayr = runInlayScreen(currentChar, outputMessage.data)
+            outputMessage.data = inlayr.text
             DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
+            if(inlayr.promise){
+                const t = await inlayr.promise
+                currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+                const asyncInlayMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+                if(asyncInlayMessageIndex !== -1){
+                    currentChat.message[asyncInlayMessageIndex].data = t
+                    DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
+                }
+            }
         }
+        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
+        const listenerMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+        await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, listenerMessageIndex)
         if(DBState.db.ttsAutoSpeech){
             await sayTTS(currentChar, result)
         }
@@ -1653,6 +1675,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     : (req.type === 'multiline') ? req.result
                     : []
         let mrerolls:string[] = []
+        let outputMessageIndex = -1
+        let outputMessageId: string | undefined
         for(let i=0;i<msgs.length;i++){
             let msg = msgs[i]
             let mess = msg[1]
@@ -1684,6 +1708,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     const p = await inlayResult.promise
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = p
                 }
+                outputMessageIndex = msgIndex
+                outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId
             }
             else if(i===0){
                 DBState.db.characters[selectedChar].chats[selectedChat].message.push({
@@ -1701,6 +1727,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     DBState.db.characters[selectedChar].chats[selectedChat].message[ind].data = p
                 }
                 mrerolls.push(result)
+                outputMessageIndex = ind
+                outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[ind]?.chatId
             }
             else{
                 mrerolls.push(result)
@@ -1726,7 +1754,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             resendChat = true
         }
         currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
-        await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, currentChat.message.length - 1)
+        if(outputMessageId){
+            outputMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
+            await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, outputMessageIndex)
+        }
     }
 
     let needsAutoContinue = false
