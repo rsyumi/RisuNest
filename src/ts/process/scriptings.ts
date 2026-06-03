@@ -111,7 +111,13 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id) && !ScriptingEditDisplayIds.has(id)){
                     return
                 }
-                return ScriptingEngineState.setVar(key, value)
+                ScriptingEngineState.setVar(key, value)
+            })
+            declareAPI('setChatVarChanged', (id:string,key:string, value:string) => {
+                if(!ScriptingSafeIds.has(id) && !ScriptingEditDisplayIds.has(id)){
+                    return false
+                }
+                return ScriptingEngineState.setVar(key, value) === true
             })
             declareAPI('getGlobalVar', (id:string, key:string) => {
                 return getGlobalChatVar(key)
@@ -1327,7 +1333,12 @@ end
 
 function setState(id, name, value)
     local escapedName = "__"..name
-    return setChatVar(id, escapedName, json.encode(value))
+    setChatVar(id, escapedName, json.encode(value))
+end
+
+function setStateChanged(id, name, value)
+    local escapedName = "__"..name
+    return setChatVarChanged(id, escapedName, json.encode(value))
 end
 
 function async(callback)
