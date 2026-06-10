@@ -8,7 +8,7 @@ export const GoogleModels: LLMModel[] = [
         id: 'gemini-3.1-pro-preview',
         provider: LLMProvider.GoogleCloud,
         format: LLMFormat.GoogleCloud,
-        flags: [LLMFlags.hasImageInput, LLMFlags.poolSupported, LLMFlags.hasAudioInput, LLMFlags.hasVideoInput, LLMFlags.hasStreaming, LLMFlags.requiresAlternateRole, LLMFlags.geminiThinking, LLMFlags.hasFirstSystemPrompt],
+        flags: [LLMFlags.hasImageInput, LLMFlags.poolSupported, LLMFlags.hasAudioInput, LLMFlags.hasVideoInput, LLMFlags.hasStreaming, LLMFlags.requiresAlternateRole, LLMFlags.geminiThinking, LLMFlags.geminiThinkingNoMinimal, LLMFlags.hasFirstSystemPrompt],
         parameters: ['reasoning_effort', 'temperature', 'top_k', 'top_p', 'presence_penalty', 'frequency_penalty'],
         tokenizer: LLMTokenizer.GoogleCloud,
         recommended: true

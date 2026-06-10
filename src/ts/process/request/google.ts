@@ -373,6 +373,11 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
             }
             delete generationConfig.thinkingBudget
         } else if (generationConfig.thinkingConfig) {
+            // Models without a `minimal` level (e.g. Gemini 3.1 Pro) — map it to `low`, as Google does.
+            if (generationConfig.thinkingConfig.thinkingLevel === 'minimal'
+                && arg.modelInfo.flags.includes(LLMFlags.geminiThinkingNoMinimal)) {
+                generationConfig.thinkingConfig.thinkingLevel = 'low'
+            }
             generationConfig.thinkingConfig.includeThoughts = true
         }
     }
