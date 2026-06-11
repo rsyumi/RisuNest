@@ -95,6 +95,42 @@ const colorShemes = {
         darkbutton: "#2d6a4f",
         type:'dark'
     },
+    "ocean": {
+        bgcolor: "#0b1f2a",
+        darkbg: "#08202b",
+        borderc: "#38bdf8",
+        selected: "#164e63",
+        draculared: "#fb7185",
+        textcolor: "#e6f6fb",
+        textcolor2: "#8fc7d5",
+        darkBorderc: "#155e75",
+        darkbutton: "#0f3a4a",
+        type:'dark'
+    },
+    "aurora": {
+        bgcolor: "#10201c",
+        darkbg: "#152a24",
+        borderc: "#5eead4",
+        selected: "#315c52",
+        draculared: "#fb7185",
+        textcolor: "#ecfdf5",
+        textcolor2: "#a7f3d0",
+        darkBorderc: "#2f6f63",
+        darkbutton: "#21443c",
+        type:'dark'
+    },
+    "twilight": {
+        bgcolor: "#171324",
+        darkbg: "#201936",
+        borderc: "#c084fc",
+        selected: "#3b2a5a",
+        draculared: "#f43f5e",
+        textcolor: "#f8f5ff",
+        textcolor2: "#c4b5fd",
+        darkBorderc: "#4c3575",
+        darkbutton: "#2e2348",
+        type:'dark'
+    },
     "realblack": {
         bgcolor: "#000000",
         darkbg: "#000000",
@@ -130,6 +166,54 @@ const colorShemes = {
         darkBorderc: "#3e3d32",
         darkbutton: "#3e3d32",
         type:'dark'
+    },
+    "sky-light": {
+        bgcolor: "#f6fbff",
+        darkbg: "#e8f3fb",
+        borderc: "#0284c7",
+        selected: "#d7ecf8",
+        draculared: "#e11d48",
+        textcolor: "#0f172a",
+        textcolor2: "#516174",
+        darkBorderc: "#b7d7ea",
+        darkbutton: "#dbeafe",
+        type:'light'
+    },
+    "sage-light": {
+        bgcolor: "#f7faf5",
+        darkbg: "#e8f0e6",
+        borderc: "#3f6212",
+        selected: "#d9e8d3",
+        draculared: "#dc2626",
+        textcolor: "#1f2933",
+        textcolor2: "#586a52",
+        darkBorderc: "#b7c9ad",
+        darkbutton: "#dce8d6",
+        type:'light'
+    },
+    "lavender-light": {
+        bgcolor: "#f8f7ff",
+        darkbg: "#ede9fe",
+        borderc: "#6d28d9",
+        selected: "#ddd6fe",
+        draculared: "#e11d48",
+        textcolor: "#1e1b4b",
+        textcolor2: "#5b5680",
+        darkBorderc: "#c4b5fd",
+        darkbutton: "#e0e7ff",
+        type:'light'
+    },
+    "slate-light": {
+        bgcolor: "#f8fafc",
+        darkbg: "#e2e8f0",
+        borderc: "#334155",
+        selected: "#cbd5e1",
+        draculared: "#dc2626",
+        textcolor: "#020617",
+        textcolor2: "#475569",
+        darkBorderc: "#94a3b8",
+        darkbutton: "#cbd5e1",
+        type:'light'
     },
     "lite": {
         bgcolor: "#1f2937",
