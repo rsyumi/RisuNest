@@ -757,6 +757,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
             const db = DBState.db
             db.colorSchemeName = 'custom'
+            db.customColorScheme = scheme
             db.colorScheme = scheme
             updateColorScheme()
         },

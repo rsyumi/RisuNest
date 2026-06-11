@@ -4,7 +4,7 @@
         changeColorSchemeType,
         exportColorScheme,
         importColorScheme,
-        updateColorScheme,
+        updateCustomColorScheme,
     } from 'src/ts/gui/colorscheme';
     import SelectInput from 'src/lib/UI/GUI/SelectInput.svelte';
     import OptionInput from 'src/lib/UI/GUI/OptionInput.svelte';
@@ -28,7 +28,7 @@
     <div class="border border-darkborderc p-2 m-2 rounded-md">
         <SelectInput
             className="mt-2"
-            value={DBState.db.colorScheme.type}
+            value={DBState.db.customColorScheme.type}
             onchange={(e) => {
                 changeColorSchemeType((e.target as HTMLInputElement).value as 'light' | 'dark');
             }}
@@ -39,7 +39,7 @@
 
         {#each colors as color}
             <div class="flex items-center mt-2">
-                <ColorInput bind:value={DBState.db.colorScheme[color[0]]} oninput={updateColorScheme} />
+                <ColorInput bind:value={DBState.db.customColorScheme[color[0]]} oninput={updateCustomColorScheme} />
                 <span class="ml-2">{color[1]}</span>
             </div>
         {/each}

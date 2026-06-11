@@ -232,15 +232,28 @@ const colorShemes = {
 
 export const ColorSchemeTypeStore = writable('dark' as 'dark'|'light')
 
+export const colorSchemePresets = colorShemes
+
 export const colorSchemeList = Object.keys(colorShemes) as (keyof typeof colorShemes)[]
 
 export function changeColorScheme(colorScheme: string){
     try {
-        if(colorScheme !== 'custom'){
+        if(colorScheme === 'custom'){
+            DBState.db.colorScheme = safeStructuredClone(DBState.db.customColorScheme ?? defaultColorScheme)
+        }
+        else{
             DBState.db.colorScheme = safeStructuredClone(colorShemes[colorScheme])
         }
         DBState.db.colorSchemeName = colorScheme
         updateColorScheme()   
+    } catch (error) {}
+}
+
+export function updateCustomColorScheme(){
+    try {
+        DBState.db.colorScheme = safeStructuredClone(DBState.db.customColorScheme ?? defaultColorScheme)
+        DBState.db.colorSchemeName = 'custom'
+        updateColorScheme()
     } catch (error) {}
 }
 
@@ -274,14 +287,14 @@ export function updateColorScheme(){
 
 export function changeColorSchemeType(type: 'light'|'dark'){
     try {
-        DBState.db.colorScheme.type = type
-        updateColorScheme()
+        DBState.db.customColorScheme.type = type
+        updateCustomColorScheme()
         updateTextThemeAndCSS()
     } catch (error) {}
 }
 
 export function exportColorScheme(){
-    let json = JSON.stringify(DBState.db.colorScheme)
+    let json = JSON.stringify(DBState.db.customColorScheme)
     downloadFile('colorScheme.json', json)
 }
 
@@ -309,9 +322,8 @@ export async function importColorScheme(){
             alertError('Invalid color scheme')
             return
         }
-        changeColorScheme('custom')
-        DBState.db.colorScheme = colorScheme
-        updateColorScheme()
+        DBState.db.customColorScheme = colorScheme
+        updateCustomColorScheme()
     }
     catch(e){
         alertError('Invalid color scheme')
