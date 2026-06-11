@@ -8,7 +8,6 @@
     } from 'src/ts/gui/colorscheme';
     import SelectInput from 'src/lib/UI/GUI/SelectInput.svelte';
     import OptionInput from 'src/lib/UI/GUI/OptionInput.svelte';
-    import ColorInput from 'src/lib/UI/GUI/ColorInput.svelte';
     import { DownloadIcon, HardDriveUploadIcon } from '@lucide/svelte';
 
     const colors = [
@@ -39,7 +38,13 @@
 
         {#each colors as color}
             <div class="flex items-center mt-2">
-                <ColorInput bind:value={DBState.db.customColorScheme[color[0]]} oninput={updateCustomColorScheme} />
+                <input
+                    type="color"
+                    class="native-color-input"
+                    aria-label={color[1]}
+                    bind:value={DBState.db.customColorScheme[color[0]]}
+                    oninput={updateCustomColorScheme}
+                />
                 <span class="ml-2">{color[1]}</span>
             </div>
         {/each}
@@ -60,3 +65,31 @@
         </div>
     </div>
 {/if}
+
+<style>
+    .native-color-input {
+        width: 1.8rem;
+        height: 1.8rem;
+        padding: 0;
+        border: 0;
+        border-radius: 9999px;
+        background: transparent;
+        cursor: pointer;
+        appearance: none;
+        -webkit-appearance: none;
+    }
+
+    .native-color-input::-webkit-color-swatch-wrapper {
+        padding: 0;
+    }
+
+    .native-color-input::-webkit-color-swatch {
+        border: 1px solid var(--risu-theme-darkborderc);
+        border-radius: 9999px;
+    }
+
+    .native-color-input::-moz-color-swatch {
+        border: 1px solid var(--risu-theme-darkborderc);
+        border-radius: 9999px;
+    }
+</style>
