@@ -86,6 +86,32 @@ export class AutoStorage{
                 i += 1
             }
 
+            const {
+                getColdStorageItem,
+                listColdDataKeys,
+                setAccountColdStorageItem
+            } = await import("../process/coldstorage.svelte")
+            const coldKeys = await listColdDataKeys(db)
+            const failedColdKeys:string[] = []
+            for(let coldIndex = 0; coldIndex < coldKeys.length; coldIndex++){
+                const key = coldKeys[coldIndex]
+                alertStore.set({
+                    type: "wait",
+                    msg: `Migrating cold storage data...(${coldIndex + 1}/${coldKeys.length})`
+                })
+                const data = await getColdStorageItem(key)
+                if(!data){
+                    failedColdKeys.push(key)
+                    continue
+                }
+                if(!await setAccountColdStorageItem(key, data)){
+                    failedColdKeys.push(key)
+                }
+            }
+            if(failedColdKeys.length > 0){
+                throw new Error(`Failed to migrate ${failedColdKeys.length} cold storage item(s) to account sync.`)
+            }
+
             const dba = replaceDbResources(db, replaced)
             const comp = encodeRisuSaveLegacy(dba, 'compression')
             //try decoding
