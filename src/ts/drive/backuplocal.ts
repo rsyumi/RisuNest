@@ -9,7 +9,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
-import { getColdStorageItem, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
+import { getColdStorageBackupKey, getColdStorageBackupName, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { DBState } from "../stores.svelte";
 
 function getBasename(data:string){
@@ -17,21 +17,6 @@ function getBasename(data:string){
     const splited = data.replace(baseNameRegex, '/').split('/')
     const lasts = splited[splited.length-1]
     return lasts
-}
-
-function getColdStorageBackupKey(name: string): string | null {
-    const match = name.match(/^(?:coldstorage[/_])?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.json$/)
-    return match?.[1] ?? null
-}
-
-function isColdStorageBackupData(data: unknown): boolean {
-    if (Array.isArray(data)) {
-        return true
-    }
-
-    return !!data
-        && typeof data === 'object'
-        && ('character' in data || 'message' in data)
 }
 
 export async function SaveLocalBackup(){
@@ -160,20 +145,18 @@ export async function SaveLocalBackup(){
         }
     }
 
-    if(!forageStorage.isAccount){
-        //save coldstorages
-        const coldKeys = await listColdDataKeys()
-        for(let i=0;i<coldKeys.length;i++){
-            const key = coldKeys[i]
-            let message = `Saving local Backup Cold data... (${i + 1} / ${coldKeys.length})`
-            alertWait(message)
-            const data = await getColdStorageItem(key)
-            if(data){
-                const encoded = new TextEncoder().encode(JSON.stringify(data))
-                await writer.writeBackup(`coldstorage_${key}.json`, encoded)
-            } else {
-                missingAssets.push(`coldstorage_${key}.json`)
-            }
+    const coldKeys = await listColdDataKeys()
+    for(let i=0;i<coldKeys.length;i++){
+        const key = coldKeys[i]
+        const backupName = getColdStorageBackupName(key)
+        let message = `Saving local Backup Cold data... (${i + 1} / ${coldKeys.length})`
+        alertWait(message)
+        const data = await getColdStorageItem(key)
+        if(data){
+            const encoded = new TextEncoder().encode(JSON.stringify(data))
+            await writer.writeBackup(backupName, encoded)
+        } else {
+            missingAssets.push(backupName)
         }
     }
 
@@ -194,7 +177,7 @@ export async function SaveLocalBackup(){
     await writer.close()
 
     if (missingAssets.length > 0) {
-        let message = 'Backup Successful, but the following assets were missing and skipped:\n\n'
+        let message = 'Backup Successful, but the following assets or cold storage items were missing and skipped:\n\n'
         for (const key of missingAssets) {
             const assetInfo = assetMap.get(key)
             if (assetInfo) {
@@ -384,20 +367,18 @@ export async function SavePartialLocalBackup(){
         }
     }
 
-    if(!forageStorage.isAccount){
-        //save coldstorages
-        const coldKeys = await listColdDataKeys()
-        for(let i=0;i<coldKeys.length;i++){
-            const key = coldKeys[i]
-            let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldKeys.length})`
-            alertWait(message)
-            const data = await getColdStorageItem(key)
-            if(data){
-                const encoded = new TextEncoder().encode(JSON.stringify(data))
-                await writer.writeBackup(`coldstorage_${key}.json`, encoded)
-            } else {
-                missingAssets.push(`coldstorage_${key}.json`)
-            }
+    const coldKeys = await listColdDataKeys()
+    for(let i=0;i<coldKeys.length;i++){
+        const key = coldKeys[i]
+        const backupName = getColdStorageBackupName(key)
+        let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldKeys.length})`
+        alertWait(message)
+        const data = await getColdStorageItem(key)
+        if(data){
+            const encoded = new TextEncoder().encode(JSON.stringify(data))
+            await writer.writeBackup(backupName, encoded)
+        } else {
+            missingAssets.push(backupName)
         }
     }
 
@@ -410,7 +391,7 @@ export async function SavePartialLocalBackup(){
     await writer.close()
 
     if (missingAssets.length > 0) {
-        let message = 'Partial backup successful, but the following profile images were missing and skipped:\n\n'
+        let message = 'Partial backup successful, but the following profile images or cold storage items were missing and skipped:\n\n'
         for (const key of missingAssets) {
             const assetInfo = assetMap.get(key)
             if (assetInfo) {
@@ -536,10 +517,7 @@ export function LoadLocalBackup(){
                         const coldStorageKey = getColdStorageBackupKey(name)
                         let handledAsColdStorage = false
 
-                        if (coldStorageKey && forageStorage.isAccount) {
-                            handledAsColdStorage = true
-                        }
-                        else if (coldStorageKey) {
+                        if (coldStorageKey) {
                             try {
                                 const text = new TextDecoder().decode(data)
                                 const jsonData = JSON.parse(text)

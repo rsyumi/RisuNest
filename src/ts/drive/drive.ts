@@ -8,6 +8,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
+import { getColdStorageBackupName, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
     const CLIENT_ID = '580075990041-l26k2d3c0nemmqiu3d3aag01npfrkn76.apps.googleusercontent.com';
@@ -164,6 +165,25 @@ async function backupDrive(ACCESS_TOKEN:string) {
         }
     }
 
+    const coldKeys = await listColdDataKeys(getDatabase())
+    for(let i=0;i<coldKeys.length;i++){
+        const key = coldKeys[i]
+        const coldStorageName = getColdStorageBackupName(key)
+        alertStore.set({
+            type: "wait",
+            msg: `Uploading Cold Storage... (${i + 1} / ${coldKeys.length})`
+        })
+        if(fileNames.includes(coldStorageName)){
+            continue
+        }
+        const data = await getColdStorageItem(key)
+        if(!data){
+            console.warn(`Skipping missing cold storage item ${key}`)
+            continue
+        }
+        await createFileInFolder(ACCESS_TOKEN, coldStorageName, new TextEncoder().encode(JSON.stringify(data)))
+    }
+
     const dbData = encodeRisuSaveLegacy(getDatabase(), 'compression')
 
     alertStore.set({
@@ -282,6 +302,7 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         const db:Database = mode === 'backup' ? await getDbFromList() : JSON.parse(Buffer.from(await getFileData(ACCESS_TOKEN, dbs[0][0].id)).toString('utf-8'))
         lastSaved = Date.now()
         localStorage.setItem('risu_lastsaved', `${lastSaved}`)
+        await restoreColdStorageFromDrive(ACCESS_TOKEN, files, db, mode)
         const requiredImages = (await getUncleanables(db))
         let ind = 0;
         let errorLogs:string[] = []
@@ -354,6 +375,43 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
     }
     else if(mode === 'backup'){
         location.search = ''
+    }
+}
+
+async function restoreColdStorageFromDrive(
+    ACCESS_TOKEN:string,
+    files:DriveFile[],
+    db:Database,
+    mode:'backup'|'sync'
+) {
+    const coldKeys = await listColdDataKeys(db)
+    for(let i=0;i<coldKeys.length;i++){
+        const key = coldKeys[i]
+        const names = new Set([
+            getColdStorageBackupName(key),
+            `coldstorage/${key}.json`,
+            `${key}.json`
+        ])
+        const file = files.find((driveFile) => names.has(driveFile.name))
+        if(!file){
+            console.warn(`Cold storage data not found in Drive backup: ${key}`)
+            continue
+        }
+        alertStore.set({
+            type: "wait",
+            msg: `${mode === 'sync' ? 'Sync' : 'Loading Backup'} Cold Storage... (${i + 1} / ${coldKeys.length})`
+        })
+        try {
+            const jsonData = JSON.parse(new TextDecoder().decode(await getFileData(ACCESS_TOKEN, file.id)))
+            if(isColdStorageBackupData(jsonData)){
+                await setColdStorageItem(key, jsonData)
+            }
+            else{
+                console.warn(`Skipping invalid cold storage Drive item ${file.name}`)
+            }
+        } catch (error) {
+            console.error(`Failed to restore cold storage item ${key}:`, error)
+        }
     }
 }
 
