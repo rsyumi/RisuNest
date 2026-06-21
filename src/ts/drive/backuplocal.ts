@@ -9,7 +9,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
-import { getColdStorageBackupKey, getColdStorageBackupName, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
+import { collectColdStorageBackupPayloads, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { DBState } from "../stores.svelte";
 
 function getBasename(data:string){
@@ -21,6 +21,13 @@ function getBasename(data:string){
 
 export async function SaveLocalBackup(){
     alertWait("Saving local backup...")
+    const db = getDatabase()
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+    if(coldStoragePayloads.missingKeys.length > 0){
+        alertError(`Backup failed. ${coldStoragePayloads.missingKeys.length} cold storage item(s) are missing.`)
+        return
+    }
+
     const writer = new LocalWriter()
     const r = await writer.init()
     if(!r){
@@ -28,7 +35,6 @@ export async function SaveLocalBackup(){
         return
     }
 
-    const db = getDatabase()
     const assetMap = new Map<string, { charName: string, assetName: string }>()
     if (db.characters) {
         for (const char of db.characters) {
@@ -145,19 +151,11 @@ export async function SaveLocalBackup(){
         }
     }
 
-    const coldKeys = await listColdDataKeys()
-    for(let i=0;i<coldKeys.length;i++){
-        const key = coldKeys[i]
-        const backupName = getColdStorageBackupName(key)
-        let message = `Saving local Backup Cold data... (${i + 1} / ${coldKeys.length})`
+    for(let i=0;i<coldStoragePayloads.payloads.length;i++){
+        const payload = coldStoragePayloads.payloads[i]
+        let message = `Saving local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
         alertWait(message)
-        const data = await getColdStorageItem(key)
-        if(data){
-            const encoded = new TextEncoder().encode(JSON.stringify(data))
-            await writer.writeBackup(backupName, encoded)
-        } else {
-            missingAssets.push(backupName)
-        }
+        await writer.writeBackup(payload.backupName, payload.encoded)
     }
 
     const dbWithoutAccount = { ...db, account: undefined }
@@ -177,7 +175,7 @@ export async function SaveLocalBackup(){
     await writer.close()
 
     if (missingAssets.length > 0) {
-        let message = 'Backup Successful, but the following assets or cold storage items were missing and skipped:\n\n'
+        let message = 'Backup Successful, but the following assets were missing and skipped:\n\n'
         for (const key of missingAssets) {
             const assetInfo = assetMap.get(key)
             if (assetInfo) {
@@ -218,6 +216,13 @@ export async function SavePartialLocalBackup(){
     }
     
     alertWait("Saving partial local backup...")
+    const db = getDatabase()
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+    if(coldStoragePayloads.missingKeys.length > 0){
+        alertError(`Partial backup failed. ${coldStoragePayloads.missingKeys.length} cold storage item(s) are missing.`)
+        return
+    }
+
     const writer = new LocalWriter()
     const r = await writer.init()
     if(!r){
@@ -225,7 +230,6 @@ export async function SavePartialLocalBackup(){
         return
     }
 
-    const db = getDatabase()
     const assetMap = new Map<string, { charName: string, assetName: string }>()
     
     // Only collect main profile images for both characters and groups
@@ -367,19 +371,11 @@ export async function SavePartialLocalBackup(){
         }
     }
 
-    const coldKeys = await listColdDataKeys()
-    for(let i=0;i<coldKeys.length;i++){
-        const key = coldKeys[i]
-        const backupName = getColdStorageBackupName(key)
-        let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldKeys.length})`
+    for(let i=0;i<coldStoragePayloads.payloads.length;i++){
+        const payload = coldStoragePayloads.payloads[i]
+        let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
         alertWait(message)
-        const data = await getColdStorageItem(key)
-        if(data){
-            const encoded = new TextEncoder().encode(JSON.stringify(data))
-            await writer.writeBackup(backupName, encoded)
-        } else {
-            missingAssets.push(backupName)
-        }
+        await writer.writeBackup(payload.backupName, payload.encoded)
     }
 
     const dbWithoutAccount = { ...db, account: undefined }
@@ -391,7 +387,7 @@ export async function SavePartialLocalBackup(){
     await writer.close()
 
     if (missingAssets.length > 0) {
-        let message = 'Partial backup successful, but the following profile images or cold storage items were missing and skipped:\n\n'
+        let message = 'Partial backup successful, but the following profile images were missing and skipped:\n\n'
         for (const key of missingAssets) {
             const assetInfo = assetMap.get(key)
             if (assetInfo) {
@@ -429,6 +425,8 @@ export function LoadLocalBackup(){
             const CHUNK_SIZE = 1024 * 1024; // 1MB chunk size
             let bytesRead = 0;
             let remainingBuffer = new Uint8Array();
+            let pendingDatabase: Uint8Array | null = null;
+            const restoredColdStorageKeys = new Set<string>();
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -481,36 +479,7 @@ export function LoadLocalBackup(){
                     }
 
                     else if (name === 'database.risudat') {
-                        let db = new Uint8Array(data);
-                        if(encryptionMeta.type === 'account' && encryptionMeta.time){
-                            try {
-                                const key = (await (await fetch(`https://sv.risuai.xyz/cryptokey?key=${encryptionMeta.time}`)).json()).key
-                                const decrypted = await decryptBuffer(db, key)
-                                db = new Uint8Array(decrypted)
-                            }
-                            catch (e) {
-                                console.error('Failed to decrypt database backup:', e)
-                                alertError('Failed to decrypt database backup, will attempt to load it without decryption.')
-                            }
-                        }
-                        const dbData = await decodeRisuSave(db);
-                        setDatabaseLite(dbData);
-                        requiresFullEncoderReload.state = true;
-                        if (isTauri) {
-                            await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });
-                            await relaunch();
-                            alertStore.set({
-                                type: "wait",
-                                msg: "Success, Refreshing your app."
-                            });
-                        } else {
-                            await forageStorage.setItem('database/database.bin', db);
-                            location.search = '';
-                            alertStore.set({
-                                type: "wait",
-                                msg: "Success, Refreshing your app."
-                            });
-                        }
+                        pendingDatabase = new Uint8Array(data);
                     }
                     
                     else {
@@ -518,13 +487,17 @@ export function LoadLocalBackup(){
                         let handledAsColdStorage = false
 
                         if (coldStorageKey) {
+                            handledAsColdStorage = true
                             try {
                                 const text = new TextDecoder().decode(data)
                                 const jsonData = JSON.parse(text)
 
                                 if (isColdStorageBackupData(jsonData)) {
-                                    await setColdStorageItem(coldStorageKey, jsonData)
-                                    handledAsColdStorage = true
+                                    if(await setColdStorageItem(coldStorageKey, jsonData)){
+                                        restoredColdStorageKeys.add(coldStorageKey)
+                                    } else {
+                                        console.error(`Failed to restore cold storage item ${coldStorageKey}`)
+                                    }
                                 } else {
                                     console.warn(`Skipping invalid cold storage backup item ${name}`)
                                 }
@@ -549,6 +522,57 @@ export function LoadLocalBackup(){
                     offset += 4 + nameLength + 4 + dataLength;
                 }
                 remainingBuffer = remainingBuffer.slice(offset);
+            }
+
+            if(!pendingDatabase){
+                alertError('Failed, Is file corrupted?')
+                return
+            }
+
+            let db = pendingDatabase;
+            if(encryptionMeta.type === 'account' && encryptionMeta.time){
+                try {
+                    const key = (await (await fetch(`https://sv.risuai.xyz/cryptokey?key=${encryptionMeta.time}`)).json()).key
+                    const decrypted = await decryptBuffer(db, key)
+                    db = new Uint8Array(decrypted)
+                }
+                catch (e) {
+                    console.error('Failed to decrypt database backup:', e)
+                    alertError('Failed to decrypt database backup, will attempt to load it without decryption.')
+                }
+            }
+            const dbData = await decodeRisuSave(db);
+            const missingColdStorageKeys:string[] = []
+            for(const key of await listColdDataKeys(dbData)){
+                if(restoredColdStorageKeys.has(key)){
+                    continue
+                }
+                const existingColdStorage = await getColdStorageItem(key)
+                if(!existingColdStorage){
+                    missingColdStorageKeys.push(key)
+                }
+            }
+            if(missingColdStorageKeys.length > 0){
+                alertError(`Backup restore failed. ${missingColdStorageKeys.length} cold storage item(s) are missing.`)
+                return
+            }
+
+            setDatabaseLite(dbData);
+            requiresFullEncoderReload.state = true;
+            if (isTauri) {
+                await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });
+                await relaunch();
+                alertStore.set({
+                    type: "wait",
+                    msg: "Success, Refreshing your app."
+                });
+            } else {
+                await forageStorage.setItem('database/database.bin', db);
+                location.search = '';
+                alertStore.set({
+                    type: "wait",
+                    msg: "Success, Refreshing your app."
+                });
             }
 
             alertNormal('Success');
