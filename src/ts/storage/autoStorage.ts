@@ -3,7 +3,7 @@ import { replaceDbResources } from "../globalApi.svelte"
 import { isNodeServer } from "src/ts/platform"
 import { NodeStorage } from "./nodeStorage"
 import { OpfsStorage } from "./opfsStorage"
-import { alertInput, alertSelect, alertStore } from "../alert"
+import { alertError, alertInput, alertSelect, alertStore } from "../alert"
 import { getDatabase, type Database } from "./database.svelte"
 import { AccountStorage } from "./accountStorage"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./risuSave";
@@ -50,7 +50,13 @@ export class AutoStorage{
             let i = 0;
             const accountStorage = new AccountStorage()
 
-            const a = accountStorage.getItem('database/database.bin')
+            let a:Buffer | null = null
+            try {
+                a = await accountStorage.getItem('database/database.bin')
+            } catch (error) {
+                alertError(error)
+                return false
+            }
             if(a){
                 const sel = await alertSelect([language.loadDataFromAccount, language.saveCurrentDataToAccount])
                 if(sel === "0"){
@@ -87,29 +93,24 @@ export class AutoStorage{
             }
 
             const {
-                getColdStorageItem,
-                listColdDataKeys,
+                collectColdStorageBackupPayloads,
                 setAccountColdStorageItem
             } = await import("../process/coldstorage.svelte")
-            const coldKeys = await listColdDataKeys(db)
-            const failedColdKeys:string[] = []
-            for(let coldIndex = 0; coldIndex < coldKeys.length; coldIndex++){
-                const key = coldKeys[coldIndex]
+            const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+            const failedColdKeys:string[] = [...coldStoragePayloads.missingKeys]
+            for(let coldIndex = 0; coldIndex < coldStoragePayloads.payloads.length; coldIndex++){
+                const payload = coldStoragePayloads.payloads[coldIndex]
                 alertStore.set({
                     type: "wait",
-                    msg: `Migrating cold storage data...(${coldIndex + 1}/${coldKeys.length})`
+                    msg: `Migrating cold storage data...(${coldIndex + 1}/${coldStoragePayloads.payloads.length})`
                 })
-                const data = await getColdStorageItem(key)
-                if(!data){
-                    failedColdKeys.push(key)
-                    continue
-                }
-                if(!await setAccountColdStorageItem(key, data)){
-                    failedColdKeys.push(key)
+                if(!await setAccountColdStorageItem(payload.key, payload.value)){
+                    failedColdKeys.push(payload.key)
                 }
             }
             if(failedColdKeys.length > 0){
-                throw new Error(`Failed to migrate ${failedColdKeys.length} cold storage item(s) to account sync.`)
+                alertError(`Failed to migrate ${failedColdKeys.length} cold storage item(s) to account sync.`)
+                return false
             }
 
             const dba = replaceDbResources(db, replaced)
@@ -117,11 +118,14 @@ export class AutoStorage{
             //try decoding
             try {
                 const z:Database = await decodeRisuSave(comp)
-                if(z.formatversion){
-                    await accountStorage.setItem('database/database.bin', comp)
+                if(!z.formatversion){
+                    throw new Error('Encoded account database is invalid.')
                 }
-                
-            } catch (error) {}
+                await accountStorage.setItem('database/database.bin', comp)
+            } catch (error) {
+                alertError(error)
+                return false
+            }
             this.realStorage = accountStorage
             alertStore.set({
                 type: "none",

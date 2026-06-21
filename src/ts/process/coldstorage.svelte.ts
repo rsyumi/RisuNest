@@ -15,7 +15,7 @@ import { fetchProtectedResource } from "../sionyw"
 import { alertClear, alertError, alertWait } from "../alert"
 import { language } from "src/lang"
 import type { Database, character } from "../storage/database.svelte"
-import { coldStorageHeader, listColdDataKeysFromDb } from "./coldstorageData"
+import { coldStorageHeader, getColdStorageBackupName, listColdDataKeysFromDb } from "./coldstorageData"
 
 export {
     coldStorageHeader,
@@ -312,6 +312,44 @@ async function removeColdStorageItems(keys:string[]) {
 
 export async function listColdDataKeys(db: Pick<Database, 'characters'> = DBState.db): Promise<string[]> {
     return listColdDataKeysFromDb(db)
+}
+
+export type ColdStorageBackupPayload = {
+    key: string
+    backupName: string
+    value: unknown
+    encoded: Uint8Array
+}
+
+export async function collectColdStorageBackupPayloads(db: Pick<Database, 'characters'> = DBState.db): Promise<{
+    payloads: ColdStorageBackupPayload[]
+    missingKeys: string[]
+}> {
+    const coldKeys = await listColdDataKeys(db)
+    const payloads: ColdStorageBackupPayload[] = []
+    const missingKeys: string[] = []
+
+    for (const key of coldKeys) {
+        try {
+            const value = await getColdStorageItem(key)
+            if (!value) {
+                missingKeys.push(key)
+                continue
+            }
+
+            payloads.push({
+                key,
+                backupName: getColdStorageBackupName(key),
+                value,
+                encoded: new TextEncoder().encode(JSON.stringify(value))
+            })
+        } catch (error) {
+            console.error(`Failed to read cold storage item ${key}:`, error)
+            missingKeys.push(key)
+        }
+    }
+
+    return { payloads, missingKeys }
 }
 
 async function makeColdDataForCharacter(i:number, coldTime:number): Promise<boolean>{
