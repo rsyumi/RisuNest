@@ -299,8 +299,6 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         }
     
         const db:Database = mode === 'backup' ? await getDbFromList() : JSON.parse(Buffer.from(await getFileData(ACCESS_TOKEN, dbs[0][0].id)).toString('utf-8'))
-        lastSaved = Date.now()
-        localStorage.setItem('risu_lastsaved', `${lastSaved}`)
         const coldStorageRestoreFailures = await restoreColdStorageFromDrive(ACCESS_TOKEN, files, db, mode)
         if(coldStorageRestoreFailures.length > 0){
             alertError(`${mode === 'sync' ? 'Sync' : 'Backup restore'} failed. ${coldStorageRestoreFailures.length} cold storage item(s) could not be restored.`)
@@ -361,6 +359,8 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
 
         if(isTauri){
             await writeFile('database/database.bin', dbData, {baseDir: BaseDirectory.AppData})
+            lastSaved = Date.now()
+            localStorage.setItem('risu_lastsaved', `${lastSaved}`)
             relaunch()
             alertStore.set({
                 type: "wait",
@@ -369,6 +369,8 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         }
         else{
             await forageStorage.setItem('database/database.bin', dbData)
+            lastSaved = Date.now()
+            localStorage.setItem('risu_lastsaved', `${lastSaved}`)
             location.search = ''
             alertStore.set({
                 type: "wait",

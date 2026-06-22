@@ -38,7 +38,7 @@ export class AutoStorage{
     }
 
     async checkAccountSync(){
-        let db = getDatabase()
+        let db = getDatabase({ snapshot: true })
         if(this.isAccount){
             return true
         }
@@ -46,7 +46,7 @@ export class AutoStorage{
             return false
         }
         if((localStorage.getItem('dosync') === 'sync' || db?.account?.useSync) && (localStorage.getItem('accountst') !== 'able')){
-            const keys = await this.realStorage.keys()
+            const keys = (await this.realStorage.keys()).filter((key) => key !== 'database/database.bin')
             let i = 0;
             const accountStorage = new AccountStorage()
 
@@ -78,26 +78,16 @@ export class AutoStorage{
                 return false
             }
 
-            let replaced:{[key:string]:string} = {}
-            
-            for(const key of keys){
-                alertStore.set({
-                    type: "wait",
-                    msg: `Migrating your data...(${i}/${keys.length})`
-                })
-                const rkey = await accountStorage.setItem(key,await this.realStorage.getItem(key))
-                if(rkey !== key){
-                    replaced[key] = rkey
-                }
-                i += 1
-            }
-
             const {
                 collectColdStorageBackupPayloads,
                 setAccountColdStorageItem
             } = await import("../process/coldstorage.svelte")
             const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
-            const failedColdKeys:string[] = [...coldStoragePayloads.missingKeys]
+            if(coldStoragePayloads.missingKeys.length > 0){
+                alertError(`Failed to migrate ${coldStoragePayloads.missingKeys.length} cold storage item(s) to account sync.`)
+                return false
+            }
+            const failedColdKeys:string[] = []
             for(let coldIndex = 0; coldIndex < coldStoragePayloads.payloads.length; coldIndex++){
                 const payload = coldStoragePayloads.payloads[coldIndex]
                 alertStore.set({
@@ -110,6 +100,24 @@ export class AutoStorage{
             }
             if(failedColdKeys.length > 0){
                 alertError(`Failed to migrate ${failedColdKeys.length} cold storage item(s) to account sync.`)
+                return false
+            }
+
+            let replaced:{[key:string]:string} = {}
+            try {
+                for(const key of keys){
+                    alertStore.set({
+                        type: "wait",
+                        msg: `Migrating your data...(${i}/${keys.length})`
+                    })
+                    const rkey = await accountStorage.setItem(key,await this.realStorage.getItem(key))
+                    if(rkey !== key){
+                        replaced[key] = rkey
+                    }
+                    i += 1
+                }
+            } catch (error) {
+                alertError(error)
                 return false
             }
 
