@@ -619,14 +619,15 @@ export async function clearLLMCache():Promise<void>{
 
 
 function applyEdittransRegex(
-      text: string, 
-      charArg: simpleCharacterArgument | string, 
+      text: string,
+      charArg: simpleCharacterArgument | string,
       alwaysExistChar: character | groupChat | simpleCharacterArgument
   ): string {
       if (charArg === '') return text
 
+      const db = getDatabase()
       let scripts: customscript[] = []
-      scripts = (getModuleRegexScripts() ?? []).concat(alwaysExistChar?.customscript ?? [])
+      scripts = (db.presetRegex ?? []).concat(getModuleRegexScripts() ?? []).concat(alwaysExistChar?.customscript ?? [])
 
       for (const script of scripts) {
           if (script.type === 'edittrans') {
