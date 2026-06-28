@@ -46,7 +46,11 @@ export class AutoStorage{
             return false
         }
         if((localStorage.getItem('dosync') === 'sync' || db?.account?.useSync) && (localStorage.getItem('accountst') !== 'able')){
-            const keys = (await this.realStorage.keys()).filter((key) => key !== 'database/database.bin')
+            const keys = (await this.realStorage.keys()).filter((key) => {
+                return key !== 'database/database.bin'
+                    && !key.startsWith('coldstorage/')
+                    && !key.startsWith('coldstorage_')
+            })
             let i = 0;
             const accountStorage = new AccountStorage()
 
@@ -80,26 +84,13 @@ export class AutoStorage{
 
             const {
                 collectColdStorageBackupPayloads,
+                replaceColdStoragePayloadResources,
                 setAccountColdStorageItem
             } = await import("../process/coldstorage.svelte")
             const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
-            if(coldStoragePayloads.missingKeys.length > 0){
-                alertError(`Failed to migrate ${coldStoragePayloads.missingKeys.length} cold storage item(s) to account sync.`)
-                return false
-            }
-            const failedColdKeys:string[] = []
-            for(let coldIndex = 0; coldIndex < coldStoragePayloads.payloads.length; coldIndex++){
-                const payload = coldStoragePayloads.payloads[coldIndex]
-                alertStore.set({
-                    type: "wait",
-                    msg: `Migrating cold storage data...(${coldIndex + 1}/${coldStoragePayloads.payloads.length})`
-                })
-                if(!await setAccountColdStorageItem(payload.key, payload.value)){
-                    failedColdKeys.push(payload.key)
-                }
-            }
-            if(failedColdKeys.length > 0){
-                alertError(`Failed to migrate ${failedColdKeys.length} cold storage item(s) to account sync.`)
+            const unavailableColdStorageCount = coldStoragePayloads.missingKeys.length + coldStoragePayloads.invalidKeys.length
+            if(unavailableColdStorageCount > 0){
+                alertError(`Failed to migrate ${unavailableColdStorageCount} cold storage item(s) to account sync because they are missing or invalid.`)
                 return false
             }
 
@@ -118,6 +109,23 @@ export class AutoStorage{
                 }
             } catch (error) {
                 alertError(error)
+                return false
+            }
+
+            const failedColdKeys:string[] = []
+            for(let coldIndex = 0; coldIndex < coldStoragePayloads.payloads.length; coldIndex++){
+                const payload = coldStoragePayloads.payloads[coldIndex]
+                alertStore.set({
+                    type: "wait",
+                    msg: `Migrating cold storage data...(${coldIndex + 1}/${coldStoragePayloads.payloads.length})`
+                })
+                const rewrittenPayload = replaceColdStoragePayloadResources(payload.value, replaced)
+                if(!await setAccountColdStorageItem(payload.key, rewrittenPayload)){
+                    failedColdKeys.push(payload.key)
+                }
+            }
+            if(failedColdKeys.length > 0){
+                alertError(`Failed to migrate ${failedColdKeys.length} cold storage item(s) to account sync.`)
                 return false
             }
 

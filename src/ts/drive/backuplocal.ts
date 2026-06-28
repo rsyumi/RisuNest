@@ -23,8 +23,9 @@ export async function SaveLocalBackup(){
     alertWait("Saving local backup...")
     const db = getDatabase()
     const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
-    if(coldStoragePayloads.missingKeys.length > 0){
-        alertError(`Backup failed. ${coldStoragePayloads.missingKeys.length} cold storage item(s) are missing.`)
+    const unavailableColdStorageCount = coldStoragePayloads.missingKeys.length + coldStoragePayloads.invalidKeys.length
+    if(unavailableColdStorageCount > 0){
+        alertError(`Backup failed. ${unavailableColdStorageCount} cold storage item(s) are missing or invalid.`)
         return
     }
 
@@ -218,8 +219,9 @@ export async function SavePartialLocalBackup(){
     alertWait("Saving partial local backup...")
     const db = getDatabase()
     const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
-    if(coldStoragePayloads.missingKeys.length > 0){
-        alertError(`Partial backup failed. ${coldStoragePayloads.missingKeys.length} cold storage item(s) are missing.`)
+    const unavailableColdStorageCount = coldStoragePayloads.missingKeys.length + coldStoragePayloads.invalidKeys.length
+    if(unavailableColdStorageCount > 0){
+        alertError(`Partial backup failed. ${unavailableColdStorageCount} cold storage item(s) are missing or invalid.`)
         return
     }
 

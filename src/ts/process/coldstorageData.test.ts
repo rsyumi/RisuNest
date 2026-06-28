@@ -5,6 +5,7 @@ import {
     getColdStorageBackupName,
     isColdStorageBackupData,
     listColdDataKeysFromDb,
+    replaceColdStoragePayloadResources,
 } from './coldstorageData'
 
 describe('coldstorageData', () => {
@@ -57,5 +58,43 @@ describe('coldstorageData', () => {
         expect(isColdStorageBackupData([])).toBe(true)
         expect(isColdStorageBackupData({ nope: true })).toBe(false)
         expect(isColdStorageBackupData(null)).toBe(false)
+    })
+
+    it('rewrites character cold storage asset references without mutating the original payload', () => {
+        const payload = {
+            character: {
+                type: 'character',
+                image: 'assets/local-main.png',
+                emotionImages: [
+                    ['neutral', 'assets/local-neutral.png'],
+                    ['happy', 'assets/local-happy.png'],
+                ],
+                additionalAssets: [
+                    ['prop', 'assets/local-prop.png'],
+                ],
+            },
+        }
+
+        const rewritten = replaceColdStoragePayloadResources(payload, {
+            'assets/local-main.png': 'assets/account-main.png',
+            'assets/local-neutral.png': 'assets/account-neutral.png',
+            'assets/local-prop.png': 'assets/account-prop.png',
+        }) as typeof payload
+
+        expect(rewritten.character.image).toBe('assets/account-main.png')
+        expect(rewritten.character.emotionImages[0][1]).toBe('assets/account-neutral.png')
+        expect(rewritten.character.emotionImages[1][1]).toBe('assets/local-happy.png')
+        expect(rewritten.character.additionalAssets[0][1]).toBe('assets/account-prop.png')
+        expect(payload.character.image).toBe('assets/local-main.png')
+        expect(payload.character.emotionImages[0][1]).toBe('assets/local-neutral.png')
+        expect(payload.character.additionalAssets[0][1]).toBe('assets/local-prop.png')
+    })
+
+    it('leaves non-character cold storage payloads unchanged', () => {
+        const payload = { message: [{ data: 'assets/local.png' }] }
+
+        expect(replaceColdStoragePayloadResources(payload, {
+            'assets/local.png': 'assets/account.png',
+        })).toBe(payload)
     })
 })

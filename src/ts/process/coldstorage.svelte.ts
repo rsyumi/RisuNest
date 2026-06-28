@@ -15,13 +15,14 @@ import { fetchProtectedResource } from "../sionyw"
 import { alertClear, alertError, alertWait } from "../alert"
 import { language } from "src/lang"
 import type { Database, character } from "../storage/database.svelte"
-import { coldStorageHeader, getColdStorageBackupName, listColdDataKeysFromDb } from "./coldstorageData"
+import { coldStorageHeader, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeysFromDb } from "./coldstorageData"
 
 export {
     coldStorageHeader,
     getColdStorageBackupKey,
     getColdStorageBackupName,
     isColdStorageBackupData,
+    replaceColdStoragePayloadResources,
     listColdDataKeysFromDb
 } from "./coldstorageData"
 
@@ -324,16 +325,23 @@ export type ColdStorageBackupPayload = {
 export async function collectColdStorageBackupPayloads(db: Pick<Database, 'characters'> = DBState.db): Promise<{
     payloads: ColdStorageBackupPayload[]
     missingKeys: string[]
+    invalidKeys: string[]
 }> {
     const coldKeys = await listColdDataKeys(db)
     const payloads: ColdStorageBackupPayload[] = []
     const missingKeys: string[] = []
+    const invalidKeys: string[] = []
 
     for (const key of coldKeys) {
         try {
             const value = await getColdStorageItem(key)
             if (!value) {
                 missingKeys.push(key)
+                continue
+            }
+
+            if (!isColdStorageBackupData(value)) {
+                invalidKeys.push(key)
                 continue
             }
 
@@ -349,7 +357,7 @@ export async function collectColdStorageBackupPayloads(db: Pick<Database, 'chara
         }
     }
 
-    return { payloads, missingKeys }
+    return { payloads, missingKeys, invalidKeys }
 }
 
 async function makeColdDataForCharacter(i:number, coldTime:number): Promise<boolean>{
