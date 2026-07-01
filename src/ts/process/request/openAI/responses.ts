@@ -333,13 +333,23 @@ async function buildResponsesBody(arg:RequestDataArgumentExtended):Promise<Recor
         tools.push({ type: 'web_search_preview' })
     }
 
+    const responseParameters = arg.modelInfo.parameters.filter((p) => [
+        'temperature',
+        'top_p',
+        'reasoning_effort',
+        'reasoning_effort_none',
+        'reasoning_effort_min_medium',
+        'reasoning_effort_xhigh',
+        'verbosity'
+    ].includes(p))
+
     let body = applyParameters({
         model: getResponsesRequestModel(arg),
         input: await buildResponseInputItems(arg),
         max_output_tokens: arg.maxTokens,
         tools: tools,
         store: false
-    }, ['temperature', 'top_p', 'reasoning_effort', 'verbosity'].filter((p) => arg.modelInfo.parameters.includes(p as any)) as any, {
+    }, responseParameters, {
         reasoning_effort: 'reasoning.effort',
         verbosity: 'text.verbosity'
     }, arg.mode, {
