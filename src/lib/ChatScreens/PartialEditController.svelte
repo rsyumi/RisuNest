@@ -18,6 +18,8 @@
         bodyRoot: HTMLElement | null;
         blockEditEnabled?: boolean;
         dragEditEnabled?: boolean;
+        translatedView?: boolean;
+        getTranslationEditContext?: () => Promise<{ key: string; data: string } | null>;
     }
 
     let {
@@ -26,10 +28,12 @@
         bodyRoot,
         blockEditEnabled = false,
         dragEditEnabled = false,
+        translatedView = false,
+        getTranslationEditContext,
     }: Props = $props();
 
     const dispatch = createEventDispatcher<{
-        save: { newData: string };
+        save: { newData: string; target: 'original' | 'translation'; translationKey?: string };
     }>();
 
     // Min drag selection length
@@ -43,19 +47,32 @@
 
     // Unified matching state: tracks both edit and delete operations
     type MatchingMode = 'edit' | 'delete' | null;
-    let matchingState = $state<{
+    type PartialEditTarget = 'original' | 'translation';
+    type MatchingState = {
         mode: MatchingMode;
         targetElement: HTMLElement | null;
         originalHTML: string;
         foundMatches: RangeResultWithContext[];
         selectedRange: RangeResult | null;
-    }>({
-        mode: null,
-        targetElement: null,
-        originalHTML: '',
-        foundMatches: [],
-        selectedRange: null,
-    });
+        sourceType: PartialEditTarget;
+        sourceData: string;
+        translationKey: string | null;
+    };
+
+    function createMatchingState(): MatchingState {
+        return {
+            mode: null,
+            targetElement: null,
+            originalHTML: '',
+            foundMatches: [],
+            selectedRange: null,
+            sourceType: 'original',
+            sourceData: messageData,
+            translationKey: null,
+        };
+    }
+
+    let matchingState = $state<MatchingState>(createMatchingState());
 
     let showMatchFailedModal = $state(false);
 
@@ -200,7 +217,15 @@
         currentDragSelectedText = '';
     }
 
-    function findAndProcessMatches(
+    async function getTranslationContextIfNeeded() {
+        if (!translatedView || !getTranslationEditContext) {
+            return null;
+        }
+
+        return await getTranslationEditContext();
+    }
+
+    async function findAndProcessMatches(
         mode: MatchingMode,
         elementOrText: HTMLElement | string,
         proceedCallback: (match: RangeResultWithContext) => void
@@ -216,13 +241,31 @@
 
         // Determine if matching from HTML element or text
         if (typeof elementOrText === 'string') {
+            const translationContext = await getTranslationContextIfNeeded();
+            const sourceType: PartialEditTarget = translationContext ? 'translation' : 'original';
+            const sourceData = translationContext?.data ?? messageData;
+
             matchingState.targetElement = null;
             matchingState.originalHTML = '';
-            matchingState.foundMatches = findAllOriginalRangesFromText(messageData, elementOrText, options);
+            matchingState.sourceType = sourceType;
+            matchingState.sourceData = sourceData;
+            matchingState.translationKey = sourceType === 'translation'
+                ? (translationContext?.key ?? null)
+                : null;
+            matchingState.foundMatches = findAllOriginalRangesFromText(sourceData, elementOrText, options);
         } else {
+            const translationContext = await getTranslationContextIfNeeded();
+            const sourceType: PartialEditTarget = translationContext ? 'translation' : 'original';
+            const sourceData = translationContext?.data ?? messageData;
+
             matchingState.targetElement = elementOrText;
             matchingState.originalHTML = elementOrText.innerHTML;
-            matchingState.foundMatches = findAllOriginalRangesFromHtml(messageData, elementOrText, options);
+            matchingState.sourceType = sourceType;
+            matchingState.sourceData = sourceData;
+            matchingState.translationKey = sourceType === 'translation'
+                ? (translationContext?.key ?? null)
+                : null;
+            matchingState.foundMatches = findAllOriginalRangesFromHtml(sourceData, elementOrText, options);
         }
 
         if (matchingState.foundMatches.length === 0) {
@@ -269,7 +312,7 @@
     function proceedWithEdit(match: RangeResultWithContext) {
         matchingState.selectedRange = match;
         matchingState.mode = null;
-        editText = messageData.slice(match.start, match.end);
+        editText = matchingState.sourceData.slice(match.start, match.end);
         isEditing = true;
 
         // Focus textarea on next tick
@@ -305,21 +348,19 @@
             matchingState.targetElement.innerHTML = matchingState.originalHTML;
         }
 
-        matchingState = {
-            mode: null,
-            targetElement: null,
-            originalHTML: '',
-            foundMatches: [],
-            selectedRange: null,
-        };
+        matchingState = createMatchingState();
     }
 
     // Save edited text
     function handleSave() {
         if (!matchingState.selectedRange) return;
 
-        const newData = replaceRange(messageData, matchingState.selectedRange, editText);
-        dispatch('save', { newData });
+        const newData = replaceRange(matchingState.sourceData, matchingState.selectedRange, editText);
+        dispatch('save', {
+            newData,
+            target: matchingState.sourceType,
+            translationKey: matchingState.translationKey ?? undefined,
+        });
 
         closeEdit();
     }
@@ -336,13 +377,7 @@
     function closeEdit() {
         isEditing = false;
         editText = '';
-        matchingState = {
-            mode: null,
-            targetElement: null,
-            originalHTML: '',
-            foundMatches: [],
-            selectedRange: null,
-        };
+        matchingState = createMatchingState();
     }
 
     // Proceed with delete after match selected
@@ -356,10 +391,14 @@
     function handleConfirmDelete() {
         if (!matchingState.selectedRange) return;
 
-        let newData = replaceRange(messageData, matchingState.selectedRange, '');
+        let newData = replaceRange(matchingState.sourceData, matchingState.selectedRange, '');
         newData = newData.replace(/\n{3,}/g, '\n\n').trim();
 
-        dispatch('save', { newData });
+        dispatch('save', {
+            newData,
+            target: matchingState.sourceType,
+            translationKey: matchingState.translationKey ?? undefined,
+        });
         closeDeleteConfirm();
     }
 
@@ -371,13 +410,7 @@
     // Close delete confirmation
     function closeDeleteConfirm() {
         isConfirmingDelete = false;
-        matchingState = {
-            mode: null,
-            targetElement: null,
-            originalHTML: '',
-            foundMatches: [],
-            selectedRange: null,
-        };
+        matchingState = createMatchingState();
     }
 
     function handleKeydown(e: KeyboardEvent) {
@@ -649,7 +682,7 @@
                             <div class="match-context-before">{match.contextBefore}</div>
                         {/if}
                         <div class="match-text">
-                            {messageData.slice(match.start, match.end).slice(0, 150)}{messageData.slice(match.start, match.end).length > 150 ? '...' : ''}
+                            {matchingState.sourceData.slice(match.start, match.end).slice(0, 150)}{matchingState.sourceData.slice(match.start, match.end).length > 150 ? '...' : ''}
                         </div>
                         {#if match.contextAfter}
                             <div class="match-context-after">{match.contextAfter}</div>
@@ -714,7 +747,7 @@
             </div>
             <p class="partial-delete-message">{language.partialEdit.deleteConfirmMessage}</p>
             <div class="partial-delete-preview">
-                {matchingState.selectedRange ? messageData.slice(matchingState.selectedRange.start, matchingState.selectedRange.end).slice(0, 200) : ''}{matchingState.selectedRange && messageData.slice(matchingState.selectedRange.start, matchingState.selectedRange.end).length > 200 ? '...' : ''}
+                {matchingState.selectedRange ? matchingState.sourceData.slice(matchingState.selectedRange.start, matchingState.selectedRange.end).slice(0, 200) : ''}{matchingState.selectedRange && matchingState.sourceData.slice(matchingState.selectedRange.start, matchingState.selectedRange.end).length > 200 ? '...' : ''}
             </div>
             <div class="partial-edit-buttons">
                 <button

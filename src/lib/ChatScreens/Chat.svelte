@@ -114,12 +114,38 @@
         DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].data = message
     }
 
-    function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
+    async function handlePartialEditSave(e: CustomEvent<{ newData: string; target: 'original' | 'translation'; translationKey?: string }>) {
         if (idx >= 0) {
+            if (e.detail.target === 'translation' && e.detail.translationKey) {
+                await setLLMCache(e.detail.translationKey, e.detail.newData)
+                if (editTranslationMode) {
+                    editTranslationText = e.detail.newData
+                }
+                ReloadChatPointer.update((v) => {
+                    v[idx] = (v[idx] ?? 0) + 1
+                    return v
+                })
+                return
+            }
+
             message = e.detail.newData
             DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].data = e.detail.newData
             displaya(e.detail.newData)
         }
+    }
+
+    async function getTranslationPartialEditContext() {
+        if (!translated || DBState.db.translatorType !== 'llm') {
+            return null
+        }
+
+        const key = await getTranslationCacheKey()
+        const data = await getLLMCache(key)
+        if (data === null) {
+            return null
+        }
+
+        return { key, data }
     }
 
     function getCbsCondition(){
@@ -431,6 +457,8 @@
                     {bodyRoot}
                     blockEditEnabled={DBState.db.enableBlockPartialEdit}
                     dragEditEnabled={DBState.db.enableDragPartialEdit}
+                    translatedView={translated}
+                    getTranslationEditContext={getTranslationPartialEditContext}
                     on:save={handlePartialEditSave}
                 />
             {/if}
