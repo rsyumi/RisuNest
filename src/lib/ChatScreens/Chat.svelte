@@ -116,7 +116,7 @@
 
     async function handlePartialEditSave(e: CustomEvent<{ newData: string; target: 'original' | 'translation'; translationKey?: string }>) {
         if (idx >= 0) {
-            if (e.detail.target === 'translation' && e.detail.translationKey) {
+            if (e.detail.target === 'translation' && e.detail.translationKey !== undefined) {
                 await setLLMCache(e.detail.translationKey, e.detail.newData)
                 if (editTranslationMode) {
                     editTranslationText = e.detail.newData
@@ -140,6 +140,9 @@
         }
 
         const key = await getTranslationCacheKey()
+        if (!key) {
+            return null
+        }
         const data = await getLLMCache(key)
         if (data === null) {
             return null
