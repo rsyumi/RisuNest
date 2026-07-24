@@ -425,8 +425,8 @@ export async function requestGoogleCloudVertex(arg:RequestDataArgumentExtended):
     console.log(arg.modelInfo);
 
     const isVertexGlobalOnlyModel = (modelId: string) => {
-        // As of 2025-12, Gemini 3 preview models are only available on the global endpoint.
-        return /^gemini-3-.*-preview$/.test(modelId)
+        // Gemini 3 preview models and Gemini 3.6 Flash are only available on the global endpoint.
+        return /^gemini-3-.*-preview$/.test(modelId) || modelId === 'gemini-3.6-flash'
     }
 
     async function generateToken(email:string,key:string){
