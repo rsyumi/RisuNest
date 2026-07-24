@@ -19,7 +19,7 @@ export const GoogleModels: LLMModel[] = [
         provider: LLMProvider.GoogleCloud,
         format: LLMFormat.GoogleCloud,
         flags: [LLMFlags.hasImageInput, LLMFlags.poolSupported, LLMFlags.hasAudioInput, LLMFlags.hasVideoInput, LLMFlags.hasStreaming, LLMFlags.requiresAlternateRole, LLMFlags.geminiThinking, LLMFlags.hasFirstSystemPrompt],
-        parameters: ['reasoning_effort', 'temperature', 'top_k', 'top_p', 'presence_penalty', 'frequency_penalty'],
+        parameters: ['reasoning_effort', 'temperature', 'top_k', 'top_p'],
         tokenizer: LLMTokenizer.GoogleCloud,
         recommended: true
     },
