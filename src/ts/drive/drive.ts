@@ -8,7 +8,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
-import { collectColdStorageBackupPayloads, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
     const CLIENT_ID = '580075990041-l26k2d3c0nemmqiu3d3aag01npfrkn76.apps.googleusercontent.com';
@@ -128,9 +128,8 @@ async function backupDrive(ACCESS_TOKEN:string) {
     })
 
     const coldStoragePayloads = await collectColdStorageBackupPayloads(getDatabase())
-    const unavailableColdStorageCount = coldStoragePayloads.missingKeys.length + coldStoragePayloads.invalidKeys.length
-    if(unavailableColdStorageCount > 0){
-        alertError(`Backup failed. ${unavailableColdStorageCount} cold storage item(s) are missing or invalid.`)
+    const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
+    if(!await confirmIncompleteColdStorageOperation(getDatabase(), unavailableColdStorageKeys, 'backup')){
         return
     }
 
@@ -302,8 +301,13 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         const db:Database = mode === 'backup' ? await getDbFromList() : JSON.parse(Buffer.from(await getFileData(ACCESS_TOKEN, dbs[0][0].id)).toString('utf-8'))
         const coldStorageRestoreFailures = await restoreColdStorageFromDrive(ACCESS_TOKEN, files, db, mode)
         if(coldStorageRestoreFailures.length > 0){
-            alertError(`${mode === 'sync' ? 'Sync' : 'Backup restore'} failed. ${coldStorageRestoreFailures.length} cold storage item(s) could not be restored.`)
-            return
+            if(mode === 'sync'){
+                alertError(`Sync failed. ${coldStorageRestoreFailures.length} cold storage item(s) could not be restored.`)
+                return
+            }
+            if(!await confirmIncompleteColdStorageOperation(db, coldStorageRestoreFailures, 'restore')){
+                return
+            }
         }
         const requiredImages = (await getUncleanables(db))
         let ind = 0;

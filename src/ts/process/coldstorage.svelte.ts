@@ -12,10 +12,10 @@ import { DBState } from "../stores.svelte"
 import type { NodeStorage } from "../storage/nodeStorage"
 import { compress as fflateCompress, decompress as fflateDecompress } from "fflate"
 import { fetchProtectedResource } from "../sionyw"
-import { alertClear, alertError, alertWait } from "../alert"
+import { alertClear, alertConfirm, alertError, alertWait } from "../alert"
 import { language } from "src/lang"
 import type { Database, character } from "../storage/database.svelte"
-import { coldStorageHeader, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeysFromDb } from "./coldstorageData"
+import { coldStorageHeader, getColdStorageAffectedCharacters, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeysFromDb } from "./coldstorageData"
 
 export {
     coldStorageHeader,
@@ -358,6 +358,33 @@ export async function collectColdStorageBackupPayloads(db: Pick<Database, 'chara
     }
 
     return { payloads, missingKeys, invalidKeys }
+}
+
+export async function confirmIncompleteColdStorageOperation(
+    db: Pick<Database, 'characters'>,
+    unavailableKeys: Iterable<string>,
+    operation: 'backup' | 'restore',
+): Promise<boolean> {
+    const uniqueUnavailableKeys = Array.from(new Set(unavailableKeys))
+    if (uniqueUnavailableKeys.length === 0) {
+        return true
+    }
+
+    const affected = getColdStorageAffectedCharacters(db, uniqueUnavailableKeys)
+    const characterNames = affected.characterNames.join(', ')
+    const message = operation === 'backup'
+        ? language.errors.coldStorageIncompleteBackupConfirm(
+            characterNames,
+            uniqueUnavailableKeys.length,
+            affected.unresolvedKeys.length,
+        )
+        : language.errors.coldStorageIncompleteRestoreConfirm(
+            characterNames,
+            uniqueUnavailableKeys.length,
+            affected.unresolvedKeys.length,
+        )
+
+    return await alertConfirm(message)
 }
 
 async function makeColdDataForCharacter(i:number, coldTime:number): Promise<boolean>{

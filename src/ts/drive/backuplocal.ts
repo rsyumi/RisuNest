@@ -9,7 +9,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
-import { collectColdStorageBackupPayloads, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { DBState } from "../stores.svelte";
 
 function getBasename(data:string){
@@ -23,9 +23,8 @@ export async function SaveLocalBackup(){
     alertWait("Saving local backup...")
     const db = getDatabase()
     const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
-    const unavailableColdStorageCount = coldStoragePayloads.missingKeys.length + coldStoragePayloads.invalidKeys.length
-    if(unavailableColdStorageCount > 0){
-        alertError(`Backup failed. ${unavailableColdStorageCount} cold storage item(s) are missing or invalid.`)
+    const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
+    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
         return
     }
 
@@ -219,9 +218,8 @@ export async function SavePartialLocalBackup(){
     alertWait("Saving partial local backup...")
     const db = getDatabase()
     const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
-    const unavailableColdStorageCount = coldStoragePayloads.missingKeys.length + coldStoragePayloads.invalidKeys.length
-    if(unavailableColdStorageCount > 0){
-        alertError(`Partial backup failed. ${unavailableColdStorageCount} cold storage item(s) are missing or invalid.`)
+    const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
+    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
         return
     }
 
@@ -550,12 +548,11 @@ export function LoadLocalBackup(){
                     continue
                 }
                 const existingColdStorage = await getColdStorageItem(key)
-                if(!existingColdStorage){
+                if(!isColdStorageBackupData(existingColdStorage)){
                     missingColdStorageKeys.push(key)
                 }
             }
-            if(missingColdStorageKeys.length > 0){
-                alertError(`Backup restore failed. ${missingColdStorageKeys.length} cold storage item(s) are missing.`)
+            if(!await confirmIncompleteColdStorageOperation(dbData, missingColdStorageKeys, 'restore')){
                 return
             }
 

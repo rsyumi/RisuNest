@@ -30,7 +30,11 @@ export const languageVietnamese = {
         "requestLogRemovedDesc": "This request log removes when client is refreshed or reloaded.",
         "vertexAuthError": "Thiếu thông tin xác thực Vertex AI.",
         "coldStorageWriteFailed": "Ghi vào bộ nhớ lạnh thất bại. Dữ liệu trò chuyện của bạn đã được bảo toàn.",
-        "coldStorageVerifyFailed": "Xác minh bộ nhớ lạnh thất bại. Dữ liệu trò chuyện của bạn đã được bảo toàn."
+        "coldStorageVerifyFailed": "Xác minh bộ nhớ lạnh thất bại. Dữ liệu trò chuyện của bạn đã được bảo toàn.",
+        "coldStorageIncompleteBackupConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `Dữ liệu bộ nhớ lạnh của ${characterNames || "nhân vật không xác định"} bị thiếu hoặc không hợp lệ.${unresolvedCount > 0 ? ` Có ${unresolvedCount} mục không thể liên kết với nhân vật.` : ""}\n\nNếu tiếp tục, bản sao lưu này sẽ thiếu ${unavailableCount} mục bộ nhớ lạnh và dữ liệu nhân vật hoặc cuộc trò chuyện bị ảnh hưởng có thể không thể khôi phục từ bản sao lưu.\n\nVẫn tạo bản sao lưu không đầy đủ?`,
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `Không thể khôi phục dữ liệu bộ nhớ lạnh của ${characterNames || "nhân vật không xác định"}.${unresolvedCount > 0 ? ` Có ${unresolvedCount} mục không thể liên kết với nhân vật.` : ""}\n\nNếu tiếp tục, ${unavailableCount} mục bộ nhớ lạnh sẽ vẫn không khả dụng và dữ liệu nhân vật hoặc cuộc trò chuyện bị ảnh hưởng có thể bị mất vĩnh viễn.\n\nVẫn tiếp tục khôi phục không đầy đủ?`
     },
     "showHelp": "Hiển thị trợ giúp",
     "help": {
