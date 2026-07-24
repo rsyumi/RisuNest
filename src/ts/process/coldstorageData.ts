@@ -61,24 +61,65 @@ export function replaceColdStoragePayloadResources(data: unknown, replacer: { [k
     return cloned
 }
 
+function listColdDataKeysFromCharacter(character: character | groupChat): string[] {
+    const keys: string[] = []
+    if (character.coldstorage) {
+        keys.push(character.coldstorage)
+        keys.push(...(character.coldStoragedChats ?? []))
+    }
+    for (const chat of character.chats ?? []) {
+        const firstMessage = chat.message?.[0]
+        if (firstMessage?.data?.startsWith(coldStorageHeader)) {
+            keys.push(firstMessage.data.slice(coldStorageHeader.length))
+        }
+    }
+    return keys
+}
+
 export function listColdDataKeysFromDb(db: Pick<Database, 'characters'> | null | undefined): string[] {
     const keys = new Set<string>()
     for (const character of db?.characters ?? []) {
         if (!character) {
             continue
         }
-        if (character.coldstorage) {
-            keys.add(character.coldstorage)
-            for (const key of character.coldStoragedChats ?? []) {
-                keys.add(key)
-            }
-        }
-        for (const chat of character.chats ?? []) {
-            const firstMessage = chat.message?.[0]
-            if (firstMessage?.data?.startsWith(coldStorageHeader)) {
-                keys.add(firstMessage.data.slice(coldStorageHeader.length))
-            }
+        for (const key of listColdDataKeysFromCharacter(character)) {
+            keys.add(key)
         }
     }
     return Array.from(keys)
+}
+
+export function getColdStorageAffectedCharacters(
+    db: Pick<Database, 'characters'> | null | undefined,
+    unavailableKeys: Iterable<string>,
+): {
+    characterNames: string[]
+    unresolvedKeys: string[]
+} {
+    const targetKeys = new Set(unavailableKeys)
+    const resolvedKeys = new Set<string>()
+    const characterNames: string[] = []
+
+    for (const character of db?.characters ?? []) {
+        if (!character) {
+            continue
+        }
+
+        let isAffected = false
+        for (const key of listColdDataKeysFromCharacter(character)) {
+            if (targetKeys.has(key)) {
+                resolvedKeys.add(key)
+                isAffected = true
+            }
+        }
+
+        if (isAffected) {
+            characterNames.push(character.name?.trim() || character.chaId || 'Unknown character')
+        }
+    }
+
+    return {
+        characterNames,
+        unresolvedKeys: Array.from(targetKeys).filter((key) => !resolvedKeys.has(key)),
+    }
 }
