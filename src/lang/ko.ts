@@ -30,7 +30,12 @@ export const languageKorean = {
         "requestLogRemovedDesc": "요청 로그는 앱이 재시작되거나 새로고침되면 삭제됩니다.",
         "vertexAuthError": "Vertex AI 인증 정보가 누락되었습니다.",
         "coldStorageWriteFailed": "콜드 스토리지 저장에 실패했습니다. 채팅 데이터는 보존되었습니다.",
-        "coldStorageVerifyFailed": "콜드 스토리지 검증에 실패했습니다. 채팅 데이터는 보존되었습니다."
+        "coldStorageVerifyFailed": "콜드 스토리지 검증에 실패했습니다. 채팅 데이터는 보존되었습니다.",
+        "coldStorageRestoreFailed": "콜드 스토리지 데이터를 불러올 수 없습니다. 해당 캐릭터의 데이터가 영구적으로 손실되었을 수 있습니다.",
+        "coldStorageIncompleteBackupConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `${characterNames || "알 수 없는 캐릭터"}의 콜드 스토리지 데이터가 없거나 손상되었습니다.${unresolvedCount > 0 ? ` 캐릭터를 확인할 수 없는 항목이 ${unresolvedCount}개 있습니다.` : ""}\n\n계속하면 이 백업에서 콜드 스토리지 항목 ${unavailableCount}개가 누락되며, 해당 캐릭터 또는 채팅 데이터를 이 백업으로 복구하지 못할 수 있습니다.\n\n그래도 불완전한 백업을 생성하시겠습니까?`,
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `${characterNames || "알 수 없는 캐릭터"}의 콜드 스토리지 데이터를 복원하지 못했습니다.${unresolvedCount > 0 ? ` 캐릭터를 확인할 수 없는 항목이 ${unresolvedCount}개 있습니다.` : ""}\n\n계속하면 콜드 스토리지 항목 ${unavailableCount}개를 사용할 수 없으며, 해당 캐릭터 또는 채팅 데이터가 영구적으로 손실될 수 있습니다.\n\n그래도 불완전한 복원을 계속하시겠습니까?`
     },
     "showHelp": "도움말 보기",
     "help": {

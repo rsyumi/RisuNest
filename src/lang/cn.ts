@@ -30,7 +30,12 @@ export const languageChinese = {
         "requestLogRemovedDesc": "当客户端刷新或加载时，该请求记录会被删除。",
         "vertexAuthError": "Vertex AI 身份验证详情缺失。",
         "coldStorageWriteFailed": "冷存储写入失败。您的聊天数据已被保留。",
-        "coldStorageVerifyFailed": "冷存储验证失败。您的聊天数据已被保留。"
+        "coldStorageVerifyFailed": "冷存储验证失败。您的聊天数据已被保留。",
+        "coldStorageRestoreFailed": "无法加载冷存储数据。受影响角色的数据可能已永久丢失。",
+        "coldStorageIncompleteBackupConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `${characterNames || "未知角色"}的冷存储数据缺失或无效。${unresolvedCount > 0 ? `有 ${unresolvedCount} 个项目无法关联到角色。` : ""}\n\n如果继续，此备份将缺少 ${unavailableCount} 个冷存储项目，受影响的角色或聊天数据可能无法从该备份恢复。\n\n仍要创建不完整的备份吗？`,
+        "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `无法恢复 ${characterNames || "未知角色"}的冷存储数据。${unresolvedCount > 0 ? `有 ${unresolvedCount} 个项目无法关联到角色。` : ""}\n\n如果继续，${unavailableCount} 个冷存储项目将不可用，受影响的角色或聊天数据可能会永久丢失。\n\n仍要继续不完整的恢复吗？`
     },
     "showHelp": "显示帮助",
     "help": {

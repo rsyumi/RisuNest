@@ -875,11 +875,11 @@ export async function changeChar(index: number, arg:{
     reseter();
     if(DBState.db.characters?.[index]?.coldstorage){
         const coldData = await getColdStorageItem(DBState.db.characters[index].coldstorage!)
-        if(coldData.character && coldData.character.chaId === DBState.db.characters[index].chaId){
+        if(coldData?.character && coldData.character.chaId === DBState.db.characters[index].chaId){
             DBState.db.characters[index] = coldData.character
         }
         else{
-            alertError(language.errors.coldStorageVerifyFailed)
+            alertError(language.errors.coldStorageRestoreFailed)
             return
         }
     }
