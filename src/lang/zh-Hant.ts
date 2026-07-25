@@ -31,6 +31,7 @@ export const languageChineseTraditional = {
         "vertexAuthError": "缺少 Vertex AI 驗證詳細資料。",
         "coldStorageWriteFailed": "冷儲存寫入失敗。您的對話資料已被保留。",
         "coldStorageVerifyFailed": "冷儲存驗證失敗。您的對話資料已被保留。",
+        "coldStorageRestoreFailed": "無法載入冷儲存資料。受影響角色的資料可能已永久遺失。",
         "coldStorageIncompleteBackupConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
             `${characterNames || "未知角色"}的冷儲存資料遺失或無效。${unresolvedCount > 0 ? `有 ${unresolvedCount} 個項目無法連結到角色。` : ""}\n\n若繼續，此備份將缺少 ${unavailableCount} 個冷儲存項目，受影響的角色或對話資料可能無法從此備份復原。\n\n仍要建立不完整的備份嗎？`,
         "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>

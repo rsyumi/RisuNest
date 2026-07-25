@@ -879,7 +879,7 @@ export async function changeChar(index: number, arg:{
             DBState.db.characters[index] = coldData.character
         }
         else{
-            alertError(language.errors.coldStorageVerifyFailed)
+            alertError(language.errors.coldStorageRestoreFailed)
             return
         }
     }

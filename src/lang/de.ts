@@ -31,6 +31,7 @@ export const languageGerman = {
         "vertexAuthError": "Vertex AI-Authentifizierungsdetails fehlen.",
         "coldStorageWriteFailed": "Kaltlager-Schreibvorgang fehlgeschlagen. Ihre Chat-Daten wurden beibehalten.",
         "coldStorageVerifyFailed": "Kaltlager-Überprüfung fehlgeschlagen. Ihre Chat-Daten wurden beibehalten.",
+        "coldStorageRestoreFailed": "Kaltlagerdaten konnten nicht geladen werden. Die Daten des betroffenen Charakters können dauerhaft verloren sein.",
         "coldStorageIncompleteBackupConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
             `Kaltlagerdaten für ${characterNames || "unbekannte Charaktere"} fehlen oder sind ungültig.${unresolvedCount > 0 ? ` ${unresolvedCount} Element(e) konnten keinem Charakter zugeordnet werden.` : ""}\n\nWenn Sie fortfahren, fehlen in dieser Sicherung ${unavailableCount} Kaltlagerelement(e). Die betroffenen Charakter- oder Chatdaten können daraus möglicherweise nicht wiederhergestellt werden.\n\nTrotzdem eine unvollständige Sicherung erstellen?`,
         "coldStorageIncompleteRestoreConfirm": (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
