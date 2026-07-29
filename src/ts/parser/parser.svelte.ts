@@ -790,6 +790,9 @@ export function trimMarkdown(data:string){
             ADD_ATTR: ["allow", "allowfullscreen", "frameborder", "scrolling", "risu-ctrl" ,"risu-btn", 'risu-trigger', 'risu-mark', 'risu-id', 'x-hl-lang', 'x-hl-text'],
         })
     }
+    else{
+        sant = decoded
+    }
 
     return sant
 }
