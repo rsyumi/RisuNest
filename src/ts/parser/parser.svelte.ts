@@ -782,12 +782,13 @@ export function trimMarkdown(data:string){
         ADD_ATTR: ["allow", "allowfullscreen", "frameborder", "scrolling", "risu-ctrl" ,"risu-btn", 'risu-trigger', 'risu-mark', 'risu-id', 'x-hl-lang', 'x-hl-text'],
     })
 
-    const decoded = decodeStyle(data)
+    const decoded = decodeStyle(sant)
 
     if(decoded !== sant){
-        sant = DOMPurify.sanitize(sant, {
+        sant = DOMPurify.sanitize(decoded, {
             ADD_TAGS: ["iframe", "style", "risu-style", "x-em", 'annotation', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'msqrt'],
             ADD_ATTR: ["allow", "allowfullscreen", "frameborder", "scrolling", "risu-ctrl" ,"risu-btn", 'risu-trigger', 'risu-mark', 'risu-id', 'x-hl-lang', 'x-hl-text'],
+            FORCE_BODY: true
         })
     }
     else{
