@@ -1845,8 +1845,8 @@ interface RisuaiPluginAPI {
      * existing Lua `output` trigger has finished, and after host-side output
      * transformations such as inlay screen processing have been written to the chat.
      * Listeners are awaited sequentially and receive the same event snapshot. A slow
-     * listener delays the remaining chat flow; use return-early patterns inside the
-     * listener if you want to spawn background work without blocking.
+     * listener delays the remaining chat flow. To run background work without
+     * blocking, fire off an async function without awaiting it inside the listener.
      *
      * The listener receives plain snapshots of `char` and the committed chat,
      * matching the convention of `getCharacterFromIndex` / `getChatFromIndex`.
