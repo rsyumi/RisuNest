@@ -31,12 +31,6 @@ export interface RisuModule{
     mcp?:MCPModule
 }
 
-export interface ModuleTriggerRuntime {
-    trigger: triggerscript
-    moduleId: string
-    index: number
-}
-
 export async function exportModule(module:RisuModule, arg:{
     alertEnd?:boolean
     saveData?:boolean
@@ -404,24 +398,16 @@ export function getModuleAssets() {
 
 
 export function getModuleTriggers() {
-    return getModuleTriggerRuntimes().map((v) => v.trigger)
-}
-
-export function getModuleTriggerRuntimes(): ModuleTriggerRuntime[] {
     const modules = getModules()
-    let triggers: ModuleTriggerRuntime[] = []
+    let triggers: triggerscript[] = []
     for (const module of modules) {
         if(!module){
             continue
         }
         if (module.trigger) {
-            triggers = triggers.concat(module.trigger.map((t, index) => {
+            triggers = triggers.concat(module.trigger.map((t) => {
                 t.lowLevelAccess = module.lowLevelAccess
-                return {
-                    trigger: t,
-                    moduleId: module.id,
-                    index,
-                }
+                return t
             }))
         }
     }

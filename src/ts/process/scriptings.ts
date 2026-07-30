@@ -12,7 +12,7 @@ import { writeInlayImage, getInlayAsset } from "./files/inlays";
 import type { OpenAIChat, MultiModal } from "./index.svelte";
 import { requestChatData, type StreamResponseChunk } from "./request/request";
 import { v4 } from "uuid";
-import { getModuleLorebooks, getModuleTriggerRuntimes } from "./modules";
+import { getModuleLorebooks, getModuleTriggers } from "./modules";
 import { Mutex } from "../mutex";
 import { tokenize } from "../tokenizer";
 import { fetchNative, readImage } from "../globalApi.svelte";
@@ -58,7 +58,6 @@ export async function runScripted(code:string, arg:{
     lowLevelAccess?: boolean,
     meta?: object,
     mode?: string,
-    engineKey?: string,
     type?: 'lua'|'py'
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
@@ -68,7 +67,6 @@ export async function runScripted(code:string, arg:{
     const getVar = arg.getVar ?? getChatVar
     const meta = arg.meta ?? {}
     const mode = arg.mode ?? 'manual'
-    const engineKey = arg.engineKey ?? `${type}:${mode}`
 
     let chat = arg.chat ?? getCurrentChat()
     let stopSending = false
@@ -77,7 +75,7 @@ export async function runScripted(code:string, arg:{
     if(type === 'lua'){
         await ensureLuaFactory()
     }
-    let ScriptingEngineState = await getOrCreateEngineState(engineKey, type);
+    let ScriptingEngineState = await getOrCreateEngineState(mode, type);
     
     return await ScriptingEngineState.mutex.runExclusive(async () => {
         ScriptingEngineState.chat = chat
@@ -87,7 +85,7 @@ export async function runScripted(code:string, arg:{
             let declareAPI:(name: string, func:Function) => void
 
             if(ScriptingEngineState.type === 'lua'){
-                console.log('Creating new Lua engine for:', engineKey)
+                console.log('Creating new Lua engine for mode:', mode)
                 ScriptingEngineState.engine?.global.close()
                 ScriptingEngineState.code = code
                 ScriptingEngineState.engine = await luaFactory.createEngine({injectObjects: true})
@@ -97,7 +95,7 @@ export async function runScripted(code:string, arg:{
                 }
             }
             if(ScriptingEngineState.type === 'py'){
-                console.log('Creating new Pyodide context for:', engineKey)
+                console.log('Creating new Pyodide context for mode:', mode)
                 ScriptingEngineState.pyodide?.close()
                 ScriptingEngineState.pyodide = new PyodideContext()
                 declareAPI = (name:string, func:Function) => {
@@ -1406,19 +1404,6 @@ ${code}
 `
 }
 
-function getCharacterEngineKey(char:character|simpleCharacterArgument, triggerIndex:number, mode:string) {
-    return `lua:char:${char.chaId}:trigger:${triggerIndex}:${mode}`
-}
-
-function getModuleEngineKey(moduleId:string, triggerIndex:number, mode:string) {
-    return `lua:module:${moduleId}:trigger:${triggerIndex}:${mode}`
-}
-
-type LuaTriggerRuntime = {
-    trigger: triggerscript
-    engineKey: string
-}
-
 export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:character|groupChat|simpleCharacterArgument, mode:string, content:T, meta?:object):Promise<T>{
     switch(mode){
         case 'editinput':
@@ -1437,25 +1422,17 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
     try {
         let data = content
 
-        const characterTriggers: LuaTriggerRuntime[] = char.type === 'group' ? [] : (char.triggerscript ?? []).map((trigger, index) => ({
-            trigger: {
-                ...trigger,
-                lowLevelAccess: false,
-            },
-            engineKey: getCharacterEngineKey(char, index, mode),
-        }))
-        const triggers = characterTriggers.concat(getModuleTriggerRuntimes().map((runtime) => ({
-            trigger: runtime.trigger,
-            engineKey: getModuleEngineKey(runtime.moduleId, runtime.index, mode),
-        })))
+        const triggers = char.type === 'group' ? (getModuleTriggers()) : (char.triggerscript.map((v) => {
+            v.lowLevelAccess = false
+            return v
+        }).concat(getModuleTriggers()))
     
-        for(let triggerRuntime of triggers){
-            if(triggerRuntime.trigger?.effect?.[0]?.type === 'triggerlua'){
-                const runResult = await runScripted(triggerRuntime.trigger.effect[0].code, {
+        for(let trigger of triggers){
+            if(trigger?.effect?.[0]?.type === 'triggerlua'){
+                const runResult = await runScripted(trigger.effect[0].code, {
                     char: char,
                     lowLevelAccess: false,
                     mode: mode,
-                    engineKey: triggerRuntime.engineKey,
                     data,
                     meta,
                 })
@@ -1473,25 +1450,17 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
 export async function runLuaButtonTrigger(char:character|groupChat|simpleCharacterArgument, data:string):Promise<any>{
     let runResult
     try {
-        const characterTriggers: LuaTriggerRuntime[] = char.type === 'group' ? [] : (char.triggerscript ?? []).map((trigger, index) => ({
-            trigger: {
-                ...trigger,
-                lowLevelAccess: char.type !== 'simple' ? char.lowLevelAccess ?? false : false,
-            },
-            engineKey: getCharacterEngineKey(char, index, 'onButtonClick'),
-        }))
-        const triggers = characterTriggers.concat(getModuleTriggerRuntimes().map((runtime) => ({
-            trigger: runtime.trigger,
-            engineKey: getModuleEngineKey(runtime.moduleId, runtime.index, 'onButtonClick'),
-        })))
+        const triggers = char.type === 'group' ? getModuleTriggers() : char.triggerscript.map<triggerscript>((v) => ({
+            ...v,
+            lowLevelAccess: char.type !== 'simple' ? char.lowLevelAccess ?? false : false
+        })).concat(getModuleTriggers())
 
-        for(let triggerRuntime of triggers){
-            if(triggerRuntime.trigger?.effect?.[0]?.type === 'triggerlua'){
-                runResult = await runScripted(triggerRuntime.trigger.effect[0].code, {
+        for(let trigger of triggers){
+            if(trigger?.effect?.[0]?.type === 'triggerlua'){
+                runResult = await runScripted(trigger.effect[0].code, {
                     char: char,
-                    lowLevelAccess: triggerRuntime.trigger.lowLevelAccess,
+                    lowLevelAccess: trigger.lowLevelAccess,
                     mode: 'onButtonClick',
-                    engineKey: triggerRuntime.engineKey,
                     data: data
                 })
             }
