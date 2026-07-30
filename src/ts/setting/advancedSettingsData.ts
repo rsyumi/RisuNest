@@ -94,6 +94,16 @@ export const advancedSettingsItems: SettingItem[] = [
         }
     },
 
+    // Chat Loading
+    {
+        id: 'adv.chatLoadInitial', type: 'number', labelKey: 'chatLoadInitialPages', bindKey: 'chatLoadInitialPages',
+        helpKey: 'chatLoadInitialPages', classes: 'mt-4', options: { min: 1 }
+    },
+    {
+        id: 'adv.chatLoadAdditional', type: 'number', labelKey: 'chatLoadAdditionalPages', bindKey: 'chatLoadAdditionalPages',
+        helpKey: 'chatLoadAdditionalPages', options: { min: 1 }
+    },
+
     // Request Location (Non-Node/Tauri)
     {
         id: 'adv.reqLoc', type: 'segmented', labelKey: 'requestLocation', bindKey: 'requestLocation',
@@ -132,6 +142,23 @@ export const advancedSettingsItems: SettingItem[] = [
     },
     { id: 'adv.autoCont', type: 'check', labelKey: 'autoContinueChat', bindKey: 'autoContinueChat', helpKey: 'autoContinueChat', classes: 'mt-4' },
     { id: 'adv.remIncomp', type: 'check', labelKey: 'removeIncompleteResponse', bindKey: 'removeIncompleteResponse', classes: 'mt-4' },
+    {
+        id: 'adv.streamingDisplayOpt',
+        type: 'segmented',
+        labelKey: 'streamingDisplayOptimizationMode',
+        bindKey: 'streamingDisplayOptimizationMode',
+        helpKey: 'streamingDisplayOptimizationMode',
+        condition: (ctx) => ctx.db.useExperimental,
+        showExperimental: true,
+        classes: 'mt-4',
+        options: {
+            segmentOptions: [
+                { value: 'off', labelKey: 'streamingDisplayOptimizationOff' },
+                { value: 'balanced', labelKey: 'streamingDisplayOptimizationBalanced' },
+                { value: 'strong', labelKey: 'streamingDisplayOptimizationStrong' }
+            ]
+        }
+    },
     { id: 'adv.newOai', type: 'check', labelKey: 'newOAIHandle', bindKey: 'newOAIHandle', classes: 'mt-4' },
     { id: 'adv.noWaitTrans', type: 'check', labelKey: 'noWaitForTranslate', bindKey: 'noWaitForTranslate', classes: 'mt-4' },
     { id: 'adv.newImgBeta', type: 'check', labelKey: 'newImageHandlingBeta', bindKey: 'newImageHandlingBeta', classes: 'mt-4' },
@@ -178,6 +205,7 @@ export const advancedSettingsItems: SettingItem[] = [
     { id: 'adv.realmOpen', type: 'check', labelKey: 'realmDirectOpen', bindKey: 'realmDirectOpen', helpKey: 'realmDirectOpen', classes: 'mt-4' },
     { id: 'adv.cssErr', type: 'check', labelKey: 'returnCSSError', bindKey: 'returnCSSError', classes: 'mt-4' },
     { id: 'adv.antiOverload', type: 'check', labelKey: 'antiServerOverload', bindKey: 'antiServerOverloads', classes: 'mt-4' },
+    { id: 'adv.openAIFlex', type: 'check', labelKey: 'openAIFlexProcessing', bindKey: 'openAIFlexProcessing', helpKey: 'openAIFlexProcessing', showExperimental: true, classes: 'mt-4' },
     { id: 'adv.claudeCache', type: 'check', labelKey: 'claude1HourCaching', bindKey: 'claude1HourCaching', classes: 'mt-4' },
     { id: 'adv.claudeBatch', type: 'check', labelKey: 'claudeBatching', bindKey: 'claudeBatching', showExperimental: true, classes: 'mt-4' },
     { id: 'adv.personaNote', type: 'check', labelKey: 'personaNote', bindKey: 'personaNote', showExperimental: true, classes: 'mt-4' },
@@ -217,6 +245,10 @@ export const advancedSettingsItems: SettingItem[] = [
     },
     {
         id: 'adv.depTrig', type: 'check', labelKey: 'showDeprecatedTriggerV1', bindKey: 'showDeprecatedTriggerV1',
+        condition: (ctx) => ctx.db.showUnrecommended, helpKey: 'unrecommended', helpUnrecommended: true, classes: 'mt-4'
+    },
+    {
+        id: 'adv.skipSavingAssetsOnWebSync', type: 'check', labelKey: 'skipSavingAssetsOnWebSync', bindKey: 'skipSavingAssetsOnWebSync',
         condition: (ctx) => ctx.db.showUnrecommended, helpKey: 'unrecommended', helpUnrecommended: true, classes: 'mt-4'
     },
 

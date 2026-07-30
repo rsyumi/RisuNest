@@ -32,6 +32,11 @@ export const languageEnglish = {
         requestLogRemovedDesc: "This request log removes when client is refreshed or reloaded.",
         coldStorageWriteFailed: "Cold storage write failed. Your chat data has been preserved.",
         coldStorageVerifyFailed: "Cold storage verification failed. Your chat data has been preserved.",
+        coldStorageRestoreFailed: "Cold storage data could not be loaded. The affected character's data may be permanently lost.",
+        coldStorageIncompleteBackupConfirm: (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `Cold storage data for ${characterNames || "unknown characters"} is missing or invalid.${unresolvedCount > 0 ? ` ${unresolvedCount} item(s) could not be linked to a character.` : ""}\n\nIf you continue, this backup will be missing ${unavailableCount} cold storage item(s), and the affected character or chat data may not be recoverable from it.\n\nCreate the incomplete backup anyway?`,
+        coldStorageIncompleteRestoreConfirm: (characterNames: string, unavailableCount: number, unresolvedCount: number) =>
+            `Cold storage data for ${characterNames || "unknown characters"} could not be restored.${unresolvedCount > 0 ? ` ${unresolvedCount} item(s) could not be linked to a character.` : ""}\n\nIf you continue, ${unavailableCount} cold storage item(s) will remain unavailable, and the affected character or chat data may be permanently lost.\n\nContinue with the incomplete restore anyway?`,
     },
     showHelp: "Show Help",
     help: {
@@ -124,6 +129,12 @@ export const languageEnglish = {
         openAIFixer: "OpenAI Fixer is a plugin that fixes some of the problems of OpenAI.",
         sayNothing: "If enabled, it will input 'say nothing' when no string inputed.",
         showUnrecommended: "If enabled, it will show unrecommended, deprecated settings. It is NOT RECOMMENDED to use these settings.",
+        streamingDisplayOptimizationMode:
+            "Reduces display lag when long responses are streamed with heavy post-processing, such as regex-based scripts. This can help on mobile or low-end devices.\n\n" +
+            "Off keeps the normal behavior, but post-processing runs on every token and can add significant overhead.\n\n" +
+            "Balanced lowers the load by trying post-processing only at short intervals, about every 0.125 seconds.\n\n" +
+            "Strong is similar to Balanced, but skips post-processing while streaming and runs it only once after the stream finishes.\n\n" +
+            "This is an experimental feature, and some features may behave unexpectedly because of it.",
         imageCompression: "If enabled, it will compress images when exporting character. if animated images doesn't works, try disabling this option.",
         useExperimental: "If enabled, it will show some experimental features.",
         forceProxyAsOpenAI: "If enabled, it will force to use OpenAI format when using reverse proxy.",
@@ -148,6 +159,8 @@ export const languageEnglish = {
         genTimes:
             "This option is used to set the number of responses to generate on support models. Other then first response will be act as cached reroll. This can reduce the cost of the model, but it can also increase the cost if you use it without reroll.",
         requestretrys: "This option is used to set the number of request retries when request fails.",
+        chatLoadInitialPages: "Number of recent chat messages to render when a chat screen opens. Higher values show more history immediately but can make long chats heavier to open.",
+        chatLoadAdditionalPages: "Number of older chat messages to render each time you scroll to the top. Higher values reduce repeated loading but can make each load heavier.",
         emotionPrompt: "This option is used to set the prompt that is used to detect emotion. If it is blank, it will use the default prompt.",
         removePunctuationHypa: "If enabled, it will remove punctuation before executing HypaMemory.",
         additionalParams:
@@ -177,6 +190,8 @@ export const languageEnglish = {
             "If enabled, it will use the old translation method, which preprocess markdown and quotes before translations instead of postprocessing after translations.",
         luaHelp:
             "You can use Lua scripts as a trigger script. You can define onInput, onOutput, onStart functions. onInput is called when user sends a message, onOutput is called when character sends a message, onStart is called when the chat starts. For more information, see the documentation.",
+        openAIFlexProcessing:
+            "OpenAI Flex responses can be slower than regular responses, but you can get them at a lower price (Batch API pricing). This toggle only applies to official OpenAI Chat Completions requests.",
         claudeCachingExperimental:
             "Caching in Claude is experimental feature that can reduce the cost of the model, but it can also increase the cost if you use it without reroll. Since this is a experimental feature, it can be unstable and behavior can be changed in the future.",
         urllora:
@@ -747,6 +762,8 @@ export const languageEnglish = {
     prompt: "Prompt",
     loreBookDepth: "Lorebook Search Depth",
     loreBookToken: "Lorebook Max Tokens",
+    chatLoadInitialPages: "Initial Chat Load Count",
+    chatLoadAdditionalPages: "Additional Chat Load Count",
     removeCharacter: "Remove Character",
     removeGroup: "Remove Group",
     exportCharacter: "Export Character",
@@ -851,6 +868,10 @@ export const languageEnglish = {
     unrecommended: "Not Recommended",
     chatNotes: "Chat Notes",
     showUnrecommended: "Show Unrecommended Settings",
+    streamingDisplayOptimizationMode: "Streaming Display Optimization",
+    streamingDisplayOptimizationOff: "Off",
+    streamingDisplayOptimizationBalanced: "Balanced",
+    streamingDisplayOptimizationStrong: "Strong",
     altGreet: "Alternative First Messages",
     scripts: "Scripts",
     settings: "Settings",
@@ -1491,6 +1512,7 @@ export const languageEnglish = {
     promptInfoEmptyToggle: "No custom toggles are currently active.",
     promptInfoEmptyText: "No prompt text has been saved.",
     escapeOutput: "Escape Output",
+    openAIFlexProcessing: "OpenAI Flex Processing",
     claudeBatching: "Claude Batching",
     claude1HourCaching: "Claude 1 Hour Caching",
     folderNameInput: "Please input the new folder name",
@@ -1679,6 +1701,12 @@ export const languageEnglish = {
     coldStorage: "Cold Storage",
     cleanColdStorage: "Clean Unused Cold Storage",
     customSidebarConfig: "Custom Sidebar Configuration",
+    cleanColdStorageConfirm: "This will permanently delete all unused cold storage data. This may contain data that isn't currently used but may be useful in the future. Do you want to continue?",
+    moveInsteadOfCopyOnCMPConvert: "Move Instead of Copy on CMP Convert",
+    successfullyConverted: "Successfully converted.",
+    convertToModule: "Convert to Module",
+    skipSavingAssetsOnWebSync: "Skip Saving Assets on Web Sync",
+    applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
 } satisfies I18nTranslation;
 
 type I18nTranslationFunction = (...args: any[]) => string;

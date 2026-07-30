@@ -15,11 +15,20 @@ import { type HypaV3Settings, type HypaV3Preset, createHypaV3Preset } from '../p
 import { normalizeTranslatorPresetState, type TranslatorPreset } from '../translator/presets'
 import { isTauri, isNodeServer } from "src/ts/platform"
 import { safeStructuredClone } from '../polyfill';
+import {
+    DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES,
+    DEFAULT_CHAT_LOAD_INITIAL_PAGES,
+    normalizeChatLoadPages,
+} from '../chatLoadPages';
+import { setDatabaseLite } from './databaseState.svelte';
+
+export { onDatabaseUpdate, setDatabaseLite } from './databaseState.svelte';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
-export let appVer = "2026.4.181" //<APP_VERSION_POINT>
+export let appVer = "2026.6.215" //<APP_VERSION_POINT>
 export let webAppSubVer = ''
 
+export type StreamingDisplayOptimizationMode = 'off'|'balanced'|'strong'
 
 export function setDatabase(data:Database){
     if(checkNullish(data.characters)){
@@ -155,6 +164,9 @@ export function setDatabase(data:Database){
     }
     if(checkNullish(data.botPresetsId)){
         data.botPresetsId = 0
+    }
+    if(Array.isArray(data.promptTemplate)){
+        data.promptTemplate = normalizePromptTemplate(data.promptTemplate)
     }
     if(checkNullish(data.sdProvider)){
         data.sdProvider = ''
@@ -377,6 +389,7 @@ export function setDatabase(data:Database){
     data.animationSpeed ??= 0.4
     data.colorScheme ??= safeStructuredClone(defaultColorScheme)
     data.colorSchemeName ??= 'default'
+    data.customColorScheme ??= safeStructuredClone(data.colorSchemeName === 'custom' ? data.colorScheme : defaultColorScheme)
     data.NAIsettings.starter ??= ""
     data.hypaModel ??= 'MiniLM'
     data.mancerHeader ??= ''
@@ -479,6 +492,9 @@ export function setDatabase(data:Database){
     }
     if (data.botPresets) {
         for (const preset of data.botPresets) {
+            if(Array.isArray(preset.promptTemplate)){
+                preset.promptTemplate = normalizePromptTemplate(preset.promptTemplate)
+            }
             preset.localNetworkMode ??= false
             preset.localNetworkTimeoutSec ??= 600
             if (typeof preset.localNetworkMode !== 'boolean') {
@@ -574,6 +590,7 @@ export function setDatabase(data:Database){
     data.showPromptComparison ??= false
     data.OaiCompAPIKeys ??= {}
     data.reasoningEffort ??= 0
+    data.verbosity ??= 1
     data.hypaV3Presets ??= [
         createHypaV3Preset("Default", {
             summarizationPrompt: data.supaMemoryPrompt ? data.supaMemoryPrompt : "",
@@ -645,6 +662,7 @@ export function setDatabase(data:Database){
     }
     data.customModels ??= []
     data.authRefreshes ??= []
+    data.openAIFlexProcessing ??= false
     data.rememberToolUsage ??= true
     data.simplifiedToolUse ??= false
     data.streamGeminiThoughts ??= false
@@ -672,6 +690,10 @@ export function setDatabase(data:Database){
     data.autoScrollToNewMessage ??= true
     data.alwaysScrollToNewMessage ??= false
     data.newMessageButtonStyle ??= 'bottom-center'
+    data.chatLoadInitialPages = normalizeChatLoadPages(data.chatLoadInitialPages, DEFAULT_CHAT_LOAD_INITIAL_PAGES)
+    data.chatLoadAdditionalPages = normalizeChatLoadPages(data.chatLoadAdditionalPages, DEFAULT_CHAT_LOAD_ADDITIONAL_PAGES)
+    data.streamingDisplayOptimizationMode ??= (data as {largeChatPerformanceMode?: StreamingDisplayOptimizationMode}).largeChatPerformanceMode ?? 'off'
+    delete (data as {largeChatPerformanceMode?: unknown}).largeChatPerformanceMode
     data.echoMessage ??= "Echo Message"
     data.echoDelay ??= 0
     if(!isNodeServer && !isTauri){
@@ -689,12 +711,17 @@ export function setDatabase(data:Database){
     data.loadouts ??= []
     data.longPressToPopupEditor ??= false
     data.customSidebarItems ??= []
+    data.moveInsteadOfCopyOnCMPConvert ??= false
+    data.skipSavingAssetsOnWebSync ??= true
+    data.coldstorage ??= data?.plugins?.length === 0
+    for(const char of data.characters){
+        for(const chat of char.chats ?? []){
+            chat.isStreaming = false
+            chat.activeStreamingDisplayOptimizationMode = undefined
+        }
+    }
     changeLanguage(data.language)
     setDatabaseLite(data)
-}
-
-export function setDatabaseLite(data:Database){
-    DBState.db = data
 }
 
 interface getDatabaseOptions{
@@ -759,6 +786,16 @@ export interface DynamicOutput {
     dynamicOutputPrompt: boolean
     showTypingEffect: boolean
     dynamicRequest: boolean
+}
+
+export interface RisuPersona {
+    personaPrompt:string
+    name:string
+    icon:string
+    largePortrait?:boolean
+    id?:string
+    note?:string
+    embeddedModule?:RisuModule
 }
 
 export interface Database{
@@ -914,14 +951,7 @@ export interface Database{
     nanogptUseSubscriptionEndpoint:boolean
     openrouterFallback:boolean
     selectedPersona:number
-    personas:{
-        personaPrompt:string
-        name:string
-        icon:string
-        largePortrait?:boolean
-        id?:string
-        note?:string
-    }[]
+    personas:RisuPersona[]
     personaNote:boolean
     assetWidth:number
     animationSpeed:number
@@ -930,6 +960,7 @@ export interface Database{
     hideRealm:boolean
     colorScheme:ColorScheme
     colorSchemeName:string
+    customColorScheme:ColorScheme
     promptTemplate?:PromptItem[]
     forceProxyAsOpenAI?:boolean
     hypaModel:HypaModel
@@ -988,6 +1019,7 @@ export interface Database{
     sideMenuRerollButton?:boolean
     requestInfoInsideChat?:boolean
     additionalParams:[string, string][]
+    applyAdditionalParamsToAll:boolean
     heightMode:string
     noWaitForTranslate:boolean
     antiClaudeOverload:boolean
@@ -1178,6 +1210,7 @@ export interface Database{
     }[]
     promptInfoInsideChat:boolean
     promptTextInfoInsideChat:boolean
+    openAIFlexProcessing:boolean
     claudeBatching:boolean
     claude1HourCaching:boolean
     rememberToolUsage:boolean
@@ -1217,6 +1250,9 @@ export interface Database{
     autoScrollToNewMessage?: boolean
     alwaysScrollToNewMessage?: boolean
     newMessageButtonStyle?: string
+    chatLoadInitialPages?: number
+    chatLoadAdditionalPages?: number
+    streamingDisplayOptimizationMode?: StreamingDisplayOptimizationMode
     pluginDevelopMode?: boolean
     echoMessage?:string
     echoDelay?:number
@@ -1236,6 +1272,8 @@ export interface Database{
     disableAprilFools?:boolean
     customSidebarItems: CustomSideBarItem[]
     lastLoadedLoadoutName: string
+    moveInsteadOfCopyOnCMPConvert?:boolean
+    skipSavingAssetsOnWebSync?:boolean
 }
 
 export interface CustomSideBarItem{
@@ -1455,6 +1493,7 @@ export interface character{
     modules?:string[]
     coldstorage?:string
     coldStoragedChats?:string[]
+    customModuleToggle?:string
 }
 
 
@@ -1784,6 +1823,7 @@ export interface Chat{
     lastMemory?:string
     suggestMessages?:string[]
     isStreaming?:boolean
+    activeStreamingDisplayOptimizationMode?:StreamingDisplayOptimizationMode
     scriptstate?:{[key:string]:string|number|boolean}
     modules?:string[]
     id?:string
@@ -2028,7 +2068,7 @@ export function saveCurrentPreset(){
         proxyRequestModel: db.proxyRequestModel,
         openrouterRequestModel: db.openrouterRequestModel,
         NAISettings: safeStructuredClone(db.NAIsettings),
-        promptTemplate: db.promptTemplate ?? null,
+        promptTemplate: normalizePromptTemplate(db.promptTemplate) ?? null,
         NAIadventure: db.NAIadventure ?? false,
         NAIappendName: db.NAIappendName ?? false,
         localStopStrings: db.localStopStrings,
@@ -2143,7 +2183,7 @@ export function setPreset(db:Database, newPres: botPreset){
     db.autoSuggestPrompt = newPres.autoSuggestPrompt ?? db.autoSuggestPrompt
     db.autoSuggestPrefix = newPres.autoSuggestPrefix ?? db.autoSuggestPrefix
     db.autoSuggestClean = newPres.autoSuggestClean ?? db.autoSuggestClean
-    db.promptTemplate = newPres.promptTemplate
+    db.promptTemplate = normalizePromptTemplate(newPres.promptTemplate)
     db.NAIadventure = newPres.NAIadventure
     db.NAIappendName = newPres.NAIappendName
     db.NAIsettings.cfg_scale ??= 1
@@ -2321,6 +2361,9 @@ export async function importPreset(f:{
         pre = {...presetTemplate,...(JSON.parse(Buffer.from(f.data).toString('utf-8')))}
         console.log(pre)
     }
+    if(pre?.promptTemplate !== undefined){
+        pre.promptTemplate = normalizePromptTemplate(pre.promptTemplate)
+    }
     let db = DBState.db
     if(pre.presetVersion && pre.presetVersion >= 3){
         //NAI preset
@@ -2446,6 +2489,7 @@ export async function importPreset(f:{
                 role: 'bot'
             })
         }
+        pr.promptTemplate = normalizePromptTemplate(pr.promptTemplate)
         pr.name = "Imported ST Preset"
         db.botPresets.push(pr)
         return
@@ -2455,4 +2499,58 @@ export async function importPreset(f:{
         db.botPresets = []
     }
     db.botPresets.push(pre)
+}
+
+function normalizePromptRole(role: unknown): 'user'|'bot'|'system'|null {
+    if(role === 'user' || role === 'bot' || role === 'system'){
+        return role
+    }
+    if(role === 'assistant' || role === 'char'){
+        return 'bot'
+    }
+    return null
+}
+
+function normalizeCacheRole(role: unknown): 'user'|'assistant'|'system'|'all' {
+    if(role === 'user' || role === 'assistant' || role === 'system' || role === 'all'){
+        return role
+    }
+    if(role === 'bot' || role === 'char'){
+        return 'assistant'
+    }
+    return 'all'
+}
+
+function normalizePromptTemplate(template: PromptItem[]|null|undefined): PromptItem[]|null {
+    if(!Array.isArray(template)){
+        return null
+    }
+    const normalized = safeStructuredClone(template) as any[]
+    for(const item of normalized){
+        if(!item || typeof item !== 'object'){
+            continue
+        }
+        switch(item.type){
+            case 'plain':
+            case 'jailbreak':
+            case 'cot':{
+                item.role = normalizePromptRole(item.role) ?? 'system'
+                break
+            }
+            case 'persona':
+            case 'description':
+            case 'authornote':
+            case 'memory':{
+                if(item.role2 !== undefined && item.role2 !== null){
+                    item.role2 = normalizePromptRole(item.role2) ?? 'system'
+                }
+                break
+            }
+            case 'cache':{
+                item.role = normalizeCacheRole(item.role)
+                break
+            }
+        }
+    }
+    return normalized as PromptItem[]
 }
