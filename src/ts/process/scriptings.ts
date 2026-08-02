@@ -113,9 +113,11 @@ export async function runScripted(code:string, arg:{
             })
             declareAPI('setChatVarChanged', (id:string,key:string, value:string) => {
                 if(!ScriptingSafeIds.has(id) && !ScriptingEditDisplayIds.has(id)){
-                    return false
+                    return
                 }
-                return ScriptingEngineState.setVar(key, value) === true
+                if(ScriptingEngineState.setVar(key, value) === true){
+                    return true
+                }
             })
             declareAPI('getGlobalVar', (id:string, key:string) => {
                 return getGlobalChatVar(key)
