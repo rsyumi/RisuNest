@@ -26,7 +26,7 @@ export function convertModuleToCharacter(m: RisuModule): character {
     for(let i = 0; i < char.globalLore.length; i++){
         const lore = safeStructuredClone(char.globalLore[i])
         if(lore.content.startsWith('@@indicator phi')){
-            char.postHistoryInstructions = lore.content.replace('@@indicator phi', '').trim()
+            char.replaceGlobalNote = lore.content.replace('@@indicator phi', '').trim()
             char.globalLore.splice(i, 1)
             i--
         }
@@ -102,13 +102,13 @@ export function convertCharacterToModule(c: character): RisuModule {
         })
     }
 
-    if(c.postHistoryInstructions){
+    if(c.replaceGlobalNote){
         mod.lorebook.push({
             key: "",
             secondkey: "",
             insertorder: 0,
             comment: "From PHI",
-            content: `@@indicator phi\n\n${c.postHistoryInstructions}`,
+            content: `@@indicator phi\n\n${c.replaceGlobalNote}`,
             mode: 'constant',
             alwaysActive: true,
             selective: false
