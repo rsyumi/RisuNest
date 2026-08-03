@@ -11,7 +11,7 @@ import { isTauri, isNodeServer } from "src/ts/platform"
 import { alertError } from "../alert"
 import { requestChatData } from "../process/request/request"
 import { doingChat, type OpenAIChat } from "../process/index.svelte"
-import { applyMarkdownToNode, type simpleCharacterArgument } from "../parser/parser.svelte"
+import { applyMarkdownToNode, risuChatParser, type simpleCharacterArgument } from "../parser/parser.svelte"
 import { selectedCharID } from "../stores.svelte"
 import { getModuleRegexScripts } from "../process/modules"
 import { getNodetextToSentence, sleep } from "../util"
@@ -618,7 +618,14 @@ export async function clearLLMCache():Promise<void>{
 }
 
 
-function applyEdittransRegex(
+interface pEdittransScript {
+    script: customscript
+    flag: string
+    order: number
+    actions: string[]
+}
+
+export function applyEdittransRegex(
       text: string,
       charArg: simpleCharacterArgument | string,
       alwaysExistChar: character | groupChat | simpleCharacterArgument
@@ -629,6 +636,9 @@ function applyEdittransRegex(
       let scripts: customscript[] = []
       scripts = (db.presetRegex ?? []).concat(getModuleRegexScripts() ?? []).concat(alwaysExistChar?.customscript ?? [])
 
+      const parsedScripts: pEdittransScript[] = []
+      let orderChanged = false
+
       for (const script of scripts) {
           if (script.type !== 'edittrans') {
               continue
@@ -637,28 +647,97 @@ function applyEdittransRegex(
               continue
           }
 
+          let flag = 'g'
+          if (script.ableFlag) {
+              flag = script.flag || 'g'
+          }
+
+          let order = 0
+          const actions: string[] = []
+
+          //parse custom flags, same as processScriptFull
+          flag = flag.replace(/<(.+?)>/g, (v: string, p1: string) => {
+              const meta = p1.split(',').map((v) => v.trim())
+              for (const m of meta) {
+                  if (m.startsWith('order ')) {
+                      order = parseInt(m.substring(6))
+                      orderChanged = true
+                  }
+                  else {
+                      actions.push(m)
+                  }
+              }
+
+              return ''
+          })
+
+          if (actions.includes('move_top') || actions.includes('move_bottom')) {
+              flag = flag.replace('g', '') //temperary fix
+          }
+
+          //remove unsupported flag
+          flag = flag.trim().replace(/[^dgimsuvy]/g, '')
+
+          //remove repeated flags
+          flag = flag.split('').filter((v, i, a) => a.indexOf(v) === i).join('')
+
+          if (flag.length === 0) {
+              flag = 'u'
+          }
+
+          parsedScripts.push({ script, flag, order, actions })
+      }
+
+      if (orderChanged) {
+          parsedScripts.sort((a, b) => b.order - a.order) //sort by order
+      }
+
+      for (const pscript of parsedScripts) {
           try {
-              let flag = 'g'
-              if (script.ableFlag) {
-                  flag = script.flag || 'g'
+              const script = pscript.script
+
+              let input = script.in
+              if (pscript.actions.includes('cbs')) {
+                  input = risuChatParser(input)
               }
 
-              //remove custom flags, which are only handled in processScriptFull
-              flag = flag.replace(/<(.+?)>/g, '')
+              const reg = new RegExp(input, pscript.flag)
+              const outScript = script.out.replaceAll("$n", "\n")
 
-              //remove unsupported flag
-              flag = flag.trim().replace(/[^dgimsuvy]/g, '')
-
-              //remove repeated flags
-              flag = flag.split('').filter((v, i, a) => a.indexOf(v) === i).join('')
-
-              if (flag.length === 0) {
-                  flag = 'u'
+              if (pscript.actions.includes('move_top') || pscript.actions.includes('move_bottom')) {
+                  const isGlobal = pscript.flag.includes('g')
+                  const matchAll = isGlobal ? text.matchAll(reg) : [text.match(reg)]
+                  text = text.replace(reg, "")
+                  for (const matched of matchAll) {
+                      if (matched) {
+                          const inData = matched[0]
+                          const out = outScript
+                              .replace(/(?<!\$)\$[0-9]+/g, (v) => {
+                                  const index = parseInt(v.substring(1))
+                                  if (index < matched.length) {
+                                      return matched[index]
+                                  }
+                                  return v
+                              })
+                              .replace(/\$\&/g, inData)
+                              .replace(/(?<!\$)\$<([^>]+)>/g, (v, p1) => {
+                                  if (matched.groups && matched.groups[p1]) {
+                                      return matched.groups[p1]
+                                  }
+                                  return v
+                              })
+                          if (pscript.actions.includes('move_top')) {
+                              text = out + '\n' + text
+                          }
+                          else {
+                              text = text + '\n' + out
+                          }
+                      }
+                  }
               }
-
-              const reg = new RegExp(script.in, flag)
-              let outScript = script.out.replaceAll("$n", "\n")
-              text = text.replace(reg, outScript)
+              else {
+                  text = text.replace(reg, outScript)
+              }
           } catch (error) {
               console.error(error)
           }
