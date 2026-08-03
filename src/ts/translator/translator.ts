@@ -720,9 +720,11 @@ export function applyEdittransRegex(
                                   return v
                               })
                               .replace(/\$\&/g, inData)
-                              .replace(/(?<!\$)\$<([^>]+)>/g, (v, p1) => {
-                                  if (matched.groups && matched.groups[p1]) {
-                                      return matched.groups[p1]
+                              //kept identical to processScriptFull, where parseInt on a group name never resolves
+                              .replace(/(?<!\$)\$<([^>]+)>/g, (v) => {
+                                  const groupName = parseInt(v.substring(2, v.length - 1))
+                                  if (matched.groups && matched.groups[groupName]) {
+                                      return matched.groups[groupName]
                                   }
                                   return v
                               })
