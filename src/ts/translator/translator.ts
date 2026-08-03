@@ -292,7 +292,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             audio.play().catch(() => {});
         }
 
-        return applyEdittransRegex(r, charArg, alwaysExistChar)
+        return applyEdittransRegex(r, charArg, alwaysExistChar, chatID)
     }
     if(db.translatorType == "bergamot" && db.htmlTranslation) {
         const from = db.aiModel.startsWith('novellist') ? 'ja' : 'en'
@@ -303,7 +303,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             bergamotTranslate = bergamotTranslator.bergamotTranslate
         }
  
-        return applyEdittransRegex(await bergamotTranslate(html, from, to, true), charArg, alwaysExistChar)
+        return applyEdittransRegex(await bergamotTranslate(html, from, to, true), charArg, alwaysExistChar, chatID)
     }
     const dom = new DOMParser().parseFromString(html, 'text/html');
     console.log(html)
@@ -489,7 +489,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
     // Remove the outer <html|body|head> tags
     translatedHTML = translatedHTML.replace(/<\/?(html|body|head)[^>]*>/g, '');
 
-    translatedHTML = applyEdittransRegex(translatedHTML, charArg, alwaysExistChar);
+    translatedHTML = applyEdittransRegex(translatedHTML, charArg, alwaysExistChar, chatID);
 
     // console.log(html)
     // console.log(translatedHTML)
@@ -628,7 +628,8 @@ interface pEdittransScript {
 export function applyEdittransRegex(
       text: string,
       charArg: simpleCharacterArgument | string,
-      alwaysExistChar: character | groupChat | simpleCharacterArgument
+      alwaysExistChar: character | groupChat | simpleCharacterArgument,
+      chatID = -1
   ): string {
       if (charArg === '') return text
 
@@ -698,7 +699,7 @@ export function applyEdittransRegex(
 
               let input = script.in
               if (pscript.actions.includes('cbs')) {
-                  input = risuChatParser(input)
+                  input = risuChatParser(input, { chatID: chatID })
               }
 
               const reg = new RegExp(input, pscript.flag)

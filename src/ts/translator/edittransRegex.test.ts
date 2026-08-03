@@ -12,9 +12,14 @@ vi.mock("../process/modules", () => ({
     moduleUpdate: () => {},
 }));
 
+const parserCalls: { data: string, chatID: number }[] = [];
+
 vi.mock("../parser/parser.svelte", () => ({
     applyMarkdownToNode: () => {},
-    risuChatParser: (data: string) => data.replaceAll("{{char}}", "Risu"),
+    risuChatParser: (data: string, arg: { chatID?: number } = {}) => {
+        parserCalls.push({ data, chatID: arg.chatID ?? -1 });
+        return data.replaceAll("{{char}}", "Risu");
+    },
 }));
 
 import { applyEdittransRegex } from "./translator";
@@ -29,13 +34,14 @@ const script = (v: Partial<customscript>): customscript => ({
 
 const alwaysExistChar = { customscript: [] } as unknown as character;
 
-const apply = (text: string, scripts: customscript[]) => {
+const apply = (text: string, scripts: customscript[], chatID = -1) => {
     database.presetRegex = scripts;
-    return applyEdittransRegex(text, "chatid", alwaysExistChar);
+    return applyEdittransRegex(text, "chatid", alwaysExistChar, chatID);
 };
 
 beforeEach(() => {
     database.presetRegex = [];
+    parserCalls.length = 0;
     vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
@@ -82,6 +88,14 @@ describe("applyEdittransRegex", () => {
         expect(apply("Risu said hi", [
             script({ in: "{{char}}", out: "Seia", ableFlag: true, flag: "g" }),
         ])).toBe("Risu said hi");
+        expect(parserCalls).toEqual([]);
+    });
+
+    it("forwards the chatID to the parser so message scoped syntaxes resolve", () => {
+        apply("Risu said hi", [
+            script({ in: "{{char}}", out: "Seia", ableFlag: true, flag: "g<cbs>" }),
+        ], 7);
+        expect(parserCalls).toEqual([{ data: "{{char}}", chatID: 7 }]);
     });
 
     it("sorts scripts by the order flag, higher first", () => {
