@@ -630,10 +630,34 @@ function applyEdittransRegex(
       scripts = (db.presetRegex ?? []).concat(getModuleRegexScripts() ?? []).concat(alwaysExistChar?.customscript ?? [])
 
       for (const script of scripts) {
-          if (script.type === 'edittrans') {
-              const reg = new RegExp(script.in, script.ableFlag ? script.flag : 'g')
+          if (script.type !== 'edittrans') {
+              continue
+          }
+          if (!script.in) {
+              continue
+          }
+
+          try {
+              let flag = 'g'
+              if (script.ableFlag) {
+                  flag = script.flag || 'g'
+              }
+
+              //remove unsupported flag
+              flag = flag.trim().replace(/[^dgimsuvy]/g, '')
+
+              //remove repeated flags
+              flag = flag.split('').filter((v, i, a) => a.indexOf(v) === i).join('')
+
+              if (flag.length === 0) {
+                  flag = 'u'
+              }
+
+              const reg = new RegExp(script.in, flag)
               let outScript = script.out.replaceAll("$n", "\n")
               text = text.replace(reg, outScript)
+          } catch (error) {
+              console.error(error)
           }
       }
       return text
