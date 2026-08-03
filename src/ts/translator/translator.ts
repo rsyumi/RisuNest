@@ -643,6 +643,9 @@ function applyEdittransRegex(
                   flag = script.flag || 'g'
               }
 
+              //remove custom flags, which are only handled in processScriptFull
+              flag = flag.replace(/<(.+?)>/g, '')
+
               //remove unsupported flag
               flag = flag.trim().replace(/[^dgimsuvy]/g, '')
 
