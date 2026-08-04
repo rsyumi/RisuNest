@@ -9,7 +9,7 @@ import { NANOGPT_RESPONSES_ENDPOINT, NANOGPT_SUBSCRIPTION_RESPONSES_ENDPOINT } f
 import { extractJSON, getOpenAIJSONSchema } from "../../templates/jsonSchema"
 import { callTool, decodeToolCall, encodeToolCall } from "../../mcp/mcp"
 import type { RequestDataArgumentExtended, requestDataResponse, StreamResponseChunk } from '../request'
-import { applyAdditionalParameters, applyParameters, getAdditionalParameters } from '../shared'
+import { applyAdditionalParameters, applyParameters, getAdditionalParameters, isReasoningCapabilityParameter } from '../shared'
 
 import type { OpenAIChatExtra, ResponseFunctionCallItem, ResponseInputItem, ResponseItem, ResponseOutputItem } from './types'
 import { getLocalNetworkRequestOptions, type LocalNetworkRequestOptions } from './shared'
@@ -333,15 +333,9 @@ async function buildResponsesBody(arg:RequestDataArgumentExtended):Promise<Recor
         tools.push({ type: 'web_search_preview' })
     }
 
-    const responseParameters = arg.modelInfo.parameters.filter((p) => [
-        'temperature',
-        'top_p',
-        'reasoning_effort',
-        'reasoning_effort_none',
-        'reasoning_effort_min_medium',
-        'reasoning_effort_xhigh',
-        'verbosity'
-    ].includes(p))
+    const responseParameters = arg.modelInfo.parameters.filter((p) =>
+        ['temperature', 'top_p', 'reasoning_effort', 'verbosity'].includes(p) || isReasoningCapabilityParameter(p)
+    )
 
     let body = applyParameters({
         model: getResponsesRequestModel(arg),
