@@ -25,9 +25,9 @@ export function convertModuleToCharacter(m: RisuModule): character {
 
     for(let i = 0; i < char.globalLore.length; i++){
         const lore = safeStructuredClone(char.globalLore[i])
-        if(lore.content.startsWith('@@indicator global_note') || lore.content.startsWith('@@indicator phi')){
+        if(lore.content.startsWith('@@indicator replace_global_note') || lore.content.startsWith('@@indicator phi')){
             // Backward compat: pre-rename modules stored global notes under the '@@indicator phi' marker
-            char.replaceGlobalNote = lore.content.replace(/^@@indicator\s+(?:global_note|phi)/, '').trim()
+            char.replaceGlobalNote = lore.content.replace(/^@@indicator\s+(?:replace_global_note|phi)/, '').trim()
             char.globalLore.splice(i, 1)
             i--
         }
@@ -108,8 +108,8 @@ export function convertCharacterToModule(c: character): RisuModule {
             key: "",
             secondkey: "",
             insertorder: 0,
-            comment: "From Global Note",
-            content: `@@indicator global_note\n\n${c.replaceGlobalNote}`,
+            comment: "From Global Note Replacement",
+            content: `@@indicator replace_global_note\n\n${c.replaceGlobalNote}`,
             mode: 'constant',
             alwaysActive: true,
             selective: false
