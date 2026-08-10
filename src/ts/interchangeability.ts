@@ -12,7 +12,7 @@ export function convertModuleToCharacter(m: RisuModule): character {
 
     char.name = m.name
     char.creatorNotes = m.description
-    char.globalLore = m.lorebook || []
+    char.globalLore = safeStructuredClone(m.lorebook || [])
     char.customscript = m.regex || []
     char.triggerscript = m.trigger || []
     char.lowLevelAccess = m.lowLevelAccess || false
