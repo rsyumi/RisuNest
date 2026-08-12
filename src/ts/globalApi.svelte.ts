@@ -912,7 +912,7 @@ export async function getUncleanables(db: Database, uptype: 'basename' | 'pure' 
         for(let cha of db.characters){
             if(cha?.coldstorage){
                 const coldData = await getColdStorageItem(cha.coldstorage!)
-                if(coldData.character && coldData.character.chaId === cha.chaId){
+                if(coldData?.character && coldData.character.chaId === cha.chaId){
                     cha = coldData.character
                 }
             }
