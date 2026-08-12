@@ -73,6 +73,12 @@
     }
 
     let matchingState = $state<MatchingState>(createMatchingState());
+    let matchingRequestId = 0;
+
+    function resetMatchingState() {
+        matchingRequestId += 1;
+        matchingState = createMatchingState();
+    }
 
     let showMatchFailedModal = $state(false);
 
@@ -232,54 +238,48 @@
     ) {
         if (!elementOrText || !messageData) return;
 
-        matchingState.mode = mode;
+        const requestId = ++matchingRequestId;
 
         // Set matching options based on mode
         const options = mode === 'edit' 
             ? { extendToEOL: false, snapStartToPrevEOL: false }
             : { extendToEOL: true, snapStartToPrevEOL: true };
 
+        const translationContext = await getTranslationContextIfNeeded();
+        if (requestId !== matchingRequestId) return;
+
+        const sourceType: PartialEditTarget = translationContext ? 'translation' : 'original';
+        const sourceData = translationContext?.data ?? messageData;
+        const nextState = createMatchingState();
+        nextState.sourceType = sourceType;
+        nextState.sourceData = sourceData;
+        nextState.translationKey = translationContext?.key ?? null;
+
         // Determine if matching from HTML element or text
         if (typeof elementOrText === 'string') {
-            const translationContext = await getTranslationContextIfNeeded();
-            const sourceType: PartialEditTarget = translationContext ? 'translation' : 'original';
-            const sourceData = translationContext?.data ?? messageData;
-
-            matchingState.targetElement = null;
-            matchingState.originalHTML = '';
-            matchingState.sourceType = sourceType;
-            matchingState.sourceData = sourceData;
-            matchingState.translationKey = sourceType === 'translation'
-                ? (translationContext?.key ?? null)
-                : null;
-            matchingState.foundMatches = findAllOriginalRangesFromText(sourceData, elementOrText, options);
+            nextState.foundMatches = findAllOriginalRangesFromText(sourceData, elementOrText, options);
         } else {
-            const translationContext = await getTranslationContextIfNeeded();
-            const sourceType: PartialEditTarget = translationContext ? 'translation' : 'original';
-            const sourceData = translationContext?.data ?? messageData;
-
-            matchingState.targetElement = elementOrText;
-            matchingState.originalHTML = elementOrText.innerHTML;
-            matchingState.sourceType = sourceType;
-            matchingState.sourceData = sourceData;
-            matchingState.translationKey = sourceType === 'translation'
-                ? (translationContext?.key ?? null)
-                : null;
-            matchingState.foundMatches = findAllOriginalRangesFromHtml(sourceData, elementOrText, options);
+            nextState.targetElement = elementOrText;
+            nextState.originalHTML = elementOrText.innerHTML;
+            nextState.foundMatches = findAllOriginalRangesFromHtml(sourceData, elementOrText, options);
         }
 
-        if (matchingState.foundMatches.length === 0) {
+        matchingState = nextState;
+
+        if (nextState.foundMatches.length === 0) {
             showMatchFailedModal = true;
             return;
         }
 
         // Filter high-confidence matches
-        const highConfidenceMatches = matchingState.foundMatches.filter(m => m.confidence >= 0.95);
+        const highConfidenceMatches = nextState.foundMatches.filter(m => m.confidence >= 0.95);
 
         if (highConfidenceMatches.length === 1) {
             proceedCallback(highConfidenceMatches[0]);
-        } else if (matchingState.foundMatches.length === 1) {
-            proceedCallback(matchingState.foundMatches[0]);
+        } else if (nextState.foundMatches.length === 1) {
+            proceedCallback(nextState.foundMatches[0]);
+        } else {
+            matchingState.mode = mode;
         }
 
         hideBlockButton();
@@ -348,7 +348,7 @@
             matchingState.targetElement.innerHTML = matchingState.originalHTML;
         }
 
-        matchingState = createMatchingState();
+        resetMatchingState();
     }
 
     // Save edited text
@@ -377,7 +377,7 @@
     function closeEdit() {
         isEditing = false;
         editText = '';
-        matchingState = createMatchingState();
+        resetMatchingState();
     }
 
     // Proceed with delete after match selected
@@ -410,7 +410,7 @@
     // Close delete confirmation
     function closeDeleteConfirm() {
         isConfirmingDelete = false;
-        matchingState = createMatchingState();
+        resetMatchingState();
     }
 
     function handleKeydown(e: KeyboardEvent) {
@@ -646,6 +646,7 @@
 
     // Cleanup on component unmount
     onDestroy(() => {
+        matchingRequestId += 1;
         if (blockButtonWrapper) {
             blockButtonWrapper.remove();
             blockButtonWrapper = null;

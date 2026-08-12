@@ -19,6 +19,7 @@
         translated: boolean
         translating: boolean
         retranslate: boolean
+        translationCacheRevision?: number
         bodyRoot?: HTMLElement|null
         modelShortName: string
     }
@@ -32,6 +33,7 @@
         translated = $bindable(false),
         translating = $bindable(false),
         retranslate = $bindable(false),
+        translationCacheRevision = 0,
         bodyRoot,
         modelShortName = '',
     }: Props =  $props()
@@ -240,7 +242,10 @@
         }
     }
 
-    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character, idx))
+    let markParsingResult = $derived.by(() => {
+        translationCacheRevision;
+        return markParsing(msgDisplay, character, idx);
+    })
 
     $effect(() => {
         markParsingResult

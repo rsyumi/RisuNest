@@ -504,7 +504,7 @@ function needSuperChunkedTranslate(){
 async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = await LLMCacheStorage.getItem(text)
-        if(cacheMatch){
+        if(cacheMatch !== null){
             return cacheMatch as string
         }
     }
