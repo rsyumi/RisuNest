@@ -19,7 +19,7 @@
         translated: boolean
         translating: boolean
         retranslate: boolean
-        translationCacheRevision?: number
+        renderRevision?: number
         bodyRoot?: HTMLElement|null
         modelShortName: string
         renderRawStreaming?: boolean
@@ -35,7 +35,7 @@
         translated = $bindable(false),
         translating = $bindable(false),
         retranslate = $bindable(false),
-        translationCacheRevision = 0,
+        renderRevision = 0,
         bodyRoot,
         modelShortName = '',
         renderRawStreaming = false,
@@ -46,6 +46,7 @@
     let lastParsed = ''
     let lastCharArg:string|simpleCharacterArgument = null
     let lastChatId = -10
+    let lastRenderedRevision: number | null = null
 
     function getCbsCondition(){
         try{
@@ -65,10 +66,11 @@
 
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
 
-    const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, tries?:number) => {
+    const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, requestedRevision: number, tries?:number) => {
         // track 'translated' and 'retranslate' state
         translated;
         retranslate;
+        const preservePendingContent = lastRenderedRevision !== null && requestedRevision !== lastRenderedRevision
         let lastParsedQueue = ''
         let mode = 'notrim' as const
         try {
@@ -109,7 +111,7 @@
                 }
             }
             if(retranslate || translated){
-                if (DBState.db.showTranslationLoading) {
+                if (DBState.db.showTranslationLoading && !preservePendingContent) {
                     lastParsed = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
                 }
 
@@ -163,11 +165,12 @@
                 alertError(`Error while parsing chat message: ${translated}, ${error.message}, ${error.stack}`)
                 return data
             }
-            return await markParsing(data, charArg, chatID, (tries ?? 0) + 1)
+            return await markParsing(data, charArg, chatID, requestedRevision, (tries ?? 0) + 1)
         }
         finally{
             //since trimMarkdown is fast, we don't need to cache it
             lastParsed = lastParsedQueue
+            lastRenderedRevision = requestedRevision
         }
     }
 
@@ -248,10 +251,7 @@
         }
     }
 
-    let markParsingResult = $derived.by(() => {
-        translationCacheRevision;
-        return markParsing(msgDisplay, character, idx);
-    })
+    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character, idx, renderRevision))
 
     $effect(() => {
         if(shouldRenderRawStreaming){

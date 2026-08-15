@@ -31,8 +31,10 @@
     let statusMessage:string = $state('')
     let retranslate = $state(false)
     let editTranslationMode = $state(false)
+    let loadingTranslationEdit = $state(false)
     let editTranslationText = $state('')
-    let translationCacheRevision = $state(0)
+    let editTranslationKey: string | null = null
+    let chatBodyRevision = $state(0)
     let bodyRoot:HTMLElement|null = $state(null)
     interface Props {
         message?: string;
@@ -87,6 +89,9 @@
     let msgDisplay = $state('')
     let translated = $state(false)
     let partialEditEnabled = $state(true)
+    let translationViewControlsDisabled = $derived(editMode || editTranslationMode || loadingTranslationEdit)
+    let originalEditControlDisabled = $derived(editTranslationMode || loadingTranslationEdit)
+    let translationEditControlDisabled = $derived(editMode || loadingTranslationEdit)
 
     export function updateStreamingDisplay(state: {
         isOptimizedStreamingMessage: boolean
@@ -131,6 +136,32 @@
         DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].data = message
     }
 
+    function startOriginalEdit() {
+        if (originalEditControlDisabled) return
+        editMode = true
+    }
+
+    function toggleOriginalEdit() {
+        if (originalEditControlDisabled) return
+
+        if (editMode) {
+            editMode = false
+            edit()
+        } else {
+            startOriginalEdit()
+        }
+    }
+
+    function toggleTranslation() {
+        if (translationViewControlsDisabled) return
+        translated = !translated
+    }
+
+    function requestRetranslation() {
+        if (translationViewControlsDisabled) return
+        retranslate = true
+    }
+
     async function handlePartialEditSave(e: CustomEvent<{ newData: string; target: 'original' | 'translation'; translationKey?: string }>) {
         if (idx < 0) return
 
@@ -149,7 +180,7 @@
     async function updateTranslationCache(key: string, data: string) {
         await setLLMCache(key, data)
         editTranslationText = data
-        translationCacheRevision += 1
+        chatBodyRevision += 1
     }
 
     async function getTranslationPartialEditContext() {
@@ -196,15 +227,28 @@
     }
 
     async function loadTranslationForEdit() {
-        const key = await getTranslationCacheKey()
-        const cached = await getLLMCache(key)
-        editTranslationText = cached ?? ''
-        editTranslationMode = true
+        if (translationViewControlsDisabled) return
+
+        loadingTranslationEdit = true
+        try {
+            const key = await getTranslationCacheKey()
+            const cached = await getLLMCache(key)
+            editTranslationKey = key
+            editTranslationText = cached ?? ''
+            editTranslationMode = true
+        } catch (error) {
+            editTranslationKey = null
+            throw error
+        } finally {
+            loadingTranslationEdit = false
+        }
     }
 
     async function saveTranslationEdit() {
-        const key = await getTranslationCacheKey()
-        await updateTranslationCache(key, editTranslationText)
+        if (!editTranslationKey) return
+
+        await updateTranslationCache(editTranslationKey, editTranslationText)
+        editTranslationKey = null
         editTranslationMode = false
     }
 
@@ -383,18 +427,17 @@
             </button>
         {/if}
         {#if DBState.db.translatorType === 'llm' && translated}
-            <button class="text-sm p-1 text-textcolor2 border-darkborderc float-end mr-2 my-1
-                            hover:ring-darkbutton hover:ring-3 rounded-md hover:text-textcolor transition-all flex justify-center items-center"
-                    onclick={() => {
-                        retranslate = true
-                    }}
+            <button class={"text-sm p-1 text-textcolor2 border-darkborderc float-end mr-2 my-1 rounded-md transition-all flex justify-center items-center " + (translationViewControlsDisabled ? 'opacity-50 cursor-not-allowed' : 'hover:ring-darkbutton hover:ring-3 hover:text-textcolor')}
+                    disabled={translationViewControlsDisabled}
+                    onclick={requestRetranslation}
             >
                 <RefreshCcwIcon size={20} />
                 <span class="ml-1">
                     {language.retranslate}
                 </span>
             </button>
-            <button class={"text-sm p-1 border-darkborderc float-end mr-2 my-1 hover:ring-darkbutton hover:ring-3 rounded-md hover:text-textcolor transition-all flex justify-center items-center " + (editTranslationMode ? 'text-blue-400' : 'text-textcolor2')}
+            <button class={"text-sm p-1 border-darkborderc float-end mr-2 my-1 rounded-md transition-all flex justify-center items-center " + (editTranslationMode ? 'text-blue-400 hover:ring-darkbutton hover:ring-3 hover:text-textcolor' : translationEditControlDisabled ? 'text-textcolor2 opacity-50 cursor-not-allowed' : 'text-textcolor2 hover:ring-darkbutton hover:ring-3 hover:text-textcolor')}
+                    disabled={translationEditControlDisabled}
                     onclick={() => {
                         if(editTranslationMode){
                             saveTranslationEdit()
@@ -460,7 +503,7 @@
             bind:this={bodyRoot}
             onclick={() => {
             if(DBState.db.clickToEdit && idx > -1 && !isOptimizedStreamingMessage){
-                editMode = true
+                startOriginalEdit()
             }
         }}
             style:font-size="{0.875 * (DBState.db.zoomsize / 100)}rem"
@@ -474,7 +517,7 @@
                     {msgDisplay}
                     {name}
                     {bodyRoot}
-                    {translationCacheRevision}
+                    renderRevision={chatBodyRevision}
                     modelShortName={
                         messageGenerationInfo ? getModelInfo(messageGenerationInfo?.model).shortName : ''
                     }
@@ -801,9 +844,12 @@
 
 {#snippet translationButton(showNames = false)}
     {#if DBState.db.translator !== '' && !blankMessage && !isOptimizedStreamingMessage}
-        <button class={"flex items-center cursor-pointer hover:text-blue-500 transition-colors button-icon-translate " + (translated ? 'text-blue-400':'')} class:translating={translating} onclick={async () => {
-            translated = !translated
-        }}>
+        <button
+            class={"flex items-center transition-colors button-icon-translate " + (translationViewControlsDisabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:text-blue-500') + (translated ? ' text-blue-400' : '')}
+            class:translating={translating}
+            disabled={translationViewControlsDisabled}
+            onclick={toggleTranslation}
+        >
             <LanguagesIcon />
             {#if showNames}
                 <span class="ml-1">{language.translate}</span>
@@ -811,15 +857,11 @@
         </button>
     {/if}
     {#if idx > -1 && !isOptimizedStreamingMessage}
-        <button class={"flex items-center hover:text-blue-500 transition-colors button-icon-edit "+(editMode?'text-blue-400':'')} onclick={() => {
-            if(!editMode){
-                editMode = true
-            }
-            else{
-                editMode = false
-                edit()
-            }
-        }}>
+        <button
+            class={"flex items-center transition-colors button-icon-edit " + (editMode ? 'text-blue-400 hover:text-blue-500' : originalEditControlDisabled ? 'opacity-50 cursor-not-allowed' : 'hover:text-blue-500')}
+            disabled={originalEditControlDisabled}
+            onclick={toggleOriginalEdit}
+        >
             <PencilIcon size={20}/>
 
             {#if showNames}
