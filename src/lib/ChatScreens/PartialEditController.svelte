@@ -511,26 +511,9 @@
                 const elementAtPoint = document.elementFromPoint(lastMouseX, lastMouseY);
                 if (elementAtPoint) {
                     const block = elementAtPoint.closest(SELECTOR) as HTMLElement | null;
-                    if (block && bodyRoot.contains(block) && hasTextContent(block)) {
+                    if (block && block !== bodyRoot && bodyRoot.contains(block) && hasTextContent(block)) {
                         showBlockButton(block);
                         return;
-                    }
-                }
-
-                // Check if element is not hidden (verify at center top of block)
-                const blocks = bodyRoot.querySelectorAll(SELECTOR);
-                for (const block of blocks) {
-                    if (isMouseInButtonZone(lastMouseX, lastMouseY, block as HTMLElement)) {
-                        if (hasTextContent(block as HTMLElement)) {
-                            const rect = (block as HTMLElement).getBoundingClientRect();
-                            const checkX = rect.left + rect.width / 2;
-                            const checkY = rect.top + 5;
-                            const elementAtBlock = document.elementFromPoint(checkX, checkY);
-                            if (elementAtBlock && (block.contains(elementAtBlock) || elementAtBlock === block)) {
-                                showBlockButton(block as HTMLElement);
-                                return;
-                            }
-                        }
                     }
                 }
 

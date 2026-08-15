@@ -528,19 +528,19 @@
                     {renderRawStreaming}
                     {rawStreamingText} />
             {/key}
-            {#if idx >= 0 && !editMode && !editTranslationMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
-                <PartialEditController
-                    messageData={message}
-                    chatIndex={idx}
-                    {bodyRoot}
-                    blockEditEnabled={DBState.db.enableBlockPartialEdit}
-                    dragEditEnabled={DBState.db.enableDragPartialEdit}
-                    translatedView={translated}
-                    getTranslationEditContext={getTranslationPartialEditContext}
-                    on:save={handlePartialEditSave}
-                />
-            {/if}
         </span>
+        {#if idx >= 0 && !editMode && !editTranslationMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
+            <PartialEditController
+                messageData={message}
+                chatIndex={idx}
+                {bodyRoot}
+                blockEditEnabled={DBState.db.enableBlockPartialEdit}
+                dragEditEnabled={DBState.db.enableDragPartialEdit}
+                translatedView={translated}
+                getTranslationEditContext={getTranslationPartialEditContext}
+                on:save={handlePartialEditSave}
+            />
+        {/if}
     {/if}
 {/snippet}
 
