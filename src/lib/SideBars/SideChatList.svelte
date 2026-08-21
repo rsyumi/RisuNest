@@ -41,7 +41,7 @@
             chatsStb.push(new Sortable(chat, {
                 group: 'chats',
                 onEnd: async (event) => {
-                    const currentChatPage = chara.chatPage
+                    const selectedChatId = chara.chats[chara.chatPage]?.id
                     const newChats: Chat[] = []
 
                     // const chats: HTMLElement = event.to
@@ -67,8 +67,8 @@
                         }
                     })
 
-                    changeChatTo(newChats.indexOf(chara.chats[currentChatPage]))
                     chara.chats = newChats
+                    if(selectedChatId) await changeChatTo(selectedChatId)
 
                     try {
                         this.destroy()
@@ -87,7 +87,7 @@
                 const newChats: Chat[] = []
                 const folders: HTMLElement[] = Array.from<HTMLElement>(event.to.children)
 
-                const currentChatPage = chara.chatPage
+                const selectedChatId = chara.chats[chara.chatPage]?.id
 
                 folders.forEach(folder => {
                     const folderIdx = parseInt(folder.getAttribute('data-risu-chat-folder-idx'))
@@ -107,8 +107,8 @@
                 })
                 
                 chara.chatFolders = newFolders
-                changeChatTo(newChats.indexOf(chara.chats[currentChatPage]))
                 chara.chats = newChats
+                if(selectedChatId) await changeChatTo(selectedChatId)
                 try {
                     folderStb.destroy()
                 } catch (e) {}
@@ -136,25 +136,25 @@
     })
 </script>
 <div class="flex flex-col w-full h-[calc(100%-2rem)] max-h-[calc(100%-2rem)]">
-    <Button className="relative bottom-2" onclick={() => {
+    <Button className="relative bottom-2" onclick={async () => {
         const cha = chara
         const len = chara.chats.length
         let chats = chara.chats
-        chats.unshift({
+        const newChat: Chat = {
             message:[], note:'', name:`New Chat ${len + 1}`, localLore:[], fmIndex: -1, id: v4()
-        })
+        }
         if(cha.type === 'group'){
             cha.characters.map((c) => {
-                chats[len].message.push({
+                newChat.message.push({
                     saying: c,
                     role: 'char',
                     data: findCharacterbyId(c).firstMessage
                 })
             })
         }
+        chats.unshift(newChat)
         chara.chats = chats
-        changeChatTo(0)
-        $ReloadGUIPointer += 1
+        await changeChatTo(newChat.id)
     }}>{language.newChat}</Button>
 
     {#key sorted}
@@ -244,10 +244,9 @@
                     <div></div>
                     {:else}
                     {#each chara.chats.filter(chat => chat.folderId == chara.chatFolders[i].id) as chat}
-                    <button data-risu-chat-idx={chara.chats.indexOf(chat)} onclick={() => {
+                    <button data-risu-chat-idx={chara.chats.indexOf(chat)} onclick={async () => {
                         if(!editMode){
-                            changeChatTo(chara.chats.indexOf(chat))
-                            $ReloadGUIPointer += 1
+                            await changeChatTo(chat.id)
                         }
                     }} class="risu-chats flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"class:bg-selected={chara.chats.indexOf(chat) === chara.chatPage}>
                         {#if editMode}
@@ -268,8 +267,8 @@
                                         newChat.name = createChatCopyName(newChat.name, 'Copy')
                                         newChat.id = v4()
                                         chara.chats.unshift(newChat)
-                                        changeChatTo(0)
                                         chara.chats = chara.chats
+                                        await changeChatTo(newChat.id)
                                         break
                                     }
                                     case 1:{
@@ -294,8 +293,7 @@
                                         break
                                     }
                                     case 2:{
-                                        changeChatTo(chara.chats.indexOf(chat))
-                                        createMultiuserRoom()
+                                        if(await changeChatTo(chat.id)) createMultiuserRoom()
                                     }
                                 }
                             }}>
@@ -332,11 +330,14 @@
                                 }
                                 const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
                                 if(d){
-                                    changeChatTo(0)
-                                    $ReloadGUIPointer += 1
                                     let chats = chara.chats
+                                    const selectedChatId = chats[chara.chatPage]?.id
+                                    const survivingId = selectedChatId === chat.id
+                                        ? chats.find((candidate) => candidate.id !== chat.id)?.id
+                                        : selectedChatId
                                     chats.splice(chara.chats.indexOf(chat), 1)
                                     chara.chats = chats
+                                    if(survivingId) await changeChatTo(survivingId)
                                 }
                             }}>
                                 <TrashIcon size={18}/>
@@ -353,10 +354,9 @@
         <div class="risu-chat flex flex-col">
             {#each chara.chats as chat, i}
             {#if chat.folderId == null}
-            <button data-risu-chat-idx={i} onclick={() => {
+            <button data-risu-chat-idx={i} onclick={async () => {
                 if(!editMode){
-                    changeChatTo(i)
-                    $ReloadGUIPointer += 1
+                    await changeChatTo(chat.id)
                 }
             }}
             class="flex items-center text-textcolor border-solid border-0 border-darkborderc p-2 cursor-pointer rounded-md"
@@ -379,8 +379,8 @@
                                 newChat.name = createChatCopyName(newChat.name, 'Copy')
                                 newChat.id = v4()
                                 chara.chats.unshift(newChat)
-                                changeChatTo(0)
                                 chara.chats = chara.chats
+                                await changeChatTo(newChat.id)
                                 break
                             }
                             case 1:{
@@ -406,8 +406,7 @@
                                 break
                             }
                             case 2:{
-                                changeChatTo(i)
-                                createMultiuserRoom()
+                                if(await changeChatTo(chat.id)) createMultiuserRoom()
                             }
                         }
                     }}>
@@ -444,11 +443,14 @@
                         }
                         const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
                         if(d){
-                            changeChatTo(0)
-                            $ReloadGUIPointer += 1
                             let chats = chara.chats
+                            const selectedChatId = chats[chara.chatPage]?.id
+                            const survivingId = selectedChatId === chat.id
+                                ? chats.find((candidate) => candidate.id !== chat.id)?.id
+                                : selectedChatId
                             chats.splice(i, 1)
                             chara.chats = chats
+                            if(survivingId) await changeChatTo(survivingId)
                         }
                     }}>
                         <TrashIcon size={18}/>

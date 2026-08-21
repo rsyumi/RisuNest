@@ -2,11 +2,11 @@ import { get, writable } from "svelte/store";
 import { saveImage, type character, type Chat, defaultSdDataFunc, type loreBook, getDatabase, getCharacterByIndex, setCharacterByIndex } from "./storage/database.svelte";
 import { alertAddCharacter, alertConfirm, alertError, alertNormal, alertSelect, alertStore, alertWait } from "./alert";
 import { language } from "../lang";
-import { checkNullish, findCharacterbyId, findCharacterIndexbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
+import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selectSingleFile } from "./util";
 import { v4 as uuidv4, v4 } from 'uuid';
 import { getImageType } from "./media";
 import { DBState, MobileGUIStack, OpenRealmStore, selectedCharID } from "./stores.svelte";
-import { AppendableBuffer, changeChatTo, checkCharOrder, downloadFile, getFileSrc, requiresFullEncoderReload } from "./globalApi.svelte";
+import { AppendableBuffer, changeChatTo, checkCharOrder, downloadFile, getFileSrc } from "./globalApi.svelte";
 import { updateInlayScreen } from "./process/inlayScreen";
 import { parseMarkdownSafe } from "./parser/parser.svelte";
 import { translateHTML } from "./translator/translator";
@@ -14,15 +14,31 @@ import { doingChat } from "./process/index.svelte";
 import { importCharacter } from "./characterCards";
 import { PngChunk } from "./pngChunk";
 import { getColdStorageItem } from "./process/coldstorage.svelte";
+import { activateCharacter, commitCharacterAddition, markPersistentDataDirty, replacePersistentDatabase } from "./storage/persistentDataRuntime.svelte";
+import type { groupChat } from "./storage/database.svelte";
 
-export function createNewCharacter() {
-    DBState.db.characters.push(createBlankChar())
-    checkCharOrder()
-    return DBState.db.characters.length - 1
+export async function commitDetachedCharacter(
+    character: character | groupChat,
+    reason: string,
+): Promise<string> {
+    const characterId = character.chaId
+    await commitCharacterAddition({
+        characterId,
+        estimatedBytes: new TextEncoder().encode(JSON.stringify(character)).byteLength,
+        install() {
+            DBState.db.characters.push(character)
+            checkCharOrder()
+        },
+    }, reason)
+    return characterId
 }
 
-export function createNewGroup(){
-    DBState.db.characters.push({
+export async function createNewCharacter(): Promise<string> {
+    return commitDetachedCharacter(createBlankChar(), 'create-character')
+}
+
+export async function createNewGroup(): Promise<string> {
+    const character: groupChat = {
         type: 'group',
         name: "",
         firstMessage: "",
@@ -30,7 +46,8 @@ export function createNewGroup(){
             message: [],
             note: '',
             name: 'Chat 1',
-            localLore: []
+            localLore: [],
+            id: v4()
         }],
         chatFolders: [],
         chatPage: 0,
@@ -46,9 +63,8 @@ export function createNewGroup(){
         characterTalks: [],
         characterActive: [],
         realmId: ''
-    })
-    checkCharOrder()
-    return DBState.db.characters.length - 1
+    }
+    return commitDetachedCharacter(character, 'create-group')
 }
 
 export async function getCharImage(loc:string, type:'plain'|'css'|'contain'|'lgcss') {
@@ -414,8 +430,9 @@ export async function importChat(){
             }
 
             DBState.db.characters[selectedID].chats.unshift(newChat)
-            changeChatTo(0)
-            alertNormal(language.successImport)
+            if(await changeChatTo(newChat.id)){
+                alertNormal(language.successImport)
+            }
         }
         else if(dat.name.endsWith('json')){
             const json = JSON.parse(Buffer.from(dat.data).toString('utf-8'))
@@ -492,6 +509,7 @@ export async function importChat(){
             const chat = doc.querySelector('.idat').textContent
             const json = JSON.parse(chat)
             if(json.message && json.note && json.name && json.localLore){
+                json.id = v4()
                 DBState.db.characters[selectedID].chats.unshift(json)
                 alertNormal(language.successImport)
             }
@@ -539,7 +557,8 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
             message: [],
             note: '',
             name: 'Chat 1',
-            localLore: []
+            localLore: [],
+            id: v4()
         }]
     }
     if(!cha.chats[cha.chatPage]){
@@ -674,7 +693,8 @@ export function createBlankChar():character{
             message: [],
             note: '',
             name: 'Chat 1',
-            localLore: []
+            localLore: [],
+            id: v4()
         }],
         chatFolders: [],
         chatPage: 0,
@@ -807,7 +827,11 @@ function dataURLtoBuffer(string:string){
 }
 
 export async function removeChar(identifier:string|number,name:string, type:'normal'|'permanent'|'permanentForce' = 'normal'){
-    const db = getDatabase()
+    const liveDatabase = getDatabase()
+    const targetId = typeof identifier === 'string'
+        ? identifier
+        : liveDatabase.characters[identifier]?.chaId
+    if (!targetId) return
     if(type !== 'permanentForce'){
         const conf = await alertConfirm(language.removeConfirm + name)
         if(!conf){
@@ -818,24 +842,17 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
             return
         }
     }
-    let chars = db.characters
-    // Resolve identifier to actual index at the time of deletion to avoid
-    // race conditions when concurrent deletions shift the array.
-    const index = typeof identifier === 'string'
-        ? findCharacterIndexbyId(identifier)
-        : identifier
-    if (index === -1 || index >= chars.length) {
-        return
-    }
+    const candidate = getDatabase({ snapshot: true })
+    const index = candidate.characters.findIndex((character) => character.chaId === targetId)
+    if (index === -1) return
     if(type === 'normal'){
-        chars[index].trashTime = Date.now()
+        candidate.characters[index].trashTime = Date.now()
     }
     else{
-        chars.splice(index, 1)
+        candidate.characters.splice(index, 1)
     }
-    checkCharOrder()
-    DBState.db.characters = chars
-    requiresFullEncoderReload.state = true
+    checkCharOrder(candidate)
+    await replacePersistentDatabase(candidate, 'character-removal')
     selectedCharID.set(-1)
 }
 
@@ -852,47 +869,65 @@ export async function addCharacter(arg:{
         return
     }
     reseter();
+    let addedCharacterId: string | null = null
     switch(r){
         case 'createfromScratch':
-            createNewCharacter()
+            addedCharacterId = await createNewCharacter()
             break
         case 'createGroup':
-            createNewGroup()
+            addedCharacterId = await createNewGroup()
             break
         case 'importCharacter':
-            await importCharacter()
+            addedCharacterId = await importCharacter()
             break
         default:
             MobileGUIStack.set(1)
             return
     }
-    let db = getDatabase()
-    if(db.characters[db.characters.length-1]){
-        changeChar(db.characters.length-1)
+    if(addedCharacterId){
+        const currentIndex = getDatabase().characters.findIndex(
+            (character) => character.chaId === addedCharacterId,
+        )
+        await changeChar(currentIndex)
     }
     MobileGUIStack.set(1)
 }
 
 export async function changeChar(index: number, arg:{
     reseter?:()=>any,
-} = {}) {
+} = {}): Promise<boolean> {
     const reseter = arg.reseter ?? (() => {})
     if(get(doingChat)){
-      return
+      return false
     }
+    const chaId = DBState.db.characters?.[index]?.chaId
+    if(!chaId) return false
     reseter();
-    if(DBState.db.characters?.[index]?.coldstorage){
-        const coldData = await getColdStorageItem(DBState.db.characters[index].coldstorage!)
-        if(coldData?.character && coldData.character.chaId === DBState.db.characters[index].chaId){
-            DBState.db.characters[index] = coldData.character
-        }
-        else{
-            alertError(language.errors.coldStorageRestoreFailed)
-            return
-        }
+    try {
+        const coldStorageKey = DBState.db.characters.find((character) => character.chaId === chaId)?.coldstorage
+        const activated = await activateCharacter(chaId, coldStorageKey ? {
+            async prepare() {
+                const coldData = await getColdStorageItem(coldStorageKey)
+                if(!coldData?.character || coldData.character.chaId !== chaId){
+                    throw new Error(language.errors.coldStorageRestoreFailed)
+                }
+                const candidate = getDatabase({ snapshot: true })
+                const candidateIndex = candidate.characters.findIndex((character) => character.chaId === chaId)
+                if(candidateIndex === -1) return null
+                candidate.characters[candidateIndex] = coldData.character
+                return { database: candidate, reason: 'cold-character-restore' }
+            },
+        } : undefined)
+        if(!activated) return false
+        const selectedIndex = DBState.db.characters.findIndex((character) => character.chaId === chaId)
+        if(selectedIndex === -1) return false
+        const updated = characterFormatUpdate(selectedIndex, {
+            updateInteraction: true,
+        })
+        markPersistentDataDirty(new TextEncoder().encode(JSON.stringify(updated)).byteLength)
+        return true
+    } catch (error) {
+        alertError(error)
+        return false
     }
-    characterFormatUpdate(index, {
-      updateInteraction: true,
-    });
-    selectedCharID.set(index);
 }

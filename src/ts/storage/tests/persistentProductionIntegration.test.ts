@@ -214,6 +214,36 @@ describe('persistent production runtime', () => {
         expect(setItem.mock.calls[0][0]).toBe('database/database.bin')
     })
 
+    it('prepares a character activation replacement before storing it', async () => {
+        const database = makeDatabase()
+        const store = makeStore(`runtime-activation-preparation-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const prepareDatabase = vi.fn(async (candidate: Database) => ({
+            ...structuredClone(candidate),
+            username: 'Prepared cold replacement',
+        }))
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase,
+        })
+        await runtime.initializeActiveWorkingSet(database)
+
+        expect(await runtime.activateCharacter('char-a', {
+            prepare: async () => ({
+                database: structuredClone(database),
+                reason: 'cold-character-restore',
+            }),
+        })).toBe(true)
+
+        expect(prepareDatabase).toHaveBeenCalledOnce()
+        expect((await store.materializeDatabase(runtime.revision)).username).toBe(
+            'Prepared cold replacement',
+        )
+    })
+
     it('broadcasts successful revisions and warns only once for foreign sessions', async () => {
         const posted: string[] = []
         let onmessage: ((event: MessageEvent) => void) | null = null

@@ -7,7 +7,12 @@ export interface WorkingSetCoordinator {
     readonly revision: DataRevision
     initialize(revision: DataRevision, database: Database): void
     flushPendingData(reason: string): Promise<void>
+    replacePersistentDatabase(database: Database, reason: string): Promise<void>
     adoptHydratedCharacter(revision: DataRevision, character: CompleteCharacter): boolean
+}
+
+export interface CharacterActivationOptions {
+    prepare?(): Promise<{ database: Database; reason: string } | null>
 }
 
 export interface ActiveWorkingSetDependencies {
@@ -29,10 +34,23 @@ export class ActiveWorkingSet {
         this.dependencies.coordinator.initialize(root.revision, database)
     }
 
-    async activateCharacter(id: string): Promise<boolean> {
+    async activateCharacter(
+        id: string,
+        options: CharacterActivationOptions = {},
+    ): Promise<boolean> {
         const generation = ++this.navigationGeneration
         await this.dependencies.coordinator.flushPendingData('activate-character')
         if (generation !== this.navigationGeneration) return false
+        if (options.prepare) {
+            const prepared = await options.prepare()
+            if (generation !== this.navigationGeneration) return false
+            if (!prepared) return false
+            await this.dependencies.coordinator.replacePersistentDatabase(
+                prepared.database,
+                prepared.reason,
+            )
+            if (generation !== this.navigationGeneration) return false
+        }
         const revision = this.dependencies.coordinator.revision
         const characterValue = await this.hydrateCharacter(id, revision, generation)
         if (!characterValue) return false

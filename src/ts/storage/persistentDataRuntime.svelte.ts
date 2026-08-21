@@ -6,6 +6,7 @@ import { prepareDatabaseForPersistence } from './databasePreparation'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
 import type { DataRevision } from './persistentDataStore'
 import type { CharacterAdditionRequest } from './saveCoordinator'
+import type { CharacterActivationOptions } from './activeWorkingSet.svelte'
 import {
     capturePersistentRoot,
     captureSelectedPersistentCharacter,
@@ -110,8 +111,10 @@ export const commitCharacterAddition = (
     request: CharacterAdditionRequest,
     reason: string,
 ): Promise<void> => getPersistentDataRuntime().commitCharacterAddition(request, reason)
-export const activateCharacter = (id: string): Promise<boolean> =>
-    getPersistentDataRuntime().activateCharacter(id)
+export const activateCharacter = (
+    id: string,
+    options?: CharacterActivationOptions,
+): Promise<boolean> => getPersistentDataRuntime().activateCharacter(id, options)
 export const activateConversation = (id: string): Promise<boolean> =>
     getPersistentDataRuntime().activateConversation(id)
 export const replacePersistentDatabase = (database: Database, reason: string): Promise<void> =>

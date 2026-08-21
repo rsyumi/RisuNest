@@ -4,7 +4,7 @@ import { defaultSdDataFunc, type character, setDatabase, type customscript, type
 import { checkNullish, decryptBuffer, isKnownUri, selectFileByDom, sleep } from "./util"
 import { language } from "src/lang"
 import { v4 as uuidv4, v4 } from 'uuid';
-import { changeChar, characterFormatUpdate } from "./characters"
+import { changeChar, characterFormatUpdate, commitDetachedCharacter } from "./characters"
 import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, forageStorage, loadAsset, LocalWriter, openURL, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
 import { isTauri, isNodeServer } from "src/ts/platform"
 import { compressImage, getImageType } from "./media"
@@ -31,6 +31,7 @@ export const hubURL = isNodeServer
     : EXTERNAL_HUB_URL;
 
 export async function importCharacter() {
+    let lastImportedCharacterId: string | null = null
     try {
         const files = await selectFileByDom(["*"], 'multiple')
         if(!files){
@@ -38,12 +39,14 @@ export async function importCharacter() {
         }
 
         for(const f of files){
-            await importCharacterProcess({
+            const importedIndex = await importCharacterProcess({
                 name: f.name,
                 data: f
             })
+            lastImportedCharacterId = getDatabase().characters[importedIndex]?.chaId ?? lastImportedCharacterId
             checkCharOrder()
         }
+        return lastImportedCharacterId
     } catch (error) {
         alertError(error)
         return null
@@ -62,14 +65,17 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
         }
         const data = f.data instanceof Uint8Array ? f.data : new Uint8Array(await f.data.arrayBuffer())
         const da = JSON.parse(Buffer.from(data).toString('utf-8'))
-        if(await importCharacterCardSpec(da)){
-            let db = getDatabase()
-            return db.characters.length - 1 as any
+        const importedId = await importCharacterCardSpec(da)
+        if(importedId){
+            return getDatabase().characters.findIndex((character) => character.chaId === importedId) as any
         }
         if((da.char_name || da.name) && (da.char_persona || da.description) && (da.char_greeting || da.first_mes)){
-            DBState.db.characters.push(convertOffSpecCards(da))
+            const importedId = await commitDetachedCharacter(
+                convertOffSpecCards(da),
+                'import-character-card',
+            )
             alertNormal(language.importedCharacter)
-            return
+            return getDatabase().characters.findIndex((character) => character.chaId === importedId) as any
         }
         else{
             alertError(language.errors.noData)
@@ -158,12 +164,11 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
             }
         }
         await importer.done()
-        let v = await importCharacterCardSpec(card, undefined, 'normal', importer.assets, lorebook, f.returnCharacter)
+        const v = await importCharacterCardSpec(card, undefined, 'normal', importer.assets, lorebook, f.returnCharacter)
         if(f.returnCharacter){
             return v as any
         }
-        let db = getDatabase()
-        return db.characters.length - 1
+        return getDatabase().characters.findIndex((character) => character.chaId === v)
     }
 
     if(!f.name.endsWith('png')){
@@ -344,9 +349,11 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
                     try {
                         const decrypted = await decryptBuffer(encrypted, password)         
                         const charaData:CharacterCardV2Risu = JSON.parse(Buffer.from(decrypted).toString('utf-8'))
-                        if(await importCharacterCardSpec(charaData, img, "normal", assets)){
-                            let db = getDatabase()
-                            return db.characters.length - 1
+                        const importedId = await importCharacterCardSpec(charaData, img, "normal", assets)
+                        if(importedId){
+                            return getDatabase().characters.findIndex(
+                                (character) => character.chaId === importedId,
+                            )
                         }
                         else{
                             throw new Error('Error while importing')
@@ -361,9 +368,11 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
                 const decrypted = await decryptBuffer(encrypted, 'RISU_NONE')
                 try {
                     const charaData:CharacterCardV2Risu = JSON.parse(Buffer.from(decrypted).toString('utf-8'))
-                    if(await importCharacterCardSpec(charaData, img, "normal", assets)){
-                        let db = getDatabase()
-                        return db.characters.length - 1
+                    const importedId = await importCharacterCardSpec(charaData, img, "normal", assets)
+                    if(importedId){
+                        return getDatabase().characters.findIndex(
+                            (character) => character.chaId === importedId,
+                        )
                     }   
                 } catch (error) {
                     alertError(language.errors.noData)
@@ -382,13 +391,17 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
     if(parsed.spec !== 'chara_card_v2' && parsed.spec !== 'chara_card_v3'){
         const charaData:OldTavernChar = JSON.parse(Buffer.from(readedChara, 'base64').toString('utf-8'))
         const imgp = await saveAsset(img)
-        DBState.db.characters.push(convertOffSpecCards(charaData, imgp))
+        const importedId = await commitDetachedCharacter(
+            convertOffSpecCards(charaData, imgp),
+            'import-character-card',
+        )
         alertNormal(language.importedCharacter)
-        return DBState.db.characters.length - 1
+        return getDatabase().characters.findIndex((character) => character.chaId === importedId)
     }
-    await importCharacterCardSpec(parsed, img, "normal", assets)
-    
-    return DBState.db.characters.length - 1
+    const importedId = await importCharacterCardSpec(parsed, img, "normal", assets)
+    return importedId
+        ? getDatabase().characters.findIndex((character) => character.chaId === importedId)
+        : null
     
 }
 
@@ -661,7 +674,8 @@ function convertOffSpecCards(charaData:OldTavernChar|CharacterCardV2Risu, imgp:s
             message: [],
             note: '',
             name: 'Chat 1',
-            localLore: []
+            localLore: [],
+            id: v4()
         }],
         chatPage: 0,
         image: imgp,
@@ -725,7 +739,7 @@ export async function exportChar(charaID:number):Promise<string> {
 }
 
 
-async function importCharacterCardSpec<T extends boolean = false>(card:CharacterCardV2Risu|CharacterCardV3, img?:Uint8Array, mode:'hub'|'normal' = 'normal', assetDict:{[key:string]:string} = {}, overrideLorebook: loreBook[] = null, returnValue:T = false as T):Promise<T extends true ? character|false : boolean>{
+async function importCharacterCardSpec<T extends boolean = false>(card:CharacterCardV2Risu|CharacterCardV3, img?:Uint8Array, mode:'hub'|'normal' = 'normal', assetDict:{[key:string]:string} = {}, overrideLorebook: loreBook[] = null, returnValue:T = false as T):Promise<T extends true ? character|false : string|false>{
     if(!card ||(card.spec !== 'chara_card_v2' && card.spec !== 'chara_card_v3' )){
         return false
     }
@@ -965,7 +979,8 @@ async function importCharacterCardSpec<T extends boolean = false>(card:Character
             message: [],
             note: '',
             name: 'Chat 1',
-            localLore: []
+            localLore: [],
+            id: v4()
         }],
         chatPage: 0,
         image: im,
@@ -1037,9 +1052,9 @@ async function importCharacterCardSpec<T extends boolean = false>(card:Character
         return char as any
     }
 
-    db.characters.push(char)
+    await commitDetachedCharacter(char, 'import-character-card')
     alertNormal(language.importedCharacter)
-    return true as any
+    return char.chaId as any
 
 }
 
@@ -1846,25 +1861,29 @@ export async function downloadRisuHub(id:string, arg:{
 
         if(res.headers.get('content-type') === 'image/png' || res.headers.get('content-type') === 'application/zip' || res.headers.get('content-type') === 'application/charx'){
             let db = getDatabase()
+            let importedIndex: number | null
             if(res.headers.get('content-type') === 'application/zip' || res.headers.get('content-type') === 'application/charx'){
-                await importCharacterProcess({
+                importedIndex = await importCharacterProcess({
                     name: 'realm.charx',
                     data: new Uint8Array(await res.arrayBuffer()),
                     lightningRealmImport: db.lightningRealmImport,
                 })
             }
             else{
-                await importCharacterProcess({
+                importedIndex = await importCharacterProcess({
                     name: 'realm.png',
                     data: res.body,
                     lightningRealmImport: db.lightningRealmImport,
                 })
             }
+            const characterId = importedIndex === null
+                ? undefined
+                : getDatabase().characters[importedIndex]?.chaId
             checkCharOrder()
             db = getDatabase()
-            if(db.characters[db.characters.length-1] && (db.goCharacterOnImport || arg.forceRedirect)){
-                const index = db.characters.length-1
-                changeChar(index)
+            if(characterId && (db.goCharacterOnImport || arg.forceRedirect)){
+                const index = db.characters.findIndex((character) => character.chaId === characterId)
+                await changeChar(index)
             }   
             return
         }
@@ -1875,12 +1894,12 @@ export async function downloadRisuHub(id:string, arg:{
 
         data.data.extensions.risuRealmImportId = id
     
-        await importCharacterCardSpec(data, await getHubResources(img), 'hub')
+        const characterId = await importCharacterCardSpec(data, await getHubResources(img), 'hub')
         checkCharOrder()
         let db = getDatabase()
-        if(db.characters[db.characters.length-1] && (db.goCharacterOnImport || arg.forceRedirect)){
-            const index = db.characters.length-1
-            changeChar(index)
+        if(characterId && (db.goCharacterOnImport || arg.forceRedirect)){
+            const index = db.characters.findIndex((character) => character.chaId === characterId)
+            await changeChar(index)
             alertStore.set({
                 type: 'none',
                 msg: ''

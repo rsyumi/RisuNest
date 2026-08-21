@@ -399,10 +399,9 @@
 
                 {#if type === 'branchedfrom'}
                     <button class="text-blue-500 hover:underline"
-                        onclick={() => {
+                        onclick={async () => {
                             console.log(parts)
-                            changeChatTo(parts[2] ?? '')
-                            foldChatToMessage(parts[4])
+                            if(await changeChatTo(parts[2] ?? '')) foldChatToMessage(parts[4])
                         }}
                     >
                         <GitBranch size={20} class="inline-block mr-1" />
@@ -856,7 +855,7 @@
         })
 
         DBState.db.characters[selIdState.selId].chats.unshift(newChat)
-        changeChatTo(0)
+        await changeChatTo(newChat.id)
     }}>
         <SplitIcon size={20}/>
         {#if showNames}

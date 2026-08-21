@@ -73,9 +73,8 @@
 <div class="flex flex-col items-center w-full overflow-y-auto h-full">
     {#each sortChar(DBState.db.characters) as char, i}
         {#if normalizeSearch(char.name).includes(normalizedSearch)}
-            <button class="flex p-2 border-t-darkborderc gap-2 w-full" class:border-t={i !== 0} onclick={() => {
-                changeChar(char.i)
-                endGrid()
+            <button class="flex p-2 border-t-darkborderc gap-2 w-full" class:border-t={i !== 0} onclick={async () => {
+                if(await changeChar(char.i)) endGrid()
             }}>
                 <BarIcon additionalStyle={getCharImage(char.image, 'css')}></BarIcon>
                 <div class="flex flex-1 w-full flex-col justify-start items-start text-start">

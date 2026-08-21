@@ -48,6 +48,7 @@ import { getNodeServerProxyAuth } from "./storage/nodeStorage";
 import { ByteBudgetLru } from "./util/byteBudgetLru";
 import { checkCharOrder as repairDatabaseCharacterOrder } from "./storage/databasePreparation";
 import {
+    activateConversation,
     configurePersistentDataRuntime,
     markPersistentDataDirty,
     replacePersistentDatabase,
@@ -2243,25 +2244,16 @@ export function foldChatToMessage(targetMessageIdOrIndex: string | number) {
     }
 }
 
-export function changeChatTo(IdOrIndex: string | number) {
-    let index = -1
-    if (typeof IdOrIndex === 'number') {
-        index = IdOrIndex
-    }
+export async function changeChatTo(IdOrIndex: string | number): Promise<boolean> {
+    const characterId = DBState.db.characters[selIdState.selId]?.chaId
+    if(!characterId) return false
+    const character = DBState.db.characters.find((value) => value.chaId === characterId)
+    const chatId = typeof IdOrIndex === 'number'
+        ? character?.chats[IdOrIndex]?.id
+        : IdOrIndex
+    if(!chatId || !character?.chats.some((chat) => chat.id === chatId)) return false
 
-    if (typeof IdOrIndex === 'string') {
-        const currentCharacter = getCurrentCharacter()
-        index = currentCharacter.chats.findIndex((v) => {
-            return v.id === IdOrIndex
-        })
-    }
-
-    if(index === -1){
-        return
-    }
-
-    DBState.db.characters[selIdState.selId].chatPage = index
-    ReloadGUIPointer.set(Math.random())
+    return activateConversation(chatId)
 }
 
 export function createChatCopyName(originalName: string,type:'Copy'|'Branch'): string {

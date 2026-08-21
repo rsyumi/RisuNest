@@ -94,6 +94,7 @@ function makeHarness(lease: PersistentRevisionLease) {
         revision: 1,
         initialize: vi.fn(),
         flushPendingData: vi.fn(() => Promise.resolve()),
+        replacePersistentDatabase: vi.fn(async () => undefined),
         adoptHydratedCharacter: vi.fn(() => true),
     }
     const store = {
@@ -191,6 +192,98 @@ describe('ActiveWorkingSet', () => {
             'char-b',
         ])
         expect(harness.store.acquireRevision).not.toHaveBeenCalled()
+    })
+
+    it('does not replace from stale character preparation after newer navigation starts', async () => {
+        const leaseA = makeLease({ characterId: 'char-a' })
+        const leaseB = makeLease({ characterId: 'char-b' })
+        const harness = makeHarness(leaseA)
+        vi.mocked(harness.store.readCharacter).mockImplementation((id) =>
+            id === 'char-a' ? leaseA.readCharacter(id) : leaseB.readCharacter(id),
+        )
+        vi.mocked(harness.store.queryConversations).mockImplementation((input) =>
+            input.characterId === 'char-a'
+                ? leaseA.queryConversations(input)
+                : leaseB.queryConversations(input),
+        )
+        vi.mocked(harness.store.readConversation).mockImplementation((characterId, conversationId) =>
+            characterId === 'char-a'
+                ? leaseA.readConversation(characterId, conversationId)
+                : leaseB.readConversation(characterId, conversationId),
+        )
+        const preparation = deferred<{ database: Database; reason: string } | null>()
+        const prepare = vi.fn(() => preparation.promise)
+
+        const first = harness.workingSet.activateCharacter('char-a', { prepare })
+        await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce())
+        const second = harness.workingSet.activateCharacter('char-b')
+        expect(await second).toBe(true)
+        preparation.resolve({ database: harness.database, reason: 'cold-character-restore' })
+
+        expect(await first).toBe(false)
+        expect(harness.coordinator.replacePersistentDatabase).not.toHaveBeenCalled()
+        expect(harness.publishedCharacters.map((characterValue) => characterValue.chaId)).toEqual([
+            'char-b',
+        ])
+    })
+
+    it('preserves selection when character preparation produces no candidate', async () => {
+        const lease = makeLease({ characterId: 'char-a' })
+        const harness = makeHarness(lease)
+
+        expect(await harness.workingSet.activateCharacter('char-a', {
+            prepare: async () => null,
+        })).toBe(false)
+
+        expect(harness.store.readCharacter).not.toHaveBeenCalled()
+        expect(harness.coordinator.replacePersistentDatabase).not.toHaveBeenCalled()
+        expect(harness.publishedCharacters).toEqual([])
+    })
+
+    it('does not publish an older character when newer navigation starts during replacement', async () => {
+        const leaseA = makeLease({ characterId: 'char-a' })
+        const leaseB = makeLease({ characterId: 'char-b' })
+        const harness = makeHarness(leaseA)
+        vi.mocked(harness.store.readCharacter).mockImplementation((id) =>
+            id === 'char-a' ? leaseA.readCharacter(id) : leaseB.readCharacter(id),
+        )
+        vi.mocked(harness.store.queryConversations).mockImplementation((input) =>
+            input.characterId === 'char-a'
+                ? leaseA.queryConversations(input)
+                : leaseB.queryConversations(input),
+        )
+        vi.mocked(harness.store.readConversation).mockImplementation((characterId, conversationId) =>
+            characterId === 'char-a'
+                ? leaseA.readConversation(characterId, conversationId)
+                : leaseB.readConversation(characterId, conversationId),
+        )
+        const replacement = deferred<void>()
+        let replacementStarted = false
+        harness.coordinator.replacePersistentDatabase.mockImplementation(async () => {
+            replacementStarted = true
+            await replacement.promise
+        })
+        harness.coordinator.flushPendingData.mockImplementation(() =>
+            replacementStarted ? replacement.promise : Promise.resolve(),
+        )
+
+        const first = harness.workingSet.activateCharacter('char-a', {
+            prepare: async () => ({
+                database: harness.database,
+                reason: 'cold-character-restore',
+            }),
+        })
+        await vi.waitFor(() =>
+            expect(harness.coordinator.replacePersistentDatabase).toHaveBeenCalledOnce(),
+        )
+        const second = harness.workingSet.activateCharacter('char-b')
+        replacement.resolve()
+
+        expect(await first).toBe(false)
+        expect(await second).toBe(true)
+        expect(harness.publishedCharacters.map((characterValue) => characterValue.chaId)).toEqual([
+            'char-b',
+        ])
     })
 
     it('preserves the previous selection when hydration fails', async () => {
@@ -312,6 +405,7 @@ describe('ActiveWorkingSet', () => {
             revision: imported.revision,
             initialize: vi.fn(),
             flushPendingData: vi.fn(async () => undefined),
+            replacePersistentDatabase: vi.fn(async () => undefined),
             adoptHydratedCharacter: vi.fn(() => true),
         }
         const workingSet = new ActiveWorkingSet({
@@ -375,6 +469,7 @@ describe('ActiveWorkingSet', () => {
                 revision: imported.revision,
                 initialize: vi.fn(),
                 flushPendingData: vi.fn(async () => undefined),
+                replacePersistentDatabase: vi.fn(async () => undefined),
                 adoptHydratedCharacter: vi.fn(() => true),
             },
             getSelectedCharacterId: () => 'char-b',

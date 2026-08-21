@@ -1,5 +1,5 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
-import { ActiveWorkingSet } from './activeWorkingSet.svelte'
+import { ActiveWorkingSet, type CharacterActivationOptions } from './activeWorkingSet.svelte'
 import type { DataRevision, PersistentDataStore } from './persistentDataStore'
 import {
     SaveCoordinator,
@@ -57,7 +57,7 @@ export interface PersistentDataRuntime {
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void>
-    activateCharacter(id: string): Promise<boolean>
+    activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
     replacePersistentDatabase(database: Database, reason: string): Promise<void>
 }
@@ -138,6 +138,22 @@ export function createPersistentDataRuntime(
         publishCharacter: dependencies.state.publishCharacter,
         publishConversation: dependencies.state.publishConversation,
     })
+    const activateCharacter = (
+        id: string,
+        options?: CharacterActivationOptions,
+    ): Promise<boolean> => {
+        const prepare = options?.prepare
+        return workingSet.activateCharacter(id, prepare ? {
+            async prepare() {
+                const prepared = await prepare()
+                if (!prepared) return null
+                return {
+                    ...prepared,
+                    database: await dependencies.prepareDatabase(prepared.database),
+                }
+            },
+        } : undefined)
+    }
     return {
         store: dependencies.store,
         get revision() {
@@ -149,7 +165,7 @@ export function createPersistentDataRuntime(
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
-        activateCharacter: (id) => workingSet.activateCharacter(id),
+        activateCharacter,
         activateConversation: (id) => workingSet.activateConversation(id),
         async replacePersistentDatabase(database, reason) {
             const prepared = await dependencies.prepareDatabase(database)
