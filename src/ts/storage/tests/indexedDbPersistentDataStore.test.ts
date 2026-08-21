@@ -117,6 +117,118 @@ persistentDataStoreContract(async () => {
 })
 
 describe('IndexedDbPersistentDataStore I/O shape', () => {
+    it('atomically adds one complete character with root and selected edits across reopen', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `atomic-character-addition-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const { characters: _characters, ...root } = structuredClone(fixtureDatabase)
+        root.username = 'Root changed with addition'
+        const selected = structuredClone(fixtureDatabase.characters[0])
+        selected.name = 'Selected changed with addition'
+        const added = structuredClone(fixtureDatabase.characters[1])
+        added.chaId = 'char-added'
+        added.name = 'Added character'
+        added.chats.forEach((chat, index) => {
+            chat.id = `added-chat-${index}`
+        })
+
+        const committed = await store.commit({
+            expectedRevision: imported.revision,
+            root,
+            replaceCharacter: selected,
+            addCharacter: added,
+        })
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        const materialized = await reopened.materializeDatabase(committed.revision)
+        expect(committed.revision).toBe(imported.revision + 1)
+        expect(materialized.username).toBe('Root changed with addition')
+        expect(materialized.characters.map((character) => character.chaId)).toEqual([
+            'char-b',
+            'char-a',
+            'char-c',
+            'char-added',
+        ])
+        expect(materialized.characters[0].name).toBe('Selected changed with addition')
+        expect(materialized.characters[3]).toEqual(added)
+    })
+
+    it('appends a character after the maximum configured index when catalog indices have gaps', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `character-addition-index-gap-${databaseSequence++}`
+        await createVersion1Database(indexedDB, databaseName)
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+            const request = indexedDB.open(databaseName)
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })
+        const transaction = database.transaction('catalog', 'readwrite')
+        const recordRequest = transaction.objectStore('catalog').get('revision-7:character:char-c')
+        const record = await new Promise<Record<string, unknown>>((resolve, reject) => {
+            recordRequest.onsuccess = () => resolve(recordRequest.result)
+            recordRequest.onerror = () => reject(recordRequest.error)
+        })
+        record.configuredIndex = 8
+        ;(record.value as { configuredIndex: number }).configuredIndex = 8
+        transaction.objectStore('catalog').put(record)
+        await new Promise<void>((resolve, reject) => {
+            transaction.oncomplete = () => resolve()
+            transaction.onabort = () => reject(transaction.error)
+            transaction.onerror = () => reject(transaction.error)
+        })
+        database.close()
+
+        const added = structuredClone(fixtureDatabase.characters[1])
+        added.chaId = 'char-added'
+        added.chats.forEach((chat, index) => {
+            chat.id = `added-chat-${index}`
+        })
+        await store.commit({ expectedRevision: 7, addCharacter: added })
+
+        const page = await store.queryCharacters({ order: 'configured', trash: false, limit: 20 })
+        expect(page.items.find((item) => item.id === 'char-added')?.configuredIndex).toBe(9)
+    })
+
+    it.each([
+        ['duplicate character ID', (character: typeof fixtureDatabase.characters[number]) => {
+            character.chaId = 'char-a'
+        }],
+        ['empty character ID', (character: typeof fixtureDatabase.characters[number]) => {
+            character.chaId = ''
+        }],
+        ['empty chat ID', (character: typeof fixtureDatabase.characters[number]) => {
+            character.chaId = 'char-added'
+            character.chats[0].id = ''
+        }],
+        ['duplicate chat ID', (character: typeof fixtureDatabase.characters[number]) => {
+            character.chaId = 'char-added'
+            character.chats[1].id = character.chats[0].id
+        }],
+    ])('rolls back a character addition with a %s across reopen', async (_case, mutate) => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `invalid-character-addition-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const added = structuredClone(fixtureDatabase.characters[1])
+        mutate(added)
+
+        await expect(store.commit({
+            expectedRevision: imported.revision,
+            addCharacter: added,
+        })).rejects.toThrow()
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        expect((await reopened.readRoot()).revision).toBe(imported.revision)
+        expect(await reopened.materializeDatabase()).toEqual(fixtureDatabase)
+    })
+
     it('upgrades version 1 records, backfills ordering, commits, and reopens', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = 'version-1-upgrade'

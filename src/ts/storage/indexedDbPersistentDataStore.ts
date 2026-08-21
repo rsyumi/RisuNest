@@ -361,6 +361,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 throw new RevisionConflictError(input.expectedRevision, active.revision)
             }
             if (input.replaceCharacter) this.validateReplacementCharacter(input.replaceCharacter)
+            if (input.addCharacter) this.validateAddedCharacter(input.addCharacter)
 
             const revision = active.revision + 1
             const generation = active.generation
@@ -371,6 +372,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (input.character) await this.putCharacter(transaction, generation, input.character)
             if (input.replaceCharacter) {
                 await this.replaceCharacter(transaction, generation, input.replaceCharacter)
+            }
+            if (input.addCharacter) {
+                await this.addCharacter(transaction, generation, input.addCharacter)
             }
             for (const mutation of input.conversations ?? []) {
                 await this.applyConversationMutation(transaction, generation, mutation)
@@ -977,6 +981,33 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             conversationIds.add(conversation.id)
         }
+    }
+
+    private validateAddedCharacter(character: Database['characters'][number]): void {
+        if (!character.chaId) {
+            throw new Error('Character addition requires a nonempty character ID')
+        }
+        const conversationIds = new Set<string>()
+        for (const conversation of character.chats) {
+            if (!conversation.id || conversationIds.has(conversation.id)) {
+                throw new Error('Character addition requires unique, nonempty chat IDs')
+            }
+            conversationIds.add(conversation.id)
+        }
+    }
+
+    private async addCharacter(
+        transaction: IDBTransaction,
+        generation: string,
+        character: Database['characters'][number],
+    ): Promise<void> {
+        const existing = await requestResult(
+            transaction.objectStore('catalog').get(
+                this.characterKey(generation, character.chaId),
+            ),
+        )
+        if (existing) throw new Error(`Character ${character.chaId} already exists`)
+        await this.replaceCharacter(transaction, generation, character)
     }
 
     private async replaceCharacter(

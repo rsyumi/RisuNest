@@ -25,6 +25,7 @@ export interface SaveCoordinatorDependencies {
     store: PersistentDataStore
     captureRoot(): RootDatabase
     captureSelectedCharacter(): CompleteCharacter | null
+    captureCharacter(id: string): CompleteCharacter | null
     /** Installs the working copy synchronously and must not throw. */
     replaceDatabase(database: Database): void
     officialPublisher?: OfficialRevisionPublisher
@@ -39,6 +40,24 @@ interface CapturedState {
     rootCanonical: string
     character: CompleteCharacter | null
     characterCanonical: string | null
+}
+
+export interface CharacterAdditionRequest {
+    characterId: string
+    estimatedBytes: number
+    install(): void
+}
+
+interface ReservedCharacterAddition {
+    request: CharacterAdditionRequest | null
+    token: object
+}
+
+interface PendingCharacterAddition {
+    characterId: string
+    token: object
+    locallyAdded: boolean
+    baseline: string | null
 }
 
 function canonicalize(value: unknown): unknown {
@@ -84,8 +103,11 @@ export class SaveCoordinator {
     private debounceHandle: unknown
     private operationTail: Promise<void> = Promise.resolve()
     private flushPromise: Promise<void> | null = null
+    private additionPromise: Promise<void> | null = null
     private pendingPublication: PinnedPublication | null = null
     private pendingPublicationRevision: DataRevision | null = null
+    private pendingCharacterAddition: PendingCharacterAddition | null = null
+    private reservedCharacterAddition: ReservedCharacterAddition | null = null
 
     constructor(private readonly dependencies: SaveCoordinatorDependencies) {
         this.clock = dependencies.clock ?? defaultClock()
@@ -110,6 +132,8 @@ export class SaveCoordinator {
         this.pendingByteCount = 0
         this.pendingPublication = null
         this.pendingPublicationRevision = null
+        this.pendingCharacterAddition = null
+        this.reservedCharacterAddition = null
     }
 
     adoptHydratedCharacter(revision: DataRevision, character: CompleteCharacter): boolean {
@@ -139,6 +163,7 @@ export class SaveCoordinator {
     flushPendingData(reason: string): Promise<void> {
         this.assertInitialized()
         this.cancelDebounce()
+        if (this.additionPromise) return this.additionPromise
         if (this.flushPromise) return this.flushPromise
         const promise = this.enqueue(() => this.flushIterations(reason, true))
         this.flushPromise = promise
@@ -165,10 +190,51 @@ export class SaveCoordinator {
         const candidate = canonicalClone(database)
         const before = this.capture()
         const capturedGeneration = this.dirtyGeneration
+        const supersededAdditionToken = (
+            this.pendingCharacterAddition ?? this.reservedCharacterAddition
+        )?.token ?? null
         this.cancelDebounce()
         return this.enqueue(() =>
-            this.runReplacement(candidate, before, capturedGeneration, reason),
+            this.runReplacement(
+                candidate,
+                before,
+                capturedGeneration,
+                supersededAdditionToken,
+                reason,
+            ),
         )
+    }
+
+    commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void> {
+        this.assertInitialized()
+        if (!request.characterId) {
+            throw new Error('Character addition requires a nonempty character ID')
+        }
+        if (this.pendingCharacterAddition || this.reservedCharacterAddition) {
+            throw new Error('A character addition is already pending')
+        }
+        const reserved: ReservedCharacterAddition = {
+            request,
+            token: {},
+        }
+        this.reservedCharacterAddition = reserved
+        const promise = this.enqueue(async () => {
+            if (this.reservedCharacterAddition === reserved) {
+                this.beginReservedAddition(reserved)
+            }
+            if (this.pendingCharacterAddition?.token !== reserved.token) return
+            await this.flushIterations(reason, true)
+        })
+        this.additionPromise = promise
+        void promise.then(
+            () => {
+                if (this.additionPromise === promise) this.additionPromise = null
+            },
+            () => {
+                if (this.additionPromise === promise) this.additionPromise = null
+            },
+        )
+        return promise
     }
 
     private enqueue(operation: () => Promise<void>): Promise<void> {
@@ -188,17 +254,46 @@ export class SaveCoordinator {
         while (true) {
             const generation = this.dirtyGeneration
             const captured = this.capture()
+            const addition = this.capturePendingAddition()
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
             if (captured.characterCanonical !== this.characterBaseline && captured.character) {
                 commit.replaceCharacter = captured.character
             }
 
-            if (commit.root || commit.replaceCharacter) {
+            let replacementIsAddition = false
+            if (addition) {
+                if (!addition.pending.locallyAdded) {
+                    commit.addCharacter = addition.character
+                } else if (
+                    addition.canonical !== addition.pending.baseline &&
+                    !commit.replaceCharacter
+                ) {
+                    commit.replaceCharacter = addition.character
+                    replacementIsAddition = true
+                }
+            }
+
+            if (commit.root || commit.replaceCharacter || commit.addCharacter) {
                 const committed = await this.dependencies.store.commit(commit)
                 this.currentRevision = committed.revision
                 if (commit.root) this.rootBaseline = captured.rootCanonical
-                if (commit.replaceCharacter) this.characterBaseline = captured.characterCanonical
+                if (commit.replaceCharacter && !replacementIsAddition) {
+                    this.characterBaseline = captured.characterCanonical
+                    if (
+                        addition &&
+                        commit.replaceCharacter.chaId === addition.pending.characterId
+                    ) {
+                        addition.pending.baseline = canonicalJson(commit.replaceCharacter)
+                    }
+                }
+                if (replacementIsAddition && addition) {
+                    addition.pending.baseline = addition.canonical
+                }
+                if (commit.addCharacter && addition) {
+                    addition.pending.locallyAdded = true
+                    addition.pending.baseline = addition.canonical
+                }
                 this.dependencies.onLocalRevision?.(committed.revision)
                 if (publishOfficial && this.dependencies.officialPublisher) {
                     this.pendingPublicationRevision = committed.revision
@@ -207,11 +302,16 @@ export class SaveCoordinator {
             }
 
             const current = this.capture()
+            const currentAddition = this.capturePendingAddition()
             if (
                 generation === this.dirtyGeneration &&
                 current.rootCanonical === this.rootBaseline &&
-                current.characterCanonical === this.characterBaseline
+                current.characterCanonical === this.characterBaseline &&
+                (!currentAddition ||
+                    (currentAddition.pending.locallyAdded &&
+                        currentAddition.canonical === currentAddition.pending.baseline))
             ) {
+                this.pendingCharacterAddition = null
                 this.pendingByteCount = 0
                 return
             }
@@ -222,6 +322,7 @@ export class SaveCoordinator {
         candidate: Database,
         before: CapturedState,
         capturedGeneration: number,
+        supersededAdditionToken: object | null,
         _reason: string,
     ): Promise<void> {
         const replaced = await this.dependencies.store.replaceFromDatabase(candidate, this.revision)
@@ -229,6 +330,12 @@ export class SaveCoordinator {
         const stalePublication = this.pendingPublication
         this.pendingPublication = null
         this.pendingPublicationRevision = null
+        if (this.pendingCharacterAddition?.token === supersededAdditionToken) {
+            this.pendingCharacterAddition = null
+        }
+        if (this.reservedCharacterAddition?.token === supersededAdditionToken) {
+            this.reservedCharacterAddition = null
+        }
         this.currentRevision = replaced.revision
         const candidateCapture = this.captureDatabase(candidate)
         this.rootBaseline = candidateCapture.rootCanonical
@@ -282,6 +389,40 @@ export class SaveCoordinator {
             character,
             characterCanonical: character ? canonicalJson(character) : null,
         }
+    }
+
+    private capturePendingAddition(): {
+        pending: PendingCharacterAddition
+        character: CompleteCharacter
+        canonical: string
+    } | null {
+        const pending = this.pendingCharacterAddition
+        if (!pending) return null
+        const value = this.dependencies.captureCharacter(pending.characterId)
+        if (!value || value.chaId !== pending.characterId) {
+            throw new Error(`Installed character ${pending.characterId} is not available`)
+        }
+        const character = canonicalClone(value)
+        return { pending, character, canonical: canonicalJson(character) }
+    }
+
+    private beginReservedAddition(reserved: ReservedCharacterAddition): void {
+        const request = reserved.request
+        if (!request) return
+        request.install()
+        reserved.request = null
+        this.reservedCharacterAddition = null
+        this.pendingCharacterAddition = {
+            characterId: request.characterId,
+            token: reserved.token,
+            locallyAdded: false,
+            baseline: null,
+        }
+        this.dirtyGeneration++
+        const bytes = Number.isFinite(request.estimatedBytes) && request.estimatedBytes > 0
+            ? request.estimatedBytes
+            : 0
+        this.pendingByteCount += bytes
     }
 
     private startBackgroundFlush(reason: string): void {

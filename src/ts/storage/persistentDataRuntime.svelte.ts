@@ -5,6 +5,7 @@ import { getDatabase, setDatabase } from './database.svelte'
 import { prepareDatabaseForPersistence } from './databasePreparation'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
 import type { DataRevision } from './persistentDataStore'
+import type { CharacterAdditionRequest } from './saveCoordinator'
 import {
     capturePersistentRoot,
     captureSelectedPersistentCharacter,
@@ -30,6 +31,9 @@ function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
         },
         captureSelectedCharacter(): CompleteCharacter | null {
             return captureSelectedPersistentCharacter(getDatabase(), get(selectedCharID))
+        },
+        captureCharacter(id) {
+            return getDatabase().characters.find((candidate) => candidate.chaId === id) ?? null
         },
         getSelectedCharacterId() {
             return getDatabase().characters[get(selectedCharID)]?.chaId
@@ -102,6 +106,10 @@ export const markPersistentDataDirty = (estimatedBytes: number): void =>
     getPersistentDataRuntime().markPersistentDataDirty(estimatedBytes)
 export const flushPendingData = (reason: string): Promise<void> =>
     getPersistentDataRuntime().flushPendingData(reason)
+export const commitCharacterAddition = (
+    request: CharacterAdditionRequest,
+    reason: string,
+): Promise<void> => getPersistentDataRuntime().commitCharacterAddition(request, reason)
 export const activateCharacter = (id: string): Promise<boolean> =>
     getPersistentDataRuntime().activateCharacter(id)
 export const activateConversation = (id: string): Promise<boolean> =>

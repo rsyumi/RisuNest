@@ -3,6 +3,7 @@ import { ActiveWorkingSet } from './activeWorkingSet.svelte'
 import type { DataRevision, PersistentDataStore } from './persistentDataStore'
 import {
     SaveCoordinator,
+    type CharacterAdditionRequest,
     type OfficialRevisionPublisher,
     type SaveCoordinatorClock,
 } from './saveCoordinator'
@@ -26,6 +27,7 @@ export function captureSelectedPersistentCharacter(
 export interface PersistentDataRuntimeStateAdapter {
     captureRoot(): RootDatabase
     captureSelectedCharacter(): CompleteCharacter | null
+    captureCharacter(id: string): CompleteCharacter | null
     getSelectedCharacterId(): string | null | undefined
     replaceDatabase(database: Database): void
     publishCharacter(character: CompleteCharacter): void
@@ -54,6 +56,7 @@ export interface PersistentDataRuntime {
     initializeActiveWorkingSet(database: Database): Promise<void>
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
+    commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void>
     activateCharacter(id: string): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
     replacePersistentDatabase(database: Database, reason: string): Promise<void>
@@ -115,6 +118,7 @@ export function createPersistentDataRuntime(
         store: dependencies.store,
         captureRoot: dependencies.state.captureRoot,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
+        captureCharacter: dependencies.state.captureCharacter,
         replaceDatabase: dependencies.state.replaceDatabase,
         officialPublisher: dependencies.officialStorage || dependencies.getOfficialStorage
             ? createOfficialPublisher(
@@ -143,6 +147,8 @@ export function createPersistentDataRuntime(
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
+        commitCharacterAddition: (request, reason) =>
+            coordinator.commitCharacterAddition(request, reason),
         activateCharacter: (id) => workingSet.activateCharacter(id),
         activateConversation: (id) => workingSet.activateConversation(id),
         async replacePersistentDatabase(database, reason) {

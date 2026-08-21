@@ -55,6 +55,10 @@ function makeAdapter(database: Database): PersistentDataRuntimeStateAdapter & {
             return root
         },
         captureSelectedCharacter: () => structuredClone(workingCopy.characters[0] ?? null),
+        captureCharacter: (id) => {
+            const character = workingCopy.characters.find((item) => item.chaId === id)
+            return character ? structuredClone(character) : null
+        },
         getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
         replaceDatabase: (replacement) => {
             workingCopy = structuredClone(replacement)
@@ -118,6 +122,39 @@ describe('persistent production runtime', () => {
         expect(reopened.characters[0].name).toBe('Changed character')
         expect(revisions).toEqual([2])
         expect(legacyWriter).not.toHaveBeenCalled()
+    })
+
+    it('commits a character addition through the production request API', async () => {
+        const database = makeDatabase()
+        const store = makeStore(`runtime-addition-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const added = structuredClone(adapter.current().characters[0])
+        added.chaId = 'char-added'
+        added.name = 'Added character'
+        added.chats[0].id = 'chat-added'
+        const install = vi.fn(() => adapter.current().characters.push(added))
+        adapter.current().username = 'Root with addition'
+        adapter.current().characters[0].name = 'Previous selected edit'
+
+        await runtime.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 256,
+            install,
+        }, 'new-character')
+
+        expect(install).toHaveBeenCalledOnce()
+        const persisted = await store.materializeDatabase(runtime.revision)
+        expect(persisted.username).toBe('Root with addition')
+        expect(persisted.characters[0].name).toBe('Previous selected edit')
+        expect(persisted.characters[1]).toEqual(added)
     })
 
     it('retries one exact pinned official snapshot and disposes it after success', async () => {

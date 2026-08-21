@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import { SaveCoordinator } from './saveCoordinator'
+import {
+    SaveCoordinator as ProductionSaveCoordinator,
+    type SaveCoordinatorDependencies,
+} from './saveCoordinator'
 import type { Database } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
@@ -40,7 +43,30 @@ function captureRoot(database: Database): Omit<Database, 'characters'> {
     return root
 }
 
+type TestCoordinatorDependencies = Omit<SaveCoordinatorDependencies, 'captureCharacter'> &
+    Partial<Pick<SaveCoordinatorDependencies, 'captureCharacter'>>
+
+class SaveCoordinator extends ProductionSaveCoordinator {
+    constructor(dependencies: TestCoordinatorDependencies) {
+        super({
+            ...dependencies,
+            captureCharacter: dependencies.captureCharacter ?? ((id) => {
+                const selected = dependencies.captureSelectedCharacter()
+                return selected?.chaId === id ? selected : null
+            }),
+        })
+    }
+}
+
 describe('SaveCoordinator', () => {
+    function makeAdditionDatabase() {
+        const database = makeDatabase()
+        const added = structuredClone(database.characters[0])
+        added.chaId = 'char-added'
+        added.name = 'Added'
+        return { database, added }
+    }
+
     it('does not commit when the persistent working copy is clean', async () => {
         const database = makeDatabase()
         const store = { commit: vi.fn() } as unknown as PersistentDataStore
@@ -285,6 +311,368 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('clean')
 
         expect(events).toEqual(['commit', 'local:5', 'publish'])
+    })
+
+    it('installs and commits a live character addition with root and previous selected edits', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const install = vi.fn(() => database.characters.push(added))
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(4)
+        database.username = 'Root changed'
+        database.characters[0].name = 'Selected changed'
+
+        await coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 123,
+            install,
+        }, 'new-character')
+
+        expect(install).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0]).toMatchObject({
+            expectedRevision: 4,
+            root: { username: 'Root changed' },
+            replaceCharacter: { chaId: 'char-a', name: 'Selected changed' },
+            addCharacter: { chaId: 'char-added', name: 'Added' },
+        })
+        expect(coordinator.revision).toBe(5)
+    })
+
+    it.each(['store', 'pin', 'publish'] as const)(
+        'persists live character edits made while awaiting %s',
+        async (stage) => {
+            const { database, added } = makeAdditionDatabase()
+            const storeGate = deferred<{ revision: number }>()
+            const pinGate = deferred<{ publish(): Promise<void>; dispose(): Promise<void> }>()
+            const publishGate = deferred<void>()
+            const commit = vi.fn()
+                .mockImplementationOnce(() => stage === 'store' ? storeGate.promise : Promise.resolve({ revision: 2 }))
+                .mockResolvedValueOnce({ revision: 3 })
+            const handle = {
+                publish: vi.fn(() => stage === 'publish' ? publishGate.promise : Promise.resolve()),
+                dispose: vi.fn(async () => undefined),
+            }
+            const pin = vi.fn(() => stage === 'pin' ? pinGate.promise : Promise.resolve(handle))
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+                replaceDatabase: () => undefined,
+                officialPublisher: { pin },
+            })
+            coordinator.initialize(1)
+
+            const saving = coordinator.commitCharacterAddition({
+                characterId: added.chaId,
+                estimatedBytes: 1,
+                install: () => database.characters.push(added),
+            }, 'new-character')
+            await vi.waitFor(() => {
+                if (stage === 'store') expect(commit).toHaveBeenCalledOnce()
+                if (stage === 'pin') expect(pin).toHaveBeenCalledOnce()
+                if (stage === 'publish') expect(handle.publish).toHaveBeenCalledOnce()
+            })
+            added.name = `Changed during ${stage}`
+            coordinator.markPersistentDataDirty(1)
+            if (stage === 'store') storeGate.resolve({ revision: 2 })
+            if (stage === 'pin') pinGate.resolve(handle)
+            if (stage === 'publish') publishGate.resolve()
+            await saving
+
+            expect(commit).toHaveBeenCalledTimes(2)
+            expect(commit.mock.calls[1][0]).toMatchObject({
+                expectedRevision: 2,
+                replaceCharacter: { chaId: 'char-added', name: `Changed during ${stage}` },
+            })
+        },
+    )
+
+    it('serializes previous selected and added-character edits into separate trailing replacements', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const firstPublish = deferred<void>()
+        const publish = vi.fn()
+            .mockImplementationOnce(() => firstPublish.promise)
+            .mockResolvedValue(undefined)
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+            officialPublisher: {
+                pin: async () => ({ publish, dispose: vi.fn(async () => undefined) }),
+            },
+        })
+        coordinator.initialize(1)
+        const saving = coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(added),
+        }, 'new-character')
+        await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce())
+        database.characters[0].name = 'Selected during publish'
+        added.name = 'Added during publish'
+        firstPublish.resolve()
+        await saving
+
+        expect(commit).toHaveBeenCalledTimes(3)
+        expect(commit.mock.calls[1][0].replaceCharacter).toMatchObject({
+            chaId: 'char-a',
+            name: 'Selected during publish',
+        })
+        expect(commit.mock.calls[2][0].replaceCharacter).toMatchObject({
+            chaId: 'char-added',
+            name: 'Added during publish',
+        })
+    })
+
+    it('retries exact remote publication before persisting later addition edits', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const publish = vi.fn().mockRejectedValueOnce(new Error('offline')).mockResolvedValue(undefined)
+        const handle = { publish, dispose: vi.fn(async () => undefined) }
+        const pin = vi.fn(async (_revision: number) => handle)
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(1)
+
+        await expect(coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(added),
+        }, 'new-character')).rejects.toThrow('offline')
+        added.name = 'Edited while offline'
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('retry')
+
+        expect(pin).toHaveBeenCalledTimes(2)
+        expect(pin.mock.calls.map((call) => call[0])).toEqual([2, 3])
+        expect(publish).toHaveBeenCalledTimes(3)
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].replaceCharacter.name).toBe('Edited while offline')
+    })
+
+    it('gives an addition requested during an older failing publication its own serialized turn', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const oldPublish = deferred<void>()
+        const publish = vi.fn()
+            .mockImplementationOnce(() => oldPublish.promise)
+            .mockResolvedValue(undefined)
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+            officialPublisher: {
+                pin: async () => ({ publish, dispose: vi.fn(async () => undefined) }),
+            },
+        })
+        coordinator.initialize(1)
+        database.username = 'Older change'
+        coordinator.markPersistentDataDirty(1)
+        const olderFlush = coordinator.flushPendingData('older')
+        await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce())
+        const install = vi.fn(() => database.characters.push(added))
+        const addition = coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install,
+        }, 'new-character')
+
+        expect(addition).not.toBe(olderFlush)
+        expect(install).not.toHaveBeenCalled()
+        oldPublish.reject(new Error('older publication failed'))
+        await expect(olderFlush).rejects.toThrow('older publication failed')
+        await addition
+
+        expect(install).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].addCharacter).toMatchObject({ chaId: 'char-added' })
+    })
+
+    it('keeps an installed addition dirty after local failure for one explicit retry', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const install = vi.fn(() => database.characters.push(added))
+        const commit = vi.fn().mockRejectedValueOnce(new Error('write failed')).mockResolvedValueOnce({ revision: 2 })
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(1)
+
+        await expect(coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 7,
+            install,
+        }, 'new-character')).rejects.toThrow('write failed')
+        await coordinator.flushPendingData('retry')
+
+        expect(install).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].addCharacter).toMatchObject({ chaId: 'char-added' })
+        expect(coordinator.revision).toBe(2)
+    })
+
+    it('does not retry an addition revision conflict and accepts no second pending addition', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const gate = deferred<{ revision: number }>()
+        const conflict = new RevisionConflictError(1, 2)
+        const commit = vi.fn(() => gate.promise)
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(1)
+        const first = coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 9,
+            install: () => database.characters.push(added),
+        }, 'new-character')
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+
+        expect(() => coordinator.commitCharacterAddition({
+            characterId: 'char-other',
+            estimatedBytes: 1,
+            install: () => undefined,
+        }, 'other-character')).toThrow('already pending')
+        gate.reject(conflict)
+        await expect(first).rejects.toBe(conflict)
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(coordinator.revision).toBe(1)
+        expect(coordinator.pendingBytes).toBe(9)
+    })
+
+    it('runs an earlier replacement before installing an addition', async () => {
+        let database = makeDatabase()
+        const replacement = makeDatabase()
+        replacement.username = 'Replacement'
+        const replacementGate = deferred<{ revision: number }>()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const store = {
+            commit,
+            replaceFromDatabase: vi.fn(() => replacementGate.promise),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: (candidate) => {
+                database = structuredClone(candidate)
+            },
+        })
+        coordinator.initialize(1)
+        const replacing = coordinator.replacePersistentDatabase(replacement, 'replace')
+        const install = vi.fn(() => {
+            const added = structuredClone(database.characters[0])
+            added.chaId = 'char-added'
+            database.characters.push(added)
+        })
+        const adding = coordinator.commitCharacterAddition({
+            characterId: 'char-added',
+            estimatedBytes: 1,
+            install,
+        }, 'new-character')
+        expect(install).not.toHaveBeenCalled()
+        replacementGate.resolve({ revision: 2 })
+        await replacing
+        await adding
+
+        expect(install).toHaveBeenCalledOnce()
+        expect(database.username).toBe('Replacement')
+        expect(commit.mock.calls[0][0]).toMatchObject({
+            expectedRevision: 2,
+            addCharacter: { chaId: 'char-added' },
+        })
+    })
+
+    it('successful replacement clears a failed addition and failed replacement preserves it', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const commit = vi.fn().mockRejectedValue(new Error('addition failed'))
+        const replaceFromDatabase = vi.fn()
+            .mockRejectedValueOnce(new Error('replacement failed'))
+            .mockResolvedValueOnce({ revision: 2 })
+        const store = { commit, replaceFromDatabase } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: (candidate) => Object.assign(database, structuredClone(candidate)),
+        })
+        coordinator.initialize(1)
+        await expect(coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(added),
+        }, 'new-character')).rejects.toThrow('addition failed')
+        await expect(coordinator.replacePersistentDatabase(makeDatabase(), 'failed-replace')).rejects.toThrow('replacement failed')
+        await expect(coordinator.flushPendingData('still-pending')).rejects.toThrow('addition failed')
+        expect(commit).toHaveBeenCalledTimes(2)
+
+        await coordinator.replacePersistentDatabase(makeDatabase(), 'successful-replace')
+        await coordinator.flushPendingData('clean')
+        expect(commit).toHaveBeenCalledTimes(2)
+    })
+
+    it('authoritative replacement supersedes a locally added character after remote failure', async () => {
+        let { database, added } = makeAdditionDatabase()
+        const staleHandle = {
+            publish: vi.fn().mockRejectedValue(new Error('offline')),
+            dispose: vi.fn(async () => undefined),
+        }
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const store = {
+            commit,
+            replaceFromDatabase: vi.fn(async () => ({ revision: 3 })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: (candidate) => {
+                database = structuredClone(candidate)
+            },
+            officialPublisher: { pin: async () => staleHandle },
+        })
+        coordinator.initialize(1)
+        await expect(coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(added),
+        }, 'new-character')).rejects.toThrow('offline')
+
+        await coordinator.replacePersistentDatabase(makeDatabase(), 'authoritative')
+        await coordinator.flushPendingData('clean')
+
+        expect(database.characters.map((character) => character.chaId)).toEqual(['char-a'])
+        expect(commit).toHaveBeenCalledOnce()
+        expect(staleHandle.dispose).toHaveBeenCalledOnce()
     })
 
     it('reports a successful replacement revision and reports nothing on failure', async () => {

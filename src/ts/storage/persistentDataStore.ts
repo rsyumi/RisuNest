@@ -96,6 +96,7 @@ export interface WorkingSetCommit {
     root?: Omit<Database, 'characters'>
     character?: CharacterDetail
     replaceCharacter?: character | groupChat
+    addCharacter?: character | groupChat
     conversations?: ConversationMutation[]
     deleteCharacterId?: string
 }
