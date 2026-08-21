@@ -2,7 +2,7 @@ import { alertNormal, alertSelect } from "../alert"
 import { keiServerURL } from "./kei"
 import { getDatabase } from "../storage/database.svelte"
 import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte"
-import { replaceDatabaseBefore } from "../storage/databaseRestore"
+import { installRisuKeiBackup } from "../storage/databaseRestore"
 
 export async function autoServerBackup(){
     const db = getDatabase()
@@ -61,9 +61,9 @@ export async function autoServerBackup(){
                         })
                     })
                     if(res.status === 200){
-                        await replaceDatabaseBefore(await res.json(), 'risu-kei-backup', {
+                        await installRisuKeiBackup(await res.json(), {
                             replaceDatabase: replacePersistentDatabase,
-                            afterReplacement: async () => (await import('../plugins/plugins.svelte')).loadPlugins(),
+                            loadPlugins: async () => (await import('../plugins/plugins.svelte')).loadPlugins(),
                         })
                         alertNormal("Successfully restored!")
                     }

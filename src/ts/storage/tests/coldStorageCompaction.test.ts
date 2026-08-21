@@ -86,4 +86,60 @@ describe('compactColdStorageDatabase', () => {
 
         expect(live).toEqual(original)
     })
+
+    it('reports bounded progress and diagnoses a skipped payload without publishing a candidate', async () => {
+        const live = fixtureDatabase()
+        const progress: Array<[string, number]> = []
+        const failures: unknown[] = []
+        const replaceDatabase = vi.fn()
+
+        const changed = await compactColdStorageDatabase(live, {
+            now: 20 * 24 * 60 * 60 * 1000,
+            createId: () => 'cold-character',
+            write: async () => false,
+            read: vi.fn(),
+            replaceDatabase,
+            onProgress: (phase, remaining) => progress.push([phase, remaining]),
+            onFailure: (failure) => failures.push(failure),
+        })
+
+        expect(changed).toBe(false)
+        expect(progress).toEqual([
+            ['character', 0],
+            ['chat', 0],
+        ])
+        expect(failures).toEqual([{
+            kind: 'write',
+            target: 'character',
+            characterIndex: 0,
+        }, {
+            kind: 'write',
+            target: 'chat',
+            characterIndex: 0,
+            chatIndex: 0,
+        }])
+        expect(replaceDatabase).not.toHaveBeenCalled()
+    })
+
+    it('diagnoses a failed verification read and leaves the candidate unpublished', async () => {
+        const live = fixtureDatabase()
+        const failures: unknown[] = []
+        const replaceDatabase = vi.fn()
+
+        const changed = await compactColdStorageDatabase(live, {
+            now: 20 * 24 * 60 * 60 * 1000,
+            createId: () => 'cold-character',
+            write: async () => true,
+            read: async () => { throw new Error('read failed') },
+            replaceDatabase,
+            onFailure: (failure) => failures.push(failure),
+        })
+
+        expect(changed).toBe(false)
+        expect(failures).toEqual([
+            { kind: 'read', target: 'character', characterIndex: 0 },
+            { kind: 'read', target: 'chat', characterIndex: 0, chatIndex: 0 },
+        ])
+        expect(replaceDatabase).not.toHaveBeenCalled()
+    })
 })

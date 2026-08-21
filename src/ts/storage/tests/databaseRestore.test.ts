@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import {
     completeAccountUnmigration,
-    replaceDatabaseBefore,
+    installAccountBackup,
+    installDriveRestore,
+    installInternalBackup,
+    installLocalBackup,
+    installRisuKeiBackup,
 } from '../databaseRestore'
 
 const database = {
@@ -10,33 +14,89 @@ const database = {
     characters: [],
 } as Database
 
-describe('replaceDatabaseBefore', () => {
-    it('runs the success action only after persistent replacement succeeds', async () => {
+describe.each([
+    ['internal backup', installInternalBackup, 'internal-backup'],
+    ['account backup', installAccountBackup, 'account-backup'],
+    ['Risu-Kei backup', installRisuKeiBackup, 'risu-kei-backup'],
+] as const)('%s restore', (_name, install, expectedReason) => {
+    it('loads plugins only after persistent replacement succeeds', async () => {
         const events: string[] = []
 
-        await replaceDatabaseBefore(database, 'account-backup', {
-            replaceDatabase: async () => {
-                events.push('replace')
+        await install(database, {
+            replaceDatabase: async (_candidate, reason) => {
+                events.push(`replace:${reason}`)
             },
-            afterReplacement: async () => {
+            loadPlugins: async () => {
                 events.push('plugins')
             },
         })
 
-        expect(events).toEqual(['replace', 'plugins'])
+        expect(events).toEqual([`replace:${expectedReason}`, 'plugins'])
     })
 
-    it('does not run the success action when persistent replacement fails', async () => {
-        const afterReplacement = vi.fn()
+    it('does not load plugins when persistent replacement fails', async () => {
+        const loadPlugins = vi.fn()
 
-        await expect(replaceDatabaseBefore(database, 'drive-restore', {
+        await expect(install(database, {
             replaceDatabase: async () => {
                 throw new Error('replacement failed')
             },
-            afterReplacement,
+            loadPlugins,
         })).rejects.toThrow('replacement failed')
 
-        expect(afterReplacement).not.toHaveBeenCalled()
+        expect(loadPlugins).not.toHaveBeenCalled()
+    })
+})
+
+describe('local backup restore', () => {
+    it('writes the explicit local mirror and relaunches after replacement', async () => {
+        const events: string[] = []
+
+        await installLocalBackup(database, {
+            replaceDatabase: async () => { events.push('replace') },
+            writeLocalMirror: async () => { events.push('local-mirror') },
+            relaunch: async () => { events.push('relaunch') },
+        })
+
+        expect(events).toEqual(['replace', 'local-mirror', 'relaunch'])
+    })
+
+    it('does not write or relaunch when replacement fails', async () => {
+        const writeLocalMirror = vi.fn()
+        const relaunch = vi.fn()
+
+        await expect(installLocalBackup(database, {
+            replaceDatabase: async () => { throw new Error('replacement failed') },
+            writeLocalMirror,
+            relaunch,
+        })).rejects.toThrow('replacement failed')
+
+        expect(writeLocalMirror).not.toHaveBeenCalled()
+        expect(relaunch).not.toHaveBeenCalled()
+    })
+})
+
+describe('Drive restore', () => {
+    it('relaunches only after replacement succeeds', async () => {
+        const events: string[] = []
+
+        await installDriveRestore(database, {
+            replaceDatabase: async () => { events.push('replace') },
+            relaunch: async () => { events.push('relaunch') },
+        })
+
+        expect(events).toEqual(['replace', 'relaunch'])
+    })
+
+    it('does not relaunch when replacement fails', async () => {
+        const relaunch = vi.fn()
+
+        await expect(installDriveRestore(database, {
+            replaceDatabase: async () => { throw new Error('replacement failed') },
+            relaunch,
+        })).rejects.toThrow('replacement failed')
+
+        expect(relaunch).not.toHaveBeenCalled()
     })
 })
 
@@ -45,15 +105,18 @@ describe('completeAccountUnmigration', () => {
         const live = structuredClone(database)
         const original = structuredClone(live)
         const events: string[] = []
-        let replaced: Database | undefined
+        let accepted = structuredClone(database)
+        accepted.account = null
+        accepted.characters = [{ chaId: 'accepted-after-time-boundary', chats: [] }] as any
         let mirrored: Database | undefined
 
         await completeAccountUnmigration(live, {
             replaceDatabase: async (candidate, reason) => {
                 events.push('replace')
                 expect(reason).toBe('account-unmigration')
-                replaced = candidate
+                expect(candidate.account).toBeNull()
             },
+            captureAcceptedDatabase: () => accepted,
             writeLegacyMirror: async (candidate) => {
                 events.push('mirror')
                 mirrored = candidate
@@ -64,9 +127,8 @@ describe('completeAccountUnmigration', () => {
         })
 
         expect(events).toEqual(['replace', 'mirror', 'finalize'])
-        expect(replaced.account).toBeNull()
-        expect(mirrored).toEqual(replaced)
-        expect(mirrored).not.toBe(replaced)
+        expect(mirrored).toEqual(accepted)
+        expect(mirrored).not.toBe(accepted)
         expect(live).toEqual(original)
     })
 
@@ -77,6 +139,7 @@ describe('completeAccountUnmigration', () => {
 
         await expect(completeAccountUnmigration(live, {
             replaceDatabase: async () => undefined,
+            captureAcceptedDatabase: () => live,
             writeLegacyMirror: async () => {
                 throw new Error('mirror failed')
             },
@@ -85,5 +148,22 @@ describe('completeAccountUnmigration', () => {
 
         expect(finalize).not.toHaveBeenCalled()
         expect(live).toEqual(original)
+    })
+
+    it('does not capture, mirror, clear flags, or reload when replacement fails', async () => {
+        const captureAcceptedDatabase = vi.fn()
+        const writeLegacyMirror = vi.fn()
+        const finalize = vi.fn()
+
+        await expect(completeAccountUnmigration(structuredClone(database), {
+            replaceDatabase: async () => { throw new Error('replacement failed') },
+            captureAcceptedDatabase,
+            writeLegacyMirror,
+            finalize,
+        })).rejects.toThrow('replacement failed')
+
+        expect(captureAcceptedDatabase).not.toHaveBeenCalled()
+        expect(writeLegacyMirror).not.toHaveBeenCalled()
+        expect(finalize).not.toHaveBeenCalled()
     })
 })

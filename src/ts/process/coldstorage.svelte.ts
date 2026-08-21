@@ -397,6 +397,23 @@ export async function makeColdData(){
             write: setColdStorageItem,
             read: getColdStorageItem,
             replaceDatabase: replacePersistentDatabase,
+            onProgress: (phase, remaining) => {
+                const target = phase === 'character' ? 'character' : 'chat'
+                alertWait(`Creating ${target} cold storage data... ${remaining} items left`)
+            },
+            onFailure: (failure) => {
+                const action = failure.kind === 'write' ? 'write' : failure.kind
+                if(failure.target === 'character'){
+                    const character = DBState.db.characters[failure.characterIndex]
+                    console.error(`Cold storage ${action} failed for character ${character?.chaId ?? failure.characterIndex}, keeping original data`)
+                    return
+                }
+                const chat = DBState.db.characters[failure.characterIndex]?.chats[failure.chatIndex ?? -1]
+                console.error(`Cold storage ${action} failed for chat ${chat?.id ?? failure.chatIndex}, keeping original data`)
+                alertError(failure.kind === 'write'
+                    ? language.errors.coldStorageWriteFailed
+                    : language.errors.coldStorageVerifyFailed)
+            },
         })
     } finally {
         alertClear()

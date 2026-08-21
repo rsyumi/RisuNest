@@ -8,6 +8,15 @@ type ColdStorageCompactionDependencies = {
     write: (key: string, value: unknown) => Promise<boolean>
     read: (key: string) => Promise<any>
     replaceDatabase: (database: Database, reason: string) => Promise<void>
+    onProgress?: (phase: 'character' | 'chat', remaining: number) => void
+    onFailure?: (failure: ColdStorageCompactionFailure) => void
+}
+
+export type ColdStorageCompactionFailure = {
+    kind: 'write' | 'read' | 'verify'
+    target: 'character' | 'chat'
+    characterIndex: number
+    chatIndex?: number
 }
 
 const tenDays = 10 * 24 * 60 * 60 * 1000
@@ -40,19 +49,28 @@ export async function compactColdStorageDatabase(
     const coldTime = dependencies.now - tenDays
     let changed = false
 
-    for (let index = 0; index < candidate.characters.length; index += 1) {
+    const characterTasks = candidate.characters.map((_character, index) => async () => {
         const character = candidate.characters[index]
         const lastInteraction = character.lastInteraction ?? dependencies.now
         if (lastInteraction >= coldTime || character.coldstorage) {
-            continue
+            return
         }
 
         const key = dependencies.createId()
         if (!await dependencies.write(key, { character: safeStructuredClone(character) })) {
-            continue
+            dependencies.onFailure?.({ kind: 'write', target: 'character', characterIndex: index })
+            return
         }
-        if (!isVerifiedCharacterPayload(await dependencies.read(key))) {
-            continue
+        let verifiedPayload: unknown
+        try {
+            verifiedPayload = await dependencies.read(key)
+        } catch {
+            dependencies.onFailure?.({ kind: 'read', target: 'character', characterIndex: index })
+            return
+        }
+        if (!isVerifiedCharacterPayload(verifiedPayload)) {
+            dependencies.onFailure?.({ kind: 'verify', target: 'character', characterIndex: index })
+            return
         }
 
         const coldStoragedChats = character.chats
@@ -78,49 +96,90 @@ export async function compactColdStorageDatabase(
             coldStoragedChats,
         } as any
         changed = true
+    })
+
+    while (characterTasks.length > 0) {
+        const batch = characterTasks.splice(0, 5)
+        dependencies.onProgress?.('character', characterTasks.length)
+        await Promise.all(batch.map((task) => task()))
     }
 
-    for (const character of candidate.characters) {
-        if (character.coldstorage) {
-            continue
-        }
-        for (const chat of character.chats) {
-            if ((chat.message?.length ?? 0) < 4) {
-                continue
-            }
-            if (chat.message?.[0]?.data?.startsWith(coldStorageHeader)) {
-                continue
-            }
-            if (latestChatTime(chat) >= coldTime) {
-                continue
-            }
+    const chatTasks: Array<() => Promise<void>> = []
+    candidate.characters.forEach((character, characterIndex) => {
+        character.chats.forEach((_chat, chatIndex) => {
+            chatTasks.push(async () => {
+                const currentCharacter = candidate.characters[characterIndex]
+                const chat = currentCharacter.chats[chatIndex]
+                if (currentCharacter.coldstorage) {
+                    return
+                }
+                if ((chat.message?.length ?? 0) < 4) {
+                    return
+                }
+                if (chat.message?.[0]?.data?.startsWith(coldStorageHeader)) {
+                    return
+                }
+                if (latestChatTime(chat) >= coldTime) {
+                    return
+                }
 
-            const key = dependencies.createId()
-            const payload = {
-                message: safeStructuredClone(chat.message),
-                hypaV2Data: safeStructuredClone(chat.hypaV2Data),
-                hypaV3Data: safeStructuredClone(chat.hypaV3Data),
-                scriptstate: safeStructuredClone(chat.scriptstate),
-                localLore: safeStructuredClone(chat.localLore),
-            }
-            if (!await dependencies.write(key, payload)) {
-                continue
-            }
-            if (!isVerifiedChatPayload(await dependencies.read(key))) {
-                continue
-            }
+                const key = dependencies.createId()
+                const payload = {
+                    message: safeStructuredClone(chat.message),
+                    hypaV2Data: safeStructuredClone(chat.hypaV2Data),
+                    hypaV3Data: safeStructuredClone(chat.hypaV3Data),
+                    scriptstate: safeStructuredClone(chat.scriptstate),
+                    localLore: safeStructuredClone(chat.localLore),
+                }
+                if (!await dependencies.write(key, payload)) {
+                    dependencies.onFailure?.({
+                        kind: 'write',
+                        target: 'chat',
+                        characterIndex,
+                        chatIndex,
+                    })
+                    return
+                }
+                let verifiedPayload: unknown
+                try {
+                    verifiedPayload = await dependencies.read(key)
+                } catch {
+                    dependencies.onFailure?.({
+                        kind: 'read',
+                        target: 'chat',
+                        characterIndex,
+                        chatIndex,
+                    })
+                    return
+                }
+                if (!isVerifiedChatPayload(verifiedPayload)) {
+                    dependencies.onFailure?.({
+                        kind: 'verify',
+                        target: 'chat',
+                        characterIndex,
+                        chatIndex,
+                    })
+                    return
+                }
 
-            chat.message = [{
-                time: dependencies.now,
-                data: coldStorageHeader + key,
-                role: 'char',
-            }]
-            chat.hypaV2Data = { chunks: [], mainChunks: [], lastMainChunkID: 0 }
-            chat.hypaV3Data = { summaries: [] }
-            chat.scriptstate = {}
-            chat.localLore = []
-            changed = true
-        }
+                chat.message = [{
+                    time: dependencies.now,
+                    data: coldStorageHeader + key,
+                    role: 'char',
+                }]
+                chat.hypaV2Data = { chunks: [], mainChunks: [], lastMainChunkID: 0 }
+                chat.hypaV3Data = { summaries: [] }
+                chat.scriptstate = {}
+                chat.localLore = []
+                changed = true
+            })
+        })
+    })
+
+    while (chatTasks.length > 0) {
+        const batch = chatTasks.splice(0, 5)
+        dependencies.onProgress?.('chat', chatTasks.length)
+        await Promise.all(batch.map((task) => task()))
     }
 
     if (changed) {

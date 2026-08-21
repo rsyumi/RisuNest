@@ -14,7 +14,7 @@ import { appDataDir, join } from "@tauri-apps/api/path";
 import { get } from "svelte/store";
 import { open } from '@tauri-apps/plugin-shell'
 import streamSaver from 'streamsaver';
-import { setDatabase, type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat, appSubVer } from "./storage/database.svelte";
+import { type Database, defaultSdDataFunc, getDatabase, appVer, getCurrentCharacter, type character, type groupChat, appSubVer } from "./storage/database.svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore } from "./stores.svelte";
@@ -50,11 +50,13 @@ import { checkCharOrder as repairDatabaseCharacterOrder } from "./storage/databa
 import {
     configurePersistentDataRuntime,
     markPersistentDataDirty,
+    replacePersistentDatabase,
 } from "./storage/persistentDataRuntime.svelte";
 import {
     createPersistentSaveObserverInstallation,
     installPersistentSaveNotifications,
 } from "./storage/persistentSaveNotifications";
+import { installInternalBackup } from "./storage/databaseRestore";
 
 export const forageStorage = new AutoStorage()
 
@@ -1891,8 +1893,12 @@ export async function loadInternalBackup() {
         await readFile('database/' + selectedBackup, { baseDir: BaseDirectory.AppData })
     ) : (await forageStorage.getItem(selectedBackup))
 
-    setDatabase(
-        await decodeRisuSave(Buffer.from(data) as unknown as Uint8Array)
+    await installInternalBackup(
+        await decodeRisuSave(Buffer.from(data) as unknown as Uint8Array),
+        {
+            replaceDatabase: replacePersistentDatabase,
+            loadPlugins,
+        },
     )
 
     alertNormal('Loaded backup')

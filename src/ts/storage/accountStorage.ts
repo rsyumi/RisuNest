@@ -10,7 +10,6 @@ import { sleep } from "../util"
 import { fetchProtectedResource } from "../sionyw"
 import { completeAccountUnmigration } from "./databaseRestore"
 import { replacePersistentDatabase } from "./persistentDataRuntime.svelte"
-import { prepareDatabaseForPersistence } from "./databasePreparation"
 
 export const AccountWarning = writable('')
 let risuSession = ''
@@ -211,12 +210,9 @@ export async function unMigrationAccount() {
         i += 1
     }
 
-    const candidate = await prepareDatabaseForPersistence({
-        ...db,
-        account: null,
-    })
-    await completeAccountUnmigration(candidate, {
+    await completeAccountUnmigration(db, {
         replaceDatabase: replacePersistentDatabase,
+        captureAcceptedDatabase: getDatabase,
         writeLegacyMirror: async (database) => {
             await MigrationStorage.setItem('database/database.bin', encodeRisuSaveLegacy(database))
         },

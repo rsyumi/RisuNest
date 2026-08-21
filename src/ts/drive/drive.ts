@@ -10,6 +10,7 @@ import { hubURL } from "../characterCards";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
+import { installDriveRestore } from "../storage/databaseRestore";
 
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
     const CLIENT_ID = '580075990041-l26k2d3c0nemmqiu3d3aag01npfrkn76.apps.googleusercontent.com';
@@ -361,24 +362,23 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
             }
         }
         db.didFirstSetup = true
-        await replacePersistentDatabase(db, 'drive-restore')
-        lastSaved = Date.now()
-        localStorage.setItem('risu_lastsaved', `${lastSaved}`)
-
-        if(isTauri){
-            alertStore.set({
-                type: "wait",
-                msg: "Success, Refreshing your app."
-            })
-            await relaunch()
-        }
-        else{
-            location.search = ''
-            alertStore.set({
-                type: "wait",
-                msg: "Success, Refreshing your app."
-            })
-        }
+        await installDriveRestore(db, {
+            replaceDatabase: replacePersistentDatabase,
+            relaunch: async () => {
+                lastSaved = Date.now()
+                localStorage.setItem('risu_lastsaved', `${lastSaved}`)
+                alertStore.set({
+                    type: "wait",
+                    msg: "Success, Refreshing your app."
+                })
+                if(isTauri){
+                    await relaunch()
+                }
+                else{
+                    location.search = ''
+                }
+            },
+        })
     }
     else if(mode === 'backup'){
         location.search = ''

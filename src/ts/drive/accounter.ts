@@ -6,7 +6,7 @@ import { decodeRisuSave } from "../storage/risuSave"
 import { language } from "src/lang"
 import { fetchProtectedResource } from "../sionyw"
 import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte"
-import { replaceDatabaseBefore } from "../storage/databaseRestore"
+import { installAccountBackup } from "../storage/databaseRestore"
 
 export function risuLogin() {
     const win = window.open(hubURL + '/hub/login')
@@ -133,9 +133,9 @@ export async function loadRisuAccountBackup() {
 
         alertWait("Loading backup")
 
-        await replaceDatabaseBefore(await decodeRisuSave(buf.buffer), 'account-backup', {
+        await installAccountBackup(await decodeRisuSave(buf.buffer), {
             replaceDatabase: replacePersistentDatabase,
-            afterReplacement: async () => (await import('../plugins/plugins.svelte')).loadPlugins(),
+            loadPlugins: async () => (await import('../plugins/plugins.svelte')).loadPlugins(),
         })
     
         alertNormal('Loaded backup')

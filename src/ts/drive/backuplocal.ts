@@ -12,6 +12,7 @@ import { language } from "src/lang";
 import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { DBState } from "../stores.svelte";
 import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
+import { installLocalBackup } from "../storage/databaseRestore";
 
 function getBasename(data:string){
     const baseNameRegex = /\\/g
@@ -557,23 +558,28 @@ export function LoadLocalBackup(){
                 return
             }
 
-            await replacePersistentDatabase(dbData, 'local-backup');
-            if (isTauri) {
-                await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });
-                alertStore.set({
-                    type: "wait",
-                    msg: "Success, Refreshing your app."
-                });
-                await relaunch();
-            } else {
-                const legacyStorage = localforage.createInstance({ name: 'risuai' });
-                await legacyStorage.setItem('database/database.bin', db);
-                location.search = '';
-                alertStore.set({
-                    type: "wait",
-                    msg: "Success, Refreshing your app."
-                });
-            }
+            await installLocalBackup(dbData, {
+                replaceDatabase: replacePersistentDatabase,
+                writeLocalMirror: async () => {
+                    if (isTauri) {
+                        await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });
+                        return
+                    }
+                    const legacyStorage = localforage.createInstance({ name: 'risuai' });
+                    await legacyStorage.setItem('database/database.bin', db);
+                },
+                relaunch: async () => {
+                    alertStore.set({
+                        type: "wait",
+                        msg: "Success, Refreshing your app."
+                    });
+                    if (isTauri) {
+                        await relaunch();
+                    } else {
+                        location.search = '';
+                    }
+                },
+            });
 
             alertNormal('Success');
         };
