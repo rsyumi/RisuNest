@@ -345,6 +345,33 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(5)
     })
 
+    it('reports a standalone addition exact promise and then idle state', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const pending = deferred<{ revision: number }>()
+        const reported: Array<Promise<void> | null> = []
+        const coordinator = new SaveCoordinator({
+            store: makeStore(vi.fn(() => pending.promise)),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+            onFlushPromise: (promise) => reported.push(promise),
+        })
+        coordinator.initialize(1)
+
+        const addition = coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(added),
+        }, 'new-character')
+
+        expect(reported).toEqual([addition])
+        pending.resolve({ revision: 2 })
+        await addition
+        await Promise.resolve()
+        expect(reported).toEqual([addition, null])
+    })
+
     it.each(['store', 'pin', 'publish'] as const)(
         'persists live character edits made while awaiting %s',
         async (stage) => {
@@ -470,6 +497,7 @@ describe('SaveCoordinator', () => {
     it('gives an addition requested during an older failing publication its own serialized turn', async () => {
         const { database, added } = makeAdditionDatabase()
         const oldPublish = deferred<void>()
+        const reported: Array<Promise<void> | null> = []
         const publish = vi.fn()
             .mockImplementationOnce(() => oldPublish.promise)
             .mockResolvedValue(undefined)
@@ -480,6 +508,7 @@ describe('SaveCoordinator', () => {
             captureSelectedCharacter: () => database.characters[0],
             captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
             replaceDatabase: () => undefined,
+            onFlushPromise: (promise) => reported.push(promise),
             officialPublisher: {
                 pin: async () => ({ publish, dispose: vi.fn(async () => undefined) }),
             },
@@ -497,14 +526,17 @@ describe('SaveCoordinator', () => {
         }, 'new-character')
 
         expect(addition).not.toBe(olderFlush)
+        expect(reported).toEqual([olderFlush, addition])
         expect(install).not.toHaveBeenCalled()
         oldPublish.reject(new Error('older publication failed'))
         await expect(olderFlush).rejects.toThrow('older publication failed')
         await addition
+        await Promise.resolve()
 
         expect(install).toHaveBeenCalledOnce()
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0].addCharacter).toMatchObject({ chaId: 'char-added' })
+        expect(reported).toEqual([olderFlush, addition, null])
     })
 
     it('keeps an installed addition dirty after local failure for one explicit retry', async () => {

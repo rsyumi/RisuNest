@@ -104,6 +104,7 @@ export class SaveCoordinator {
     private operationTail: Promise<void> = Promise.resolve()
     private flushPromise: Promise<void> | null = null
     private additionPromise: Promise<void> | null = null
+    private lastReportedFlushPromise: Promise<void> | null = null
     private pendingPublication: PinnedPublication | null = null
     private pendingPublicationRevision: DataRevision | null = null
     private pendingCharacterAddition: PendingCharacterAddition | null = null
@@ -167,18 +168,18 @@ export class SaveCoordinator {
         if (this.flushPromise) return this.flushPromise
         const promise = this.enqueue(() => this.flushIterations(reason, true))
         this.flushPromise = promise
-        this.dependencies.onFlushPromise?.(promise)
+        this.reportActivePromise()
         void promise.then(
             () => {
                 if (this.flushPromise === promise) {
                     this.flushPromise = null
-                    this.dependencies.onFlushPromise?.(null)
+                    this.reportActivePromise()
                 }
             },
             () => {
                 if (this.flushPromise === promise) {
                     this.flushPromise = null
-                    this.dependencies.onFlushPromise?.(null)
+                    this.reportActivePromise()
                 }
             },
         )
@@ -226,12 +227,19 @@ export class SaveCoordinator {
             await this.flushIterations(reason, true)
         })
         this.additionPromise = promise
+        this.reportActivePromise()
         void promise.then(
             () => {
-                if (this.additionPromise === promise) this.additionPromise = null
+                if (this.additionPromise === promise) {
+                    this.additionPromise = null
+                    this.reportActivePromise()
+                }
             },
             () => {
-                if (this.additionPromise === promise) this.additionPromise = null
+                if (this.additionPromise === promise) {
+                    this.additionPromise = null
+                    this.reportActivePromise()
+                }
             },
         )
         return promise
@@ -427,6 +435,13 @@ export class SaveCoordinator {
 
     private startBackgroundFlush(reason: string): void {
         void this.flushPendingData(reason).catch((error) => this.dependencies.onBackgroundError?.(error))
+    }
+
+    private reportActivePromise(): void {
+        const active = this.additionPromise ?? this.flushPromise
+        if (active === this.lastReportedFlushPromise) return
+        this.lastReportedFlushPromise = active
+        this.dependencies.onFlushPromise?.(active)
     }
 
     private async publishPendingRevision(): Promise<void> {
