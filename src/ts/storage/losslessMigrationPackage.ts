@@ -2,44 +2,57 @@ export const losslessMigrationMagic = new TextEncoder().encode('RISUMIGRATION\0'
 export const losslessMigrationVersion = 1
 
 export type LosslessMigrationEntryKind = 'database' | 'asset' | 'inlay' | 'cold'
-export type LosslessMigrationMetadataValue =
-    | null
-    | boolean
-    | number
-    | string
-    | LosslessMigrationMetadataValue[]
-    | { [key: string]: LosslessMigrationMetadataValue }
-export type LosslessMigrationMetadata = { [key: string]: LosslessMigrationMetadataValue }
+export type LosslessMigrationInlayType = 'image' | 'video' | 'audio' | 'signature'
+export type EmptyMigrationMetadata = Readonly<Record<string, never>>
+
+export interface AssetMigrationMetadata {
+    readonly kind: 'asset'
+    readonly mime: string
+    readonly name: string
+    readonly ext: string
+}
+
+export interface InlayMigrationMetadata {
+    readonly kind: 'inlay'
+    readonly mime: string
+    readonly name: string
+    readonly ext: string
+    readonly inlayType: LosslessMigrationInlayType
+    readonly width?: number
+    readonly height?: number
+}
+
+export type LosslessMigrationMetadata = EmptyMigrationMetadata | AssetMigrationMetadata | InlayMigrationMetadata
 
 export interface LosslessMigrationInputEntry {
-    kind: LosslessMigrationEntryKind
-    id: string
-    metadata: LosslessMigrationMetadata
-    data: Uint8Array
+    readonly kind: LosslessMigrationEntryKind
+    readonly id: string
+    readonly metadata: LosslessMigrationMetadata
+    readonly data: Uint8Array
 }
 
 export interface LosslessMigrationManifestEntry {
-    kind: LosslessMigrationEntryKind
-    id: string
-    metadata: LosslessMigrationMetadata
-    size: number
-    sha256: string
+    readonly kind: LosslessMigrationEntryKind
+    readonly id: string
+    readonly metadata: LosslessMigrationMetadata
+    readonly size: number
+    readonly sha256: string
 }
 
 export interface LosslessMigrationManifest {
-    version: 1
-    entries: LosslessMigrationManifestEntry[]
+    readonly version: 1
+    readonly entries: readonly LosslessMigrationManifestEntry[]
 }
 
-export interface DecodedLosslessMigrationEntry extends LosslessMigrationManifestEntry {
-    data: Uint8Array
-}
+export type DecodedLosslessMigrationEntry = LosslessMigrationManifestEntry & { readonly data: Uint8Array }
 
 export interface DecodedLosslessMigrationPackage {
-    version: 1
-    manifest: LosslessMigrationManifest
+    readonly version: 1
+    readonly manifest: LosslessMigrationManifest
     entries(): AsyncIterable<DecodedLosslessMigrationEntry>
 }
+
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
 const kindOrder: Record<LosslessMigrationEntryKind, number> = {
     database: 0,
@@ -55,40 +68,15 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function validateMetadataValue(value: unknown, label: string): asserts value is LosslessMigrationMetadataValue {
-    if (value === null || typeof value === 'string' || typeof value === 'boolean') return
-    if (typeof value === 'number') {
-        if (Number.isFinite(value)) return
-        throw new Error(`${label} contains a non-finite number`)
-    }
-    if (Array.isArray(value)) {
-        value.forEach((item, index) => validateMetadataValue(item, `${label}[${index}]`))
-        return
-    }
-    if (isPlainObject(value)) {
-        for (const [key, item] of Object.entries(value)) {
-            if (!key || key.includes('\0')) throw new Error(`${label} contains an unsafe key`)
-            validateMetadataValue(item, `${label}.${key}`)
-        }
-        return
-    }
-    throw new Error(`${label} must contain JSON values only`)
-}
-
-function validateMetadata(value: unknown): asserts value is LosslessMigrationMetadata {
-    if (!isPlainObject(value)) throw new Error('Migration entry metadata must be an object')
-    validateMetadataValue(value, 'Migration entry metadata')
-}
-
-function canonicalize(value: LosslessMigrationMetadataValue): LosslessMigrationMetadataValue {
+function canonicalize(value: JsonValue): JsonValue {
     if (Array.isArray(value)) return value.map(canonicalize)
     if (!isPlainObject(value)) return value
     return Object.fromEntries(
-        Object.keys(value).sort().map((key) => [key, canonicalize(value[key] as LosslessMigrationMetadataValue)]),
+        Object.keys(value).sort().map((key) => [key, canonicalize(value[key] as JsonValue)]),
     )
 }
 
-function canonicalStringify(value: LosslessMigrationMetadataValue): string {
+function canonicalStringify(value: JsonValue): string {
     return JSON.stringify(canonicalize(value))
 }
 
@@ -96,13 +84,89 @@ function isEntryKind(value: unknown): value is LosslessMigrationEntryKind {
     return value === 'database' || value === 'asset' || value === 'inlay' || value === 'cold'
 }
 
+function hasExactKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+    const keys = Object.keys(value)
+    return required.every((key) => keys.includes(key))
+        && keys.every((key) => required.includes(key) || optional.includes(key))
+}
+
+function validateCommonBlobMetadata(value: Record<string, unknown>): void {
+    if (typeof value.mime !== 'string' || !value.mime.trim()) throw new Error('Migration entry metadata requires a MIME string')
+    if (typeof value.name !== 'string' || !value.name) throw new Error('Migration entry metadata requires a name string')
+    if (typeof value.ext !== 'string') throw new Error('Migration entry metadata requires an extension string')
+}
+
+function validateMetadata(kind: LosslessMigrationEntryKind, value: unknown): LosslessMigrationMetadata {
+    if (!isPlainObject(value)) throw new Error('Migration entry metadata must be an object')
+    if (kind === 'database' || kind === 'cold') {
+        if (Object.keys(value).length !== 0) throw new Error(`${kind} migration metadata must be empty`)
+        return {}
+    }
+    if (kind === 'asset') {
+        if (!hasExactKeys(value, ['kind', 'mime', 'name', 'ext']) || value.kind !== 'asset') {
+            throw new Error('Asset migration metadata has missing, mismatched, or unexpected fields')
+        }
+        validateCommonBlobMetadata(value)
+        return { kind: 'asset', mime: value.mime as string, name: value.name as string, ext: value.ext as string }
+    }
+    if (!hasExactKeys(value, ['kind', 'mime', 'name', 'ext', 'inlayType'], ['width', 'height']) || value.kind !== 'inlay') {
+        throw new Error('Inlay migration metadata has missing, mismatched, or unexpected fields')
+    }
+    validateCommonBlobMetadata(value)
+    if (value.inlayType !== 'image' && value.inlayType !== 'video'
+        && value.inlayType !== 'audio' && value.inlayType !== 'signature') {
+        throw new Error('Inlay migration metadata has an unsupported inlay type')
+    }
+    for (const dimension of ['width', 'height'] as const) {
+        const size = value[dimension]
+        if (size !== undefined && (typeof size !== 'number' || !Number.isFinite(size) || size < 0)) {
+            throw new Error(`Inlay migration metadata ${dimension} must be finite and nonnegative`)
+        }
+    }
+    return {
+        kind: 'inlay',
+        mime: value.mime as string,
+        name: value.name as string,
+        ext: value.ext as string,
+        inlayType: value.inlayType,
+        ...(value.width === undefined ? {} : { width: value.width as number }),
+        ...(value.height === undefined ? {} : { height: value.height as number }),
+    }
+}
+
+function isWellFormedUnicode(value: string): boolean {
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index)
+        if (code >= 0xd800 && code <= 0xdbff) {
+            if (index + 1 >= value.length) return false
+            const next = value.charCodeAt(index + 1)
+            if (next < 0xdc00 || next > 0xdfff) return false
+            index++
+        } else if (code >= 0xdc00 && code <= 0xdfff) {
+            return false
+        }
+    }
+    return true
+}
+
 function validateLogicalId(kind: LosslessMigrationEntryKind, id: unknown): asserts id is string {
-    if (typeof id !== 'string' || !id || id.includes('\0') || id.includes('\\')
-        || id.startsWith('/') || /^[a-z]:/i.test(id)) {
+    if (typeof id !== 'string' || !id || !isWellFormedUnicode(id)) {
+        throw new Error('Migration entry has unsafe or malformed Unicode in its logical ID')
+    }
+    if (id !== id.normalize('NFC')) throw new Error('Migration entry logical ID must use normalized Unicode')
+    if (/[\u0000-\u001f\u007f-\u009f]/.test(id) || /%(?:2e|2f|5c)/i.test(id)
+        || id.includes('\\') || id.startsWith('/') || /^[a-z]:/i.test(id)) {
         throw new Error('Migration entry has an unsafe logical ID')
     }
     const segments = id.split('/')
-    if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+    if (segments.some((segment) => {
+        const compatible = segment.normalize('NFKC')
+        return !segment || segment === '.' || segment === '..'
+            || compatible.includes('/') || compatible.includes('\\')
+            || compatible === '.' || compatible === '..'
+            || /[\u0000-\u001f\u007f-\u009f]/.test(compatible)
+            || /%(?:2e|2f|5c)/i.test(compatible)
+    })) {
         throw new Error('Migration entry has an unsafe logical ID')
     }
     if (kind === 'database' && id !== 'database.risudat') {
@@ -158,7 +222,20 @@ async function collectInput(
     input: Iterable<LosslessMigrationInputEntry> | AsyncIterable<LosslessMigrationInputEntry>,
 ): Promise<LosslessMigrationInputEntry[]> {
     const entries: LosslessMigrationInputEntry[] = []
-    for await (const entry of input) entries.push(entry)
+    for await (const entry of input) {
+        if (!isPlainObject(entry) || !isEntryKind(entry.kind)) {
+            throw new Error('Migration entry has an unsupported kind or shape')
+        }
+        validateLogicalId(entry.kind, entry.id)
+        const metadata = validateMetadata(entry.kind, entry.metadata)
+        if (!(entry.data instanceof Uint8Array)) throw new Error('Migration entry data must be a Uint8Array')
+        entries.push({
+            kind: entry.kind,
+            id: entry.id,
+            metadata,
+            data: entry.data.slice(),
+        } as LosslessMigrationInputEntry)
+    }
     return entries
 }
 
@@ -166,12 +243,6 @@ export async function encodeLosslessMigrationPackage(
     input: Iterable<LosslessMigrationInputEntry> | AsyncIterable<LosslessMigrationInputEntry>,
 ): Promise<Uint8Array> {
     const entries = await collectInput(input)
-    for (const entry of entries) {
-        if (!isEntryKind(entry.kind)) throw new Error('Migration entry has an unsupported kind')
-        validateLogicalId(entry.kind, entry.id)
-        validateMetadata(entry.metadata)
-        if (!(entry.data instanceof Uint8Array)) throw new Error('Migration entry data must be a Uint8Array')
-    }
     validateEntryIdentity(entries)
     entries.sort(compareEntries)
 
@@ -180,13 +251,13 @@ export async function encodeLosslessMigrationPackage(
         manifestEntries.push({
             kind: entry.kind,
             id: entry.id,
-            metadata: canonicalize(entry.metadata) as LosslessMigrationMetadata,
+            metadata: entry.metadata,
             size: entry.data.byteLength,
             sha256: await sha256(entry.data),
         })
     }
     const manifest: LosslessMigrationManifest = { version: losslessMigrationVersion, entries: manifestEntries }
-    const manifestBytes = new TextEncoder().encode(canonicalStringify(manifest as unknown as LosslessMigrationMetadataValue))
+    const manifestBytes = new TextEncoder().encode(canonicalStringify(manifest as unknown as JsonValue))
     if (manifestBytes.byteLength > 0xffffffff) throw new RangeError('Migration manifest length overflow')
     const payloadLength = entries.reduce((total, entry) => total + frameHeaderLength + entry.data.byteLength, 0)
     const totalLength = headerLength + manifestBytes.byteLength + payloadLength
@@ -226,14 +297,18 @@ function parseManifest(bytes: Uint8Array): { manifest: LosslessMigrationManifest
     } catch {
         throw new Error('Migration package manifest is malformed')
     }
-    if (!isPlainObject(raw) || raw.version !== losslessMigrationVersion || !Array.isArray(raw.entries)) {
+    if (!isPlainObject(raw) || !hasExactKeys(raw, ['version', 'entries'])
+        || raw.version !== losslessMigrationVersion || !Array.isArray(raw.entries)) {
         throw new Error('Migration package manifest has an unsupported version or shape')
     }
     const entries: LosslessMigrationManifestEntry[] = raw.entries.map((value, index) => {
         if (!isPlainObject(value)) throw new Error(`Migration manifest entry ${index} is malformed`)
+        if (!hasExactKeys(value, ['kind', 'id', 'metadata', 'size', 'sha256'])) {
+            throw new Error(`Migration manifest entry ${index} has unexpected fields`)
+        }
         if (!isEntryKind(value.kind)) throw new Error(`Migration manifest entry ${index} has an unsupported kind`)
         validateLogicalId(value.kind, value.id)
-        validateMetadata(value.metadata)
+        const metadata = validateMetadata(value.kind, value.metadata)
         if (!Number.isSafeInteger(value.size) || (value.size as number) < 0) {
             throw new Error(`Migration manifest entry ${index} has an invalid size`)
         }
@@ -243,7 +318,7 @@ function parseManifest(bytes: Uint8Array): { manifest: LosslessMigrationManifest
         return {
             kind: value.kind,
             id: value.id,
-            metadata: value.metadata,
+            metadata,
             size: value.size as number,
             sha256: value.sha256,
         }
@@ -261,28 +336,40 @@ export async function decodeLosslessMigrationPackage(
     bytes: Uint8Array,
 ): Promise<DecodedLosslessMigrationPackage> {
     if (!(bytes instanceof Uint8Array)) throw new Error('Migration package must be a Uint8Array')
-    const { manifest, frameOffset } = parseManifest(bytes)
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-    const decodedEntries: DecodedLosslessMigrationEntry[] = []
+    const ownedBytes = bytes.slice()
+    const { manifest: parsedManifest, frameOffset } = parseManifest(ownedBytes)
+    const view = new DataView(ownedBytes.buffer, ownedBytes.byteOffset, ownedBytes.byteLength)
+    const payloads: Uint8Array[] = []
     let offset = frameOffset
-    for (const entry of manifest.entries) {
-        if (bytes.byteLength - offset < frameHeaderLength) throw new Error('Migration package is missing or truncated framed entries')
+    for (const entry of parsedManifest.entries) {
+        if (ownedBytes.byteLength - offset < frameHeaderLength) throw new Error('Migration package is missing or truncated framed entries')
         const length = readUint64(view, offset)
         offset += frameHeaderLength
         if (length !== entry.size) throw new Error(`Migration entry ${entry.id} frame size mismatch`)
-        if (length > bytes.byteLength - offset) throw new Error(`Migration entry ${entry.id} payload is truncated or length overflows package`)
-        const data = bytes.subarray(offset, offset + length)
+        if (length > ownedBytes.byteLength - offset) throw new Error(`Migration entry ${entry.id} payload is truncated or length overflows package`)
+        const data = ownedBytes.subarray(offset, offset + length)
         offset += length
         if (await sha256(data) !== entry.sha256) throw new Error(`Migration entry ${entry.id} hash mismatch`)
-        decodedEntries.push({ ...entry, data })
+        payloads.push(data)
     }
-    if (offset !== bytes.byteLength) throw new Error('Migration package contains extra framed entries or trailing bytes')
+    if (offset !== ownedBytes.byteLength) throw new Error('Migration package contains extra framed entries or trailing bytes')
 
-    return {
+    const entries = parsedManifest.entries.map((entry) => Object.freeze({
+        ...entry,
+        metadata: Object.freeze({ ...entry.metadata }),
+    })) as readonly LosslessMigrationManifestEntry[]
+    const manifest = Object.freeze({
+        version: losslessMigrationVersion,
+        entries: Object.freeze(entries),
+    }) satisfies LosslessMigrationManifest
+
+    return Object.freeze({
         version: losslessMigrationVersion,
         manifest,
         async *entries() {
-            for (const entry of decodedEntries) yield entry
+            for (let index = 0; index < entries.length; index++) {
+                yield Object.freeze({ ...entries[index], data: payloads[index].slice() })
+            }
         },
-    }
+    })
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
     decodeLosslessMigrationPackage,
     encodeLosslessMigrationPackage,
@@ -10,16 +10,16 @@ const encoder = new TextEncoder()
 
 function fixture(): LosslessMigrationInputEntry[] {
     return [
-        { kind: 'cold', id: 'chat-b', metadata: { compression: 'fflate' }, data: new Uint8Array([41, 42]) },
+        { kind: 'cold', id: 'chat-b', metadata: {}, data: new Uint8Array([41, 42]) },
         { kind: 'asset', id: 'assets/voice.mp3', metadata: { ext: 'mp3', kind: 'asset', mime: 'audio/mpeg', name: 'voice.mp3' }, data: new Uint8Array([20, 21]) },
         { kind: 'inlay', id: 'signature-id', metadata: { ext: 'json', inlayType: 'signature', kind: 'inlay', mime: 'application/json', name: 'signature' }, data: encoder.encode('{"ok":true}') },
-        { kind: 'database', id: 'database.risudat', metadata: { format: 'risudat' }, data: new Uint8Array([82, 73, 83, 85]) },
+        { kind: 'database', id: 'database.risudat', metadata: {}, data: new Uint8Array([82, 73, 83, 85]) },
         { kind: 'asset', id: 'assets/photo.jpg', metadata: { ext: 'jpg', kind: 'asset', mime: 'image/jpeg', name: 'photo.jpg' }, data: new Uint8Array([10, 11, 12]) },
         { kind: 'inlay', id: 'audio-id', metadata: { ext: 'mp3', inlayType: 'audio', kind: 'inlay', mime: 'audio/mpeg', name: 'audio' }, data: new Uint8Array([31, 32]) },
         { kind: 'asset', id: 'assets/movie.webm', metadata: { ext: 'webm', kind: 'asset', mime: 'video/webm', name: 'movie.webm' }, data: new Uint8Array([22, 23, 24]) },
         { kind: 'inlay', id: 'image-id', metadata: { height: 48, ext: 'png', width: 64, inlayType: 'image', kind: 'inlay', mime: 'image/png', name: 'image' }, data: new Uint8Array([30]) },
         { kind: 'asset', id: 'assets/photo.png', metadata: { ext: 'png', kind: 'asset', mime: 'image/png', name: 'photo.png' }, data: new Uint8Array([1, 2, 3]) },
-        { kind: 'cold', id: 'character-a', metadata: { compression: 'fflate' }, data: new Uint8Array([40]) },
+        { kind: 'cold', id: 'character-a', metadata: {}, data: new Uint8Array([40]) },
         { kind: 'inlay', id: 'video-id', metadata: { ext: 'webm', inlayType: 'video', kind: 'inlay', mime: 'video/webm', name: 'video' }, data: new Uint8Array([33, 34, 35]) },
         { kind: 'asset', id: 'assets/empty.bin', metadata: { ext: 'bin', kind: 'asset', mime: 'application/octet-stream', name: 'empty.bin' }, data: new Uint8Array() },
     ]
@@ -99,7 +99,7 @@ describe('lossless migration package', () => {
         const second = [...first].reverse().map((entry) => ({
             ...entry,
             metadata: Object.fromEntries(Object.entries(entry.metadata).reverse()),
-        }))
+        })) as LosslessMigrationInputEntry[]
 
         expect(await encodeLosslessMigrationPackage(first)).toEqual(await encodeLosslessMigrationPackage(second))
     })
@@ -110,6 +110,86 @@ describe('lossless migration package', () => {
         }
         const { entries } = await collect(await encodeLosslessMigrationPackage(source()))
         expect(entries).toHaveLength(fixture().length)
+    })
+
+    it('snapshots a reusable async producer buffer at each yield', async () => {
+        const scratch = new Uint8Array(1)
+        async function* source(): AsyncIterable<LosslessMigrationInputEntry> {
+            scratch[0] = 1
+            yield { kind: 'database', id: 'database.risudat', metadata: {}, data: scratch }
+            scratch[0] = 2
+            yield {
+                kind: 'asset',
+                id: 'assets/a.bin',
+                metadata: { kind: 'asset', mime: 'application/octet-stream', name: 'a.bin', ext: 'bin' },
+                data: scratch,
+            }
+        }
+
+        const { entries } = await collect(await encodeLosslessMigrationPackage(source()))
+        expect(entries.map((entry) => [...entry.data])).toEqual([[1], [2]])
+    })
+
+    it('owns entry bytes before encoder hashing awaits and does not mutate caller entries', async () => {
+        const input = fixture()
+        const originalOrder = input.map((entry) => entry.id)
+        const originalDatabase = input.find((entry) => entry.kind === 'database')!
+        const originalDigest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle)
+        let releaseDigest!: () => void
+        const digestRelease = new Promise<void>((resolve) => { releaseDigest = resolve })
+        let signalDigestStarted!: () => void
+        const digestStarted = new Promise<void>((resolve) => { signalDigestStarted = resolve })
+        let first = true
+        const digest = vi.spyOn(globalThis.crypto.subtle, 'digest').mockImplementation(async (algorithm, data) => {
+            if (first) {
+                first = false
+                signalDigestStarted()
+                await digestRelease
+            }
+            return originalDigest(algorithm, data)
+        })
+
+        const encoding = encodeLosslessMigrationPackage(input)
+        await digestStarted
+        originalDatabase.data[0] = 0
+        ;(originalDatabase.metadata as any).changed = true
+        releaseDigest()
+        const { entries } = await collect(await encoding)
+        digest.mockRestore()
+
+        expect(entries.find((entry) => entry.kind === 'database')?.data[0]).toBe(82)
+        expect(entries.find((entry) => entry.kind === 'database')?.metadata).toEqual({})
+        expect(input.map((entry) => entry.id)).toEqual(originalOrder)
+    })
+
+    it('owns the input package and isolates its frozen manifest from caller mutation', async () => {
+        const packageBytes = await encodeLosslessMigrationPackage(fixture())
+        const decoded = await decodeLosslessMigrationPackage(packageBytes)
+        packageBytes.fill(0)
+        const manifestEntry = decoded.manifest.entries.find((entry) => entry.kind === 'asset')!
+
+        expect(Object.isFrozen(decoded.manifest)).toBe(true)
+        expect(Object.isFrozen(decoded.manifest.entries)).toBe(true)
+        expect(Object.isFrozen(manifestEntry)).toBe(true)
+        expect(Object.isFrozen(manifestEntry.metadata)).toBe(true)
+        expect(() => { (manifestEntry as any).id = 'assets/changed.bin' }).toThrow(TypeError)
+        expect(() => { (manifestEntry.metadata as any).mime = 'text/plain' }).toThrow(TypeError)
+
+        const entries = []
+        for await (const entry of decoded.entries()) entries.push(entry)
+        expect(entries.find((entry) => entry.kind === 'database')?.data).toEqual(new Uint8Array([82, 73, 83, 85]))
+    })
+
+    it('returns isolated bytes on every decoded entry iteration and stays manifest-consistent', async () => {
+        const decoded = await decodeLosslessMigrationPackage(await encodeLosslessMigrationPackage(fixture()))
+        const first = []
+        for await (const entry of decoded.entries()) first.push(entry)
+        first[0].data[0] = 0
+        const second = []
+        for await (const entry of decoded.entries()) second.push(entry)
+
+        expect(second[0].data[0]).toBe(82)
+        expect(second.map(({ data: _data, ...entry }) => entry)).toEqual(decoded.manifest.entries)
     })
 
     it.each([
@@ -181,5 +261,66 @@ describe('lossless migration package', () => {
         const { manifest } = readManifest(bytes)
         ;(manifest as any).entries[0].metadata = []
         await expect(decodeLosslessMigrationPackage(withManifest(bytes, manifest))).rejects.toThrow(/metadata/i)
+    })
+
+    it('rejects unexpected version 1 manifest and entry fields', async () => {
+        const bytes = await encodeLosslessMigrationPackage(fixture())
+        const root = readManifest(bytes).manifest as any
+        root.extra = true
+        await expect(decodeLosslessMigrationPackage(withManifest(bytes, root))).rejects.toThrow(/shape|unexpected/i)
+
+        const entry = readManifest(bytes).manifest as any
+        entry.entries[0].extra = true
+        await expect(decodeLosslessMigrationPackage(withManifest(bytes, entry))).rejects.toThrow(/unexpected/i)
+    })
+
+    it.each([
+        ['missing asset metadata', {}, /metadata/i],
+        ['mismatched asset kind', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png' }, /metadata|kind/i],
+        ['unexpected asset field', { kind: 'asset', mime: 'image/png', name: 'a', ext: 'png', width: 1 }, /metadata|unexpected/i],
+        ['missing inlay type', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png' }, /metadata|inlay/i],
+        ['unsupported inlay type', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png', inlayType: 'document' }, /metadata|inlay/i],
+        ['nonfinite inlay dimension', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png', inlayType: 'image', width: Number.POSITIVE_INFINITY }, /metadata|width/i],
+        ['unexpected database metadata', { format: 'risudat' }, /metadata|database/i],
+        ['unexpected cold metadata', { compression: 'fflate' }, /metadata|cold/i],
+    ])('rejects %s on encode', async (_name, metadata, message) => {
+        const entries = fixture() as any[]
+        const kind = _name.includes('inlay') ? 'inlay' : _name.includes('database') ? 'database' : _name.includes('cold') ? 'cold' : 'asset'
+        const entry = entries.find((candidate) => candidate.kind === kind)
+        entry.metadata = metadata
+        await expect(encodeLosslessMigrationPackage(entries)).rejects.toThrow(message)
+    })
+
+    it.each([
+        ['missing asset metadata', 'asset', {}, /metadata/i],
+        ['mismatched asset kind', 'asset', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png', inlayType: 'image' }, /metadata|kind/i],
+        ['unexpected asset field', 'asset', { kind: 'asset', mime: 'image/png', name: 'a', ext: 'png', width: 1 }, /metadata|unexpected/i],
+        ['missing inlay type', 'inlay', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png' }, /metadata|inlay/i],
+        ['unsupported inlay type', 'inlay', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png', inlayType: 'document' }, /metadata|inlay/i],
+        ['nonfinite inlay dimension', 'inlay', { kind: 'inlay', mime: 'image/png', name: 'a', ext: 'png', inlayType: 'image', width: Number.POSITIVE_INFINITY }, /metadata|width/i],
+        ['unexpected database metadata', 'database', { format: 'risudat' }, /metadata|database/i],
+        ['unexpected cold metadata', 'cold', { compression: 'fflate' }, /metadata|cold/i],
+    ])('rejects %s from an untrusted manifest', async (_name, kind, metadata, message) => {
+        const bytes = await encodeLosslessMigrationPackage(fixture())
+        const { manifest } = readManifest(bytes)
+        const entry = (manifest as any).entries.find((candidate: any) => candidate.kind === kind)
+        entry.metadata = metadata
+        await expect(decodeLosslessMigrationPackage(withManifest(bytes, manifest))).rejects.toThrow(message)
+    })
+
+    it.each([
+        'assets/%2e%2e/secret',
+        'assets/a%2Fb',
+        'assets/a%5Cb',
+        'assets/\ud800.png',
+        'assets/．．/secret',
+        'assets/a／b',
+        'assets/e\u0301.png',
+    ])('rejects the unsafe or non-normalized logical ID %s on decode', async (id) => {
+        const bytes = await encodeLosslessMigrationPackage(fixture())
+        const { manifest } = readManifest(bytes)
+        const asset = (manifest as any).entries.find((entry: any) => entry.kind === 'asset')
+        asset.id = id
+        await expect(decodeLosslessMigrationPackage(withManifest(bytes, manifest))).rejects.toThrow(/unsafe|unicode|normalized/i)
     })
 })
