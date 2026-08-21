@@ -10,6 +10,7 @@ import {
     readBlobForFacade,
 } from './platformBlobStore'
 import { SeekMode } from '@tauri-apps/plugin-fs'
+import { isGeneratedStorageRootId } from './storageRoot'
 
 function memoryBackend() {
     const values = new Map<string, Uint8Array>()
@@ -55,6 +56,25 @@ describe('rooted BlobStore mapping', () => {
         const { backend } = memoryBackend()
         const factory = createKeyValueRootedBlobStoreFactory(backend)
         expect(() => factory.open({ kind: 'generation', id: '../escape' })).toThrow(TypeError)
+    })
+
+    test.each([
+        ['safe', true],
+        ['safe_1-2', true],
+        ['a'.repeat(64), true],
+        ['', false],
+        ['../escape', false],
+        ['a'.repeat(65), false],
+        ['with space', false],
+    ])('shares generated-root validation for %j', (id, expected) => {
+        expect(isGeneratedStorageRootId(id)).toBe(expected)
+        const { backend } = memoryBackend()
+        const factory = createKeyValueRootedBlobStoreFactory(backend)
+        if (expected) {
+            expect(() => factory.open({ kind: 'generation', id })).not.toThrow()
+        } else {
+            expect(() => factory.open({ kind: 'generation', id })).toThrow(TypeError)
+        }
     })
 
     test('resolves one active root for a complete public operation', async () => {

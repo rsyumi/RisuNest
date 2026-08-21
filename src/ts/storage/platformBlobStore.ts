@@ -12,8 +12,8 @@ import {
     type BlobReadRange,
     type BlobStore,
 } from './blobStore'
-
-export type BlobStorageRoot = { kind: 'legacy' } | { kind: 'generation'; id: string }
+import { assertGeneratedStorageRootId, type BlobStorageRoot } from './storageRoot'
+export type { BlobStorageRoot } from './storageRoot'
 
 export interface RootedBlobStoreFactory {
     open(root: BlobStorageRoot): BlobStore
@@ -23,11 +23,9 @@ export interface ActiveBlobRootResolver {
     getActiveRoot(): Promise<BlobStorageRoot>
 }
 
-const safeGenerationId = /^[A-Za-z0-9_-]{1,64}$/
-
 function rootPrefix(root: BlobStorageRoot): string {
     if (root.kind === 'legacy') return ''
-    if (!safeGenerationId.test(root.id)) throw new TypeError('Invalid BlobStore generation identifier')
+    assertGeneratedStorageRootId(root.id)
     return `blobstore/generations/${root.id}/`
 }
 

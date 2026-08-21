@@ -33,6 +33,7 @@ function createStore(input?: {
         prepareReplacement: vi.fn(),
         activatePreparedReplacement: vi.fn(),
         discardPreparedReplacement: vi.fn(),
+        listPreparedReplacements: vi.fn(),
         readActivePayloadGeneration: vi.fn(),
         readActiveTuple: vi.fn(),
         queryCharacters: vi.fn(),

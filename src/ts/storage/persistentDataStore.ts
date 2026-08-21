@@ -12,12 +12,12 @@ export interface PreparedPersistentReplacement {
     id: string
     baseRevision: DataRevision
     dataGeneration: string
+    payloadGeneration: string
     manifestHash: string
 }
 
 export interface PreparedReplacementActivation {
     prepared: PreparedPersistentReplacement
-    payloadGeneration: string
     manifestHash: string
 }
 
@@ -170,11 +170,13 @@ export interface PersistentDataStore {
     prepareReplacement(
         database: Database,
         manifestHash: string,
+        payloadGeneration: string,
     ): Promise<PreparedPersistentReplacement>
     activatePreparedReplacement(
         input: PreparedReplacementActivation,
     ): Promise<{ revision: DataRevision }>
     discardPreparedReplacement(prepared: PreparedPersistentReplacement): Promise<void>
+    listPreparedReplacements(): Promise<PreparedPersistentReplacement[]>
     readActivePayloadGeneration(): Promise<string>
     readActiveTuple(): Promise<ActivePersistentTuple>
     materializeDatabase(revision?: DataRevision): Promise<Database>

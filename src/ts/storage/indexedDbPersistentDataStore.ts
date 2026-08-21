@@ -20,6 +20,7 @@ import type {
     WorkingSetCommit,
 } from './persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
+import { assertGeneratedStorageRootId } from './storageRoot'
 
 const DATABASE_VERSION = 3
 const MESSAGE_PAGE_SIZE = 128
@@ -56,6 +57,19 @@ interface PreparedGenerationCounts {
 
 interface PreparedReplacementMarker extends PreparedPersistentReplacement {
     counts: PreparedGenerationCounts
+}
+
+interface GenerationCleanupMarker {
+    generation: string
+}
+
+export type PersistentGenerationCleanupErrorHandler = (
+    generation: string,
+    error: unknown,
+) => void
+
+function reportGenerationCleanupError(generation: string, error: unknown): void {
+    console.error(`Persistent data cleanup failed for generation ${generation}`, error)
 }
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
@@ -120,6 +134,8 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         private readonly databaseName: string,
         private readonly indexedDbFactory: IDBFactory = indexedDB,
         private readonly keyRangeFactory: typeof IDBKeyRange = globalThis.IDBKeyRange,
+        private readonly onCleanupError: PersistentGenerationCleanupErrorHandler =
+            reportGenerationCleanupError,
     ) {}
 
     async open(): Promise<void> {
@@ -197,6 +213,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
         await transactionDone(transaction)
         await this.sweepTemporaryGenerations()
+        await this.retryQueuedGenerationCleanup()
     }
 
     async readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
@@ -447,7 +464,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     async prepareReplacement(
         databaseValue: Database,
         manifestHash: string,
+        payloadGeneration: string,
     ): Promise<PreparedPersistentReplacement> {
+        this.validatePreparedPayloadGeneration(payloadGeneration)
         const database = this.requireDatabase()
         const transaction = database.transaction([...STORE_NAMES], 'readwrite')
         const id = globalThis.crypto.randomUUID()
@@ -459,6 +478,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 id,
                 baseRevision: active.revision,
                 dataGeneration,
+                payloadGeneration,
                 manifestHash,
             }
             const marker: PreparedReplacementMarker = { ...prepared, counts }
@@ -479,9 +499,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     async activatePreparedReplacement(
         input: PreparedReplacementActivation,
     ): Promise<{ revision: DataRevision }> {
+        this.validatePreparedPayloadGeneration(input.prepared.payloadGeneration)
         const database = this.requireDatabase()
         const transaction = database.transaction([...STORE_NAMES], 'readwrite')
-        let previousGeneration = ''
         try {
             const active = await this.readActive(transaction)
             if (active.revision !== input.prepared.baseRevision) {
@@ -501,16 +521,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             await this.validateGeneration(transaction, marker.dataGeneration, marker.counts)
             const revision = active.revision + 1
-            previousGeneration = active.generation
             this.setActiveTuple(
                 transaction,
                 revision,
                 marker.dataGeneration,
-                input.payloadGeneration,
+                marker.payloadGeneration,
             )
+            this.enqueueGenerationCleanup(transaction, active.generation)
             transaction.objectStore('meta').delete(this.preparedMarkerKey(marker.id))
             await transactionDone(transaction)
-            void this.deleteGeneration(previousGeneration).catch(() => undefined)
+            await this.retryQueuedGenerationCleanup()
             return { revision }
         } catch (error) {
             try {
@@ -549,6 +569,24 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             } catch {}
             throw error
         }
+    }
+
+    async listPreparedReplacements(): Promise<PreparedPersistentReplacement[]> {
+        const transaction = this.requireDatabase().transaction('meta', 'readonly')
+        const markers = await this.readMetaValuesByPrefix<PreparedReplacementMarker>(
+            transaction.objectStore('meta'),
+            'preparedReplacement:',
+        )
+        await transactionDone(transaction)
+        return markers
+            .map(({ id, baseRevision, dataGeneration, payloadGeneration, manifestHash }) => ({
+                id,
+                baseRevision,
+                dataGeneration,
+                payloadGeneration,
+                manifestHash,
+            }))
+            .sort((left, right) => left.id.localeCompare(right.id))
     }
 
     async readActivePayloadGeneration(): Promise<string> {
@@ -1035,6 +1073,61 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
+    private enqueueGenerationCleanup(transaction: IDBTransaction, generation: string): void {
+        transaction.objectStore('meta').put({
+            key: this.generationCleanupMarkerKey(generation),
+            value: { generation } satisfies GenerationCleanupMarker,
+        })
+    }
+
+    private async retryQueuedGenerationCleanup(): Promise<void> {
+        const database = this.requireDatabase()
+        let queued: GenerationCleanupMarker[]
+        try {
+            const readTransaction = database.transaction('meta', 'readonly')
+            queued = await this.readMetaValuesByPrefix<GenerationCleanupMarker>(
+                readTransaction.objectStore('meta'),
+                'generationCleanup:',
+            )
+            await transactionDone(readTransaction)
+        } catch (error) {
+            this.reportCleanupError('queue', error)
+            return
+        }
+        for (const marker of queued) {
+            let transaction: IDBTransaction | undefined
+            try {
+                transaction = database.transaction([...STORE_NAMES], 'readwrite')
+                const active = await this.readActive(transaction)
+                if (
+                    marker.generation === active.generation ||
+                    activeSnapshotGenerations.has(marker.generation)
+                ) {
+                    await transactionDone(transaction)
+                    continue
+                }
+                await this.deleteGenerationFromTransaction(transaction, marker.generation)
+                transaction
+                    .objectStore('meta')
+                    .delete(this.generationCleanupMarkerKey(marker.generation))
+                await transactionDone(transaction)
+            } catch (error) {
+                try {
+                    transaction?.abort()
+                } catch {}
+                this.reportCleanupError(marker.generation, error)
+            }
+        }
+    }
+
+    private reportCleanupError(generation: string, error: unknown): void {
+        try {
+            this.onCleanupError(generation, error)
+        } catch (reportError) {
+            reportGenerationCleanupError(generation, reportError)
+        }
+    }
+
     private async sweepTemporaryGenerations(): Promise<void> {
         const database = this.requireDatabase()
         const transaction = database.transaction([...DATA_STORE_NAMES], 'readwrite')
@@ -1060,6 +1153,25 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             })
         }
         await transactionDone(transaction)
+    }
+
+    private readMetaValuesByPrefix<T>(store: IDBObjectStore, prefix: string): Promise<T[]> {
+        return new Promise((resolve, reject) => {
+            const values: T[] = []
+            const request = store.openCursor(
+                this.keyRangeFactory.bound(prefix, `${prefix}\uffff`),
+            )
+            request.onerror = () => reject(request.error)
+            request.onsuccess = () => {
+                const cursor = request.result
+                if (!cursor) {
+                    resolve(values)
+                    return
+                }
+                values.push((cursor.value as { value: T }).value)
+                cursor.continue()
+            }
+        })
     }
 
     private async applyConversationMutation(
@@ -1643,6 +1755,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return `preparedReplacement:${id}`
     }
 
+    private generationCleanupMarkerKey(generation: string): string {
+        return `generationCleanup:${generation}`
+    }
+
+    private validatePreparedPayloadGeneration(payloadGeneration: string): void {
+        assertGeneratedStorageRootId(payloadGeneration)
+        if (payloadGeneration === LEGACY_PAYLOAD_GENERATION) {
+            throw new TypeError('Prepared replacement requires a generated payload identifier')
+        }
+    }
+
     private matchesPreparedReplacement(
         marker: PreparedReplacementMarker,
         prepared: PreparedPersistentReplacement,
@@ -1651,6 +1774,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             marker.id === prepared.id &&
             marker.baseRevision === prepared.baseRevision &&
             marker.dataGeneration === prepared.dataGeneration &&
+            marker.payloadGeneration === prepared.payloadGeneration &&
             marker.manifestHash === prepared.manifestHash
         )
     }
