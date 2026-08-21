@@ -447,8 +447,11 @@
     }
 
     async function screenShot(){
+        const previousLoadPages = loadPages
         try {
             loadPages = Infinity
+            await tick()
+            await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
             const html2canvas = await import('html-to-image');
             const chats = document.querySelectorAll('.default-chat-screen .risu-chat')
             alertWait("Taking screenShot...")
@@ -495,10 +498,11 @@
                 mergedCanvas.remove();
             }
             alertNormal(language.screenshotSaved)
-            loadPages = getInitialChatLoadPages(DBState.db)
         } catch (error) {
             console.error(error)
             alertError("Error while taking screenshot")
+        } finally {
+            loadPages = previousLoadPages
         }
     }
 

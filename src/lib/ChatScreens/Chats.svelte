@@ -5,6 +5,7 @@
     import { getCharImage } from 'src/ts/characters';
     import { createSimpleCharacter, DBState, selectedCharID, ReloadChatPointer } from 'src/ts/stores.svelte';
     import { chatFoldedStateMessageIndex } from 'src/ts/globalApi.svelte';
+    import { shouldContainChatMessage } from 'src/ts/chatLoadPages';
     import { get } from 'svelte/store';
     
     const getCurrentChatRoomId = () => {
@@ -96,6 +97,14 @@
             const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false);
             const reloadPointer = reloadPointerMap[i] ?? 0;
             const activeStreamingMessage = i === activeStreamingIndex && message.role === 'char';
+            const containMessage = shouldContainChatMessage({
+                index: i,
+                totalLength: messages.length,
+                isStreaming: currentChat?.isStreaming === true && i === messages.length - 1,
+                isComment: message.isComment ?? false,
+                data: message.data,
+                captureAll: loadPages === Infinity,
+            });
             const hashMessageData = activeStreamingMessage ? '' : message.data;
             let hashd = hashMessageData + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString();
             const currentHash = hashCode(hashd);
@@ -104,6 +113,7 @@
                 const b = document.createElement('div');
                 b.setAttribute('x-hashed', currentHash.toString());
                 b.classList.add('chat-message-container');
+                b.classList.toggle('is-settled-history', containMessage);
                 const inst = mount(Chat, {
                     target: b,
                     props: {
@@ -138,6 +148,8 @@
                 }
             }
             else{
+                const element = chatBody.querySelector(`[x-hashed="${currentHash}"]`);
+                element?.classList.toggle('is-settled-history', containMessage);
                 mountInstances.get(currentHash)?.updateStreamingDisplay?.({
                     isOptimizedStreamingMessage: activeStreamingMessage,
                     streamingOptimizationMode: performanceMode,

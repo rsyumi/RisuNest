@@ -514,6 +514,11 @@ body {
   display: block;
 }
 
+.chat-message-container.is-settled-history {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 16rem;
+}
+
 .x-risu-tool-call {
   @apply border border-darkborderc bg-darkbg text-textcolor rounded-md shadow-xs focus:outline-hidden transition-colors duration-200 px-4 py-2 min-w-0;
 }
