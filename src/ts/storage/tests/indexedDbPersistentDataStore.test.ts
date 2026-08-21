@@ -1,6 +1,7 @@
 import { IDBFactory, IDBIndex, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
+import { SnapshotReleasedError } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
 import { persistentDataStoreContract } from './persistentDataStoreContract'
 
@@ -368,5 +369,92 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             new Map(storeNames.map((storeName) => [storeName, new Set(['revision-2'])])),
         )
         expect((await store.readRoot()).value.username).toBe('Replacement User')
+    })
+
+    it('copies an immutable revision with cursors and releases it idempotently', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore('revision-snapshot-lease', indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        const getAllSpy = vi.spyOn(IDBObjectStore.prototype, 'getAll')
+        const materializeSpy = vi.spyOn(store, 'materializeDatabase')
+
+        const lease = await store.acquireRevision(imported.revision)
+
+        expect(getAllSpy).not.toHaveBeenCalled()
+        expect(materializeSpy).not.toHaveBeenCalled()
+        getAllSpy.mockRestore()
+        materializeSpy.mockRestore()
+
+        const root = (await store.readRoot()).value
+        await store.commit({
+            expectedRevision: imported.revision,
+            root: { ...root, username: 'Committed Later' },
+        })
+        expect((await lease.readRoot()).value.username).toBe('Fixture User')
+        expect((await lease.readConversation('char-a', 'conv-short'))?.value.message).toHaveLength(2)
+
+        await lease.release()
+        await lease.release()
+        await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(
+            lease.queryCharacters({ order: 'configured', trash: false, limit: 1 }),
+        ).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.readCharacter('char-a')).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(
+            lease.queryConversations({ characterId: 'char-a', order: 'configured', limit: 1 }),
+        ).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.readConversation('char-a', 'conv-short')).rejects.toBeInstanceOf(
+            SnapshotReleasedError,
+        )
+        await expect(
+            lease.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-short',
+                limit: 1,
+            }),
+        ).rejects.toBeInstanceOf(SnapshotReleasedError)
+    })
+
+    it('sweeps inactive temporary snapshot generations on open', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'orphaned-revision-snapshot'
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(fixtureDatabase)
+
+        const openRequest = indexedDB.open(databaseName)
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+            openRequest.onsuccess = () => resolve(openRequest.result)
+            openRequest.onerror = () => reject(openRequest.error)
+        })
+        const transaction = database.transaction('root', 'readwrite')
+        transaction.objectStore('root').put({
+            key: 'snapshot-orphaned',
+            generation: 'snapshot-orphaned',
+            value: { username: 'Orphaned' },
+        })
+        await new Promise<void>((resolve, reject) => {
+            transaction.oncomplete = () => resolve()
+            transaction.onerror = () => reject(transaction.error)
+            transaction.onabort = () => reject(transaction.error)
+        })
+        database.close()
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+
+        const verifyRequest = indexedDB.open(databaseName)
+        const verifyDatabase = await new Promise<IDBDatabase>((resolve, reject) => {
+            verifyRequest.onsuccess = () => resolve(verifyRequest.result)
+            verifyRequest.onerror = () => reject(verifyRequest.error)
+        })
+        const verifyTransaction = verifyDatabase.transaction('root', 'readonly')
+        const orphan = await new Promise<unknown>((resolve, reject) => {
+            const request = verifyTransaction.objectStore('root').get('snapshot-orphaned')
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })
+        expect(orphan).toBeUndefined()
     })
 })

@@ -109,6 +109,26 @@ export class RevisionConflictError extends Error {
     }
 }
 
+export class SnapshotReleasedError extends Error {
+    constructor() {
+        super('Persistent revision snapshot has been released')
+        this.name = 'SnapshotReleasedError'
+    }
+}
+
+export interface PersistentRevisionLease {
+    readonly revision: DataRevision
+    readRoot(): Promise<Versioned<Omit<Database, 'characters'>>>
+    queryCharacters(input: CharacterQuery): Promise<CharacterPage>
+    readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
+    queryConversations(input: ConversationQuery): Promise<ConversationPage>
+    readConversation(characterId: string, conversationId: string): Promise<Versioned<Chat> | null>
+    readConversationWindow(
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationWindow> | null>
+    release(): Promise<void>
+}
+
 export interface PersistentDataStore {
     open(): Promise<void>
     readRoot(): Promise<Versioned<Omit<Database, 'characters'>>>
@@ -121,4 +141,5 @@ export interface PersistentDataStore {
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
     replaceFromDatabase(database: Database): Promise<{ revision: DataRevision }>
     materializeDatabase(revision?: DataRevision): Promise<Database>
+    acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>
 }

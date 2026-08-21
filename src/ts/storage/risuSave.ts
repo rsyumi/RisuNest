@@ -33,7 +33,7 @@ const checkedRemoteExistence = new Set<string>();
 const magicHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 7]); 
 const magicCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 8]);
 const magicStreamCompressedHeader = new Uint8Array([0, 82, 73, 83, 85, 83, 65, 86, 69, 0, 9]);
-const magicRisuSaveHeader = new TextEncoder().encode("RISUSAVE\0");
+export const magicRisuSaveHeader = new TextEncoder().encode("RISUSAVE\0");
 
 
 async function checkCompressionStreams(){
@@ -90,7 +90,7 @@ export type toSaveType = {
     pluginCustomStorage: boolean;
 }
 
-enum RisuSaveType {
+export enum RisuSaveType {
     CONFIG = 0,
     ROOT = 1,
     CHARACTER_WITH_CHAT = 2,
@@ -112,6 +112,35 @@ type EncodeBlockArg = {
     name:string
     cache?:boolean
     skipRemoteSaving?:boolean
+}
+
+export async function encodeRisuSaveBlock(arg: {
+    compression: boolean
+    data: string
+    type: RisuSaveType
+    name: string
+}): Promise<Uint8Array> {
+    let dataBuffer: Uint8Array
+    if (arg.compression) {
+        await checkCompressionStreams()
+        const stream = new CompressionStream('gzip')
+        const writer = stream.writable.getWriter()
+        writer.write(new TextEncoder().encode(arg.data) as any)
+        writer.close()
+        dataBuffer = new Uint8Array(await new Response(stream.readable).arrayBuffer())
+    } else {
+        dataBuffer = new TextEncoder().encode(arg.data)
+    }
+    const nameBuffer = new TextEncoder().encode(arg.name)
+    const lengthBuffer = new ArrayBuffer(4)
+    new Uint32Array(lengthBuffer)[0] = dataBuffer.length
+    const result = new Uint8Array(2 + 1 + nameBuffer.length + 4 + dataBuffer.length)
+    result.set(new Uint8Array([arg.type, arg.compression ? 1 : 0]), 0)
+    result.set(new Uint8Array([nameBuffer.length]), 2)
+    result.set(nameBuffer, 3)
+    result.set(new Uint8Array(lengthBuffer), 3 + nameBuffer.length)
+    result.set(dataBuffer, 7 + nameBuffer.length)
+    return result
 }
 
 type EncodeBlockOption = {
@@ -343,30 +372,8 @@ export class RisuSaveEncoder {
     }
 
     async encodeRawBlock(arg:EncodeBlockArg){
-        let databuf: Uint8Array;
         const cacheBlock = arg.cache ?? true;
-        if(arg.compression){
-            await checkCompressionStreams();
-            const cs = new CompressionStream('gzip');
-            const writer = cs.writable.getWriter();
-            writer.write(new TextEncoder().encode(arg.data));
-            writer.close();
-            const compressedData = await new Response(cs.readable).arrayBuffer();
-            databuf = (new Uint8Array(compressedData));
-        }
-        else{
-            databuf = (new TextEncoder().encode(arg.data));
-        }
-        const nameBuf = new TextEncoder().encode(arg.name);
-        const lengthBuf = new ArrayBuffer(4);
-        new Uint32Array(lengthBuf)[0] = databuf.length;
-        const arrayBuf = new ArrayBuffer(2 + 1 + nameBuf.length + 4 + databuf.length);
-        const buf = new Uint8Array(arrayBuf);
-        buf.set(new Uint8Array([arg.type, arg.compression ? 1 : 0]), 0);
-        buf.set(new Uint8Array([nameBuf.length]), 2);
-        buf.set(nameBuf, 3);
-        buf.set(new Uint8Array(lengthBuf), 3 + nameBuf.length);
-        buf.set(databuf, 7 + nameBuf.length);
+        const buf = await encodeRisuSaveBlock(arg)
         await risuSaveCacheForage.setItem(`risuSaveBlock_${arg.name}`, {
             type: arg.type,
             data: arg.data,

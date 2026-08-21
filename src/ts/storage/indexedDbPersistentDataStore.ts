@@ -12,15 +12,18 @@ import type {
     ConversationWindowQuery,
     DataRevision,
     PersistentDataStore,
+    PersistentRevisionLease,
     Versioned,
     WorkingSetCommit,
 } from './persistentDataStore'
-import { RevisionConflictError } from './persistentDataStore'
+import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
 
 const DATABASE_VERSION = 2
 const MESSAGE_PAGE_SIZE = 128
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
 const STORE_NAMES = ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
+const DATA_STORE_NAMES = ['root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
+const activeSnapshotGenerations = new Set<string>()
 
 interface StoredRecord<T> {
     key: string
@@ -171,6 +174,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             transaction.objectStore('root').put({ key: generation, generation, value: {} })
         }
         await transactionDone(transaction)
+        await this.sweepTemporaryGenerations()
     }
 
     async readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
@@ -487,6 +491,316 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const result = { ...root.value, characters } as Database
         await transactionDone(transaction)
         return result
+    }
+
+    async acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease> {
+        const database = this.requireDatabase()
+        const generation = `snapshot-${revision}-${globalThis.crypto.randomUUID()}`
+        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
+        activeSnapshotGenerations.add(generation)
+        try {
+            const active = await this.readActive(transaction)
+            if (active.revision !== revision) {
+                throw new RevisionConflictError(revision, active.revision)
+            }
+            const root = (await requestResult(
+                transaction.objectStore('root').get(active.generation),
+            )) as StoredRecord<Omit<Database, 'characters'>> | undefined
+            if (!root) throw new RevisionConflictError(revision, active.revision)
+            transaction.objectStore('root').put({ ...root, key: generation, generation })
+            for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
+                await this.copyGeneration(
+                    transaction.objectStore(storeName),
+                    active.generation,
+                    generation,
+                )
+            }
+            await transactionDone(transaction)
+        } catch (error) {
+            activeSnapshotGenerations.delete(generation)
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+
+        let released = false
+        let releasePromise: Promise<void> | undefined
+        const assertActive = () => {
+            if (released) throw new SnapshotReleasedError()
+        }
+        return {
+            revision,
+            readRoot: async () => {
+                assertActive()
+                return this.readRootAt(revision, generation)
+            },
+            queryCharacters: async (input) => {
+                assertActive()
+                return this.queryCharactersAt(generation, input)
+            },
+            readCharacter: async (id) => {
+                assertActive()
+                return this.readCharacterAt(revision, generation, id)
+            },
+            queryConversations: async (input) => {
+                assertActive()
+                return this.queryConversationsAt(generation, input)
+            },
+            readConversation: async (characterId, conversationId) => {
+                assertActive()
+                return this.readConversationAt(revision, generation, characterId, conversationId)
+            },
+            readConversationWindow: async (input) => {
+                assertActive()
+                return this.readConversationWindowAt(revision, generation, input)
+            },
+            release: async () => {
+                if (releasePromise) return releasePromise
+                released = true
+                releasePromise = this.deleteGeneration(generation).finally(() => {
+                    activeSnapshotGenerations.delete(generation)
+                })
+                return releasePromise
+            },
+        }
+    }
+
+    private async readRootAt(
+        revision: DataRevision,
+        generation: string,
+    ): Promise<Versioned<Omit<Database, 'characters'>>> {
+        const transaction = this.requireDatabase().transaction('root', 'readonly')
+        const record = (await requestResult(
+            transaction.objectStore('root').get(generation),
+        )) as StoredRecord<Omit<Database, 'characters'>> | undefined
+        await transactionDone(transaction)
+        if (!record) throw new Error('Persistent snapshot root is missing')
+        return { revision, value: record.value }
+    }
+
+    private async queryCharactersAt(
+        generation: string,
+        input: CharacterQuery,
+    ): Promise<CharacterPage> {
+        const transaction = this.requireDatabase().transaction('catalog', 'readonly')
+        const index = transaction.objectStore('catalog').index(
+            input.order === 'configured' ? 'byGenerationConfigured' : 'byGenerationRecent',
+        )
+        const search = input.search?.trim().toLocaleLowerCase()
+        const range =
+            input.order === 'configured'
+                ? this.keyRangeFactory.bound([generation, 0], [generation, MAX_INDEX_VALUE])
+                : this.keyRangeFactory.bound(
+                      [generation, -MAX_INDEX_VALUE, 0],
+                      [generation, 0, MAX_INDEX_VALUE],
+                  )
+        const result = await cursorPage<CharacterSummary>(
+            index,
+            range,
+            input,
+            (item) =>
+                item.trashed === input.trash &&
+                (!search || item.name.toLocaleLowerCase().includes(search)),
+        )
+        await transactionDone(transaction)
+        return result
+    }
+
+    private async readCharacterAt(
+        revision: DataRevision,
+        generation: string,
+        id: string,
+    ): Promise<Versioned<CharacterDetail> | null> {
+        const transaction = this.requireDatabase().transaction('characters', 'readonly')
+        const record = (await requestResult(
+            transaction.objectStore('characters').get(this.characterKey(generation, id)),
+        )) as StoredRecord<CharacterDetail> | undefined
+        await transactionDone(transaction)
+        return record ? { revision, value: record.value } : null
+    }
+
+    private async queryConversationsAt(
+        generation: string,
+        input: ConversationQuery,
+    ): Promise<ConversationPage> {
+        const transaction = this.requireDatabase().transaction('conversations', 'readonly')
+        const index = transaction.objectStore('conversations').index(
+            input.order === 'configured'
+                ? 'byGenerationCharacterConfigured'
+                : 'byGenerationCharacterRecent',
+        )
+        const prefix = [generation, input.characterId]
+        const range =
+            input.order === 'configured'
+                ? this.keyRangeFactory.bound([...prefix, 0], [...prefix, MAX_INDEX_VALUE])
+                : this.keyRangeFactory.bound(
+                      [...prefix, -MAX_INDEX_VALUE, 0],
+                      [...prefix, 0, MAX_INDEX_VALUE],
+                  )
+        const result = await cursorPage<StoredConversation>(index, range, input, () => true)
+        await transactionDone(transaction)
+        return { items: result.items.map((item) => item.summary), nextCursor: result.nextCursor }
+    }
+
+    private async readConversationAt(
+        revision: DataRevision,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<Chat> | null> {
+        const transaction = this.requireDatabase().transaction(
+            ['conversations', 'messagePages'],
+            'readonly',
+        )
+        const record = (await requestResult(
+            transaction
+                .objectStore('conversations')
+                .get(this.conversationKey(generation, characterId, conversationId)),
+        )) as StoredRecord<StoredConversation> | undefined
+        if (!record) {
+            await transactionDone(transaction)
+            return null
+        }
+        const message = await this.readMessagesFromTransaction(
+            transaction,
+            generation,
+            characterId,
+            conversationId,
+        )
+        await transactionDone(transaction)
+        return { revision, value: { ...record.value.detail, message } }
+    }
+
+    private async readConversationWindowAt(
+        revision: DataRevision,
+        generation: string,
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationWindow> | null> {
+        const transaction = this.requireDatabase().transaction(
+            ['conversations', 'messagePages'],
+            'readonly',
+        )
+        const conversation = (await requestResult(
+            transaction
+                .objectStore('conversations')
+                .get(this.conversationKey(generation, input.characterId, input.conversationId)),
+        )) as StoredRecord<StoredConversation> | undefined
+        if (!conversation) {
+            await transactionDone(transaction)
+            return null
+        }
+        const totalMessages = conversation.value.summary.messageCount
+        let startIndex: number
+        let endIndex: number
+        let anchorPage: StoredMessagePage | undefined
+        if (input.anchorMessageId !== undefined) {
+            const anchor = await this.findMessage(
+                transaction,
+                generation,
+                input.characterId,
+                input.conversationId,
+                input.anchorMessageId,
+                totalMessages,
+            )
+            if (!anchor) {
+                await transactionDone(transaction)
+                return null
+            }
+            anchorPage = anchor.page
+            startIndex = Math.max(0, anchor.index - Math.max(0, input.before ?? 0))
+            endIndex = Math.min(totalMessages, anchor.index + Math.max(0, input.after ?? 0) + 1)
+        } else {
+            endIndex = totalMessages
+            startIndex = Math.max(0, endIndex - Math.max(0, input.limit ?? MESSAGE_PAGE_SIZE))
+        }
+        const messages = await this.readMessageRange(
+            transaction,
+            generation,
+            input.characterId,
+            input.conversationId,
+            startIndex,
+            endIndex,
+            anchorPage,
+        )
+        await transactionDone(transaction)
+        return {
+            revision,
+            value: {
+                characterId: input.characterId,
+                conversationId: input.conversationId,
+                messages,
+                startIndex,
+                endIndex,
+                totalMessages,
+                hasMoreBefore: startIndex > 0,
+                hasMoreAfter: endIndex < totalMessages,
+            },
+        }
+    }
+
+    private copyGeneration(
+        store: IDBObjectStore,
+        sourceGeneration: string,
+        targetGeneration: string,
+    ): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const request = store.index('byGeneration').openCursor(this.keyRangeFactory.only(sourceGeneration))
+            request.onerror = () => reject(request.error)
+            request.onsuccess = () => {
+                const cursor = request.result
+                if (!cursor) {
+                    resolve()
+                    return
+                }
+                const record = cursor.value as StoredRecord<unknown>
+                store.put({
+                    ...record,
+                    key: `${targetGeneration}${record.key.slice(sourceGeneration.length)}`,
+                    generation: targetGeneration,
+                })
+                cursor.continue()
+            }
+        })
+    }
+
+    private async deleteGeneration(generation: string): Promise<void> {
+        const transaction = this.requireDatabase().transaction([...DATA_STORE_NAMES], 'readwrite')
+        transaction.objectStore('root').delete(generation)
+        for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
+            await this.deleteIndexRange(
+                transaction.objectStore(storeName).index('byGeneration'),
+                this.keyRangeFactory.only(generation),
+            )
+        }
+        await transactionDone(transaction)
+    }
+
+    private async sweepTemporaryGenerations(): Promise<void> {
+        const database = this.requireDatabase()
+        const transaction = database.transaction([...DATA_STORE_NAMES], 'readwrite')
+        for (const storeName of DATA_STORE_NAMES) {
+            await new Promise<void>((resolve, reject) => {
+                const request = transaction.objectStore(storeName).openCursor()
+                request.onerror = () => reject(request.error)
+                request.onsuccess = () => {
+                    const cursor = request.result
+                    if (!cursor) {
+                        resolve()
+                        return
+                    }
+                    const generation = (cursor.value as StoredRecord<unknown>).generation
+                    if (
+                        generation.startsWith('snapshot-') &&
+                        !activeSnapshotGenerations.has(generation)
+                    ) {
+                        cursor.delete()
+                    }
+                    cursor.continue()
+                }
+            })
+        }
+        await transactionDone(transaction)
     }
 
     private async applyConversationMutation(
