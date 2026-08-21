@@ -11,6 +11,18 @@ export interface PluginCompatibilityController {
     transition(next: PluginCompatibilityProfile): Promise<PluginCompatibilityProfile>
 }
 
+interface PluginLoadRequest<T> {
+    nextProfile: PluginCompatibilityProfile
+    pluginV2: readonly T[]
+    pluginV3: readonly T[]
+}
+
+interface PluginLoadDependencies<T> {
+    controller: PluginCompatibilityController
+    loadV2(plugins: readonly T[], isCurrent: () => boolean): Promise<unknown>
+    loadV3(plugins: readonly T[]): Promise<unknown>
+}
+
 export function selectPluginCompatibilityProfile(
     plugins: readonly PluginCompatibilityDescriptor[],
 ): PluginCompatibilityProfile {
@@ -19,10 +31,46 @@ export function selectPluginCompatibilityProfile(
         : 'scalable-v3'
 }
 
+export function createFullCompatibilityPersistence<T>(
+    getCompatibilitySnapshot: () => T,
+    replacePersistentDatabase: (database: T, reason: string) => Promise<void>,
+): () => Promise<void> {
+    return () =>
+        replacePersistentDatabase(getCompatibilitySnapshot(), 'plugin-profile-change')
+}
+
+export function createPluginLoadOrchestrator<T>(dependencies: PluginLoadDependencies<T>) {
+    let loadGeneration = 0
+
+    return async (request: PluginLoadRequest<T>): Promise<void> => {
+        const generation = ++loadGeneration
+        const isCurrent = () => generation === loadGeneration
+
+        if (
+            dependencies.controller.profile === 'maximum-compatibility' &&
+            request.nextProfile === 'scalable-v3'
+        ) {
+            await dependencies.loadV2([], isCurrent)
+            if (!isCurrent()) return
+            const appliedProfile = await dependencies.controller.transition(request.nextProfile)
+            if (!isCurrent() || appliedProfile !== request.nextProfile) return
+        } else {
+            const appliedProfile = await dependencies.controller.transition(request.nextProfile)
+            if (!isCurrent() || appliedProfile !== request.nextProfile) return
+            await dependencies.loadV2(request.pluginV2, isCurrent)
+            if (!isCurrent()) return
+        }
+
+        await dependencies.loadV3(request.pluginV3)
+    }
+}
+
 export function createPluginCompatibilityController(
-    flushBeforeEviction: () => Promise<void>,
+    persistBeforeEviction: () => Promise<void>,
 ): PluginCompatibilityController {
     let profile: PluginCompatibilityProfile = 'scalable-v3'
+    let transitionGeneration = 0
+    let pendingPersistence: Promise<void> | null = null
 
     return {
         get profile() {
@@ -32,13 +80,27 @@ export function createPluginCompatibilityController(
             return profile === 'scalable-v3'
         },
         async transition(next) {
-            if (next === profile) return profile
+            const generation = ++transitionGeneration
             if (next === 'maximum-compatibility') {
                 profile = next
+                if (pendingPersistence) {
+                    await pendingPersistence.catch(() => undefined)
+                }
                 return profile
             }
-            await flushBeforeEviction()
-            profile = next
+            if (next === profile) return profile
+
+            const persistence = (pendingPersistence ??= persistBeforeEviction())
+            try {
+                await persistence
+            } finally {
+                if (pendingPersistence === persistence) {
+                    pendingPersistence = null
+                }
+            }
+            if (generation === transitionGeneration) {
+                profile = next
+            }
             return profile
         },
     }

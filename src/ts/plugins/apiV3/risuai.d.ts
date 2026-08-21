@@ -1211,6 +1211,8 @@ interface PluginCharacterSummary {
 }
 
 interface PluginCharacterPage {
+    /** Persistent revision represented by this page. */
+    revision: number;
     items: PluginCharacterSummary[];
     nextCursor?: string;
 }
@@ -1225,6 +1227,8 @@ interface PluginConversationSummary {
 }
 
 interface PluginConversationPage {
+    /** Persistent revision represented by this page. */
+    revision: number;
     items: PluginConversationSummary[];
     nextCursor?: string;
 }

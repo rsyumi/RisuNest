@@ -12,10 +12,12 @@ import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClas
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
+    createFullCompatibilityPersistence,
     createPluginCompatibilityController,
+    createPluginLoadOrchestrator,
     selectPluginCompatibilityProfile,
 } from "./pluginCompatibility";
-import { flushPendingData } from "../storage/persistentDataRuntime.svelte";
+import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 
 export const customProviderStore = writable([] as string[])
 
@@ -434,9 +436,18 @@ export async function importPlugin(code:string|null = null, argu:{
 
 let pluginTranslator = false
 
-export const pluginCompatibility = createPluginCompatibilityController(() =>
-    flushPendingData('plugin-profile-change'),
+export const pluginCompatibility = createPluginCompatibilityController(
+    createFullCompatibilityPersistence(
+        () => getDatabase({ snapshot: true }),
+        replacePersistentDatabase,
+    ),
 )
+
+const applyPluginLoad = createPluginLoadOrchestrator<RisuPlugin>({
+    controller: pluginCompatibility,
+    loadV2: loadV2Plugin,
+    loadV3: loadV3Plugins,
+})
 
 export async function loadPlugins() {
     console.log('Loading plugins...')
@@ -448,17 +459,7 @@ export async function loadPlugins() {
     const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
     const nextProfile = selectPluginCompatibilityProfile(plugins)
 
-    if (
-        pluginCompatibility.profile === 'maximum-compatibility' &&
-        nextProfile === 'scalable-v3'
-    ) {
-        await loadV2Plugin([])
-        await pluginCompatibility.transition(nextProfile)
-    } else {
-        await pluginCompatibility.transition(nextProfile)
-        await loadV2Plugin(pluginV2)
-    }
-    await loadV3Plugins(pluginV3)
+    await applyPluginLoad({ nextProfile, pluginV2, pluginV3 })
 }
 
 export type PluginV2ProviderArgument = {
@@ -846,13 +847,18 @@ export const getV2PluginAPIs = () => {
     }
 }
 
-export async function loadV2Plugin(plugins: RisuPlugin[]) {
+export async function loadV2Plugin(
+    plugins: readonly RisuPlugin[],
+    isCurrent: () => boolean = () => true,
+) {
 
     if (pluginV2.loaded) {
         for (const unload of pluginV2.unload) {
             await unload()
+            if (!isCurrent()) return
         }
 
+        if (!isCurrent()) return
         pluginV2.providers.clear()
         pluginV2.editdisplay.clear()
         pluginV2.editoutput.clear()
@@ -861,11 +867,13 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
         pluginV2.chatOutput.clear()
     }
 
+    if (!isCurrent()) return
     pluginV2.loaded = true
 
     globalThis.__pluginApis__ = getV2PluginAPIs()
 
     for (const plugin of plugins) {
+        if (!isCurrent()) return
         let data = ''
         let version = plugin.version || 2
 
@@ -921,6 +929,7 @@ export async function loadV2Plugin(plugins: RisuPlugin[]) {
 
         if(version === '2.1'){
             const safety = (await checkCodeSafety(plugin.script))
+            if (!isCurrent()) return
             data = safety.modifiedCode
             console.log('Safety check result:', safety)
             console.log('Loading V2.1 Plugin', plugin.name, data)

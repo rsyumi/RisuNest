@@ -196,6 +196,7 @@ do {
         cursor: characterCursor,
     })
     if (!page) break
+    console.log('Persistent revision:', page.revision)
     for (const character of page.items) {
         console.log(character.id, character.name)
     }
@@ -215,6 +216,7 @@ do {
         cursor: conversationCursor,
     })
     if (!page) break
+    console.log('Persistent revision:', page.revision)
     for (const conversation of page.items) {
         console.log(conversation.id, conversation.name)
     }
@@ -245,6 +247,8 @@ selects maximum compatibility, while disabled API v2.1 plugins do not. Maximum c
 preserves the synchronous live database Proxy, root DOM behavior, visual plugins, and global
 CSS, but cannot guarantee memory independent of library size. The scalable profile does not
 remove V3 root DOM access, visual APIs, or global CSS compatibility.
+Before leaving maximum compatibility, RisuAI persists a detached complete database snapshot so
+changes made through the live Proxy are durable before compatibility data can be evicted.
 
 `getDatabase()` remains supported as the explicit compatibility snapshot. Requesting
 `characters`, including its default `'all'`, can temporarily materialize the complete library.
