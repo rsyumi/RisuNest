@@ -15,6 +15,7 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
+    "benchmark:phase1": "vitest bench src/ts/process/phase1Algorithms.bench.ts --run --pool=forks --maxWorkers=1 --no-file-parallelism",
     "tauri": "tauri",
     "android:init": "tauri android init --ci --skip-targets-install",
     "android:build:emulator": "tauri android build --debug --apk --target x86_64 --ci",
