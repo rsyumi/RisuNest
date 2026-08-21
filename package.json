@@ -11,6 +11,7 @@
     "dev": "vite",
     "build": "vite build --sourcemap",
     "tauribuild": "vite build",
+    "tauribuild:android": "vite build --mode android",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
