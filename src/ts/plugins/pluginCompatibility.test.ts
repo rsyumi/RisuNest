@@ -142,41 +142,176 @@ describe('plugin compatibility profiles', () => {
         )
     })
 
-    it('prevents an older unload from clearing a re-enabled v2.1 runtime', async () => {
+    it('serializes a late v2 unload before a newer v2.1 runtime load', async () => {
         const unloadStarted = deferred<void>()
         const finishUnload = deferred<void>()
         const loadedV2: string[] = []
         const loadedV3: string[] = []
+        let activeStages = 0
+        let overlapped = false
         const controller = createPluginCompatibilityController(async () => undefined)
         await controller.transition('maximum-compatibility')
         const load = createPluginLoadOrchestrator<string>({
             controller,
-            loadV2: async (plugins, isCurrent) => {
-                if (plugins.length === 0) {
-                    unloadStarted.resolve(undefined)
-                    await finishUnload.promise
+            loadV2: async (plugins) => {
+                activeStages++
+                if (activeStages > 1) overlapped = true
+                try {
+                    if (plugins.length === 0) {
+                        unloadStarted.resolve(undefined)
+                        await finishUnload.promise
+                    }
+                    loadedV2.splice(0, loadedV2.length, ...plugins)
+                } finally {
+                    activeStages--
                 }
-                if (!isCurrent()) return
-                loadedV2.splice(0, loadedV2.length, ...plugins)
             },
             loadV3: async (plugins) => {
+                activeStages++
+                if (activeStages > 1) overlapped = true
                 loadedV3.splice(0, loadedV3.length, ...plugins)
+                activeStages--
             },
         })
 
         const disabling = load({ nextProfile: 'scalable-v3', pluginV2: [], pluginV3: ['old-v3'] })
         await unloadStarted.promise
-        await load({
+        let enablingSettled = false
+        const enabling = load({
             nextProfile: 'maximum-compatibility',
             pluginV2: ['enabled-v2.1'],
             pluginV3: ['new-v3'],
+        }).then(() => {
+            enablingSettled = true
         })
+        expect(controller.profile).toBe('maximum-compatibility')
+        expect(controller.allowsEviction).toBe(false)
+        await Promise.resolve()
+        expect(enablingSettled).toBe(false)
         finishUnload.resolve(undefined)
         await disabling
+        await enabling
 
+        expect(overlapped).toBe(false)
         expect(controller.profile).toBe('maximum-compatibility')
         expect(controller.allowsEviction).toBe(false)
         expect(loadedV2).toEqual(['enabled-v2.1'])
         expect(loadedV3).toEqual(['new-v3'])
+    })
+
+    it('serializes an in-flight v3 load before the latest plugin runtime', async () => {
+        const oldV3Started = deferred<void>()
+        const finishOldV3 = deferred<void>()
+        const loadedV2: string[] = []
+        const loadedV3: string[] = []
+        let activeStages = 0
+        let overlapped = false
+        const controller = createPluginCompatibilityController(async () => undefined)
+        const load = createPluginLoadOrchestrator<string>({
+            controller,
+            loadV2: async (plugins) => {
+                activeStages++
+                if (activeStages > 1) overlapped = true
+                loadedV2.splice(0, loadedV2.length, ...plugins)
+                activeStages--
+            },
+            loadV3: async (plugins) => {
+                activeStages++
+                if (activeStages > 1) overlapped = true
+                try {
+                    if (plugins.includes('old-v3')) {
+                        oldV3Started.resolve(undefined)
+                        await finishOldV3.promise
+                    }
+                    loadedV3.splice(0, loadedV3.length, ...plugins)
+                } finally {
+                    activeStages--
+                }
+            },
+        })
+
+        const oldLoad = load({
+            nextProfile: 'scalable-v3',
+            pluginV2: [],
+            pluginV3: ['old-v3'],
+        })
+        await oldV3Started.promise
+        let latestSettled = false
+        const latestLoad = load({
+            nextProfile: 'maximum-compatibility',
+            pluginV2: ['latest-v2.1'],
+            pluginV3: ['latest-v3'],
+        }).then(() => {
+            latestSettled = true
+        })
+
+        expect(controller.profile).toBe('maximum-compatibility')
+        expect(controller.allowsEviction).toBe(false)
+        await Promise.resolve()
+        expect(latestSettled).toBe(false)
+        finishOldV3.resolve(undefined)
+        await oldLoad
+        await latestLoad
+
+        expect(overlapped).toBe(false)
+        expect(loadedV2).toEqual(['latest-v2.1'])
+        expect(loadedV3).toEqual(['latest-v3'])
+        expect(controller.profile).toBe('maximum-compatibility')
+        expect(controller.allowsEviction).toBe(false)
+    })
+
+    it('continues queued plugin loads after an earlier operation rejects', async () => {
+        const failingV3Started = deferred<void>()
+        const rejectFailingV3 = deferred<void>()
+        const loadedV3: string[] = []
+        const error = new Error('v3 unload failed')
+        let activeStages = 0
+        let overlapped = false
+        const controller = createPluginCompatibilityController(async () => undefined)
+        const load = createPluginLoadOrchestrator<string>({
+            controller,
+            loadV2: async () => undefined,
+            loadV3: async (plugins) => {
+                activeStages++
+                if (activeStages > 1) overlapped = true
+                try {
+                    if (plugins.includes('failing-v3')) {
+                        failingV3Started.resolve(undefined)
+                        await rejectFailingV3.promise
+                        throw error
+                    }
+                    loadedV3.splice(0, loadedV3.length, ...plugins)
+                } finally {
+                    activeStages--
+                }
+            },
+        })
+
+        const failingLoad = load({
+            nextProfile: 'scalable-v3',
+            pluginV2: [],
+            pluginV3: ['failing-v3'],
+        })
+        await failingV3Started.promise
+        let recoverySettled = false
+        const recoveryLoad = load({
+            nextProfile: 'maximum-compatibility',
+            pluginV2: ['enabled-v2.1'],
+            pluginV3: ['recovered-v3'],
+        }).then(() => {
+            recoverySettled = true
+        })
+
+        await Promise.resolve()
+        expect(recoverySettled).toBe(false)
+        rejectFailingV3.resolve(undefined)
+        await expect(failingLoad).rejects.toBe(error)
+        await recoveryLoad
+
+        expect(overlapped).toBe(false)
+        expect(recoverySettled).toBe(true)
+        expect(loadedV3).toEqual(['recovered-v3'])
+        expect(controller.profile).toBe('maximum-compatibility')
+        expect(controller.allowsEviction).toBe(false)
     })
 })

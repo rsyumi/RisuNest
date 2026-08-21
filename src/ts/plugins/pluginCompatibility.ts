@@ -41,27 +41,50 @@ export function createFullCompatibilityPersistence<T>(
 
 export function createPluginLoadOrchestrator<T>(dependencies: PluginLoadDependencies<T>) {
     let loadGeneration = 0
+    let operationTail = Promise.resolve()
 
-    return async (request: PluginLoadRequest<T>): Promise<void> => {
+    return (request: PluginLoadRequest<T>): Promise<void> => {
         const generation = ++loadGeneration
         const isCurrent = () => generation === loadGeneration
+        const maximumTransition =
+            request.nextProfile === 'maximum-compatibility'
+                ? dependencies.controller.transition('maximum-compatibility')
+                : null
 
-        if (
-            dependencies.controller.profile === 'maximum-compatibility' &&
-            request.nextProfile === 'scalable-v3'
-        ) {
-            await dependencies.loadV2([], isCurrent)
+        const operation = operationTail.then(async () => {
+            let appliedMaximumProfile: PluginCompatibilityProfile | null = null
+            if (maximumTransition) {
+                appliedMaximumProfile = await maximumTransition
+            }
             if (!isCurrent()) return
-            const appliedProfile = await dependencies.controller.transition(request.nextProfile)
-            if (!isCurrent() || appliedProfile !== request.nextProfile) return
-        } else {
-            const appliedProfile = await dependencies.controller.transition(request.nextProfile)
-            if (!isCurrent() || appliedProfile !== request.nextProfile) return
-            await dependencies.loadV2(request.pluginV2, isCurrent)
-            if (!isCurrent()) return
-        }
 
-        await dependencies.loadV3(request.pluginV3)
+            if (
+                dependencies.controller.profile === 'maximum-compatibility' &&
+                request.nextProfile === 'scalable-v3'
+            ) {
+                await dependencies.loadV2([], isCurrent)
+                if (!isCurrent()) return
+                const appliedProfile = await dependencies.controller.transition(
+                    request.nextProfile,
+                )
+                if (!isCurrent() || appliedProfile !== request.nextProfile) return
+            } else {
+                const appliedProfile =
+                    appliedMaximumProfile ??
+                    (await dependencies.controller.transition(request.nextProfile))
+                if (!isCurrent() || appliedProfile !== request.nextProfile) return
+                await dependencies.loadV2(request.pluginV2, isCurrent)
+                if (!isCurrent()) return
+            }
+
+            await dependencies.loadV3(request.pluginV3)
+        })
+
+        operationTail = operation.then(
+            () => undefined,
+            () => undefined,
+        )
+        return operation
     }
 }
 
