@@ -564,7 +564,7 @@ type PluginV3ProviderOptions = PluginV2ProviderOptions & {
 
 export const customV3ProviderMetaStore:LLMModel[] = []
 
-const getPluginPermission = async (pluginName: string, permissionDesc: 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat', reconfirm: boolean|'periodically' = false) => {
+const getPluginPermission = async (pluginName: string, permissionDesc: 'fetchLogs'|'db'|'mainDom'|'replacer'|'provider'|'sendChat'|'inlay', reconfirm: boolean|'periodically' = false) => {
     if(permissionGivenPlugins.has(pluginName)){
         return true;
     }
@@ -606,6 +606,7 @@ const getPluginPermission = async (pluginName: string, permissionDesc: 'fetchLog
         : permissionDesc === 'replacer' ? language.replacerPermissionConsent.replace("{}", pluginName)
         : permissionDesc === 'provider' ? language.providerPermissionConsent.replace("{}", pluginName)
         : permissionDesc === 'sendChat' ? language.sendChatConsent.replace("{}", pluginName)
+        : permissionDesc === 'inlay' ? language.inlayPermissionConsent.replace("{}", pluginName)
         : `Error`
     if(alertTitle === 'Error'){
         return false;
@@ -728,6 +729,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         addRisuChatListener: async (mode:'output', func:Function) => {
+            //permission check, lets use same as replacer
+            const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
+            if(!conf){
+                return;
+            }
             oldApis.addRisuChatListener(mode, func as any);
             addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuChatListener(mode, func as any));
         },
@@ -737,6 +743,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
         readInlay: async (id: string) => {
+            const conf = await getPluginPermission(plugin.name, 'inlay', 'periodically');
+            if(!conf){
+                return null;
+            }
             return await getInlayAsset(id);
         },
         saveAsset: oldApis.saveAsset,
