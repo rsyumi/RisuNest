@@ -319,11 +319,16 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const replacement = structuredClone(fixtureDatabase.characters[1])
         replacement.chats[0].message = replacement.chats[0].message.slice(0, 1)
         const cursorRanges: Array<{
+            store: string
             index: string
             lower: IDBValidKey | undefined
             upper: IDBValidKey | undefined
+            direction: IDBCursorDirection | undefined
         }> = []
+        const objectStoreIo: Array<{ store: string; operation: 'openCursor' | 'clear' }> = []
         const originalOpenCursor = IDBIndex.prototype.openCursor
+        const originalObjectStoreOpenCursor = IDBObjectStore.prototype.openCursor
+        const originalClear = IDBObjectStore.prototype.clear
         const cursorSpy = vi
             .spyOn(IDBIndex.prototype, 'openCursor')
             .mockImplementation(function (
@@ -331,8 +336,33 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 ...args: Parameters<IDBIndex['openCursor']>
             ) {
                 const range = args[0] instanceof IDBKeyRange ? args[0] : undefined
-                cursorRanges.push({ index: this.name, lower: range?.lower, upper: range?.upper })
+                cursorRanges.push({
+                    store: this.objectStore.name,
+                    index: this.name,
+                    lower: range?.lower,
+                    upper: range?.upper,
+                    direction: args[1],
+                })
                 return originalOpenCursor.apply(this, args)
+            })
+        const objectStoreCursorSpy = vi
+            .spyOn(IDBObjectStore.prototype, 'openCursor')
+            .mockImplementation(function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore['openCursor']>
+            ) {
+                if (this.name === 'conversations' || this.name === 'messagePages') {
+                    objectStoreIo.push({ store: this.name, operation: 'openCursor' })
+                }
+                return originalObjectStoreOpenCursor.apply(this, args)
+            })
+        const clearSpy = vi
+            .spyOn(IDBObjectStore.prototype, 'clear')
+            .mockImplementation(function (this: IDBObjectStore) {
+                if (this.name === 'conversations' || this.name === 'messagePages') {
+                    objectStoreIo.push({ store: this.name, operation: 'clear' })
+                }
+                return originalClear.apply(this)
             })
 
         try {
@@ -342,18 +372,27 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             })
         } finally {
             cursorSpy.mockRestore()
+            objectStoreCursorSpy.mockRestore()
+            clearSpy.mockRestore()
         }
 
-        expect(cursorRanges).toContainEqual({
-            index: 'byGenerationCharacterConfigured',
-            lower: ['revision-1', 'char-a', 0],
-            upper: ['revision-1', 'char-a', Number.MAX_SAFE_INTEGER],
-        })
-        expect(cursorRanges).toContainEqual({
-            index: 'byGenerationCharacter',
-            lower: ['revision-1', 'char-a'],
-            upper: ['revision-1', 'char-a'],
-        })
+        expect(cursorRanges).toEqual([
+            {
+                store: 'conversations',
+                index: 'byGenerationCharacterConfigured',
+                lower: ['revision-1', 'char-a', 0],
+                upper: ['revision-1', 'char-a', Number.MAX_SAFE_INTEGER],
+                direction: undefined,
+            },
+            {
+                store: 'messagePages',
+                index: 'byGenerationCharacter',
+                lower: ['revision-1', 'char-a'],
+                upper: ['revision-1', 'char-a'],
+                direction: undefined,
+            },
+        ])
+        expect(objectStoreIo).toEqual([])
         expect((await store.readConversation('char-b', 'conv-beta'))?.value.message).toHaveLength(3)
 
         const openRequest = indexedDB.open('selected-character-write-shape')

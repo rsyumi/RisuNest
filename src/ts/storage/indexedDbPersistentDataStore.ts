@@ -974,9 +974,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )) as StoredRecord<CharacterSummary> | undefined
         const configuredIndex =
             existing?.value.configuredIndex ??
-            (await requestResult(
-                transaction.objectStore('catalog').index('byGeneration').count(generation),
-            ))
+            (await this.nextCharacterConfiguredIndex(transaction, generation))
 
         await this.deleteIndexRange(
             transaction.objectStore('conversations').index('byGenerationCharacterConfigured'),
@@ -1001,6 +999,26 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         for (let index = 0; index < chats.length; index++) {
             this.putConversation(transaction, generation, character.chaId, chats[index], index)
         }
+    }
+
+    private async nextCharacterConfiguredIndex(
+        transaction: IDBTransaction,
+        generation: string,
+    ): Promise<number> {
+        const cursor = await requestResult(
+            transaction
+                .objectStore('catalog')
+                .index('byGenerationConfigured')
+                .openCursor(
+                    this.keyRangeFactory.bound(
+                        [generation, 0],
+                        [generation, MAX_INDEX_VALUE],
+                    ),
+                    'prev',
+                ),
+        )
+        if (!cursor) return 0
+        return (cursor.value as StoredRecord<CharacterSummary>).value.configuredIndex + 1
     }
 
     private putCharacterRecords(

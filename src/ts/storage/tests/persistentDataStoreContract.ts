@@ -104,20 +104,9 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     })
                 )?.value.messages.map((message) => message.chatId),
             ).toEqual(['msg-128', 'msg-129'])
-            expect(await reopened.readConversation('char-a', 'conv-short')).toMatchObject({
-                revision: 1,
-                value: {
-                    id: 'conv-short',
-                    name: 'Short chat',
-                    note: '',
-                    localLore: [],
-                    lastDate: 250,
-                    message: [
-                        { chatId: 'msg-000', data: 'message-000' },
-                        { chatId: 'msg-001', data: 'message-001' },
-                    ],
-                },
-            })
+            const conversation = await reopened.readConversation('char-a', 'conv-short')
+            expect(conversation?.revision).toBe(1)
+            expect(conversation?.value).toEqual(fixtureDatabase.characters[1].chats[1])
         })
 
         it('rejects stale commits without changing the current data', async () => {
@@ -229,6 +218,30 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     message: [{ chatId: 'msg-added', data: 'added' }],
                 },
             })
+        })
+
+        it('appends a new character after the greatest configured index despite catalog gaps', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(fixtureDatabase)
+            const afterDelete = await store.commit({
+                expectedRevision: imported.revision,
+                deleteCharacterId: 'char-a',
+            })
+            const replacement = structuredClone(fixtureDatabase.characters[1])
+            replacement.chaId = 'char-new'
+            replacement.name = 'New character'
+
+            await store.commit({
+                expectedRevision: afterDelete.revision,
+                replaceCharacter: replacement,
+            })
+
+            expect(
+                (await store.queryCharacters({ order: 'configured', trash: false, limit: 10 })).items,
+            ).toMatchObject([
+                { id: 'char-b', configuredIndex: 0 },
+                { id: 'char-new', configuredIndex: 3 },
+            ])
         })
 
         it('removes omitted conversations and their message pages', async () => {
