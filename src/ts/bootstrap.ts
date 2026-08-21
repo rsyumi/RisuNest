@@ -8,9 +8,8 @@ import {
     remove
 } from "@tauri-apps/plugin-fs"
 import { changeFullscreen, checkNullish, sleep } from "./util"
-import { v4 as uuidv4 } from 'uuid';
 import { get } from "svelte/store";
-import { setDatabase, defaultSdDataFunc, getDatabase } from "./storage/database.svelte";
+import { setDatabase, getDatabase, type Database } from "./storage/database.svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
@@ -18,7 +17,6 @@ import { loadPlugins } from "./plugins/plugins.svelte";
 import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { characterURLImport } from "./characterCards";
-import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { loadRisuAccountData } from "./drive/accounter";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -27,7 +25,6 @@ import { autoServerBackup } from "./kei/backup";
 import { language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
-import { updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
 import type { AccountStorage } from "./storage/accountStorage";
@@ -46,6 +43,11 @@ import { isTauri, isTauriDesktop } from "./platform";
 import { registerModelDynamic } from "./model/modellist";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
+import {
+    assignIds as assignDatabaseIds,
+    checkNewFormat as migrateDatabaseFormat,
+} from "./storage/databasePreparation";
+export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 
@@ -228,7 +230,10 @@ export async function loadData() {
 
             }
             LoadingStatusState.text = "Checking For Format Update..."
-            await checkNewFormat()
+            const migratedDatabase = await migrateDatabaseFormat(getDatabase())
+            assignDatabaseIds(migratedDatabase)
+            checkCharOrder(migratedDatabase)
+            setDatabase(migratedDatabase)
             const db = getDatabase();
 
             LoadingStatusState.text = "Updating States..."
@@ -255,7 +260,6 @@ export async function loadData() {
             loadedStore.set(true)
             selectedCharID.set(-1)
             startObserveDom()
-            assignIds()
             registerModelDynamic()
             saveDb()
             moduleUpdate()
@@ -336,178 +340,11 @@ function updateHeightMode() {
 /**
  * Checks and updates the database format to the latest version.
  */
-async function checkNewFormat(): Promise<void> {
-    let db = getDatabase();
-
-    // Check data integrity
-    db.characters = db.characters.map((v) => {
-        if (!v) {
-            return null;
-        }
-        v.chaId ??= uuidv4();
-        v.type ??= 'character';
-        v.chatPage ??= 0;
-        v.chats ??= [];
-        v.customscript ??= [];
-        v.firstMessage ??= '';
-        v.globalLore ??= [];
-        v.name ??= '';
-        v.viewScreen ??= 'none';
-        v.emotionImages = v.emotionImages ?? [];
-
-        if (v.type === 'character') {
-            v.bias ??= [];
-            v.characterVersion ??= '';
-            v.creator ??= '';
-            v.desc ??= '';
-            v.utilityBot ??= false;
-            v.tags ??= [];
-            v.systemPrompt ??= '';
-            v.scenario ??= '';
-        }
-        return v;
-    }).filter((v) => {
-        return v !== null;
-    });
-
-    db.modules = await Promise.all((db.modules ?? []).map(async (v) => {
-        if (v?.lorebook) {
-            if (!Array.isArray(v.lorebook)) {
-                console.error('Critical: Invalid lorebook format detected in module');
-                console.error('Module data:', JSON.stringify(v, null, 2));
-                
-                // Alert user about corrupted data
-                alertError(language.bootstrap.dataCorruptionDetected(v.name || 'Unknown', typeof v.lorebook));
-                await waitAlert();
-                
-                // Ask if user wants to report the issue
-                const shouldReport = await alertConfirm(language.bootstrap.reportErrorQuestion);
-                
-                if (shouldReport) {
-                    try {
-                        // Collect diagnostic information (without personal data)
-                        const diagnosticInfo = {
-                            timestamp: new Date().toISOString(),
-                            moduleName: v.name || 'Unknown',
-                            lorebookType: typeof v.lorebook,
-                            lorebookValue: JSON.stringify(v.lorebook).substring(0, 500), // First 500 chars only
-                            isArray: Array.isArray(v.lorebook),
-                            keys: v.lorebook ? Object.keys(v.lorebook).join(', ') : 'N/A',
-                            formatVersion: db.formatversion || 'Unknown'
-                        };
-                        
-                        // Show the diagnostic info and allow user to copy or send
-                        const reportData = JSON.stringify(diagnosticInfo, null, 2);
-                        await alertMd(language.bootstrap.diagnosticInformation(reportData));
-                        await waitAlert();
-                        
-                        console.log('Diagnostic information for developers:', diagnosticInfo);
-                    } catch (reportError) {
-                        console.error('Failed to generate diagnostic report:', reportError);
-                    }
-                }
-                
-                // Ask if user wants to reset the data
-                const shouldReset = await alertConfirm(language.bootstrap.resetLorebookQuestion);
-                
-                if (shouldReset) {
-                    v.lorebook = [];
-                    console.log('Lorebook reset to empty array by user choice');
-                } else {
-                    console.warn('User chose to keep corrupted lorebook data');
-                }
-            } else {
-                v.lorebook = updateLorebooks(v.lorebook);
-            }
-        }
-        return v
-    }));
-    
-    db.modules = db.modules.filter((v) => {
-        return v !== null && v !== undefined;
-    });
-
-    db.personas = (db.personas ?? []).map((v) => {
-        v.id ??= uuidv4()
-        return v
-    }).filter((v) => {
-        return v !== null && v !== undefined;
-    });
-
-    if (!db.formatversion) {
-        function checkClean(data: string) {
-
-            if (data.startsWith('assets') || (data.length < 3)) {
-                return data
-            }
-            else {
-                const d = 'assets/' + (data.replace(/\\/g, '/').split('assets/')[1])
-                if (!d) {
-                    return data
-                }
-                return d;
-            }
-        }
-
-        db.customBackground = checkClean(db.customBackground);
-        db.userIcon = checkClean(db.userIcon);
-
-        for (let i = 0; i < db.characters.length; i++) {
-            if (db.characters[i].image) {
-                db.characters[i].image = checkClean(db.characters[i].image);
-            }
-            if (db.characters[i].emotionImages) {
-                for (let i2 = 0; i2 < db.characters[i].emotionImages.length; i2++) {
-                    if (db.characters[i].emotionImages[i2] && db.characters[i].emotionImages[i2].length >= 2) {
-                        db.characters[i].emotionImages[i2][1] = checkClean(db.characters[i].emotionImages[i2][1]);
-                    }
-                }
-            }
-        }
-
-        db.formatversion = 2;
-    }
-    if (db.formatversion < 3) {
-        for (let i = 0; i < db.characters.length; i++) {
-            let cha = db.characters[i];
-            if (cha.type === 'character') {
-                if (checkNullish(cha.sdData)) {
-                    cha.sdData = defaultSdDataFunc();
-                }
-            }
-        }
-
-        db.formatversion = 3;
-    }
-    if (db.formatversion < 4) {
-        //migration removed due to issues
-        db.formatversion = 4;
-    }
-    if (db.formatversion < 5) {
-        if (db.loreBookToken < 8000) {
-            db.loreBookToken = 8000;
-        }
-        db.formatversion = 5;
-    }
-    if (!db.characterOrder) {
-        db.characterOrder = [];
-    }
-    if (db.mainPrompt === oldMainPrompt) {
-        db.mainPrompt = defaultMainPrompt;
-    }
-    if (db.mainPrompt === oldJailbreak) {
-        db.mainPrompt = defaultJailbreak;
-    }
-    for (let i = 0; i < db.characters.length; i++) {
-        const trashTime = db.characters[i].trashTime;
-        const targetTrashTime = trashTime ? trashTime + 1000 * 60 * 60 * 24 * 3 : 0;
-        if (trashTime && targetTrashTime < Date.now()) {
-            db.characters.splice(i, 1);
-            i--;
-        }
-    }
-    setDatabase(db);
-    checkCharOrder();
+export async function checkNewFormat(
+    db: Database,
+    options: { now?: number } = {},
+): Promise<Database> {
+    return migrateDatabaseFormat(db, options)
 }
 
 /**
@@ -646,31 +483,3 @@ async function cleanChunks(options:{
 /**
  * Assigns unique IDs to characters and chats.
  */
-function assignIds() {
-    if (!DBState?.db?.characters) {
-        return
-    }
-    const assignedIds = new Set<string>()
-    for (let i = 0; i < DBState.db.characters.length; i++) {
-        const cha = DBState.db.characters[i]
-        if (!cha.chaId) {
-            cha.chaId = uuidv4()
-        }
-        if (assignedIds.has(cha.chaId)) {
-            console.warn(`Duplicate chaId found: ${cha.chaId}. Assigning new ID.`);
-            cha.chaId = uuidv4();
-        }
-        assignedIds.add(cha.chaId)
-        for (let i2 = 0; i2 < cha.chats.length; i2++) {
-            const chat = cha.chats[i2]
-            if (!chat.id) {
-                chat.id = uuidv4()
-            }
-            if (assignedIds.has(chat.id)) {
-                console.warn(`Duplicate chat ID found: ${chat.id}. Assigning new ID.`);
-                chat.id = uuidv4();
-            }
-            assignedIds.add(chat.id)
-        }
-    }
-}

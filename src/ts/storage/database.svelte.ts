@@ -3,7 +3,6 @@ import { checkNullish, decryptBuffer, encryptBuffer, selectSingleFile } from '..
 import { changeLanguage, language } from '../../lang';
 import type { RisuPlugin } from '../plugins/plugins.svelte';
 import type {triggerscript as triggerscriptMain} from '../process/triggers';
-import { downloadFile, saveAsset as saveImageGlobal } from '../globalApi.svelte';
 import { defaultAutoSuggestPrompt, defaultJailbreak, defaultMainPrompt } from './defaultPrompts';
 import { alertNormal } from '../alert';
 import type { NAISettings } from '../process/models/nai';
@@ -27,7 +26,7 @@ export let appSubVer = 'preview'
 
 export type StreamingDisplayOptimizationMode = 'off'|'balanced'|'strong'
 
-export function setDatabase(data:Database){
+export function normalizeDatabaseDefaults(data:Database): Database {
     if(checkNullish(data.characters)){
         data.characters = []
     }
@@ -717,6 +716,11 @@ export function setDatabase(data:Database){
             chat.activeStreamingDisplayOptimizationMode = undefined
         }
     }
+    return data
+}
+
+export function setDatabase(data:Database){
+    normalizeDatabaseDefaults(data)
     changeLanguage(data.language)
     setDatabaseLite(data)
 }
@@ -1935,7 +1939,10 @@ export interface OobaSettings{
 }
 
 
-export const saveImage = saveImageGlobal
+export async function saveImage(data: Uint8Array, customId = '', fileName = '') {
+    const { saveAsset } = await import('../globalApi.svelte')
+    return saveAsset(data, customId, fileName)
+}
 
 export const defaultAIN:AINsettings = {
     top_p: 0.7,
@@ -2289,6 +2296,7 @@ import type { OpenAIChat } from '../process/index.svelte';
 import type { Loadout } from '../loadout';
 
 export async function downloadPreset(id:number, type:'json'|'risupreset'|'return' = 'json'){
+    const { downloadFile } = await import('../globalApi.svelte')
     saveCurrentPreset()
     let db = getDatabase()
     let pres = safeStructuredClone(db.botPresets[id])
