@@ -28,7 +28,6 @@ src-others/
 *.sln
 *.sw?
 /src-tauri/target/
-/src-tauri/gen/
 /build/
 pycache/
 test.ts
@@ -46,7 +45,3 @@ dist.zip
 /scripts/
 .env
 /server/node/ssl/certificate
-
-
-# Due to Cargo.lock makes the project build fail, we ignore it
-Cargo.lock
