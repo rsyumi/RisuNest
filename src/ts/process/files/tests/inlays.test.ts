@@ -5,6 +5,7 @@ import {
     getInlayAsset,
     getInlayAssetBlob,
     listInlayAssets,
+    migrateLegacyInlayAsset,
     postInlayAsset,
     removeInlayAsset,
     saveInlayedSignature,
@@ -31,11 +32,23 @@ vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: a
 })
 
 const store = new Map<string, unknown>()
+let corruptReadKey: string | undefined
+let throwReadKey: string | undefined
 
 vi.mock('localforage', () => ({
     default: {
         createInstance: () => ({
-            getItem: vi.fn(async (key: string) => store.get(key) ?? null),
+            getItem: vi.fn(async (key: string) => {
+                if (key === throwReadKey) {
+                    throwReadKey = undefined
+                    throw new Error('verification read failed')
+                }
+                if (key === corruptReadKey) {
+                    corruptReadKey = undefined
+                    return new Uint8Array([9])
+                }
+                return store.get(key) ?? null
+            }),
             setItem: vi.fn(async (key: string, value: unknown) => {
                 store.set(key, value)
             }),
@@ -101,6 +114,8 @@ function makeImage(w: number, h: number): HTMLImageElement {
 beforeEach(() => {
     vi.clearAllMocks()
     store.clear()
+    corruptReadKey = undefined
+    throwReadKey = undefined
 })
 
 describe('setInlayAsset', () => {
@@ -521,5 +536,33 @@ describe('BlobStore inlay compatibility', () => {
         const signature = { signatures: [{ type: 'text' as const, content: 'synthetic' }], sourceFormat: 0 as any, source: 'local' }
         await saveInlayedSignature('signature', signature)
         expect((await getInlayAsset('signature'))?.data).toBe(JSON.stringify(signature))
+    })
+
+    test('removes a failed verification destination before retrying migration', async () => {
+        store.set('retry-id', {
+            data: new Blob([new Uint8Array([7, 8])], { type: 'image/png' }),
+            ext: 'png', name: 'retry.png', type: 'image', width: 2, height: 1,
+        } satisfies InlayAsset)
+        corruptReadKey = `blobstore/inlays/${Buffer.from('retry-id').toString('hex')}.bin`
+
+        expect(await migrateLegacyInlayAsset('retry-id')).toBeNull()
+        expect([...store.keys()].some((key) => key.includes(Buffer.from('retry-id').toString('hex')))).toBe(false)
+        expect(store.get('retry-id')).toBeDefined()
+
+        expect(await migrateLegacyInlayAsset('retry-id')).toMatchObject({ kind: 'inlay', size: 2 })
+    })
+
+    test('removes a destination when verification throws before retrying migration', async () => {
+        store.set('throw-id', {
+            data: new Blob([new Uint8Array([4, 5])], { type: 'image/png' }),
+            ext: 'png', name: 'throw.png', type: 'image', width: 2, height: 1,
+        } satisfies InlayAsset)
+        throwReadKey = `blobstore/inlays/${Buffer.from('throw-id').toString('hex')}.bin`
+
+        await expect(migrateLegacyInlayAsset('throw-id')).rejects.toThrow('verification read failed')
+        expect([...store.keys()].some((key) => key.includes(Buffer.from('throw-id').toString('hex')))).toBe(false)
+        expect(store.get('throw-id')).toBeDefined()
+
+        expect(await migrateLegacyInlayAsset('throw-id')).toMatchObject({ kind: 'inlay', size: 2 })
     })
 })

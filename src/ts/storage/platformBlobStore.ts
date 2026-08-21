@@ -82,7 +82,8 @@ export function createResolvingBlobStore(factory: RootedBlobStoreFactory, resolv
     }
 }
 
-type KeyValueStorage = {
+export type KeyValueStorage = {
+    readonly blobStorageKind?: 'opfs'
     setItem(key: string, value: Uint8Array): Promise<unknown>
     getItem(key: string): Promise<Uint8Array | null>
     keys(): Promise<string[]>
@@ -244,13 +245,27 @@ export function createStorageRootedBlobStoreFactory(
     return createKeyValueRootedBlobStoreFactory(keyValueBackend(selected.storage))
 }
 
+export async function createBrowserBlobBackend(
+    selected: KeyValueStorage | null,
+    getOpfsDirectory: () => Promise<FileSystemDirectoryHandle> = () => navigator.storage.getDirectory(),
+): Promise<BlobKeyValueBackend> {
+    if (selected?.blobStorageKind === 'opfs') return createOpfsBlobBackend(await getOpfsDirectory())
+    return keyValueBackend(selected ?? browserLocalStorage)
+}
+
+export async function readBlobForFacade(
+    store: BlobStore,
+    key: string,
+    rejectMissing: boolean,
+): Promise<Uint8Array | null> {
+    const value = await store.read(key)
+    if (value === null && rejectMissing) throw new Error(`Missing asset: ${key}`)
+    return value
+}
+
 async function createProductionFactory(): Promise<RootedBlobStoreFactory> {
     if (isTauri) return createKeyValueRootedBlobStoreFactory(createTauriBlobBackend())
-    const selected = await storageProvider()
-    if (selected?.constructor?.name === 'OpfsStorage') {
-        return createKeyValueRootedBlobStoreFactory(createOpfsBlobBackend(await navigator.storage.getDirectory()))
-    }
-    return createKeyValueRootedBlobStoreFactory(keyValueBackend(selected ?? browserLocalStorage))
+    return createKeyValueRootedBlobStoreFactory(await createBrowserBlobBackend(await storageProvider()))
 }
 
 const deferredFactory: RootedBlobStoreFactory = {

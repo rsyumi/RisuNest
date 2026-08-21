@@ -1,11 +1,13 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import {
+    createBrowserBlobBackend,
     createOpfsBlobBackend,
     createStorageRootedBlobStoreFactory,
     createTauriBlobBackend,
     createKeyValueRootedBlobStoreFactory,
     createResolvingBlobStore,
     physicalBlobKeys,
+    readBlobForFacade,
 } from './platformBlobStore'
 import { SeekMode } from '@tauri-apps/plugin-fs'
 
@@ -171,5 +173,37 @@ describe('rooted BlobStore mapping', () => {
         const backend = createOpfsBlobBackend(directory)
         expect(await backend.readRange!('assets/a', { start: 1, endExclusive: 3 })).toEqual(new Uint8Array([1, 2]))
         expect(sliceCalls).toEqual([[1, 3]])
+    })
+
+    test('production browser selection keeps OPFS reads bounded', async () => {
+        const getItem = vi.fn(async () => new Uint8Array([0, 1, 2, 3]))
+        const selected = {
+            blobStorageKind: 'opfs' as const,
+            setItem: vi.fn(async () => undefined),
+            getItem,
+            keys: vi.fn(async () => []),
+            removeItem: vi.fn(async () => undefined),
+        }
+        const file = new File([new Uint8Array([0, 1, 2, 3])], 'value')
+        const directory = {
+            getFileHandle: async () => ({ getFile: async () => file }),
+        } as unknown as FileSystemDirectoryHandle
+
+        const backend = await createBrowserBlobBackend(selected, async () => directory)
+
+        expect(await backend.readRange!('assets/a', { start: 1, endExclusive: 3 })).toEqual(new Uint8Array([1, 2]))
+        expect(getItem).not.toHaveBeenCalled()
+    })
+
+    test('facade rejects missing native blobs', async () => {
+        const store = createKeyValueRootedBlobStoreFactory(memoryBackend().backend).open({ kind: 'legacy' })
+
+        await expect(readBlobForFacade(store, 'assets/missing', true)).rejects.toThrow('Missing asset')
+    })
+
+    test('facade preserves nullable browser reads', async () => {
+        const store = createKeyValueRootedBlobStoreFactory(memoryBackend().backend).open({ kind: 'legacy' })
+
+        await expect(readBlobForFacade(store, 'assets/missing', false)).resolves.toBeNull()
     })
 })

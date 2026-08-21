@@ -211,27 +211,34 @@ async function migrateLegacyInlayAssetInStore(id: string, blobStore: BlobStore):
     const legacy = await readLegacyInlayAsset(id)
     if (!legacy) return null
     const { bytes, mime } = await inlayBytes(legacy)
-    const written = await blobStore.put(id, bytes, {
-        kind: 'inlay',
-        inlayType: legacy.type,
-        mime,
-        name: legacy.name,
-        ext: legacy.ext,
-        width: legacy.width,
-        height: legacy.height,
-    })
-    const verifiedMetadata = await blobStore.stat(id)
-    const verifiedBytes = await blobStore.read(id)
-    if (!verifiedMetadata || verifiedMetadata.kind !== 'inlay' || !verifiedBytes
-        || written.kind !== 'inlay' || verifiedMetadata.inlayType !== legacy.type
-        || verifiedMetadata.name !== legacy.name
-        || verifiedMetadata.ext !== legacy.ext.replace(/^\.+/, '').toLowerCase()
-        || verifiedMetadata.width !== legacy.width || verifiedMetadata.height !== legacy.height
-        || verifiedMetadata.mime !== written.mime || verifiedMetadata.size !== bytes.byteLength
-        || !bytesEqual(verifiedBytes, bytes)) {
-        return null
+    let written: BlobMetadata
+    try {
+        written = await blobStore.put(id, bytes, {
+            kind: 'inlay',
+            inlayType: legacy.type,
+            mime,
+            name: legacy.name,
+            ext: legacy.ext,
+            width: legacy.width,
+            height: legacy.height,
+        })
+        const verifiedMetadata = await blobStore.stat(id)
+        const verifiedBytes = await blobStore.read(id)
+        if (!verifiedMetadata || verifiedMetadata.kind !== 'inlay' || !verifiedBytes
+            || written.kind !== 'inlay' || verifiedMetadata.inlayType !== legacy.type
+            || verifiedMetadata.name !== legacy.name
+            || verifiedMetadata.ext !== legacy.ext.replace(/^\.+/, '').toLowerCase()
+            || verifiedMetadata.width !== legacy.width || verifiedMetadata.height !== legacy.height
+            || verifiedMetadata.mime !== written.mime || verifiedMetadata.size !== bytes.byteLength
+            || !bytesEqual(verifiedBytes, bytes)) {
+            await blobStore.remove(id)
+            return null
+        }
+        return verifiedMetadata
+    } catch (error) {
+        await blobStore.remove(id)
+        throw error
     }
-    return verifiedMetadata
 }
 
 export async function migrateLegacyInlayAsset(id: string): Promise<BlobMetadata | null> {

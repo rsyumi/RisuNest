@@ -57,7 +57,7 @@ import {
     installPersistentSaveNotifications,
 } from "./storage/persistentSaveNotifications";
 import { installInternalBackup } from "./storage/databaseRestore";
-import { configureBlobStoreStorageProvider, resolveBlobStore } from "./storage/platformBlobStore";
+import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore } from "./storage/platformBlobStore";
 
 export const forageStorage = new AutoStorage()
 configureBlobStoreStorageProvider(async () => {
@@ -137,7 +137,9 @@ let checkedPaths: string[] = []
 export async function getFileSrc(loc: string) {
     if (isTauri) {
         if (loc.startsWith('assets')) {
-            return await (await resolveBlobStore()).resolveUrl(loc) ?? ''
+            const url = await (await resolveBlobStore()).resolveUrl(loc)
+            if (!url) console.error(new Error(`Missing asset: ${loc}`))
+            return url ?? ''
         }
         return convertFileSrc(loc)
     }
@@ -226,7 +228,7 @@ let appDataDirPath = ''
 export async function readImage(data: string) {
     if (!isTauri) await forageStorage.Init()
     if (data.startsWith('assets/') && !forageStorage.isAccount) {
-        return await (await resolveBlobStore()).read(data)
+        return await readBlobForFacade(await resolveBlobStore(), data, isTauri)
     }
     if (isTauri) {
         if (data.startsWith('assets')) {
@@ -295,7 +297,7 @@ export async function loadAsset(id: string) {
     if (!isTauri && forageStorage.isAccount) {
         return await forageStorage.getItem(id) as unknown as Uint8Array
     }
-    return await (await resolveBlobStore()).read(id)
+    return await readBlobForFacade(await resolveBlobStore(), id, isTauri)
 }
 
 export let saving = $state({

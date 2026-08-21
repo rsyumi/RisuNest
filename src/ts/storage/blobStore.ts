@@ -115,7 +115,7 @@ export function createKeyValueBlobStore(
             const logicalKey = key.slice(keys.legacyAssetPrefix.length - 'assets/'.length)
             const metadataKey = keys.metadata(logicalKey)
             if (keySet.has(metadataKey)) continue
-            const payloadSize = backend.size ? await backend.size(key) : (await backend.read(key))?.byteLength ?? null
+            const payloadSize = backend.size ? await backend.size(key) : (await backend.read(key))?.byteLength ?? 0
             if (payloadSize === null) continue
             const ext = normalizeBlobExtension(logicalKey.split('.').pop() ?? '')
             const metadata: BlobMetadata = {
@@ -156,12 +156,13 @@ export function createKeyValueBlobStore(
         async read(key, range) {
             await initialize()
             if (range) validateBlobReadRange(range)
+            const metadata = await stat(key)
+            if (!metadata) return null
             const payloadKey = keys.payload(key)
             if (range && backend.readRange) return backend.readRange(payloadKey, range)
             const data = await backend.read(payloadKey)
             if (!data) {
-                const metadata = parseMetadata(await backend.read(keys.metadata(key)))
-                if (metadata?.size === 0 && (await backend.keys()).includes(payloadKey)) return new Uint8Array()
+                if (metadata.size === 0) return new Uint8Array()
                 return null
             }
             if (!range) return data

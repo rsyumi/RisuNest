@@ -2,6 +2,8 @@ import { asBuffer } from "../util";
 
 export class OpfsStorage{
 
+    readonly blobStorageKind = 'opfs' as const
+
     opfs:FileSystemDirectoryHandle
 
     async setItem(key:string, value:Uint8Array) {

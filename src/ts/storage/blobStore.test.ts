@@ -12,6 +12,10 @@ function harness() {
             if (!key.includes('/metadata/')) payloadReads += 1
             return values.get(key)?.slice() ?? null
         },
+        async readRange(key, range) {
+            if (!key.includes('/metadata/')) payloadReads += 1
+            return values.get(key)?.slice(range.start, range.endExclusive) ?? null
+        },
         async keys() {
             return [...values.keys()]
         },
@@ -106,5 +110,32 @@ describe('BlobStore contract', () => {
         const readsBeforeList = payloadReadCount()
         expect(await store.list()).toEqual([])
         expect(payloadReadCount()).toBe(readsBeforeList)
+    })
+
+    test('does not read a payload without live metadata', async () => {
+        const { store, values } = harness()
+        await store.stat('assets/orphan.bin')
+        values.set('assets/orphan.bin', new Uint8Array([1, 2, 3]))
+
+        expect(await store.read('assets/orphan.bin')).toBeNull()
+        expect(await store.read('assets/orphan.bin', { start: 1, endExclusive: 2 })).toBeNull()
+    })
+
+    test('backfills zero-byte metadata when keys prove the Node payload exists', async () => {
+        const values = new Map<string, Uint8Array>()
+        values.set('assets/empty.bin', new Uint8Array())
+        const backend: BlobKeyValueBackend = {
+            async write(key, value) { values.set(key, value.slice()) },
+            async read(key) {
+                const value = values.get(key)
+                return value?.byteLength ? value.slice() : null
+            },
+            async keys() { return [...values.keys()] },
+            async remove(key) { values.delete(key) },
+        }
+        const store = createKeyValueBlobStore(backend, { kind: 'legacy' })
+
+        expect(await store.stat('assets/empty.bin')).toMatchObject({ size: 0 })
+        expect(await store.read('assets/empty.bin')).toEqual(new Uint8Array())
     })
 })
