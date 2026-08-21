@@ -48,6 +48,7 @@ export interface CharacterQuery {
 }
 
 export interface CharacterPage {
+    revision: DataRevision
     items: CharacterSummary[]
     nextCursor?: string
 }
@@ -60,6 +61,7 @@ export interface ConversationQuery {
 }
 
 export interface ConversationPage {
+    revision: DataRevision
     items: ConversationSummary[]
     nextCursor?: string
 }

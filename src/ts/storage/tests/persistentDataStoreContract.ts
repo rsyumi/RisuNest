@@ -12,7 +12,11 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
     describe('PersistentDataStore contract', () => {
         it('queries the character catalog without hydrating conversations', async () => {
             const { store } = await createHarness()
-            await store.replaceFromDatabase(fixtureDatabase)
+            const imported = await store.replaceFromDatabase(fixtureDatabase)
+
+            expect(
+                await store.queryCharacters({ order: 'configured', trash: false, limit: 2 }),
+            ).toHaveProperty('revision', imported.revision)
 
             expect(
                 (await store.queryCharacters({ order: 'configured', trash: false, limit: 2 })).items.map(
@@ -83,6 +87,26 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 hasMoreBefore: true,
                 hasMoreAfter: true,
             })
+        })
+
+        it('returns the active revision with every conversation page, including an empty page', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(fixtureDatabase)
+
+            expect(
+                await store.queryConversations({
+                    characterId: 'char-a',
+                    order: 'configured',
+                    limit: 1,
+                }),
+            ).toHaveProperty('revision', imported.revision)
+            expect(
+                await store.queryConversations({
+                    characterId: 'missing',
+                    order: 'configured',
+                    limit: 10,
+                }),
+            ).toEqual({ revision: imported.revision, items: [] })
         })
 
         it('preserves catalog and message results after reopening', async () => {

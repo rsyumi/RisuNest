@@ -1,11 +1,11 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
-import type { DataRevision, PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
+import type { DataRevision, PersistentDataStore } from './persistentDataStore'
 
 type CompleteCharacter = character | groupChat
 
 export interface WorkingSetCoordinator {
     readonly revision: DataRevision
-    initialize(revision: DataRevision): void
+    initialize(revision: DataRevision, database: Database): void
     flushPendingData(reason: string): Promise<void>
     adoptHydratedCharacter(revision: DataRevision, character: CompleteCharacter): boolean
 }
@@ -23,10 +23,10 @@ export class ActiveWorkingSet {
 
     constructor(private readonly dependencies: ActiveWorkingSetDependencies) {}
 
-    async initializeActiveWorkingSet(_database: Database): Promise<void> {
+    async initializeActiveWorkingSet(database: Database): Promise<void> {
         await this.dependencies.store.open()
         const root = await this.dependencies.store.readRoot()
-        this.dependencies.coordinator.initialize(root.revision)
+        this.dependencies.coordinator.initialize(root.revision, database)
     }
 
     async activateCharacter(id: string): Promise<boolean> {
@@ -34,24 +34,13 @@ export class ActiveWorkingSet {
         await this.dependencies.coordinator.flushPendingData('activate-character')
         if (generation !== this.navigationGeneration) return false
         const revision = this.dependencies.coordinator.revision
-        const lease = await this.dependencies.store.acquireRevision(revision)
-        try {
-            if (lease.revision !== revision) return false
-            const characterValue = await this.hydrateCharacter(lease, id)
-            if (
-                generation !== this.navigationGeneration ||
-                this.dependencies.coordinator.revision !== revision
-            ) {
-                return false
-            }
-            if (!this.dependencies.coordinator.adoptHydratedCharacter(revision, characterValue)) {
-                return false
-            }
-            this.dependencies.publishCharacter(characterValue)
-            return true
-        } finally {
-            await lease.release()
+        const characterValue = await this.hydrateCharacter(id, revision, generation)
+        if (!characterValue) return false
+        if (!this.dependencies.coordinator.adoptHydratedCharacter(revision, characterValue)) {
+            return false
         }
+        this.dependencies.publishCharacter(characterValue)
+        return true
     }
 
     async activateConversation(id: string): Promise<boolean> {
@@ -61,35 +50,26 @@ export class ActiveWorkingSet {
         await this.dependencies.coordinator.flushPendingData('activate-conversation')
         if (generation !== this.navigationGeneration) return false
         const revision = this.dependencies.coordinator.revision
-        const lease = await this.dependencies.store.acquireRevision(revision)
-        try {
-            if (lease.revision !== revision) return false
-            const conversation = await lease.readConversation(characterId, id)
-            if (!conversation) throw new Error(`Conversation ${id} was not found for ${characterId}`)
-            this.verifyRevision(lease, conversation.revision)
-            if (conversation.value.id !== id) {
-                throw new Error(`Conversation ${id} returned mismatched ID ${conversation.value.id ?? ''}`)
-            }
-            if (
-                generation !== this.navigationGeneration ||
-                this.dependencies.coordinator.revision !== revision
-            ) {
-                return false
-            }
-            this.dependencies.publishConversation(characterId, conversation.value)
-            return true
-        } finally {
-            await lease.release()
+        const conversation = await this.dependencies.store.readConversation(characterId, id)
+        if (!this.isCurrent(generation, revision)) return false
+        if (!conversation) throw new Error(`Conversation ${id} was not found for ${characterId}`)
+        if (conversation.revision !== revision) return false
+        if (conversation.value.id !== id) {
+            throw new Error(`Conversation ${id} returned mismatched ID ${conversation.value.id ?? ''}`)
         }
+        this.dependencies.publishConversation(characterId, conversation.value)
+        return true
     }
 
     private async hydrateCharacter(
-        lease: PersistentRevisionLease,
         id: string,
-    ): Promise<CompleteCharacter> {
-        const detail = await lease.readCharacter(id)
+        revision: DataRevision,
+        generation: number,
+    ): Promise<CompleteCharacter | null> {
+        const detail = await this.dependencies.store.readCharacter(id)
+        if (!this.isCurrent(generation, revision)) return null
         if (!detail) throw new Error(`Character ${id} was not found`)
-        this.verifyRevision(lease, detail.revision)
+        if (detail.revision !== revision) return null
         if (detail.value.chaId !== id) {
             throw new Error(`Character ${id} returned mismatched ID ${detail.value.chaId}`)
         }
@@ -97,19 +77,21 @@ export class ActiveWorkingSet {
         const chats: Chat[] = []
         let cursor: string | undefined
         do {
-            const page = await lease.queryConversations({
+            const page = await this.dependencies.store.queryConversations({
                 characterId: id,
                 order: 'configured',
                 limit: 100,
                 cursor,
             })
+            if (!this.isCurrent(generation, revision) || page.revision !== revision) return null
             for (const summary of page.items) {
                 if (summary.characterId !== id) {
                     throw new Error(`Conversation ${summary.id} returned mismatched character ID`)
                 }
-                const conversation = await lease.readConversation(id, summary.id)
+                const conversation = await this.dependencies.store.readConversation(id, summary.id)
+                if (!this.isCurrent(generation, revision)) return null
                 if (!conversation) throw new Error(`Conversation ${summary.id} was not found for ${id}`)
-                this.verifyRevision(lease, conversation.revision)
+                if (conversation.revision !== revision) return null
                 if (conversation.value.id !== summary.id) {
                     throw new Error(`Conversation ${summary.id} returned mismatched ID`)
                 }
@@ -121,9 +103,10 @@ export class ActiveWorkingSet {
         return { ...detail.value, chats } as CompleteCharacter
     }
 
-    private verifyRevision(lease: PersistentRevisionLease, revision: DataRevision): void {
-        if (revision !== lease.revision) {
-            throw new Error(`Persistent revision changed from ${lease.revision} to ${revision}`)
-        }
+    private isCurrent(generation: number, revision: DataRevision): boolean {
+        return (
+            generation === this.navigationGeneration &&
+            revision === this.dependencies.coordinator.revision
+        )
     }
 }

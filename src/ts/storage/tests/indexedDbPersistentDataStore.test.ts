@@ -502,6 +502,16 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             root: { ...root, username: 'Committed Later' },
         })
         expect((await lease.readRoot()).value.username).toBe('Fixture User')
+        expect(
+            await lease.queryCharacters({ order: 'configured', trash: false, limit: 1 }),
+        ).toHaveProperty('revision', imported.revision)
+        expect(
+            await lease.queryConversations({
+                characterId: 'char-a',
+                order: 'configured',
+                limit: 1,
+            }),
+        ).toHaveProperty('revision', imported.revision)
         expect((await lease.readConversation('char-a', 'conv-short'))?.value.message).toHaveLength(2)
 
         await lease.release()

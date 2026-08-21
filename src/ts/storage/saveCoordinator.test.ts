@@ -48,6 +48,7 @@ describe('SaveCoordinator', () => {
             store,
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
         })
         coordinator.initialize(4)
 
@@ -71,10 +72,35 @@ describe('SaveCoordinator', () => {
             store: makeStore(),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
         })
 
         coordinator.initialize(1)
         await coordinator.flushPendingData('clean')
+    })
+
+    it('initializes baselines from the supplied authoritative database', async () => {
+        let database = makeDatabase()
+        database.username = 'Stale live state'
+        const authoritative = makeDatabase()
+        authoritative.username = 'Authoritative state'
+        authoritative.characters[0].name = 'Authoritative character'
+        const store = makeStore()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: (replacement) => {
+                database = replacement
+            },
+        })
+
+        coordinator.initialize(6, authoritative)
+        database = structuredClone(authoritative)
+        await coordinator.flushPendingData('clean')
+
+        expect(store.commit).not.toHaveBeenCalled()
+        expect(coordinator.revision).toBe(6)
     })
 
     it('returns the exact shared promise for concurrent flushes', async () => {
@@ -85,6 +111,7 @@ describe('SaveCoordinator', () => {
             store,
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
         })
         coordinator.initialize(1)
         database.username = 'Changed'
@@ -109,6 +136,7 @@ describe('SaveCoordinator', () => {
                 store,
                 captureRoot: () => captureRoot(database),
                 captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
             })
             coordinator.initialize(1)
             database.username = 'Debounced'
@@ -136,6 +164,7 @@ describe('SaveCoordinator', () => {
             store: makeStore(),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
         })
         coordinator.initialize(1)
 
@@ -159,6 +188,7 @@ describe('SaveCoordinator', () => {
             store,
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
         })
         coordinator.initialize(2)
 
@@ -213,6 +243,7 @@ describe('SaveCoordinator', () => {
             store: makeStore(commit),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
         })
         coordinator.initialize(1)
         database.username = 'one'
@@ -244,6 +275,7 @@ describe('SaveCoordinator', () => {
             store: makeStore(commit),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
         })
         coordinator.initialize(1)
         database.username = 'Uncommitted'
@@ -259,13 +291,14 @@ describe('SaveCoordinator', () => {
     it('retries the same pinned publication before another local commit', async () => {
         const database = makeDatabase()
         const publish = vi.fn().mockRejectedValueOnce(new Error('remote')).mockResolvedValueOnce(undefined)
-        const handle = { publish }
+        const handle = { publish, dispose: vi.fn(async () => undefined) }
         const pin = vi.fn().mockResolvedValue(handle)
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
         const coordinator = new SaveCoordinator({
             store: makeStore(commit),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
             officialPublisher: { pin },
         })
         coordinator.initialize(1)
@@ -281,6 +314,68 @@ describe('SaveCoordinator', () => {
         expect(pin).toHaveBeenCalledTimes(2)
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0].expectedRevision).toBe(2)
+    })
+
+    it('retries pinning the committed revision before creating a newer local revision', async () => {
+        const database = makeDatabase()
+        const handle = {
+            publish: vi.fn(async () => undefined),
+            dispose: vi.fn(async () => undefined),
+        }
+        const pin = vi.fn().mockRejectedValueOnce(new Error('pin failed')).mockResolvedValueOnce(handle)
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: (replacement) => Object.assign(database, replacement),
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(1)
+        database.username = 'Committed locally'
+        coordinator.markPersistentDataDirty(1)
+
+        await expect(coordinator.flushPendingData('first')).rejects.toThrow('pin failed')
+        await coordinator.flushPendingData('retry')
+
+        expect(pin).toHaveBeenNthCalledWith(1, 2)
+        expect(pin).toHaveBeenNthCalledWith(2, 2)
+        expect(commit).toHaveBeenCalledTimes(1)
+        expect(handle.publish).toHaveBeenCalledTimes(1)
+        expect(handle.dispose).toHaveBeenCalledTimes(1)
+    })
+
+    it('disposes a failed pre-replacement publication so it can never publish later', async () => {
+        const database = makeDatabase()
+        const staleHandle = {
+            publish: vi.fn().mockRejectedValueOnce(new Error('remote failed')),
+            dispose: vi.fn(async () => undefined),
+        }
+        const pin = vi.fn(async () => staleHandle)
+        const store = {
+            commit: vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 })),
+            replaceFromDatabase: vi.fn(async () => ({ revision: 3 })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: (replacement) => Object.assign(database, replacement),
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(1)
+        database.username = 'Local revision'
+        coordinator.markPersistentDataDirty(1)
+        await expect(coordinator.flushPendingData('publish')).rejects.toThrow('remote failed')
+
+        const replacement = makeDatabase()
+        replacement.username = 'Authoritative replacement'
+        await coordinator.replacePersistentDatabase(replacement, 'replace')
+        await coordinator.flushPendingData('clean')
+
+        expect(staleHandle.dispose).toHaveBeenCalledTimes(1)
+        expect(staleHandle.publish).toHaveBeenCalledTimes(1)
+        expect(pin).toHaveBeenCalledTimes(1)
     })
 
     it('serializes replacement and leaves post-capture mutations for the next ordinary flush', async () => {

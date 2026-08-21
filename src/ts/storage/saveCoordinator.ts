@@ -9,6 +9,7 @@ type RootDatabase = Omit<Database, 'characters'>
 
 export interface PinnedPublication {
     publish(): Promise<void>
+    dispose(): Promise<void>
 }
 
 export interface OfficialRevisionPublisher {
@@ -24,7 +25,8 @@ export interface SaveCoordinatorDependencies {
     store: PersistentDataStore
     captureRoot(): RootDatabase
     captureSelectedCharacter(): CompleteCharacter | null
-    replaceDatabase?(database: Database): void
+    /** Installs the working copy synchronously and must not throw. */
+    replaceDatabase(database: Database): void
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
     onBackgroundError?(error: unknown): void
@@ -81,6 +83,7 @@ export class SaveCoordinator {
     private operationTail: Promise<void> = Promise.resolve()
     private flushPromise: Promise<void> | null = null
     private pendingPublication: PinnedPublication | null = null
+    private pendingPublicationRevision: DataRevision | null = null
 
     constructor(private readonly dependencies: SaveCoordinatorDependencies) {
         this.clock = dependencies.clock ?? defaultClock()
@@ -95,15 +98,16 @@ export class SaveCoordinator {
         return this.pendingByteCount
     }
 
-    initialize(revision: DataRevision): void {
+    initialize(revision: DataRevision, database?: Database): void {
         this.cancelDebounce()
-        const captured = this.capture()
+        const captured = database ? this.captureDatabase(database) : this.capture()
         this.currentRevision = revision
         this.rootBaseline = captured.rootCanonical
         this.characterBaseline = captured.characterCanonical
         this.dirtyGeneration = 0
         this.pendingByteCount = 0
         this.pendingPublication = null
+        this.pendingPublicationRevision = null
     }
 
     adoptHydratedCharacter(revision: DataRevision, character: CompleteCharacter): boolean {
@@ -168,9 +172,8 @@ export class SaveCoordinator {
     }
 
     private async flushIterations(_reason: string, publishOfficial: boolean): Promise<void> {
-        if (this.pendingPublication) {
-            await this.pendingPublication.publish()
-            this.pendingPublication = null
+        if (this.pendingPublicationRevision !== null) {
+            await this.publishPendingRevision()
         }
 
         while (true) {
@@ -188,10 +191,8 @@ export class SaveCoordinator {
                 if (commit.root) this.rootBaseline = captured.rootCanonical
                 if (commit.replaceCharacter) this.characterBaseline = captured.characterCanonical
                 if (publishOfficial && this.dependencies.officialPublisher) {
-                    const pinned = await this.dependencies.officialPublisher.pin(committed.revision)
-                    this.pendingPublication = pinned
-                    await pinned.publish()
-                    this.pendingPublication = null
+                    this.pendingPublicationRevision = committed.revision
+                    await this.publishPendingRevision()
                 }
             }
 
@@ -215,6 +216,9 @@ export class SaveCoordinator {
     ): Promise<void> {
         const replaced = await this.dependencies.store.replaceFromDatabase(candidate)
         const live = this.capture()
+        const stalePublication = this.pendingPublication
+        this.pendingPublication = null
+        this.pendingPublicationRevision = null
         this.currentRevision = replaced.revision
         const candidateCapture = this.captureDatabase(candidate)
         this.rootBaseline = candidateCapture.rootCanonical
@@ -233,7 +237,10 @@ export class SaveCoordinator {
             else published.characters.push(canonicalClone(live.character))
         }
 
-        this.dependencies.replaceDatabase?.(published)
+        this.dependencies.replaceDatabase(published)
+        if (stalePublication) {
+            await this.disposePublication(stalePublication)
+        }
 
         if (this.dirtyGeneration === capturedGeneration) {
             this.cancelDebounce()
@@ -268,6 +275,27 @@ export class SaveCoordinator {
 
     private startBackgroundFlush(reason: string): void {
         void this.flushPendingData(reason).catch((error) => this.dependencies.onBackgroundError?.(error))
+    }
+
+    private async publishPendingRevision(): Promise<void> {
+        const revision = this.pendingPublicationRevision
+        if (revision === null || !this.dependencies.officialPublisher) return
+        if (!this.pendingPublication) {
+            this.pendingPublication = await this.dependencies.officialPublisher.pin(revision)
+        }
+        const publication = this.pendingPublication
+        await publication.publish()
+        this.pendingPublication = null
+        this.pendingPublicationRevision = null
+        await this.disposePublication(publication)
+    }
+
+    private async disposePublication(publication: PinnedPublication): Promise<void> {
+        try {
+            await publication.dispose()
+        } catch (error) {
+            this.dependencies.onBackgroundError?.(error)
+        }
     }
 
     private cancelDebounce(): void {

@@ -1,11 +1,14 @@
+import { IDBFactory, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import { ActiveWorkingSet } from '../activeWorkingSet.svelte'
 import type { Chat, Database, character, groupChat } from '../database.svelte'
+import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import type {
     ConversationPage,
     PersistentDataStore,
     PersistentRevisionLease,
 } from '../persistentDataStore'
+import { fixtureDatabase } from './persistentDataFixtures'
 
 function makeCharacter(id: string, chats: Chat[] = []): character {
     return {
@@ -58,6 +61,7 @@ function makeLease(input: {
             const index = cursor ? Number(cursor) : 0
             const pageChats = chats.slice(index, index + 1)
             return {
+                revision,
                 items: pageChats.map((chat, offset) => ({
                     id: chat.id!,
                     characterId: input.characterId,
@@ -95,7 +99,12 @@ function makeHarness(lease: PersistentRevisionLease) {
     const store = {
         open: vi.fn(async () => undefined),
         readRoot: vi.fn(async () => ({ revision: 1, value: { username: 'Fixture' } })),
-        acquireRevision: vi.fn(async () => lease),
+        readCharacter: vi.fn((id: string) => lease.readCharacter(id)),
+        queryConversations: vi.fn((input) => lease.queryConversations(input)),
+        readConversation: vi.fn((characterId: string, conversationId: string) =>
+            lease.readConversation(characterId, conversationId),
+        ),
+        acquireRevision: vi.fn(() => Promise.reject(new Error('navigation acquired a snapshot'))),
     } as unknown as PersistentDataStore
     const publishedCharacters: character[] = []
     const publishedConversations: Array<{ characterId: string; conversation: Chat }> = []
@@ -139,7 +148,7 @@ describe('ActiveWorkingSet', () => {
             chats: [{ id: 'chat-a' }, { id: 'chat-b' }],
         })
         expect(lease.queryConversations).toHaveBeenCalledTimes(2)
-        expect(lease.release).toHaveBeenCalledTimes(1)
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
         expect(harness.coordinator.adoptHydratedCharacter).toHaveBeenCalledWith(
             1,
             harness.publishedCharacters[0],
@@ -157,12 +166,22 @@ describe('ActiveWorkingSet', () => {
         })
         const leaseB = makeLease({ characterId: 'char-b' })
         const harness = makeHarness(leaseA)
-        vi.mocked(harness.store.acquireRevision)
-            .mockResolvedValueOnce(leaseA)
-            .mockResolvedValueOnce(leaseB)
+        vi.mocked(harness.store.readCharacter).mockImplementation((id) =>
+            id === 'char-a' ? leaseA.readCharacter(id) : leaseB.readCharacter(id),
+        )
+        vi.mocked(harness.store.queryConversations).mockImplementation((input) =>
+            input.characterId === 'char-a'
+                ? leaseA.queryConversations(input)
+                : leaseB.queryConversations(input),
+        )
+        vi.mocked(harness.store.readConversation).mockImplementation((characterId, conversationId) =>
+            characterId === 'char-a'
+                ? leaseA.readConversation(characterId, conversationId)
+                : leaseB.readConversation(characterId, conversationId),
+        )
 
         const first = harness.workingSet.activateCharacter('char-a')
-        await vi.waitFor(() => expect(harness.store.acquireRevision).toHaveBeenCalledTimes(1))
+        await vi.waitFor(() => expect(leaseA.readCharacter).toHaveBeenCalledTimes(1))
         const second = harness.workingSet.activateCharacter('char-b')
         await second
         a.resolve({ revision: 1, value: makeCharacterDetail('char-a') })
@@ -171,8 +190,7 @@ describe('ActiveWorkingSet', () => {
         expect(harness.publishedCharacters.map((characterValue) => characterValue.chaId)).toEqual([
             'char-b',
         ])
-        expect(leaseA.release).toHaveBeenCalledTimes(1)
-        expect(leaseB.release).toHaveBeenCalledTimes(1)
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
     it('preserves the previous selection when hydration fails', async () => {
@@ -187,7 +205,7 @@ describe('ActiveWorkingSet', () => {
         )
 
         expect(harness.publishedCharacters).toEqual([])
-        expect(lease.release).toHaveBeenCalledTimes(1)
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
     it('uses the selected character captured before conversation navigation awaits', async () => {
@@ -207,7 +225,7 @@ describe('ActiveWorkingSet', () => {
         expect(lease.readConversation).toHaveBeenCalledWith('char-a', 'chat-a')
         expect(harness.publishedConversations).toEqual([{ characterId: 'char-a', conversation: chat }])
         expect(harness.coordinator.adoptHydratedCharacter).not.toHaveBeenCalled()
-        expect(lease.release).toHaveBeenCalledTimes(1)
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
     it('discards hydration when the coordinator revision changes', async () => {
@@ -217,7 +235,7 @@ describe('ActiveWorkingSet', () => {
 
         expect(await harness.workingSet.activateCharacter('char-a')).toBe(false)
         expect(harness.publishedCharacters).toEqual([])
-        expect(lease.release).toHaveBeenCalledTimes(1)
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
     it('discards a result when the revision changes during hydration', async () => {
@@ -230,13 +248,13 @@ describe('ActiveWorkingSet', () => {
         const harness = makeHarness(lease)
 
         const activation = harness.workingSet.activateCharacter('char-a')
-        await vi.waitFor(() => expect(lease.readCharacter).toHaveBeenCalledTimes(1))
+        await vi.waitFor(() => expect(harness.store.readCharacter).toHaveBeenCalledTimes(1))
         harness.coordinator.revision = 2
         detail.resolve({ revision: 1, value: makeCharacterDetail('char-a') })
 
         expect(await activation).toBe(false)
         expect(harness.publishedCharacters).toEqual([])
-        expect(lease.release).toHaveBeenCalledTimes(1)
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
     it('does not publish when the hydrated baseline can no longer be adopted', async () => {
@@ -247,7 +265,7 @@ describe('ActiveWorkingSet', () => {
         expect(await harness.workingSet.activateCharacter('char-a')).toBe(false)
 
         expect(harness.publishedCharacters).toEqual([])
-        expect(lease.release).toHaveBeenCalledTimes(1)
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
     it('opens the store revision and initializes coordinator baselines', async () => {
@@ -256,6 +274,117 @@ describe('ActiveWorkingSet', () => {
         await harness.workingSet.initializeActiveWorkingSet(harness.database)
 
         expect(harness.store.open).toHaveBeenCalledTimes(1)
-        expect(harness.coordinator.initialize).toHaveBeenCalledWith(1)
+        expect(harness.coordinator.initialize).toHaveBeenCalledWith(1, harness.database)
+    })
+
+    it('rehydrates after reopen through bounded reads without writing IndexedDB', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'active-working-set-reopen'
+        const initial = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await initial.open()
+        const imported = await initial.replaceFromDatabase(fixtureDatabase)
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        const acquireRevision = vi.spyOn(reopened, 'acquireRevision')
+        const writes = { put: 0, add: 0, delete: 0, clear: 0 }
+        const originalPut = IDBObjectStore.prototype.put
+        const originalAdd = IDBObjectStore.prototype.add
+        const originalDelete = IDBObjectStore.prototype.delete
+        const originalClear = IDBObjectStore.prototype.clear
+        const putSpy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (...args) {
+            writes.put++
+            return originalPut.apply(this, args as Parameters<IDBObjectStore['put']>)
+        })
+        const addSpy = vi.spyOn(IDBObjectStore.prototype, 'add').mockImplementation(function (...args) {
+            writes.add++
+            return originalAdd.apply(this, args as Parameters<IDBObjectStore['add']>)
+        })
+        const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(function (...args) {
+            writes.delete++
+            return originalDelete.apply(this, args as Parameters<IDBObjectStore['delete']>)
+        })
+        const clearSpy = vi.spyOn(IDBObjectStore.prototype, 'clear').mockImplementation(function () {
+            writes.clear++
+            return originalClear.apply(this)
+        })
+        const published: Array<character | groupChat> = []
+        const coordinator = {
+            revision: imported.revision,
+            initialize: vi.fn(),
+            flushPendingData: vi.fn(async () => undefined),
+            adoptHydratedCharacter: vi.fn(() => true),
+        }
+        const workingSet = new ActiveWorkingSet({
+            store: reopened,
+            coordinator,
+            getSelectedCharacterId: () => 'char-a',
+            publishCharacter: (value) => published.push(value),
+            publishConversation: vi.fn(),
+        })
+
+        try {
+            expect(await workingSet.activateCharacter('char-a')).toBe(true)
+        } finally {
+            putSpy.mockRestore()
+            addSpy.mockRestore()
+            deleteSpy.mockRestore()
+            clearSpy.mockRestore()
+        }
+
+        expect(published[0]).toEqual(fixtureDatabase.characters[1])
+        expect(acquireRevision).not.toHaveBeenCalled()
+        expect(writes).toEqual({ put: 0, add: 0, delete: 0, clear: 0 })
+    })
+
+    it('discards mixed revisions when an intervening commit makes the next page empty', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'active-working-set-revision-race'
+        const reader = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        const writer = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reader.open()
+        const imported = await reader.replaceFromDatabase(fixtureDatabase)
+        await writer.open()
+        const originalQuery = reader.queryConversations.bind(reader)
+        const originalReadConversation = reader.readConversation.bind(reader)
+        let firstPage = true
+        vi.spyOn(reader, 'queryConversations').mockImplementation(async (input) => {
+            const page = await originalQuery(input)
+            if (firstPage) {
+                firstPage = false
+                return { ...page, nextCursor: '1' }
+            }
+            return page
+        })
+        let firstConversation = true
+        vi.spyOn(reader, 'readConversation').mockImplementation(async (characterId, conversationId) => {
+            const conversation = await originalReadConversation(characterId, conversationId)
+            if (firstConversation) {
+                firstConversation = false
+                const root = await writer.readRoot()
+                await writer.commit({
+                    expectedRevision: root.revision,
+                    root: { ...root.value, username: 'Intervening commit' },
+                })
+            }
+            return conversation
+        })
+        const publishCharacter = vi.fn()
+        const workingSet = new ActiveWorkingSet({
+            store: reader,
+            coordinator: {
+                revision: imported.revision,
+                initialize: vi.fn(),
+                flushPendingData: vi.fn(async () => undefined),
+                adoptHydratedCharacter: vi.fn(() => true),
+            },
+            getSelectedCharacterId: () => 'char-b',
+            publishCharacter,
+            publishConversation: vi.fn(),
+        })
+
+        expect(await workingSet.activateCharacter('char-b')).toBe(false)
+        expect(publishCharacter).not.toHaveBeenCalled()
+        expect(vi.mocked(reader.queryConversations)).toHaveBeenCalledTimes(2)
+        expect((await originalQuery({ characterId: 'char-b', order: 'configured', limit: 100, cursor: '1' })).items).toEqual([])
     })
 })

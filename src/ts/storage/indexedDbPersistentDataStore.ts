@@ -191,7 +191,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     async queryCharacters(input: CharacterQuery): Promise<CharacterPage> {
         const database = this.requireDatabase()
         const transaction = database.transaction(['meta', 'catalog'], 'readonly')
-        const { generation } = await this.readActive(transaction)
+        const { revision, generation } = await this.readActive(transaction)
         const store = transaction.objectStore('catalog')
         const index = store.index(
             input.order === 'configured' ? 'byGenerationConfigured' : 'byGenerationRecent',
@@ -213,7 +213,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 (!search || item.name.toLocaleLowerCase().includes(search)),
             )
         await transactionDone(transaction)
-        return result
+        return { revision, ...result }
     }
 
     async readCharacter(id: string): Promise<Versioned<CharacterDetail> | null> {
@@ -230,7 +230,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     async queryConversations(input: ConversationQuery): Promise<ConversationPage> {
         const database = this.requireDatabase()
         const transaction = database.transaction(['meta', 'conversations'], 'readonly')
-        const { generation } = await this.readActive(transaction)
+        const { revision, generation } = await this.readActive(transaction)
         const index = transaction.objectStore('conversations').index(
             input.order === 'configured'
                 ? 'byGenerationCharacterConfigured'
@@ -246,7 +246,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                   )
         const result = await cursorPage<StoredConversation>(index, range, input, () => true)
         await transactionDone(transaction)
-        return { items: result.items.map((item) => item.summary), nextCursor: result.nextCursor }
+        return {
+            revision,
+            items: result.items.map((item) => item.summary),
+            nextCursor: result.nextCursor,
+        }
     }
 
     async readConversation(
@@ -570,7 +574,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             queryCharacters: async (input) => {
                 assertActive()
-                return this.queryCharactersAt(generation, input)
+                return this.queryCharactersAt(revision, generation, input)
             },
             readCharacter: async (id) => {
                 assertActive()
@@ -578,7 +582,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             queryConversations: async (input) => {
                 assertActive()
-                return this.queryConversationsAt(generation, input)
+                return this.queryConversationsAt(revision, generation, input)
             },
             readConversation: async (characterId, conversationId) => {
                 assertActive()
@@ -613,6 +617,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     }
 
     private async queryCharactersAt(
+        revision: DataRevision,
         generation: string,
         input: CharacterQuery,
     ): Promise<CharacterPage> {
@@ -637,7 +642,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 (!search || item.name.toLocaleLowerCase().includes(search)),
         )
         await transactionDone(transaction)
-        return result
+        return { revision, ...result }
     }
 
     private async readCharacterAt(
@@ -654,6 +659,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     }
 
     private async queryConversationsAt(
+        revision: DataRevision,
         generation: string,
         input: ConversationQuery,
     ): Promise<ConversationPage> {
@@ -673,7 +679,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                   )
         const result = await cursorPage<StoredConversation>(index, range, input, () => true)
         await transactionDone(transaction)
-        return { items: result.items.map((item) => item.summary), nextCursor: result.nextCursor }
+        return {
+            revision,
+            items: result.items.map((item) => item.summary),
+            nextCursor: result.nextCursor,
+        }
     }
 
     private async readConversationAt(
