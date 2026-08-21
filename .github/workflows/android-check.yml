@@ -74,13 +74,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $apk = Get-ChildItem -Path 'src-tauri/gen/android/app/build/outputs/apk' -Recurse -Filter '*.apk' |
-            Where-Object FullName -Match 'arm64|aarch64' |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-          if ($null -eq $apk) {
-            throw 'No arm64 debug APK was produced.'
+          $apks = @(Get-ChildItem -Path 'src-tauri/gen/android/app/build/outputs/apk' -Recurse -Filter '*.apk')
+          if ($apks.Count -ne 1) {
+            throw "Expected exactly one arm64 debug APK, found $($apks.Count)."
           }
+          $apk = $apks[0]
           & ./util/checkAndroidAlignment.ps1 -ApkPath $apk.FullName *>&1 |
             Tee-Object -FilePath android-alignment.log
           if ($LASTEXITCODE -ne 0) {
@@ -101,9 +99,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-arm64-debug-apk
-          path: |
-            src-tauri/gen/android/app/build/outputs/apk/**/*arm64*.apk
-            src-tauri/gen/android/app/build/outputs/apk/**/*aarch64*.apk
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 7
 
