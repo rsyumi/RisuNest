@@ -4,6 +4,7 @@ import { asBuffer, Semaphore, sleep } from "../util";
 import { alertStore } from "../alert";
 import { hasher } from "../parser/parser.svelte";
 import { hubURL } from "../characterCards";
+import { fetchRealmResource } from "../realmAccess";
 
 // File size and chunk size constants
 const MAX_ASSET_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
@@ -442,7 +443,14 @@ export class CharXImporter{
 export async function CharXSkippableChecker(data:Uint8Array){
     const hashed = await hasher(data)
     const reHashed = await hasher(new TextEncoder().encode(hashed))
-    const x = await fetch(hubURL + '/rs/assets/' + reHashed + '.png')
+    const realmAssetRequest = fetchRealmResource(hubURL + '/rs/assets/' + reHashed + '.png')
+    if(!realmAssetRequest){
+        return {
+            success: false,
+            hash: hashed
+        }
+    }
+    const x = await realmAssetRequest
     return {
         success: x.status >= HTTP_STATUS_OK_MIN && x.status < HTTP_STATUS_OK_MAX,
         hash: hashed

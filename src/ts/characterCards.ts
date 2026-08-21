@@ -19,7 +19,7 @@ import { exportModuleLegacy, readModule, type RisuModule } from "./process/modul
 import { readFile } from "@tauri-apps/plugin-fs"
 import { onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { AccountStorage } from "./storage/accountStorage"
-import { isRealmAccessDisabled } from "./realmAccess"
+import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -259,26 +259,29 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
             if(db.account?.useSync && f.lightningRealmImport){
                 const id = await hasher(assetData)
                 const xid = 'assets/' + id + '.png'
-                queueFetchKey.push(assetIndex)
-                queueFetchData.push(assetData)
-                queueFetch.push(fetch('https://sv.risuai.xyz/rs/' + xid))
-                assets[assetIndex] =  'xid:' + xid
-                if(queueFetch.length > 10){
-                    const res = await Promise.all(queueFetch)
-                    for(let i=0;i<res.length;i++){
-                        if(res[i].status !== 200){
-                            const assetId = await saveAsset(queueFetchData[i])
-                            assets[queueFetchKey[i]] = assetId
+                const realmAssetRequest = fetchRealmResource('https://sv.risuai.xyz/rs/' + xid)
+                if(realmAssetRequest){
+                    queueFetchKey.push(assetIndex)
+                    queueFetchData.push(assetData)
+                    queueFetch.push(realmAssetRequest)
+                    assets[assetIndex] =  'xid:' + xid
+                    if(queueFetch.length > 10){
+                        const res = await Promise.all(queueFetch)
+                        for(let i=0;i<res.length;i++){
+                            if(res[i].status !== 200){
+                                const assetId = await saveAsset(queueFetchData[i])
+                                assets[queueFetchKey[i]] = assetId
+                            }
+                            else{
+                                assets[queueFetchKey[i]] = assets[queueFetchKey[i]].replace('xid:', '')
+                            }
                         }
-                        else{
-                            assets[queueFetchKey[i]] = assets[queueFetchKey[i]].replace('xid:', '')
-                        }
+                        queueFetch = []
+                        queueFetchKey = []
+                        queueFetchData = []
                     }
-                    queueFetch = []
-                    queueFetchKey = []
-                    queueFetchData = []
+                    continue
                 }
-                continue
             }
 
 
