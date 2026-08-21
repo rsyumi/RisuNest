@@ -143,7 +143,10 @@ export interface PersistentDataStore {
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
-    replaceFromDatabase(database: Database): Promise<{ revision: DataRevision }>
+    replaceFromDatabase(
+        database: Database,
+        expectedRevision?: DataRevision,
+    ): Promise<{ revision: DataRevision }>
     materializeDatabase(revision?: DataRevision): Promise<Database>
     acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>
 }
