@@ -382,11 +382,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    async replaceFromDatabase(databaseValue: Database): Promise<{ revision: DataRevision }> {
+    async replaceFromDatabase(
+        databaseValue: Database,
+        expectedRevision?: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
         const database = this.requireDatabase()
         const transaction = database.transaction([...STORE_NAMES], 'readwrite')
         try {
             const active = await this.readActive(transaction)
+            if (expectedRevision !== undefined && active.revision !== expectedRevision) {
+                throw new RevisionConflictError(expectedRevision, active.revision)
+            }
             const revision = active.revision + 1
             const generation = this.generationFor(revision)
             const ids = new Set<string>()

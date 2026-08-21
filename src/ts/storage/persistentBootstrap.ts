@@ -38,18 +38,18 @@ export async function bootstrapPersistentDatabase(
         database = await dependencies.prepareDatabase(persistent)
         source = 'persistent'
         if (canonicalJson(database) !== canonicalJson(persistent)) {
-            revision = (await dependencies.store.replaceFromDatabase(database)).revision
+            revision = (await dependencies.store.replaceFromDatabase(database, revision)).revision
         }
     } else {
         const legacy = await dependencies.loadLegacyCandidate()
         database = await dependencies.prepareDatabase(legacy.database)
-        revision = (await dependencies.store.replaceFromDatabase(database)).revision
+        revision = (await dependencies.store.replaceFromDatabase(database, revision)).revision
         source = legacy.source
     }
 
     if (dependencies.explicitCandidate !== undefined && dependencies.explicitCandidate !== null) {
         database = await dependencies.prepareDatabase(dependencies.explicitCandidate)
-        revision = (await dependencies.store.replaceFromDatabase(database)).revision
+        revision = (await dependencies.store.replaceFromDatabase(database, revision)).revision
         source = dependencies.explicitSource ?? 'account'
     }
 

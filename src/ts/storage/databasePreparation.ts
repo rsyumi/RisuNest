@@ -174,14 +174,14 @@ export function assignIds(
 
 export function checkCharOrder(database: Database): Database {
     database.characterOrder ??= []
-    const ordered = database.characterOrder.flatMap((entry) =>
-        typeof entry === 'string' ? [entry] : entry?.data ?? [],
-    )
-    const characterIds = database.characters
-        .filter((character) => !character.trashTime)
-        .map((character) => character.chaId)
-
+    const ordered: string[] = []
+    for (const entry of database.characterOrder) {
+        if (typeof entry === 'string') ordered.push(entry)
+        else if (entry) ordered.push(...entry.data)
+    }
+    const characterIds: string[] = []
     for (const character of database.characters) {
+        if (!character.trashTime) characterIds.push(character.chaId)
         if (
             !character.trashTime &&
             character.chaId !== '§temp' &&
@@ -192,14 +192,27 @@ export function checkCharOrder(database: Database): Database {
         }
     }
 
-    database.characterOrder = database.characterOrder
-        .map((entry) => {
-            if (typeof entry === 'string') return characterIds.includes(entry) ? entry : null
-            if (!entry) return null
-            const data = entry.data.filter((id) => characterIds.includes(id))
-            return data.length > 0 ? { ...entry, data } : null
-        })
-        .filter((entry) => entry !== null)
+    for (let index = 0; index < database.characterOrder.length; index++) {
+        const entry = database.characterOrder[index]
+        if (typeof entry === 'string') {
+            if (!characterIds.includes(entry)) {
+                database.characterOrder.splice(index, 1)
+                index--
+            }
+            continue
+        }
+        if (!entry || entry.data.length === 0) {
+            database.characterOrder.splice(index, 1)
+            index--
+            continue
+        }
+        for (let folderIndex = 0; folderIndex < entry.data.length; folderIndex++) {
+            if (!characterIds.includes(entry.data[folderIndex])) {
+                entry.data.splice(folderIndex, 1)
+                folderIndex--
+            }
+        }
+    }
     return database
 }
 

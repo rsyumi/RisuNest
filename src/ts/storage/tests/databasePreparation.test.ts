@@ -49,7 +49,7 @@ vi.mock('../../model/modellist', () => ({
     LLMTokenizer: {},
 }))
 import type { Database } from '../database.svelte'
-import { prepareDatabaseForPersistence } from '../databasePreparation'
+import { checkCharOrder, prepareDatabaseForPersistence } from '../databasePreparation'
 import { fixtureDatabase } from './persistentDataFixtures'
 
 function deterministicIds(...ids: string[]): () => string {
@@ -152,5 +152,42 @@ describe('prepareDatabaseForPersistence', () => {
             }),
         ).rejects.toThrow('ID allocation failed')
         expect(input).toEqual(original)
+    })
+
+    it('repairs character order in place and preserves retained folder identity', () => {
+        const database = structuredClone(fixtureDatabase)
+        const folder = {
+            name: 'Favorites',
+            id: 'folder-favorites',
+            color: '#ffffff',
+            data: ['char-a', 'missing-character'],
+        }
+        database.characterOrder = [folder, 'missing-character']
+        const order = database.characterOrder
+
+        checkCharOrder(database)
+
+        expect(database.characterOrder).toBe(order)
+        expect(database.characterOrder[0]).toBe(folder)
+        expect(folder.data).toEqual(['char-a'])
+    })
+
+    it('retains a folder emptied by invalid-ID repair until the next call', () => {
+        const database = structuredClone(fixtureDatabase)
+        const folder = {
+            name: 'Missing',
+            id: 'folder-missing',
+            color: '#ffffff',
+            data: ['missing-character'],
+        }
+        database.characterOrder = [folder]
+
+        checkCharOrder(database)
+
+        expect(database.characterOrder[0]).toBe(folder)
+        expect(folder.data).toEqual([])
+
+        checkCharOrder(database)
+        expect(database.characterOrder).not.toContain(folder)
     })
 })

@@ -1,6 +1,8 @@
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
-import type { PersistentDataStore } from '../persistentDataStore'
+import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
+import { RevisionConflictError, type PersistentDataStore } from '../persistentDataStore'
 import { bootstrapPersistentDatabase } from '../persistentBootstrap'
 import { fixtureDatabase } from './persistentDataFixtures'
 
@@ -52,7 +54,7 @@ describe('bootstrapPersistentDatabase', () => {
         expect(loadLegacyCandidate).toHaveBeenCalledTimes(1)
         expect(prepareDatabase).toHaveBeenCalledTimes(1)
         expect(store.replaceFromDatabase).toHaveBeenCalledTimes(1)
-        expect(store.replaceFromDatabase).toHaveBeenCalledWith(prepared)
+        expect(store.replaceFromDatabase).toHaveBeenCalledWith(prepared, 0)
         expect(result).toEqual({ database: prepared, revision: 1, source: 'primary' })
     })
 
@@ -70,7 +72,7 @@ describe('bootstrapPersistentDatabase', () => {
             })
 
             expect(loadLegacyCandidate).toHaveBeenCalledTimes(1)
-            expect(store.replaceFromDatabase).toHaveBeenCalledTimes(1)
+            expect(store.replaceFromDatabase).toHaveBeenCalledWith(candidate, 0)
             expect(result.source).toBe(source)
         },
     )
@@ -106,6 +108,7 @@ describe('bootstrapPersistentDatabase', () => {
         })
 
         expect(changedStore.replaceFromDatabase).toHaveBeenCalledTimes(1)
+        expect(changedStore.replaceFromDatabase).toHaveBeenCalledWith(changed, 4)
         expect(changedResult).toEqual({ database: changed, revision: 5, source: 'persistent' })
 
         const reordered = Object.fromEntries(Object.entries(persistent).reverse()) as unknown as Database
@@ -136,7 +139,60 @@ describe('bootstrapPersistentDatabase', () => {
         })
 
         expect(store.replaceFromDatabase).toHaveBeenCalledTimes(1)
-        expect(store.replaceFromDatabase).toHaveBeenCalledWith(remote)
+        expect(store.replaceFromDatabase).toHaveBeenCalledWith(remote, 3)
         expect(result).toEqual({ database: remote, revision: 4, source: 'account' })
+    })
+
+    it('rejects persistent normalization when another connection commits first', async () => {
+        const indexedDB = new IDBFactory()
+        const first = new IndexedDbPersistentDataStore('bootstrap-normalization-cas', indexedDB, IDBKeyRange)
+        const second = new IndexedDbPersistentDataStore('bootstrap-normalization-cas', indexedDB, IDBKeyRange)
+        await Promise.all([first.open(), second.open()])
+        await first.replaceFromDatabase(structuredClone(fixtureDatabase))
+
+        const prepared = structuredClone(fixtureDatabase)
+        prepared.formatversion = 5
+        const concurrent = structuredClone(fixtureDatabase)
+        concurrent.username = 'Concurrent user'
+        const { characters: _characters, ...concurrentRoot } = concurrent
+
+        await expect(
+            bootstrapPersistentDatabase({
+                store: first,
+                loadLegacyCandidate: vi.fn(),
+                prepareDatabase: async () => {
+                    await second.commit({ expectedRevision: 1, root: concurrentRoot })
+                    return prepared
+                },
+            }),
+        ).rejects.toBeInstanceOf(RevisionConflictError)
+
+        expect((await second.readRoot()).revision).toBe(2)
+        expect((await second.materializeDatabase()).username).toBe('Concurrent user')
+    })
+
+    it('rejects a revision-zero import when another connection imports first', async () => {
+        const indexedDB = new IDBFactory()
+        const first = new IndexedDbPersistentDataStore('bootstrap-blank-cas', indexedDB, IDBKeyRange)
+        const second = new IndexedDbPersistentDataStore('bootstrap-blank-cas', indexedDB, IDBKeyRange)
+        await Promise.all([first.open(), second.open()])
+        const candidate = structuredClone(fixtureDatabase)
+        candidate.username = 'Stale starter'
+        const concurrent = structuredClone(fixtureDatabase)
+        concurrent.username = 'First importer'
+
+        await expect(
+            bootstrapPersistentDatabase({
+                store: first,
+                loadLegacyCandidate: async () => ({ database: candidate, source: 'primary' }),
+                prepareDatabase: async (database) => {
+                    await second.replaceFromDatabase(concurrent)
+                    return structuredClone(database)
+                },
+            }),
+        ).rejects.toBeInstanceOf(RevisionConflictError)
+
+        expect((await second.readRoot()).revision).toBe(1)
+        expect((await second.materializeDatabase()).username).toBe('First importer')
     })
 })
