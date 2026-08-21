@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => {
     const cache = new Map<string, unknown>()
@@ -9,7 +9,9 @@ const mocks = vi.hoisted(() => {
         fetchProtectedResource: vi.fn(),
         alertLogin: vi.fn(async () => 'new-token'),
         alertNormalWait: vi.fn(async () => undefined),
-        sleep: vi.fn(() => new Promise<void>(() => undefined)),
+        sleep: vi.fn((milliseconds: number) => new Promise<void>((resolve) => {
+            setTimeout(resolve, milliseconds)
+        })),
         cachedForage: {
             getItem: vi.fn(async (key: string) => cache.get(key) ?? null),
             setItem: vi.fn(async (key: string, value: unknown) => {
@@ -64,17 +66,44 @@ beforeEach(() => {
     mocks.fetchProtectedResource.mockReset()
     mocks.alertLogin.mockReset().mockResolvedValue('new-token')
     mocks.alertNormalWait.mockReset().mockResolvedValue(undefined)
-    mocks.sleep.mockReset().mockImplementation(() => new Promise<void>(() => undefined))
-    mocks.cachedForage.getItem.mockClear()
-    mocks.cachedForage.setItem.mockClear()
-    mocks.localforage.getItem.mockClear()
-    mocks.localforage.setItem.mockClear()
+    mocks.sleep.mockReset().mockImplementation((milliseconds: number) => new Promise<void>((resolve) => {
+        setTimeout(resolve, milliseconds)
+    }))
+    mocks.cachedForage.getItem.mockReset().mockImplementation(async (key: string) => (
+        mocks.cache.get(key) ?? null
+    ))
+    mocks.cachedForage.setItem.mockReset().mockImplementation(async (key: string, value: unknown) => {
+        mocks.cache.set(key, value)
+        return value
+    })
+    mocks.localforage.getItem.mockReset().mockImplementation(async (key: string) => (
+        mocks.assets.get(key) ?? null
+    ))
+    mocks.localforage.setItem.mockReset().mockImplementation(async (key: string, value: unknown) => {
+        mocks.assets.set(key, value)
+        return value
+    })
     mocks.cache.clear()
     mocks.assets.clear()
     mocks.localforage.createInstance.mockReturnValue(mocks.cachedForage)
     localStorage.clear()
     vi.spyOn(Date, 'now').mockReturnValue(1_725_000_000_123)
 })
+
+afterEach(() => {
+    vi.useRealTimers()
+})
+
+function cancellableResponse(
+    status: number,
+    headers?: HeadersInit,
+    cancel: () => void = vi.fn(),
+): { response: Response; cancel: () => void } {
+    return {
+        response: new Response(new ReadableStream({ cancel }), { status, headers }),
+        cancel,
+    }
+}
 
 describe('AccountStorage structured wire contract', () => {
     it('writes with the exact session and save-date headers', async () => {
@@ -118,7 +147,7 @@ describe('AccountStorage structured wire contract', () => {
         const storage = new AccountStorage()
 
         await storage.readItem('database/database.bin')
-        await storage.readItem('assets/a.png')
+        await storage.readItem('assets/database-icon.png')
 
         expect(mocks.fetchProtectedResource.mock.calls[0]).toEqual([
             '/api/account/read/64617461626173652f64617461626173652e62696e|fixed-uuid',
@@ -131,7 +160,7 @@ describe('AccountStorage structured wire contract', () => {
             },
         ])
         expect(mocks.fetchProtectedResource.mock.calls[1][0]).toBe(
-            '/api/account/read/6173736574732f612e706e67',
+            '/api/account/read/6173736574732f64617461626173652d69636f6e2e706e67',
         )
     })
 
@@ -173,14 +202,43 @@ describe('AccountStorage structured wire contract', () => {
         await expect(storage.setItem('assets/a.png', new Uint8Array())).resolves.toBe('assets/a.png')
     })
 
+    it('does not parse malformed JSON bodies for body-independent statuses', async () => {
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 70 }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response(null, 304, {
+                'content-type': 'application/json; charset=utf-8',
+            }))
+            .mockResolvedValueOnce(response('not-json', 403, {
+                'content-type': 'application/json; charset=utf-8',
+                'x-risu-status': 'warn',
+            }))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage()
+
+        await expect(storage.writeItem('assets/a.png', new Uint8Array())).resolves.toEqual({
+            kind: 'not-modified',
+            replacementKey: 'assets/a.png',
+        })
+        await expect(storage.writeItem('assets/b.png', new Uint8Array())).resolves.toEqual({
+            kind: 'auth-warning',
+        })
+    })
+
     it('retries an ordinary 403 after login and exposes a warning 403', async () => {
+        const retryBody = cancellableResponse(403)
+        const warnCancel = vi.fn(() => {
+            throw new Error('cancel failed')
+        })
+        const warnBody = cancellableResponse(403, { 'x-risu-status': 'warn' }, warnCancel)
         mocks.fetchProtectedResource
             .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 8 }), 200, {
                 'content-type': 'application/json',
             }))
-            .mockResolvedValueOnce(response('forbidden', 403))
+            .mockResolvedValueOnce(retryBody.response)
             .mockResolvedValueOnce(response('assets/retried.png'))
-            .mockResolvedValueOnce(response('warn', 403, { 'x-risu-status': 'warn' }))
+            .mockResolvedValueOnce(warnBody.response)
         const { AccountStorage } = await loadStorage()
         const storage = new AccountStorage()
 
@@ -193,6 +251,66 @@ describe('AccountStorage structured wire contract', () => {
         await expect(storage.writeItem('assets/b.png', new Uint8Array([2]))).resolves.toEqual({
             kind: 'auth-warning',
         })
+        expect(retryBody.cancel).toHaveBeenCalledOnce()
+        expect(warnBody.cancel).toHaveBeenCalledOnce()
+    })
+
+    it('does not mutate the database cache for warning or failed writes', async () => {
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 80 }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response('warn', 403, { 'x-risu-status': 'warn' }))
+            .mockResolvedValueOnce(response('failed', 500))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage()
+        const bytes = new Uint8Array([8, 0])
+
+        await expect(storage.writeItem('database/database.bin', bytes)).resolves.toEqual({
+            kind: 'auth-warning',
+        })
+        await expect(storage.writeItem('database/database.bin', bytes)).rejects.toBe('failed')
+
+        expect(mocks.cachedForage.setItem).not.toHaveBeenCalled()
+        expect(mocks.cache.size).toBe(0)
+    })
+
+    it('awaits both database cache updates after a successful write', async () => {
+        const pending: Array<() => void> = []
+        mocks.cachedForage.setItem.mockImplementation((key: string, value: unknown) => (
+            new Promise((resolve) => pending.push(() => {
+                mocks.cache.set(key, value)
+                resolve(value)
+            }))
+        ))
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 81 }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response('retry', 403))
+            .mockResolvedValueOnce(response('database/database.bin'))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage()
+        const bytes = new Uint8Array([8, 1])
+        let settled = false
+
+        const write = storage.writeItem('database/database.bin', bytes).finally(() => {
+            settled = true
+        })
+        await vi.waitFor(() => expect(pending).toHaveLength(1))
+        expect(mocks.alertLogin).toHaveBeenCalledOnce()
+        expect(settled).toBe(false)
+        pending.shift()!()
+        await vi.waitFor(() => expect(pending).toHaveLength(1))
+        expect(settled).toBe(false)
+        pending.shift()!()
+
+        await expect(write).resolves.toEqual({
+            kind: 'written',
+            replacementKey: 'database/database.bin',
+        })
+        expect(mocks.cache.get('database/database.bin')).toEqual(bytes)
+        expect(mocks.cache.get('database/database.bin__date')).toBe('1725000000123')
     })
 
     it('publishes each successful JSON warning once without turning it into a failure', async () => {
@@ -201,8 +319,12 @@ describe('AccountStorage structured wire contract', () => {
             .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 9 }), 200, {
                 'content-type': 'application/json',
             }))
-            .mockResolvedValueOnce(response(warningBody, 200, { 'content-type': 'application/json' }))
-            .mockResolvedValueOnce(response(warningBody, 200, { 'content-type': 'application/json' }))
+            .mockResolvedValueOnce(response(warningBody, 200, {
+                'content-type': 'Application/JSON; Charset=UTF-8',
+            }))
+            .mockResolvedValueOnce(response(warningBody, 200, {
+                'content-type': 'application/json; charset=utf-8',
+            }))
         const { AccountStorage, AccountWarning } = await loadStorage()
         const seen: string[] = []
         const unsubscribe = AccountWarning.subscribe((value) => seen.push(value))
@@ -219,12 +341,13 @@ describe('AccountStorage structured wire contract', () => {
     })
 
     it('keeps reload-session writes pending after scheduling the existing alert', async () => {
+        vi.useFakeTimers()
         mocks.fetchProtectedResource
             .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 10 }), 200, {
                 'content-type': 'application/json',
             }))
             .mockResolvedValueOnce(response(JSON.stringify({ reloadSession: true }), 200, {
-                'content-type': 'application/json',
+                'content-type': 'application/json; charset=utf-8',
             }))
         const { AccountStorage } = await loadStorage()
         const storage = new AccountStorage()
@@ -234,9 +357,9 @@ describe('AccountStorage structured wire contract', () => {
             settled = true
         })
         await vi.waitFor(() => expect(mocks.alertNormalWait).toHaveBeenCalledOnce())
-
-        expect(mocks.sleep).toHaveBeenCalledOnce()
+        await vi.advanceTimersByTimeAsync(100_000_001)
         expect(settled).toBe(false)
+        expect(mocks.sleep).not.toHaveBeenCalled()
     })
 
     it('reports cumulative progress and preserves compatibility buffers', async () => {
@@ -279,5 +402,34 @@ describe('AccountStorage structured wire contract', () => {
 
         await expect(storage.getItem('missing')).resolves.toBeNull()
         await expect(storage.setItem('database/database.bin', new Uint8Array([1]))).resolves.toBeUndefined()
+    })
+
+    it('fails a 303 cache match when the cached bytes are missing', async () => {
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response(
+            JSON.stringify({ match: true }),
+            303,
+            { 'content-type': 'application/json' },
+        ))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage()
+
+        await expect(storage.readItem('database/database.bin')).rejects.toThrow(
+            'Cached account bytes are missing for database/database.bin',
+        )
+    })
+
+    it('cancels an ignored read 403 body before retrying', async () => {
+        const forbidden = cancellableResponse(403)
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(forbidden.response)
+            .mockResolvedValueOnce(response(new Uint8Array([9])))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage()
+
+        await expect(storage.readItem('plain-key')).resolves.toEqual({
+            kind: 'value',
+            bytes: new Uint8Array([9]),
+        })
+        expect(forbidden.cancel).toHaveBeenCalledOnce()
     })
 })

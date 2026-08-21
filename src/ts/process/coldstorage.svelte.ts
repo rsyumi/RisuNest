@@ -98,6 +98,16 @@ export async function getColdStorageItem(key:string, opts:{
     }
 }
 
+async function discardResponseBody(response:Response):Promise<void> {
+    try {
+        await response.body?.cancel()
+    } catch (error) {}
+}
+
+function isAbortError(error:unknown):boolean {
+    return typeof error === 'object' && error !== null && 'name' in error && error.name === 'AbortError'
+}
+
 export async function getAccountColdStorageItem(
     key:string,
     signal?:AbortSignal,
@@ -111,6 +121,7 @@ export async function getAccountColdStorageItem(
     })
 
     if(d.status !== 200){
+        await discardResponseBody(d)
         return null
     }
     const buf = await d.arrayBuffer()
@@ -159,8 +170,12 @@ export async function setAccountColdStorageItem(
             console.error('Error setting cold storage item:', await res.text().catch(() => 'unknown'))
             return false
         }
+        await discardResponseBody(res)
         return true
     } catch (error) {
+        if(isAbortError(error)){
+            throw error
+        }
         console.error('Cold storage account write failed:', error)
         return false
     }

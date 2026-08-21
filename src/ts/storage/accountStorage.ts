@@ -6,7 +6,6 @@ import { forageStorage, getUncleanables, getUncleanablesSync } from "../globalAp
 import { encodeRisuSaveLegacy } from "./risuSave"
 import { v4 } from "uuid"
 import { language } from "src/lang"
-import { sleep } from "../util"
 import { fetchProtectedResource } from "../sionyw"
 import { completeAccountUnmigration } from "./databaseRestore"
 import { replacePersistentDatabase } from "./persistentDataRuntime.svelte"
@@ -16,6 +15,7 @@ let risuSession = ''
 const cachedForage = localforage.createInstance({name: "risuaiAccountCached"})
 
 let seenWarnings:string[] = []
+const accountDatabaseKey = 'database/database.bin'
 
 export type AccountReadResult =
     | { kind: 'value'; bytes: Uint8Array }
@@ -38,6 +38,28 @@ export interface AccountWriteOptions {
 
 function withSignal(options: RequestInit, signal?: AbortSignal): RequestInit {
     return signal ? { ...options, signal } : options
+}
+
+function isJsonResponse(response: Response): boolean {
+    return /^\s*application\/json\s*(?:;|$)/i.test(response.headers.get('content-type') ?? '')
+}
+
+async function discardResponseBody(response: Response): Promise<void> {
+    try {
+        await response.body?.cancel()
+    } catch (error) {}
+}
+
+function waitForever(): Promise<never> {
+    return new Promise(() => {})
+}
+
+async function cacheDatabaseWrite(key:string, value:Uint8Array, saveDate:string):Promise<void> {
+    if(key !== accountDatabaseKey){
+        return
+    }
+    await cachedForage.setItem(key, value)
+    await cachedForage.setItem(key + '__date', saveDate)
 }
 
 export class AccountStorage{
@@ -84,12 +106,6 @@ export class AccountStorage{
                     'x-risu-save-date': saveDate
                 }
             }, options.signal))
-            if(key === 'database/database.bin'){
-                cachedForage.setItem(key, value).then(() => {
-                    cachedForage.setItem(key + '__date', saveDate)
-                })
-            }
-
             let daText:string|undefined = undefined
             const getDaText = async () => {
                 if(daText === undefined){
@@ -98,7 +114,25 @@ export class AccountStorage{
                 return daText
             }
 
-            if(da.headers.get('Content-Type') === 'application/json'){
+            if(da.status === 304){
+                await discardResponseBody(da)
+                await cacheDatabaseWrite(key, value, saveDate)
+                return { kind: 'not-modified', replacementKey: key }
+            }
+            if(da.status === 403){
+                await discardResponseBody(da)
+                if(da.headers.get('x-risu-status') === 'warn'){
+                    return { kind: 'auth-warning' }
+                }
+                localStorage.setItem("fallbackRisuToken",await alertLogin())
+                this.checkAuth()
+                continue
+            }
+            if(da.status < 200 || da.status >= 300){
+                throw await getDaText()
+            }
+
+            if(isJsonResponse(da)){
                 const json = JSON.parse(await getDaText())
                 if(json?.warning){
                     if(!seenWarnings.includes(json.warning)){
@@ -107,33 +141,19 @@ export class AccountStorage{
                     }
                 }
                 if(json?.reloadSession){
-                    alertNormalWait(language.activeTabChange).then(() => {
+                    void alertNormalWait(language.activeTabChange).then(() => {
                         location.reload()
                     })
-                    await sleep(100000000) // wait forever
-                    return
+                    await waitForever()
                 }
             }
 
-            if(da.status === 304){
-                return { kind: 'not-modified', replacementKey: key }
-            }
-            if(da.status === 403){
-                if(da.headers.get('x-risu-status') === 'warn'){
-                    return { kind: 'auth-warning' }
-                }
-                localStorage.setItem("fallbackRisuToken",await alertLogin())
-                this.checkAuth()
-                continue
-            }
-
-            if(da.status < 200 || da.status >= 300){
-                throw await getDaText()
-            }
+            const replacementKey = await getDaText()
             if(key.startsWith('assets/')){
                 await localforage.setItem(key, new Uint8Array(value).buffer)
             }
-            return { kind: 'written', replacementKey: await getDaText() }
+            await cacheDatabaseWrite(key, value, saveDate)
+            return { kind: 'written', replacementKey }
         }
 
         throw new Error('Account write did not complete')
@@ -162,7 +182,7 @@ export class AccountStorage{
         const saveDate = await cachedForage.getItem(key + '__date') as number|string|undefined
         while((!da) || da.status === 403){
             da = await fetchProtectedResource('/api/account/read/' + Buffer.from(key ,'utf-8').toString('hex') +
-                (key.includes('database') ? ('|' + v4()) : ''), withSignal({
+                (key === accountDatabaseKey ? ('|' + v4()) : ''), withSignal({
                 method: "GET",
                 headers: {
                     'x-risu-key': key,
@@ -170,6 +190,7 @@ export class AccountStorage{
                 }
             }, options.signal))
             if(da.status === 403){
+                await discardResponseBody(da)
                 localStorage.setItem("fallbackRisuToken",await alertLogin())
                 this.checkAuth()
             }
@@ -177,7 +198,10 @@ export class AccountStorage{
         if(da.status === 303){
             const data = await da.json()
             if(data.match){
-                const cached = await cachedForage.getItem(key) as ArrayBuffer|Uint8Array
+                const cached = await cachedForage.getItem(key) as ArrayBuffer|Uint8Array|null
+                if(!cached){
+                    throw new Error(`Cached account bytes are missing for ${key}`)
+                }
                 return { kind: 'not-modified', bytes: new Uint8Array(cached) }
             }
             else{

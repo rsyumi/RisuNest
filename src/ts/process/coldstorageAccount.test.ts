@@ -43,10 +43,15 @@ describe('official account cold storage transport', () => {
     })
 
     it('returns missing for every non-200 remote read', async () => {
-        mocks.fetchProtectedResource.mockResolvedValueOnce(new Response(null, { status: 204 }))
+        const cancel = vi.fn()
+        mocks.fetchProtectedResource.mockResolvedValueOnce(new Response(
+            new ReadableStream({ cancel }),
+            { status: 404 },
+        ))
         const { getAccountColdStorageItem } = await import('./coldstorage.svelte')
 
         await expect(getAccountColdStorageItem('cold-missing')).resolves.toBeNull()
+        expect(cancel).toHaveBeenCalledOnce()
     })
 
     it('writes compressed JSON with exact headers and an abort signal', async () => {
@@ -74,5 +79,31 @@ describe('official account cold storage transport', () => {
         const { setAccountColdStorageItem } = await import('./coldstorage.svelte')
 
         await expect(setAccountColdStorageItem('cold-c', {})).resolves.toBe(false)
+    })
+
+    it('cancels the ignored successful write body', async () => {
+        const cancel = vi.fn()
+        mocks.fetchProtectedResource.mockResolvedValueOnce(new Response(
+            new ReadableStream({ cancel }),
+            { status: 200 },
+        ))
+        const { setAccountColdStorageItem } = await import('./coldstorage.svelte')
+
+        await expect(setAccountColdStorageItem('cold-d', {})).resolves.toBe(true)
+        expect(cancel).toHaveBeenCalledOnce()
+    })
+
+    it('preserves read and write AbortError identity', async () => {
+        const readAbort = new DOMException('read cancelled', 'AbortError')
+        const writeAbort = new DOMException('write cancelled', 'AbortError')
+        const { getAccountColdStorageItem, setAccountColdStorageItem } = await import(
+            './coldstorage.svelte'
+        )
+
+        mocks.fetchProtectedResource.mockRejectedValueOnce(readAbort)
+        await expect(getAccountColdStorageItem('cold-read-abort')).rejects.toBe(readAbort)
+
+        mocks.fetchProtectedResource.mockRejectedValueOnce(writeAbort)
+        await expect(setAccountColdStorageItem('cold-write-abort', {})).rejects.toBe(writeAbort)
     })
 })
