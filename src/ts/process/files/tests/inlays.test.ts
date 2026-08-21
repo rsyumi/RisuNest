@@ -7,6 +7,7 @@ import {
     listInlayAssets,
     postInlayAsset,
     removeInlayAsset,
+    saveInlayedSignature,
     setInlayAsset,
     writeInlayImage,
 } from '../inlays'
@@ -41,6 +42,7 @@ vi.mock('localforage', () => ({
             removeItem: vi.fn(async (key: string) => {
                 store.delete(key)
             }),
+            keys: vi.fn(async () => [...store.keys()]),
             iterate: vi.fn(async (cb: (value: unknown, key: string) => void) => {
                 for (const [key, value] of store) {
                     cb(value, key)
@@ -114,7 +116,9 @@ describe('setInlayAsset', () => {
 
         await setInlayAsset('asset-1', asset)
 
-        expect(store.get('asset-1')).toBe(asset)
+        expect(await getInlayAssetBlob('asset-1')).toMatchObject({
+            ext: 'png', height: 100, name: 'test.png', type: 'image', width: 100,
+        })
     })
 
     test('overwrites an existing asset with the same id', async () => {
@@ -138,7 +142,7 @@ describe('setInlayAsset', () => {
         await setInlayAsset('id-1', first)
         await setInlayAsset('id-1', second)
 
-        expect(store.get('id-1') as InlayAsset).toMatchObject({
+        expect(await getInlayAssetBlob('id-1')).toMatchObject({
             height: 20,
             name: 'second.png',
             type: 'image',
@@ -225,8 +229,8 @@ describe('getInlayAssetBlob', () => {
         const result = await getInlayAssetBlob('legacy-id')
         expect(result!.data).toBeInstanceOf(Blob)
 
-        const updated = store.get('legacy-id') as InlayAsset
-        expect(updated.data).toBeInstanceOf(Blob)
+        const retained = store.get('legacy-id') as InlayAsset
+        expect(retained.data).toBe(b64)
     })
 })
 
@@ -279,7 +283,7 @@ describe('postInlayAsset', () => {
         })
         expect(result).toBe('test-uuid-1234')
 
-        const stored = store.get('test-uuid-1234') as InlayAsset
+        const stored = await getInlayAssetBlob('test-uuid-1234')
         expect(stored).toMatchObject({
             data: expect.any(Blob),
             ext: 'mp3',
@@ -296,7 +300,7 @@ describe('postInlayAsset', () => {
         })
         expect(result).toBe('test-uuid-1234')
 
-        const stored = store.get('test-uuid-1234') as InlayAsset
+        const stored = await getInlayAssetBlob('test-uuid-1234')
         expect(stored).toMatchObject({
             data: expect.any(Blob),
             ext: 'webm',
@@ -330,9 +334,9 @@ describe('postInlayAsset', () => {
                     data: new Uint8Array([0x00]),
                 })
                 expect(result).not.toBeNull()
-                const stored = store.get(result!) as InlayAsset
-                expect(stored.type).toBe('audio')
-                expect(stored.ext).toBe(ext)
+                const stored = await getInlayAssetBlob(result!)
+                expect(stored!.type).toBe('audio')
+                expect(stored!.ext).toBe(ext)
             }),
         )
     })
@@ -346,9 +350,9 @@ describe('postInlayAsset', () => {
                     data: new Uint8Array([0x00]),
                 })
                 expect(result).not.toBeNull()
-                const stored = store.get(result!) as InlayAsset
-                expect(stored.type).toBe('video')
-                expect(stored.ext).toBe(ext)
+                const stored = await getInlayAssetBlob(result!)
+                expect(stored!.type).toBe('video')
+                expect(stored!.ext).toBe(ext)
             }),
         )
     })
@@ -366,7 +370,7 @@ describe('writeInlayImage', () => {
 
         expect(result).toBe('custom-id')
 
-        const stored = store.get('custom-id') as InlayAsset
+        const stored = await getInlayAssetBlob('custom-id')
         expect(stored).toMatchObject({
             data: expect.any(Blob),
             ext: 'png',
@@ -383,8 +387,8 @@ describe('writeInlayImage', () => {
         const result = await writeInlayImage(imgObj)
         expect(result).toBe('test-uuid-1234')
 
-        const stored = store.get('test-uuid-1234') as InlayAsset
-        expect(stored.name).toBe('test-uuid-1234')
+        const stored = await getInlayAssetBlob('test-uuid-1234')
+        expect(stored!.name).toBe('test-uuid-1234')
     })
 
     test('output pixels never exceed 1024 * 1024', async () => {
@@ -393,11 +397,11 @@ describe('writeInlayImage', () => {
                 store.clear()
                 const img = makeImage(w, h)
                 await writeInlayImage(img, { id: 'prop-img' })
-                const stored = store.get('prop-img') as InlayAsset
+                const stored = await getInlayAssetBlob('prop-img')
 
-                expect(stored.width * stored.height).toBeLessThanOrEqual(1024 * 1024)
-                expect(stored.width).toBeGreaterThan(0)
-                expect(stored.height).toBeGreaterThan(0)
+                expect(stored!.width! * stored!.height!).toBeLessThanOrEqual(1024 * 1024)
+                expect(stored!.width).toBeGreaterThan(0)
+                expect(stored!.height).toBeGreaterThan(0)
             }),
         )
     })
@@ -411,10 +415,10 @@ describe('writeInlayImage', () => {
                     store.clear()
                     const img = makeImage(w, h)
                     await writeInlayImage(img, { id: 'ratio-img' })
-                    const stored = store.get('ratio-img') as InlayAsset
+                    const stored = await getInlayAssetBlob('ratio-img')
 
                     const originalRatio = w / h
-                    const storedRatio = stored.width / stored.height
+                    const storedRatio = stored!.width! / stored!.height!
                     expect(Math.abs(originalRatio - storedRatio) / originalRatio).toBeLessThan(0.01)
                 },
             ),
@@ -428,7 +432,7 @@ describe('writeInlayImage', () => {
                 const img = makeImage(w, h)
                 await writeInlayImage(img, { id: 'small-img' })
 
-                const stored = store.get('small-img') as InlayAsset
+                const stored = await getInlayAssetBlob('small-img')
                 expect(stored).toMatchObject({
                     height: h,
                     width: w,
@@ -464,7 +468,7 @@ describe('set -> get round-trip', () => {
                     const result = await getInlayAsset(id)
                     expect(result).toMatchObject({
                         data: expect.any(String),
-                        ext,
+                        ext: ext.replace(/^\.+/, '').toLowerCase(),
                         height,
                         width,
                         name,
@@ -497,5 +501,25 @@ describe('set -> remove -> get', () => {
                 expect(await getInlayAsset(id)).toBeNull()
             }),
         )
+    })
+})
+
+describe('BlobStore inlay compatibility', () => {
+    test('round trips image, audio, video, and signature bytes', async () => {
+        const fixtures: [string, InlayAsset, Uint8Array][] = [
+            ['image', { data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }), ext: 'png', name: 'a.png', type: 'image', width: 2, height: 1 }, new Uint8Array([1, 2])],
+            ['audio', { data: new Blob([new Uint8Array([3])], { type: 'audio/mpeg' }), ext: 'mp3', name: 'a.mp3', type: 'audio' }, new Uint8Array([3])],
+            ['video', { data: new Blob([new Uint8Array([4, 5])], { type: 'video/webm' }), ext: 'webm', name: 'a.webm', type: 'video' }, new Uint8Array([4, 5])],
+        ]
+        for (const [id, asset, bytes] of fixtures) {
+            await setInlayAsset(id, asset)
+            const loaded = await getInlayAssetBlob(id)
+            expect(new Uint8Array(await loaded!.data.arrayBuffer())).toEqual(bytes)
+            expect(loaded).toMatchObject({ name: asset.name, ext: asset.ext, type: asset.type })
+        }
+
+        const signature = { signatures: [{ type: 'text' as const, content: 'synthetic' }], sourceFormat: 0 as any, source: 'local' }
+        await saveInlayedSignature('signature', signature)
+        expect((await getInlayAsset('signature'))?.data).toBe(JSON.stringify(signature))
     })
 })

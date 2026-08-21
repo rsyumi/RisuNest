@@ -1,8 +1,9 @@
 import { alertError, alertInput, alertNormal, alertSelect, alertStore } from "../alert";
 import { getDatabase, type Database } from "../storage/database.svelte";
 import { forageStorage, getUncleanables, openURL } from "../globalApi.svelte";
+import { resolveBlobStore } from "../storage/platformBlobStore";
+import { selectLegacyBackupAssetKeys } from "./backupAssets";
 import { isTauri } from "src/ts/platform"
-import { BaseDirectory, exists, readFile, readDir, writeFile } from "@tauri-apps/plugin-fs";
 import { language } from "../../lang";
 import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
@@ -118,6 +119,8 @@ export function syncDrive() {
 
 
 async function backupDrive(ACCESS_TOKEN:string) {
+    await forageStorage.Init()
+    const blobStore = await resolveBlobStore()
     alertStore.set({
         type: "wait",
         msg: "Uploading Backup..."
@@ -135,8 +138,8 @@ async function backupDrive(ACCESS_TOKEN:string) {
         return
     }
 
-    if(isTauri){
-        const assets = await readDir('assets', {baseDir: BaseDirectory.AppData})
+    if(!forageStorage.isAccount){
+        const assets = await blobStore.list({ kind: 'asset' })
         let i = 0;
         for(let asset of assets){
             i += 1;
@@ -144,18 +147,16 @@ async function backupDrive(ACCESS_TOKEN:string) {
                 type: "wait",
                 msg: `Uploading Backup... (${i} / ${assets.length})`
             })
-            const key = asset.name
-            if(!key || !key.endsWith('.png')){
-                continue
-            }
-            const formatedKey = newFormatKeys(key)
+            const key = asset.key
+            const formatedKey = newFormatKeys(isTauri ? key.slice('assets/'.length) : key)
             if(!fileNames.includes(formatedKey)){
-                await createFileInFolder(ACCESS_TOKEN, formatedKey, await readFile('assets/' + asset.name, {baseDir: BaseDirectory.AppData}))
+                const data = await blobStore.read(key)
+                if (data) await createFileInFolder(ACCESS_TOKEN, formatedKey, data)
             }
         }
     }
     else{
-        const keys = await forageStorage.keys()
+        const keys = selectLegacyBackupAssetKeys(await forageStorage.keys())
 
         for(let i=0;i<keys.length;i++){
             alertStore.set({
@@ -163,9 +164,6 @@ async function backupDrive(ACCESS_TOKEN:string) {
                 msg: `Uploading Backup... (${i} / ${keys.length})`
             })
             const key = keys[i]
-            if(!key.endsWith('.png')){
-                continue
-            }
             const formatedKey = newFormatKeys(key)
             if(!fileNames.includes(formatedKey)){
                 await createFileInFolder(ACCESS_TOKEN, formatedKey, await forageStorage.getItem(key) as unknown as Uint8Array)
@@ -205,6 +203,8 @@ type DriveFile = {
 }
 
 async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<void|"noSync"> {
+    await forageStorage.Init()
+    const blobStore = await resolveBlobStore()
     if(mode === 'backup'){
         alertStore.set({
             type: "wait",
@@ -220,16 +220,12 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         if(db?.account?.useSync){
             return false
         }
-        if(isTauri){
-            return await exists(`assets/` + images, {baseDir: BaseDirectory.AppData})
+        if (!forageStorage.isAccount) return await blobStore.stat(`assets/${images}`) !== null
+        if(!loadedForageKeys){
+            foragekeys = await forageStorage.keys()
+            loadedForageKeys = true
         }
-        else{
-            if(!loadedForageKeys){
-                foragekeys = await forageStorage.keys()
-                loadedForageKeys = true
-            }
-            return foragekeys.includes('assets/' + images)
-        }
+        return foragekeys.includes('assets/' + images)
     }
     const fileNames = files.map((d) => {
         return d.name
@@ -339,12 +335,12 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
                             for(const file of files){
                                 if(file.name === formatedImage){
                                     const fData = await getFileData(ACCESS_TOKEN, file.id)
-                                    if(isTauri){
-                                        await writeFile(`assets/` + images, fData ,{baseDir: BaseDirectory.AppData})
-        
-                                    }
-                                    else{
+                                    if(forageStorage.isAccount){
                                         await forageStorage.setItem('assets/' + images, fData)
+                                    } else {
+                                        await blobStore.put(`assets/${images}`, fData, {
+                                            kind: 'asset', mime: '', name: images, ext: images.split('.').pop() ?? '',
+                                        })
                                     }
                                     tries = 3
                                 }

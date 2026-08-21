@@ -4,6 +4,8 @@ import { getImageType } from "src/ts/media";
 import { getDatabase } from "../../storage/database.svelte";
 import { getModelInfo, LLMFlags, LLMFormat } from "src/ts/model/modellist";
 import { asBuffer } from "../../util";
+import { type BlobMetadata, type BlobStore, type InlayBlobMetadata } from "../../storage/blobStore";
+import { resolveBlobStore } from "../../storage/platformBlobStore";
 
 export type InlayAsset = {
     data: string | Blob
@@ -53,7 +55,7 @@ export async function postInlayAsset(img:{
         const audioBlob = new Blob([asBuffer(img.data)], {type: `audio/${extention}`})
         const imgid = v4()
 
-        await inlayStorage.setItem(imgid, {
+        await setInlayAsset(imgid, {
             name: img.name,
             data: audioBlob,
             ext: extention,
@@ -67,7 +69,7 @@ export async function postInlayAsset(img:{
         const videoBlob = new Blob([asBuffer(img.data)], {type: `video/${extention}`})
         const imgid = v4()
 
-        await inlayStorage.setItem(imgid, {
+        await setInlayAsset(imgid, {
             name: img.name,
             data: videoBlob,
             ext: extention,
@@ -107,12 +109,12 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
             resolve(null)
         }
     })
-    const imageBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    const imageBlob = await new Promise<Blob>((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
 
 
     const imgid = arg.id ?? v4()
 
-    await inlayStorage.setItem(imgid, {
+    await setInlayAsset(imgid, {
         name: arg.name ?? imgid,
         data: imageBlob,
         ext: 'png',
@@ -134,7 +136,7 @@ export type InlaySignature = {
 }
 
 export async function saveInlayedSignature(sigid:string,signature:InlaySignature){
-    await inlayStorage.setItem(sigid, {
+    await setInlayAsset(sigid, {
         name: sigid,
         data: JSON.stringify(signature),
         ext: 'json',
@@ -169,56 +171,127 @@ function blobToBase64(blob: Blob): Promise<string> {
     });
 }
 
-// Returns with base64 data URI
-export async function getInlayAsset(id: string){
-    const img = await inlayStorage.getItem<InlayAsset | null>(id)
-    if(img === null){
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+    return left.byteLength === right.byteLength && left.every((value, index) => value === right[index])
+}
+
+async function inlayBytes(asset: InlayAsset): Promise<{ bytes: Uint8Array; mime: string }> {
+    if (asset.data instanceof Blob) {
+        return { bytes: new Uint8Array(await asset.data.arrayBuffer()), mime: asset.data.type }
+    }
+    if (asset.type === 'signature') {
+        return { bytes: new TextEncoder().encode(asset.data), mime: 'application/json' }
+    }
+    const blob = base64ToBlob(asset.data)
+    return { bytes: new Uint8Array(await blob.arrayBuffer()), mime: blob.type }
+}
+
+function metadataToAsset<T extends string | Blob>(metadata: InlayBlobMetadata, data: T): Omit<InlayAsset, 'data'> & { data: T } {
+    return {
+        data,
+        ext: metadata.ext,
+        height: metadata.height,
+        name: metadata.name,
+        type: metadata.inlayType,
+        width: metadata.width,
+    }
+}
+
+export async function listLegacyInlayAssetIds(): Promise<string[]> {
+    return await inlayStorage.keys()
+}
+
+export async function readLegacyInlayAsset(id: string): Promise<InlayAsset | null> {
+    return await inlayStorage.getItem<InlayAsset | null>(id)
+}
+
+async function migrateLegacyInlayAssetInStore(id: string, blobStore: BlobStore): Promise<BlobMetadata | null> {
+    const existing = await blobStore.stat(id)
+    if (existing?.kind === 'inlay') return existing
+    const legacy = await readLegacyInlayAsset(id)
+    if (!legacy) return null
+    const { bytes, mime } = await inlayBytes(legacy)
+    const written = await blobStore.put(id, bytes, {
+        kind: 'inlay',
+        inlayType: legacy.type,
+        mime,
+        name: legacy.name,
+        ext: legacy.ext,
+        width: legacy.width,
+        height: legacy.height,
+    })
+    const verifiedMetadata = await blobStore.stat(id)
+    const verifiedBytes = await blobStore.read(id)
+    if (!verifiedMetadata || verifiedMetadata.kind !== 'inlay' || !verifiedBytes
+        || written.kind !== 'inlay' || verifiedMetadata.inlayType !== legacy.type
+        || verifiedMetadata.name !== legacy.name
+        || verifiedMetadata.ext !== legacy.ext.replace(/^\.+/, '').toLowerCase()
+        || verifiedMetadata.width !== legacy.width || verifiedMetadata.height !== legacy.height
+        || verifiedMetadata.mime !== written.mime || verifiedMetadata.size !== bytes.byteLength
+        || !bytesEqual(verifiedBytes, bytes)) {
         return null
     }
+    return verifiedMetadata
+}
 
-    let data: string;
-    if(img.data instanceof Blob){
-        data = await blobToBase64(img.data)
-    } else {
-        data = img.data as string
-    }
+export async function migrateLegacyInlayAsset(id: string): Promise<BlobMetadata | null> {
+    return migrateLegacyInlayAssetInStore(id, await resolveBlobStore())
+}
 
-    return { ...img, data }
+// Returns with base64 data URI
+export async function getInlayAsset(id: string){
+    const blobStore = await resolveBlobStore()
+    const metadata = await migrateLegacyInlayAssetInStore(id, blobStore)
+    if (!metadata || metadata.kind !== 'inlay') return null
+    const bytes = await blobStore.read(id)
+    if (!bytes) return null
+    const data = metadata.inlayType === 'signature'
+        ? new TextDecoder().decode(bytes)
+        : await blobToBase64(new Blob([asBuffer(bytes)], { type: metadata.mime }))
+    return metadataToAsset(metadata, data)
 }
 
 // Returns with Blob
 export async function getInlayAssetBlob(id: string){
-    const img = await inlayStorage.getItem<InlayAsset | null>(id)
-    if(img === null){
-        return null
-    }
-
-    let data: Blob;
-    if(typeof img.data === 'string'){
-        // Migrate to Blob
-        data = base64ToBlob(img.data)
-        setInlayAsset(id, { ...img, data })
-    } else {
-        data = img.data
-    }
-
-    return { ...img, data }
+    const blobStore = await resolveBlobStore()
+    const metadata = await migrateLegacyInlayAssetInStore(id, blobStore)
+    if (!metadata || metadata.kind !== 'inlay') return null
+    const bytes = await blobStore.read(id)
+    if (!bytes) return null
+    return metadataToAsset(metadata, new Blob([asBuffer(bytes)], { type: metadata.mime }))
 }
 
 export async function listInlayAssets(): Promise<[id: string, InlayAsset][]> {
+    const blobStore = await resolveBlobStore()
+    for (const id of await listLegacyInlayAssetIds()) await migrateLegacyInlayAssetInStore(id, blobStore)
     const assets: [id: string, InlayAsset][] = []
-    await inlayStorage.iterate<InlayAsset, void>((value, key) => {
-        assets.push([key, value])
-    })
-
+    for (const metadata of await blobStore.list({ kind: 'inlay' })) {
+        if (metadata.kind !== 'inlay') continue
+        const bytes = await blobStore.read(metadata.key)
+        if (!bytes) continue
+        const data = metadata.inlayType === 'signature'
+            ? new TextDecoder().decode(bytes)
+            : await blobToBase64(new Blob([asBuffer(bytes)], { type: metadata.mime }))
+        assets.push([metadata.key, metadataToAsset(metadata, data)])
+    }
     return assets
 }
 
 export async function setInlayAsset(id: string, img: InlayAsset){
-    await inlayStorage.setItem(id, img)
+    const { bytes, mime } = await inlayBytes(img)
+    await (await resolveBlobStore()).put(id, bytes, {
+        kind: 'inlay',
+        inlayType: img.type,
+        mime,
+        name: img.name,
+        ext: img.ext,
+        width: img.width,
+        height: img.height,
+    })
 }
 
 export async function removeInlayAsset(id: string){
+    await (await resolveBlobStore()).remove(id)
     await inlayStorage.removeItem(id)
 }
 

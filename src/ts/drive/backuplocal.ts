@@ -1,7 +1,9 @@
-import { BaseDirectory, readFile, readDir, writeFile } from "@tauri-apps/plugin-fs";
+import { BaseDirectory, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
 import { LocalWriter, forageStorage } from "../globalApi.svelte";
+import { resolveBlobStore } from "../storage/platformBlobStore";
+import { isLegacyBackupAssetKey, selectLegacyBackupAssetKeys } from "./backupAssets";
 import { isTauri } from "src/ts/platform"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase } from "../storage/database.svelte";
@@ -22,6 +24,8 @@ function getBasename(data:string){
 }
 
 export async function SaveLocalBackup(){
+    await forageStorage.Init()
+    const blobStore = await resolveBlobStore()
     alertWait("Saving local backup...")
     const db = getDatabase()
     const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
@@ -79,8 +83,8 @@ export async function SaveLocalBackup(){
     }
     const missingAssets: string[] = []
 
-    if(isTauri){
-        const assets = await readDir('assets', {baseDir: BaseDirectory.AppData})
+    if(!forageStorage.isAccount){
+        const assets = await blobStore.list({ kind: 'asset' })
         let i = 0;
         for(let asset of assets){
             i += 1;
@@ -94,20 +98,17 @@ export async function SaveLocalBackup(){
             }
             alertWait(message)
 
-            const key = asset.name
-            if(!key || !key.endsWith('.png')){
-                continue
-            }
-            const data = await readFile('assets/' + asset.name, {baseDir: BaseDirectory.AppData})
+            const key = asset.key
+            const data = await blobStore.read(key)
             if (data) {
-                await writer.writeBackup(key, data)
+                await writer.writeBackup(isTauri ? key.slice('assets/'.length) : key, data)
             } else {
                 missingAssets.push(key)
             }
         }
     }
     else{
-        const keys = await forageStorage.keys()
+        const keys = selectLegacyBackupAssetKeys(await forageStorage.keys())
 
         for(let i=0;i<keys.length;i++){
             const key = keys[i]
@@ -121,9 +122,6 @@ export async function SaveLocalBackup(){
             }
             alertWait(message)
 
-            if(!key || !key.endsWith('.png')){
-                continue
-            }
             let data: Uint8Array | undefined;
             let isCached = false;
             if(forageStorage.isAccount && key.startsWith('assets/')){
@@ -203,6 +201,8 @@ export async function SaveLocalBackup(){
  * - Ideal for backing up core visual identity without bulk data
  */
 export async function SavePartialLocalBackup(){
+    await forageStorage.Init()
+    const blobStore = await resolveBlobStore()
     // First confirmation: Explain the difference from regular backup
     const firstConfirm = await alertConfirm(language.partialBackupFirstConfirm)
     
@@ -290,19 +290,11 @@ export async function SavePartialLocalBackup(){
     
     const missingAssets: string[] = []
 
-    if(isTauri){
-        // readDir returns entries without 'assets/' prefix, unlike forageStorage.keys()
-        const assets = await readDir('assets', {baseDir: BaseDirectory.AppData})
+    if(!forageStorage.isAccount){
+        const assets = await blobStore.list({ kind: 'asset' })
         let i = 0;
         for(let asset of assets){
-            if(!asset.name){
-                continue
-            }
-
-            const keyWithPrefix = asset.name.startsWith('assets/') ? asset.name : `assets/${asset.name}`
-            if(!keyWithPrefix.endsWith('.png')){
-                continue
-            }
+            const keyWithPrefix = asset.key
             
             // Only process if this asset is in our map (profile images only)
             if(!assetMap.has(keyWithPrefix)){
@@ -320,7 +312,7 @@ export async function SavePartialLocalBackup(){
             }
             alertWait(message)
 
-            const data = await readFile(keyWithPrefix, {baseDir: BaseDirectory.AppData})
+            const data = await blobStore.read(keyWithPrefix)
             if (data) {
                 await writer.writeBackup(keyWithPrefix, data)
             } else {
@@ -330,7 +322,7 @@ export async function SavePartialLocalBackup(){
     }
     else{
         const keys = await forageStorage.keys()
-        const assetKeys = Array.from(assetMap.keys())
+        const assetKeys = selectLegacyBackupAssetKeys(Array.from(assetMap.keys()))
 
         for(let i=0;i<assetKeys.length;i++){
             const key = assetKeys[i]
@@ -344,10 +336,6 @@ export async function SavePartialLocalBackup(){
             }
             alertWait(message)
 
-            if(!key || !key.endsWith('.png')){
-                continue
-            }
-            
             let data: Uint8Array | undefined;
             let isCached = false;
             if(forageStorage.isAccount && key.startsWith('assets/')){
@@ -422,6 +410,8 @@ export function LoadLocalBackup(){
             }
             const file = input.files[0];
             input.remove();
+            await forageStorage.Init()
+            const blobStore = await resolveBlobStore()
 
             const reader = file.stream().getReader();
             const CHUNK_SIZE = 1024 * 1024; // 1MB chunk size
@@ -509,10 +499,13 @@ export function LoadLocalBackup(){
                         }
 
                         if (!handledAsColdStorage) {
-                            if (isTauri) {
-                                await writeFile(`assets/` + name, data, { baseDir: BaseDirectory.AppData });
-                            } else {
+                            const key = `assets/${name}`
+                            if (forageStorage.isAccount) {
                                 await forageStorage.setItem('assets/' + name, data);
+                            } else if (isLegacyBackupAssetKey(key)) {
+                                await blobStore.put(key, data, {
+                                    kind: 'asset', mime: '', name, ext: name.split('.').pop() ?? '',
+                                })
                             }
                         }
                     }

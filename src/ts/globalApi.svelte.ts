@@ -57,8 +57,13 @@ import {
     installPersistentSaveNotifications,
 } from "./storage/persistentSaveNotifications";
 import { installInternalBackup } from "./storage/databaseRestore";
+import { configureBlobStoreStorageProvider, resolveBlobStore } from "./storage/platformBlobStore";
 
 export const forageStorage = new AutoStorage()
+configureBlobStoreStorageProvider(async () => {
+    await forageStorage.Init()
+    return forageStorage.isAccount ? null : forageStorage.realStorage as any
+})
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 
@@ -121,7 +126,6 @@ const browserAssetByteCache = new ByteBudgetLru<string, Uint8Array>(
 )
 const pendingBrowserAssetReads = new Map<string, Promise<Uint8Array>>()
 
-let pathCache: { [key: string]: string } = {}
 let checkedPaths: string[] = []
 
 /**
@@ -133,24 +137,18 @@ let checkedPaths: string[] = []
 export async function getFileSrc(loc: string) {
     if (isTauri) {
         if (loc.startsWith('assets')) {
-            if (appDataDirPath === '') {
-                appDataDirPath = await appDataDir();
-            }
-            const cached = pathCache[loc]
-            if (cached) {
-                return convertFileSrc(cached)
-            }
-            else {
-                const joined = await join(appDataDirPath, loc)
-                pathCache[loc] = joined
-                return convertFileSrc(joined)
-            }
+            return await (await resolveBlobStore()).resolveUrl(loc) ?? ''
         }
         return convertFileSrc(loc)
     }
+    await forageStorage.Init()
     if (forageStorage.isAccount && loc.startsWith('assets')) {
         return hubURL + `/rs/` + loc
     }
+    const blobStore = loc.startsWith('assets/') ? await resolveBlobStore() : null
+    const readLocalFile = async () => blobStore
+        ? await blobStore.read(loc)
+        : await forageStorage.getItem(loc) as unknown as Uint8Array
     try {
         if (usingSw) {
             const encoded = Buffer.from(loc, 'utf-8').toString('hex')
@@ -166,7 +164,8 @@ export async function getFileSrc(loc: string) {
                         return "/sw/img/" + encoded
                     }
                     else {
-                        const f: Uint8Array = await forageStorage.getItem(loc) as unknown as Uint8Array
+                        const f = await readLocalFile()
+                        if (!f) throw new Error(`Missing asset: ${loc}`)
                         await fetch("/sw/register/" + encoded, {
                             method: "POST",
                             body: f as any
@@ -194,7 +193,10 @@ export async function getFileSrc(loc: string) {
             if (!data) {
                 let pending = pendingBrowserAssetReads.get(loc)
                 if (!pending) {
-                    pending = forageStorage.getItem(loc) as Promise<Uint8Array>
+                    pending = readLocalFile().then((value) => {
+                        if (!value) throw new Error(`Missing asset: ${loc}`)
+                        return value
+                    })
                     pendingBrowserAssetReads.set(loc, pending)
                     const cleanup = () => {
                         pendingBrowserAssetReads.delete(loc)
@@ -204,7 +206,8 @@ export async function getFileSrc(loc: string) {
                 data = await pending
                 browserAssetByteCache.set(loc, data)
             }
-            return `data:image/png;base64,${Buffer.from(data).toString('base64')}`
+            const metadata = await blobStore?.stat(loc)
+            return `data:${metadata?.mime ?? 'application/octet-stream'};base64,${Buffer.from(data).toString('base64')}`
         }
     } catch (error) {
         console.error(error)
@@ -221,6 +224,10 @@ let appDataDirPath = ''
  * @returns {Promise<Uint8Array>} - A promise that resolves to the data of the image file.
  */
 export async function readImage(data: string) {
+    if (!isTauri) await forageStorage.Init()
+    if (data.startsWith('assets/') && !forageStorage.isAccount) {
+        return await (await resolveBlobStore()).read(data)
+    }
     if (isTauri) {
         if (data.startsWith('assets')) {
             if (appDataDirPath === '') {
@@ -244,6 +251,7 @@ export async function readImage(data: string) {
  * @returns {Promise<string>} - A promise that resolves to the path of the saved asset file.
  */
 export async function saveAsset(data: Uint8Array, customId: string = '', fileName: string = '') {
+    if (!isTauri) await forageStorage.Init()
     let id = ''
     if (customId !== '') {
         id = customId
@@ -259,20 +267,21 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
     if (fileName && fileName.split('.').length > 0) {
         fileExtension = fileName.split('.').pop()
     }
-    if (isTauri) {
-        await writeFile(`assets/${id}.${fileExtension}`, data, {
-            baseDir: BaseDirectory.AppData
-        });
-        return `assets/${id}.${fileExtension}`
-    }
-    else {
-        let form = `assets/${id}.${fileExtension}`
+    const form = `assets/${id}.${fileExtension}`
+    if (!isTauri && forageStorage.isAccount) {
         const replacer = await forageStorage.setItem(form, data)
         if (replacer) {
             return replacer
         }
         return form
     }
+    await (await resolveBlobStore()).put(form, data, {
+        kind: 'asset',
+        mime: '',
+        name: fileName || `${id}.${fileExtension}`,
+        ext: fileExtension,
+    })
+    return form
 }
 
 /**
@@ -282,12 +291,11 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
  * @returns {Promise<Uint8Array>} - A promise that resolves to the data of the loaded asset file.
  */
 export async function loadAsset(id: string) {
-    if (isTauri) {
-        return await readFile(id, { baseDir: BaseDirectory.AppData })
-    }
-    else {
+    if (!isTauri) await forageStorage.Init()
+    if (!isTauri && forageStorage.isAccount) {
         return await forageStorage.getItem(id) as unknown as Uint8Array
     }
+    return await (await resolveBlobStore()).read(id)
 }
 
 export let saving = $state({
