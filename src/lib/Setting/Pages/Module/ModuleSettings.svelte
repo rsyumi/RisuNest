@@ -8,12 +8,13 @@
     import { SquarePen, TrashIcon, Globe, Share2Icon, PlusIcon, HardDriveUpload, Waypoints, UserIcon } from "@lucide/svelte";
     import { v4 } from "uuid";
     import { tooltip } from "src/ts/gui/tooltip";
-    import { alertConfirm, alertNormal, alertSelect } from "src/ts/alert";
+    import { alertConfirm, alertError, alertNormal, alertSelect } from "src/ts/alert";
     import TextInput from "src/lib/UI/GUI/TextInput.svelte";
     import { onDestroy } from "svelte";
     import { importMCPModule } from "src/ts/process/mcp/mcp";
     import { convertModuleToCharacter } from "src/ts/interchangeability";
     import { commitDetachedCharacter } from "src/ts/characters";
+    import { commitModuleCharacterConversion } from "./moduleCharacterConversion";
     let tempModule:RisuModule = $state({
         name: '',
         description: '',
@@ -64,8 +65,11 @@
                                 e.stopPropagation()
                                 const module = DBState.db.modules.find((v) => v.id === rmodule.id)
                                 const char = convertModuleToCharacter(module)
-                                await commitDetachedCharacter(char, 'convert-module-to-character')
-                                alertNormal(language.successfullyConverted)
+                                await commitModuleCharacterConversion(char, {
+                                    commit: commitDetachedCharacter,
+                                    onSuccess: () => alertNormal(language.successfullyConverted),
+                                    onError: alertError,
+                                })
                             }}>
                                 <UserIcon size={18}/>
                                 
