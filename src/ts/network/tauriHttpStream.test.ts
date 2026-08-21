@@ -76,16 +76,21 @@ describe('fetchTauriHttpStream', () => {
         expect(await reader.read()).toEqual({ done: true, value: undefined })
     })
 
-    test('performs one upstream read per downstream pull without logging ahead', async () => {
+    test('allows one plugin-buffered chunk without wrapper or logging lookahead', async () => {
         let pulls = 0
-        const chunks = [new Uint8Array([1]), new Uint8Array([2])]
+        const chunks = [
+            new Uint8Array([1]),
+            new Uint8Array([2]),
+            new Uint8Array([3]),
+            new Uint8Array([4]),
+        ]
         const upstream = new ReadableStream<Uint8Array>({
             pull(controller) {
                 const chunk = chunks[pulls]
                 pulls += 1
                 controller.enqueue(chunk)
             },
-        }, { highWaterMark: 0 })
+        })
         pluginFetch.mockResolvedValue(pluginResponse(upstream))
         const onChunk = vi.fn()
 
@@ -95,19 +100,32 @@ describe('fetchTauriHttpStream', () => {
             headers: {},
             onChunk,
         })
-        expect(pulls).toBe(0)
+        expect(pulls).toBe(1)
 
         const reader = response.body!.getReader()
         expect(await reader.read()).toEqual({ done: false, value: chunks[0] })
-        expect(pulls).toBe(1)
         expect(onChunk).toHaveBeenCalledExactlyOnceWith(chunks[0])
         await Promise.resolve()
         await Promise.resolve()
-        expect(pulls).toBe(1)
+        expect(pulls).toBeLessThanOrEqual(2)
+        const pullsAfterFirstRead = pulls
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(pulls).toBe(pullsAfterFirstRead)
 
         expect(await reader.read()).toEqual({ done: false, value: chunks[1] })
-        expect(pulls).toBe(2)
         expect(onChunk).toHaveBeenNthCalledWith(2, chunks[1])
+        await Promise.resolve()
+        expect(pulls).toBe(pullsAfterFirstRead + 1)
+        const pullsAfterSecondRead = pulls
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(pulls).toBe(pullsAfterSecondRead)
+
+        expect(await reader.read()).toEqual({ done: false, value: chunks[2] })
+        expect(onChunk).toHaveBeenNthCalledWith(3, chunks[2])
+        await Promise.resolve()
+        expect(pulls).toBe(pullsAfterSecondRead + 1)
         await reader.cancel()
     })
 
