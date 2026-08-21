@@ -2184,8 +2184,8 @@ export function getVersionString(): string {
     if(appSubVer) {
         versionString += '-' + appSubVer
     }
-    if (window.location.hostname === 'nightly.risuai.xyz') {
-        versionString += ' (Nightly)'
+    if (import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE') {
+        versionString = 'Nightly Build ' + import.meta.env.VITE_RISU_BUILD_TIME
     }
     if (window.location.hostname === 'stable.risuai.xyz') {
         versionString += ' (Stable)';

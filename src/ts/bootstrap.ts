@@ -234,7 +234,7 @@ export async function loadData() {
             updateHeightMode()
             updateErrorHandling()
             updateGuisize()
-            if (!localStorage.getItem('nightlyWarned') && window.location.hostname === 'nightly.risuai.xyz') {
+            if (!localStorage.getItem('nightlyWarned') && import.meta.env.VITE_RISU_NIGHTLY_BUILD === 'TRUE') {
                 alertMd(language.nightlyWarning)
                 await waitAlert()
                 localStorage.setItem('nightlyWarned', 'true')
