@@ -37,6 +37,8 @@
     import Legal from './lib/Others/Legal.svelte';
     import CustomSidebarConfig from './lib/Others/CustomSidebarConfig.svelte';
     import { RISU_APP_INTERNAL_DRAG_TYPE, RISU_SIDEBAR_DRAG_TYPE } from './ts/dragTypes';
+    import { keepFocusedInputVisible } from './ts/gui/imeVisibility';
+    import { isTauriMobile } from './ts/platform';
 
 
   
@@ -65,7 +67,7 @@
 
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-<main class="flex bg-bg w-full h-full max-w-100vw text-textcolor" ondragover={(e) => {
+<main class="flex bg-bg w-full h-full max-w-100vw text-textcolor" use:keepFocusedInputVisible={isTauriMobile} ondragover={(e) => {
     const dropEffect = getMainDropEffect(e)
     e.preventDefault()
     e.dataTransfer.dropEffect = dropEffect

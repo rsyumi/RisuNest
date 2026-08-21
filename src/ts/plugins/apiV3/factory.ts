@@ -251,6 +251,50 @@ await (async function() {
         window.parent.postMessage(payload, '*', transferables);
     }
 
+    const nonTextInputTypes = new Set([
+        'button', 'checkbox', 'color', 'file', 'hidden', 'image',
+        'radio', 'range', 'reset', 'submit'
+    ]);
+    let focusedInputReportFrame = 0;
+
+    function getFocusedTextInput() {
+        const element = document.activeElement;
+        if (element instanceof HTMLTextAreaElement) {
+            return !element.disabled && !element.readOnly ? element : null;
+        }
+        if (element instanceof HTMLInputElement) {
+            return !element.disabled && !element.readOnly && !nonTextInputTypes.has(element.type)
+                ? element
+                : null;
+        }
+        return element instanceof HTMLElement && element.isContentEditable ? element : null;
+    }
+
+    function reportFocusedInput() {
+        focusedInputReportFrame = 0;
+        const element = getFocusedTextInput();
+        if (!element) {
+            send({ type: 'RISU_PLUGIN_INPUT_FOCUS', rect: null });
+            return;
+        }
+
+        const rect = element.getBoundingClientRect();
+        send({
+            type: 'RISU_PLUGIN_INPUT_FOCUS',
+            rect: { top: rect.top, bottom: rect.bottom }
+        });
+    }
+
+    function scheduleFocusedInputReport() {
+        if (!focusedInputReportFrame) {
+            focusedInputReportFrame = requestAnimationFrame(reportFocusedInput);
+        }
+    }
+
+    document.addEventListener('focusin', reportFocusedInput);
+    document.addEventListener('focusout', scheduleFocusedInputReport);
+    window.addEventListener('scroll', scheduleFocusedInputReport, true);
+
     function sendRequest(type, payload) {
         return new Promise((resolve, reject) => {
             const reqId = Math.random().toString(36).substring(7);
@@ -780,6 +824,7 @@ export class SandboxHost {
 
         this.iframe.style.backgroundColor = "transparent";
         this.iframe.setAttribute('allowTransparency', 'true');
+        this.iframe.setAttribute('data-risu-plugin-frame', '');
 
         this.iframe.sandbox.add('allow-scripts');
         this.iframe.sandbox.add('allow-modals')
