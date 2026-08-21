@@ -19,6 +19,7 @@ import { exportModuleLegacy, readModule, type RisuModule } from "./process/modul
 import { readFile } from "@tauri-apps/plugin-fs"
 import { onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { AccountStorage } from "./storage/accountStorage"
+import { isRealmAccessDisabled } from "./realmAccess"
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -389,6 +390,10 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
 }
 
 export const getRealmInfo = async (realmPath:string) => {
+    if(isRealmAccessDisabled()){
+        return
+    }
+
     const url = new URL(location.href);
     url.searchParams.delete('realm');
     window.history.pushState(null, '', url.toString());
@@ -1685,6 +1690,10 @@ export async function shareRisuHub2(char:character, arg:{
     anon: boolean,
     update: boolean
 }) {
+    if(isRealmAccessDisabled()){
+        return
+    }
+
     try {
         char = safeStructuredClone(char)
         char.license = arg.license
@@ -1778,6 +1787,10 @@ export async function getRisuHub(arg:{
     nsfw:boolean
     sort:string
 }):Promise<hubType[]> {
+    if(isRealmAccessDisabled()){
+        return []
+    }
+
     try {
         arg.search += ' __shared'
         const stringArg = `search==${arg.search}&&page==${arg.page}&&nsfw==${arg.nsfw}&&sort==${arg.sort}&&web==${(!isNodeServer && !isTauri) ? 'web' : 'other'}`
@@ -1804,6 +1817,10 @@ export async function getRisuHub(arg:{
 export async function downloadRisuHub(id:string, arg:{
     forceRedirect?: boolean
 } = {}) {
+    if(isRealmAccessDisabled()){
+        return
+    }
+
     try {
         if(!arg.forceRedirect){
             if(!(await alertTOS())){
@@ -1874,6 +1891,10 @@ export async function downloadRisuHub(id:string, arg:{
 }
 
 export async function getHubResources(id:string) {
+    if(isRealmAccessDisabled()){
+        throw new Error('RisuRealm access is disabled for this test build')
+    }
+
     const res = await fetch(`${hubURL}/resource/${id}`)
     if(res.status !== 200){
         throw (await res.text())

@@ -13,6 +13,9 @@ export default defineConfig({
   },
   test: {
     environment: 'happy-dom',
+    env: {
+      VITE_DISABLE_REALM: 'true',
+    },
     setupFiles: ['vitest.setup.ts'],
   },
 })

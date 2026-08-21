@@ -1,6 +1,7 @@
 <script lang="ts">
     import { alertMd } from "src/ts/alert";
     import { shareRealmCardData } from "src/ts/realm";
+    import { isRealmAccessDisabled } from "src/ts/realmAccess";
     import { downloadPreset } from "src/ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { selectedCharID, ShowRealmFrameStore } from "src/ts/stores.svelte";
@@ -15,6 +16,7 @@
     const id = DBState.db?.account?.id
     let loadingStage = $state(0)
     let pongGot = false
+    const realmAccessDisabled = isRealmAccessDisabled()
 
     const pmfunc = (e:MessageEvent) => {
         if(e.data.type === 'filedata' && e.data.success){
@@ -51,6 +53,11 @@
     }
 
     onMount(async () => {
+        if(realmAccessDisabled){
+            close()
+            return
+        }
+
         window.addEventListener('message', pmfunc)
 
         let data:{
@@ -123,8 +130,10 @@
         <div class="loadmove"></div>
     </div>
     {/if}
-    <iframe bind:this={iframe}
-        src={getUrl()}
-        title="upload" class="w-full flex-1" class:hidden={loadingStage < 1}
-></iframe>
+    {#if !realmAccessDisabled}
+        <iframe bind:this={iframe}
+            src={getUrl()}
+            title="upload" class="w-full flex-1" class:hidden={loadingStage < 1}
+        ></iframe>
+    {/if}
 </div>
