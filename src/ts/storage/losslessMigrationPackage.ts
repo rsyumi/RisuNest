@@ -204,6 +204,47 @@ async function sha256(data: Uint8Array): Promise<string> {
     return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('')
 }
 
+export function createLosslessMigrationManifest(
+    input: readonly LosslessMigrationManifestEntry[],
+): LosslessMigrationManifest {
+    const entries = input.map((entry, index) => {
+        if (!isPlainObject(entry) || !isEntryKind(entry.kind)) {
+            throw new Error(`Migration manifest entry ${index} has an unsupported kind or shape`)
+        }
+        validateLogicalId(entry.kind, entry.id)
+        const metadata = validateMetadata(entry.kind, entry.metadata)
+        if (!Number.isSafeInteger(entry.size) || entry.size < 0) {
+            throw new Error(`Migration manifest entry ${index} has an invalid size`)
+        }
+        if (typeof entry.sha256 !== 'string' || !sha256Pattern.test(entry.sha256)) {
+            throw new Error(`Migration manifest entry ${index} has an invalid SHA-256 hash`)
+        }
+        return Object.freeze({
+            kind: entry.kind,
+            id: entry.id,
+            metadata: Object.freeze({ ...metadata }),
+            size: entry.size,
+            sha256: entry.sha256,
+        })
+    })
+    validateEntryIdentity(entries)
+    entries.sort(compareEntries)
+    return Object.freeze({
+        version: losslessMigrationVersion,
+        entries: Object.freeze(entries),
+    })
+}
+
+export async function hashLosslessMigrationManifest(
+    manifest: LosslessMigrationManifest,
+): Promise<string> {
+    if (!isPlainObject(manifest) || manifest.version !== losslessMigrationVersion || !Array.isArray(manifest.entries)) {
+        throw new Error('Migration manifest has an unsupported version or shape')
+    }
+    const validated = createLosslessMigrationManifest(manifest.entries)
+    return sha256(new TextEncoder().encode(canonicalStringify(validated as unknown as JsonValue)))
+}
+
 function writeUint64(view: DataView, offset: number, value: number): void {
     if (!Number.isSafeInteger(value) || value < 0) throw new RangeError('Migration frame length overflow')
     view.setUint32(offset, value >>> 0, true)
@@ -256,7 +297,7 @@ export async function encodeLosslessMigrationPackage(
             sha256: await sha256(entry.data),
         })
     }
-    const manifest: LosslessMigrationManifest = { version: losslessMigrationVersion, entries: manifestEntries }
+    const manifest = createLosslessMigrationManifest(manifestEntries)
     const manifestBytes = new TextEncoder().encode(canonicalStringify(manifest as unknown as JsonValue))
     if (manifestBytes.byteLength > 0xffffffff) throw new RangeError('Migration manifest length overflow')
     const payloadLength = entries.reduce((total, entry) => total + frameHeaderLength + entry.data.byteLength, 0)
@@ -354,14 +395,8 @@ export async function decodeLosslessMigrationPackage(
     }
     if (offset !== ownedBytes.byteLength) throw new Error('Migration package contains extra framed entries or trailing bytes')
 
-    const entries = parsedManifest.entries.map((entry) => Object.freeze({
-        ...entry,
-        metadata: Object.freeze({ ...entry.metadata }),
-    })) as readonly LosslessMigrationManifestEntry[]
-    const manifest = Object.freeze({
-        version: losslessMigrationVersion,
-        entries: Object.freeze(entries),
-    }) satisfies LosslessMigrationManifest
+    const manifest = createLosslessMigrationManifest(parsedManifest.entries)
+    const entries = manifest.entries
 
     return Object.freeze({
         version: losslessMigrationVersion,

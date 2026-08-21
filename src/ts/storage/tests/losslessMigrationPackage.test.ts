@@ -1,9 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+    createLosslessMigrationManifest,
     decodeLosslessMigrationPackage,
     encodeLosslessMigrationPackage,
+    hashLosslessMigrationManifest,
     losslessMigrationMagic,
     type LosslessMigrationInputEntry,
+    type LosslessMigrationManifestEntry,
 } from '../losslessMigrationPackage'
 
 const encoder = new TextEncoder()
@@ -56,6 +59,35 @@ function withManifest(packageBytes: Uint8Array, manifest: Record<string, unknown
 }
 
 describe('lossless migration package', () => {
+    it('creates one frozen canonical manifest and hashes its canonical bytes', async () => {
+        const entries: LosslessMigrationManifestEntry[] = [
+            {
+                kind: 'asset' as const,
+                id: 'assets/a.png',
+                metadata: { kind: 'asset' as const, mime: 'image/png', name: 'a.png', ext: 'png' },
+                size: 1,
+                sha256: '0'.repeat(64),
+            },
+            {
+                kind: 'database' as const,
+                id: 'database.risudat',
+                metadata: {},
+                size: 2,
+                sha256: '1'.repeat(64),
+            },
+        ]
+        const manifest = createLosslessMigrationManifest(entries)
+
+        expect(manifest.entries.map((entry) => `${entry.kind}:${entry.id}`)).toEqual([
+            'database:database.risudat', 'asset:assets/a.png',
+        ])
+        expect(Object.isFrozen(manifest)).toBe(true)
+        expect(Object.isFrozen(manifest.entries[0].metadata)).toBe(true)
+        expect(await hashLosslessMigrationManifest(manifest)).toBe(
+            'eb8f4261b538e29d6c764efaab4bfb3fb5f31b238f8a4c81489c17edfdb2411e',
+        )
+        await expect(hashLosslessMigrationManifest({ ...manifest, version: 2 } as never)).rejects.toThrow(/version/i)
+    })
     it('round trips every namespace, metadata field, exact byte, and zero-length payload', async () => {
         const original = fixture()
         const packageBytes = await encodeLosslessMigrationPackage(original)
