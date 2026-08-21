@@ -41,6 +41,12 @@ import { fetchTauriHttpStream } from './network/tauriHttpStream';
 import { moduleUpdate } from "./process/modules";
 import { AccountStorage } from "./storage/accountStorage";
 import { getColdStorageItem, makeColdData } from "./process/coldstorage.svelte";
+import {
+    listCharacterResources,
+    listDatabaseRootResources,
+    replaceCharacterResources,
+    replaceDatabaseRootResources,
+} from "./process/coldstorageData";
 import { isTauri, isNodeServer } from "./platform";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
@@ -841,78 +847,14 @@ export function getUncleanablesSync(db: Database, uptype: 'basename' | 'pure' = 
         uncleanable.add(bn);
     }
 
-    addUncleanable(db.customBackground);
-    addUncleanable(db.userIcon);
     const chars = options?.chars ?? db.characters
-
-    for (let cha of chars) {
-        if (cha.image) {
-            addUncleanable(cha.image);
-        }
-        if (cha.emotionImages) {
-            for (const em of cha.emotionImages) {
-                addUncleanable(em[1]);
-            }
-        }
-        if (cha.type !== 'group') {
-            if (cha.additionalAssets) {
-                for (const em of cha.additionalAssets) {
-                    addUncleanable(em[1]);
-                }
-            }
-            if (cha.vits) {
-                const keys = Object.keys(cha.vits.files);
-                for (const key of keys) {
-                    const vit = cha.vits.files[key];
-                    addUncleanable(vit);
-                }
-            }
-            if (cha.ccAssets) {
-                for (const asset of cha.ccAssets) {
-                    addUncleanable(asset.uri);
-                }
-            }
-        }
+    for (const resource of listDatabaseRootResources(db)) {
+        addUncleanable(resource)
     }
-
-    if (db.modules) {
-        for (const module of db.modules) {
-            const assets = module.assets
-            if (assets) {
-                for (const asset of assets) {
-                    addUncleanable(asset[1])
-                }
-            }
-            if(module.icon){
-                addUncleanable(module.icon)
-            }
+    for (const cha of chars) {
+        for (const resource of listCharacterResources(cha)) {
+            addUncleanable(resource)
         }
-    }
-
-    if (db.personas) {
-        db.personas.map((v) => {
-            addUncleanable(v.icon);
-
-            if(v.embeddedModule){
-                const assets = v.embeddedModule.assets
-                if (assets) {
-                    for (const asset of assets) {
-                        addUncleanable(asset[1])
-                    }
-                }
-                if(v.embeddedModule.icon){
-                    addUncleanable(v.embeddedModule.icon)
-                }
-            }
-        });
-    }
-
-    if (db.characterOrder) {
-        db.characterOrder.forEach((item) => {
-            if (typeof item === 'object' && 'imgFile' in item) {
-                addUncleanable(item.imgFile);
-            }
-        })
     }
     return Array.from(uncleanable);
 }
@@ -926,40 +868,13 @@ export function getUncleanablesSync(db: Database, uptype: 'basename' | 'pure' = 
  * @returns {Database} - The updated database object with replaced resources.
  */
 export function replaceDbResources(db: Database, replacer: { [key: string]: string }): Database {
-    /**
-     * Replaces a given data string with its corresponding value from the replacer object.
-     * 
-     * @param {string} data - The data string to be replaced.
-     * @returns {string} - The replaced data string or the original data if no replacement is found.
-     */
-    function replaceData(data: string): string {
-        if (!data) {
-            return data;
-        }
-        return replacer[data] ?? data;
+    const { characters, ...root } = db
+    return {
+        ...replaceDatabaseRootResources(root, replacer),
+        characters: characters.map((character) => (
+            replaceCharacterResources(character, replacer)
+        )),
     }
-
-    db.customBackground = replaceData(db.customBackground);
-    db.userIcon = replaceData(db.userIcon);
-
-    for (const cha of db.characters) {
-        if (cha.image) {
-            cha.image = replaceData(cha.image);
-        }
-        if (cha.emotionImages) {
-            for (let i = 0; i < cha.emotionImages.length; i++) {
-                cha.emotionImages[i][1] = replaceData(cha.emotionImages[i][1]);
-            }
-        }
-        if (cha.type !== 'group') {
-            if (cha.additionalAssets) {
-                for (let i = 0; i < cha.additionalAssets.length; i++) {
-                    cha.additionalAssets[i][1] = replaceData(cha.additionalAssets[i][1]);
-                }
-            }
-        }
-    }
-    return db;
 }
 
 /**

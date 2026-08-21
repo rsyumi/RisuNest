@@ -4,7 +4,11 @@ import { describe, expect, it, vi } from 'vitest'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import { RevisionConflictError } from '../persistentDataStore'
 import { decodeRisuSave, encodeRisuSaveBlock, RisuSaveType } from '../risuSave'
-import { importRisuSaveToStore, streamRisuSaveFromStore } from '../risuSaveStoreAdapter'
+import {
+    importRisuSaveToStore,
+    streamRisuSaveFromLease,
+    streamRisuSaveFromStore,
+} from '../risuSaveStoreAdapter'
 import { risuSaveFixtureDatabase, risuSaveFixtures } from './risuSaveFixtures'
 
 vi.mock('../database.svelte', () => ({
@@ -109,6 +113,101 @@ describe('RisuSave persistent store adapter', () => {
         expect((await decodeRisuSave(exported)).username).toBe('Snapshot User')
         expect((await store.readRoot()).value.username).toBe('Later User')
         expect(materialize).not.toHaveBeenCalled()
+    })
+
+    it('streams a supplied lease without releasing it or materializing a database', async () => {
+        const store = new IndexedDbPersistentDataStore(
+            'risu-save-injected-lease',
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(risuSaveFixtureDatabase))
+        const lease = await store.acquireRevision(imported.revision)
+        const release = vi.spyOn(lease, 'release')
+        const materialize = vi.spyOn(store, 'materializeDatabase')
+
+        const exported = await concatenate(streamRisuSaveFromLease(lease))
+
+        await expect(decodeRisuSave(exported)).resolves.toEqual(risuSaveFixtureDatabase)
+        expect(release).not.toHaveBeenCalled()
+        expect(materialize).not.toHaveBeenCalled()
+        await lease.release()
+    })
+
+    it('projects root and character resources while streaming from a lease', async () => {
+        const database = structuredClone(risuSaveFixtureDatabase) as any
+        database.customBackground = 'assets/background.png'
+        database.userIcon = 'assets/user.png'
+        database.modules = [{
+            assets: [['module', 'assets/module.png', 'png']],
+            icon: 'assets/module-icon.png',
+        }]
+        database.personas = [{
+            icon: 'assets/persona.png',
+            embeddedModule: {
+                assets: [['embedded', 'assets/embedded.png', 'png']],
+                icon: 'assets/embedded-icon.png',
+            },
+        }]
+        database.characterOrder = [{ name: 'Folder', imgFile: 'assets/folder.png' }]
+        Object.assign(database.characters[0], {
+            image: 'assets/character.png',
+            emotionImages: [['happy', 'assets/emotion.png']],
+            additionalAssets: [['prop', 'assets/prop.png', 'png']],
+            vits: { files: { model: 'assets/model.onnx' } },
+            ccAssets: [{ type: 'icon', uri: 'assets/card.png', name: 'card', ext: 'png' }],
+        })
+        const resources = [
+            'assets/background.png',
+            'assets/user.png',
+            'assets/module.png',
+            'assets/module-icon.png',
+            'assets/persona.png',
+            'assets/embedded.png',
+            'assets/embedded-icon.png',
+            'assets/folder.png',
+            'assets/character.png',
+            'assets/emotion.png',
+            'assets/prop.png',
+            'assets/model.onnx',
+            'assets/card.png',
+        ]
+        const replacements = Object.fromEntries(
+            resources.map((resource) => [resource, `remote/${resource}`]),
+        )
+        const store = new IndexedDbPersistentDataStore(
+            'risu-save-resource-projection',
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(database)
+        const lease = await store.acquireRevision(imported.revision)
+        const release = vi.spyOn(lease, 'release')
+
+        const exported = await concatenate(streamRisuSaveFromLease(lease, {
+            replaceResources: replacements,
+        }))
+        const projected = await decodeRisuSave(exported) as any
+
+        expect(projected.customBackground).toBe('remote/assets/background.png')
+        expect(projected.userIcon).toBe('remote/assets/user.png')
+        expect(projected.modules[0].assets[0][1]).toBe('remote/assets/module.png')
+        expect(projected.modules[0].icon).toBe('remote/assets/module-icon.png')
+        expect(projected.personas[0].icon).toBe('remote/assets/persona.png')
+        expect(projected.personas[0].embeddedModule.assets[0][1]).toBe('remote/assets/embedded.png')
+        expect(projected.personas[0].embeddedModule.icon).toBe('remote/assets/embedded-icon.png')
+        expect(projected.characterOrder[0].imgFile).toBe('remote/assets/folder.png')
+        expect(projected.characters[0].image).toBe('remote/assets/character.png')
+        expect(projected.characters[0].emotionImages[0][1]).toBe('remote/assets/emotion.png')
+        expect(projected.characters[0].additionalAssets[0][1]).toBe('remote/assets/prop.png')
+        expect(projected.characters[0].vits.files.model).toBe('remote/assets/model.onnx')
+        expect(projected.characters[0].ccAssets[0].uri).toBe('remote/assets/card.png')
+        expect(database.customBackground).toBe('assets/background.png')
+        expect(database.characters[0].image).toBe('assets/character.png')
+        expect(release).not.toHaveBeenCalled()
+        await lease.release()
     })
 
     it('exports trashed characters in configured order', async () => {

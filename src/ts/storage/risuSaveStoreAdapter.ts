@@ -6,6 +6,10 @@ import type {
     PersistentRevisionLease,
 } from './persistentDataStore'
 import {
+    replaceCharacterResources,
+    replaceDatabaseRootResources,
+} from '../process/coldstorageData'
+import {
     decodeRisuSave,
     encodeRisuSaveBlock,
     magicRisuSaveHeader,
@@ -69,64 +73,82 @@ async function* characterValues(lease: PersistentRevisionLease): AsyncGenerator<
 export async function* streamRisuSaveFromStore(
     store: PersistentDataStore,
     revision: DataRevision,
+    options?: RisuSaveStreamOptions,
 ): AsyncGenerator<Uint8Array> {
     const lease = await store.acquireRevision(revision)
     try {
-        const root = (await lease.readRoot()).value
-        const directory: string[] = [
-            'preset',
-            'modules',
-            'loadouts',
-            'plugins',
-            'pluginStorage',
-        ]
-        const characterIds = (await characterSummaries(lease)).map((item) => item.id)
-        directory.push(...characterIds, 'config')
-
-        const {
-            botPresets,
-            modules,
-            loadouts,
-            plugins,
-            pluginCustomStorage,
-            ...rootData
-        } = root
-        yield magicRisuSaveHeader.slice()
-        yield await encodeRisuSaveBlock({
-            compression: true,
-            data: JSON.stringify({ ...rootData, __directory: directory }),
-            type: RisuSaveType.ROOT,
-            name: 'root',
-        })
-        for (const [type, name, value] of [
-            [RisuSaveType.BOTPRESET, 'preset', botPresets],
-            [RisuSaveType.MODULES, 'modules', modules],
-            [RisuSaveType.LOADOUTS, 'loadouts', loadouts],
-            [RisuSaveType.PLUGINS, 'plugins', plugins],
-            [RisuSaveType.PLUGIN_STORAGE, 'pluginStorage', pluginCustomStorage],
-        ] as const) {
-            yield await encodeRisuSaveBlock({
-                compression: true,
-                data: JSON.stringify(value),
-                type,
-                name,
-            })
-        }
-        for await (const character of characterValues(lease)) {
-            yield await encodeRisuSaveBlock({
-                compression: true,
-                data: JSON.stringify(character),
-                type: RisuSaveType.CHARACTER_WITH_CHAT,
-                name: character.chaId,
-            })
-        }
-        yield await encodeRisuSaveBlock({
-            compression: true,
-            data: JSON.stringify({ version: 1 }),
-            type: RisuSaveType.CONFIG,
-            name: 'config',
-        })
+        yield* streamRisuSaveFromLease(lease, options)
     } finally {
         await lease.release()
     }
+}
+
+export interface RisuSaveStreamOptions {
+    replaceResources?: Readonly<Record<string, string>>
+}
+
+export async function* streamRisuSaveFromLease(
+    lease: PersistentRevisionLease,
+    options?: RisuSaveStreamOptions,
+): AsyncGenerator<Uint8Array> {
+    const storedRoot = (await lease.readRoot()).value
+    const root = options?.replaceResources
+        ? replaceDatabaseRootResources(storedRoot, options.replaceResources)
+        : storedRoot
+    const directory: string[] = [
+        'preset',
+        'modules',
+        'loadouts',
+        'plugins',
+        'pluginStorage',
+    ]
+    const characterIds = (await characterSummaries(lease)).map((item) => item.id)
+    directory.push(...characterIds, 'config')
+
+    const {
+        botPresets,
+        modules,
+        loadouts,
+        plugins,
+        pluginCustomStorage,
+        ...rootData
+    } = root
+    yield magicRisuSaveHeader.slice()
+    yield await encodeRisuSaveBlock({
+        compression: true,
+        data: JSON.stringify({ ...rootData, __directory: directory }),
+        type: RisuSaveType.ROOT,
+        name: 'root',
+    })
+    for (const [type, name, value] of [
+        [RisuSaveType.BOTPRESET, 'preset', botPresets],
+        [RisuSaveType.MODULES, 'modules', modules],
+        [RisuSaveType.LOADOUTS, 'loadouts', loadouts],
+        [RisuSaveType.PLUGINS, 'plugins', plugins],
+        [RisuSaveType.PLUGIN_STORAGE, 'pluginStorage', pluginCustomStorage],
+    ] as const) {
+        yield await encodeRisuSaveBlock({
+            compression: true,
+            data: JSON.stringify(value),
+            type,
+            name,
+        })
+    }
+    for await (const storedCharacter of characterValues(lease)) {
+        const character = options?.replaceResources
+            ? replaceCharacterResources(storedCharacter, options.replaceResources)
+            : storedCharacter
+        yield await encodeRisuSaveBlock({
+            compression: true,
+            data: JSON.stringify(character),
+            type: RisuSaveType.CHARACTER_WITH_CHAT,
+            name: character.chaId,
+        })
+    }
+    yield await encodeRisuSaveBlock({
+        compression: true,
+        data: JSON.stringify({ version: 1 }),
+        type: RisuSaveType.CONFIG,
+        name: 'config',
+    })
 }

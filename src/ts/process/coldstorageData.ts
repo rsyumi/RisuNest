@@ -22,27 +22,127 @@ export function isColdStorageBackupData(data: unknown): boolean {
         && ('character' in data || 'message' in data)
 }
 
-function replaceData(data: string | undefined, replacer: { [key: string]: string }) {
+function replaceData(
+    data: string | undefined,
+    replacer: Readonly<Record<string, string>>,
+) {
     if (!data) {
         return data
     }
     return replacer[data] ?? data
 }
 
-function replaceCharacterResources(cha: character | groupChat, replacer: { [key: string]: string }) {
-    cha.image = replaceData(cha.image, replacer)
+function addResource(resources: string[], value: string | undefined) {
+    if (value) {
+        resources.push(value)
+    }
+}
+
+export function listDatabaseRootResources(
+    root: Omit<Database, 'characters'>,
+): string[] {
+    const resources: string[] = []
+    addResource(resources, root.customBackground)
+    addResource(resources, root.userIcon)
+    for (const module of root.modules ?? []) {
+        for (const asset of module.assets ?? []) {
+            addResource(resources, asset[1])
+        }
+        addResource(resources, module.icon)
+    }
+    for (const persona of root.personas ?? []) {
+        addResource(resources, persona.icon)
+        for (const asset of persona.embeddedModule?.assets ?? []) {
+            addResource(resources, asset[1])
+        }
+        addResource(resources, persona.embeddedModule?.icon)
+    }
+    for (const item of root.characterOrder ?? []) {
+        if (typeof item === 'object') {
+            addResource(resources, item.imgFile)
+        }
+    }
+    return resources
+}
+
+export function listCharacterResources(value: character | groupChat): string[] {
+    const resources: string[] = []
+    addResource(resources, value.image)
+    for (const emotion of value.emotionImages ?? []) {
+        addResource(resources, emotion[1])
+    }
+    if (value.type !== 'group') {
+        for (const asset of value.additionalAssets ?? []) {
+            addResource(resources, asset[1])
+        }
+        for (const file of Object.values(value.vits?.files ?? {})) {
+            addResource(resources, file)
+        }
+        for (const asset of value.ccAssets ?? []) {
+            addResource(resources, asset.uri)
+        }
+    }
+    return resources
+}
+
+export function replaceDatabaseRootResources<T extends Omit<Database, 'characters'>>(
+    root: T,
+    replacements: Readonly<Record<string, string>>,
+): T {
+    const cloned = safeStructuredClone(root)
+    cloned.customBackground = replaceData(cloned.customBackground, replacements)
+    cloned.userIcon = replaceData(cloned.userIcon, replacements)
+    for (const module of cloned.modules ?? []) {
+        for (const asset of module.assets ?? []) {
+            asset[1] = replaceData(asset[1], replacements)
+        }
+        module.icon = replaceData(module.icon, replacements)
+    }
+    for (const persona of cloned.personas ?? []) {
+        persona.icon = replaceData(persona.icon, replacements)
+        for (const asset of persona.embeddedModule?.assets ?? []) {
+            asset[1] = replaceData(asset[1], replacements)
+        }
+        if (persona.embeddedModule) {
+            persona.embeddedModule.icon = replaceData(
+                persona.embeddedModule.icon,
+                replacements,
+            )
+        }
+    }
+    for (const item of cloned.characterOrder ?? []) {
+        if (typeof item === 'object') {
+            item.imgFile = replaceData(item.imgFile, replacements)
+        }
+    }
+    return cloned
+}
+
+export function replaceCharacterResources<T extends character | groupChat>(
+    value: T,
+    replacements: Readonly<Record<string, string>>,
+): T {
+    const cha = safeStructuredClone(value)
+    cha.image = replaceData(cha.image, replacements)
 
     if (cha.emotionImages) {
         for (let i = 0; i < cha.emotionImages.length; i++) {
-            cha.emotionImages[i][1] = replaceData(cha.emotionImages[i][1], replacer)
+            cha.emotionImages[i][1] = replaceData(cha.emotionImages[i][1], replacements)
         }
     }
 
-    if (cha.type !== 'group' && cha.additionalAssets) {
-        for (let i = 0; i < cha.additionalAssets.length; i++) {
-            cha.additionalAssets[i][1] = replaceData(cha.additionalAssets[i][1], replacer)
+    if (cha.type !== 'group') {
+        for (const asset of cha.additionalAssets ?? []) {
+            asset[1] = replaceData(asset[1], replacements)
+        }
+        for (const key of Object.keys(cha.vits?.files ?? {})) {
+            cha.vits!.files[key] = replaceData(cha.vits!.files[key], replacements)
+        }
+        for (const asset of cha.ccAssets ?? []) {
+            asset.uri = replaceData(asset.uri, replacements)
         }
     }
+    return cha
 }
 
 export function replaceColdStoragePayloadResources(data: unknown, replacer: { [key: string]: string }): unknown {
@@ -57,16 +157,16 @@ export function replaceColdStoragePayloadResources(data: unknown, replacer: { [k
     }
 
     const cloned = safeStructuredClone(data) as { character: character | groupChat }
-    replaceCharacterResources(cloned.character, replacer)
+    cloned.character = replaceCharacterResources(cloned.character, replacer)
     return cloned
 }
 
-function listColdDataKeysFromCharacter(character: character | groupChat): string[] {
+export function listColdDataKeysFromCharacter(character: character | groupChat): string[] {
     const keys: string[] = []
     if (character.coldstorage) {
         keys.push(character.coldstorage)
-        keys.push(...(character.coldStoragedChats ?? []))
     }
+    keys.push(...(character.coldStoragedChats ?? []))
     for (const chat of character.chats ?? []) {
         const firstMessage = chat.message?.[0]
         if (firstMessage?.data?.startsWith(coldStorageHeader)) {
