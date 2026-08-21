@@ -45,6 +45,7 @@ import { isTauri, isNodeServer } from "./platform";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
+import { ByteBudgetLru } from "./util/byteBudgetLru";
 
 export const forageStorage = new AutoStorage()
 
@@ -102,6 +103,12 @@ let fileCache: {
     origin: [],
     res: []
 }
+
+const browserAssetByteCache = new ByteBudgetLru<string, Uint8Array>(
+    16 * 1024 * 1024,
+    (_loc, data) => data.byteLength,
+)
+const pendingBrowserAssetReads = new Map<string, Promise<Uint8Array>>()
 
 let pathCache: { [key: string]: string } = {}
 let checkedPaths: string[] = []
@@ -172,25 +179,21 @@ export async function getFileSrc(loc: string) {
             }
         }
         else {
-            let ind = fileCache.origin.indexOf(loc)
-            if (ind === -1) {
-                ind = fileCache.origin.length
-                fileCache.origin.push(loc)
-                fileCache.res.push('loading')
-                const f: Uint8Array = await forageStorage.getItem(loc) as unknown as Uint8Array
-                fileCache.res[ind] = f
-                return `data:image/png;base64,${Buffer.from(f).toString('base64')}`
-            }
-            else {
-                const f = fileCache.res[ind]
-                if (f === 'loading') {
-                    while (fileCache.res[ind] === 'loading') {
-                        await sleep(10)
+            let data = browserAssetByteCache.get(loc)
+            if (!data) {
+                let pending = pendingBrowserAssetReads.get(loc)
+                if (!pending) {
+                    pending = forageStorage.getItem(loc) as Promise<Uint8Array>
+                    pendingBrowserAssetReads.set(loc, pending)
+                    const cleanup = () => {
+                        pendingBrowserAssetReads.delete(loc)
                     }
-                    return `data:image/png;base64,${Buffer.from(fileCache.res[ind]).toString('base64')}`
+                    void pending.then(cleanup, cleanup)
                 }
-                return `data:image/png;base64,${Buffer.from(f).toString('base64')}`
+                data = await pending
+                browserAssetByteCache.set(loc, data)
             }
+            return `data:image/png;base64,${Buffer.from(data).toString('base64')}`
         }
     } catch (error) {
         console.error(error)
