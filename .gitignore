@@ -28,6 +28,8 @@ src-others/
 *.sln
 *.sw?
 /src-tauri/target/
+/src-tauri/gen/schemas/acl-manifests.json
+/src-tauri/gen/schemas/*-schema.json
 /build/
 pycache/
 test.ts
