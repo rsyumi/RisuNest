@@ -16,9 +16,6 @@ export class AutoStorage{
 
     async setItem(key:string, value:Uint8Array):Promise<string|null> {
         await this.Init()
-        if(this.isAccount){
-            return await (this.realStorage as AccountStorage).setItem(key, value)
-        }
         await this.realStorage.setItem(key, value)
         return null
     }
@@ -64,7 +61,6 @@ export class AutoStorage{
             if(a){
                 const sel = await alertSelect([language.loadDataFromAccount, language.saveCurrentDataToAccount])
                 if(sel === "0"){
-                    this.realStorage = accountStorage
                     alertStore.set({
                         type: "none",
                         msg: ""
@@ -142,7 +138,6 @@ export class AutoStorage{
                 alertError(error)
                 return false
             }
-            this.realStorage = accountStorage
             alertStore.set({
                 type: "none",
                 msg: ""
@@ -151,24 +146,18 @@ export class AutoStorage{
             localStorage.setItem('accountst', 'able')
             localStorage.setItem('fallbackRisuToken',JSON.stringify(db.account))
             this.isAccount = true
-            await localforage.clear()
             return true
         }
         else if(localStorage.getItem('accountst') === 'able'){
             localStorage.setItem('accountst', 'able')
-            this.realStorage = new AccountStorage()
             this.isAccount = true
         }
         return false
     }
 
     async Init(){
+        this.isAccount = localStorage.getItem('accountst') === 'able'
         if(!this.realStorage){
-            if(localStorage.getItem('accountst') === 'able'){
-                this.realStorage = new AccountStorage()
-                this.isAccount = true
-                return
-            }
             if(isNodeServer){
                 console.log("using node storage")
                 this.realStorage = new NodeStorage()

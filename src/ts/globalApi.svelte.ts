@@ -59,6 +59,7 @@ import {
 } from "./storage/persistentSaveNotifications";
 import { installInternalBackup } from "./storage/databaseRestore";
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore } from "./storage/platformBlobStore";
+import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
 
 export const forageStorage = new AutoStorage()
 configureBlobStoreStorageProvider(async () => {
@@ -136,17 +137,18 @@ let checkedPaths: string[] = []
  * @returns {Promise<string>} - A promise that resolves to the source URL of the file.
  */
 export async function getFileSrc(loc: string) {
-    if (isTauri) {
-        if (loc.startsWith('assets')) {
-            const url = await (await resolveBlobStore()).resolveUrl(loc)
-            if (!url) console.error(new Error(`Missing asset: ${loc}`))
-            return url ?? ''
-        }
-        return convertFileSrc(loc)
-    }
     await forageStorage.Init()
-    if (forageStorage.isAccount && loc.startsWith('assets')) {
+    const route = selectAssetSourceRoute(loc, isTauri, forageStorage.isAccount)
+    if (route === 'account') {
         return hubURL + `/rs/` + loc
+    }
+    if (route === 'tauri-asset') {
+        const url = await (await resolveBlobStore()).resolveUrl(loc)
+        if (!url) console.error(new Error(`Missing asset: ${loc}`))
+        return url ?? ''
+    }
+    if (route === 'tauri-path') {
+        return convertFileSrc(loc)
     }
     const blobStore = loc.startsWith('assets/') ? await resolveBlobStore() : null
     const readLocalFile = async () => blobStore
