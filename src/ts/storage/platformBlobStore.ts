@@ -88,7 +88,7 @@ export type KeyValueStorage = {
     removeItem(key: string): Promise<unknown>
 }
 
-function keyValueBackend(storage: KeyValueStorage): BlobKeyValueBackend {
+export function createStorageBlobKeyValueBackend(storage: KeyValueStorage): BlobKeyValueBackend {
     return {
         async write(key, value) { await storage.setItem(key, value) },
         async read(key) {
@@ -229,18 +229,20 @@ export function createTauriBlobBackend(dependencies?: TauriBlobBackendDependenci
 const browserLocalStorage = localforage.createInstance({ name: 'risuai' }) as unknown as KeyValueStorage
 const legacyRootResolver: ActiveBlobRootResolver = { async getActiveRoot() { return { kind: 'legacy' } } }
 let productionFactory: Promise<RootedBlobStoreFactory> | undefined
+let productionBackend: Promise<BlobKeyValueBackend> | undefined
 let storageProvider: () => Promise<KeyValueStorage | null> = async () => browserLocalStorage
 
 export function configureBlobStoreStorageProvider(provider: () => Promise<KeyValueStorage | null>): void {
     storageProvider = provider
     productionFactory = undefined
+    productionBackend = undefined
 }
 
 export function createStorageRootedBlobStoreFactory(
     selected: { storage: KeyValueStorage; isAccount: boolean },
 ): RootedBlobStoreFactory {
     if (selected.isAccount) throw new TypeError('AccountStorage cannot be used as a BlobStore backend')
-    return createKeyValueRootedBlobStoreFactory(keyValueBackend(selected.storage))
+    return createKeyValueRootedBlobStoreFactory(createStorageBlobKeyValueBackend(selected.storage))
 }
 
 export async function createBrowserBlobBackend(
@@ -248,7 +250,7 @@ export async function createBrowserBlobBackend(
     getOpfsDirectory: () => Promise<FileSystemDirectoryHandle> = () => navigator.storage.getDirectory(),
 ): Promise<BlobKeyValueBackend> {
     if (selected?.blobStorageKind === 'opfs') return createOpfsBlobBackend(await getOpfsDirectory())
-    return keyValueBackend(selected ?? browserLocalStorage)
+    return createStorageBlobKeyValueBackend(selected ?? browserLocalStorage)
 }
 
 export async function readBlobForFacade(
@@ -261,9 +263,17 @@ export async function readBlobForFacade(
     return value
 }
 
+async function createProductionBackend(): Promise<BlobKeyValueBackend> {
+    if (isTauri) return createTauriBlobBackend()
+    return createBrowserBlobBackend(await storageProvider())
+}
+
+export function getPlatformBlobKeyValueBackend(): Promise<BlobKeyValueBackend> {
+    return productionBackend ??= createProductionBackend()
+}
+
 async function createProductionFactory(): Promise<RootedBlobStoreFactory> {
-    if (isTauri) return createKeyValueRootedBlobStoreFactory(createTauriBlobBackend())
-    return createKeyValueRootedBlobStoreFactory(await createBrowserBlobBackend(await storageProvider()))
+    return createKeyValueRootedBlobStoreFactory(await getPlatformBlobKeyValueBackend())
 }
 
 const deferredFactory: RootedBlobStoreFactory = {
