@@ -86,11 +86,118 @@ export async function loadLoreBookV3Prompt(){
     const fullWordMatchingSetting = char.loreSettings?.fullWordMatching ?? false
     const chatLength = currentChat.length + 1 //includes first message
     const recursiveScanning = char.loreSettings?.recursiveScanning ?? true
-    let recursivePrompt:{
-        prompt: string,
-        source: string,
+    type SearchKey = {
+        raw: string
+        lower: string
+        noSpace: string
+    }
+    type MessageView = {
+        source: string
+        prompt: string
         data: string
-    }[] = []
+        normalizedPrompt: string
+        normalizedData: string
+        noSpaceData: string
+        words: string[]
+    }
+
+    const parseSearchKeys = (keys: string[]): SearchKey[] => {
+        const parsed: SearchKey[] = []
+        for (const key of keys) {
+            const raw = key.trim()
+            if (raw.length > 0) {
+                const lower = raw.toLocaleLowerCase()
+                parsed.push({ raw, lower, noSpace: lower.replace(/ /g, '') })
+            }
+        }
+        return parsed
+    }
+
+    const primarySearchKeys = new Map<number, SearchKey[]>()
+    const secondarySearchKeys = new Map<number, SearchKey[]>()
+    const getPrimarySearchKeys = (index: number) => {
+        let parsed = primarySearchKeys.get(index)
+        if (!parsed) {
+            parsed = parseSearchKeys(fullLore[index].key.split(','))
+            primarySearchKeys.set(index, parsed)
+        }
+        return parsed.slice()
+    }
+    const getSecondarySearchKeys = (index: number) => {
+        let parsed = secondarySearchKeys.get(index)
+        if (!parsed) {
+            parsed = parseSearchKeys(fullLore[index].secondkey.split(','))
+            secondarySearchKeys.set(index, parsed)
+        }
+        return parsed.slice()
+    }
+    const directiveSearchKeys = new Map<string, SearchKey[]>()
+    const getDirectiveSearchKeys = (keys: string[]) => {
+        const cacheKey = JSON.stringify(keys)
+        let parsed = directiveSearchKeys.get(cacheKey)
+        if (!parsed) {
+            parsed = parseSearchKeys(keys)
+            directiveSearchKeys.set(cacheKey, parsed)
+        }
+        return parsed.slice()
+    }
+
+    const createMessageView = (source: string, prompt: string, data: string): MessageView => {
+        const normalizedPrompt = prompt.toLocaleLowerCase().replace(/\{\{\/\/(.+?)\}\}/g, '').replace(/\{\{comment:(.+?)\}\}/g, '')
+        const normalizedData = data.toLocaleLowerCase().replace(/\{\{\/\/(.+?)\}\}/g, '').replace(/\{\{comment:(.+?)\}\}/g, '')
+        return {
+            source,
+            prompt,
+            data,
+            normalizedPrompt,
+            normalizedData,
+            noSpaceData: normalizedData.replace(/ /g, ''),
+            words: normalizedData.split(' '),
+        }
+    }
+
+    const baseMessageViewsByDepth = new Map<number, MessageView[]>()
+    const getBaseMessageViews = (messages: Message[], searchDepth: number) => {
+        let views = baseMessageViewsByDepth.get(searchDepth)
+        if (views) {
+            return views
+        }
+        const sliced = messages.slice(messages.length - searchDepth, messages.length)
+        views = sliced.map((msg, i) => {
+            if (msg.role === 'user') {
+                return createMessageView(
+                    `message ${i} by user`,
+                    `\x01{{${DBState.db.username}}}:` + msg.data + '\x01',
+                    msg.data,
+                )
+            }
+            return createMessageView(
+                `message ${i} by char`,
+                `\x01{{${msg.name ?? (msg.saying ? findCharacterbyId(msg.saying)?.name : null) ?? char.name}}}:` + msg.data + '\x01',
+                msg.data,
+            )
+        })
+        baseMessageViewsByDepth.set(searchDepth, views)
+        return views
+    }
+
+    const regexCache = new Map<string, RegExp | null>()
+    const getRegex = (pattern: string, flags: string) => {
+        const cacheKey = JSON.stringify([pattern, flags])
+        if (regexCache.has(cacheKey)) {
+            return regexCache.get(cacheKey) ?? null
+        }
+        try {
+            const regex = new RegExp(pattern, flags)
+            regexCache.set(cacheKey, regex)
+            return regex
+        } catch (error) {
+            regexCache.set(cacheKey, null)
+            return null
+        }
+    }
+
+    let recursivePrompt: MessageView[] = []
     let matchLog:{
         prompt: string,
         source: string
@@ -98,72 +205,44 @@ export async function loadLoreBookV3Prompt(){
     }[] = []
 
     const searchMatch = (messages:Message[],arg:{
-        keys:string[],
+        keys:SearchKey[],
         searchDepth:number,
         regex:boolean
         fullWordMatching:boolean
         all?:boolean
         dontSearchWhenRecursive: boolean
     }) => {
-        const sliced = messages.slice(messages.length - arg.searchDepth,messages.length)
-        const newKeys = []
-        for (const key of arg.keys) {
-            const trimmed = key.trim()
-            if (trimmed.length > 0) {
-                newKeys.push(trimmed)
-            }
-        }
-        arg.keys = newKeys
-        let mList:{
-            source:string
-            prompt:string
-            data:string
-        }[] = sliced.map((msg, i) => {
-            if(msg.role === 'user'){
-                return {
-                    source: `message ${i} by user`,
-                    prompt: `\x01{{${DBState.db.username}}}:` + msg.data + '\x01',
-                    data: msg.data
-                }
-            }
-            else{
-                return {
-                    source: `message ${i} by char`,
-                    prompt: `\x01{{${msg.name ?? (msg.saying ? findCharacterbyId(msg.saying)?.name : null) ?? char.name}}}:` + msg.data + '\x01',
-                    data: msg.data
-                }
-            }
-        }).concat(
-            arg.dontSearchWhenRecursive ? [] : recursivePrompt.map((msg) => {
-                return {
-                    source: 'lorebook ' + msg.source,
-                    prompt: msg.prompt,
-                    data: msg.data
-                }
-            }))    
+        const mList = getBaseMessageViews(messages, arg.searchDepth).concat(
+            arg.dontSearchWhenRecursive ? [] : recursivePrompt,
+        )
 
         if(arg.regex){
             for(const mText of mList){
-                for(const regexString of arg.keys){
+                for(const regexKey of arg.keys){
+                    const regexString = regexKey.raw
                     if(!regexString.startsWith('/')){
                         return false
                     }
                     const regexFlag = regexString.split('/').pop()
                     if(regexFlag){
-                        arg.keys[0] = regexString.replace('/'+regexFlag,'')
-                        try {
-                            const regex = new RegExp(arg.keys[0],regexFlag)
-                            const d = regex.test(mText.data)
-                            if(d){
-                                matchLog.push({
-                                    prompt: mText.prompt,
-                                    source: mText.source,
-                                    activated: regexString
-                                })
-                                return true
-                            }
-                        } catch (error) {
+                        arg.keys[0] = {
+                            raw: regexString.replace('/' + regexFlag, ''),
+                            lower: '',
+                            noSpace: '',
+                        }
+                        const regex = getRegex(arg.keys[0].raw, regexFlag)
+                        if (!regex) {
                             return false
+                        }
+                        regex.lastIndex = 0
+                        const d = regex.test(mText.data)
+                        if(d){
+                            matchLog.push({
+                                prompt: mText.prompt,
+                                source: mText.source,
+                                activated: regexString
+                            })
+                            return true
                         }
                     }
                 }
@@ -171,27 +250,17 @@ export async function loadLoreBookV3Prompt(){
             return false
         }
 
-        mList = mList.map((m) => {
-            return {
-                source: m.source,
-                prompt: m.prompt.toLocaleLowerCase().replace(/\{\{\/\/(.+?)\}\}/g,'').replace(/\{\{comment:(.+?)\}\}/g,''),
-                data: m.data.toLocaleLowerCase().replace(/\{\{\/\/(.+?)\}\}/g,'').replace(/\{\{comment:(.+?)\}\}/g,'')
-            }
-        })
-
         let allMode = arg.all ?? false
         let allModeMatched = true
 
         for(const m of mList){
-            let mText = m.data
             if(arg.fullWordMatching){
-                const splited = mText.split(' ')
                 for(const key of arg.keys){
-                    if(splited.includes(key.toLocaleLowerCase())){
+                    if(m.words.includes(key.lower)){
                         matchLog.push({
-                            prompt: m.prompt,
+                            prompt: m.normalizedPrompt,
                             source: m.source,
-                            activated: key
+                            activated: key.raw
                         })
                         if(!allMode){
                             return true
@@ -203,14 +272,12 @@ export async function loadLoreBookV3Prompt(){
                 }
             }
             else{
-                mText = mText.replace(/ /g,'')
                 for(const key of arg.keys){
-                    const realKey = key.toLocaleLowerCase().replace(/ /g,'')
-                    if(mText.includes(realKey)){
+                    if(m.noSpaceData.includes(key.noSpace)){
                         matchLog.push({
-                            prompt: m.prompt,
+                            prompt: m.normalizedPrompt,
                             source: m.source,
-                            activated: key
+                            activated: key.raw
                         })
                         if(!allMode){
                             return true
@@ -246,7 +313,7 @@ export async function loadLoreBookV3Prompt(){
             lore:boolean
         }|null
     }[] = []
-    let activatedIndexes:number[] = []
+    const activatedIndexes = new Set<number>()
     let disabledUIPrompts:string[] = []
     let matchTimes = 0
     let keepActivateAfterMatch = false
@@ -254,7 +321,7 @@ export async function loadLoreBookV3Prompt(){
     while(matching){
         matching = false
         for(let i=0;i<fullLore.length;i++){
-            if(activatedIndexes.includes(i)){
+            if(activatedIndexes.has(i)){
                 continue
             }
             if(!fullLore[i].alwaysActive && !fullLore[i].key){
@@ -275,7 +342,7 @@ export async function loadLoreBookV3Prompt(){
             let forceState:string = 'none'
             let role:'system'|'user'|'assistant' = 'system'
             let searchQueries:{
-                keys:string[],
+                keys:SearchKey[],
                 negative:boolean,
                 all?:boolean
             }[] = []
@@ -286,7 +353,7 @@ export async function loadLoreBookV3Prompt(){
                 activated = false
                 for(let j=0;j<i;j++){
                     if(fullLore[j].id === fullLore[i].id){
-                        if(!activatedIndexes.includes(j)){
+                        if(!activatedIndexes.has(j)){
                             fullLore[i].comment = fullLore[j].comment
                             fullLore[i].content = fullLore[j].content
                             fullLore[i].alwaysActive = true
@@ -438,21 +505,21 @@ export async function loadLoreBookV3Prompt(){
                     }
                     case 'additional_keys':{
                         searchQueries.push({
-                            keys: arg,
+                            keys: getDirectiveSearchKeys(arg),
                             negative: false
                         })
                         return
                     }
                     case 'exclude_keys':{
                         searchQueries.push({
-                            keys: arg,
+                            keys: getDirectiveSearchKeys(arg),
                             negative: true
                         })
                         return
                     }
                     case 'exclude_keys_all':{
                         searchQueries.push({
-                            keys: arg,
+                            keys: getDirectiveSearchKeys(arg),
                             negative: true,
                             all: true
                         })
@@ -520,13 +587,13 @@ export async function loadLoreBookV3Prompt(){
             }
             else{
                 searchQueries.push({
-                    keys: fullLore[i].key.split(','),
+                    keys: getPrimarySearchKeys(i),
                     negative: false
                 })
 
                 if(fullLore[i].secondkey && fullLore[i].selective){
                     searchQueries.push({
-                        keys: fullLore[i].secondkey.split(','),
+                        keys: getSecondarySearchKeys(i),
                         negative: false
                     })
                 }
@@ -578,7 +645,7 @@ export async function loadLoreBookV3Prompt(){
                     source: fullLore[i].comment || `lorebook ${i}`,
                     inject: inject ?? null
                 })
-                activatedIndexes.push(i)
+                activatedIndexes.add(i)
 
                 if(keepActivateAfterMatch){
                     setChatVar('__internal_ka_' + (fullLore[i].id ?? pickHashRand(5555,fullLore[i].content).toString()), 'true')
@@ -595,11 +662,11 @@ export async function loadLoreBookV3Prompt(){
 
                 if(recursive){
                     matching = true
-                    recursivePrompt.push({
-                        prompt: content,
-                        data: content,
-                        source: fullLore[i].comment || `lorebook ${i}`,
-                    })
+                    recursivePrompt.push(createMessageView(
+                        'lorebook ' + (fullLore[i].comment || `lorebook ${i}`),
+                        content,
+                        content,
+                    ))
                 }
             }
         }

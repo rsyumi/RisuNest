@@ -1,0 +1,197 @@
+import { beforeEach, describe, expect, test, vi } from 'vitest'
+
+vi.mock('../parser/chatVar.svelte', () => ({
+    getChatVar: vi.fn(),
+    setChatVar: vi.fn(),
+}))
+
+vi.mock('../stores.svelte', () => ({
+    DBState: { db: {} },
+    selectedCharID: {
+        subscribe: (run: (value: number) => void) => {
+            run(0)
+            return () => undefined
+        },
+    },
+}))
+
+vi.mock('../tokenizer', () => ({
+    tokenize: vi.fn(async (text: string) => text.length),
+}))
+
+vi.mock('../parser/parser.svelte', () => ({
+    risuChatParser: vi.fn((text: string) => text),
+}))
+
+vi.mock('../util', () => ({
+    findCharacterbyId: vi.fn(),
+    pickHashRand: vi.fn(() => 0),
+    selectSingleFile: vi.fn(),
+}))
+
+vi.mock('../alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
+vi.mock('../../lang', () => ({ language: { successExport: 'exported' } }))
+vi.mock('../globalApi.svelte', () => ({ downloadFile: vi.fn(), saveAsset: vi.fn() }))
+vi.mock('./modules', () => ({ getModuleLorebooks: vi.fn(() => []) }))
+
+import { DBState } from '../stores.svelte'
+import { loadLoreBookV3Prompt } from './lorebook.svelte'
+
+type Lore = {
+    key: string
+    content: string
+    comment?: string
+    alwaysActive?: boolean
+    secondkey?: string
+    selective?: boolean
+    useRegex?: boolean
+    insertorder?: number
+    mode?: 'normal' | 'child'
+    id?: string
+}
+
+function setLorebook(lore: Lore[], messages = [{ role: 'user', data: '' }], tokenBudget = 10_000) {
+    DBState.db = {
+        username: 'User',
+        loreBookDepth: 10,
+        loreBookToken: tokenBudget,
+        characters: [{
+            name: 'Char',
+            chatPage: 0,
+            globalLore: lore.map((entry) => ({
+                comment: '',
+                alwaysActive: false,
+                secondkey: '',
+                selective: false,
+                insertorder: 100,
+                mode: 'normal',
+                ...entry,
+            })),
+            chats: [{ localLore: [], message: messages }],
+            loreSettings: { recursiveScanning: true },
+        }],
+    } as never
+}
+
+async function activePrompts() {
+    const result = await loadLoreBookV3Prompt()
+    return result.actives.map((active) => active.prompt)
+}
+
+beforeEach(() => {
+    vi.restoreAllMocks()
+})
+
+describe('loadLoreBookV3Prompt characterization', () => {
+    test('normalizes case, comments, and spaces for partial matching', async () => {
+        setLorebook(
+            [{ key: 'alpha beta', content: 'matched' }],
+            [{ role: 'user', data: 'ALPHA{{// hidden}} beta' }],
+        )
+
+        await expect(activePrompts()).resolves.toEqual(['matched'])
+    })
+
+    test('uses split(\' \') semantics for full-word matching', async () => {
+        setLorebook(
+            [
+                { key: 'alpha', content: 'space-match' },
+                { key: 'beta', content: '@@match_full_word\ntab-no-match' },
+            ],
+            [{ role: 'user', data: 'alpha  beta\tgamma' }],
+        )
+
+        await expect(activePrompts()).resolves.toEqual(['space-match'])
+    })
+
+    test('requires selective keys and rejects entries with matching negative keys', async () => {
+        setLorebook(
+            [
+                { key: 'alpha', secondkey: 'beta', selective: true, content: 'selective' },
+                { key: 'alpha', content: '@@exclude_keys gamma\nnegative' },
+            ],
+            [{ role: 'user', data: 'alpha beta gamma' }],
+        )
+
+        await expect(activePrompts()).resolves.toEqual(['selective'])
+    })
+
+    test('makes recursive prompts visible in activation order unless recursive search is disabled', async () => {
+        setLorebook(
+            [
+                { key: 'alpha', content: 'beta' },
+                { key: 'beta', content: 'recursive' },
+                { key: 'beta', content: '@@no_recursive_search\nnot-recursive' },
+            ],
+            [{ role: 'user', data: 'alpha' }],
+        )
+
+        await expect(activePrompts()).resolves.toEqual(['recursive', 'beta'])
+    })
+
+    test('applies priority before token budget and insertion order afterward', async () => {
+        setLorebook(
+            [
+                { key: 'alpha', content: '@@priority 10\nAAAA', insertorder: 1 },
+                { key: 'alpha', content: '@@priority 0\nBBBB', insertorder: 200 },
+            ],
+            [{ role: 'user', data: 'alpha' }],
+            4,
+        )
+
+        await expect(activePrompts()).resolves.toEqual(['AAAA'])
+    })
+
+    test('preserves slash regex parsing and matches repeated global and sticky tests', async () => {
+        setLorebook(
+            [
+                { key: '/foo/g', useRegex: true, content: 'global-one' },
+                { key: '/foo/g', useRegex: true, content: 'global-two' },
+                { key: '/foo/y', useRegex: true, content: 'sticky-one' },
+                { key: '/foo/y', useRegex: true, content: 'sticky-two' },
+                { key: '/foo/z', useRegex: true, content: 'invalid' },
+                { key: 'alpha', content: 'after-invalid' },
+            ],
+            [{ role: 'user', data: '/foo alpha' }],
+        )
+
+        await expect(activePrompts()).resolves.toEqual([
+            'after-invalid',
+            'sticky-two',
+            'sticky-one',
+            'global-two',
+            'global-one',
+        ])
+    })
+
+    test('normalizes each depth view once', async () => {
+        setLorebook([
+            { key: 'alpha', content: 'one' },
+            { key: 'alpha', content: 'two' },
+            { key: 'alpha', content: 'three' },
+        ], [{ role: 'user', data: 'ALPHA' }])
+        const lowerCase = vi.spyOn(String.prototype, 'toLocaleLowerCase')
+
+        await expect(activePrompts()).resolves.toEqual(['three', 'two', 'one'])
+        expect(lowerCase).toHaveBeenCalledTimes(11)
+    })
+
+    test('compiles each exact slash regex once per invocation', async () => {
+        setLorebook([
+            { key: '/foo/g', useRegex: true, content: 'one' },
+            { key: '/foo/g', useRegex: true, content: 'two' },
+            { key: '/foo/g', useRegex: true, content: 'three' },
+        ], [{ role: 'user', data: '/foo' }])
+        const NativeRegExp = globalThis.RegExp
+        let constructorCalls = 0
+        vi.stubGlobal('RegExp', new Proxy(NativeRegExp, {
+            construct(target, args, newTarget) {
+                constructorCalls += 1
+                return Reflect.construct(target, args, newTarget)
+            },
+        }))
+
+        await expect(activePrompts()).resolves.toEqual(['three', 'two', 'one'])
+        expect(constructorCalls).toBe(1)
+    })
+})
