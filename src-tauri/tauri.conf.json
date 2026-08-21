@@ -44,7 +44,13 @@
     "deep-link": {
       "desktop": {
         "schemes": ["risuailocal"]
-      }
+      },
+      "mobile": [
+        {
+          "scheme": ["risuailocal"],
+          "appLink": false
+        }
+      ]
     }
   },
   "app": {
