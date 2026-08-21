@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { get } from 'svelte/store'
 
 const mocks = vi.hoisted(() => ({
     database: { characters: [] as any[] },
@@ -10,6 +11,7 @@ const mocks = vi.hoisted(() => ({
     getColdStorageItem: vi.fn(),
     alertConfirm: vi.fn(async () => true),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
+    alertError: vi.fn(),
 }))
 
 vi.mock('uuid', () => ({
@@ -30,7 +32,7 @@ vi.mock('./alert', async () => {
     return {
         alertAddCharacter: mocks.alertAddCharacter,
         alertConfirm: mocks.alertConfirm,
-        alertError: vi.fn(),
+        alertError: mocks.alertError,
         alertNormal: vi.fn(),
         alertSelect: vi.fn(),
         alertStore: writable({ type: 'none', msg: '' }),
@@ -90,6 +92,7 @@ import {
     createNewGroup,
     removeChar,
 } from './characters'
+import { MobileGUIStack } from './stores.svelte'
 
 describe('runtime chat identity', () => {
     beforeEach(() => {
@@ -233,6 +236,29 @@ describe('runtime chat identity', () => {
 
         const characterId = mocks.database.characters[0].chaId
         expect(events).toEqual(['commit', `activate:${characterId}`])
+    })
+
+    it.each([
+        ['local', 'createfromScratch'],
+        ['official', 'createGroup'],
+    ])('settles a %s addition rejection and restores the mobile stack', async (_kind, choice) => {
+        mocks.alertAddCharacter.mockResolvedValue(choice)
+        let installs = 0
+        const failure = new Error(`${_kind} publication failed`)
+        mocks.commitCharacterAddition.mockImplementation(async (request) => {
+            installs++
+            request.install()
+            throw failure
+        })
+
+        await expect(addCharacter()).resolves.toBeUndefined()
+
+        expect(installs).toBe(1)
+        expect(mocks.database.characters).toHaveLength(1)
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(mocks.alertError).toHaveBeenCalledOnce()
+        expect(mocks.alertError).toHaveBeenCalledWith(failure)
+        expect(get(MobileGUIStack)).toBe(1)
     })
 
     it('assigns an ID when formatting creates an empty-chat fallback', () => {

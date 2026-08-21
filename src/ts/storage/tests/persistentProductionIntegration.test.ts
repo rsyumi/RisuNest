@@ -157,6 +157,44 @@ describe('persistent production runtime', () => {
         expect(persisted.characters[1]).toEqual(added)
     })
 
+    it('reopens an inactive character converted from a module with complete chats', async () => {
+        const database = makeDatabase()
+        const databaseName = `runtime-module-conversion-${crypto.randomUUID()}`
+        const store = makeStore(databaseName)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const converted = structuredClone(adapter.current().characters[0])
+        converted.chaId = 'module-character'
+        converted.name = 'Converted module'
+        converted.chats = [{
+            id: 'module-chat',
+            name: 'Module chat',
+            note: '',
+            localLore: [],
+            message: [{ role: 'char', data: 'Converted message' }],
+        }]
+
+        await runtime.commitCharacterAddition({
+            characterId: converted.chaId,
+            estimatedBytes: 256,
+            install: () => adapter.current().characters.push(converted),
+        }, 'convert-module-to-character')
+
+        const reopened = makeStore(databaseName)
+        await reopened.open()
+        const persisted = await reopened.materializeDatabase(runtime.revision)
+        expect(persisted.characters.find((character) => character.chaId === converted.chaId)).toEqual(
+            converted,
+        )
+    })
+
     it('retries one exact pinned official snapshot and disposes it after success', async () => {
         const database = makeDatabase()
         const store = makeStore(`publisher-${crypto.randomUUID()}`)

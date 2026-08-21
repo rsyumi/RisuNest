@@ -859,38 +859,43 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
 export async function addCharacter(arg:{
     reseter?:()=>any,
 } = {}){
-    MobileGUIStack.set(100)
     const reseter = arg.reseter ?? (() => {})
-    const r = await alertAddCharacter()
-    if(r === 'importFromRealm'){
-        selectedCharID.set(-1)
-        OpenRealmStore.set(true)
-        MobileGUIStack.set(0)
-        return
-    }
-    reseter();
-    let addedCharacterId: string | null = null
-    switch(r){
-        case 'createfromScratch':
-            addedCharacterId = await createNewCharacter()
-            break
-        case 'createGroup':
-            addedCharacterId = await createNewGroup()
-            break
-        case 'importCharacter':
-            addedCharacterId = await importCharacter()
-            break
-        default:
-            MobileGUIStack.set(1)
+    MobileGUIStack.set(100)
+    let finalStack = 1
+    try {
+        const r = await alertAddCharacter()
+        if(r === 'importFromRealm'){
+            selectedCharID.set(-1)
+            OpenRealmStore.set(true)
+            finalStack = 0
             return
+        }
+        reseter();
+        let addedCharacterId: string | null = null
+        switch(r){
+            case 'createfromScratch':
+                addedCharacterId = await createNewCharacter()
+                break
+            case 'createGroup':
+                addedCharacterId = await createNewGroup()
+                break
+            case 'importCharacter':
+                addedCharacterId = await importCharacter()
+                break
+            default:
+                return
+        }
+        if(addedCharacterId){
+            const currentIndex = getDatabase().characters.findIndex(
+                (character) => character.chaId === addedCharacterId,
+            )
+            await changeChar(currentIndex)
+        }
+    } catch (error) {
+        alertError(error)
+    } finally {
+        MobileGUIStack.set(finalStack)
     }
-    if(addedCharacterId){
-        const currentIndex = getDatabase().characters.findIndex(
-            (character) => character.chaId === addedCharacterId,
-        )
-        await changeChar(currentIndex)
-    }
-    MobileGUIStack.set(1)
 }
 
 export async function changeChar(index: number, arg:{
