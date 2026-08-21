@@ -42,7 +42,7 @@ import {
     setUsingSw,
     checkCharOrder
 } from "./globalApi.svelte";
-import { isTauri } from "./platform";
+import { isTauri, isTauriDesktop } from "./platform";
 import { registerModelDynamic } from "./model/modellist";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
@@ -58,7 +58,9 @@ export async function loadData() {
         try {
             if (isTauri) {
                 LoadingStatusState.text = "Checking Files..."
-                appWindow.maximize()
+                if (isTauriDesktop) {
+                    appWindow.maximize()
+                }
                 if (!await exists('', { baseDir: BaseDirectory.AppData })) {
                     await mkdir('', { baseDir: BaseDirectory.AppData })
                 }
@@ -114,9 +116,11 @@ export async function loadData() {
                         throw "Your save file is corrupted"
                     }
                 }
-                LoadingStatusState.text = "Checking Update..."
-                await checkRisuUpdate()
-                await changeFullscreen()
+                if (isTauriDesktop) {
+                    LoadingStatusState.text = "Checking Update..."
+                    await checkRisuUpdate()
+                    await changeFullscreen()
+                }
 
             }
             else {
