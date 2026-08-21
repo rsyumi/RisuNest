@@ -153,12 +153,11 @@ export function planManifestDelta(input: {
         nextBlobs.set(hash, { size: input.remote.blobs[hash].size })
     }
     for (const hash of referencedBlobHashes) {
-        const metadata = input.remote.blobs[hash]
-            ?? input.local.blobs[hash]
-            ?? input.base.blobs[hash]
-        if (metadata) {
-            nextBlobs.set(hash, { size: metadata.size })
+        const metadata = input.remote.blobs[hash] ?? input.local.blobs[hash]
+        if (!metadata) {
+            throw new Error(`Manifest delta input is missing metadata for blob: ${hash}`)
         }
+        nextBlobs.set(hash, { size: metadata.size })
     }
 
     return {

@@ -100,6 +100,59 @@ describe('planManifestDelta', () => {
         })
     })
 
+    it('rejects a locally changed live record with missing blob metadata', () => {
+        const localRecord: ManifestRecord = {
+            revision: 1,
+            tombstone: false,
+            hash: 'local-record',
+            size: 5,
+            blobHashes: ['blob-missing'],
+        }
+
+        expect(() => planManifestDelta({
+            base: manifest('base', {}),
+            local: manifest('local', { 'record-a': localRecord }),
+            remote: manifest('remote', {}),
+        })).toThrowError('Manifest delta input is missing metadata for blob: blob-missing')
+    })
+
+    it('rejects a preserved remote-only live record with missing blob metadata', () => {
+        const remoteRecord: ManifestRecord = {
+            revision: 3,
+            tombstone: false,
+            hash: 'remote-record',
+            size: 7,
+            blobHashes: ['blob-remote-missing'],
+        }
+
+        expect(() => planManifestDelta({
+            base: manifest('base', {}),
+            local: manifest('local', {}),
+            remote: manifest('remote', { 'record-z': remoteRecord }),
+        })).toThrowError('Manifest delta input is missing metadata for blob: blob-remote-missing')
+    })
+
+    it('uses remote metadata when a local record omits it', () => {
+        const changed: ManifestRecord = {
+            revision: 2,
+            tombstone: false,
+            hash: 'record-a-v2',
+            size: 12,
+            blobHashes: ['blob-shared'],
+        }
+        const plan = planManifestDelta({
+            base: manifest('base', {}),
+            local: manifest('local', { 'record-a': changed }),
+            remote: manifest('remote', {}, { 'blob-shared': { size: 9 } }),
+        })
+
+        expect(plan.kind).toBe('ready')
+        if (plan.kind === 'ready') {
+            expect(plan.commit.nextBlobs).toEqual({ 'blob-shared': { size: 9 } })
+            expect(plan.commit.uploadBlobHashes).toEqual([])
+        }
+    })
+
     it('propagates only an explicit local tombstone', () => {
         const base = manifest('base', { 'record-a': baseRecord })
         const local = manifest('local', {
@@ -127,7 +180,10 @@ describe('planManifestDelta', () => {
     it('does not infer deletion from an omitted local record', () => {
         const base = manifest('base', { 'record-a': baseRecord })
         const local = manifest('local', {})
-        const remote = manifest('remote', { 'record-a': baseRecord })
+        const remote = manifest('remote', { 'record-a': baseRecord }, {
+            'blob-a': { size: 2 },
+            'blob-b': { size: 3 },
+        })
 
         const plan = planManifestDelta({ base, local, remote })
 
@@ -213,6 +269,9 @@ describe('planManifestDelta', () => {
         })
         const remote = manifest('remote', {
             'record-a': { ...baseRecord, revision: 30 },
+        }, {
+            'blob-a': { size: 2 },
+            'blob-b': { size: 3 },
         })
 
         const plan = planManifestDelta({ base, local, remote })
