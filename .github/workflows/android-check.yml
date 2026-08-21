@@ -1,0 +1,117 @@
+name: Android debug APK check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'util/checkAndroidAlignment.ps1'
+      - '.github/workflows/android-check.yml'
+
+permissions:
+  contents: read
+
+env:
+  VITE_DISABLE_REALM: 'true'
+
+jobs:
+  android-debug-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'ndk;28.2.13676358'
+          echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Initialize Android project
+        if: ${{ hashFiles('src-tauri/gen/android/gradlew') == '' }}
+        run: pnpm android:init
+
+      - name: Make Gradle wrapper executable
+        shell: bash
+        run: chmod +x src-tauri/gen/android/gradlew
+
+      - name: Capture generated Android source baseline
+        shell: bash
+        run: git status --short --untracked-files=all -- src-tauri/gen/android > "$RUNNER_TEMP/android-gen.status.before"
+
+      - name: Build arm64 debug APK
+        run: pnpm android:build:arm64
+
+      - name: Verify APK alignment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $apk = Get-ChildItem -Path 'src-tauri/gen/android/app/build/outputs/apk' -Recurse -Filter '*.apk' |
+            Where-Object FullName -Match 'arm64|aarch64' |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if ($null -eq $apk) {
+            throw 'No arm64 debug APK was produced.'
+          }
+          & ./util/checkAndroidAlignment.ps1 -ApkPath $apk.FullName *>&1 |
+            Tee-Object -FilePath android-alignment.log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Verify generated Android source is unchanged
+        shell: bash
+        run: |
+          git status --short --untracked-files=all -- src-tauri/gen/android > "$RUNNER_TEMP/android-gen.status.after"
+          if ! diff -u "$RUNNER_TEMP/android-gen.status.before" "$RUNNER_TEMP/android-gen.status.after"; then
+            echo 'Build changed generated Android files.'
+            exit 1
+          fi
+
+      - name: Upload arm64 debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64-debug-apk
+          path: |
+            src-tauri/gen/android/app/build/outputs/apk/**/*arm64*.apk
+            src-tauri/gen/android/app/build/outputs/apk/**/*aarch64*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload alignment log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-alignment-log
+          path: android-alignment.log
+          if-no-files-found: warn
+          retention-days: 7
