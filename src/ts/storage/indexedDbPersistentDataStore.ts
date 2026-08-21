@@ -17,14 +17,21 @@ import type {
 } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
 
-const DATABASE_VERSION = 1
+const DATABASE_VERSION = 2
 const MESSAGE_PAGE_SIZE = 128
+const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
 const STORE_NAMES = ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 
 interface StoredRecord<T> {
     key: string
     generation: string
     value: T
+}
+
+interface StoredMessagePage extends StoredRecord<Message[]> {
+    characterId: string
+    conversationId: string
+    pageIndex: number
 }
 
 interface StoredConversation {
@@ -47,16 +54,44 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
     })
 }
 
-function page<T>(items: T[], limit: number, cursor?: string): { items: T[]; nextCursor?: string } {
-    const offset = cursor === undefined ? 0 : Number.parseInt(cursor, 10)
-    const safeOffset = Number.isFinite(offset) && offset >= 0 ? offset : 0
-    const safeLimit = Math.max(0, limit)
-    const result = items.slice(safeOffset, safeOffset + safeLimit)
-    const nextOffset = safeOffset + result.length
-    return {
-        items: result,
-        nextCursor: nextOffset < items.length ? String(nextOffset) : undefined,
-    }
+function cursorPage<T>(
+    index: IDBIndex,
+    range: IDBKeyRange,
+    input: { limit: number; cursor?: string },
+    predicate: (value: T) => boolean,
+): Promise<{ items: T[]; nextCursor?: string }> {
+    const parsedOffset = input.cursor === undefined ? 0 : Number.parseInt(input.cursor, 10)
+    const offset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0
+    const limit = Math.max(0, input.limit)
+    return new Promise((resolve, reject) => {
+        const items: T[] = []
+        let matched = 0
+        let hasMore = false
+        const request = index.openCursor(range)
+        request.onerror = () => reject(request.error)
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) {
+                resolve({
+                    items,
+                    nextCursor: hasMore ? String(offset + items.length) : undefined,
+                })
+                return
+            }
+            const value = (cursor.value as StoredRecord<T>).value
+            if (predicate(value)) {
+                if (matched >= offset && items.length < limit) {
+                    items.push(value)
+                } else if (matched >= offset + limit) {
+                    hasMore = true
+                    resolve({ items, nextCursor: String(offset + items.length) })
+                    return
+                }
+                matched++
+            }
+            cursor.continue()
+        }
+    })
 }
 
 export class IndexedDbPersistentDataStore implements PersistentDataStore {
@@ -65,6 +100,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     constructor(
         private readonly databaseName: string,
         private readonly indexedDbFactory: IDBFactory = indexedDB,
+        private readonly keyRangeFactory: typeof IDBKeyRange = globalThis.IDBKeyRange,
     ) {}
 
     async open(): Promise<void> {
@@ -78,15 +114,58 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     database.createObjectStore(storeName, { keyPath: 'key' })
                 }
             }
+            const transaction = request.transaction!
+            this.createIndex(
+                transaction.objectStore('catalog'),
+                'byGenerationConfigured',
+                ['generation', 'configuredIndex'],
+            )
+            this.createIndex(
+                transaction.objectStore('catalog'),
+                'byGenerationRecent',
+                ['generation', 'recentSortValue', 'configuredIndex'],
+            )
+            this.createIndex(transaction.objectStore('catalog'), 'byGeneration', 'generation')
+            this.createIndex(transaction.objectStore('characters'), 'byGeneration', 'generation')
+            this.createIndex(
+                transaction.objectStore('conversations'),
+                'byGenerationCharacterConfigured',
+                ['generation', 'value.summary.characterId', 'configuredIndex'],
+            )
+            this.createIndex(
+                transaction.objectStore('conversations'),
+                'byGenerationCharacterRecent',
+                ['generation', 'value.summary.characterId', 'recentSortValue', 'configuredIndex'],
+            )
+            this.createIndex(transaction.objectStore('conversations'), 'byGeneration', 'generation')
+            this.createIndex(
+                transaction.objectStore('messagePages'),
+                'byConversationPage',
+                ['generation', 'characterId', 'conversationId', 'pageIndex'],
+            )
+            this.createIndex(
+                transaction.objectStore('messagePages'),
+                'byGenerationCharacter',
+                ['generation', 'characterId'],
+            )
+            this.createIndex(transaction.objectStore('messagePages'), 'byGeneration', 'generation')
+            this.backfillOrderKeys<CharacterSummary>(
+                transaction.objectStore('catalog'),
+                (record) => record.value,
+            )
+            this.backfillOrderKeys<StoredConversation>(
+                transaction.objectStore('conversations'),
+                (record) => record.value.summary,
+            )
         }
         this.database = await requestResult(request)
 
         const transaction = this.database.transaction(['meta', 'root'], 'readwrite')
         const meta = transaction.objectStore('meta')
         const currentRevision = await requestResult(meta.get('currentRevision'))
+        meta.put({ key: 'schemaVersion', value: DATABASE_VERSION })
         if (!currentRevision) {
             const generation = this.generationFor(0)
-            meta.put({ key: 'schemaVersion', value: DATABASE_VERSION })
             meta.put({ key: 'activeGeneration', value: generation })
             meta.put({ key: 'currentRevision', value: 0 })
             transaction.objectStore('root').put({ key: generation, generation, value: {} })
@@ -109,22 +188,28 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const database = this.requireDatabase()
         const transaction = database.transaction(['meta', 'catalog'], 'readonly')
         const { generation } = await this.readActive(transaction)
-        const records = await this.generationRecords<CharacterSummary>(
-            transaction.objectStore('catalog'),
-            generation,
+        const store = transaction.objectStore('catalog')
+        const index = store.index(
+            input.order === 'configured' ? 'byGenerationConfigured' : 'byGenerationRecent',
         )
         const search = input.search?.trim().toLocaleLowerCase()
-        const items = records
-            .map((record) => record.value)
-            .filter((item) => item.trashed === input.trash)
-            .filter((item) => !search || item.name.toLocaleLowerCase().includes(search))
-            .sort((left, right) =>
-                input.order === 'configured'
-                    ? left.configuredIndex - right.configuredIndex
-                    : right.recentAt - left.recentAt || left.configuredIndex - right.configuredIndex,
+        const range =
+            input.order === 'configured'
+                ? this.keyRangeFactory.bound([generation, 0], [generation, MAX_INDEX_VALUE])
+                : this.keyRangeFactory.bound(
+                      [generation, -MAX_INDEX_VALUE, 0],
+                      [generation, 0, MAX_INDEX_VALUE],
+                  )
+        const result = await cursorPage<CharacterSummary>(
+            index,
+            range,
+            input,
+            (item) =>
+                item.trashed === input.trash &&
+                (!search || item.name.toLocaleLowerCase().includes(search)),
             )
         await transactionDone(transaction)
-        return page(items, input.limit, input.cursor)
+        return result
     }
 
     async readCharacter(id: string): Promise<Versioned<CharacterDetail> | null> {
@@ -142,21 +227,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const database = this.requireDatabase()
         const transaction = database.transaction(['meta', 'conversations'], 'readonly')
         const { generation } = await this.readActive(transaction)
-        const items = (
-            await this.generationRecords<StoredConversation>(
-                transaction.objectStore('conversations'),
-                generation,
-            )
+        const index = transaction.objectStore('conversations').index(
+            input.order === 'configured'
+                ? 'byGenerationCharacterConfigured'
+                : 'byGenerationCharacterRecent',
         )
-            .map((record) => record.value.summary)
-            .filter((summary) => summary.characterId === input.characterId)
-            .sort((left, right) =>
-                input.order === 'configured'
-                    ? left.configuredIndex - right.configuredIndex
-                    : right.recentAt - left.recentAt || left.configuredIndex - right.configuredIndex,
-            )
+        const prefix = [generation, input.characterId]
+        const range =
+            input.order === 'configured'
+                ? this.keyRangeFactory.bound([...prefix, 0], [...prefix, MAX_INDEX_VALUE])
+                : this.keyRangeFactory.bound(
+                      [...prefix, -MAX_INDEX_VALUE, 0],
+                      [...prefix, 0, MAX_INDEX_VALUE],
+                  )
+        const result = await cursorPage<StoredConversation>(index, range, input, () => true)
         await transactionDone(transaction)
-        return page(items, input.limit, input.cursor)
+        return { items: result.items.map((item) => item.summary), nextCursor: result.nextCursor }
     }
 
     async readConversationWindow(
@@ -178,38 +264,51 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             return null
         }
 
-        const messages = await this.readMessagesFromTransaction(
+        const totalMessages = conversation.value.summary.messageCount
+        let startIndex: number
+        let endIndex: number
+        let anchorPage: StoredMessagePage | undefined
+        if (input.anchorMessageId !== undefined) {
+            const anchor = await this.findMessage(
+                transaction,
+                generation,
+                input.characterId,
+                input.conversationId,
+                input.anchorMessageId,
+                totalMessages,
+            )
+            if (!anchor) {
+                await transactionDone(transaction)
+                return null
+            }
+            anchorPage = anchor.page
+            startIndex = Math.max(0, anchor.index - Math.max(0, input.before ?? 0))
+            endIndex = Math.min(totalMessages, anchor.index + Math.max(0, input.after ?? 0) + 1)
+        } else {
+            endIndex = totalMessages
+            startIndex = Math.max(0, endIndex - Math.max(0, input.limit ?? MESSAGE_PAGE_SIZE))
+        }
+        const messages = await this.readMessageRange(
             transaction,
             generation,
             input.characterId,
             input.conversationId,
+            startIndex,
+            endIndex,
+            anchorPage,
         )
-        let startIndex: number
-        let endIndex: number
-        if (input.anchorMessageId !== undefined) {
-            const anchorIndex = messages.findIndex((message) => message.chatId === input.anchorMessageId)
-            if (anchorIndex === -1) {
-                await transactionDone(transaction)
-                return null
-            }
-            startIndex = Math.max(0, anchorIndex - Math.max(0, input.before ?? 0))
-            endIndex = Math.min(messages.length, anchorIndex + Math.max(0, input.after ?? 0) + 1)
-        } else {
-            endIndex = messages.length
-            startIndex = Math.max(0, endIndex - Math.max(0, input.limit ?? MESSAGE_PAGE_SIZE))
-        }
 
         const result = {
             revision,
             value: {
                 characterId: input.characterId,
                 conversationId: input.conversationId,
-                messages: messages.slice(startIndex, endIndex),
+                messages,
                 startIndex,
                 endIndex,
-                totalMessages: messages.length,
+                totalMessages,
                 hasMoreBefore: startIndex > 0,
-                hasMoreAfter: endIndex < messages.length,
+                hasMoreAfter: endIndex < totalMessages,
             },
         }
         await transactionDone(transaction)
@@ -306,6 +405,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             ) {
                 throw new Error('Persistent conversation staging validation failed')
             }
+            transaction.objectStore('root').delete(active.generation)
+            for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages']) {
+                await this.deleteIndexRange(
+                    transaction.objectStore(storeName).index('byGeneration'),
+                    this.keyRangeFactory.only(active.generation),
+                )
+            }
             this.setActive(transaction, revision, generation)
             await transactionDone(transaction)
             return { revision }
@@ -391,12 +497,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const key = this.conversationKey(generation, mutation.characterId, mutation.conversationId)
         if (mutation.type === 'delete') {
             transaction.objectStore('conversations').delete(key)
-            await this.deleteMatching(
-                transaction.objectStore('messagePages'),
-                (record) =>
-                    record.generation === generation &&
-                    record.characterId === mutation.characterId &&
-                    record.conversationId === mutation.conversationId,
+            await this.deleteConversationPages(
+                transaction,
+                generation,
+                mutation.characterId,
+                mutation.conversationId,
+                0,
             )
             await this.refreshCharacterSummary(transaction, generation, mutation.characterId)
             return
@@ -408,32 +514,75 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         if (!existing && !mutation.conversation) {
             throw new Error(`Conversation ${mutation.conversationId} does not exist`)
         }
-        const messages = existing
-            ? await this.readMessagesFromTransaction(
-                  transaction,
-                  generation,
-                  mutation.characterId,
-                  mutation.conversationId,
-              )
-            : []
-        const start = Math.max(0, Math.min(messages.length, mutation.start))
-        messages.splice(start, Math.max(0, mutation.deleteCount), ...mutation.messages)
-        const detail = mutation.conversation ?? existing!.value.detail
-        const configuredIndex = existing?.value.summary.configuredIndex ?? (await this.conversationCount(transaction, generation, mutation.characterId))
-        await this.deleteMatching(
-            transaction.objectStore('messagePages'),
-            (record) =>
-                record.generation === generation &&
-                record.characterId === mutation.characterId &&
-                record.conversationId === mutation.conversationId,
-        )
-        this.putConversation(
-            transaction,
-            generation,
-            mutation.characterId,
-            { ...detail, id: mutation.conversationId, message: messages },
-            configuredIndex,
-        )
+        if (!existing) {
+            this.putConversation(
+                transaction,
+                generation,
+                mutation.characterId,
+                {
+                    ...mutation.conversation!,
+                    id: mutation.conversationId,
+                    message: mutation.messages,
+                },
+                await this.conversationCount(transaction, generation, mutation.characterId),
+            )
+            await this.refreshCharacterSummary(transaction, generation, mutation.characterId)
+            return
+        }
+
+        const oldMessageCount = existing.value.summary.messageCount
+        const start = Math.max(0, Math.min(oldMessageCount, mutation.start))
+        const deleteCount = Math.min(Math.max(0, mutation.deleteCount), oldMessageCount - start)
+        const detail = mutation.conversation ?? existing.value.detail
+        const delta = mutation.messages.length - deleteCount
+
+        if (deleteCount > 0 || mutation.messages.length > 0) {
+            const startPage = Math.floor(start / MESSAGE_PAGE_SIZE)
+            const lastPage = Math.max(startPage, Math.ceil(oldMessageCount / MESSAGE_PAGE_SIZE) - 1)
+            const endPage =
+                delta === 0
+                    ? Math.floor((start + Math.max(deleteCount, 1) - 1) / MESSAGE_PAGE_SIZE)
+                    : lastPage
+            const pages = await this.readMessagePages(
+                transaction,
+                generation,
+                mutation.characterId,
+                mutation.conversationId,
+                startPage,
+                endPage,
+            )
+            const firstPageStart = startPage * MESSAGE_PAGE_SIZE
+            const messages = pages.flatMap((page) => page.value)
+            messages.splice(start - firstPageStart, deleteCount, ...mutation.messages)
+
+            if (delta !== 0) {
+                await this.deleteConversationPages(
+                    transaction,
+                    generation,
+                    mutation.characterId,
+                    mutation.conversationId,
+                    startPage,
+                )
+            }
+            for (let offset = 0; offset < messages.length; offset += MESSAGE_PAGE_SIZE) {
+                this.putMessagePage(
+                    transaction,
+                    generation,
+                    mutation.characterId,
+                    mutation.conversationId,
+                    startPage + offset / MESSAGE_PAGE_SIZE,
+                    messages.slice(offset, offset + MESSAGE_PAGE_SIZE),
+                )
+            }
+        }
+
+        const summary: ConversationSummary = {
+            ...existing.value.summary,
+            name: detail.name,
+            recentAt: detail.lastDate ?? existing.value.summary.recentAt,
+            messageCount: oldMessageCount + delta,
+        }
+        this.putConversationRecord(transaction, generation, summary, detail)
         await this.refreshCharacterSummary(transaction, generation, mutation.characterId)
     }
 
@@ -445,7 +594,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const existing = (await requestResult(
             transaction.objectStore('catalog').get(this.characterKey(generation, detail.chaId)),
         )) as StoredRecord<CharacterSummary> | undefined
-        const configuredIndex = existing?.value.configuredIndex ?? (await this.generationRecords(transaction.objectStore('catalog'), generation)).length
+        const configuredIndex =
+            existing?.value.configuredIndex ??
+            (await requestResult(
+                transaction.objectStore('catalog').index('byGeneration').count(generation),
+            ))
         const conversationCount = await this.conversationCount(transaction, generation, detail.chaId)
         this.putCharacterRecords(transaction, generation, detail, configuredIndex, conversationCount)
     }
@@ -469,6 +622,8 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         transaction.objectStore('catalog').put({
             key: this.characterKey(generation, detail.chaId),
             generation,
+            configuredIndex,
+            recentSortValue: -summary.recentAt,
             value: summary,
         })
         transaction.objectStore('characters').put({
@@ -495,22 +650,50 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             recentAt: conversation.lastDate ?? message.at(-1)?.time ?? 0,
             messageCount: message.length,
         }
-        transaction.objectStore('conversations').put({
-            key: this.conversationKey(generation, characterId, id),
-            generation,
-            value: { summary, detail },
-        })
+        this.putConversationRecord(transaction, generation, summary, detail)
         for (let offset = 0; offset < message.length; offset += MESSAGE_PAGE_SIZE) {
-            const pageIndex = offset / MESSAGE_PAGE_SIZE
-            transaction.objectStore('messagePages').put({
-                key: this.messagePageKey(generation, characterId, id, pageIndex),
+            this.putMessagePage(
+                transaction,
                 generation,
                 characterId,
-                conversationId: id,
-                pageIndex,
-                value: message.slice(offset, offset + MESSAGE_PAGE_SIZE),
-            })
+                id,
+                offset / MESSAGE_PAGE_SIZE,
+                message.slice(offset, offset + MESSAGE_PAGE_SIZE),
+            )
         }
+    }
+
+    private putConversationRecord(
+        transaction: IDBTransaction,
+        generation: string,
+        summary: ConversationSummary,
+        detail: Omit<Chat, 'message'>,
+    ): void {
+        transaction.objectStore('conversations').put({
+            key: this.conversationKey(generation, summary.characterId, summary.id),
+            generation,
+            configuredIndex: summary.configuredIndex,
+            recentSortValue: -summary.recentAt,
+            value: { summary, detail },
+        })
+    }
+
+    private putMessagePage(
+        transaction: IDBTransaction,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        pageIndex: number,
+        messages: Message[],
+    ): void {
+        transaction.objectStore('messagePages').put({
+            key: this.messagePageKey(generation, characterId, conversationId, pageIndex),
+            generation,
+            characterId,
+            conversationId,
+            pageIndex,
+            value: messages,
+        })
     }
 
     private async refreshCharacterSummary(
@@ -535,13 +718,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const key = this.characterKey(generation, characterId)
         transaction.objectStore('catalog').delete(key)
         transaction.objectStore('characters').delete(key)
-        await this.deleteMatching(
-            transaction.objectStore('conversations'),
-            (record) => record.generation === generation && record.value.summary.characterId === characterId,
+        await this.deleteIndexRange(
+            transaction.objectStore('conversations').index('byGenerationCharacterConfigured'),
+            this.keyRangeFactory.bound(
+                [generation, characterId, 0],
+                [generation, characterId, MAX_INDEX_VALUE],
+            ),
         )
-        await this.deleteMatching(
-            transaction.objectStore('messagePages'),
-            (record) => record.generation === generation && record.characterId === characterId,
+        await this.deleteIndexRange(
+            transaction.objectStore('messagePages').index('byGenerationCharacter'),
+            this.keyRangeFactory.only([generation, characterId]),
         )
     }
 
@@ -550,12 +736,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         generation: string,
         characterId: string,
     ): Promise<number> {
-        return (
-            await this.generationRecords<StoredConversation>(
-                transaction.objectStore('conversations'),
-                generation,
-            )
-        ).filter((record) => record.value.summary.characterId === characterId).length
+        return requestResult(
+            transaction
+                .objectStore('conversations')
+                .index('byGenerationCharacterConfigured')
+                .count(
+                    this.keyRangeFactory.bound(
+                        [generation, characterId, 0],
+                        [generation, characterId, MAX_INDEX_VALUE],
+                    ),
+                ),
+        )
     }
 
     private async readMessagesFromTransaction(
@@ -564,25 +755,180 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         characterId: string,
         conversationId: string,
     ): Promise<Message[]> {
-        const records = (
-            await this.generationRecords<Message[]>(transaction.objectStore('messagePages'), generation)
-        )
-            .filter(
-                (record: any) =>
-                    record.characterId === characterId && record.conversationId === conversationId,
+        return (
+            await this.readMessagePages(
+                transaction,
+                generation,
+                characterId,
+                conversationId,
+                0,
+                MAX_INDEX_VALUE,
             )
-            .sort((left: any, right: any) => left.pageIndex - right.pageIndex)
-        return records.flatMap((record) => record.value)
+        ).flatMap((record) => record.value)
     }
 
-    private async deleteMatching(
-        store: IDBObjectStore,
-        predicate: (record: any) => boolean,
-    ): Promise<void> {
-        const records = (await requestResult(store.getAll())) as any[]
-        for (const record of records) {
-            if (predicate(record)) store.delete(record.key)
+    private readMessageRange(
+        transaction: IDBTransaction,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        startIndex: number,
+        endIndex: number,
+        cachedPage?: StoredMessagePage,
+    ): Promise<Message[]> {
+        if (startIndex >= endIndex) return Promise.resolve([])
+        const startPage = Math.floor(startIndex / MESSAGE_PAGE_SIZE)
+        const endPage = Math.floor((endIndex - 1) / MESSAGE_PAGE_SIZE)
+        const pagesPromise = cachedPage
+            ? this.readMessagePagesByKey(
+                  transaction,
+                  generation,
+                  characterId,
+                  conversationId,
+                  startPage,
+                  endPage,
+                  cachedPage,
+              )
+            : this.readMessagePages(
+                  transaction,
+                  generation,
+                  characterId,
+                  conversationId,
+                  startPage,
+                  endPage,
+              )
+        return pagesPromise.then((pages) => {
+            const firstPageStart = startPage * MESSAGE_PAGE_SIZE
+            return pages
+                .flatMap((record) => record.value)
+                .slice(startIndex - firstPageStart, endIndex - firstPageStart)
+        })
+    }
+
+    private async readMessagePagesByKey(
+        transaction: IDBTransaction,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        startPage: number,
+        endPage: number,
+        cachedPage: StoredMessagePage,
+    ): Promise<StoredMessagePage[]> {
+        const pages: StoredMessagePage[] = []
+        for (let pageIndex = startPage; pageIndex <= endPage; pageIndex++) {
+            if (pageIndex === cachedPage.pageIndex) {
+                pages.push(cachedPage)
+                continue
+            }
+            const page = (await requestResult(
+                transaction
+                    .objectStore('messagePages')
+                    .get(this.messagePageKey(generation, characterId, conversationId, pageIndex)),
+            )) as StoredMessagePage | undefined
+            if (page) pages.push(page)
         }
+        return pages
+    }
+
+    private readMessagePages(
+        transaction: IDBTransaction,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        startPage: number,
+        endPage: number,
+    ): Promise<StoredMessagePage[]> {
+        if (startPage > endPage) return Promise.resolve([])
+        const range = this.keyRangeFactory.bound(
+            [generation, characterId, conversationId, startPage],
+            [generation, characterId, conversationId, endPage],
+        )
+        return new Promise((resolve, reject) => {
+            const pages: StoredMessagePage[] = []
+            const request = transaction
+                .objectStore('messagePages')
+                .index('byConversationPage')
+                .openCursor(range)
+            request.onerror = () => reject(request.error)
+            request.onsuccess = () => {
+                const cursor = request.result
+                if (!cursor) {
+                    resolve(pages)
+                    return
+                }
+                pages.push(cursor.value as StoredMessagePage)
+                cursor.continue()
+            }
+        })
+    }
+
+    private findMessage(
+        transaction: IDBTransaction,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        messageId: string,
+        totalMessages: number,
+    ): Promise<{ index: number; page: StoredMessagePage } | null> {
+        if (totalMessages === 0) return Promise.resolve(null)
+        const lastPage = Math.floor((totalMessages - 1) / MESSAGE_PAGE_SIZE)
+        const range = this.keyRangeFactory.bound(
+            [generation, characterId, conversationId, 0],
+            [generation, characterId, conversationId, lastPage],
+        )
+        return new Promise((resolve, reject) => {
+            const request = transaction
+                .objectStore('messagePages')
+                .index('byConversationPage')
+                .openCursor(range)
+            request.onerror = () => reject(request.error)
+            request.onsuccess = () => {
+                const cursor = request.result
+                if (!cursor) {
+                    resolve(null)
+                    return
+                }
+                const page = cursor.value as StoredMessagePage
+                const indexInPage = page.value.findIndex((message) => message.chatId === messageId)
+                if (indexInPage !== -1) {
+                    resolve({ index: page.pageIndex * MESSAGE_PAGE_SIZE + indexInPage, page })
+                    return
+                }
+                cursor.continue()
+            }
+        })
+    }
+
+    private deleteConversationPages(
+        transaction: IDBTransaction,
+        generation: string,
+        characterId: string,
+        conversationId: string,
+        startPage: number,
+    ): Promise<void> {
+        return this.deleteIndexRange(
+            transaction.objectStore('messagePages').index('byConversationPage'),
+            this.keyRangeFactory.bound(
+                [generation, characterId, conversationId, startPage],
+                [generation, characterId, conversationId, MAX_INDEX_VALUE],
+            ),
+        )
+    }
+
+    private deleteIndexRange(index: IDBIndex, range: IDBKeyRange): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const request = index.openCursor(range)
+            request.onerror = () => reject(request.error)
+            request.onsuccess = () => {
+                const cursor = request.result
+                if (!cursor) {
+                    resolve()
+                    return
+                }
+                cursor.delete()
+                cursor.continue()
+            }
+        })
     }
 
     private async readActive(
@@ -615,13 +961,36 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         store: IDBObjectStore,
         generation: string,
     ): Promise<StoredRecord<T>[]> {
-        const records = (await requestResult(store.getAll())) as StoredRecord<T>[]
-        return records.filter((record) => record.generation === generation)
+        return (await requestResult(store.index('byGeneration').getAll(generation))) as StoredRecord<T>[]
     }
 
     private requireDatabase(): IDBDatabase {
         if (!this.database) throw new Error('Persistent data store is not open')
         return this.database
+    }
+
+    private createIndex(store: IDBObjectStore, name: string, keyPath: string | string[]): void {
+        if (!store.indexNames.contains(name)) store.createIndex(name, keyPath)
+    }
+
+    private backfillOrderKeys<T>(
+        store: IDBObjectStore,
+        summaryFrom: (record: StoredRecord<T>) => { configuredIndex: number; recentAt: number },
+    ): void {
+        const request = store.openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) return
+            const record = cursor.value as StoredRecord<T> & {
+                configuredIndex?: number
+                recentSortValue?: number
+            }
+            const summary = summaryFrom(record)
+            record.configuredIndex = summary.configuredIndex
+            record.recentSortValue = -summary.recentAt
+            cursor.update(record)
+            cursor.continue()
+        }
     }
 
     private generationFor(revision: DataRevision): string {
