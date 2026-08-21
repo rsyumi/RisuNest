@@ -44,17 +44,9 @@ export async function getColdStorageItem(key:string, opts:{
 } = {}) {
 
     if(forageStorage.isAccount && !opts.accountFallback){
-        const d = await fetchProtectedResource('/hub/account/coldstorage', {
-            method: 'GET',
-            headers: {
-                'x-risu-key': key,
-            }
-        })
-
-        if(d.status === 200){
-            const buf = await d.arrayBuffer()
-            const text = new TextDecoder().decode(await decompress(new Uint8Array(buf)))
-            return JSON.parse(text)
+        const value = await getAccountColdStorageItem(key)
+        if(value !== null){
+            return value
         }
         return await getColdStorageItem(key, {
             accountFallback: true
@@ -106,6 +98,26 @@ export async function getColdStorageItem(key:string, opts:{
     }
 }
 
+export async function getAccountColdStorageItem(
+    key:string,
+    signal?:AbortSignal,
+):Promise<unknown|null> {
+    const d = await fetchProtectedResource('/hub/account/coldstorage', {
+        method: 'GET',
+        headers: {
+            'x-risu-key': key,
+        },
+        ...(signal ? { signal } : {}),
+    })
+
+    if(d.status !== 200){
+        return null
+    }
+    const buf = await d.arrayBuffer()
+    const text = new TextDecoder().decode(await decompress(new Uint8Array(buf)))
+    return JSON.parse(text)
+}
+
 async function compressColdStorageValue(value:any):Promise<Uint8Array | null> {
     try {
         const json = JSON.stringify(value)
@@ -123,7 +135,11 @@ async function compressColdStorageValue(value:any):Promise<Uint8Array | null> {
     }
 }
 
-export async function setAccountColdStorageItem(key:string, value:any):Promise<boolean> {
+export async function setAccountColdStorageItem(
+    key:string,
+    value:any,
+    signal?:AbortSignal,
+):Promise<boolean> {
     const compressed = await compressColdStorageValue(value)
     if(!compressed){
         return false
@@ -136,7 +152,8 @@ export async function setAccountColdStorageItem(key:string, value:any):Promise<b
                 'x-risu-key': key,
                 'content-type': 'application/octet-stream'
             },
-            body: compressed as any
+            body: compressed as any,
+            ...(signal ? { signal } : {}),
         })
         if(res.status !== 200){
             console.error('Error setting cold storage item:', await res.text().catch(() => 'unknown'))

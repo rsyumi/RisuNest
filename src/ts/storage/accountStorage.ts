@@ -17,37 +17,63 @@ const cachedForage = localforage.createInstance({name: "risuaiAccountCached"})
 
 let seenWarnings:string[] = []
 
+export type AccountReadResult =
+    | { kind: 'value'; bytes: Uint8Array }
+    | { kind: 'not-modified'; bytes: Uint8Array }
+    | { kind: 'missing' }
+
+export type AccountWriteResult =
+    | { kind: 'written'; replacementKey: string }
+    | { kind: 'not-modified'; replacementKey: string }
+    | { kind: 'auth-warning' }
+
+export interface AccountReadOptions {
+    progress?(ratio: number): void
+    signal?: AbortSignal
+}
+
+export interface AccountWriteOptions {
+    signal?: AbortSignal
+}
+
+function withSignal(options: RequestInit, signal?: AbortSignal): RequestInit {
+    return signal ? { ...options, signal } : options
+}
+
 export class AccountStorage{
     auth:string
     usingSync:boolean
 
     async setItem(key:string, value:Uint8Array) {
-        this.checkAuth()
-        let da:Response
-
-        let daText:string|undefined = undefined
-        const getDaText = async () => {
-            if(daText === undefined){
-                daText = await da.text()
-            }
-            return daText
+        const result = await this.writeItem(key, value)
+        if(result.kind === 'auth-warning'){
+            return undefined
         }
+        return result.replacementKey
+    }
 
+    async writeItem(
+        key:string,
+        value:Uint8Array,
+        options:AccountWriteOptions = {},
+    ):Promise<AccountWriteResult> {
+        this.checkAuth()
+        let da:Response|undefined
 
         while((!da) || da.status === 403){
 
             const saveDate = Date.now().toFixed(0)
 
             if(risuSession === ''){
-                da = await fetchProtectedResource('/api/account/getsessionnumber', {
+                da = await fetchProtectedResource('/api/account/getsessionnumber', withSignal({
                     method: "GET"
-                })
+                }, options.signal))
 
                 const json = await da.json()
                 risuSession = `${json.sessionNumber}`
             }
 
-            da = await fetchProtectedResource('/api/account/write', {
+            da = await fetchProtectedResource('/api/account/write', withSignal({
                 method: "POST",
                 body: value as any,
                 headers: {
@@ -57,11 +83,19 @@ export class AccountStorage{
                     'x-risu-session': risuSession,
                     'x-risu-save-date': saveDate
                 }
-            })
+            }, options.signal))
             if(key === 'database/database.bin'){
                 cachedForage.setItem(key, value).then(() => {
                     cachedForage.setItem(key + '__date', saveDate)
                 })
+            }
+
+            let daText:string|undefined = undefined
+            const getDaText = async () => {
+                if(daText === undefined){
+                    daText = await da!.text()
+                }
+                return daText
             }
 
             if(da.headers.get('Content-Type') === 'application/json'){
@@ -82,44 +116,59 @@ export class AccountStorage{
             }
 
             if(da.status === 304){
-                return key
+                return { kind: 'not-modified', replacementKey: key }
             }
             if(da.status === 403){
                 if(da.headers.get('x-risu-status') === 'warn'){
-                    return
+                    return { kind: 'auth-warning' }
                 }
                 localStorage.setItem("fallbackRisuToken",await alertLogin())
                 this.checkAuth()
+                continue
             }
+
+            if(da.status < 200 || da.status >= 300){
+                throw await getDaText()
+            }
+            if(key.startsWith('assets/')){
+                await localforage.setItem(key, new Uint8Array(value).buffer)
+            }
+            return { kind: 'written', replacementKey: await getDaText() }
         }
-        if(da.status < 200 || da.status >= 300){
-            throw await getDaText()
-        }
-        if(key.startsWith('assets/')){
-            await localforage.setItem(key, new Uint8Array(value).buffer)
-        }
-        return await getDaText()
+
+        throw new Error('Account write did not complete')
     }
-    async getItem(key:string, callback?:(status:number) => void):Promise<Buffer> {
+
+    async getItem(key:string, callback?:(status:number) => void):Promise<Buffer|null> {
+        const result = await this.readItem(key, { progress: callback })
+        if(result.kind === 'missing'){
+            return null
+        }
+        return Buffer.from(result.bytes)
+    }
+
+    async readItem(
+        key:string,
+        options:AccountReadOptions = {},
+    ):Promise<AccountReadResult> {
         this.checkAuth()
         if(key.startsWith('assets/')){
-            const k:ArrayBuffer = await localforage.getItem(key)
-            if(k){
-                return Buffer.from(k)
+            const cached:ArrayBuffer|null = await localforage.getItem(key)
+            if(cached){
+                return { kind: 'value', bytes: new Uint8Array(cached) }
             }
         }
-        let da:Response
-        const saveDate = await cachedForage.getItem(key + '__date') as number|undefined
-        const perf = performance.now()
+        let da:Response|undefined
+        const saveDate = await cachedForage.getItem(key + '__date') as number|string|undefined
         while((!da) || da.status === 403){
-            da = await fetchProtectedResource('/api/account/read/' + Buffer.from(key ,'utf-8').toString('hex') + 
-                (key.includes('database') ? ('|' + v4()) : ''), {
+            da = await fetchProtectedResource('/api/account/read/' + Buffer.from(key ,'utf-8').toString('hex') +
+                (key.includes('database') ? ('|' + v4()) : ''), withSignal({
                 method: "GET",
                 headers: {
                     'x-risu-key': key,
                     'x-risu-save-date': (saveDate || 0).toString()
                 }
-            })
+            }, options.signal))
             if(da.status === 403){
                 localStorage.setItem("fallbackRisuToken",await alertLogin())
                 this.checkAuth()
@@ -128,11 +177,11 @@ export class AccountStorage{
         if(da.status === 303){
             const data = await da.json()
             if(data.match){
-                const c = Buffer.from(await cachedForage.getItem(key))
-                return c
+                const cached = await cachedForage.getItem(key) as ArrayBuffer|Uint8Array
+                return { kind: 'not-modified', bytes: new Uint8Array(cached) }
             }
             else{
-                return null
+                return { kind: 'missing' }
             }
         }
 
@@ -140,16 +189,16 @@ export class AccountStorage{
             throw await da.text()
         }
         if(da.status === 204){
-            return null
+            return { kind: 'missing' }
         }
         if(key.startsWith('assets/')){
             const ab = await da.arrayBuffer()
             await localforage.setItem(key, ab)
-            return Buffer.from(ab)
+            return { kind: 'value', bytes: new Uint8Array(ab) }
         }
-        if(!callback){
+        if(!options.progress){
             const ab = await da.arrayBuffer()
-            return Buffer.from(ab)
+            return { kind: 'value', bytes: new Uint8Array(ab) }
         }
         const size = parseInt(da.headers.get('x-body-size'))
         const appendable = new Uint8Array(size)
@@ -163,10 +212,10 @@ export class AccountStorage{
             }
             appendable.set(value, i)
             i += value.length
-            callback(i/size)
+            options.progress(i/size)
         }
 
-        return Buffer.from(appendable)
+        return { kind: 'value', bytes: appendable }
     }
     keys():string[]{
         let db = getDatabase()
