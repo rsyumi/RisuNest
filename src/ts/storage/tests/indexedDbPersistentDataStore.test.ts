@@ -6,6 +6,99 @@ import { persistentDataStoreContract } from './persistentDataStoreContract'
 
 let databaseSequence = 0
 
+async function createVersion1Database(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    const databaseValue = structuredClone(fixtureDatabase)
+    databaseValue.characters[1].chats[0].lastDate = 250
+    databaseValue.characters[1].chats[1].lastDate = 350
+    const generation = 'revision-7'
+    const openRequest = indexedDB.open(databaseName, 1)
+    openRequest.onupgradeneeded = () => {
+        for (const storeName of [
+            'meta',
+            'root',
+            'catalog',
+            'characters',
+            'conversations',
+            'messagePages',
+        ]) {
+            openRequest.result.createObjectStore(storeName, { keyPath: 'key' })
+        }
+    }
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        openRequest.onsuccess = () => resolve(openRequest.result)
+        openRequest.onerror = () => reject(openRequest.error)
+    })
+    const transaction = database.transaction(
+        ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'],
+        'readwrite',
+    )
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 1 })
+    transaction.objectStore('meta').put({ key: 'activeGeneration', value: generation })
+    transaction.objectStore('meta').put({ key: 'currentRevision', value: 7 })
+    const { characters, ...root } = databaseValue
+    transaction.objectStore('root').put({ key: generation, generation, value: root })
+    for (let configuredIndex = 0; configuredIndex < characters.length; configuredIndex++) {
+        const character = characters[configuredIndex]
+        const { chats, ...detail } = character
+        const summary = {
+            id: character.chaId,
+            name: character.name,
+            image: character.image,
+            configuredIndex,
+            recentAt: character.lastInteraction ?? 0,
+            trashed: character.trashTime !== undefined,
+            conversationCount: chats.length,
+        }
+        transaction.objectStore('catalog').put({
+            key: `${generation}:character:${character.chaId}`,
+            generation,
+            value: summary,
+        })
+        transaction.objectStore('characters').put({
+            key: `${generation}:character:${character.chaId}`,
+            generation,
+            value: detail,
+        })
+        for (let conversationIndex = 0; conversationIndex < chats.length; conversationIndex++) {
+            const conversation = chats[conversationIndex]
+            const { message, ...conversationDetail } = conversation
+            const conversationSummary = {
+                id: conversation.id!,
+                characterId: character.chaId,
+                name: conversation.name,
+                configuredIndex: conversationIndex,
+                recentAt: conversation.lastDate ?? message.at(-1)?.time ?? 0,
+                messageCount: message.length,
+            }
+            transaction.objectStore('conversations').put({
+                key: `${generation}:conversation:${character.chaId}:${conversation.id}`,
+                generation,
+                value: { summary: conversationSummary, detail: conversationDetail },
+            })
+            for (let offset = 0; offset < message.length; offset += 128) {
+                const pageIndex = offset / 128
+                transaction.objectStore('messagePages').put({
+                    key: `${generation}:message-page:${character.chaId}:${conversation.id}:${pageIndex}`,
+                    generation,
+                    characterId: character.chaId,
+                    conversationId: conversation.id,
+                    pageIndex,
+                    value: message.slice(offset, offset + 128),
+                })
+            }
+        }
+    }
+    await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve()
+        transaction.onabort = () => reject(transaction.error)
+        transaction.onerror = () => reject(transaction.error)
+    })
+    database.close()
+}
+
 persistentDataStoreContract(async () => {
     const indexedDB = new IDBFactory()
     const databaseName = `persistent-store-contract-${databaseSequence++}`
@@ -23,6 +116,76 @@ persistentDataStoreContract(async () => {
 })
 
 describe('IndexedDbPersistentDataStore I/O shape', () => {
+    it('upgrades version 1 records, backfills ordering, commits, and reopens', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'version-1-upgrade'
+        await createVersion1Database(indexedDB, databaseName)
+
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+
+        expect(await store.readRoot()).toMatchObject({
+            revision: 7,
+            value: { username: 'Fixture User' },
+        })
+        expect(
+            (await store.queryCharacters({ order: 'configured', trash: false, limit: 10 })).items.map(
+                (item) => item.id,
+            ),
+        ).toEqual(['char-b', 'char-a'])
+        expect(
+            (await store.queryCharacters({ order: 'recent', trash: false, limit: 10 })).items.map(
+                (item) => item.id,
+            ),
+        ).toEqual(['char-a', 'char-b'])
+        expect(
+            (
+                await store.queryConversations({
+                    characterId: 'char-a',
+                    order: 'configured',
+                    limit: 10,
+                })
+            ).items.map((item) => item.id),
+        ).toEqual(['conv-long', 'conv-short'])
+        expect(
+            (
+                await store.queryConversations({
+                    characterId: 'char-a',
+                    order: 'recent',
+                    limit: 10,
+                })
+            ).items.map((item) => item.id),
+        ).toEqual(['conv-short', 'conv-long'])
+        expect(
+            (
+                await store.readConversationWindow({
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    limit: 4,
+                })
+            )?.value.messages.map((message) => message.chatId),
+        ).toEqual(['msg-126', 'msg-127', 'msg-128', 'msg-129'])
+
+        const detail = (await store.readCharacter('char-a'))!.value
+        const committed = await store.commit({
+            expectedRevision: 7,
+            character: { ...detail, name: 'Alpha Upgraded' },
+        })
+        expect(committed.revision).toBe(8)
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        expect(await reopened.readCharacter('char-a')).toMatchObject({
+            revision: 8,
+            value: { name: 'Alpha Upgraded' },
+        })
+        expect(
+            (await reopened.queryCharacters({ order: 'configured', trash: false, limit: 10 })).items.map(
+                (item) => item.id,
+            ),
+        ).toEqual(['char-b', 'char-a'])
+    })
+
     it('scopes catalog, conversation, and latest-window reads to IndexedDB ranges', async () => {
         const indexedDB = new IDBFactory()
         const store = new IndexedDbPersistentDataStore(
