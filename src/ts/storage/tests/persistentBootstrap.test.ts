@@ -30,6 +30,11 @@ function createStore(input?: {
         replaceFromDatabase: vi.fn(async () => ({
             revision: input?.replacementRevision ?? revision + 1,
         })),
+        prepareReplacement: vi.fn(),
+        activatePreparedReplacement: vi.fn(),
+        discardPreparedReplacement: vi.fn(),
+        readActivePayloadGeneration: vi.fn(),
+        readActiveTuple: vi.fn(),
         queryCharacters: vi.fn(),
         readCharacter: vi.fn(),
         queryConversations: vi.fn(),

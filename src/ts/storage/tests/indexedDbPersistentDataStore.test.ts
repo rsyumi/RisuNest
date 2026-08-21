@@ -1,7 +1,7 @@
 import { IDBFactory, IDBIndex, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
-import { SnapshotReleasedError } from '../persistentDataStore'
+import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
 import { persistentDataStoreContract } from './persistentDataStoreContract'
 
@@ -117,6 +117,300 @@ persistentDataStoreContract(async () => {
 })
 
 describe('IndexedDbPersistentDataStore I/O shape', () => {
+    it('keeps a prepared replacement invisible across reopen until activation', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `prepared-invisible-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const replacement = structuredClone(fixtureDatabase)
+        replacement.username = 'Prepared User'
+
+        const prepared = await store.prepareReplacement(replacement, 'manifest-prepared')
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+
+        expect((await reopened.readRoot()).value.username).toBe('Fixture User')
+        expect(await reopened.readActivePayloadGeneration()).toBe('legacy')
+        await reopened.activatePreparedReplacement({
+            prepared,
+            payloadGeneration: 'payload-prepared',
+            manifestHash: 'manifest-prepared',
+        })
+        expect((await reopened.readRoot()).value.username).toBe('Prepared User')
+    })
+
+    it('atomically activates fully materialized data and payload generations', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `prepared-activate-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const replacement = structuredClone(fixtureDatabase)
+        replacement.username = 'Activated User'
+        replacement.characters[1].name = 'Activated Character'
+        const prepared = await store.prepareReplacement(replacement, 'manifest-activate')
+
+        const activated = await store.activatePreparedReplacement({
+            prepared,
+            payloadGeneration: 'payload-activate',
+            manifestHash: 'manifest-activate',
+        })
+
+        expect(activated.revision).toBe(imported.revision + 1)
+        expect(await store.readActiveTuple()).toEqual({
+            revision: activated.revision,
+            dataGeneration: prepared.dataGeneration,
+            payloadGeneration: 'payload-activate',
+        })
+        expect(await store.materializeDatabase()).toEqual(replacement)
+    })
+
+    it('keeps the old active tuple when the activation transaction aborts', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `prepared-abort-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const before = await store.readActiveTuple()
+        const replacement = structuredClone(fixtureDatabase)
+        replacement.username = 'Must Not Activate'
+        const prepared = await store.prepareReplacement(replacement, 'manifest-abort')
+        const originalPut = IDBObjectStore.prototype.put
+        const putSpy = vi
+            .spyOn(IDBObjectStore.prototype, 'put')
+            .mockImplementation(function (this: IDBObjectStore, value: unknown, key?: IDBValidKey) {
+                const request = originalPut.call(this, value, key)
+                if ((value as { key?: string }).key === 'activePayloadGeneration') {
+                    this.transaction.abort()
+                }
+                return request
+            })
+
+        try {
+            await expect(
+                store.activatePreparedReplacement({
+                    prepared,
+                    payloadGeneration: 'payload-abort',
+                    manifestHash: 'manifest-abort',
+                }),
+            ).rejects.toThrow()
+        } finally {
+            putSpy.mockRestore()
+        }
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        expect(await reopened.readActiveTuple()).toEqual(before)
+        expect(await reopened.materializeDatabase()).toEqual(fixtureDatabase)
+    })
+
+    it('reopens the complete new tuple after activation commits', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `prepared-committed-reopen-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const replacement = structuredClone(fixtureDatabase)
+        replacement.username = 'Committed Before Publication'
+        const prepared = await store.prepareReplacement(replacement, 'manifest-reopen')
+        const activated = await store.activatePreparedReplacement({
+            prepared,
+            payloadGeneration: 'payload-reopen',
+            manifestHash: 'manifest-reopen',
+        })
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        expect(await reopened.readActiveTuple()).toEqual({
+            revision: activated.revision,
+            dataGeneration: prepared.dataGeneration,
+            payloadGeneration: 'payload-reopen',
+        })
+        expect(await reopened.materializeDatabase()).toEqual(replacement)
+    })
+
+    it('rejects stale prepared activation without retrying or changing either pointer', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `prepared-stale-${databaseSequence++}`
+        const first = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        const second = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await first.open()
+        await second.open()
+        await first.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const replacement = structuredClone(fixtureDatabase)
+        replacement.username = 'Stale Replacement'
+        const prepared = await first.prepareReplacement(replacement, 'manifest-stale')
+        const root = (await second.readRoot()).value
+        const committed = await second.commit({
+            expectedRevision: prepared.baseRevision,
+            root: { ...root, username: 'Concurrent Commit' },
+        })
+        const before = await second.readActiveTuple()
+
+        await expect(
+            first.activatePreparedReplacement({
+                prepared,
+                payloadGeneration: 'payload-stale',
+                manifestHash: 'manifest-stale',
+            }),
+        ).rejects.toEqual(new RevisionConflictError(prepared.baseRevision, committed.revision))
+
+        expect(await second.readActiveTuple()).toEqual(before)
+        expect((await second.readRoot()).value.username).toBe('Concurrent Commit')
+    })
+
+    it('rejects a manifest mismatch without changing the active tuple', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `prepared-manifest-mismatch-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const before = await store.readActiveTuple()
+        const prepared = await store.prepareReplacement(
+            structuredClone(fixtureDatabase),
+            'manifest-expected',
+        )
+
+        await expect(
+            store.activatePreparedReplacement({
+                prepared,
+                payloadGeneration: 'payload-mismatch',
+                manifestHash: 'manifest-other',
+            }),
+        ).rejects.toThrow('manifest')
+        expect(await store.readActiveTuple()).toEqual(before)
+    })
+
+    it('rejects a prepared generation whose durable records no longer match its marker', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `prepared-record-mismatch-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const before = await store.readActiveTuple()
+        const prepared = await store.prepareReplacement(
+            structuredClone(fixtureDatabase),
+            'manifest-records',
+        )
+        const request = indexedDB.open(databaseName)
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })
+        const transaction = database.transaction('catalog', 'readwrite')
+        transaction
+            .objectStore('catalog')
+            .delete(`${prepared.dataGeneration}:character:char-a`)
+        await new Promise<void>((resolve, reject) => {
+            transaction.oncomplete = () => resolve()
+            transaction.onabort = () => reject(transaction.error)
+            transaction.onerror = () => reject(transaction.error)
+        })
+        database.close()
+
+        await expect(
+            store.activatePreparedReplacement({
+                prepared,
+                payloadGeneration: 'payload-records',
+                manifestHash: 'manifest-records',
+            }),
+        ).rejects.toThrow('data validation')
+        expect(await store.readActiveTuple()).toEqual(before)
+    })
+
+    it('preserves the active payload generation during ordinary commits', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `ordinary-payload-preservation-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const prepared = await store.prepareReplacement(
+            structuredClone(fixtureDatabase),
+            'manifest-preserve',
+        )
+        const activated = await store.activatePreparedReplacement({
+            prepared,
+            payloadGeneration: 'payload-preserve',
+            manifestHash: 'manifest-preserve',
+        })
+        const root = (await store.readRoot()).value
+
+        await store.commit({
+            expectedRevision: activated.revision,
+            root: { ...root, username: 'Ordinary Commit' },
+        })
+
+        expect(await store.readActivePayloadGeneration()).toBe('payload-preserve')
+    })
+
+    it('defaults version 1 and version 2 databases to the legacy payload generation', async () => {
+        for (const version of [1, 2]) {
+            const indexedDB = new IDBFactory()
+            const databaseName = `payload-upgrade-v${version}-${databaseSequence++}`
+            await createVersion1Database(indexedDB, databaseName)
+            if (version === 2) {
+                const request = indexedDB.open(databaseName, 2)
+                const database = await new Promise<IDBDatabase>((resolve, reject) => {
+                    request.onsuccess = () => resolve(request.result)
+                    request.onerror = () => reject(request.error)
+                })
+                database.close()
+            }
+            const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+            await store.open()
+
+            expect(await store.readActivePayloadGeneration()).toBe('legacy')
+            expect((await store.readRoot()).revision).toBe(7)
+        }
+    })
+
+    it('discards only its inactive prepared replacement and preserves active and leased data', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `prepared-discard-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+        const lease = await store.acquireRevision(imported.revision)
+        const discardedDatabase = structuredClone(fixtureDatabase)
+        discardedDatabase.username = 'Discarded User'
+        const discarded = await store.prepareReplacement(discardedDatabase, 'manifest-discard')
+        const retainedDatabase = structuredClone(fixtureDatabase)
+        retainedDatabase.username = 'Retained Prepared User'
+        const retained = await store.prepareReplacement(retainedDatabase, 'manifest-retained')
+
+        await store.discardPreparedReplacement(discarded)
+        await store.discardPreparedReplacement({
+            ...discarded,
+            id: 'unknown',
+            dataGeneration: (await store.readActiveTuple()).dataGeneration,
+        })
+
+        expect(await store.materializeDatabase()).toEqual(fixtureDatabase)
+        expect((await lease.readRoot()).value.username).toBe('Fixture User')
+        await expect(
+            store.activatePreparedReplacement({
+                prepared: discarded,
+                payloadGeneration: 'payload-discarded',
+                manifestHash: 'manifest-discard',
+            }),
+        ).rejects.toThrow('prepared')
+        await store.activatePreparedReplacement({
+            prepared: retained,
+            payloadGeneration: 'payload-retained',
+            manifestHash: 'manifest-retained',
+        })
+        expect((await store.readRoot()).value.username).toBe('Retained Prepared User')
+        expect((await lease.readRoot()).value.username).toBe('Fixture User')
+        await lease.release()
+    })
+
     it('atomically adds one complete character with root and selected edits across reopen', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `atomic-character-addition-${databaseSequence++}`

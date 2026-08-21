@@ -2,6 +2,25 @@ import type { Chat, Database, Message, character, groupChat } from './database.s
 
 export type DataRevision = number
 
+export interface ActivePersistentTuple {
+    revision: DataRevision
+    dataGeneration: string
+    payloadGeneration: string
+}
+
+export interface PreparedPersistentReplacement {
+    id: string
+    baseRevision: DataRevision
+    dataGeneration: string
+    manifestHash: string
+}
+
+export interface PreparedReplacementActivation {
+    prepared: PreparedPersistentReplacement
+    payloadGeneration: string
+    manifestHash: string
+}
+
 export interface Versioned<T> {
     revision: DataRevision
     value: T
@@ -148,6 +167,16 @@ export interface PersistentDataStore {
         database: Database,
         expectedRevision?: DataRevision,
     ): Promise<{ revision: DataRevision }>
+    prepareReplacement(
+        database: Database,
+        manifestHash: string,
+    ): Promise<PreparedPersistentReplacement>
+    activatePreparedReplacement(
+        input: PreparedReplacementActivation,
+    ): Promise<{ revision: DataRevision }>
+    discardPreparedReplacement(prepared: PreparedPersistentReplacement): Promise<void>
+    readActivePayloadGeneration(): Promise<string>
+    readActiveTuple(): Promise<ActivePersistentTuple>
     materializeDatabase(revision?: DataRevision): Promise<Database>
     acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>
 }

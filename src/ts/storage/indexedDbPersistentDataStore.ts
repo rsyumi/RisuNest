@@ -1,5 +1,6 @@
 import type { Chat, Database, Message } from './database.svelte'
 import type {
+    ActivePersistentTuple,
     CharacterDetail,
     CharacterPage,
     CharacterQuery,
@@ -13,14 +14,17 @@ import type {
     DataRevision,
     PersistentDataStore,
     PersistentRevisionLease,
+    PreparedPersistentReplacement,
+    PreparedReplacementActivation,
     Versioned,
     WorkingSetCommit,
 } from './persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
 
-const DATABASE_VERSION = 2
+const DATABASE_VERSION = 3
 const MESSAGE_PAGE_SIZE = 128
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
+const LEGACY_PAYLOAD_GENERATION = 'legacy'
 const STORE_NAMES = ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 const DATA_STORE_NAMES = ['root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 const activeSnapshotGenerations = new Set<string>()
@@ -40,6 +44,18 @@ interface StoredMessagePage extends StoredRecord<Message[]> {
 interface StoredConversation {
     summary: ConversationSummary
     detail: Omit<Chat, 'message'>
+}
+
+interface PreparedGenerationCounts {
+    root: number
+    catalog: number
+    characters: number
+    conversations: number
+    messagePages: number
+}
+
+interface PreparedReplacementMarker extends PreparedPersistentReplacement {
+    counts: PreparedGenerationCounts
 }
 
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
@@ -165,13 +181,19 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
         const transaction = this.database.transaction(['meta', 'root'], 'readwrite')
         const meta = transaction.objectStore('meta')
-        const currentRevision = await requestResult(meta.get('currentRevision'))
+        const [currentRevision, activePayloadGeneration] = await Promise.all([
+            requestResult(meta.get('currentRevision')),
+            requestResult(meta.get('activePayloadGeneration')),
+        ])
         meta.put({ key: 'schemaVersion', value: DATABASE_VERSION })
         if (!currentRevision) {
             const generation = this.generationFor(0)
             meta.put({ key: 'activeGeneration', value: generation })
+            meta.put({ key: 'activePayloadGeneration', value: LEGACY_PAYLOAD_GENERATION })
             meta.put({ key: 'currentRevision', value: 0 })
             transaction.objectStore('root').put({ key: generation, generation, value: {} })
+        } else if (!activePayloadGeneration) {
+            meta.put({ key: 'activePayloadGeneration', value: LEGACY_PAYLOAD_GENERATION })
         }
         await transactionDone(transaction)
         await this.sweepTemporaryGenerations()
@@ -403,59 +425,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             const revision = active.revision + 1
             const generation = this.generationFor(revision)
-            const ids = new Set<string>()
-            const conversationIds = new Set<string>()
-            let expectedConversationCount = 0
-
-            const { characters, ...root } = databaseValue
-            this.putRoot(transaction, generation, root)
-            for (let index = 0; index < characters.length; index++) {
-                const character = characters[index]
-                if (!character.chaId || ids.has(character.chaId)) {
-                    throw new Error('Persistent data import requires unique character IDs')
-                }
-                ids.add(character.chaId)
-                const { chats, ...detail } = character
-                this.putCharacterRecords(transaction, generation, detail, index, chats.length)
-                const characterConversationIds = new Set<string>()
-                for (let conversationIndex = 0; conversationIndex < chats.length; conversationIndex++) {
-                    const conversation = chats[conversationIndex]
-                    if (!conversation.id || characterConversationIds.has(conversation.id)) {
-                        throw new Error(`Character ${character.chaId} requires unique conversation IDs`)
-                    }
-                    characterConversationIds.add(conversation.id)
-                    conversationIds.add(`${character.chaId}:${conversation.id}`)
-                    expectedConversationCount++
-                    this.putConversation(
-                        transaction,
-                        generation,
-                        character.chaId,
-                        conversation,
-                        conversationIndex,
-                    )
-                }
-            }
-
-            const stagedCatalog = await this.generationRecords<CharacterSummary>(
-                transaction.objectStore('catalog'),
-                generation,
-            )
-            if (stagedCatalog.length !== characters.length || stagedCatalog.some((item) => !ids.has(item.value.id))) {
-                throw new Error('Persistent data staging validation failed')
-            }
-            const stagedConversations = await this.generationRecords<StoredConversation>(
-                transaction.objectStore('conversations'),
-                generation,
-            )
-            if (
-                stagedConversations.length !== expectedConversationCount ||
-                stagedConversations.some(
-                    (item) =>
-                        !conversationIds.has(`${item.value.summary.characterId}:${item.value.summary.id}`),
-                )
-            ) {
-                throw new Error('Persistent conversation staging validation failed')
-            }
+            await this.stageDatabase(transaction, databaseValue, generation)
             transaction.objectStore('root').delete(active.generation)
             for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages']) {
                 await this.deleteIndexRange(
@@ -471,6 +441,128 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 transaction.abort()
             } catch {}
             throw error
+        }
+    }
+
+    async prepareReplacement(
+        databaseValue: Database,
+        manifestHash: string,
+    ): Promise<PreparedPersistentReplacement> {
+        const database = this.requireDatabase()
+        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
+        const id = globalThis.crypto.randomUUID()
+        const dataGeneration = `prepared-${id}`
+        try {
+            const active = await this.readActive(transaction)
+            const counts = await this.stageDatabase(transaction, databaseValue, dataGeneration)
+            const prepared = {
+                id,
+                baseRevision: active.revision,
+                dataGeneration,
+                manifestHash,
+            }
+            const marker: PreparedReplacementMarker = { ...prepared, counts }
+            transaction.objectStore('meta').put({
+                key: this.preparedMarkerKey(id),
+                value: marker,
+            })
+            await transactionDone(transaction)
+            return prepared
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async activatePreparedReplacement(
+        input: PreparedReplacementActivation,
+    ): Promise<{ revision: DataRevision }> {
+        const database = this.requireDatabase()
+        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
+        let previousGeneration = ''
+        try {
+            const active = await this.readActive(transaction)
+            if (active.revision !== input.prepared.baseRevision) {
+                throw new RevisionConflictError(input.prepared.baseRevision, active.revision)
+            }
+            const markerRecord = await requestResult(
+                transaction.objectStore('meta').get(this.preparedMarkerKey(input.prepared.id)),
+            )
+            const marker = (
+                markerRecord as { value?: PreparedReplacementMarker } | undefined
+            )?.value
+            if (!marker || !this.matchesPreparedReplacement(marker, input.prepared)) {
+                throw new Error('Persistent prepared replacement is missing or does not match')
+            }
+            if (marker.manifestHash !== input.manifestHash) {
+                throw new Error('Persistent prepared replacement manifest does not match')
+            }
+            await this.validateGeneration(transaction, marker.dataGeneration, marker.counts)
+            const revision = active.revision + 1
+            previousGeneration = active.generation
+            this.setActiveTuple(
+                transaction,
+                revision,
+                marker.dataGeneration,
+                input.payloadGeneration,
+            )
+            transaction.objectStore('meta').delete(this.preparedMarkerKey(marker.id))
+            await transactionDone(transaction)
+            void this.deleteGeneration(previousGeneration).catch(() => undefined)
+            return { revision }
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async discardPreparedReplacement(prepared: PreparedPersistentReplacement): Promise<void> {
+        const database = this.requireDatabase()
+        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
+        try {
+            const active = await this.readActive(transaction)
+            const markerRecord = await requestResult(
+                transaction.objectStore('meta').get(this.preparedMarkerKey(prepared.id)),
+            )
+            const marker = (
+                markerRecord as { value?: PreparedReplacementMarker } | undefined
+            )?.value
+            if (
+                !marker ||
+                !this.matchesPreparedReplacement(marker, prepared) ||
+                marker.dataGeneration === active.generation ||
+                activeSnapshotGenerations.has(marker.dataGeneration)
+            ) {
+                await transactionDone(transaction)
+                return
+            }
+            await this.deleteGenerationFromTransaction(transaction, marker.dataGeneration)
+            transaction.objectStore('meta').delete(this.preparedMarkerKey(marker.id))
+            await transactionDone(transaction)
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async readActivePayloadGeneration(): Promise<string> {
+        return (await this.readActiveTuple()).payloadGeneration
+    }
+
+    async readActiveTuple(): Promise<ActivePersistentTuple> {
+        const transaction = this.requireDatabase().transaction('meta', 'readonly')
+        const active = await this.readActive(transaction)
+        await transactionDone(transaction)
+        return {
+            revision: active.revision,
+            dataGeneration: active.generation,
+            payloadGeneration: active.payloadGeneration,
         }
     }
 
@@ -817,8 +909,123 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         })
     }
 
+    private async stageDatabase(
+        transaction: IDBTransaction,
+        databaseValue: Database,
+        generation: string,
+    ): Promise<PreparedGenerationCounts> {
+        const ids = new Set<string>()
+        const conversationIds = new Set<string>()
+        let conversationCount = 0
+        let messagePageCount = 0
+        const { characters, ...root } = databaseValue
+        this.putRoot(transaction, generation, root)
+        for (let index = 0; index < characters.length; index++) {
+            const character = characters[index]
+            if (!character.chaId || ids.has(character.chaId)) {
+                throw new Error('Persistent data import requires unique character IDs')
+            }
+            ids.add(character.chaId)
+            const { chats, ...detail } = character
+            this.putCharacterRecords(transaction, generation, detail, index, chats.length)
+            const characterConversationIds = new Set<string>()
+            for (let conversationIndex = 0; conversationIndex < chats.length; conversationIndex++) {
+                const conversation = chats[conversationIndex]
+                if (!conversation.id || characterConversationIds.has(conversation.id)) {
+                    throw new Error(`Character ${character.chaId} requires unique conversation IDs`)
+                }
+                characterConversationIds.add(conversation.id)
+                conversationIds.add(`${character.chaId}:${conversation.id}`)
+                conversationCount++
+                messagePageCount += Math.ceil(conversation.message.length / MESSAGE_PAGE_SIZE)
+                this.putConversation(
+                    transaction,
+                    generation,
+                    character.chaId,
+                    conversation,
+                    conversationIndex,
+                )
+            }
+        }
+
+        const stagedCatalog = await this.generationRecords<CharacterSummary>(
+            transaction.objectStore('catalog'),
+            generation,
+        )
+        if (
+            stagedCatalog.length !== characters.length ||
+            stagedCatalog.some((item) => !ids.has(item.value.id))
+        ) {
+            throw new Error('Persistent data staging validation failed')
+        }
+        const stagedConversations = await this.generationRecords<StoredConversation>(
+            transaction.objectStore('conversations'),
+            generation,
+        )
+        if (
+            stagedConversations.length !== conversationCount ||
+            stagedConversations.some(
+                (item) =>
+                    !conversationIds.has(
+                        `${item.value.summary.characterId}:${item.value.summary.id}`,
+                    ),
+            )
+        ) {
+            throw new Error('Persistent conversation staging validation failed')
+        }
+        const counts = {
+            root: 1,
+            catalog: characters.length,
+            characters: characters.length,
+            conversations: conversationCount,
+            messagePages: messagePageCount,
+        }
+        await this.validateGeneration(transaction, generation, counts)
+        return counts
+    }
+
+    private async validateGeneration(
+        transaction: IDBTransaction,
+        generation: string,
+        expected: PreparedGenerationCounts,
+    ): Promise<void> {
+        const root = await requestResult(transaction.objectStore('root').get(generation))
+        const counts = {
+            root: root ? 1 : 0,
+            catalog: await requestResult(
+                transaction.objectStore('catalog').index('byGeneration').count(generation),
+            ),
+            characters: await requestResult(
+                transaction.objectStore('characters').index('byGeneration').count(generation),
+            ),
+            conversations: await requestResult(
+                transaction.objectStore('conversations').index('byGeneration').count(generation),
+            ),
+            messagePages: await requestResult(
+                transaction.objectStore('messagePages').index('byGeneration').count(generation),
+            ),
+        }
+        if (
+            Object.keys(expected).some(
+                (key) =>
+                    counts[key as keyof typeof counts] !==
+                    expected[key as keyof typeof expected],
+            )
+        ) {
+            throw new Error('Persistent prepared replacement data validation failed')
+        }
+    }
+
     private async deleteGeneration(generation: string): Promise<void> {
         const transaction = this.requireDatabase().transaction([...DATA_STORE_NAMES], 'readwrite')
+        await this.deleteGenerationFromTransaction(transaction, generation)
+        await transactionDone(transaction)
+    }
+
+    private async deleteGenerationFromTransaction(
+        transaction: IDBTransaction,
+        generation: string,
+    ): Promise<void> {
         transaction.objectStore('root').delete(generation)
         for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
             await this.deleteIndexRange(
@@ -826,7 +1033,6 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 this.keyRangeFactory.only(generation),
             )
         }
-        await transactionDone(transaction)
     }
 
     private async sweepTemporaryGenerations(): Promise<void> {
@@ -1398,13 +1604,19 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     private async readActive(
         transaction: IDBTransaction,
-    ): Promise<{ revision: DataRevision; generation: string }> {
+    ): Promise<{ revision: DataRevision; generation: string; payloadGeneration: string }> {
         const store = transaction.objectStore('meta')
-        const revisionRecord = await requestResult(store.get('currentRevision'))
-        const generationRecord = await requestResult(store.get('activeGeneration'))
+        const [revisionRecord, generationRecord, payloadGenerationRecord] = await Promise.all([
+            requestResult(store.get('currentRevision')),
+            requestResult(store.get('activeGeneration')),
+            requestResult(store.get('activePayloadGeneration')),
+        ])
         return {
             revision: (revisionRecord as { value: DataRevision }).value,
             generation: (generationRecord as { value: string }).value,
+            payloadGeneration:
+                (payloadGenerationRecord as { value?: string } | undefined)?.value ??
+                LEGACY_PAYLOAD_GENERATION,
         }
     }
 
@@ -1412,6 +1624,35 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const meta = transaction.objectStore('meta')
         meta.put({ key: 'activeGeneration', value: generation })
         meta.put({ key: 'currentRevision', value: revision })
+    }
+
+    private setActiveTuple(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        dataGeneration: string,
+        payloadGeneration: string,
+    ): void {
+        this.setActive(transaction, revision, dataGeneration)
+        transaction.objectStore('meta').put({
+            key: 'activePayloadGeneration',
+            value: payloadGeneration,
+        })
+    }
+
+    private preparedMarkerKey(id: string): string {
+        return `preparedReplacement:${id}`
+    }
+
+    private matchesPreparedReplacement(
+        marker: PreparedReplacementMarker,
+        prepared: PreparedPersistentReplacement,
+    ): boolean {
+        return (
+            marker.id === prepared.id &&
+            marker.baseRevision === prepared.baseRevision &&
+            marker.dataGeneration === prepared.dataGeneration &&
+            marker.manifestHash === prepared.manifestHash
+        )
     }
 
     private putRoot(
