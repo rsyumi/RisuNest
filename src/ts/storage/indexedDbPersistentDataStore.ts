@@ -249,6 +249,35 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return { items: result.items.map((item) => item.summary), nextCursor: result.nextCursor }
     }
 
+    async readConversation(
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<Chat> | null> {
+        const database = this.requireDatabase()
+        const transaction = database.transaction(
+            ['meta', 'conversations', 'messagePages'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        const record = (await requestResult(
+            transaction
+                .objectStore('conversations')
+                .get(this.conversationKey(generation, characterId, conversationId)),
+        )) as StoredRecord<StoredConversation> | undefined
+        if (!record) {
+            await transactionDone(transaction)
+            return null
+        }
+        const message = await this.readMessagesFromTransaction(
+            transaction,
+            generation,
+            characterId,
+            conversationId,
+        )
+        await transactionDone(transaction)
+        return { revision, value: { ...record.value.detail, message } }
+    }
+
     async readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null> {
@@ -327,6 +356,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (active.revision !== input.expectedRevision) {
                 throw new RevisionConflictError(input.expectedRevision, active.revision)
             }
+            if (input.replaceCharacter) this.validateReplacementCharacter(input.replaceCharacter)
 
             const revision = active.revision + 1
             const generation = active.generation
@@ -335,6 +365,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 await this.deleteCharacter(transaction, generation, input.deleteCharacterId)
             }
             if (input.character) await this.putCharacter(transaction, generation, input.character)
+            if (input.replaceCharacter) {
+                await this.replaceCharacter(transaction, generation, input.replaceCharacter)
+            }
             for (const mutation of input.conversations ?? []) {
                 await this.applyConversationMutation(transaction, generation, mutation)
             }
@@ -915,6 +948,59 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             ))
         const conversationCount = await this.conversationCount(transaction, generation, detail.chaId)
         this.putCharacterRecords(transaction, generation, detail, configuredIndex, conversationCount)
+    }
+
+    private validateReplacementCharacter(character: Database['characters'][number]): void {
+        if (!character.chaId) {
+            throw new Error('Selected character replacement requires a nonempty character ID')
+        }
+        const conversationIds = new Set<string>()
+        for (const conversation of character.chats) {
+            if (!conversation.id || conversationIds.has(conversation.id)) {
+                throw new Error('Selected character replacement requires unique, nonempty chat IDs')
+            }
+            conversationIds.add(conversation.id)
+        }
+    }
+
+    private async replaceCharacter(
+        transaction: IDBTransaction,
+        generation: string,
+        character: Database['characters'][number],
+    ): Promise<void> {
+        const key = this.characterKey(generation, character.chaId)
+        const existing = (await requestResult(
+            transaction.objectStore('catalog').get(key),
+        )) as StoredRecord<CharacterSummary> | undefined
+        const configuredIndex =
+            existing?.value.configuredIndex ??
+            (await requestResult(
+                transaction.objectStore('catalog').index('byGeneration').count(generation),
+            ))
+
+        await this.deleteIndexRange(
+            transaction.objectStore('conversations').index('byGenerationCharacterConfigured'),
+            this.keyRangeFactory.bound(
+                [generation, character.chaId, 0],
+                [generation, character.chaId, MAX_INDEX_VALUE],
+            ),
+        )
+        await this.deleteIndexRange(
+            transaction.objectStore('messagePages').index('byGenerationCharacter'),
+            this.keyRangeFactory.only([generation, character.chaId]),
+        )
+
+        const { chats, ...detail } = character
+        this.putCharacterRecords(
+            transaction,
+            generation,
+            detail,
+            configuredIndex,
+            chats.length,
+        )
+        for (let index = 0; index < chats.length; index++) {
+            this.putConversation(transaction, generation, character.chaId, chats[index], index)
+        }
     }
 
     private putCharacterRecords(

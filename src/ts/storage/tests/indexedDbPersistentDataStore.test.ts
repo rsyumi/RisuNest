@@ -307,6 +307,77 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         ).toEqual(['msg-004', 'msg-edited', 'msg-006'])
     })
 
+    it('scopes selected-character replacement deletes to that character', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            'selected-character-write-shape',
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        const replacement = structuredClone(fixtureDatabase.characters[1])
+        replacement.chats[0].message = replacement.chats[0].message.slice(0, 1)
+        const cursorRanges: Array<{
+            index: string
+            lower: IDBValidKey | undefined
+            upper: IDBValidKey | undefined
+        }> = []
+        const originalOpenCursor = IDBIndex.prototype.openCursor
+        const cursorSpy = vi
+            .spyOn(IDBIndex.prototype, 'openCursor')
+            .mockImplementation(function (
+                this: IDBIndex,
+                ...args: Parameters<IDBIndex['openCursor']>
+            ) {
+                const range = args[0] instanceof IDBKeyRange ? args[0] : undefined
+                cursorRanges.push({ index: this.name, lower: range?.lower, upper: range?.upper })
+                return originalOpenCursor.apply(this, args)
+            })
+
+        try {
+            await store.commit({
+                expectedRevision: imported.revision,
+                replaceCharacter: replacement,
+            })
+        } finally {
+            cursorSpy.mockRestore()
+        }
+
+        expect(cursorRanges).toContainEqual({
+            index: 'byGenerationCharacterConfigured',
+            lower: ['revision-1', 'char-a', 0],
+            upper: ['revision-1', 'char-a', Number.MAX_SAFE_INTEGER],
+        })
+        expect(cursorRanges).toContainEqual({
+            index: 'byGenerationCharacter',
+            lower: ['revision-1', 'char-a'],
+            upper: ['revision-1', 'char-a'],
+        })
+        expect((await store.readConversation('char-b', 'conv-beta'))?.value.message).toHaveLength(3)
+
+        const openRequest = indexedDB.open('selected-character-write-shape')
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+            openRequest.onsuccess = () => resolve(openRequest.result)
+            openRequest.onerror = () => reject(openRequest.error)
+        })
+        const transaction = database.transaction('messagePages', 'readonly')
+        const pageCountRequest = transaction
+            .objectStore('messagePages')
+            .index('byConversationPage')
+            .count(
+                IDBKeyRange.bound(
+                    ['revision-1', 'char-a', 'conv-long', 0],
+                    ['revision-1', 'char-a', 'conv-long', Number.MAX_SAFE_INTEGER],
+                ),
+            )
+        const pageCount = await new Promise<number>((resolve, reject) => {
+            pageCountRequest.onsuccess = () => resolve(pageCountRequest.result)
+            pageCountRequest.onerror = () => reject(pageCountRequest.error)
+        })
+        expect(pageCount).toBe(1)
+    })
+
     it('reuses the anchor lookup page when reading an anchored window', async () => {
         const indexedDB = new IDBFactory()
         const store = new IndexedDbPersistentDataStore('bounded-anchor-shape', indexedDB, IDBKeyRange)

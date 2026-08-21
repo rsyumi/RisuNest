@@ -93,6 +93,7 @@ export interface WorkingSetCommit {
     expectedRevision: DataRevision
     root?: Omit<Database, 'characters'>
     character?: CharacterDetail
+    replaceCharacter?: character | groupChat
     conversations?: ConversationMutation[]
     deleteCharacterId?: string
 }
@@ -135,6 +136,7 @@ export interface PersistentDataStore {
     queryCharacters(input: CharacterQuery): Promise<CharacterPage>
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
     queryConversations(input: ConversationQuery): Promise<ConversationPage>
+    readConversation(characterId: string, conversationId: string): Promise<Versioned<Chat> | null>
     readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
