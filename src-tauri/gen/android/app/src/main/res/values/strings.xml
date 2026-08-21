@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">"RisuAI"</string>
     <string name="main_activity_title">"RisuAI"</string>
+    <string name="press_back_again_to_exit">Press back again to exit</string>
 </resources>
