@@ -1635,6 +1635,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 streamingFlushFrame = null
             }
         }
+        const processStreamingSnapshot = async (snapshot:string, cache:'normal'|'bypass') => {
+            try {
+                return await processScriptFull(nowChatroom, reformatContent(prefix + snapshot), 'editoutput', msgIndex, {}, { cache, signal: abortSignal, regexWorker: true })
+            }
+            catch(error){
+                if(abortSignal.aborted || streamAborted){
+                    return null
+                }
+                throw error
+            }
+        }
         const flushStreamingDisplay = async () => {
             clearStreamingFlushSchedule()
             if(streamingFlushPromise){
@@ -1654,7 +1665,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         DBState.db.characters[selectedChar].reloadKeys += 1
                         continue
                     }
-                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + nextResult), 'editoutput', msgIndex)
+                    const result2 = await processStreamingSnapshot(nextResult, 'bypass')
+                    if(result2 === null){
+                        continue
+                    }
                     DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
                     emoChanged = result2.emoChanged
                     DBState.db.characters[selectedChar].reloadKeys += 1
@@ -1713,7 +1727,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         scheduleStreamingDisplayFlush()
                     }
                     else{
-                        let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
+                        const result2 = await processStreamingSnapshot(result, 'bypass')
+                        if(result2 === null){
+                            break
+                        }
                         DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
                         emoChanged = result2.emoChanged
                         DBState.db.characters[selectedChar].reloadKeys += 1
@@ -1739,9 +1756,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     throw streamingFlushError
                 }
                 if(deferStreamingPostProcessing && receivedStreamingResult){
-                    let result2 = await processScriptFull(nowChatroom, reformatContent(prefix + result), 'editoutput', msgIndex)
-                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
-                    emoChanged = result2.emoChanged
+                    const result2 = await processStreamingSnapshot(result, 'normal')
+                    if(result2 !== null){
+                        DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = result2.data
+                        emoChanged = result2.emoChanged
+                    }
                 }
             }
             finally {

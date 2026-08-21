@@ -1,0 +1,183 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { character, customscript } from '../storage/database.svelte'
+
+const mocks = vi.hoisted(() => {
+    const state = {
+        emotions: {} as Record<string, [string, string, number][]>,
+        cbsPatternCalls: 0,
+        cbsFirstPattern: 'x',
+        cbsFirstError: null as Error | null,
+    }
+    const charEmotionStore = {
+        set(value: Record<string, [string, string, number][]>) {
+            state.emotions = value
+        },
+    }
+    return {
+        state,
+        charEmotionStore,
+        selectedCharStore: {},
+        database: {
+            dynamicAssets: false,
+            presetRegex: [] as customscript[],
+            characters: [] as never[],
+        },
+    }
+})
+
+vi.mock('svelte/store', () => ({
+    get: (store: unknown) => store === mocks.charEmotionStore ? mocks.state.emotions : 0,
+}))
+vi.mock('src/ts/stores.svelte', () => ({
+    CharEmotion: mocks.charEmotionStore,
+    selectedCharID: mocks.selectedCharStore,
+}))
+vi.mock('src/ts/storage/database.svelte', () => ({
+    getDatabase: () => mocks.database,
+    getCurrentCharacter: vi.fn(),
+    getCurrentChat: vi.fn(),
+}))
+vi.mock('src/ts/globalApi.svelte', () => ({ downloadFile: vi.fn() }))
+vi.mock('src/ts/alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
+vi.mock('src/lang', () => ({ language: {} }))
+vi.mock('src/ts/util', () => ({ selectSingleFile: vi.fn() }))
+vi.mock('src/ts/parser/parser.svelte', () => ({
+    assetRegex: /$^/g,
+    risuChatParser: (data: string) => {
+        if(data === 'phase1-cbs-pattern'){
+            mocks.state.cbsPatternCalls++
+            if(mocks.state.cbsPatternCalls === 1){
+                if(mocks.state.cbsFirstError){
+                    throw mocks.state.cbsFirstError
+                }
+                return mocks.state.cbsFirstPattern
+            }
+            return 'x'
+        }
+        return data
+    },
+}))
+vi.mock('src/ts/process/modules', () => ({
+    getModuleAssets: () => [],
+    getModuleRegexScripts: () => [],
+}))
+vi.mock('src/ts/process/memory/hypamemory', () => ({ HypaProcesser: class {} }))
+vi.mock('src/ts/process/scriptings', () => ({
+    runLuaEditTrigger: async (_char: unknown, _mode: unknown, data: string) => data,
+}))
+vi.mock('src/ts/plugins/plugins.svelte', () => ({
+    pluginV2: { editinput: new Set(), editoutput: new Set(), editprocess: new Set(), editdisplay: new Set() },
+}))
+vi.mock('src/ts/process/triggers', () => ({ runTrigger: vi.fn() }))
+
+const { processScriptFull, resetScriptCache } = await import('./scripts')
+
+function makeScript(input: string, output: string, flag = 'g'): customscript {
+    return {
+        comment: '',
+        in: input,
+        out: output,
+        type: 'editoutput',
+        flag,
+        ableFlag: true,
+    }
+}
+
+function makeCharacter(scripts: customscript[]): character {
+    return {
+        type: 'character',
+        chaId: 'cache-character',
+        customscript: scripts,
+        emotionImages: [['happy', 'happy.png']],
+    } as character
+}
+
+const emptyResultWithAction = [
+    makeScript('x', ''),
+    makeScript('^$', '@@emo happy'),
+]
+
+describe('processScriptFull result caching', () => {
+    beforeEach(() => {
+        resetScriptCache()
+        mocks.state.emotions = {}
+        mocks.state.cbsPatternCalls = 0
+        mocks.state.cbsFirstPattern = 'x'
+        mocks.state.cbsFirstError = null
+    })
+
+    it('treats a cached empty string as a hit', async () => {
+        const character = makeCharacter(emptyResultWithAction)
+
+        expect(await processScriptFull(character, 'x', 'editoutput')).toEqual({
+            data: '',
+            emoChanged: true,
+        })
+        expect(await processScriptFull(character, 'x', 'editoutput')).toEqual({
+            data: '',
+            emoChanged: false,
+        })
+    })
+
+    it('bypass neither reads nor writes the completed result cache', async () => {
+        const character = makeCharacter(emptyResultWithAction)
+
+        await processScriptFull(character, 'x', 'editoutput')
+        expect((await processScriptFull(character, 'x', 'editoutput', -1, {}, { cache: 'bypass' })).emoChanged).toBe(true)
+
+        resetScriptCache()
+        expect((await processScriptFull(character, 'x', 'editoutput', -1, {}, { cache: 'bypass' })).emoChanged).toBe(true)
+        expect((await processScriptFull(character, 'x', 'editoutput')).emoChanged).toBe(true)
+        expect((await processScriptFull(character, 'x', 'editoutput')).emoChanged).toBe(false)
+    })
+
+    it('preserves the cache-key CBS parse before bypass execution', async () => {
+        const character = makeCharacter([
+            makeScript('phase1-cbs-pattern', 'b', 'g<cbs>'),
+        ])
+        mocks.state.cbsFirstPattern = '['
+
+        const result = await processScriptFull(character, 'x', 'editoutput', -1, {}, { cache: 'bypass' })
+
+        expect(result.data).toBe('b')
+        expect(mocks.state.cbsPatternCalls).toBe(2)
+    })
+
+    it('preserves cache-key CBS parser errors when bypassing', async () => {
+        const character = makeCharacter([
+            makeScript('phase1-cbs-pattern', 'b', 'g<cbs>'),
+        ])
+        const parserError = new Error('cache-key CBS parser failure')
+        mocks.state.cbsFirstError = parserError
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        await expect(processScriptFull(
+            character,
+            'x',
+            'editoutput',
+            -1,
+            {},
+            { cache: 'bypass' },
+        )).rejects.toThrow(parserError)
+        errorLog.mockRestore()
+    })
+
+    it('keeps no more than 1,000 completed results', async () => {
+        const character = makeCharacter([makeScript('^', '@@emo happy')])
+
+        for (let index = 0; index <= 1_000; index++) {
+            await processScriptFull(character, `result-${index}`, 'editoutput')
+        }
+
+        expect((await processScriptFull(character, 'result-0', 'editoutput')).emoChanged).toBe(true)
+        expect((await processScriptFull(character, 'result-1000', 'editoutput')).emoChanged).toBe(false)
+    })
+
+    it('does not retain a completed result larger than the byte budget', async () => {
+        const character = makeCharacter([makeScript('^', '@@emo happy')])
+        const oversized = 'a'.repeat(2_100_000)
+
+        expect((await processScriptFull(character, oversized, 'editoutput')).emoChanged).toBe(true)
+        expect((await processScriptFull(character, oversized, 'editoutput')).emoChanged).toBe(true)
+    })
+})

@@ -11,16 +11,19 @@ import { HypaProcesser } from "./memory/hypamemory";
 import { runLuaEditTrigger } from "./scriptings";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { runTrigger } from "./triggers";
+import { ByteBudgetLru } from "../util/byteBudgetLru";
+import { canExecuteRegexPlanInWorker, executeRegexPlanSync, getRegexExecutionPlan, type RegexExecutionPlanEntry } from "./regexExecutionPlan";
+import { getSharedRegexWorkerClient } from "./regexWorkerClient";
 
-const dreg = /{{data}}/g
-const randomness = /\|\|\|/g
+const SCRIPT_CACHE_BUDGET = 8 * 1024 * 1024
+const SCRIPT_CACHE_ENTRY_LIMIT = 1000
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 
-type pScript = {
-    script: customscript,
-    order: number
-    actions: string[]
+export interface ProcessScriptOptions {
+    cache?: 'normal' | 'bypass'
+    signal?: AbortSignal
+    regexWorker?: boolean
 }
 
 export async function processScript(char:character|groupChat, data:string, mode:ScriptMode, cbsConditions:CbsConditions = {}){
@@ -66,7 +69,15 @@ export async function importRegex(o?:customscript[]):Promise<customscript[]>{
 }
 
 let bestMatchCache = new Map<string, string>()
-let processScriptCache = new Map<string, string>()
+let processScriptCache = createScriptCache()
+
+function createScriptCache() {
+    return new ByteBudgetLru<string, string>(
+        SCRIPT_CACHE_BUDGET,
+        (key, result) => 2 * (key.length + result.length),
+        SCRIPT_CACHE_ENTRY_LIMIT,
+    )
+}
 
 function generateScriptCacheKey(scripts: customscript[], data: string, mode: ScriptMode, chatID = -1, cbsConditions: CbsConditions = {}) {
     let hash = data + '|||' + mode + '|||';
@@ -81,11 +92,6 @@ function generateScriptCacheKey(scripts: customscript[], data: string, mode: Scr
 
 function cacheScript(hash:string, result:string){
     processScriptCache.set(hash, result)
-
-    if(processScriptCache.size > 1000){
-        processScriptCache.delete(processScriptCache.keys().next().value)
-    }
-
 }
 
 function getScriptCache(hash:string){
@@ -93,10 +99,10 @@ function getScriptCache(hash:string){
 }
 
 export function resetScriptCache(){
-    processScriptCache = new Map()
+    processScriptCache = createScriptCache()
 }
 
-export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}){
+export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     let db = getDatabase()
     let emoChanged = false
     data = await runLuaEditTrigger(char, mode, data, { index:chatID })
@@ -132,54 +138,57 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
 
     data = risuChatParser(data, { chatID: chatID, cbsConditions })
     const scripts = (db.presetRegex ?? []).concat(char.customscript).concat(getModuleRegexScripts())
-    const hash = generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions)
-    const cached = getScriptCache(hash)
-    if(cached){
-        return {data: cached, emoChanged: false}
+    const useResultCache = options.cache !== 'bypass'
+    const hash = useResultCache ? generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions) : undefined
+    if(!useResultCache){
+        for(const script of scripts){
+            if(script.type === mode && script.flag?.includes('<cbs>')){
+                risuChatParser(script.in, { chatID: chatID, cbsConditions })
+            }
+        }
+    }
+    if(hash !== undefined){
+        const cached = getScriptCache(hash)
+        if(cached !== undefined){
+            return {data: cached, emoChanged: false}
+        }
     }
     
     if(scripts.length === 0){
-        cacheScript(hash, data)
+        if(hash !== undefined){
+            cacheScript(hash, data)
+        }
         return {data, emoChanged}
     }
-    function executeScript(pscript:pScript){
-        const script = pscript.script
+
+    const plan = getRegexExecutionPlan(scripts, mode)
+    const parse = (value: string) => risuChatParser(value, { chatID: chatID, cbsConditions })
+
+    function executeScript(entry:RegexExecutionPlanEntry){
+        const script = entry.script
         
         if(script.in === ''){
             return
         }
 
-        if(script.type === mode){
+        const outScript = entry.replacement
+        const flag = entry.flags
+        let reg: RegExp
+        if(entry.dynamicPattern){
+            reg = new RegExp(parse(entry.pattern), flag)
+        }
+        else{
+            if(entry.compileError !== undefined){
+                throw entry.compileError
+            }
+            if(entry.compiledRegex === undefined){
+                throw new Error('Regex execution plan entry was not compiled')
+            }
+            reg = entry.compiledRegex
+        }
+        reg.lastIndex = 0
 
-            let outScript2 = script.out.replaceAll("$n", "\n")
-            let outScript = outScript2.replace(dreg, "$&")
-            let flag = 'g'
-            if(script.ableFlag){
-                flag = script.flag || 'g'
-            }
-            if(outScript.startsWith('@@move_top') || outScript.startsWith('@@move_bottom') || pscript.actions.includes('move_top') || pscript.actions.includes('move_bottom')){
-                flag = flag.replace('g', '') //temperary fix
-            }
-            if(outScript.endsWith('>') && !pscript.actions.includes('no_end_nl')){
-                outScript += '\n'
-            }
-            //remove unsupported flag
-            flag = flag.trim().replace(/[^dgimsuvy]/g, '')
-
-            //remove repeated flags
-            flag = flag.split('').filter((v, i, a) => a.indexOf(v) === i).join('')
-            
-            if(flag.length === 0){
-                flag = 'u'
-            }
-
-            let input = script.in
-            if(pscript.actions.includes('cbs')){
-                input = risuChatParser(input, { chatID: chatID, cbsConditions })
-            }
-
-            const reg = new RegExp(input, flag)
-            if(outScript.startsWith('@@') || pscript.actions.length > 0){
+            if(outScript.startsWith('@@') || entry.actions.length > 0){
                 if(reg.test(data)){
                     if(outScript.startsWith('@@emo ')){
                         const emoName = script.out.substring(6).trim()
@@ -204,14 +213,14 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                             }
                         }
                     }
-                    else if((outScript.startsWith('@@inject') || pscript.actions.includes('inject')) && chatID !== -1){
+                    else if((outScript.startsWith('@@inject') || entry.actions.includes('inject')) && chatID !== -1){
                         const selchar = db.characters[get(selectedCharID)]
                         selchar.chats[selchar.chatPage].message[chatID].data = data
                         data = data.replace(reg, "")
                     }
                     else if(
                         outScript.startsWith('@@move_top') || outScript.startsWith('@@move_bottom') ||
-                        pscript.actions.includes('move_top') || pscript.actions.includes('move_bottom')
+                        entry.actions.includes('move_top') || entry.actions.includes('move_bottom')
                     ){
                         const isGlobal = flag.includes('g')
                         const matchAll = isGlobal ? data.matchAll(reg) : [data.match(reg)]
@@ -235,7 +244,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                                         }
                                         return v
                                     })
-                                if(outScript.startsWith('@@move_top') || pscript.actions.includes('move_top')){
+                                if(outScript.startsWith('@@move_top') || entry.actions.includes('move_top')){
                                     data = out + '\n' +data
                                 }
                                 else{
@@ -245,11 +254,11 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                         }
                     }
                     else{
-                        data = risuChatParser(data.replace(reg, outScript), { chatID: chatID, cbsConditions })
+                        data = parse(data.replace(reg, outScript))
                     }
                 }
                 else{
-                    if((outScript.startsWith('@@repeat_back') || pscript.actions.includes('repeat_back'))  && chatID !== -1){
+                    if((outScript.startsWith('@@repeat_back') || entry.actions.includes('repeat_back'))  && chatID !== -1){
                         const v = outScript.split(' ', 2)[1]
                         const selchar = db.characters[get(selectedCharID)]
                         const chat = selchar.chats[selchar.chatPage]
@@ -288,56 +297,28 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                 }
             }
             else{
-                data = risuChatParser(data.replace(reg, outScript), { chatID: chatID, cbsConditions })
+                data = parse(data.replace(reg, outScript))
+            }
+    }
+
+    if(plan.requiresHostExecution){
+        for (const entry of plan.entries){
+            try {
+                executeScript(entry)
+            } catch (error) {
+                console.error(error)
             }
         }
     }
-
-    let parsedScripts:pScript[] = []
-    let orderChanged = false
-    for (const script of scripts){
-        if(script.ableFlag && script.flag?.includes('<')){
-            const rregex = /<(.+?)>/g
-            const scriptData = safeStructuredClone(script)
-            let order = 0
-            const actions:string[] = []
-            scriptData.flag = scriptData.flag?.replace(rregex, (v:string, p1:string) => {
-                const meta = p1.split(',').map((v) => v.trim())
-                for(const m of meta){
-                    if(m.startsWith('order ')){
-                        order = parseInt(m.substring(6))
-                        orderChanged = true
-                    }
-                    else{
-                        actions.push(m)
-                    }
-                }
-
-                return ''
-            })
-            parsedScripts.push({
-                script: scriptData,
-                order,
-                actions
-            })
-            continue
+    else if(options.regexWorker && mode === 'editoutput' && canExecuteRegexPlanInWorker(plan, data)){
+        const result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })
+        data = result.data
+        for(const error of result.errors){
+            console.error(error.error)
         }
-        parsedScripts.push({
-            script,
-            order: 0,
-            actions: []
-        })
     }
-
-    if(orderChanged){
-        parsedScripts.sort((a, b) => b.order - a.order) //sort by order
-    }
-    for (const script of parsedScripts){
-        try {
-            executeScript(script)            
-        } catch (error) {
-            console.error(error)
-        }
+    else{
+        data = executeRegexPlanSync(plan, data, parse).data
     }
 
     
@@ -345,7 +326,9 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
     if(db.dynamicAssets && (char.type === 'simple' || char.type === 'character') && char.additionalAssets && char.additionalAssets.length > 0){
         if((!db.dynamicAssetsEditDisplay && mode === 'editdisplay')
             || mode === 'editinput' || mode === 'editprocess'){
-            cacheScript(hash, data)
+            if(hash !== undefined){
+                cacheScript(hash, data)
+            }
             return {data, emoChanged}
         }
         const assetNames = char.additionalAssets.map((v) => v[0])
@@ -381,7 +364,9 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
     }
 
-    cacheScript(hash, data)
+    if(hash !== undefined){
+        cacheScript(hash, data)
+    }
 
     return {data, emoChanged}
 }
