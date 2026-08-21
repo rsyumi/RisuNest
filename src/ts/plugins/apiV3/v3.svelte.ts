@@ -34,6 +34,15 @@ import {
     type AfterTTSResult,
     type TTSHookFn,
 } from "src/ts/process/ttsHooks";
+import { createPersistentDataStore } from "src/ts/storage/persistentDataStoreFactory";
+import { flushPendingData } from "src/ts/storage/persistentDataRuntime.svelte";
+import {
+    createPluginDatabaseAccess,
+    type PluginDatabaseAccess,
+    type PluginCharacterQuery,
+    type PluginConversationMessageQuery,
+    type PluginConversationQuery,
+} from "../pluginDatabaseAccess";
 
 /*
     V3 API for RisuAI Plugins
@@ -56,6 +65,16 @@ import {
 
 const pluginChannel = new Map<string, Function>();
 const documentEventListeners: Array<{type: string, listener: EventListenerOrEventListenerObject, options: any}> = [];
+let pluginDatabaseAccess: PluginDatabaseAccess | undefined
+
+function getPluginDatabaseAccess(): PluginDatabaseAccess {
+    return (pluginDatabaseAccess ??= createPluginDatabaseAccess({
+        store: createPersistentDataStore(),
+        flushPendingData,
+        getCompatibilityDatabase: () => DBState.db,
+        snapshot: <T>(value: T) => $state.snapshot(value) as T,
+    }))
+}
 
 class SafeElement {
     #element: HTMLElement;
@@ -746,15 +765,19 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             if(!conf){
                 return null;
             }
-            const db = DBState.db
-            let liteDB = {}
-            for(const key of allowedDbKeys){
-                if(includeOnly !== 'all' && !includeOnly.includes(key)){
-                    continue;
-                }
-                (liteDB as any)[key] = $state.snapshot((db as any)[key]);
-            }
-            return liteDB;
+            return getPluginDatabaseAccess().getDatabaseSnapshot(includeOnly, allowedDbKeys)
+        },
+        queryCharacters: async (input?: PluginCharacterQuery) => {
+            const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
+            return allowed ? getPluginDatabaseAccess().queryCharacters(input) : null
+        },
+        queryConversations: async (input: PluginConversationQuery) => {
+            const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
+            return allowed ? getPluginDatabaseAccess().queryConversations(input) : null
+        },
+        queryConversationMessages: async (input: PluginConversationMessageQuery) => {
+            const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
+            return allowed ? getPluginDatabaseAccess().queryConversationMessages(input) : null
         },
 
         installPlugin: handlePluginInstallViaPlugin,

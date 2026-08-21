@@ -182,6 +182,78 @@ await risuai.getCharacter()
 await risuai.setCharacter(characterData)
 ```
 
+#### Scalable database queries
+
+API v3 plugins can page committed data by stable IDs without requesting a complete database
+snapshot. Treat every returned cursor as opaque and pass it back unchanged.
+
+```javascript
+let characterCursor
+do {
+    const page = await risuai.queryCharacters({
+        order: 'configured',
+        limit: 50,
+        cursor: characterCursor,
+    })
+    if (!page) break
+    for (const character of page.items) {
+        console.log(character.id, character.name)
+    }
+    characterCursor = page.nextCursor
+} while (characterCursor)
+```
+
+Page conversations with the stable character ID returned above:
+
+```javascript
+let conversationCursor
+do {
+    const page = await risuai.queryConversations({
+        characterId,
+        order: 'configured',
+        limit: 50,
+        cursor: conversationCursor,
+    })
+    if (!page) break
+    for (const conversation of page.items) {
+        console.log(conversation.id, conversation.name)
+    }
+    conversationCursor = page.nextCursor
+} while (conversationCursor)
+```
+
+Read the latest bounded message window, or anchor a bounded window around a stable message ID:
+
+```javascript
+const latest = await risuai.queryConversationMessages({
+    characterId,
+    conversationId,
+    limit: 128,
+})
+
+const aroundMessage = await risuai.queryConversationMessages({
+    characterId,
+    conversationId,
+    anchorMessageId,
+    before: 32,
+    after: 32,
+})
+```
+
+V3-only plugin sets use the scalable profile automatically. Any enabled API v2.1 plugin
+selects maximum compatibility, while disabled API v2.1 plugins do not. Maximum compatibility
+preserves the synchronous live database Proxy, root DOM behavior, visual plugins, and global
+CSS, but cannot guarantee memory independent of library size. The scalable profile does not
+remove V3 root DOM access, visual APIs, or global CSS compatibility.
+
+`getDatabase()` remains supported as the explicit compatibility snapshot. Requesting
+`characters`, including its default `'all'`, can temporarily materialize the complete library.
+The bounded query methods flush pending compatibility changes before exposing committed data
+and return cloned values rather than mutable live references. Existing index-based APIs remain
+compatible, but stable IDs and opaque cursors are the scalable path. A denied permission returns
+`null`, and an anchored message query also returns `null` when its character, conversation, or
+message cannot be found.
+
 #### Argument APIs (v3.0)
 
 Type-safe argument management:

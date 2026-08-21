@@ -11,6 +11,11 @@ import { checkCodeSafety } from "./pluginSafety";
 import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClass";
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
+import {
+    createPluginCompatibilityController,
+    selectPluginCompatibilityProfile,
+} from "./pluginCompatibility";
+import { flushPendingData } from "../storage/persistentDataRuntime.svelte";
 
 export const customProviderStore = writable([] as string[])
 
@@ -429,16 +434,30 @@ export async function importPlugin(code:string|null = null, argu:{
 
 let pluginTranslator = false
 
+export const pluginCompatibility = createPluginCompatibilityController(() =>
+    flushPendingData('plugin-profile-change'),
+)
+
 export async function loadPlugins() {
     console.log('Loading plugins...')
     let db = getDatabase()
 
-
-    const enabledPlugins = safeStructuredClone(db.plugins).filter((p: RisuPlugin) => p.enabled)
+    const plugins = safeStructuredClone(db.plugins)
+    const enabledPlugins = plugins.filter((p: RisuPlugin) => p.enabled)
     const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
     const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
+    const nextProfile = selectPluginCompatibilityProfile(plugins)
 
-    await loadV2Plugin(pluginV2)
+    if (
+        pluginCompatibility.profile === 'maximum-compatibility' &&
+        nextProfile === 'scalable-v3'
+    ) {
+        await loadV2Plugin([])
+        await pluginCompatibility.transition(nextProfile)
+    } else {
+        await pluginCompatibility.transition(nextProfile)
+        await loadV2Plugin(pluginV2)
+    }
     await loadV3Plugins(pluginV3)
 }
 

@@ -1200,6 +1200,95 @@ interface ProviderOptions {
     tokenizerFunc?: (content: string) => number[] | Promise<number[]>;
 }
 
+interface PluginCharacterSummary {
+    id: string;
+    name: string;
+    image?: string;
+    configuredIndex: number;
+    recentAt: number;
+    trashed: boolean;
+    conversationCount: number;
+}
+
+interface PluginCharacterPage {
+    items: PluginCharacterSummary[];
+    nextCursor?: string;
+}
+
+interface PluginConversationSummary {
+    id: string;
+    characterId: string;
+    name: string;
+    configuredIndex: number;
+    recentAt: number;
+    messageCount: number;
+}
+
+interface PluginConversationPage {
+    items: PluginConversationSummary[];
+    nextCursor?: string;
+}
+
+interface PluginConversationMessage {
+    role: 'user' | 'char';
+    data: string;
+    saying?: string;
+    chatId?: string;
+    time?: number;
+    generationInfo?: Record<string, unknown>;
+    promptInfo?: Record<string, unknown>;
+    name?: string;
+    otherUser?: boolean;
+    disabled?: false | true | 'allBefore';
+    isComment?: boolean;
+}
+
+interface PluginConversationWindow {
+    characterId: string;
+    conversationId: string;
+    messages: PluginConversationMessage[];
+    startIndex: number;
+    endIndex: number;
+    totalMessages: number;
+    hasMoreBefore: boolean;
+    hasMoreAfter: boolean;
+}
+
+interface PluginCharacterQuery {
+    search?: string;
+    order?: 'configured' | 'recent';
+    trash?: boolean;
+    /** Defaults to 50 and is clamped to 100. */
+    limit?: number;
+    /** Opaque cursor returned by the previous page. */
+    cursor?: string;
+}
+
+interface PluginConversationQuery {
+    /** Stable character ID. */
+    characterId: string;
+    order?: 'configured' | 'recent';
+    /** Defaults to 50 and is clamped to 100. */
+    limit?: number;
+    /** Opaque cursor returned by the previous page. */
+    cursor?: string;
+}
+
+interface PluginConversationMessageQuery {
+    /** Stable character ID. */
+    characterId: string;
+    /** Stable conversation ID. */
+    conversationId: string;
+    /** Latest-window size, defaults to 128 and is clamped to 128. */
+    limit?: number;
+    /** Stable message ID for anchored mode. Missing anchored data returns null. */
+    anchorMessageId?: string;
+    /** Messages before the anchor. The complete anchored window cannot exceed 128. */
+    before?: number;
+    /** Messages after the anchor. The complete anchored window cannot exceed 128. */
+    after?: number;
+}
+
 // ============================================================================
 // Risuai Global API
 // ============================================================================
@@ -1435,7 +1524,9 @@ interface RisuaiPluginAPI {
      * textTheme, lineHeight, seperateModelsForAxModels, seperateModels,
      * customCSS, guiHTML, colorSchemeName, characterOrder, selectedPersona
      *
-     * Use includeOnly to limit which keys to retrieve for better performance.
+     * Requesting characters, including the default 'all', materializes a complete
+     * compatibility snapshot and can temporarily use memory proportional to the library.
+     * Prefer the bounded ID-based query methods for normal reads.
      * 
      * @example
      * ```typescript
@@ -1446,6 +1537,21 @@ interface RisuaiPluginAPI {
      * ```
      */
     getDatabase(includeOnly:string[]|'all' = 'all'): Promise<DatabaseSubset|null>;
+
+    /** Pages committed character summaries. Returns null when database permission is denied. */
+    queryCharacters(input?: PluginCharacterQuery): Promise<PluginCharacterPage | null>;
+
+    /** Pages committed conversations for a stable character ID. */
+    queryConversations(input: PluginConversationQuery): Promise<PluginConversationPage | null>;
+
+    /**
+     * Reads a bounded latest or anchored message window. Omit anchorMessageId, before,
+     * and after for latest mode. Returns null when permission is denied or anchored data
+     * does not exist.
+     */
+    queryConversationMessages(
+        input: PluginConversationMessageQuery,
+    ): Promise<PluginConversationWindow | null>;
 
     /**
      * Sets the database (lightweight save)
