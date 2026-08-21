@@ -116,6 +116,7 @@
     "@types/uuid": "^9.0.8",
     "@types/wicg-file-system-access": "^2020.9.8",
     "autoprefixer": "^10.4.23",
+    "fake-indexeddb": "^6.2.5",
     "fast-check": "^4.5.3",
     "happy-dom": "^20.1.0",
     "internal-ip": "^7.0.0",
