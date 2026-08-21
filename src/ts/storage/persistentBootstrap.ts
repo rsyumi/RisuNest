@@ -1,6 +1,10 @@
 import type { Database } from './database.svelte'
 import type { LegacyLocalStorage } from './legacyLocalStorage'
-import type { DataRevision, PersistentDataStore } from './persistentDataStore'
+import {
+    RevisionConflictError,
+    type DataRevision,
+    type PersistentDataStore,
+} from './persistentDataStore'
 import { canonicalJson } from './saveCoordinator'
 
 export type PersistentBootstrapSource = 'persistent' | 'primary' | 'fallback' | 'default' | 'account'
@@ -66,6 +70,7 @@ export async function replaceExplicitBootstrapCandidate(dependencies: {
         await dependencies.replaceCandidate(await dependencies.decodeCandidate(bytes))
         return true
     } catch (error) {
+        if (error instanceof RevisionConflictError) throw error
         dependencies.onError?.(error)
         return false
     }

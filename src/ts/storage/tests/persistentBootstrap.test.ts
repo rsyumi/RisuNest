@@ -114,6 +114,50 @@ describe('bootstrapPersistentDatabase', () => {
         expect(await store.materializeDatabase()).toEqual(remote)
     })
 
+    it('stops bootstrap when another connection commits during explicit remote loading', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `account-bootstrap-race-${crypto.randomUUID()}`
+        const first = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        const second = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await Promise.all([first.open(), second.open()])
+
+        const local = structuredClone(fixtureDatabase)
+        local.username = 'Local user'
+        const remote = structuredClone(fixtureDatabase)
+        remote.username = 'Remote user'
+        const concurrent = structuredClone(fixtureDatabase)
+        concurrent.username = 'Concurrent user'
+        const { characters: _characters, ...concurrentRoot } = concurrent
+        await first.replaceFromDatabase(local)
+
+        let revision = 1
+        const loadCandidate = vi.fn(async () => {
+            await second.commit({ expectedRevision: 1, root: concurrentRoot })
+            return new TextEncoder().encode(JSON.stringify(remote))
+        })
+        const replaceCandidate = vi.fn(async (database: Database) => {
+            revision = (await first.replaceFromDatabase(database, revision)).revision
+        })
+        const loadPlugins = vi.fn()
+        const continueBootstrap = async () => {
+            await replaceExplicitBootstrapCandidate({
+                loadCandidate,
+                decodeCandidate: async (bytes) => JSON.parse(new TextDecoder().decode(bytes)),
+                replaceCandidate,
+            })
+            await loadPlugins()
+        }
+
+        await expect(continueBootstrap()).rejects.toBeInstanceOf(RevisionConflictError)
+
+        expect(loadCandidate).toHaveBeenCalledOnce()
+        expect(replaceCandidate).toHaveBeenCalledOnce()
+        expect(loadPlugins).not.toHaveBeenCalled()
+        expect(revision).toBe(1)
+        expect((await second.readRoot()).revision).toBe(2)
+        expect((await second.materializeDatabase()).username).toBe('Concurrent user')
+    })
+
     it('lists legacy backups newest first without including unrelated keys', () => {
         expect(listLegacyDatabaseBackups([
             'database/dbbackup-12.bin',
