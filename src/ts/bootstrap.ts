@@ -237,8 +237,7 @@ export async function loadData() {
             if (!localStorage.getItem('nightlyWarned') && window.location.hostname === 'nightly.risuai.xyz') {
                 alertMd(language.nightlyWarning)
                 await waitAlert()
-                //for testing, leave empty
-                localStorage.setItem('nightlyWarned', '')
+                localStorage.setItem('nightlyWarned', 'true')
             }
             if (db.botSettingAtStart) {
                 botMakerMode.set(true)
