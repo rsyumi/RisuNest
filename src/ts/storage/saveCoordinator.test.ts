@@ -412,6 +412,10 @@ describe('SaveCoordinator', () => {
         firstCommit.resolve({ revision: 2 })
         await flushing
         await vi.waitFor(() => expect(replaceFromDatabase).toHaveBeenCalledTimes(1))
+        expect(replaceFromDatabase).toHaveBeenCalledWith(
+            expect.objectContaining({ username: 'Replacement' }),
+            2,
+        )
         expect(replaceDatabase).not.toHaveBeenCalled()
         database.characters[0].name = 'Mutation after capture'
         coordinator.markPersistentDataDirty(12)

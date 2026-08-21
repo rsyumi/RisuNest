@@ -214,7 +214,7 @@ export class SaveCoordinator {
         capturedGeneration: number,
         _reason: string,
     ): Promise<void> {
-        const replaced = await this.dependencies.store.replaceFromDatabase(candidate)
+        const replaced = await this.dependencies.store.replaceFromDatabase(candidate, this.revision)
         const live = this.capture()
         const stalePublication = this.pendingPublication
         this.pendingPublication = null
