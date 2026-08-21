@@ -1,4 +1,5 @@
 import type { Database } from './database.svelte'
+import type { LegacyLocalStorage } from './legacyLocalStorage'
 import type { DataRevision, PersistentDataStore } from './persistentDataStore'
 import { canonicalJson } from './saveCoordinator'
 
@@ -29,6 +30,45 @@ export function listLegacyDatabaseBackups(keys: string[]): number[] {
         .filter((timestamp): timestamp is string => timestamp !== undefined)
         .map(Number)
         .sort((a, b) => b - a)
+}
+
+export async function readLegacyDatabaseCandidate(
+    storage: LegacyLocalStorage,
+    decode: (bytes: Uint8Array) => Promise<Database>,
+    onError: (error: unknown) => void = () => undefined,
+): Promise<LegacyDatabaseCandidate> {
+    try {
+        const primary = await storage.getItem('database/database.bin')
+        if (primary) return { database: await decode(primary), source: 'primary' }
+    } catch (error) {
+        onError(error)
+    }
+    for (const backup of listLegacyDatabaseBackups(await storage.keys())) {
+        try {
+            const bytes = await storage.getItem(`database/dbbackup-${backup}.bin`)
+            if (bytes) return { database: await decode(bytes), source: 'fallback' }
+        } catch (error) {
+            onError(error)
+        }
+    }
+    return { database: {} as Database, source: 'default' }
+}
+
+export async function replaceExplicitBootstrapCandidate(dependencies: {
+    loadCandidate(): Promise<Uint8Array | null>
+    decodeCandidate(bytes: Uint8Array): Promise<Database>
+    replaceCandidate(database: Database): Promise<void>
+    onError?(error: unknown): void
+}): Promise<boolean> {
+    try {
+        const bytes = await dependencies.loadCandidate()
+        if (!bytes) return false
+        await dependencies.replaceCandidate(await dependencies.decodeCandidate(bytes))
+        return true
+    } catch (error) {
+        dependencies.onError?.(error)
+        return false
+    }
 }
 
 export async function bootstrapPersistentDatabase(

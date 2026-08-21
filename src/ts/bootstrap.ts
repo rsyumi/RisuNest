@@ -47,8 +47,11 @@ import {
 import {
     bootstrapPersistentDatabase,
     listLegacyDatabaseBackups,
+    readLegacyDatabaseCandidate,
+    replaceExplicitBootstrapCandidate,
     type LegacyDatabaseCandidate,
 } from "./storage/persistentBootstrap";
+import { getLegacyLocalStorage } from "./storage/legacyLocalStorage";
 import {
     getPersistentDataRuntime,
     initializeActiveWorkingSet,
@@ -100,25 +103,11 @@ async function loadLegacyDatabaseCandidate(): Promise<LegacyDatabaseCandidate> {
     }
 
     LoadingStatusState.text = 'Loading Local Save File...'
-    const primary = await forageStorage.getItem('database/database.bin') as Uint8Array | null
-    if (primary) {
-        try {
-            return { database: await decodeRisuSave(primary), source: 'primary' }
-        } catch (error) {
-            console.error(error)
-        }
-    }
-    for (const backup of listLegacyDatabaseBackups(await forageStorage.keys())) {
-        try {
-            const bytes = await forageStorage.getItem(
-                `database/dbbackup-${backup}.bin`,
-            ) as Uint8Array
-            return { database: await decodeRisuSave(bytes), source: 'fallback' }
-        } catch (error) {
-            console.error(error)
-        }
-    }
-    return { database: {} as Database, source: 'default' }
+    return readLegacyDatabaseCandidate(
+        getLegacyLocalStorage(),
+        decodeRisuSave,
+        (error) => console.error(error),
+    )
 }
 
 /**
@@ -161,23 +150,19 @@ export async function loadData() {
         if (!isTauri) {
             if (await forageStorage.checkAccountSync()) {
                 LoadingStatusState.text = 'Checking Account Sync...'
-                try {
-                    const remote = await (forageStorage.realStorage as AccountStorage).getItem(
+                await replaceExplicitBootstrapCandidate({
+                    loadCandidate: () => (forageStorage.realStorage as AccountStorage).getItem(
                         'database/database.bin',
                         (value) => {
                             LoadingStatusState.text =
                                 `Loading Remote Save File ${(value * 100).toFixed(2)}%`
                         },
-                    ) as Uint8Array | null
-                    if (remote) {
-                        await replacePersistentDatabase(
-                            await decodeRisuSave(remote),
-                            'account-bootstrap',
-                        )
-                    }
-                } catch (error) {
-                    console.error(error)
-                }
+                    ) as Promise<Uint8Array | null>,
+                    decodeCandidate: decodeRisuSave,
+                    replaceCandidate: (database) =>
+                        replacePersistentDatabase(database, 'account-bootstrap'),
+                    onError: (error) => console.error(error),
+                })
             }
             LoadingStatusState.text = 'Rechecking Account Sync...'
             await forageStorage.checkAccountSync()

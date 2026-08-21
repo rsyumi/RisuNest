@@ -3,7 +3,12 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import { RevisionConflictError, type PersistentDataStore } from '../persistentDataStore'
-import { bootstrapPersistentDatabase, listLegacyDatabaseBackups } from '../persistentBootstrap'
+import {
+    bootstrapPersistentDatabase,
+    listLegacyDatabaseBackups,
+    readLegacyDatabaseCandidate,
+    replaceExplicitBootstrapCandidate,
+} from '../persistentBootstrap'
 import { fixtureDatabase } from './persistentDataFixtures'
 
 function createStore(input?: {
@@ -36,6 +41,79 @@ function createStore(input?: {
 }
 
 describe('bootstrapPersistentDatabase', () => {
+    it.each([
+        ['missing', async () => null],
+        ['failing', async () => { throw new Error('remote unavailable') }],
+    ])('imports valid local bytes when an explicit remote is %s', async (_case, loadRemote) => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `account-bootstrap-local-${crypto.randomUUID()}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        const local = structuredClone(fixtureDatabase)
+        local.username = 'Local user'
+        const localStorage = {
+            getItem: vi.fn(async (key: string) => key === 'database/database.bin'
+                ? new TextEncoder().encode(JSON.stringify(local))
+                : null),
+            keys: vi.fn(async () => ['database/database.bin']),
+        }
+
+        const bootstrapped = await bootstrapPersistentDatabase({
+            store,
+            loadLegacyCandidate: () => readLegacyDatabaseCandidate(
+                localStorage,
+                async (bytes) => JSON.parse(new TextDecoder().decode(bytes)) as Database,
+            ),
+            prepareDatabase: async (database) => structuredClone(database),
+        })
+        let revision = bootstrapped.revision
+        const replaced = await replaceExplicitBootstrapCandidate({
+            loadCandidate: loadRemote,
+            decodeCandidate: async (bytes) => JSON.parse(new TextDecoder().decode(bytes)),
+            replaceCandidate: async (database) => {
+                revision = (await store.replaceFromDatabase(database, revision)).revision
+            },
+        })
+
+        expect(bootstrapped.source).toBe('primary')
+        expect(replaced).toBe(false)
+        expect(revision).toBe(1)
+        expect(await store.materializeDatabase()).toEqual(local)
+    })
+
+    it('applies a valid explicit remote only after selecting the local candidate', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `account-bootstrap-remote-${crypto.randomUUID()}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        const local = structuredClone(fixtureDatabase)
+        local.username = 'Local user'
+        const remote = structuredClone(fixtureDatabase)
+        remote.username = 'Remote user'
+        const bootstrapped = await bootstrapPersistentDatabase({
+            store,
+            loadLegacyCandidate: async () => ({ database: local, source: 'primary' }),
+            prepareDatabase: async (database) => structuredClone(database),
+        })
+        let revision = bootstrapped.revision
+
+        const replaced = await replaceExplicitBootstrapCandidate({
+            loadCandidate: async () => new TextEncoder().encode(JSON.stringify(remote)),
+            decodeCandidate: async (bytes) => JSON.parse(new TextDecoder().decode(bytes)),
+            replaceCandidate: async (database) => {
+                revision = (await store.replaceFromDatabase(database, revision)).revision
+            },
+        })
+
+        expect(replaced).toBe(true)
+        expect(revision).toBe(2)
+        expect(await store.materializeDatabase()).toEqual(remote)
+    })
+
     it('lists legacy backups newest first without including unrelated keys', () => {
         expect(listLegacyDatabaseBackups([
             'database/dbbackup-12.bin',
