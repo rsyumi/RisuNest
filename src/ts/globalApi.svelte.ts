@@ -7,7 +7,7 @@ import {
     readDir,
     remove
 } from "@tauri-apps/plugin-fs"
-import { changeFullscreen, checkNullish, sleep } from "./util"
+import { changeFullscreen, sleep } from "./util"
 import { convertFileSrc, invoke } from "@tauri-apps/api/core"
 import { v4 as uuidv4, v4 } from 'uuid';
 import { appDataDir, join } from "@tauri-apps/api/path";
@@ -20,16 +20,16 @@ import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState, selIdState, ReloadGUIPointer, bodyIntercepterStore } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
 import { alertConfirm, alertError, alertMd, alertNormal, alertNormalWait, alertSelect, alertTOS, waitAlert } from "./alert";
-import { checkDriverInit, syncDrive } from "./drive/drive";
+import { checkDriverInit } from "./drive/drive";
 import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { loadRisuAccountData } from "./drive/accounter";
-import { decodeRisuSave, encodeRisuSaveLegacy, RisuSaveEncoder, type toSaveType } from "./storage/risuSave";
+import { decodeRisuSave } from "./storage/risuSave";
 import { AutoStorage } from "./storage/autoStorage";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
-import { autoServerBackup, saveDbKei } from "./kei/backup";
+import { autoServerBackup } from "./kei/backup";
 import { save } from "@tauri-apps/plugin-dialog";
 import { listen } from '@tauri-apps/api/event'
 import { language } from "src/lang";
@@ -39,7 +39,7 @@ import { updateLorebooks } from "./characters";
 import { initMobileGesture } from "./hotkey";
 import { fetch as TauriHTTPFetch } from '@tauri-apps/plugin-http';
 import { moduleUpdate } from "./process/modules";
-import type { AccountStorage } from "./storage/accountStorage";
+import { AccountStorage } from "./storage/accountStorage";
 import { getColdStorageItem, makeColdData } from "./process/coldstorage.svelte";
 import { isTauri, isNodeServer } from "./platform";
 import { isLocalNetworkUrl } from "./network/localNetwork";
@@ -47,6 +47,11 @@ import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEv
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
 import { ByteBudgetLru } from "./util/byteBudgetLru";
 import { checkCharOrder as repairDatabaseCharacterOrder } from "./storage/databasePreparation";
+import {
+    configurePersistentDataRuntime,
+    markPersistentDataDirty,
+} from "./storage/persistentDataRuntime.svelte";
+import { installPersistentSaveNotifications } from "./storage/persistentSaveNotifications";
 
 export const forageStorage = new AutoStorage()
 
@@ -280,7 +285,6 @@ export async function loadAsset(id: string) {
     }
 }
 
-let lastSave = ''
 export let saving = $state({
     state: false
 })
@@ -293,199 +297,58 @@ export let saving = $state({
 export let requiresFullEncoderReload = $state({
     state: false
 })
+let disposePersistentSaveObserver: (() => void) | null = null
+
+function estimateSnapshotBytes(value: unknown): number {
+    try {
+        return new TextEncoder().encode(JSON.stringify(value)).byteLength
+    } catch {
+        return 0
+    }
+}
+
 export async function saveDb() {
-    let changed = false
-    syncDrive()
-    let gotChannel = false
-    const sessionID = v4()
-    let channel: BroadcastChannel
-    if (window.BroadcastChannel) {
-        channel = new BroadcastChannel('risu-db')
-    }
-    if (channel) {
-        channel.onmessage = (ev) => {
-            if (ev.data === sessionID) {
-                return
-            }
-            if (!gotChannel) {
-                gotChannel = true
-                alertNormalWait(language.activeTabChange).then(() => {
-                    location.reload()
-                })
-            }
-        }
-    }
-
-    const changeTracker: toSaveType = {
-        character: [],
-        chat: [],
-        botPreset: false,
-        modules: false,
-        loadouts: false,
-        plugins: false,
-        pluginCustomStorage: false
-    }
-
-    let encoder = new RisuSaveEncoder()
-    await encoder.init(getDatabase(), {
-        compression: forageStorage.isAccount
+    if (disposePersistentSaveObserver) return
+    configurePersistentDataRuntime({
+        officialStorage:
+            forageStorage.isAccount && forageStorage.realStorage instanceof AccountStorage
+                ? forageStorage.realStorage
+                : null,
     })
-
-    $effect.root(() => {
-
-        let selIdState = $state(0)
-
-        const debounceTime = 500; // 500 milliseconds
-        let saveTimeout: ReturnType<typeof setTimeout> | null = null;
-
-        selectedCharID.subscribe((v) => {
-            selIdState = v
-        })
-
-        function saveTimeoutExecute() {
-            if (saveTimeout) {
-                clearTimeout(saveTimeout);
-            }
-            saveTimeout = setTimeout(() => {
-                changed = true;
-            }, debounceTime);
-        }
-
+    const channel = window.BroadcastChannel ? new BroadcastChannel('risu-db') : null
+    const disposeNotifications = installPersistentSaveNotifications({
+        sessionId: v4(),
+        channel,
+        configureRuntime: configurePersistentDataRuntime,
+        showForeignRevisionWarning: () => {
+            void alertNormalWait(language.activeTabChange).then(() => location.reload())
+        },
+        setSaving: (value) => {
+            saving.state = value
+        },
+        reportError: (error) => alertError(error instanceof Error ? error : String(error)),
+    })
+    const disposeEffects = $effect.root(() => {
         $effect(() => {
-            DBState.db.botPresetsId
-            DBState.db.botPresets.length
-            changeTracker.botPreset = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.modules)
-            changeTracker.modules = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.loadouts)
-            changeTracker.loadouts = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.plugins)
-            changeTracker.plugins = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
-            $state.snapshot(DBState.db.pluginCustomStorage)
-            changeTracker.pluginCustomStorage = true
-            saveTimeoutExecute()
-        })
-        $effect(() => {
+            const root: Record<string, unknown> = {}
             for (const key in DBState.db) {
-                if (
-                    key !== 'characters' && key !== 'botPresets' && key !== 'modules' &&
-                    key !== 'loadouts' && key !== 'plugins' && key !== 'pluginCustomStorage'
-                ) {
-                    $state.snapshot(DBState.db[key])
+                if (key !== 'characters') {
+                    root[key] = $state.snapshot(DBState.db[key])
                 }
             }
-            if (DBState?.db?.characters?.[selIdState]) {
-                for (const key in DBState.db.characters[selIdState]) {
-                    if (key !== 'chats') {
-                        $state.snapshot(DBState.db.characters[selIdState][key])
-                    }
-                }
-                $state.snapshot(DBState.db.characters[selIdState].chats)
-                if (changeTracker.character[0] !== DBState.db.characters[selIdState]?.chaId) {
-                    changeTracker.character.unshift(DBState.db.characters[selIdState]?.chaId)
-                }
-                if (
-                    changeTracker.chat[0]?.[0] !== DBState.db.characters[selIdState]?.chaId ||
-                    changeTracker.chat[0]?.[1] !== DBState.db.characters[selIdState]?.chats[DBState.db.characters[selIdState]?.chatPage].id
-                ) {
-                    changeTracker.chat.unshift([DBState.db.characters[selIdState]?.chaId, DBState.db.characters[selIdState]?.chats[DBState.db.characters[selIdState]?.chatPage].id])
-                }
-            }
-            saveTimeoutExecute()
+            markPersistentDataDirty(estimateSnapshotBytes(root))
+        })
+        $effect(() => {
+            const character = DBState.db.characters?.[selIdState.selId]
+            markPersistentDataDirty(
+                estimateSnapshotBytes(character ? $state.snapshot(character) : null),
+            )
         })
     })
-
-    let savetrys = 0
-    let lastDbData = new Uint8Array(0)
-    await sleep(1000)
-    while (true) {
-        if (!changed) {
-            await sleep(500)
-            continue
-        }
-
-        saving.state = true
-        changed = false
-        try {
-
-            if (requiresFullEncoderReload.state) {
-                encoder = new RisuSaveEncoder()
-                await encoder.init(getDatabase(), {
-                    compression: forageStorage.isAccount,
-                    skipRemoteSavingOnCharacters: false
-                })
-                requiresFullEncoderReload.state = false
-            }
-
-            let toSave = safeStructuredClone(changeTracker)
-            changeTracker.character = changeTracker.character.length === 0 ? [] : [changeTracker.character[0]]
-            changeTracker.chat = changeTracker.chat.length === 0 ? [] : [changeTracker.chat[0]]
-            changeTracker.botPreset = false
-            changeTracker.modules = false
-            if (gotChannel) {
-                //Data is saved in other tab
-                await sleep(1000)
-                continue
-            }
-            if (channel) {
-                channel.postMessage(sessionID)
-            }
-            let db = getDatabase()
-            if (!db.characters) {
-                await sleep(1000)
-                continue
-            }
-
-            await encoder.set(db, toSave)
-            const encoded = encoder.encode()
-            if (!encoded) {
-                await sleep(1000)
-                continue
-            }
-            const dbData = new Uint8Array(encoded)
-            if (isTauri) {
-                await writeFile('database/database.bin', dbData, { baseDir: BaseDirectory.AppData });
-                await writeFile(`database/dbbackup-${(Date.now() / 100).toFixed()}.bin`, dbData, { baseDir: BaseDirectory.AppData });
-            }
-            else {
-
-                await forageStorage.setItem('database/database.bin', dbData)
-                if (!forageStorage.isAccount) {
-                    await forageStorage.setItem(`database/dbbackup-${(Date.now() / 100).toFixed()}.bin`, dbData)
-                }
-                if (forageStorage.isAccount) {
-                    await sleep(3000)
-                }
-            }
-            if (!forageStorage.isAccount) {
-                await getDbBackups()
-            }
-            savetrys = 0
-            await saveDbKei()
-            await sleep(500)
-        } catch (error) {
-            savetrys += 1
-            if (savetrys > 4) {
-                alertError(error)
-            }
-            else {
-                console.error(error)
-            }
-        }
-
-        saving.state = false
+    disposePersistentSaveObserver = () => {
+        disposeEffects()
+        disposeNotifications()
+        disposePersistentSaveObserver = null
     }
 }
 

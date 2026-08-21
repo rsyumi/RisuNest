@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import { RevisionConflictError, type PersistentDataStore } from '../persistentDataStore'
-import { bootstrapPersistentDatabase } from '../persistentBootstrap'
+import { bootstrapPersistentDatabase, listLegacyDatabaseBackups } from '../persistentBootstrap'
 import { fixtureDatabase } from './persistentDataFixtures'
 
 function createStore(input?: {
@@ -36,6 +36,16 @@ function createStore(input?: {
 }
 
 describe('bootstrapPersistentDatabase', () => {
+    it('lists legacy backups newest first without including unrelated keys', () => {
+        expect(listLegacyDatabaseBackups([
+            'database/dbbackup-12.bin',
+            'database/database.bin',
+            'database/dbbackup-105.bin',
+            'database/dbbackup-invalid.bin',
+            'assets/dbbackup-999.bin',
+        ])).toEqual([105, 12])
+    })
+
     it('imports one prepared legacy candidate when the store is blank', async () => {
         const store = createStore({ revision: 0, replacementRevision: 1 })
         const legacy = structuredClone(fixtureDatabase)

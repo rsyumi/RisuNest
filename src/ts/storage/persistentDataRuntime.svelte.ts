@@ -6,6 +6,8 @@ import { prepareDatabaseForPersistence } from './databasePreparation'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
 import type { DataRevision } from './persistentDataStore'
 import {
+    capturePersistentRoot,
+    captureSelectedPersistentCharacter,
     createPersistentDataRuntime,
     type OfficialDatabaseStorage,
     type PersistentDataRuntime,
@@ -24,12 +26,10 @@ type CompleteCharacter = character | groupChat
 function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
     return {
         captureRoot() {
-            const { characters: _characters, ...root } = getDatabase({ snapshot: true })
-            return root
+            return capturePersistentRoot(getDatabase())
         },
         captureSelectedCharacter(): CompleteCharacter | null {
-            const database = getDatabase({ snapshot: true })
-            return database.characters[get(selectedCharID)] ?? null
+            return captureSelectedPersistentCharacter(getDatabase(), get(selectedCharID))
         },
         getSelectedCharacterId() {
             return getDatabase().characters[get(selectedCharID)]?.chaId
@@ -86,7 +86,7 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
         productionRuntime = createPersistentDataRuntime({
             store: getPersistentDataStore(),
             state: productionStateAdapter(),
-            officialStorage: productionConfiguration.officialStorage,
+            getOfficialStorage: () => productionConfiguration.officialStorage,
             onLocalRevision: (revision) => productionConfiguration.onLocalRevision?.(revision),
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),
             onBackgroundError: (error) => productionConfiguration.onBackgroundError?.(error),

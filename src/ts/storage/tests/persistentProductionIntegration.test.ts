@@ -3,10 +3,13 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import {
+    capturePersistentRoot,
+    captureSelectedPersistentCharacter,
     createPersistentDataRuntime,
     type PersistentDataRuntimeStateAdapter,
 } from '../persistentDataRuntime'
 import { decodeRisuSave } from '../risuSave'
+import { installPersistentSaveNotifications } from '../persistentSaveNotifications'
 
 vi.mock('../database.svelte', () => ({
     getDatabase: () => {
@@ -71,6 +74,21 @@ function makeStore(name: string) {
 }
 
 describe('persistent production runtime', () => {
+    it('captures root and the selected character without traversing inactive characters', () => {
+        const database = makeDatabase()
+        const inactive = structuredClone(database.characters[0])
+        Object.defineProperty(inactive, 'chats', {
+            enumerable: true,
+            get: () => {
+                throw new Error('inactive character was traversed')
+            },
+        })
+        database.characters.push(inactive)
+
+        expect(capturePersistentRoot(database).username).toBe('Fixture')
+        expect(captureSelectedPersistentCharacter(database, 0)?.chaId).toBe('char-a')
+    })
+
     it('commits ordinary root and selected-character edits without a legacy writer', async () => {
         const database = makeDatabase()
         const store = makeStore(`runtime-${crypto.randomUUID()}`)
@@ -129,5 +147,71 @@ describe('persistent production runtime', () => {
         expect(writes[1]).toBe(writes[0])
         expect((await decodeRisuSave(writes[0])).username).toBe('Published')
         expect(runtime.revision).toBe(2)
+    })
+
+    it('uses the official account storage selected after local initialization', async () => {
+        const database = makeDatabase()
+        const store = makeStore(`late-publisher-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const setItem = vi.fn(async (_key: string, _bytes: Uint8Array) => undefined)
+        let officialStorage: { setItem: typeof setItem } | null = null
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            getOfficialStorage: () => officialStorage,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        officialStorage = { setItem }
+        adapter.current().username = 'Account enabled'
+        runtime.markPersistentDataDirty(64)
+
+        await runtime.flushPendingData('account-enabled')
+
+        expect(setItem).toHaveBeenCalledOnce()
+        expect(setItem.mock.calls[0][0]).toBe('database/database.bin')
+    })
+
+    it('broadcasts successful revisions and warns only once for foreign sessions', async () => {
+        const posted: string[] = []
+        let onmessage: ((event: MessageEvent) => void) | null = null
+        let callbacks: {
+            onLocalRevision?: (revision: number) => void
+            onFlushPromise?: (promise: Promise<void> | null) => void
+        } = {}
+        const warning = vi.fn()
+        const savingStates: boolean[] = []
+        const dispose = installPersistentSaveNotifications({
+            sessionId: 'local-session',
+            channel: {
+                postMessage: (value) => posted.push(value as string),
+                close: vi.fn(),
+                get onmessage() {
+                    return onmessage
+                },
+                set onmessage(value) {
+                    onmessage = value
+                },
+            },
+            configureRuntime: (next) => {
+                callbacks = next
+            },
+            showForeignRevisionWarning: warning,
+            setSaving: (value) => savingStates.push(value),
+        })
+
+        callbacks.onLocalRevision?.(2)
+        onmessage?.({ data: 'local-session' } as MessageEvent)
+        onmessage?.({ data: 'foreign-a' } as MessageEvent)
+        onmessage?.({ data: 'foreign-b' } as MessageEvent)
+        callbacks.onFlushPromise?.(Promise.resolve())
+        callbacks.onFlushPromise?.(null)
+        dispose()
+
+        expect(posted).toEqual(['local-session'])
+        expect(warning).toHaveBeenCalledOnce()
+        expect(savingStates).toEqual([true, false])
     })
 })

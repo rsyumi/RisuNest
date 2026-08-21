@@ -7,21 +7,20 @@ import {
     readDir,
     remove
 } from "@tauri-apps/plugin-fs"
-import { changeFullscreen, checkNullish, sleep } from "./util"
+import { changeFullscreen, sleep } from "./util"
 import { get } from "svelte/store";
 import { setDatabase, getDatabase, type Database } from "./storage/database.svelte";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertError, alertMd, alertTOS, waitAlert, alertConfirm, alertInput } from "./alert";
+import { alertError, alertMd, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { characterURLImport } from "./characterCards";
 import { loadRisuAccountData } from "./drive/accounter";
-import { decodeRisuSave, encodeRisuSaveLegacy } from "./storage/risuSave";
+import { decodeRisuSave } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
-import { autoServerBackup } from "./kei/backup";
 import { language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
@@ -33,20 +32,28 @@ import { getRemoteSaveCleanupAction, getRemoteSavePayloadName } from "./storage/
 import {
     forageStorage,
     saveDb,
-    getDbBackups,
     getUncleanables,
     getBasename,
-    setUsingSw,
-    checkCharOrder
+    setUsingSw
 } from "./globalApi.svelte";
 import { isTauri, isTauriDesktop } from "./platform";
 import { registerModelDynamic } from "./model/modellist";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
 import {
-    assignIds as assignDatabaseIds,
     checkNewFormat as migrateDatabaseFormat,
+    prepareDatabaseForPersistence,
 } from "./storage/databasePreparation";
+import {
+    bootstrapPersistentDatabase,
+    listLegacyDatabaseBackups,
+    type LegacyDatabaseCandidate,
+} from "./storage/persistentBootstrap";
+import {
+    getPersistentDataRuntime,
+    initializeActiveWorkingSet,
+    replacePersistentDatabase,
+} from "./storage/persistentDataRuntime.svelte";
 export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
@@ -54,225 +61,195 @@ const appWindow = isTauri ? getCurrentWebviewWindow() : null
 /**
  * Loads the application data.
  */
-export async function loadData() {
-    const loaded = get(loadedStore)
-    if (!loaded) {
-        try {
-            if (isTauri) {
-                LoadingStatusState.text = "Checking Files..."
-                if (isTauriDesktop) {
-                    appWindow.maximize()
-                }
-                if (!await exists('', { baseDir: BaseDirectory.AppData })) {
-                    await mkdir('', { baseDir: BaseDirectory.AppData })
-                }
-                if (!await exists('database', { baseDir: BaseDirectory.AppData })) {
-                    await mkdir('database', { baseDir: BaseDirectory.AppData })
-                }
-                if (!await exists('assets', { baseDir: BaseDirectory.AppData })) {
-                    await mkdir('assets', { baseDir: BaseDirectory.AppData })
-                }
-                if (!await exists('database/database.bin', { baseDir: BaseDirectory.AppData })) {
-                    await writeFile('database/database.bin', encodeRisuSaveLegacy({}), { baseDir: BaseDirectory.AppData });
-                }
-                const appDataDirPath = await appDataDir();
-                try {
-                    LoadingStatusState.text = "Reading Save File..."
-                    const dbPath = await join(appDataDirPath, 'database/database.bin');
-                    const assetUrl = convertFileSrc(dbPath);
-                    const response = await fetch(assetUrl);
-                    if (!response.ok) {
-                        throw new Error(`Failed to load database: ${response.status}`);
-                    }
-                    const readed = new Uint8Array(await response.arrayBuffer());
-                    LoadingStatusState.text = "Cleaning Unnecessary Files..."
-                    getDbBackups() //this also cleans the backups
-                    LoadingStatusState.text = "Decoding Save File..."
-                    const decoded = await decodeRisuSave(readed)
-                    setDatabase(decoded)
-                } catch (error) {
-                    LoadingStatusState.text = "Reading Backup Files..."
-                    const backups = await getDbBackups()
-                    let backupLoaded = false
-                    for (const backup of backups) {
-                        if (!backupLoaded) {
-                            try {
-                                LoadingStatusState.text = `Reading Backup File ${backup}...`
-                                const backupPath = await join(appDataDirPath, `database/dbbackup-${backup}.bin`);
-                                const backupAssetUrl = convertFileSrc(backupPath);
-                                const backupResponse = await fetch(backupAssetUrl);
-                                if (!backupResponse.ok) {
-                                    throw new Error(`Failed to load backup ${backup}: ${backupResponse.status}`);
-                                }
-                                const backupData = new Uint8Array(await backupResponse.arrayBuffer());
-                                setDatabase(
-                                    await decodeRisuSave(backupData)
-                                )
-                                backupLoaded = true
-                            } catch (error) {
-                                console.error(error)
-                            }
-                        }
-                    }
-                    if (!backupLoaded) {
-                        throw "Your save file is corrupted"
-                    }
-                }
-                if (isTauriDesktop) {
-                    LoadingStatusState.text = "Checking Update..."
-                    await checkRisuUpdate()
-                    await changeFullscreen()
-                }
+async function readTauriLegacyDatabase(path: string): Promise<Database> {
+    const appDataDirPath = await appDataDir()
+    const databasePath = await join(appDataDirPath, path)
+    const response = await fetch(convertFileSrc(databasePath))
+    if (!response.ok) throw new Error(`Failed to load database: ${response.status}`)
+    return decodeRisuSave(new Uint8Array(await response.arrayBuffer()))
+}
 
-            }
-            else {
-                await forageStorage.Init()
-
-                LoadingStatusState.text = "Loading Local Save File..."
-                let gotStorage: Uint8Array = await forageStorage.getItem('database/database.bin') as unknown as Uint8Array
-                LoadingStatusState.text = "Decoding Local Save File..."
-                if (checkNullish(gotStorage)) {
-                    gotStorage = encodeRisuSaveLegacy({})
-                    await forageStorage.setItem('database/database.bin', gotStorage)
-                }
-                try {
-                    const decoded = await decodeRisuSave(gotStorage)
-                    console.log(decoded)
-                    setDatabase(decoded)
-                } catch (error) {
-                    console.error(error)
-                    const backups = await getDbBackups()
-                    let backupLoaded = false
-                    for (const backup of backups) {
-                        try {
-                            LoadingStatusState.text = `Reading Backup File ${backup}...`
-                            const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
-                            setDatabase(
-                                await decodeRisuSave(backupData)
-                            )
-                            backupLoaded = true
-                        } catch (error) { }
-                    }
-                    if (!backupLoaded) {
-                        throw "Forage: Your save file is corrupted"
-                    }
-                }
-
-                if (await forageStorage.checkAccountSync()) {
-                    LoadingStatusState.text = "Checking Account Sync..."
-                    let gotStorage: Uint8Array = await (forageStorage.realStorage as AccountStorage).getItem('database/database.bin', (v) => {
-                        LoadingStatusState.text = `Loading Remote Save File ${(v * 100).toFixed(2)}%`
-                    })
-                    if (checkNullish(gotStorage)) {
-                        gotStorage = encodeRisuSaveLegacy({})
-                        await forageStorage.setItem('database/database.bin', gotStorage)
-                    }
-                    try {
-                        setDatabase(
-                            await decodeRisuSave(gotStorage)
-                        )
-                    } catch (error) {
-                        const backups = await getDbBackups()
-                        let backupLoaded = false
-                        for (const backup of backups) {
-                            try {
-                                LoadingStatusState.text = `Reading Backup File ${backup}...`
-                                const backupData: Uint8Array = await forageStorage.getItem(`database/dbbackup-${backup}.bin`) as unknown as Uint8Array
-                                setDatabase(
-                                    await decodeRisuSave(backupData)
-                                )
-                                backupLoaded = true
-                            } catch (error) { }
-                        }
-                        if (!backupLoaded) {
-                            // throw "Your save file is corrupted"
-                            await autoServerBackup()
-                            await sleep(10000)
-                        }
-                    }
-                }
-                LoadingStatusState.text = "Rechecking Account Sync..."
-                await forageStorage.checkAccountSync()
-                LoadingStatusState.text = "Checking Drive Sync..."
-                const isDriverMode = await checkDriverInit()
-                if (isDriverMode) {
-                    return
-                }
-                LoadingStatusState.text = "Checking Service Worker..."
-                if (navigator.serviceWorker) {
-                    setUsingSw(true)
-                    await registerSw()
-                }
-                else {
-                    setUsingSw(false)
-                }
-                if (getDatabase().didFirstSetup) {
-                    characterURLImport()
-                }
-            }
-            LoadingStatusState.text = "Loading Plugins..."
+async function loadLegacyDatabaseCandidate(): Promise<LegacyDatabaseCandidate> {
+    if (isTauri) {
+        if (await exists('database/database.bin', { baseDir: BaseDirectory.AppData })) {
             try {
-                await loadPlugins()
-            } catch (error) { }
-            if (getDatabase().account) {
-                LoadingStatusState.text = "Checking Account Data..."
-                try {
-                    await loadRisuAccountData()
-                } catch (error) { }
-            }
-            try {
-                //@ts-expect-error navigator.standalone is iOS Safari non-standard property, not in Navigator interface
-                const isInStandaloneMode = (window.matchMedia('(display-mode: standalone)').matches) || (window.navigator.standalone) || document.referrer.includes('android-app://');
-                if (isInStandaloneMode) {
-                    await navigator.storage.persist()
+                LoadingStatusState.text = 'Reading Save File...'
+                return {
+                    database: await readTauriLegacyDatabase('database/database.bin'),
+                    source: 'primary',
                 }
             } catch (error) {
-
+                console.error(error)
             }
-            LoadingStatusState.text = "Checking For Format Update..."
-            const migratedDatabase = await migrateDatabaseFormat(getDatabase())
-            assignDatabaseIds(migratedDatabase)
-            checkCharOrder(migratedDatabase)
-            setDatabase(migratedDatabase)
-            const db = getDatabase();
-
-            LoadingStatusState.text = "Updating States..."
-            updateColorScheme()
-            updateTextThemeAndCSS()
-            updateAnimationSpeed()
-            updateHeightMode()
-            updateErrorHandling()
-            updateGuisize()
-            if (!localStorage.getItem('nightlyWarned') && window.location.hostname === 'nightly.risuai.xyz') {
-                alertMd(language.nightlyWarning)
-                await waitAlert()
-                //for testing, leave empty
-                localStorage.setItem('nightlyWarned', '')
-            }
-            if (db.botSettingAtStart) {
-                botMakerMode.set(true)
-            }
-            if ((db.betaMobileGUI && window.innerWidth <= 800) || import.meta.env.VITE_RISU_LITE === 'TRUE') {
-                initMobileGesture()
-                MobileGUI.set(true)
-            }
-            await makeColdData()
-            loadedStore.set(true)
-            selectedCharID.set(-1)
-            startObserveDom()
-            registerModelDynamic()
-            saveDb()
-            moduleUpdate()
-            cleanChunks()
-            alertTOS().then((a) => {
-                if (a === false) {
-                    location.reload()
-                }
-            })
-            
-        } catch (error) {
-            alertError(error)
         }
+        LoadingStatusState.text = 'Reading Backup Files...'
+        const backupKeys = (await readDir('database', {
+            baseDir: BaseDirectory.AppData,
+        })).map((entry) => `database/${entry.name}`)
+        for (const backup of listLegacyDatabaseBackups(backupKeys)) {
+            try {
+                return {
+                    database: await readTauriLegacyDatabase(`database/dbbackup-${backup}.bin`),
+                    source: 'fallback',
+                }
+            } catch (error) {
+                console.error(error)
+            }
+        }
+        return { database: {} as Database, source: 'default' }
+    }
+
+    LoadingStatusState.text = 'Loading Local Save File...'
+    const primary = await forageStorage.getItem('database/database.bin') as Uint8Array | null
+    if (primary) {
+        try {
+            return { database: await decodeRisuSave(primary), source: 'primary' }
+        } catch (error) {
+            console.error(error)
+        }
+    }
+    for (const backup of listLegacyDatabaseBackups(await forageStorage.keys())) {
+        try {
+            const bytes = await forageStorage.getItem(
+                `database/dbbackup-${backup}.bin`,
+            ) as Uint8Array
+            return { database: await decodeRisuSave(bytes), source: 'fallback' }
+        } catch (error) {
+            console.error(error)
+        }
+    }
+    return { database: {} as Database, source: 'default' }
+}
+
+/**
+ * Loads the application data.
+ */
+export async function loadData() {
+    if (get(loadedStore)) return
+    try {
+        if (isTauri) {
+            LoadingStatusState.text = 'Checking Files...'
+            if (isTauriDesktop) appWindow.maximize()
+            if (!await exists('', { baseDir: BaseDirectory.AppData })) {
+                await mkdir('', { baseDir: BaseDirectory.AppData })
+            }
+            if (!await exists('database', { baseDir: BaseDirectory.AppData })) {
+                await mkdir('database', { baseDir: BaseDirectory.AppData })
+            }
+            if (!await exists('assets', { baseDir: BaseDirectory.AppData })) {
+                await mkdir('assets', { baseDir: BaseDirectory.AppData })
+            }
+        } else {
+            await forageStorage.Init()
+        }
+
+        const runtime = getPersistentDataRuntime()
+        const local = await bootstrapPersistentDatabase({
+            store: runtime.store,
+            loadLegacyCandidate: loadLegacyDatabaseCandidate,
+            prepareDatabase: prepareDatabaseForPersistence,
+        })
+        setDatabase(local.database)
+        await initializeActiveWorkingSet(local.database)
+
+        if (isTauriDesktop) {
+            LoadingStatusState.text = 'Checking Update...'
+            await checkRisuUpdate()
+            await changeFullscreen()
+        }
+
+        if (!isTauri) {
+            if (await forageStorage.checkAccountSync()) {
+                LoadingStatusState.text = 'Checking Account Sync...'
+                try {
+                    const remote = await (forageStorage.realStorage as AccountStorage).getItem(
+                        'database/database.bin',
+                        (value) => {
+                            LoadingStatusState.text =
+                                `Loading Remote Save File ${(value * 100).toFixed(2)}%`
+                        },
+                    ) as Uint8Array | null
+                    if (remote) {
+                        await replacePersistentDatabase(
+                            await decodeRisuSave(remote),
+                            'account-bootstrap',
+                        )
+                    }
+                } catch (error) {
+                    console.error(error)
+                }
+            }
+            LoadingStatusState.text = 'Rechecking Account Sync...'
+            await forageStorage.checkAccountSync()
+            LoadingStatusState.text = 'Checking Drive Sync...'
+            if (await checkDriverInit()) return
+            LoadingStatusState.text = 'Checking Service Worker...'
+            if (navigator.serviceWorker) {
+                setUsingSw(true)
+                await registerSw()
+            } else {
+                setUsingSw(false)
+            }
+            if (getDatabase().didFirstSetup) characterURLImport()
+        }
+
+        LoadingStatusState.text = 'Checking For Format Update...'
+        await makeColdData()
+
+        LoadingStatusState.text = 'Loading Plugins...'
+        try {
+            await loadPlugins()
+        } catch (error) {
+            console.error(error)
+        }
+        if (getDatabase().account) {
+            LoadingStatusState.text = 'Checking Account Data...'
+            try {
+                await loadRisuAccountData()
+            } catch (error) {
+                console.error(error)
+            }
+        }
+        try {
+            const isInStandaloneMode = window.matchMedia('(display-mode: standalone)').matches ||
+                (window.navigator as Navigator & { standalone?: boolean }).standalone ||
+                document.referrer.includes('android-app://')
+            if (isInStandaloneMode) await navigator.storage.persist()
+        } catch {}
+
+        const database = getDatabase()
+        LoadingStatusState.text = 'Updating States...'
+        updateColorScheme()
+        updateTextThemeAndCSS()
+        updateAnimationSpeed()
+        updateHeightMode()
+        updateErrorHandling()
+        updateGuisize()
+        if (!localStorage.getItem('nightlyWarned') && window.location.hostname === 'nightly.risuai.xyz') {
+            alertMd(language.nightlyWarning)
+            await waitAlert()
+            localStorage.setItem('nightlyWarned', '')
+        }
+        if (database.botSettingAtStart) botMakerMode.set(true)
+        if (
+            (database.betaMobileGUI && window.innerWidth <= 800) ||
+            import.meta.env.VITE_RISU_LITE === 'TRUE'
+        ) {
+            initMobileGesture()
+            MobileGUI.set(true)
+        }
+        loadedStore.set(true)
+        selectedCharID.set(-1)
+        startObserveDom()
+        registerModelDynamic()
+        await saveDb()
+        moduleUpdate()
+        cleanChunks()
+        void alertTOS().then((accepted) => {
+            if (accepted === false) location.reload()
+        })
+    } catch (error) {
+        alertError(error)
     }
 }
 

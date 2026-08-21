@@ -125,6 +125,31 @@ describe('SaveCoordinator', () => {
         await first
     })
 
+    it('reports the exact shared flush promise and clears it after completion', async () => {
+        const database = makeDatabase()
+        const pending = deferred<{ revision: number }>()
+        const reported: Array<Promise<void> | null> = []
+        const coordinator = new SaveCoordinator({
+            store: makeStore(vi.fn(() => pending.promise)),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onFlushPromise: (promise) => reported.push(promise),
+        })
+        coordinator.initialize(1)
+        database.username = 'Changed'
+        coordinator.markPersistentDataDirty(1)
+
+        const first = coordinator.flushPendingData('first')
+        const second = coordinator.flushPendingData('second')
+        pending.resolve({ revision: 2 })
+        await first
+        await Promise.resolve()
+
+        expect(second).toBe(first)
+        expect(reported).toEqual([first, null])
+    })
+
     it('debounces for 500 ms and flushes immediately at the pending byte limit', async () => {
         vi.useFakeTimers()
         try {
@@ -260,6 +285,32 @@ describe('SaveCoordinator', () => {
         await coordinator.flushPendingData('clean')
 
         expect(events).toEqual(['commit', 'local:5', 'publish'])
+    })
+
+    it('reports a successful replacement revision and reports nothing on failure', async () => {
+        let database = makeDatabase()
+        const revisions: number[] = []
+        const store = makeStore()
+        vi.mocked(store.replaceFromDatabase)
+            .mockResolvedValueOnce({ revision: 8 })
+            .mockRejectedValueOnce(new Error('replace failed'))
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: (replacement) => {
+                database = replacement
+            },
+            onLocalRevision: (revision) => revisions.push(revision),
+        })
+        coordinator.initialize(7)
+
+        await coordinator.replacePersistentDatabase(makeDatabase(), 'first')
+        await expect(
+            coordinator.replacePersistentDatabase(makeDatabase(), 'second'),
+        ).rejects.toThrow('replace failed')
+
+        expect(revisions).toEqual([8])
     })
 
     it('runs trailing commits for mutations made during every deferred commit', async () => {

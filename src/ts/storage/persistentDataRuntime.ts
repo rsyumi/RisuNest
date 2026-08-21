@@ -11,6 +11,18 @@ import { streamRisuSaveFromStore } from './risuSaveStoreAdapter'
 type CompleteCharacter = character | groupChat
 type RootDatabase = Omit<Database, 'characters'>
 
+export function capturePersistentRoot(database: Database): RootDatabase {
+    const { characters: _characters, ...root } = database
+    return root
+}
+
+export function captureSelectedPersistentCharacter(
+    database: Database,
+    selectedIndex: number,
+): CompleteCharacter | null {
+    return database.characters[selectedIndex] ?? null
+}
+
 export interface PersistentDataRuntimeStateAdapter {
     captureRoot(): RootDatabase
     captureSelectedCharacter(): CompleteCharacter | null
@@ -28,6 +40,7 @@ export interface PersistentDataRuntimeDependencies {
     store: PersistentDataStore
     state: PersistentDataRuntimeStateAdapter
     officialStorage?: OfficialDatabaseStorage | null
+    getOfficialStorage?(): OfficialDatabaseStorage | null
     clock?: SaveCoordinatorClock
     onLocalRevision?(revision: DataRevision): void
     onFlushPromise?(promise: Promise<void> | null): void
@@ -67,10 +80,17 @@ async function concatenateSnapshot(
 
 function createOfficialPublisher(
     store: PersistentDataStore,
-    storage: OfficialDatabaseStorage,
+    getStorage: () => OfficialDatabaseStorage | null,
 ): OfficialRevisionPublisher {
     return {
         async pin(revision) {
+            const storage = getStorage()
+            if (!storage) {
+                return {
+                    publish: async () => undefined,
+                    dispose: async () => undefined,
+                }
+            }
             let bytes: Uint8Array | null = await concatenateSnapshot(store, revision)
             let disposed = false
             return {
@@ -96,11 +116,15 @@ export function createPersistentDataRuntime(
         captureRoot: dependencies.state.captureRoot,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         replaceDatabase: dependencies.state.replaceDatabase,
-        officialPublisher: dependencies.officialStorage
-            ? createOfficialPublisher(dependencies.store, dependencies.officialStorage)
+        officialPublisher: dependencies.officialStorage || dependencies.getOfficialStorage
+            ? createOfficialPublisher(
+                dependencies.store,
+                dependencies.getOfficialStorage ?? (() => dependencies.officialStorage ?? null),
+            )
             : undefined,
         clock: dependencies.clock,
         onLocalRevision: dependencies.onLocalRevision,
+        onFlushPromise: dependencies.onFlushPromise,
         onBackgroundError: dependencies.onBackgroundError,
     })
     const workingSet = new ActiveWorkingSet({
@@ -110,22 +134,6 @@ export function createPersistentDataRuntime(
         publishCharacter: dependencies.state.publishCharacter,
         publishConversation: dependencies.state.publishConversation,
     })
-    let reportedFlush: Promise<void> | null = null
-
-    const flushPendingData = (reason: string): Promise<void> => {
-        const promise = coordinator.flushPendingData(reason)
-        if (reportedFlush !== promise) {
-            reportedFlush = promise
-            dependencies.onFlushPromise?.(promise)
-            void promise.finally(() => {
-                if (reportedFlush !== promise) return
-                reportedFlush = null
-                dependencies.onFlushPromise?.(null)
-            }).catch(() => undefined)
-        }
-        return promise
-    }
-
     return {
         store: dependencies.store,
         get revision() {
@@ -134,7 +142,7 @@ export function createPersistentDataRuntime(
         initializeActiveWorkingSet: (database) => workingSet.initializeActiveWorkingSet(database),
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
-        flushPendingData,
+        flushPendingData: (reason) => coordinator.flushPendingData(reason),
         activateCharacter: (id) => workingSet.activateCharacter(id),
         activateConversation: (id) => workingSet.activateConversation(id),
         async replacePersistentDatabase(database, reason) {

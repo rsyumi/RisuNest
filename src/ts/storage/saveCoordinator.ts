@@ -30,6 +30,7 @@ export interface SaveCoordinatorDependencies {
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
     onLocalRevision?(revision: DataRevision): void
+    onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
 }
 
@@ -141,12 +142,19 @@ export class SaveCoordinator {
         if (this.flushPromise) return this.flushPromise
         const promise = this.enqueue(() => this.flushIterations(reason, true))
         this.flushPromise = promise
+        this.dependencies.onFlushPromise?.(promise)
         void promise.then(
             () => {
-                if (this.flushPromise === promise) this.flushPromise = null
+                if (this.flushPromise === promise) {
+                    this.flushPromise = null
+                    this.dependencies.onFlushPromise?.(null)
+                }
             },
             () => {
-                if (this.flushPromise === promise) this.flushPromise = null
+                if (this.flushPromise === promise) {
+                    this.flushPromise = null
+                    this.dependencies.onFlushPromise?.(null)
+                }
             },
         )
         return promise
@@ -240,6 +248,7 @@ export class SaveCoordinator {
         }
 
         this.dependencies.replaceDatabase(published)
+        this.dependencies.onLocalRevision?.(replaced.revision)
         if (stalePublication) {
             await this.disposePublication(stalePublication)
         }

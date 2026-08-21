@@ -23,6 +23,14 @@ export interface PersistentBootstrapResult {
     source: PersistentBootstrapSource
 }
 
+export function listLegacyDatabaseBackups(keys: string[]): number[] {
+    return keys
+        .map((key) => /^database\/dbbackup-(\d+)\.bin$/.exec(key)?.[1])
+        .filter((timestamp): timestamp is string => timestamp !== undefined)
+        .map(Number)
+        .sort((a, b) => b - a)
+}
+
 export async function bootstrapPersistentDatabase(
     dependencies: PersistentBootstrapDependencies,
 ): Promise<PersistentBootstrapResult> {
