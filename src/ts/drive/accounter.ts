@@ -1,10 +1,12 @@
 import { hubURL } from "../characterCards"
-import { getDatabase, setDatabase } from "../storage/database.svelte"
+import { getDatabase } from "../storage/database.svelte"
 import { alertConfirm, alertError, alertMd, alertNormal, alertSelect, alertWait } from "../alert"
 import { AppendableBuffer } from "../globalApi.svelte"
 import { decodeRisuSave } from "../storage/risuSave"
 import { language } from "src/lang"
 import { fetchProtectedResource } from "../sionyw"
+import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte"
+import { replaceDatabaseBefore } from "../storage/databaseRestore"
 
 export function risuLogin() {
     const win = window.open(hubURL + '/hub/login')
@@ -131,9 +133,10 @@ export async function loadRisuAccountBackup() {
 
         alertWait("Loading backup")
 
-        setDatabase(
-            await decodeRisuSave(buf.buffer)
-        )
+        await replaceDatabaseBefore(await decodeRisuSave(buf.buffer), 'account-backup', {
+            replaceDatabase: replacePersistentDatabase,
+            afterReplacement: async () => (await import('../plugins/plugins.svelte')).loadPlugins(),
+        })
     
         alertNormal('Loaded backup')
     }

@@ -8,6 +8,9 @@ import { v4 } from "uuid"
 import { language } from "src/lang"
 import { sleep } from "../util"
 import { fetchProtectedResource } from "../sionyw"
+import { completeAccountUnmigration } from "./databaseRestore"
+import { replacePersistentDatabase } from "./persistentDataRuntime.svelte"
+import { prepareDatabaseForPersistence } from "./databasePreparation"
 
 export const AccountWarning = writable('')
 let risuSession = ''
@@ -192,11 +195,14 @@ export class AccountStorage{
 
 export async function unMigrationAccount() {
     const keys = await forageStorage.keys()
-    let db = getDatabase()
+    const db = getDatabase()
     let i = 0;
     const MigrationStorage = localforage.createInstance({name: "risuai"})
     
     for(const key of keys){
+        if(key === 'database/database.bin'){
+            continue
+        }
         alertStore.set({
             type: "wait",
             msg: `Migrating your data...(${i}/${keys.length})`
@@ -205,16 +211,21 @@ export async function unMigrationAccount() {
         i += 1
     }
 
-    db.account = null
-    await MigrationStorage.setItem('database/database.bin', encodeRisuSaveLegacy(db))
-
-    alertStore.set({
-        type: "none",
-        msg: ""
+    const candidate = await prepareDatabaseForPersistence({
+        ...db,
+        account: null,
     })
-
-    localStorage.setItem('dosync', 'avoid')
-    localStorage.removeItem('accountst')
-    localStorage.removeItem('fallbackRisuToken')
-    location.reload()
+    await completeAccountUnmigration(candidate, {
+        replaceDatabase: replacePersistentDatabase,
+        writeLegacyMirror: async (database) => {
+            await MigrationStorage.setItem('database/database.bin', encodeRisuSaveLegacy(database))
+        },
+        finalize: () => {
+            alertStore.set({ type: "none", msg: "" })
+            localStorage.setItem('dosync', 'avoid')
+            localStorage.removeItem('accountst')
+            localStorage.removeItem('fallbackRisuToken')
+            location.reload()
+        },
+    })
 }

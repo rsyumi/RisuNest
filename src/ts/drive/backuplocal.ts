@@ -1,16 +1,17 @@
 import { BaseDirectory, readFile, readDir, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
-import { LocalWriter, forageStorage, requiresFullEncoderReload } from "../globalApi.svelte";
+import { LocalWriter, forageStorage } from "../globalApi.svelte";
 import { isTauri } from "src/ts/platform"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
-import { getDatabase, setDatabaseLite } from "../storage/database.svelte";
+import { getDatabase } from "../storage/database.svelte";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
 import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
 import { DBState } from "../stores.svelte";
+import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 
 function getBasename(data:string){
     const baseNameRegex = /\\/g
@@ -556,17 +557,17 @@ export function LoadLocalBackup(){
                 return
             }
 
-            setDatabaseLite(dbData);
-            requiresFullEncoderReload.state = true;
+            await replacePersistentDatabase(dbData, 'local-backup');
             if (isTauri) {
                 await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });
-                await relaunch();
                 alertStore.set({
                     type: "wait",
                     msg: "Success, Refreshing your app."
                 });
+                await relaunch();
             } else {
-                await forageStorage.setItem('database/database.bin', db);
+                const legacyStorage = localforage.createInstance({ name: 'risuai' });
+                await legacyStorage.setItem('database/database.bin', db);
                 location.search = '';
                 alertStore.set({
                     type: "wait",
