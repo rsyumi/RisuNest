@@ -51,7 +51,10 @@ import {
     configurePersistentDataRuntime,
     markPersistentDataDirty,
 } from "./storage/persistentDataRuntime.svelte";
-import { installPersistentSaveNotifications } from "./storage/persistentSaveNotifications";
+import {
+    createPersistentSaveObserverInstallation,
+    installPersistentSaveNotifications,
+} from "./storage/persistentSaveNotifications";
 
 export const forageStorage = new AutoStorage()
 
@@ -297,7 +300,7 @@ export let saving = $state({
 export let requiresFullEncoderReload = $state({
     state: false
 })
-let disposePersistentSaveObserver: (() => void) | null = null
+const persistentSaveObserverInstallation = createPersistentSaveObserverInstallation()
 
 function estimateSnapshotBytes(value: unknown): number {
     try {
@@ -308,48 +311,53 @@ function estimateSnapshotBytes(value: unknown): number {
 }
 
 export async function saveDb() {
-    if (disposePersistentSaveObserver) return
-    configurePersistentDataRuntime({
-        officialStorage:
-            forageStorage.isAccount && forageStorage.realStorage instanceof AccountStorage
-                ? forageStorage.realStorage
-                : null,
-    })
-    const channel = window.BroadcastChannel ? new BroadcastChannel('risu-db') : null
-    const disposeNotifications = installPersistentSaveNotifications({
-        sessionId: v4(),
-        channel,
-        configureRuntime: configurePersistentDataRuntime,
-        showForeignRevisionWarning: () => {
-            void alertNormalWait(language.activeTabChange).then(() => location.reload())
-        },
-        setSaving: (value) => {
-            saving.state = value
-        },
-        reportError: (error) => alertError(error instanceof Error ? error : String(error)),
-    })
-    const disposeEffects = $effect.root(() => {
-        $effect(() => {
-            const root: Record<string, unknown> = {}
-            for (const key in DBState.db) {
-                if (key !== 'characters') {
-                    root[key] = $state.snapshot(DBState.db[key])
+    persistentSaveObserverInstallation.install(() => {
+        configurePersistentDataRuntime({
+            officialStorage:
+                forageStorage.isAccount && forageStorage.realStorage instanceof AccountStorage
+                    ? forageStorage.realStorage
+                    : null,
+        })
+        const channel = window.BroadcastChannel ? new BroadcastChannel('risu-db') : null
+        const disposeNotifications = installPersistentSaveNotifications({
+            sessionId: v4(),
+            channel,
+            configureRuntime: configurePersistentDataRuntime,
+            showForeignRevisionWarning: () => {
+                void alertNormalWait(language.activeTabChange).then(() => location.reload())
+            },
+            setSaving: (value) => {
+                saving.state = value
+            },
+            reportError: (error) => alertError(error instanceof Error ? error : String(error)),
+        })
+        const disposeEffects = $effect.root(() => {
+            $effect(() => {
+                const root: Record<string, unknown> = {}
+                for (const key in DBState.db) {
+                    if (key !== 'characters') {
+                        root[key] = $state.snapshot(DBState.db[key])
+                    }
                 }
-            }
-            markPersistentDataDirty(estimateSnapshotBytes(root))
+                markPersistentDataDirty(estimateSnapshotBytes(root))
+            })
+            $effect(() => {
+                const character = DBState.db.characters?.[selIdState.selId]
+                markPersistentDataDirty(
+                    estimateSnapshotBytes(character ? $state.snapshot(character) : null),
+                )
+            })
         })
-        $effect(() => {
-            const character = DBState.db.characters?.[selIdState.selId]
-            markPersistentDataDirty(
-                estimateSnapshotBytes(character ? $state.snapshot(character) : null),
-            )
-        })
+        return () => {
+            disposeEffects()
+            disposeNotifications()
+            saving.state = false
+        }
     })
-    disposePersistentSaveObserver = () => {
-        disposeEffects()
-        disposeNotifications()
-        disposePersistentSaveObserver = null
-    }
+}
+
+export function stopSaveDb(): void {
+    persistentSaveObserverInstallation.stop()
 }
 
 /**

@@ -21,6 +21,28 @@ export interface PersistentSaveNotificationDependencies {
     reportError?(error: unknown): void
 }
 
+export interface PersistentSaveObserverInstallation {
+    install(installer: () => () => void): void
+    stop(): void
+}
+
+export function createPersistentSaveObserverInstallation(): PersistentSaveObserverInstallation {
+    let dispose: (() => void) | null = null
+    return {
+        install(installer) {
+            const current = dispose
+            dispose = null
+            current?.()
+            dispose = installer()
+        },
+        stop() {
+            const current = dispose
+            dispose = null
+            current?.()
+        },
+    }
+}
+
 export function installPersistentSaveNotifications(
     dependencies: PersistentSaveNotificationDependencies,
 ): () => void {

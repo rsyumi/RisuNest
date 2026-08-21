@@ -9,7 +9,10 @@ import {
     type PersistentDataRuntimeStateAdapter,
 } from '../persistentDataRuntime'
 import { decodeRisuSave } from '../risuSave'
-import { installPersistentSaveNotifications } from '../persistentSaveNotifications'
+import {
+    createPersistentSaveObserverInstallation,
+    installPersistentSaveNotifications,
+} from '../persistentSaveNotifications'
 
 vi.mock('../database.svelte', () => ({
     getDatabase: () => {
@@ -213,5 +216,66 @@ describe('persistent production runtime', () => {
         expect(posted).toEqual(['local-session'])
         expect(warning).toHaveBeenCalledOnce()
         expect(savingStates).toEqual([true, false])
+    })
+
+    it('stops and reinstalls the production observer without stale callbacks', () => {
+        const installation = createPersistentSaveObserverInstallation()
+        const warning = vi.fn()
+        const savingStates: boolean[] = []
+        let activeCallbacks: {
+            onLocalRevision?: (revision: number) => void
+            onFlushPromise?: (promise: Promise<void> | null) => void
+        } = {}
+        const installSession = (sessionId: string) => {
+            let onmessage: ((event: MessageEvent) => void) | null = null
+            const close = vi.fn()
+            const disposeEffects = vi.fn()
+            const channel = {
+                postMessage: vi.fn(),
+                close,
+                get onmessage() {
+                    return onmessage
+                },
+                set onmessage(value) {
+                    onmessage = value
+                },
+            }
+            installation.install(() => {
+                const disposeNotifications = installPersistentSaveNotifications({
+                    sessionId,
+                    channel,
+                    configureRuntime: (callbacks) => {
+                        activeCallbacks = callbacks
+                    },
+                    showForeignRevisionWarning: warning,
+                    setSaving: (value) => savingStates.push(value),
+                })
+                return () => {
+                    disposeEffects()
+                    disposeNotifications()
+                }
+            })
+            return { channel, close, disposeEffects }
+        }
+
+        const first = installSession('first')
+        const second = installSession('second')
+        first.channel.onmessage?.({ data: 'foreign-old' } as MessageEvent)
+        second.channel.onmessage?.({ data: 'foreign-new' } as MessageEvent)
+        activeCallbacks.onFlushPromise?.(Promise.resolve())
+        activeCallbacks.onFlushPromise?.(null)
+        installation.stop()
+        const third = installSession('third')
+
+        expect(first.disposeEffects).toHaveBeenCalledOnce()
+        expect(first.close).toHaveBeenCalledOnce()
+        expect(second.disposeEffects).toHaveBeenCalledOnce()
+        expect(second.close).toHaveBeenCalledOnce()
+        expect(warning).toHaveBeenCalledOnce()
+        expect(savingStates).toEqual([true, false])
+        expect(third.close).not.toHaveBeenCalled()
+        installation.stop()
+        expect(third.disposeEffects).toHaveBeenCalledOnce()
+        expect(third.close).toHaveBeenCalledOnce()
     })
 })
