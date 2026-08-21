@@ -90,3 +90,113 @@ test('keeps explicit false as the generation stop signal', async () => {
   expect(result.res).toBe(false)
   expect(result.stopSending).toBe(true)
 })
+
+test('keeps Lua globals separate for different character IDs', async () => {
+  const code = `
+    counter = 0
+    function phase1_character_isolation(id)
+      counter = counter + 1
+      return counter
+    end
+  `
+
+  const firstCharacter = await runScripted(code, {
+    char: { chaId: 'phase1-character-a' } as never,
+    chat: { message: [] } as never,
+    mode: 'phase1_character_isolation',
+  })
+  const secondCharacter = await runScripted(code, {
+    char: { chaId: 'phase1-character-b' } as never,
+    chat: { message: [] } as never,
+    mode: 'phase1_character_isolation',
+  })
+
+  expect(firstCharacter.res).toBe(1)
+  expect(secondCharacter.res).toBe(1)
+})
+
+test('rejects malformed Lua source on every invocation', async () => {
+  const arg = {
+    char: { chaId: 'phase1-malformed-source' } as never,
+    chat: { message: [] } as never,
+    mode: 'phase1-malformed-source',
+  }
+
+  await expect(runScripted('function onStart(', arg)).rejects.toThrow()
+  await expect(runScripted('function onStart(', arg)).rejects.toThrow()
+})
+
+test('rejects concurrent malformed Lua source callers', async () => {
+  const arg = {
+    char: { chaId: 'phase1-concurrent-malformed-source' } as never,
+    chat: { message: [] } as never,
+    mode: 'phase1-concurrent-malformed-source',
+  }
+
+  const results = await Promise.allSettled([
+    runScripted('function onStart(', arg),
+    runScripted('function onStart(', arg),
+  ])
+
+  expect(results).toEqual([
+    expect.objectContaining({ status: 'rejected' }),
+    expect.objectContaining({ status: 'rejected' }),
+  ])
+})
+
+test('evicts the least recently used idle Lua engine after 17 modes', async () => {
+  const code = `
+    counter = 0
+    for i = 0, 16 do
+      _G["phase1-lru-" .. i] = function(id)
+        counter = counter + 1
+        return counter
+      end
+    end
+  `
+  const baseArg = {
+    char: { chaId: 'phase1-lru-owner' } as never,
+    chat: { message: [] } as never,
+  }
+
+  for (let index = 0; index < 17; index++) {
+    const result = await runScripted(code, {
+      ...baseArg,
+      mode: `phase1-lru-${index}`,
+    })
+    expect(result.res).toBe(1)
+  }
+
+  const result = await runScripted(code, {
+    ...baseArg,
+    mode: 'phase1-lru-0',
+  })
+
+  expect(result.res).toBe(1)
+})
+
+test('does not retain an editDisplay access ID after its handler returns', async () => {
+  const setVar = vi.fn()
+  const code = `
+    previousId = nil
+    listenEdit('editDisplay', function(id, value, meta)
+      if previousId then
+        setChatVar(previousId, 'stale-access', 'should-not-write')
+      end
+      previousId = id
+      return value
+    end)
+  `
+  const arg = {
+    char: { chaId: 'phase1-edit-display-id' } as never,
+    chat: { message: [] } as never,
+    data: 'content',
+    setVar,
+    mode: 'editDisplay',
+  }
+
+  await runScripted(code, arg)
+  await runScripted(code, arg)
+
+  expect(setVar).not.toHaveBeenCalled()
+})

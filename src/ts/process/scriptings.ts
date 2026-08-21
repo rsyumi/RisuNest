@@ -28,6 +28,9 @@ let lastRequestsCount = 0
 interface BasicScriptingEngineState {
     code?: string;
     mutex: Mutex;
+    cacheKey: string;
+    activeUses: number;
+    lastUsed: number;
     chat?: Chat;
     setVar?: (key:string, value:string) => boolean|void,
     getVar?: (key:string) => string,
@@ -47,7 +50,8 @@ type ScriptingEngineState = LuaScriptingEngineState | PythonScriptingEngineState
 
 let ScriptingEngines = new Map<string, ScriptingEngineState>()
 let luaFactoryPromise: Promise<void> | null = null;
-let pendingEngineCreations = new Map<string, Promise<ScriptingEngineState>>();
+let scriptingEngineRecency = 0
+const MAX_SCRIPTING_ENGINES = 16
 
 export async function runScripted(code:string, arg:{
     char?:character|groupChat|simpleCharacterArgument,
@@ -75,19 +79,23 @@ export async function runScripted(code:string, arg:{
     if(type === 'lua'){
         await ensureLuaFactory()
     }
-    let ScriptingEngineState = await getOrCreateEngineState(mode, type);
+    const ownerChaId = char?.chaId ?? 'global'
+    const ScriptingEngineState = getOrCreateEngineState(mode, type, ownerChaId, code);
+    ScriptingEngineState.activeUses++
+    let invocationFinished = false
     
+    try {
     return await ScriptingEngineState.mutex.runExclusive(async () => {
         ScriptingEngineState.chat = chat
         ScriptingEngineState.setVar = setVar
         ScriptingEngineState.getVar = getVar
         if (code !== ScriptingEngineState.code) {
+            try {
             let declareAPI:(name: string, func:Function) => void
 
             if(ScriptingEngineState.type === 'lua'){
                 console.log('Creating new Lua engine for mode:', mode)
                 ScriptingEngineState.engine?.global.close()
-                ScriptingEngineState.code = code
                 ScriptingEngineState.engine = await luaFactory.createEngine({injectObjects: true})
                 const luaEngine = ScriptingEngineState.engine
                 declareAPI = (name:string, func:Function) => {
@@ -1061,6 +1069,10 @@ export async function runScripted(code:string, arg:{
                 await ScriptingEngineState.pyodide?.init(code)
             }
             ScriptingEngineState.code = code
+            } catch (error) {
+                discardFailedScriptingEngineState(ScriptingEngineState)
+                throw error
+            }
         }
         let accessKey = v4()
         if(mode === 'editDisplay'){
@@ -1072,6 +1084,7 @@ export async function runScripted(code:string, arg:{
                 ScriptingLowLevelIds.add(accessKey)
             }
         }
+        try {
         let res:any
         if(ScriptingEngineState.type === 'lua'){
             const luaEngine = ScriptingEngineState.engine
@@ -1163,14 +1176,24 @@ export async function runScripted(code:string, arg:{
                 }
             }
         }
-        ScriptingSafeIds.delete(accessKey)
-        ScriptingLowLevelIds.delete(accessKey)
         chat = ScriptingEngineState.chat
 
         return {
             stopSending, chat, res
         }
+        } finally {
+            ScriptingSafeIds.delete(accessKey)
+            ScriptingLowLevelIds.delete(accessKey)
+            ScriptingEditDisplayIds.delete(accessKey)
+            invocationFinished = true
+            finishScriptingEngineUse(ScriptingEngineState)
+        }
     })
+    } finally {
+        if (!invocationFinished) {
+            finishScriptingEngineUse(ScriptingEngineState)
+        }
+    }
 }
 
 async function makeLuaFactory(){
@@ -1213,35 +1236,78 @@ async function ensureLuaFactory() {
     }
 }
 
-async function getOrCreateEngineState(
+function getOrCreateEngineState(
     mode: string, 
-    type: 'lua'|'py'
-): Promise<ScriptingEngineState> {
-    let engineState = ScriptingEngines.get(mode);
+    type: 'lua'|'py',
+    ownerChaId: string,
+    code: string,
+): ScriptingEngineState {
+    const cacheKey = JSON.stringify([type, ownerChaId, mode, code])
+    let engineState = ScriptingEngines.get(cacheKey);
     if (engineState) {
+        engineState.lastUsed = ++scriptingEngineRecency
         return engineState;
     }
-    
-    let pendingCreation = pendingEngineCreations.get(mode);
-    if (pendingCreation) {
-        return pendingCreation;
+
+    engineState = {
+        mutex: new Mutex(),
+        cacheKey,
+        activeUses: 0,
+        lastUsed: ++scriptingEngineRecency,
+        type,
+    };
+    ScriptingEngines.set(cacheKey, engineState);
+    return engineState;
+}
+
+function evictIdleScriptingEngines() {
+    while (ScriptingEngines.size > MAX_SCRIPTING_ENGINES) {
+        let oldest: ScriptingEngineState | undefined
+        for (const state of ScriptingEngines.values()) {
+            if (state.activeUses === 0 && (!oldest || state.lastUsed < oldest.lastUsed)) {
+                oldest = state
+            }
+        }
+        if (!oldest) {
+            return
+        }
+
+        ScriptingEngines.delete(oldest.cacheKey)
+        if (oldest.type === 'lua') {
+            oldest.engine?.global.close()
+            oldest.engine = undefined
+        } else {
+            oldest.pyodide?.close()
+            oldest.pyodide = undefined
+        }
     }
-    
-    const creationPromise = (() => {
-        const engineState: ScriptingEngineState = {
-            mutex: new Mutex(),
-            type: type,
-        };
-        ScriptingEngines.set(mode, engineState);
+}
 
-        pendingEngineCreations.delete(mode);
+function finishScriptingEngineUse(state: ScriptingEngineState) {
+    state.activeUses--
+    state.lastUsed = ++scriptingEngineRecency
+    if (state.code === undefined) {
+        removeScriptingEngineStateIfUnused(state)
+    }
+    evictIdleScriptingEngines()
+}
 
-        return Promise.resolve(engineState);
-    })();
-    
-    pendingEngineCreations.set(mode, creationPromise);
-    
-    return creationPromise;
+function discardFailedScriptingEngineState(state: ScriptingEngineState) {
+    state.code = undefined
+    if (state.type === 'lua') {
+        state.engine?.global.close()
+        state.engine = undefined
+    } else {
+        state.pyodide?.close()
+        state.pyodide = undefined
+    }
+    removeScriptingEngineStateIfUnused(state)
+}
+
+function removeScriptingEngineStateIfUnused(state: ScriptingEngineState) {
+    if (state.activeUses === 0 && ScriptingEngines.get(state.cacheKey) === state) {
+        ScriptingEngines.delete(state.cacheKey)
+    }
 }
 
 function luaCodeWrapper(code:string){
