@@ -6,3 +6,10 @@ const PERSISTENT_DATA_DATABASE_NAME = 'risuai-persistent-data'
 export function createPersistentDataStore(): PersistentDataStore {
     return new IndexedDbPersistentDataStore(PERSISTENT_DATA_DATABASE_NAME, indexedDB, IDBKeyRange)
 }
+
+let persistentDataStore: PersistentDataStore | null = null
+
+export function getPersistentDataStore(): PersistentDataStore {
+    persistentDataStore ??= createPersistentDataStore()
+    return persistentDataStore
+}

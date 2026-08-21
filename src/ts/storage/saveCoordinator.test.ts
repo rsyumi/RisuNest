@@ -230,6 +230,38 @@ describe('SaveCoordinator', () => {
         })
     })
 
+    it('reports a successful local revision once before official publication', async () => {
+        const database = makeDatabase()
+        const events: string[] = []
+        const store = makeStore(vi.fn(async ({ expectedRevision }) => {
+            events.push('commit')
+            return { revision: expectedRevision + 1 }
+        }))
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onLocalRevision: (revision) => events.push(`local:${revision}`),
+            officialPublisher: {
+                pin: async () => ({
+                    publish: async () => {
+                        events.push('publish')
+                    },
+                    dispose: async () => undefined,
+                }),
+            },
+        })
+        coordinator.initialize(4)
+        database.username = 'Changed'
+        coordinator.markPersistentDataDirty(1)
+
+        await coordinator.flushPendingData('test')
+        await coordinator.flushPendingData('clean')
+
+        expect(events).toEqual(['commit', 'local:5', 'publish'])
+    })
+
     it('runs trailing commits for mutations made during every deferred commit', async () => {
         const database = makeDatabase()
         const first = deferred<{ revision: number }>()

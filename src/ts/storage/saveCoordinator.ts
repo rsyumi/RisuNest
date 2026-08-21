@@ -29,6 +29,7 @@ export interface SaveCoordinatorDependencies {
     replaceDatabase(database: Database): void
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
+    onLocalRevision?(revision: DataRevision): void
     onBackgroundError?(error: unknown): void
 }
 
@@ -190,6 +191,7 @@ export class SaveCoordinator {
                 this.currentRevision = committed.revision
                 if (commit.root) this.rootBaseline = captured.rootCanonical
                 if (commit.replaceCharacter) this.characterBaseline = captured.characterCanonical
+                this.dependencies.onLocalRevision?.(committed.revision)
                 if (publishOfficial && this.dependencies.officialPublisher) {
                     this.pendingPublicationRevision = committed.revision
                     await this.publishPendingRevision()
