@@ -57,9 +57,11 @@ import {
     initializeActiveWorkingSet,
     replacePersistentDatabase,
 } from "./storage/persistentDataRuntime.svelte";
+import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
 export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
+let disposeLifecycleCommitListeners: (() => void) | undefined
 
 /**
  * Loads the application data.
@@ -140,6 +142,7 @@ export async function loadData() {
         })
         setDatabase(local.database)
         await initializeActiveWorkingSet(local.database)
+        disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners()
 
         if (isTauriDesktop) {
             LoadingStatusState.text = 'Checking Update...'

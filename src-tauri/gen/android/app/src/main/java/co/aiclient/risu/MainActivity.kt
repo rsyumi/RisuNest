@@ -1,5 +1,6 @@
 package co.aiclient.risu
 
+import android.content.ComponentCallbacks2
 import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
@@ -14,6 +15,9 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updateLayoutParams
 
 private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
+private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
+private const val STOP_REASON = "stop"
+private const val TRIM_MEMORY_REASON = "trim-memory"
 
 internal data class WebViewMargins(
   val left: Int,
@@ -68,8 +72,24 @@ internal class BackNavigationPolicy(
   }
 }
 
+internal class LifecycleFlushDispatcher(
+  private val dispatch: (String) -> Unit,
+) {
+  fun onStop() {
+    dispatch(STOP_REASON)
+  }
+
+  fun onTrimMemory(level: Int) {
+    if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+      dispatch(TRIM_MEMORY_REASON)
+    }
+  }
+}
+
 class MainActivity : TauriActivity() {
   private val backNavigationPolicy = BackNavigationPolicy()
+  private var lifecycleWebView: WebView? = null
+  private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
@@ -78,6 +98,7 @@ class MainActivity : TauriActivity() {
 
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
+    lifecycleWebView = webView
 
     val contentRoot = findViewById<ViewGroup>(android.R.id.content)
     ViewCompat.setOnApplyWindowInsetsListener(contentRoot) { _, windowInsets ->
@@ -122,6 +143,23 @@ class MainActivity : TauriActivity() {
           }
         }
       },
+    )
+  }
+
+  override fun onStop() {
+    lifecycleFlushDispatcher.onStop()
+    super.onStop()
+  }
+
+  override fun onTrimMemory(level: Int) {
+    lifecycleFlushDispatcher.onTrimMemory(level)
+    super.onTrimMemory(level)
+  }
+
+  private fun dispatchLifecycleFlush(reason: String) {
+    lifecycleWebView?.evaluateJavascript(
+      "window.dispatchEvent(new CustomEvent('$NATIVE_LIFECYCLE_EVENT',{detail:{reason:'$reason'}}));",
+      null,
     )
   }
 }

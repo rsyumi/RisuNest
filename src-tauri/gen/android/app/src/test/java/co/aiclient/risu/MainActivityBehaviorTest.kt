@@ -1,10 +1,51 @@
 package co.aiclient.risu
 
+import android.content.ComponentCallbacks2
 import androidx.core.view.WindowInsetsCompat
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class MainActivityBehaviorTest {
+  @Test
+  fun `activity stop requests a lifecycle flush`() {
+    val reasons = mutableListOf<String>()
+    val dispatcher = LifecycleFlushDispatcher(reasons::add)
+
+    dispatcher.onStop()
+
+    assertEquals(listOf("stop"), reasons)
+  }
+
+  @Test
+  fun `trim memory below UI hidden does not request a lifecycle flush`() {
+    val reasons = mutableListOf<String>()
+    val dispatcher = LifecycleFlushDispatcher(reasons::add)
+
+    dispatcher.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN - 1)
+
+    assertEquals(emptyList<String>(), reasons)
+  }
+
+  @Test
+  fun `trim memory at UI hidden requests a lifecycle flush`() {
+    val reasons = mutableListOf<String>()
+    val dispatcher = LifecycleFlushDispatcher(reasons::add)
+
+    dispatcher.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN)
+
+    assertEquals(listOf("trim-memory"), reasons)
+  }
+
+  @Test
+  fun `trim memory above UI hidden requests a lifecycle flush`() {
+    val reasons = mutableListOf<String>()
+    val dispatcher = LifecycleFlushDispatcher(reasons::add)
+
+    dispatcher.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN + 1)
+
+    assertEquals(listOf("trim-memory"), reasons)
+  }
+
   @Test
   fun `system bars and display cutout remain outside the web view`() {
     val margins = resolveWebViewMargins(
