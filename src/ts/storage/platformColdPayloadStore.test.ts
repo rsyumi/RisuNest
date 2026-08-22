@@ -57,6 +57,20 @@ describe('rooted cold payload storage', () => {
         expect(await store.read('same')).toBeNull()
     })
 
+    test('does not touch OPFS until a cold payload is actually used', async () => {
+        let resolutions = 0
+        const store = createLegacyBrowserOpfsColdPayloadStore(async () => {
+            resolutions += 1
+            throw new DOMException('', 'SecurityError')
+        })
+
+        expect(resolutions).toBe(0)
+        await expect(store.read('any')).rejects.toBeInstanceOf(DOMException)
+        expect(resolutions).toBe(1)
+        await expect(store.list()).rejects.toBeInstanceOf(DOMException)
+        expect(resolutions).toBe(2)
+    })
+
     test('shares the generated backend with the platform blob factory seam', async () => {
         const backend = memoryBackend()
         const legacy = createLegacyNodeColdPayloadStore(backend)

@@ -59,13 +59,23 @@ export function createLegacyOpfsColdPayloadStore(backend: BlobKeyValueBackend): 
     })
 }
 
+/** Resolves the OPFS root lazily so browsers without it still boot, as they did before cold payloads were rooted. */
 export function createLegacyBrowserOpfsColdPayloadStore(
-    directory: FileSystemDirectoryHandle,
+    source: FileSystemDirectoryHandle | (() => Promise<FileSystemDirectoryHandle>),
 ): ColdPayloadStore {
     const fileName = (key: string) => `coldstorage_${key}.json`
+    let pending: Promise<FileSystemDirectoryHandle> | undefined
+    const resolveDirectory = () => {
+        if (typeof source !== 'function') return Promise.resolve(source)
+        return pending ??= source().catch((error) => {
+            pending = undefined
+            throw error
+        })
+    }
     return {
         async read(key) {
             try {
+                const directory = await resolveDirectory()
                 const file = await (await directory.getFileHandle(fileName(key))).getFile()
                 return new Uint8Array(await file.arrayBuffer())
             } catch (error) {
@@ -74,6 +84,7 @@ export function createLegacyBrowserOpfsColdPayloadStore(
             }
         },
         async write(key, data) {
+            const directory = await resolveDirectory()
             const writable = await (await directory.getFileHandle(fileName(key), { create: true })).createWritable()
             try {
                 await writable.write(data.slice().buffer as ArrayBuffer)
@@ -83,7 +94,7 @@ export function createLegacyBrowserOpfsColdPayloadStore(
         },
         async list() {
             const keys: string[] = []
-            for await (const [name] of directory.entries()) {
+            for await (const [name] of (await resolveDirectory()).entries()) {
                 if (name.startsWith('coldstorage_') && name.endsWith('.json')) {
                     keys.push(name.slice('coldstorage_'.length, -'.json'.length))
                 }
@@ -92,7 +103,7 @@ export function createLegacyBrowserOpfsColdPayloadStore(
         },
         async remove(key) {
             try {
-                await directory.removeEntry(fileName(key))
+                await (await resolveDirectory()).removeEntry(fileName(key))
             } catch (error) {
                 if (!(error instanceof DOMException) || error.name !== 'NotFoundError') throw error
             }

@@ -48,7 +48,7 @@ async function createProductionMigrationRuntime(): Promise<ApplicationMigrationR
         ? createLegacyTauriColdPayloadStore(backend)
         : isNodeServer
             ? createLegacyNodeColdPayloadStore(backend)
-            : createLegacyBrowserOpfsColdPayloadStore(await navigator.storage.getDirectory())
+            : createLegacyBrowserOpfsColdPayloadStore(() => navigator.storage.getDirectory())
     const cold = await createPlatformRootedColdPayloadStoreFactory(
         legacyCold,
         async () => backend,
@@ -86,7 +86,10 @@ async function createProductionMigrationRuntime(): Promise<ApplicationMigrationR
 let productionRuntime: Promise<ApplicationMigrationRuntime> | null = null
 
 function getProductionMigrationRuntime(): Promise<ApplicationMigrationRuntime> {
-    return productionRuntime ??= createProductionMigrationRuntime()
+    return productionRuntime ??= createProductionMigrationRuntime().catch((error) => {
+        productionRuntime = null
+        throw error
+    })
 }
 
 export async function initializePersistentMigrationAuthority(): Promise<void> {
