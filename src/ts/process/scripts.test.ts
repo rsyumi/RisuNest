@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => {
         cbsPatternCalls: 0,
         cbsFirstPattern: 'x',
         cbsFirstError: null as Error | null,
+        workerFailure: null as unknown,
+        workerCalls: 0,
     }
     const charEmotionStore = {
         set(value: Record<string, [string, string, number][]>) {
@@ -69,8 +71,21 @@ vi.mock('src/ts/plugins/plugins.svelte', () => ({
     pluginV2: { editinput: new Set(), editoutput: new Set(), editprocess: new Set(), editdisplay: new Set() },
 }))
 vi.mock('src/ts/process/triggers', () => ({ runTrigger: vi.fn() }))
+vi.mock('./regexWorkerClient', async (importOriginal) => {
+    const original = await importOriginal<typeof import('./regexWorkerClient')>()
+    return {
+        ...original,
+        getSharedRegexWorkerClient: () => ({
+            execute: async () => {
+                mocks.state.workerCalls++
+                throw mocks.state.workerFailure
+            },
+        }),
+    }
+})
 
 const { processScriptFull, resetScriptCache } = await import('./scripts')
+const { RegexExecutionTimeoutError } = await import('./regexWorkerClient')
 
 function makeScript(input: string, output: string, flag = 'g'): customscript {
     return {
@@ -104,6 +119,8 @@ describe('processScriptFull result caching', () => {
         mocks.state.cbsPatternCalls = 0
         mocks.state.cbsFirstPattern = 'x'
         mocks.state.cbsFirstError = null
+        mocks.state.workerFailure = null
+        mocks.state.workerCalls = 0
     })
 
     it('treats a cached empty string as a hit', async () => {
@@ -160,6 +177,40 @@ describe('processScriptFull result caching', () => {
             { cache: 'bypass' },
         )).rejects.toThrow(parserError)
         errorLog.mockRestore()
+    })
+
+    it('still applies the ruleset when the regex Worker is unusable', async () => {
+        const character = makeCharacter([makeScript('cat', 'dog')])
+        mocks.state.workerFailure = new Error('Worker is not defined')
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        const result = await processScriptFull(
+            character,
+            'a cat here',
+            'editoutput',
+            -1,
+            {},
+            { cache: 'bypass', regexWorker: true },
+        )
+
+        expect(mocks.state.workerCalls).toBe(1)
+        expect(result.data).toBe('a dog here')
+        errorLog.mockRestore()
+    })
+
+    it('does not fall back to the UI thread when the regex Worker times out', async () => {
+        const character = makeCharacter([makeScript('cat', 'dog')])
+        const timeout = new RegexExecutionTimeoutError(1)
+        mocks.state.workerFailure = timeout
+
+        await expect(processScriptFull(
+            character,
+            'a cat here',
+            'editoutput',
+            -1,
+            {},
+            { cache: 'bypass', regexWorker: true },
+        )).rejects.toBe(timeout)
     })
 
     it('keeps no more than 1,000 completed results', async () => {
