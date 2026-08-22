@@ -468,10 +468,12 @@ export async function importChat(){
             if(json.type === 'risuAllChats' && json.ver === 1){
                 const chats = json.data
                 if(Array.isArray(chats) && chats.length > 0){
+                    const usedIds = new Set(DBState.db.characters[selectedID].chats.map((chat) => chat.id))
                     DBState.db.characters[selectedID].chats.unshift(...(chats.map((v) => {
-                        if(!v.id){
+                        if(!v.id || usedIds.has(v.id)){
                             v.id = uuidv4()
                         }
+                        usedIds.add(v.id)
                         if(!v.localLore){
                             v.localLore = []
                         }

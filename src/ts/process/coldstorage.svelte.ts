@@ -338,7 +338,11 @@ async function removeColdStorageItems(keys:string[]) {
         }
     }
     else if(localColdStorageRuntime){
-        await localColdStorageRuntime.remove(keys)
+        try {
+            await localColdStorageRuntime.remove(keys)
+        } catch (error) {
+            console.error('Cold storage remove failed:', error)
+        }
     }
     else if(isNodeServer){
         try {

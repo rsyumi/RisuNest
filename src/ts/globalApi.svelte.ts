@@ -322,18 +322,13 @@ export async function loadAsset(id: string) {
     return await readBlobForFacade(await resolveBlobStore(), id, isTauri)
 }
 
+/**
+ * Saves the current state of the database.
+ */
 export let saving = $state({
     state: false
 })
 
-/**
- * Saves the current state of the database.
- * 
- * @returns {Promise<void>} - A promise that resolves when the database has been saved.
- */
-export let requiresFullEncoderReload = $state({
-    state: false
-})
 const persistentSaveObserverInstallation = createPersistentSaveObserverInstallation()
 
 function estimateSnapshotBytes(value: unknown): number {
@@ -382,10 +377,6 @@ export async function saveDb() {
             saving.state = false
         }
     })
-}
-
-export function stopSaveDb(): void {
-    persistentSaveObserverInstallation.stop()
 }
 
 let usingSw = false

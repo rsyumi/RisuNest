@@ -64,7 +64,6 @@ vi.mock('./globalApi.svelte', () => ({
     checkCharOrder: vi.fn(),
     downloadFile: vi.fn(),
     getFileSrc: vi.fn(),
-    requiresFullEncoderReload: { state: false },
 }))
 vi.mock('./process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
 vi.mock('./parser/parser.svelte', () => ({ parseMarkdownSafe: (value: string) => value }))
