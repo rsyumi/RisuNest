@@ -12,6 +12,7 @@
     import TextAreaInput from '../UI/GUI/TextAreaInput.svelte'
     import TextInput from "../UI/GUI/TextInput.svelte";
     import CustomSideBar from "./CustomSidebar.svelte";
+    import { getGlobalChatVar, setGlobalChatVar } from "src/ts/parser/chatVar.svelte";
 
     interface Props {
         chara?: character|groupChat
@@ -95,7 +96,9 @@
         {:else if toggle.type === 'select'}
             <div class="w-full flex gap-2 mt-2 items-center" class:justify-end={$MobileGUI} >
                 <span>{toggle.value}</span>
-                <SelectInput className="w-32" bind:value={DBState.db.globalChatVariables[`toggle_${toggle.key}`]}>
+                <SelectInput className="w-32" value={getGlobalChatVar(`toggle_${toggle.key}`)} onchange={(e) => {
+                    setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
+                }}>
                     {#each toggle.options as option, i}
                         <OptionInput value={i.toString()}>{option}</OptionInput>
                     {/each}
@@ -104,12 +107,21 @@
         {:else if toggle.type === 'text'}
             <div class="w-full flex gap-2 mt-2 items-center" class:justify-end={$MobileGUI}>
                 <span>{toggle.value}</span>
-                <TextInput className="w-32" bind:value={DBState.db.globalChatVariables[`toggle_${toggle.key}`]} />
+                <TextInput className="w-32" value={getGlobalChatVar(`toggle_${toggle.key}`)} onchange={(e) => {
+                    setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
+                }} />
             </div>
         {:else if toggle.type === 'textarea'}
             <div class="w-full flex gap-2 mt-2 items-start" class:justify-end={$MobileGUI}>
                 <span class="mt-1.5">{toggle.value}</span>
-                <TextAreaInput className="w-32" height='20' bind:value={DBState.db.globalChatVariables[`toggle_${toggle.key}`]} />
+                <TextAreaInput className="w-32" height='20' value={getGlobalChatVar(`toggle_${toggle.key}`)} onchange={(e) => {
+                    //check is div
+                    if(e.currentTarget instanceof HTMLDivElement){
+                        setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.innerText)
+                    } else {
+                        setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
+                    }
+                }} />
             </div>
         {:else if toggle.type === 'caption'}
             <div class="w-full mt-1 text-xs text-textcolor2">
@@ -127,8 +139,8 @@
             {/if}
         {:else}
             <div class="w-full flex mt-2 items-center" class:justify-end={$MobileGUI}>
-                <CheckInput check={DBState.db.globalChatVariables[`toggle_${toggle.key}`] === '1'} reverse={reverse} name={toggle.value} onChange={() => {
-                    DBState.db.globalChatVariables[`toggle_${toggle.key}`] = DBState.db.globalChatVariables[`toggle_${toggle.key}`] === '1' ? '0' : '1'
+                <CheckInput check={getGlobalChatVar(`toggle_${toggle.key}`) === '1'} reverse={reverse} name={toggle.value} onChange={() => {
+                    DBState.db.globalChatVariables[`toggle_${toggle.key}`] = getGlobalChatVar(`toggle_${toggle.key}`) === '1' ? '0' : '1'
                 }} />
             </div>
         {/if}

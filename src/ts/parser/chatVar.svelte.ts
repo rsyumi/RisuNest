@@ -41,3 +41,7 @@ export function setChatVar(key:string, value:string): boolean {
 export function getGlobalChatVar(key:string): string {
     return DBState.db.globalChatVariables[key] ?? 'null'
 }
+
+export function setGlobalChatVar(key:string, value:string) {
+    DBState.db.globalChatVariables[key] = value
+}
