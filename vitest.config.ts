@@ -12,6 +12,7 @@ export default defineConfig({
     conditions: ['browser'],
   },
   test: {
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.worktrees/**'],
     environment: 'happy-dom',
     env: {
       VITE_DISABLE_REALM: 'true',

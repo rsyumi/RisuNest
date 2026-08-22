@@ -100,6 +100,7 @@ export class SaveCoordinator {
     private currentRevision: DataRevision | null = null
     private rootBaseline: string | null = null
     private characterBaseline: string | null = null
+    private characterBaselineId: string | null = null
     private dirtyGeneration = 0
     private pendingByteCount = 0
     private debounceHandle: unknown
@@ -131,7 +132,7 @@ export class SaveCoordinator {
         const captured = database ? this.captureDatabase(database) : this.capture()
         this.currentRevision = revision
         this.rootBaseline = captured.rootCanonical
-        this.characterBaseline = captured.characterCanonical
+        this.setCharacterBaseline(captured)
         this.dirtyGeneration = 0
         this.pendingByteCount = 0
         this.pendingPublication = null
@@ -143,6 +144,7 @@ export class SaveCoordinator {
     adoptHydratedCharacter(revision: DataRevision, character: CompleteCharacter): boolean {
         if (this.currentRevision !== revision) return false
         this.characterBaseline = canonicalJson(character)
+        this.characterBaselineId = character.chaId
         return true
     }
 
@@ -254,7 +256,7 @@ export class SaveCoordinator {
         this.reservedCharacterAddition = null
         this.currentRevision = revision
         this.rootBaseline = captured.rootCanonical
-        this.characterBaseline = captured.characterCanonical
+        this.setCharacterBaseline(captured)
         this.dirtyGeneration = 0
         this.pendingByteCount = 0
         this.dependencies.replaceDatabase(activated)
@@ -327,11 +329,14 @@ export class SaveCoordinator {
         while (true) {
             const generation = this.dirtyGeneration
             const captured = this.capture()
+            const detached = captured.character ? null : this.captureDetachedCharacter()
             const addition = this.capturePendingAddition()
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
             if (captured.characterCanonical !== this.characterBaseline && captured.character) {
                 commit.replaceCharacter = captured.character
+            } else if (detached) {
+                commit.replaceCharacter = detached
             }
 
             let replacementIsAddition = false
@@ -352,7 +357,7 @@ export class SaveCoordinator {
                 this.currentRevision = committed.revision
                 if (commit.root) this.rootBaseline = captured.rootCanonical
                 if (commit.replaceCharacter && !replacementIsAddition) {
-                    this.characterBaseline = captured.characterCanonical
+                    this.setCharacterBaseline(captured)
                     if (
                         addition &&
                         commit.replaceCharacter.chaId === addition.pending.characterId
@@ -373,6 +378,8 @@ export class SaveCoordinator {
                     await this.publishPendingRevision()
                 }
             }
+
+            if (!captured.character && !commit.replaceCharacter) this.setCharacterBaseline(captured)
 
             const current = this.capture()
             const currentAddition = this.capturePendingAddition()
@@ -412,7 +419,7 @@ export class SaveCoordinator {
         this.currentRevision = replaced.revision
         const candidateCapture = this.captureDatabase(candidate)
         this.rootBaseline = candidateCapture.rootCanonical
-        this.characterBaseline = candidateCapture.characterCanonical
+        this.setCharacterBaseline(candidateCapture)
 
         const published = canonicalClone(candidate)
         const publishedParts = splitDatabase(published)
@@ -437,6 +444,20 @@ export class SaveCoordinator {
             this.cancelDebounce()
             this.pendingByteCount = 0
         }
+    }
+
+    private setCharacterBaseline(captured: CapturedState): void {
+        this.characterBaseline = captured.characterCanonical
+        this.characterBaselineId = captured.character?.chaId ?? null
+    }
+
+    /** Returns the last selected character when the selection was cleared before its edits were committed. */
+    private captureDetachedCharacter(): CompleteCharacter | null {
+        if (this.characterBaseline === null || this.characterBaselineId === null) return null
+        const retained = this.dependencies.captureCharacter(this.characterBaselineId)
+        if (!retained) return null
+        const canonical = canonicalJson(retained)
+        return canonical === this.characterBaseline ? null : JSON.parse(canonical) as CompleteCharacter
     }
 
     private capture(): CapturedState {

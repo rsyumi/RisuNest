@@ -1208,6 +1208,60 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(4)
     })
 
+    it('finishes flushing after the selected character is deselected', async () => {
+        const database = makeDatabase()
+        let selectedIndex = 0
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[selectedIndex] ?? null,
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(1)
+        expect(coordinator.adoptHydratedCharacter(1, database.characters[0])).toBe(true)
+
+        selectedIndex = -1
+        database.username = 'Deselected'
+        coordinator.markPersistentDataDirty(4)
+
+        await coordinator.flushPendingData('deselected')
+
+        expect(commit).toHaveBeenCalledTimes(1)
+        expect(commit.mock.calls[0][0]).toMatchObject({ root: { username: 'Deselected' } })
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
+        expect(coordinator.pendingBytes).toBe(0)
+    })
+
+    it('commits the newly selected character after the selection changes', async () => {
+        const database = makeDatabase()
+        const second = structuredClone(database.characters[0])
+        second.chaId = 'char-b'
+        second.name = 'Beta'
+        database.characters.push(second)
+        let selectedIndex = 0
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[selectedIndex] ?? null,
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(1)
+        expect(coordinator.adoptHydratedCharacter(1, database.characters[0])).toBe(true)
+
+        selectedIndex = 1
+        database.characters[1].name = 'Beta edited'
+        coordinator.markPersistentDataDirty(4)
+
+        await coordinator.flushPendingData('reselected')
+
+        expect(commit).toHaveBeenCalledTimes(1)
+        expect(commit.mock.calls[0][0]).toMatchObject({
+            replaceCharacter: { chaId: 'char-b', name: 'Beta edited' },
+        })
+    })
+
     it('does not publish or change baselines when replacement fails', async () => {
         const database = makeDatabase()
         const replaceDatabase = vi.fn()
