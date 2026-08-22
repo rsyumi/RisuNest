@@ -2,9 +2,6 @@ import { AppendableBuffer, saveAsset, type LocalWriter, type VirtualWriter } fro
 import * as fflate from "fflate";
 import { asBuffer, Semaphore, sleep } from "../util";
 import { alertStore } from "../alert";
-import { hasher } from "../parser/parser.svelte";
-import { hubURL } from "../characterCards";
-import { fetchRealmResource } from "../realmAccess";
 
 // File size and chunk size constants
 const MAX_ASSET_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
@@ -14,8 +11,6 @@ const CHUNK_SIZE_BYTES = 1024 * 1024; // 1MB
 const MAX_CONCURRENT_ASSET_SAVES = 10;
 
 // HTTP status code ranges
-const HTTP_STATUS_OK_MIN = 200;
-const HTTP_STATUS_OK_MAX = 300;
 
 export async function processZip(dataArray: Uint8Array): Promise<string> {
     const unzipped = await new Promise<fflate.Unzipped>((resolve, reject) => {
@@ -193,8 +188,6 @@ export class CharXImporter{
 
     // Configuration
     alertInfo:boolean = false  // Show progress alerts to user
-    skipSaving: boolean = false  // If true, only compute hashes without saving
-    hashSignal: string|undefined  // Hash to signal server for sync (when skipSaving is false)
 
     constructor(){
         this.unzip = new fflate.Unzip()
@@ -261,7 +254,7 @@ export class CharXImporter{
         this.unzip.push(data, final)
 
         if(final){
-            await this.#finalize()
+            this.#finalize()
         }
     }
 
@@ -395,11 +388,7 @@ export class CharXImporter{
         try {
             await this.semaphore.acquire()
             acquired = true
-            const assetSaveId = this.skipSaving
-                ? `assets/${await hasher(asset.data)}.png`
-                : await saveAsset(asset.data)
-
-            this.assets[asset.id] = assetSaveId
+            this.assets[asset.id] = await saveAsset(asset.data)
         } catch (error) {
             this.errors.push(error instanceof Error ? error : new Error(String(error)))
         } finally {
@@ -414,45 +403,11 @@ export class CharXImporter{
 
     /**
      * Finalizes processing when all ZIP data has been pushed.
-     * Saves hash signal if needed and marks the queue as complete.
      */
-    async #finalize(){
-        // Save hash signal for server sync if needed
-        if(this.hashSignal){
-            await saveAsset(new TextEncoder().encode(this.hashSignal))
-        }
-
+    #finalize(){
         this.isFinalized = true
         this.#checkCompletion()
     }
 }
 
 
-/**
- * Checks if a CharX file's assets already exist on the server.
- *
- * This optimization allows skipping asset uploads when importing from the hub:
- * 1. Hashes the entire file
- * 2. Double-hashes the hash (for privacy/security)
- * 3. Checks if server has this hash registered
- *
- * If successful, the importer can skip saving assets and just reference server copies.
- *
- * @returns {success: boolean, hash: string} - Whether assets exist on server, and the file hash
- */
-export async function CharXSkippableChecker(data:Uint8Array){
-    const hashed = await hasher(data)
-    const reHashed = await hasher(new TextEncoder().encode(hashed))
-    const realmAssetRequest = fetchRealmResource(hubURL + '/rs/assets/' + reHashed + '.png')
-    if(!realmAssetRequest){
-        return {
-            success: false,
-            hash: hashed
-        }
-    }
-    const x = await realmAssetRequest
-    return {
-        success: x.status >= HTTP_STATUS_OK_MIN && x.status < HTTP_STATUS_OK_MAX,
-        hash: hashed
-    }
-}
