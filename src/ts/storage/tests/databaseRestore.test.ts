@@ -4,7 +4,6 @@ import {
     completeAccountUnmigration,
     installAccountBackup,
     installDriveRestore,
-    installInternalBackup,
     installLocalBackup,
     installRisuKeiBackup,
     materializeAccountUnmigrationResources,
@@ -16,7 +15,6 @@ const database = {
 } as Database
 
 describe.each([
-    ['internal backup', installInternalBackup, 'internal-backup'],
     ['account backup', installAccountBackup, 'account-backup'],
     ['Risu-Kei backup', installRisuKeiBackup, 'risu-kei-backup'],
 ] as const)('%s restore', (_name, install, expectedReason) => {
@@ -50,46 +48,39 @@ describe.each([
 })
 
 describe('local backup restore', () => {
-    it('writes the explicit local mirror and relaunches after replacement', async () => {
+    it('publishes the accepted revision before relaunching', async () => {
         const events: string[] = []
 
         await installLocalBackup(database, {
             replaceDatabase: async () => { events.push('replace') },
             publishAcceptedRevision: async () => { events.push('publish') },
-            writeLocalMirror: async () => { events.push('local-mirror') },
             relaunch: async () => { events.push('relaunch') },
         })
 
-        expect(events).toEqual(['replace', 'publish', 'local-mirror', 'relaunch'])
+        expect(events).toEqual(['replace', 'publish', 'relaunch'])
     })
 
-    it('does not write or relaunch when replacement fails', async () => {
-        const writeLocalMirror = vi.fn()
+    it('does not relaunch when replacement fails', async () => {
         const relaunch = vi.fn()
 
         await expect(installLocalBackup(database, {
             replaceDatabase: async () => { throw new Error('replacement failed') },
             publishAcceptedRevision: vi.fn(),
-            writeLocalMirror,
             relaunch,
         })).rejects.toThrow('replacement failed')
 
-        expect(writeLocalMirror).not.toHaveBeenCalled()
         expect(relaunch).not.toHaveBeenCalled()
     })
 
-    it('retains publication retry ownership and does not mirror or relaunch on publish failure', async () => {
-        const writeLocalMirror = vi.fn()
+    it('retains publication retry ownership and does not relaunch on publish failure', async () => {
         const relaunch = vi.fn()
 
         await expect(installLocalBackup(database, {
             replaceDatabase: async () => undefined,
             publishAcceptedRevision: async () => { throw new Error('official offline') },
-            writeLocalMirror,
             relaunch,
         })).rejects.toThrow('official offline')
 
-        expect(writeLocalMirror).not.toHaveBeenCalled()
         expect(relaunch).not.toHaveBeenCalled()
     })
 })
@@ -133,14 +124,10 @@ describe('Drive restore', () => {
 })
 
 describe('completeAccountUnmigration', () => {
-    it('replaces persistence and writes the same detached local mirror before clearing flags', async () => {
+    it('replaces persistence with a detached account-free candidate before clearing flags', async () => {
         const live = structuredClone(database)
         const original = structuredClone(live)
         const events: string[] = []
-        let accepted = structuredClone(database)
-        accepted.account = null
-        accepted.characters = [{ chaId: 'accepted-after-time-boundary', chats: [] }] as any
-        let mirrored: Database | undefined
 
         await completeAccountUnmigration(live, {
             prepareResources: async () => { events.push('resources') },
@@ -148,75 +135,38 @@ describe('completeAccountUnmigration', () => {
                 events.push('replace')
                 expect(reason).toBe('account-unmigration')
                 expect(candidate.account).toBeNull()
+                expect(candidate).not.toBe(live)
             },
-            captureAcceptedDatabase: () => accepted,
-            writeLegacyMirror: async (candidate) => {
-                events.push('mirror')
-                mirrored = candidate
-            },
-            finalize: () => {
-                events.push('finalize')
-            },
+            finalize: () => { events.push('finalize') },
         })
 
-        expect(events).toEqual(['resources', 'replace', 'mirror', 'finalize'])
-        expect(mirrored).toEqual(accepted)
-        expect(mirrored).not.toBe(accepted)
+        expect(events).toEqual(['resources', 'replace', 'finalize'])
         expect(live).toEqual(original)
     })
 
-    it('retains account state and flags when the local mirror fails', async () => {
-        const live = structuredClone(database)
-        const original = structuredClone(live)
-        const finalize = vi.fn()
-
-        await expect(completeAccountUnmigration(live, {
-            prepareResources: async () => undefined,
-            replaceDatabase: async () => undefined,
-            captureAcceptedDatabase: () => live,
-            writeLegacyMirror: async () => {
-                throw new Error('mirror failed')
-            },
-            finalize,
-        })).rejects.toThrow('mirror failed')
-
-        expect(finalize).not.toHaveBeenCalled()
-        expect(live).toEqual(original)
-    })
-
-    it('does not capture, mirror, clear flags, or reload when replacement fails', async () => {
-        const captureAcceptedDatabase = vi.fn()
-        const writeLegacyMirror = vi.fn()
+    it('does not clear flags when replacement fails', async () => {
         const finalize = vi.fn()
 
         await expect(completeAccountUnmigration(structuredClone(database), {
             prepareResources: async () => undefined,
             replaceDatabase: async () => { throw new Error('replacement failed') },
-            captureAcceptedDatabase,
-            writeLegacyMirror,
             finalize,
         })).rejects.toThrow('replacement failed')
 
-        expect(captureAcceptedDatabase).not.toHaveBeenCalled()
-        expect(writeLegacyMirror).not.toHaveBeenCalled()
         expect(finalize).not.toHaveBeenCalled()
     })
 
-    it('does not replace, mirror, or clear flags when remote-only materialization fails', async () => {
+    it('does not replace or clear flags when remote-only materialization fails', async () => {
         const replaceDatabase = vi.fn()
-        const writeLegacyMirror = vi.fn()
         const finalize = vi.fn()
 
         await expect(completeAccountUnmigration(structuredClone(database), {
             prepareResources: async () => { throw new Error('remote asset missing') },
             replaceDatabase,
-            captureAcceptedDatabase: () => database,
-            writeLegacyMirror,
             finalize,
         })).rejects.toThrow('remote asset missing')
 
         expect(replaceDatabase).not.toHaveBeenCalled()
-        expect(writeLegacyMirror).not.toHaveBeenCalled()
         expect(finalize).not.toHaveBeenCalled()
     })
 })

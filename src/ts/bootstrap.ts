@@ -49,13 +49,7 @@ import {
     checkNewFormat as migrateDatabaseFormat,
     prepareDatabaseForPersistence,
 } from "./storage/databasePreparation";
-import {
-    bootstrapPersistentDatabase,
-    listLegacyDatabaseBackups,
-    readLegacyDatabaseCandidate,
-    type LegacyDatabaseCandidate,
-} from "./storage/persistentBootstrap";
-import { getLegacyLocalStorage } from "./storage/legacyLocalStorage";
+import { bootstrapPersistentDatabase } from "./storage/persistentBootstrap";
 import {
     getPersistentDataRuntime,
     initializeActiveWorkingSet,
@@ -81,55 +75,6 @@ let disposeLifecycleCommitListeners: (() => void) | undefined
 /**
  * Loads the application data.
  */
-async function readTauriLegacyDatabase(path: string): Promise<Database> {
-    const appDataDirPath = await appDataDir()
-    const databasePath = await join(appDataDirPath, path)
-    const response = await fetch(convertFileSrc(databasePath))
-    if (!response.ok) throw new Error(`Failed to load database: ${response.status}`)
-    return decodeRisuSave(new Uint8Array(await response.arrayBuffer()))
-}
-
-async function loadLegacyDatabaseCandidate(): Promise<LegacyDatabaseCandidate> {
-    if (isTauri) {
-        if (await exists('database/database.bin', { baseDir: BaseDirectory.AppData })) {
-            try {
-                LoadingStatusState.text = 'Reading Save File...'
-                return {
-                    database: await readTauriLegacyDatabase('database/database.bin'),
-                    source: 'primary',
-                }
-            } catch (error) {
-                console.error(error)
-            }
-        }
-        LoadingStatusState.text = 'Reading Backup Files...'
-        const backupKeys = (await readDir('database', {
-            baseDir: BaseDirectory.AppData,
-        })).map((entry) => `database/${entry.name}`)
-        for (const backup of listLegacyDatabaseBackups(backupKeys)) {
-            try {
-                return {
-                    database: await readTauriLegacyDatabase(`database/dbbackup-${backup}.bin`),
-                    source: 'fallback',
-                }
-            } catch (error) {
-                console.error(error)
-            }
-        }
-        return { database: {} as Database, source: 'default' }
-    }
-
-    LoadingStatusState.text = 'Loading Local Save File...'
-    return readLegacyDatabaseCandidate(
-        getLegacyLocalStorage(),
-        decodeRisuSave,
-        (error) => console.error(error),
-    )
-}
-
-/**
- * Loads the application data.
- */
 export async function loadData() {
     if (get(loadedStore)) return
     try {
@@ -138,9 +83,6 @@ export async function loadData() {
             if (isTauriDesktop) appWindow.maximize()
             if (!await exists('', { baseDir: BaseDirectory.AppData })) {
                 await mkdir('', { baseDir: BaseDirectory.AppData })
-            }
-            if (!await exists('database', { baseDir: BaseDirectory.AppData })) {
-                await mkdir('database', { baseDir: BaseDirectory.AppData })
             }
             if (!await exists('assets', { baseDir: BaseDirectory.AppData })) {
                 await mkdir('assets', { baseDir: BaseDirectory.AppData })
@@ -153,7 +95,6 @@ export async function loadData() {
         const runtime = getPersistentDataRuntime()
         const local = await bootstrapPersistentDatabase({
             store: runtime.store,
-            loadLegacyCandidate: loadLegacyDatabaseCandidate,
             prepareDatabase: prepareDatabaseForPersistence,
         })
         setDatabase(local.database)

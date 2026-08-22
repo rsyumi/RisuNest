@@ -62,7 +62,6 @@ import {
     createPersistentSaveObserverInstallation,
     installPersistentSaveNotifications,
 } from "./storage/persistentSaveNotifications";
-import { installInternalBackup } from "./storage/databaseRestore";
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore } from "./storage/platformBlobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
 import { readActiveAsset, storeActiveAsset } from "./storage/accountAssetAccess";
@@ -387,49 +386,6 @@ export async function saveDb() {
 
 export function stopSaveDb(): void {
     persistentSaveObserverInstallation.stop()
-}
-
-/**
- * Retrieves the database backups.
- * 
- * @returns {Promise<number[]>} - A promise that resolves to an array of backup timestamps.
- */
-export async function getDbBackups() {
-    let db = getDatabase()
-    if (db?.account?.useSync && !isTauri && !isNodeServer) {
-        return []
-    }
-    if (isTauri) {
-        const keys = await readDir('database', { baseDir: BaseDirectory.AppData })
-        let backups: number[] = []
-        for (const key of keys) {
-            if (key.name.startsWith("dbbackup-")) {
-                let da = key.name.substring(9)
-                da = da.substring(0, da.length - 4)
-                backups.push(parseInt(da))
-            }
-        }
-        backups.sort((a, b) => b - a)
-        while (backups.length > 20) {
-            const last = backups.pop()
-            await remove(`database/dbbackup-${last}.bin`, { baseDir: BaseDirectory.AppData })
-        }
-        return backups
-    }
-    else {
-        const keys = await forageStorage.keys()
-
-        const backups = keys
-            .filter(key => key.startsWith('database/dbbackup-'))
-            .map(key => parseInt(key.slice(18, -4)))
-            .sort((a, b) => b - a);
-
-        while (backups.length > 20) {
-            const last = backups.pop()
-            await forageStorage.removeItem(`database/dbbackup-${last}.bin`)
-        }
-        return backups
-    }
 }
 
 let usingSw = false
@@ -1611,53 +1567,6 @@ export class BlankWriter {
     async end() {
         //do nothing, just to make compatible with other writer
     }
-}
-
-export async function loadInternalBackup() {
-
-    const keys = isTauri ? (await readDir('database', { baseDir: BaseDirectory.AppData })).map((v) => {
-        return v.name
-    }) : (await forageStorage.keys())
-    let internalBackups: string[] = []
-    for (const key of keys) {
-        if (key.includes('dbbackup-')) {
-            internalBackups.push(key)
-        }
-    }
-
-    const selectOptions = [
-        'Cancel',
-        ...(internalBackups.map((a) => {
-            return (new Date(parseInt(a.replace('database/dbbackup-', '').replace('dbbackup-', '')) * 100)).toLocaleString()
-        }))
-    ]
-
-    const alertResult = parseInt(
-        await alertSelect(selectOptions)
-    ) - 1
-
-    if (alertResult === -1) {
-        return
-    }
-
-    const selectedBackup = internalBackups[alertResult]
-
-    const data = isTauri ? (
-        await readFile('database/' + selectedBackup, { baseDir: BaseDirectory.AppData })
-    ) : (await forageStorage.getItem(selectedBackup))
-
-    await installInternalBackup(
-        await decodeRisuSave(Buffer.from(data) as unknown as Uint8Array),
-        {
-            replaceDatabase: replacePersistentDatabase,
-            loadPlugins,
-        },
-    )
-
-    alertNormal('Loaded backup')
-
-
-
 }
 
 /**

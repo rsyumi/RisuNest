@@ -15,9 +15,6 @@ async function installPluginRestore(
     await dependencies.loadPlugins()
 }
 
-export const installInternalBackup = (database: Database, dependencies: PluginRestoreDependencies) =>
-    installPluginRestore(database, 'internal-backup', dependencies)
-
 export const installAccountBackup = (database: Database, dependencies: PluginRestoreDependencies) =>
     installPluginRestore(database, 'account-backup', dependencies)
 
@@ -83,13 +80,11 @@ export async function installLocalBackup(
     dependencies: {
         replaceDatabase: (database: Database, reason: string) => Promise<void>
         publishAcceptedRevision: () => Promise<void>
-        writeLocalMirror: () => Promise<void>
         relaunch: () => void | Promise<void>
     },
 ): Promise<void> {
     await dependencies.replaceDatabase(database, 'local-backup')
     await dependencies.publishAcceptedRevision()
-    await dependencies.writeLocalMirror()
     await dependencies.relaunch()
 }
 
@@ -111,8 +106,6 @@ export async function completeAccountUnmigration(
     dependencies: {
         prepareResources: () => Promise<void>
         replaceDatabase: (database: Database, reason: string) => Promise<void>
-        captureAcceptedDatabase: () => Database
-        writeLegacyMirror: (database: Database) => Promise<void>
         finalize: () => void
     },
 ): Promise<void> {
@@ -121,6 +114,5 @@ export async function completeAccountUnmigration(
 
     await dependencies.prepareResources()
     await dependencies.replaceDatabase(candidate, 'account-unmigration')
-    await dependencies.writeLegacyMirror(safeStructuredClone(dependencies.captureAcceptedDatabase()))
     dependencies.finalize()
 }

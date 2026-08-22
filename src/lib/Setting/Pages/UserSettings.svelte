@@ -6,7 +6,7 @@
     import { DBState } from 'src/ts/stores.svelte';
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     import { alertConfirm} from "src/ts/alert";
-    import { forageStorage, loadInternalBackup } from "src/ts/globalApi.svelte";
+    import { forageStorage } from "src/ts/globalApi.svelte";
     import { isTauri, isNodeServer } from "src/ts/platform"
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
@@ -71,16 +71,7 @@
     {language.loadBackupLocal}
 </Button>
 
-{#if !forageStorage.isAccount}
-    <Button
-        onclick={async () => {
-            if((await alertConfirm(language.backupLoadConfirm)) && (await alertConfirm(language.backupLoadConfirm2))){
-                loadInternalBackup()
-            }
-        }} className="mt-2">
-        {language.loadInternalBackup}
-    </Button>
-{:else}
+{#if forageStorage.isAccount}
     <Button
         onclick={async () => {
             loadRisuAccountBackup()

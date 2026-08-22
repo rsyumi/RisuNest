@@ -59,7 +59,6 @@ export interface BlobPhysicalKeyMapper {
     payload(key: string): string
     metadata(key: string): string
     metadataPrefix: string
-    legacyAssetPrefix: string
 }
 
 const mimeByExtension: Record<string, string> = {
@@ -104,36 +103,7 @@ export function createKeyValueBlobStore(
         payload: (key: string) => key.startsWith('assets/') ? key : `blobstore/inlays/${Buffer.from(key).toString('hex')}.bin`,
         metadata: (key: string) => `blobstore/metadata/${Buffer.from(key).toString('hex')}.json`,
         metadataPrefix: 'blobstore/metadata/',
-        legacyAssetPrefix: 'assets/',
     }
-
-    let initialized: Promise<void> | undefined
-    const backfillLegacyMetadata = async () => {
-        const allKeys = await backend.keys()
-        const keySet = new Set(allKeys)
-        for (const key of allKeys.filter((value) => value.startsWith(keys.legacyAssetPrefix))) {
-            const logicalKey = key.slice(keys.legacyAssetPrefix.length - 'assets/'.length)
-            const metadataKey = keys.metadata(logicalKey)
-            if (keySet.has(metadataKey)) continue
-            const payloadSize = backend.size ? await backend.size(key) : (await backend.read(key))?.byteLength ?? 0
-            if (payloadSize === null) continue
-            const ext = normalizeBlobExtension(logicalKey.split('.').pop() ?? '')
-            const metadata: BlobMetadata = {
-                key: logicalKey,
-                kind: 'asset',
-                size: payloadSize,
-                mime: inferBlobMime(undefined, ext),
-                name: logicalKey.split('/').pop() ?? logicalKey,
-                ext,
-            }
-            await backend.write(metadataKey, new TextEncoder().encode(JSON.stringify(metadata)))
-        }
-    }
-
-    const initialize = () => initialized ??= backfillLegacyMetadata().catch((error) => {
-        initialized = undefined
-        throw error
-    })
 
     async function payloadExists(payloadKey: string): Promise<boolean> {
         if (backend.size) return await backend.size(payloadKey) !== null
@@ -141,7 +111,6 @@ export function createKeyValueBlobStore(
     }
 
     async function stat(key: string): Promise<BlobMetadata | null> {
-        await initialize()
         const metadata = parseMetadata(await backend.read(keys.metadata(key)))
         if (!metadata) return null
         return await payloadExists(keys.payload(key)) ? metadata : null
@@ -149,8 +118,7 @@ export function createKeyValueBlobStore(
 
     return {
         async put(key, data, input) {
-            await initialize()
-            const ext = normalizeBlobExtension(input.ext)
+                const ext = normalizeBlobExtension(input.ext)
             const metadata = {
                 ...input,
                 key,
@@ -163,8 +131,7 @@ export function createKeyValueBlobStore(
             return metadata
         },
         async read(key, range) {
-            await initialize()
-            if (range) validateBlobReadRange(range)
+                if (range) validateBlobReadRange(range)
             const metadata = await stat(key)
             if (!metadata) return null
             const payloadKey = keys.payload(key)
@@ -179,8 +146,7 @@ export function createKeyValueBlobStore(
         },
         stat,
         async list(query) {
-            await initialize()
-            const allKeys = await backend.keys()
+                const allKeys = await backend.keys()
             const keySet = new Set(allKeys)
             const results: BlobMetadata[] = []
             for (const metadataKey of allKeys.filter((key) => key.startsWith(keys.metadataPrefix))) {
@@ -191,13 +157,11 @@ export function createKeyValueBlobStore(
             return results.sort((left, right) => left.key.localeCompare(right.key))
         },
         async remove(key) {
-            await initialize()
-            await backend.remove(keys.payload(key))
+                await backend.remove(keys.payload(key))
             await backend.remove(keys.metadata(key))
         },
         async resolveUrl(key) {
-            await initialize()
-            if (!await stat(key)) return null
+                if (!await stat(key)) return null
             return backend.resolveUrl?.(keys.payload(key)) ?? null
         },
     }

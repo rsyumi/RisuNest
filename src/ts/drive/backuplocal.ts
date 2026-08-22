@@ -503,14 +503,6 @@ export function LoadLocalBackup(){
             await installLocalBackup(dbData, {
                 replaceDatabase: replacePersistentDatabase,
                 publishAcceptedRevision: publishCurrentOfficialRevision,
-                writeLocalMirror: async () => {
-                    if (isTauri) {
-                        await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });
-                        return
-                    }
-                    const legacyStorage = localforage.createInstance({ name: 'risuai' });
-                    await legacyStorage.setItem('database/database.bin', db);
-                },
                 relaunch: async () => {
                     alertStore.set({
                         type: "wait",

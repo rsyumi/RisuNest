@@ -330,10 +330,6 @@ export async function unMigrationAccount() {
             },
         }),
         replaceDatabase: replacePersistentDatabase,
-        captureAcceptedDatabase: getDatabase,
-        writeLegacyMirror: async (database) => {
-            await MigrationStorage.setItem('database/database.bin', encodeRisuSaveLegacy(database))
-        },
         finalize: () => {
             alertStore.set({ type: "none", msg: "" })
             localStorage.setItem('dosync', 'avoid')

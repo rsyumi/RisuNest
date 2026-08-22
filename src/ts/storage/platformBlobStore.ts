@@ -31,7 +31,6 @@ const blobKeyMapper: BlobPhysicalKeyMapper = {
     payload: (key) => physicalBlobKeys(key).payload,
     metadata: (key) => physicalBlobKeys(key).metadata,
     metadataPrefix: 'blobstore/metadata/',
-    legacyAssetPrefix: 'assets/',
 }
 
 export function createBackedBlobStore(backend: BlobKeyValueBackend): BlobStore {
