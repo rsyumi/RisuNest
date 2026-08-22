@@ -4,7 +4,7 @@
     import { parseToggleSyntax, type sidebarToggle, type sidebarToggleGroup } from "src/ts/util";
     import { language } from "src/lang";
     import type { PromptItem } from "src/ts/process/prompt";
-    import { getCurrentCharacter, type character, type groupChat } from "src/ts/storage/database.svelte";
+    import { getCurrentCharacter, getCurrentChat, type character, type groupChat } from "src/ts/storage/database.svelte";
     import Accordion from '../UI/Accordion.svelte'
     import CheckInput from "../UI/GUI/CheckInput.svelte";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
@@ -12,7 +12,8 @@
     import TextAreaInput from '../UI/GUI/TextAreaInput.svelte'
     import TextInput from "../UI/GUI/TextInput.svelte";
     import CustomSideBar from "./CustomSidebar.svelte";
-    import { getGlobalChatVar, setGlobalChatVar } from "src/ts/parser/chatVar.svelte";
+    import { getGlobalChatVar, isLocallyHandledGlobalChatVar, removeLocallyHandledGlobalChatVar, setGlobalChatVar } from "src/ts/parser/chatVar.svelte";
+    import { PinIcon } from "@lucide/svelte";
 
     interface Props {
         chara?: character|groupChat
@@ -52,6 +53,12 @@
         return templateUsesJailbreakToggle(template)
     })
 
+    // let getToggleDisplayName = (toggle: sidebarToggle) => {
+    //     if(isLocallyHandledGlobalChatVar(`toggle_${toggle.key}`)){
+    //         return toggle.value + ' (📌)'
+    //     }
+    //     return toggle.value
+    // }
     let charToggle = $state((DBState.db?.characters?.[$selectedCharID] as character)?.customModuleToggle)
     $effect(() => {
         const charToggleTemp = (DBState.db?.characters?.[$selectedCharID] as character)?.customModuleToggle
@@ -83,7 +90,29 @@
             return acc
         }, [])
     })
+
+    const getGlobalChatVarNH = (key: string) => {
+        const value = getGlobalChatVar(key)
+        if (value === 'null') {
+            return ''
+        }
+        return value
+    }
 </script>
+
+{#snippet localToggle(toggle: sidebarToggle)}
+    {#if isLocallyHandledGlobalChatVar(`toggle_${toggle.key}`)}
+        <button onclick={() => {
+            removeLocallyHandledGlobalChatVar(`toggle_${toggle.key}`)
+        }}>
+            📌
+        </button>
+    {/if}
+{/snippet}
+
+{#snippet getToggleDisplayName(toggle: sidebarToggle)}
+    {toggle.value}{@render localToggle(toggle)}
+{/snippet}
 
 {#snippet toggles(items: sidebarToggle[], reverse: boolean = false)}
     {#each items as toggle, index}
@@ -95,8 +124,8 @@
             </div>
         {:else if toggle.type === 'select'}
             <div class="w-full flex gap-2 mt-2 items-center" class:justify-end={$MobileGUI} >
-                <span>{toggle.value}</span>
-                <SelectInput className="w-32" value={getGlobalChatVar(`toggle_${toggle.key}`)} onchange={(e) => {
+                <span>{@render getToggleDisplayName(toggle)}</span>
+                <SelectInput className="w-32" value={getGlobalChatVarNH(`toggle_${toggle.key}`)} onchange={(e) => {
                     setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
                 }}>
                     {#each toggle.options as option, i}
@@ -106,15 +135,15 @@
             </div>
         {:else if toggle.type === 'text'}
             <div class="w-full flex gap-2 mt-2 items-center" class:justify-end={$MobileGUI}>
-                <span>{toggle.value}</span>
-                <TextInput className="w-32" value={getGlobalChatVar(`toggle_${toggle.key}`)} onchange={(e) => {
+                <span>{@render getToggleDisplayName(toggle)}</span>
+                <TextInput className="w-32" value={getGlobalChatVarNH(`toggle_${toggle.key}`)} onchange={(e) => {
                     setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.value)
                 }} />
             </div>
         {:else if toggle.type === 'textarea'}
             <div class="w-full flex gap-2 mt-2 items-start" class:justify-end={$MobileGUI}>
-                <span class="mt-1.5">{toggle.value}</span>
-                <TextAreaInput className="w-32" height='20' value={getGlobalChatVar(`toggle_${toggle.key}`)} onchange={(e) => {
+                <span class="mt-1.5">{@render getToggleDisplayName(toggle)}</span>
+                <TextAreaInput className="w-32" height='20' value={getGlobalChatVarNH(`toggle_${toggle.key}`)} onchange={(e) => {
                     //check is div
                     if(e.currentTarget instanceof HTMLDivElement){
                         setGlobalChatVar(`toggle_${toggle.key}`, e.currentTarget.innerText)
@@ -132,16 +161,18 @@
             {#if index === 0 || items[index - 1]?.type !== 'divider' || items[index - 1]?.value !== toggle.value}
                 <div class="w-full min-h-5 flex gap-2 mt-2 items-center" class:justify-end={!reverse}>
                     {#if toggle.value}
-                        <span class="shrink-0">{toggle.value}</span>
+                        <span class="shrink-0">{@render getToggleDisplayName(toggle)}</span>
                     {/if}
                     <hr class="border-t border-darkborderc m-0 grow" />
                 </div>
             {/if}
         {:else}
             <div class="w-full flex mt-2 items-center" class:justify-end={$MobileGUI}>
-                <CheckInput check={getGlobalChatVar(`toggle_${toggle.key}`) === '1'} reverse={reverse} name={toggle.value} onChange={() => {
-                    DBState.db.globalChatVariables[`toggle_${toggle.key}`] = getGlobalChatVar(`toggle_${toggle.key}`) === '1' ? '0' : '1'
-                }} />
+                <CheckInput check={getGlobalChatVarNH(`toggle_${toggle.key}`) === '1'} reverse={reverse} name={toggle.value} onChange={() => {
+                    setGlobalChatVar(`toggle_${toggle.key}`, getGlobalChatVarNH(`toggle_${toggle.key}`) === '1' ? '0' : '1')
+                }}>
+                    {@render localToggle(toggle)}
+                </CheckInput>
             </div>
         {/if}
     {/each}
@@ -176,6 +207,18 @@
     {#if chara && (DBState.db.supaModelType !== 'none' || DBState.db.hanuraiEnable || DBState.db.hypaV3)}
         <div class="flex mt-2 items-center">
             <CheckInput bind:check={chara.supaMemory} name={DBState.db.hypaV3 ? language.ToggleHypaMemory : DBState.db.hanuraiEnable ? language.hanuraiMemory : DBState.db.hypaMemory ? language.ToggleHypaMemory : language.ToggleSuperMemory}/>
+        </div>
+    {/if}
+    
+    {#if chara}
+        <div class="flex mt-2 items-center w-full" class:justify-end={$MobileGUI}>
+            <CheckInput check={getCurrentChat()?.useLocallySetGlobalVariables} name={language.localToggles} onChange={() => {
+                const chatIndx = DBState.db.characters[$selectedCharID].chatPage
+                const chat = DBState.db.characters[$selectedCharID].chats[chatIndx]
+                if(chat){
+                    chat.useLocallySetGlobalVariables = !chat.useLocallySetGlobalVariables
+                }
+            }} />
         </div>
     {/if}
 {/if}

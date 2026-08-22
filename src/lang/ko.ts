@@ -1520,4 +1520,5 @@ export const languageKorean = {
     nanoGPTSelectFromList: "목록에서 선택",
     nanoGPTManualInput: "수동 입력",
     nanoGPTManualModelSelect: "수동 모델 선택",
+    localToggles: "로컬 토글",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>
