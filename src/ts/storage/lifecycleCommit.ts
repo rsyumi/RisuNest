@@ -5,6 +5,7 @@ export type LifecycleCommitReason =
     | 'visibility-hidden'
     | 'stop'
     | 'trim-memory'
+    | 'exit'
 
 type LifecycleFlush = (reason: LifecycleCommitReason) => Promise<void>
 
@@ -28,7 +29,7 @@ export function registerLifecycleCommitListeners(
     }
     const onNativeLifecycle = (event: Event) => {
         const reason = (event as CustomEvent<NativeLifecycleDetail>).detail?.reason
-        if (reason === 'stop' || reason === 'trim-memory') {
+        if (reason === 'stop' || reason === 'trim-memory' || reason === 'exit') {
             requestFlush(reason)
         }
     }

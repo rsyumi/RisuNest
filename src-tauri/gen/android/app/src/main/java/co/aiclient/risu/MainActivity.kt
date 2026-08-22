@@ -2,7 +2,6 @@ package co.aiclient.risu
 
 import android.content.ComponentCallbacks2
 import android.os.Bundle
-import android.os.Process
 import android.os.SystemClock
 import android.view.ViewGroup
 import android.webkit.WebView
@@ -18,6 +17,7 @@ private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
+private const val EXIT_REASON = "exit"
 
 internal data class WebViewMargins(
   val left: Int,
@@ -38,11 +38,6 @@ internal fun resolveWebViewMargins(
 
 internal fun nativeMarginInsetTypes() = WindowInsetsCompat.Type.systemBars() or
   WindowInsetsCompat.Type.displayCutout()
-
-internal fun exitApplication(removeTask: () -> Unit, terminateProcess: () -> Unit) {
-  removeTask()
-  terminateProcess()
-}
 
 internal enum class BackNavigationAction {
   GO_BACK,
@@ -131,15 +126,18 @@ class MainActivity : TauriActivity() {
         override fun handleOnBackPressed() {
           when (backNavigationPolicy.decide(webView.canGoBack(), SystemClock.elapsedRealtime())) {
             BackNavigationAction.GO_BACK -> webView.goBack()
-            BackNavigationAction.SHOW_EXIT_HINT -> Toast.makeText(
-              this@MainActivity,
-              R.string.press_back_again_to_exit,
-              Toast.LENGTH_SHORT,
-            ).show()
-            BackNavigationAction.EXIT -> exitApplication(
-              removeTask = ::finishAndRemoveTask,
-              terminateProcess = { Process.killProcess(Process.myPid()) },
-            )
+            BackNavigationAction.SHOW_EXIT_HINT -> {
+              dispatchLifecycleFlush(EXIT_REASON)
+              Toast.makeText(
+                this@MainActivity,
+                R.string.press_back_again_to_exit,
+                Toast.LENGTH_SHORT,
+              ).show()
+            }
+            BackNavigationAction.EXIT -> {
+              dispatchLifecycleFlush(EXIT_REASON)
+              finishAndRemoveTask()
+            }
           }
         }
       },

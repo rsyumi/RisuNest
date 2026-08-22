@@ -59,7 +59,7 @@ describe('registerLifecycleCommitListeners', () => {
         dispose()
     })
 
-    it.each(['stop', 'trim-memory'] as const)('forwards native %s events', (reason) => {
+    it.each(['stop', 'trim-memory', 'exit'] as const)('forwards native %s events', (reason) => {
         const flush = vi.fn(async () => undefined)
         const dispose = registerLifecycleCommitListeners(flush)
 

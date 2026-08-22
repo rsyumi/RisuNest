@@ -60,16 +60,4 @@ class MainActivityBehaviorTest {
   fun `keyboard inset remains available to the web view`() {
     assertEquals(0, nativeMarginInsetTypes() and WindowInsetsCompat.Type.ime())
   }
-
-  @Test
-  fun `application exit removes the task before terminating the process`() {
-    val exitSteps = mutableListOf<String>()
-
-    exitApplication(
-      removeTask = { exitSteps += "remove task" },
-      terminateProcess = { exitSteps += "terminate process" },
-    )
-
-    assertEquals(listOf("remove task", "terminate process"), exitSteps)
-  }
 }
