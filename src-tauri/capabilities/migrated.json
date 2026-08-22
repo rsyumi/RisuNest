@@ -17,6 +17,10 @@
     "fs:allow-remove",
     "fs:allow-rename",
     "fs:allow-exists",
+    "fs:allow-stat",
+    "fs:allow-open",
+    "fs:allow-seek",
+    "fs:allow-read",
     {
       "identifier": "fs:scope",
       "allow": [
