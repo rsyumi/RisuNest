@@ -1,7 +1,8 @@
-import type { BlobStore } from '../storage/blobStore'
+import type { BlobStore, BlobWriteMetadata, InlayBlobMetadata } from '../storage/blobStore'
 import { readActiveAsset, storeActiveAsset } from '../storage/accountAssetAccess'
 
-export const legacyBackupIncludesInlays = false
+const INLAY_ENTRY_NAME = /^inlay_((?:[0-9a-f]{2})+)\.risuinlay$/
+const INLAY_TYPES = new Set(['image', 'video', 'audio', 'signature'])
 
 export function isLegacyBackupAssetKey(key: string): boolean {
     const normalized = key.replace(/\\/g, '/')
@@ -43,4 +44,44 @@ export async function writeBackupAsset(
         name,
         ext: name.split('.').pop() ?? '',
     })
+}
+
+export interface BackupInlayEntry {
+    key: string
+    metadata: BlobWriteMetadata
+    data: Uint8Array
+}
+
+/** Hex keeps the id single segment, so the basename the writer applies cannot truncate it. */
+export function getBackupInlayName(key: string): string {
+    return `inlay_${Buffer.from(key, 'utf-8').toString('hex')}.risuinlay`
+}
+
+export function encodeBackupInlayEntry(metadata: InlayBlobMetadata, data: Uint8Array): Uint8Array {
+    const header = new TextEncoder().encode(JSON.stringify(metadata))
+    const entry = new Uint8Array(4 + header.byteLength + data.byteLength)
+    new DataView(entry.buffer).setUint32(0, header.byteLength, true)
+    entry.set(header, 4)
+    entry.set(data, 4 + header.byteLength)
+    return entry
+}
+
+export function decodeBackupInlayEntry(name: string, entry: Uint8Array): BackupInlayEntry | null {
+    if (!INLAY_ENTRY_NAME.test(name) || entry.byteLength < 4) return null
+    const headerLength = new DataView(entry.buffer, entry.byteOffset, entry.byteLength).getUint32(0, true)
+    if (headerLength === 0 || 4 + headerLength > entry.byteLength) return null
+    let header: Partial<InlayBlobMetadata>
+    try {
+        header = JSON.parse(new TextDecoder().decode(entry.subarray(4, 4 + headerLength)))
+    } catch {
+        return null
+    }
+    const { key, size: _size, ...metadata } = header
+    if (typeof key !== 'string' || key === '' || isLegacyBackupAssetKey(key)) return null
+    if (metadata.kind !== 'inlay' || !INLAY_TYPES.has(metadata.inlayType as string)) return null
+    return {
+        key,
+        metadata: metadata as BlobWriteMetadata,
+        data: entry.slice(4 + headerLength),
+    }
 }

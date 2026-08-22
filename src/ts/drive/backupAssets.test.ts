@@ -3,8 +3,10 @@ import type { BlobStore } from '../storage/blobStore'
 import { configureOfficialAccountAssetReader } from '../storage/accountAssetAccess'
 import {
     collectBackupAssetKeys,
+    decodeBackupInlayEntry,
+    encodeBackupInlayEntry,
+    getBackupInlayName,
     isLegacyBackupAssetKey,
-    legacyBackupIncludesInlays,
     readBackupAsset,
     selectLegacyBackupAssetKeys,
     writeBackupAsset,
@@ -23,7 +25,79 @@ describe('legacy backup asset selection', () => {
             'assets', 'database/database.bin', 'coldstorage/a', 'coldstorage_a',
             'blobstore/metadata/a.json', 'blobstore/inlays/a.bin', 'raw-inlay-id', 'backup/file',
         ]) expect(isLegacyBackupAssetKey(key)).toBe(false)
-        expect(legacyBackupIncludesInlays).toBe(false)
+    })
+})
+
+describe('backup inlay entries', () => {
+    const metadata = {
+        key: 'inlay-1',
+        kind: 'inlay',
+        size: 3,
+        mime: 'image/png',
+        name: 'shot.png',
+        ext: 'png',
+        inlayType: 'image',
+        width: 4,
+        height: 5,
+    } as const
+
+    test('round trips payload and metadata through a single entry', () => {
+        const data = new Uint8Array([1, 2, 3])
+        const name = getBackupInlayName(metadata.key)
+
+        expect(name).toBe('inlay_696e6c61792d31.risuinlay')
+        expect(decodeBackupInlayEntry(name, encodeBackupInlayEntry(metadata, data))).toEqual({
+            key: 'inlay-1',
+            data,
+            metadata: {
+                kind: 'inlay',
+                mime: 'image/png',
+                name: 'shot.png',
+                ext: 'png',
+                inlayType: 'image',
+                width: 4,
+                height: 5,
+            },
+        })
+    })
+
+    test('round trips a zero byte payload', () => {
+        const name = getBackupInlayName('empty')
+        const decoded = decodeBackupInlayEntry(name, encodeBackupInlayEntry(
+            { ...metadata, key: 'empty', size: 0 },
+            new Uint8Array(),
+        ))
+
+        expect(decoded?.data).toEqual(new Uint8Array())
+    })
+
+    test('leaves entries it does not own to the asset and cold branches', () => {
+        const entry = encodeBackupInlayEntry(metadata, new Uint8Array([1]))
+
+        expect(decodeBackupInlayEntry('profile.png', entry)).toBeNull()
+        expect(decodeBackupInlayEntry('coldstorage_a.json', entry)).toBeNull()
+        expect(decodeBackupInlayEntry('inlay_zz.risuinlay', entry)).toBeNull()
+    })
+
+    test('rejects damaged, mistyped, and asset shadowing entries', () => {
+        const name = getBackupInlayName(metadata.key)
+        const entry = encodeBackupInlayEntry(metadata, new Uint8Array([1]))
+
+        expect(decodeBackupInlayEntry(name, entry.subarray(0, 3))).toBeNull()
+        expect(decodeBackupInlayEntry(name, entry.subarray(0, 6))).toBeNull()
+        expect(decodeBackupInlayEntry(name, new Uint8Array([9, 0, 0, 0, 1, 2]))).toBeNull()
+        expect(decodeBackupInlayEntry(
+            name,
+            encodeBackupInlayEntry({ ...metadata, kind: 'asset' } as never, new Uint8Array([1])),
+        )).toBeNull()
+        expect(decodeBackupInlayEntry(
+            name,
+            encodeBackupInlayEntry({ ...metadata, inlayType: 'model' } as never, new Uint8Array([1])),
+        )).toBeNull()
+        expect(decodeBackupInlayEntry(
+            name,
+            encodeBackupInlayEntry({ ...metadata, key: 'assets/shadow.png' }, new Uint8Array([1])),
+        )).toBeNull()
     })
 })
 

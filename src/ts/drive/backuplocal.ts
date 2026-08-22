@@ -3,8 +3,12 @@ import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
 import { getUncleanables, LocalWriter, forageStorage } from "../globalApi.svelte";
 import { resolveBlobStore } from "../storage/platformBlobStore";
+import type { InlayBlobMetadata } from "../storage/blobStore";
 import {
     collectBackupAssetKeys,
+    decodeBackupInlayEntry,
+    encodeBackupInlayEntry,
+    getBackupInlayName,
     isLegacyBackupAssetKey,
     readBackupAsset,
     selectLegacyBackupAssetKeys,
@@ -121,6 +125,23 @@ export async function SaveLocalBackup(){
         if (readRemotely) {
             await sleep(1000)
         }
+    }
+
+    const inlays = (await blobStore.list({ kind: 'inlay' }))
+        .filter((metadata): metadata is InlayBlobMetadata =>
+            metadata.kind === 'inlay' && !isLegacyBackupAssetKey(metadata.key))
+    for(let i=0;i<inlays.length;i++){
+        const metadata = inlays[i]
+        alertWait(`Saving local Backup inlays... (${i + 1} / ${inlays.length})`)
+        const data = await blobStore.read(metadata.key)
+        if (data === null) {
+            missingAssets.push(metadata.key)
+            continue
+        }
+        await writer.writeBackup(
+            getBackupInlayName(metadata.key),
+            encodeBackupInlayEntry(metadata, data),
+        )
     }
 
     for(let i=0;i<coldStoragePayloads.payloads.length;i++){
@@ -405,6 +426,13 @@ export function LoadLocalBackup(){
                     }
                     
                     else {
+                        const inlayEntry = decodeBackupInlayEntry(name, data)
+                        if (inlayEntry) {
+                            await blobStore.put(inlayEntry.key, inlayEntry.data, inlayEntry.metadata)
+                            offset += 4 + nameLength + 4 + dataLength;
+                            await sleep(10);
+                            continue;
+                        }
                         const coldStorageKey = getColdStorageBackupKey(name)
                         let handledAsColdStorage = false
 
