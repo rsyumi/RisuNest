@@ -111,6 +111,20 @@ export function createGatedResolvingBlobStore(
     }
 }
 
+export function createRootPinnedGatedBlobStore(
+    pinned: BlobStore,
+    gatedWrites: Pick<BlobStore, 'put' | 'remove'>,
+): BlobStore {
+    return {
+        put: (key, data, metadata) => gatedWrites.put(key, data, metadata),
+        read: (key, range) => pinned.read(key, range),
+        stat: (key) => pinned.stat(key),
+        list: (query) => pinned.list(query),
+        remove: (key) => gatedWrites.remove(key),
+        resolveUrl: (key) => pinned.resolveUrl(key),
+    }
+}
+
 export type KeyValueStorage = {
     readonly blobStorageKind?: 'opfs'
     setItem(key: string, value: Uint8Array): Promise<unknown>
@@ -248,7 +262,11 @@ export function createTauriBlobBackend(dependencies?: TauriBlobBackendDependenci
         },
         async size(key) { return await deps.exists(key) ? deps.size(key) : null },
         async keys() {
-            return [...await deps.list('assets'), ...await deps.list('blobstore')]
+            return [
+                ...await deps.list('assets'),
+                ...await deps.list('blobstore'),
+                ...await deps.list('coldstorage'),
+            ]
         },
         async remove(key) {
             if (await deps.exists(key)) await deps.remove(key)
@@ -322,9 +340,18 @@ const deferredFactory: RootedBlobStoreFactory = {
 }
 
 let activeResolver: ActiveBlobRootResolver = legacyRootResolver
+let gatedProductionStore: BlobStore | null = null
 
 export function setActiveBlobRootResolver(resolver: ActiveBlobRootResolver): void {
     activeResolver = resolver
+}
+
+export function configureActiveBlobStore(
+    resolver: RefreshingActiveBlobRootResolver,
+    gate: StorageMutationGate,
+): void {
+    activeResolver = resolver
+    gatedProductionStore = createGatedResolvingBlobStore(deferredFactory, resolver, gate)
 }
 
 export function getRootedBlobStoreFactory(): RootedBlobStoreFactory {
@@ -332,9 +359,13 @@ export function getRootedBlobStoreFactory(): RootedBlobStoreFactory {
 }
 
 export function getBlobStore(): BlobStore {
-    return createResolvingBlobStore(deferredFactory, { getActiveRoot: () => activeResolver.getActiveRoot() })
+    return gatedProductionStore
+        ?? createResolvingBlobStore(deferredFactory, { getActiveRoot: () => activeResolver.getActiveRoot() })
 }
 
 export async function resolveBlobStore(): Promise<BlobStore> {
-    return deferredFactory.open(await activeResolver.getActiveRoot())
+    const pinned = deferredFactory.open(await activeResolver.getActiveRoot())
+    return gatedProductionStore
+        ? createRootPinnedGatedBlobStore(pinned, gatedProductionStore)
+        : pinned
 }

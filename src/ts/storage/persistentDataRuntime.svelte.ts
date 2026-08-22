@@ -3,7 +3,7 @@ import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
 import type { Chat, Database, character, groupChat } from './database.svelte'
 import { getDatabase, setDatabase } from './database.svelte'
 import { prepareDatabaseForPersistence } from './databasePreparation'
-import { getPersistentDataStore } from './persistentDataStoreFactory'
+import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
 import type { DataRevision } from './persistentDataStore'
 import type { CharacterAdditionRequest } from './saveCoordinator'
 import type { CharacterActivationOptions } from './activeWorkingSet.svelte'
@@ -95,6 +95,8 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),
             onBackgroundError: (error) => productionConfiguration.onBackgroundError?.(error),
             prepareDatabase: prepareDatabaseForPersistence,
+            runExclusiveMigration: (operation) =>
+                getPersistentStorageAuthority().gate.runMigration(operation),
         })
     }
     return productionRuntime

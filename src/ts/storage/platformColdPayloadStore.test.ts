@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from 'vitest'
 import {
     createKeyValueColdPayloadStore,
     createLegacyNodeColdPayloadStore,
+    createLegacyBrowserOpfsColdPayloadStore,
     createLegacyOpfsColdPayloadStore,
     createLegacyTauriColdPayloadStore,
     createRootedColdPayloadStoreFactory,
@@ -22,6 +23,40 @@ function memoryBackend(initial: Record<string, Uint8Array> = {}) {
 }
 
 describe('rooted cold payload storage', () => {
+    test('uses the exact flat browser OPFS legacy names', async () => {
+        const values = new Map<string, Uint8Array>()
+        const directory = {
+            async getFileHandle(name: string, options?: { create?: boolean }) {
+                if (!values.has(name) && !options?.create) throw new DOMException('', 'NotFoundError')
+                values.set(name, values.get(name) ?? new Uint8Array())
+                return {
+                    async getFile() {
+                        return new File([values.get(name)!.slice().buffer as ArrayBuffer], name)
+                    },
+                    async createWritable() {
+                        return {
+                            async write(value: ArrayBuffer) { values.set(name, new Uint8Array(value).slice()) },
+                            async close() {},
+                        }
+                    },
+                }
+            },
+            async *entries() {
+                for (const name of values.keys()) yield [name, {}]
+            },
+            async removeEntry(name: string) { values.delete(name) },
+        } as unknown as FileSystemDirectoryHandle
+        const store = createLegacyBrowserOpfsColdPayloadStore(directory)
+
+        await store.write('same', new Uint8Array([3]))
+
+        expect([...values.keys()]).toEqual(['coldstorage_same.json'])
+        expect(await store.read('same')).toEqual(new Uint8Array([3]))
+        expect(await store.list()).toEqual(['same'])
+        await store.remove('same')
+        expect(await store.read('same')).toBeNull()
+    })
+
     test('shares the generated backend with the platform blob factory seam', async () => {
         const backend = memoryBackend()
         const legacy = createLegacyNodeColdPayloadStore(backend)

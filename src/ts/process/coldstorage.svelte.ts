@@ -18,6 +18,7 @@ import type { Database } from "../storage/database.svelte"
 import { coldStorageHeader, getColdStorageAffectedCharacters, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeysFromDb } from "./coldstorageData"
 import { compactColdStorageDatabase } from "../storage/coldStorageCompaction"
 import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte"
+import type { LocalColdStorageRuntime } from "../storage/localColdStorageRuntime"
 
 export {
     coldStorageHeader,
@@ -27,6 +28,12 @@ export {
     replaceColdStoragePayloadResources,
     listColdDataKeysFromDb
 } from "./coldstorageData"
+
+let localColdStorageRuntime: LocalColdStorageRuntime | null = null
+
+export function configureLocalColdStorageRuntime(runtime: LocalColdStorageRuntime): void {
+    localColdStorageRuntime = runtime
+}
 
 async function decompress(data:Uint8Array) {
     return new Promise<Uint8Array>((resolve, reject) => {
@@ -51,6 +58,9 @@ export async function getColdStorageItem(key:string, opts:{
         return await getColdStorageItem(key, {
             accountFallback: true
         })
+    }
+    else if(localColdStorageRuntime){
+        return localColdStorageRuntime.read(key)
     }
     else if(isNodeServer){
         try {
@@ -193,6 +203,10 @@ export async function setColdStorageItem(key:string, value:any):Promise<boolean>
 
 export async function setLocalColdStorageItem(key:string, value:any):Promise<boolean> {
 
+    if(localColdStorageRuntime){
+        return localColdStorageRuntime.write(key, value)
+    }
+
     const compressed = await compressColdStorageValue(value)
     if(!compressed){
         return false
@@ -248,6 +262,10 @@ export async function listColdStorageItems():Promise<{items:string[]}> {
             return await d.json()
         }
         return null
+    }
+
+    else if(localColdStorageRuntime){
+        return { items: await localColdStorageRuntime.list() }
     }
 
     else if(isNodeServer){
@@ -318,6 +336,9 @@ async function removeColdStorageItems(keys:string[]) {
         } catch (error) {
             console.error('Cold storage account remove failed:', error)
         }
+    }
+    else if(localColdStorageRuntime){
+        await localColdStorageRuntime.remove(keys)
     }
     else if(isNodeServer){
         try {

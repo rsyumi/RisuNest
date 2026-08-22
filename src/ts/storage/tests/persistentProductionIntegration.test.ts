@@ -10,6 +10,7 @@ import {
 } from '../persistentDataRuntime'
 import { decodeRisuSave } from '../risuSave'
 import {
+    configurePersistentSavePayloadRefresh,
     createPersistentSaveObserverInstallation,
     installPersistentSaveNotifications,
 } from '../persistentSaveNotifications'
@@ -309,6 +310,42 @@ describe('persistent production runtime', () => {
         expect(dispose).toHaveBeenCalledOnce()
     })
 
+    it('routes migration through the configured exclusive runner and adopts without replacing again', async () => {
+        const database = makeDatabase()
+        const store = makeStore(`runtime-migration-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const events: string[] = []
+        const runExclusiveMigration = vi.fn()
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            runExclusiveMigration: async <T,>(operation: () => Promise<T>) => {
+                runExclusiveMigration()
+                events.push('exclusive')
+                return operation()
+            },
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const replacement = structuredClone(database)
+        replacement.username = 'Activated migration'
+
+        const result = await runtime.runMigration('lossless-import', async () => {
+            events.push('operation')
+            await runtime.adoptActivatedDatabase(replacement, 2)
+            return 'done'
+        })
+
+        expect(result).toBe('done')
+        expect(events).toEqual(['exclusive', 'operation'])
+        expect(runExclusiveMigration).toHaveBeenCalledOnce()
+        expect(runtime.revision).toBe(2)
+        expect(adapter.current().username).toBe('Activated migration')
+        expect((await store.readRoot()).revision).toBe(1)
+    })
+
     it('prepares a character activation replacement before storing it', async () => {
         const database = makeDatabase()
         const store = makeStore(`runtime-activation-preparation-${crypto.randomUUID()}`)
@@ -347,7 +384,11 @@ describe('persistent production runtime', () => {
             onFlushPromise?: (promise: Promise<void> | null) => void
         } = {}
         const warning = vi.fn()
+        const refreshActivePayloadRoot = vi.fn(async () => undefined)
+        configurePersistentSavePayloadRefresh(refreshActivePayloadRoot)
         const savingStates: boolean[] = []
+        const visibility = new EventTarget() as EventTarget & { visibilityState: DocumentVisibilityState }
+        Object.defineProperty(visibility, 'visibilityState', { value: 'hidden', writable: true })
         const dispose = installPersistentSaveNotifications({
             sessionId: 'local-session',
             channel: {
@@ -363,6 +404,7 @@ describe('persistent production runtime', () => {
             configureRuntime: (next) => {
                 callbacks = next
             },
+            visibilityDocument: visibility,
             showForeignRevisionWarning: warning,
             setSaving: (value) => savingStates.push(value),
         })
@@ -371,12 +413,16 @@ describe('persistent production runtime', () => {
         onmessage?.({ data: 'local-session' } as MessageEvent)
         onmessage?.({ data: 'foreign-a' } as MessageEvent)
         onmessage?.({ data: 'foreign-b' } as MessageEvent)
+        Object.defineProperty(visibility, 'visibilityState', { value: 'visible' })
+        visibility.dispatchEvent(new Event('visibilitychange'))
+        await Promise.resolve()
         callbacks.onFlushPromise?.(Promise.resolve())
         callbacks.onFlushPromise?.(null)
         dispose()
 
         expect(posted).toEqual(['local-session'])
         expect(warning).toHaveBeenCalledOnce()
+        expect(refreshActivePayloadRoot).toHaveBeenCalledTimes(3)
         expect(savingStates).toEqual([true, false])
     })
 

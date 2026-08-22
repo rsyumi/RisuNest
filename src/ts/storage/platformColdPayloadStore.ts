@@ -59,6 +59,47 @@ export function createLegacyOpfsColdPayloadStore(backend: BlobKeyValueBackend): 
     })
 }
 
+export function createLegacyBrowserOpfsColdPayloadStore(
+    directory: FileSystemDirectoryHandle,
+): ColdPayloadStore {
+    const fileName = (key: string) => `coldstorage_${key}.json`
+    return {
+        async read(key) {
+            try {
+                const file = await (await directory.getFileHandle(fileName(key))).getFile()
+                return new Uint8Array(await file.arrayBuffer())
+            } catch (error) {
+                if (error instanceof DOMException && error.name === 'NotFoundError') return null
+                throw error
+            }
+        },
+        async write(key, data) {
+            const writable = await (await directory.getFileHandle(fileName(key), { create: true })).createWritable()
+            try {
+                await writable.write(data.slice().buffer as ArrayBuffer)
+            } finally {
+                await writable.close()
+            }
+        },
+        async list() {
+            const keys: string[] = []
+            for await (const [name] of directory.entries()) {
+                if (name.startsWith('coldstorage_') && name.endsWith('.json')) {
+                    keys.push(name.slice('coldstorage_'.length, -'.json'.length))
+                }
+            }
+            return keys.sort()
+        },
+        async remove(key) {
+            try {
+                await directory.removeEntry(fileName(key))
+            } catch (error) {
+                if (!(error instanceof DOMException) || error.name !== 'NotFoundError') throw error
+            }
+        },
+    }
+}
+
 function utf8Hex(value: string): string {
     return Buffer.from(value, 'utf-8').toString('hex')
 }

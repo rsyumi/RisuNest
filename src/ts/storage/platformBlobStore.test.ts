@@ -6,6 +6,7 @@ import {
     createTauriBlobBackend,
     createKeyValueRootedBlobStoreFactory,
     createGatedResolvingBlobStore,
+    createRootPinnedGatedBlobStore,
     createResolvingBlobStore,
     physicalBlobKeys,
     readBlobForFacade,
@@ -27,6 +28,26 @@ function memoryBackend() {
 }
 
 describe('rooted BlobStore mapping', () => {
+    test('keeps resolved reads pinned while routing writes through the active gated facade', async () => {
+        const metadata = { kind: 'asset' as const, mime: 'image/png', name: 'a.png', ext: 'png' }
+        const pinned = createKeyValueRootedBlobStoreFactory(memoryBackend().backend).open({ kind: 'legacy' })
+        await pinned.put('assets/pinned.png', new Uint8Array([1]), metadata)
+        const write = vi.fn(async () => ({ ...metadata, key: 'assets/current.png', size: 1 }))
+        const remove = vi.fn(async () => undefined)
+        const store = createRootPinnedGatedBlobStore(pinned, {
+            ...pinned,
+            put: write,
+            remove,
+        })
+
+        expect(await store.read('assets/pinned.png')).toEqual(new Uint8Array([1]))
+        await store.put('assets/current.png', new Uint8Array([2]), metadata)
+        await store.remove('assets/current.png')
+
+        expect(write).toHaveBeenCalledOnce()
+        expect(remove).toHaveBeenCalledOnce()
+    })
+
     test('gates only writes, refreshes after locking, and resolves one concrete root', async () => {
         const { backend } = memoryBackend()
         const factory = createKeyValueRootedBlobStoreFactory(backend)
@@ -200,6 +221,27 @@ describe('rooted BlobStore mapping', () => {
         expect(Math.max(...readSizes)).toBeLessThanOrEqual(3)
         expect(closes).toBe(1)
         expect(await backend.resolveUrl!('assets/a')).toBe('asset://assets/a')
+    })
+
+    test('Tauri keys include legacy cold payload files', async () => {
+        const listed: string[] = []
+        const backend = createTauriBlobBackend({
+            exists: async () => false,
+            mkdir: async () => {},
+            write: async () => {},
+            read: async () => new Uint8Array(),
+            list: async (path) => {
+                listed.push(path)
+                return path === 'coldstorage' ? ['coldstorage/one.json'] : []
+            },
+            remove: async () => {},
+            size: async () => 0,
+            open: async () => { throw new Error('not used') },
+            resolveUrl: async () => '',
+        })
+
+        expect(await backend.keys()).toEqual(['coldstorage/one.json'])
+        expect(listed).toEqual(['assets', 'blobstore', 'coldstorage'])
     })
 
     test('does not resolve a URL for a missing logical key', async () => {
