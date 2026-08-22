@@ -1,11 +1,16 @@
-import type { BlobMetadata } from './blobStore'
+import {
+    inferBlobMime,
+    normalizeBlobExtension,
+    type BlobMetadata,
+    type BlobWriteMetadata,
+} from './blobStore'
 import type { Database } from './database.svelte'
 import {
     createLosslessMigrationManifest,
     decodeLosslessMigrationPackage,
     encodeLosslessMigrationPackage,
     hashLosslessMigrationManifest,
-    type DecodedLosslessMigrationEntry,
+    type DecodedLosslessMigrationPackage,
     type LosslessMigrationInputEntry,
     type LosslessMigrationManifestEntry,
 } from './losslessMigrationPackage'
@@ -39,9 +44,14 @@ export interface LosslessMigrationImportResult {
     unreferenced: string[]
 }
 
+export type LosslessInPlaceMigrationResult =
+    | ({ status: 'migrated' } & LosslessMigrationImportResult)
+    | { status: 'already_migrated'; tuple: ActivePersistentTuple }
+
 export interface LosslessMigrationOrchestrator {
     importPackage(bytes: Uint8Array): Promise<LosslessMigrationImportResult>
     exportPackage(): Promise<Uint8Array>
+    migrateLegacyInPlace(): Promise<LosslessInPlaceMigrationResult>
     recoverInterruptedMigrations(): Promise<void>
 }
 
@@ -55,6 +65,8 @@ export interface LosslessMigrationOrchestratorDependencies {
     prepareDatabase(database: Database): Promise<Database>
     encodeDatabase(lease: PersistentRevisionLease): Promise<Uint8Array>
     collectReferences(database: Database, coldValues: ReadonlyMap<string, unknown>): MigrationReferenceGraph
+    listLegacyInlayAssetIds(): Promise<string[]>
+    readLegacyInlayPayload(id: string): Promise<{ data: Uint8Array; metadata: BlobWriteMetadata } | null>
     installActiveTuple(tuple: ActivePersistentTuple): void
     publishDatabase(database: Database, tuple: ActivePersistentTuple): void | Promise<void>
     onInterruption?(point: MigrationInterruptionPoint, entry?: LosslessMigrationManifestEntry): void | Promise<void>
@@ -71,15 +83,17 @@ function identity(kind: string, id: string): string {
     return `${kind}\0${id}`
 }
 
-function migrationMetadata(metadata: BlobMetadata): LosslessMigrationInputEntry['metadata'] {
+function migrationMetadata(metadata: BlobMetadata | BlobWriteMetadata): LosslessMigrationInputEntry['metadata'] {
+    const ext = normalizeBlobExtension(metadata.ext)
+    const mime = inferBlobMime(metadata.mime, ext)
     if (metadata.kind === 'asset') {
-        return { kind: 'asset', mime: metadata.mime, name: metadata.name, ext: metadata.ext }
+        return { kind: 'asset', mime, name: metadata.name, ext }
     }
     return {
         kind: 'inlay',
-        mime: metadata.mime,
+        mime,
         name: metadata.name,
-        ext: metadata.ext,
+        ext,
         inlayType: metadata.inlayType,
         ...(metadata.width === undefined ? {} : { width: metadata.width }),
         ...(metadata.height === undefined ? {} : { height: metadata.height }),
@@ -93,101 +107,108 @@ export function createLosslessMigrationOrchestrator(
         await dependencies.onInterruption?.(point, entry)
     }
 
+    const activateDecodedPackage = async (
+        decoded: DecodedLosslessMigrationPackage,
+        previous: ActivePersistentTuple,
+    ): Promise<LosslessMigrationImportResult> => {
+        const stage = dependencies.stages.create(previous.payloadGeneration)
+        let prepared: PreparedPersistentReplacement | undefined
+        let committed = false
+        try {
+            let databaseBytes: Uint8Array | undefined
+            const coldValues = new Map<string, unknown>()
+            for await (const entry of decoded.entries()) {
+                if (entry.kind === 'database') {
+                    databaseBytes = entry.data
+                    continue
+                }
+                await stage.put(entry)
+                if (entry.kind === 'cold') coldValues.set(entry.id, await stage.readColdValue(entry.id))
+                await interrupt('after-entry', entry)
+            }
+            if (!databaseBytes) throw new Error('Migration package is missing database.risudat')
+            const database = await dependencies.prepareDatabase(await dependencies.decodeDatabase(databaseBytes))
+            const manifest = createLosslessMigrationManifest(decoded.manifest.entries)
+            const manifestHash = await hashLosslessMigrationManifest(manifest)
+            const references = dependencies.collectReferences(database, coldValues)
+            const byIdentity = new Map(manifest.entries.map((entry) => [identity(entry.kind, entry.id), entry]))
+            const required = [
+                ...references.assets.map((id) => ['asset', id] as const),
+                ...references.inlays.map((id) => ['inlay', id] as const),
+                ...references.cold.map((id) => ['cold', id] as const),
+            ]
+            for (const [kind, id] of required) {
+                const entry = byIdentity.get(identity(kind, id))
+                if (!entry) throw new Error(`Missing referenced ${kind} migration entry ${id}`)
+                await stage.verifyEntry(entry)
+            }
+            await stage.seal(manifest, manifestHash)
+            await interrupt('after-seal')
+            prepared = await dependencies.store.prepareReplacement(
+                database,
+                manifestHash,
+                stage.payloadGeneration,
+            )
+            await interrupt('after-prepare')
+            const seal = await stage.verifySeal()
+            if (seal.manifestHash !== prepared.manifestHash
+                || seal.payloadGeneration !== prepared.payloadGeneration) {
+                throw new Error('Prepared replacement does not match the sealed payload stage')
+            }
+            await interrupt('before-activate')
+            const activated = await dependencies.store.activatePreparedReplacement({ prepared, manifestHash })
+            committed = true
+            await interrupt('after-activate')
+            const tuple = await dependencies.store.readActiveTuple()
+            if (tuple.revision !== activated.revision
+                || tuple.dataGeneration !== prepared.dataGeneration
+                || tuple.payloadGeneration !== prepared.payloadGeneration) {
+                throw new Error('Committed persistent tuple does not match its prepared replacement')
+            }
+            dependencies.installActiveTuple(tuple)
+            await dependencies.publishDatabase(database, tuple)
+
+            const requiredIdentities = new Set(required.map(([kind, id]) => identity(kind, id)))
+            const unreferenced = manifest.entries
+                .filter((entry) => entry.kind !== 'database'
+                    && !requiredIdentities.has(identity(entry.kind, entry.id)))
+                .map((entry) => `${entry.kind}:${entry.id}`)
+            if (previous.payloadGeneration !== 'legacy') {
+                try {
+                    await dependencies.stages.removeGeneration(previous.payloadGeneration, tuple.payloadGeneration)
+                } catch (error) {
+                    dependencies.onCleanupError?.(error)
+                }
+            }
+            return { tuple, manifestHash, unreferenced }
+        } catch (error) {
+            if (!committed) {
+                let payloadRemoved = false
+                try {
+                    const active = await dependencies.store.readActiveTuple()
+                    await dependencies.stages.removeGeneration(stage.payloadGeneration, active.payloadGeneration)
+                    payloadRemoved = true
+                } catch (cleanupError) {
+                    dependencies.onCleanupError?.(cleanupError)
+                }
+                if (payloadRemoved && prepared) {
+                    try {
+                        await dependencies.store.discardPreparedReplacement(prepared)
+                    } catch (cleanupError) {
+                        dependencies.onCleanupError?.(cleanupError)
+                    }
+                }
+            }
+            throw error
+        }
+    }
+
     return {
         async importPackage(bytes) {
             const decoded = await decodeLosslessMigrationPackage(bytes)
             return dependencies.runMigration('lossless-import', async () => {
                 const previous = await dependencies.store.readActiveTuple()
-                const stage = dependencies.stages.create(previous.payloadGeneration)
-                let prepared: PreparedPersistentReplacement | undefined
-                let committed = false
-                try {
-                    let databaseBytes: Uint8Array | undefined
-                    const coldValues = new Map<string, unknown>()
-                    for await (const entry of decoded.entries()) {
-                        if (entry.kind === 'database') {
-                            databaseBytes = entry.data
-                            continue
-                        }
-                        await stage.put(entry)
-                        if (entry.kind === 'cold') coldValues.set(entry.id, await stage.readColdValue(entry.id))
-                        await interrupt('after-entry', entry)
-                    }
-                    if (!databaseBytes) throw new Error('Migration package is missing database.risudat')
-                    const database = await dependencies.prepareDatabase(await dependencies.decodeDatabase(databaseBytes))
-                    const manifest = createLosslessMigrationManifest(decoded.manifest.entries)
-                    const manifestHash = await hashLosslessMigrationManifest(manifest)
-                    const references = dependencies.collectReferences(database, coldValues)
-                    const byIdentity = new Map(manifest.entries.map((entry) => [identity(entry.kind, entry.id), entry]))
-                    const required = [
-                        ...references.assets.map((id) => ['asset', id] as const),
-                        ...references.inlays.map((id) => ['inlay', id] as const),
-                        ...references.cold.map((id) => ['cold', id] as const),
-                    ]
-                    for (const [kind, id] of required) {
-                        const entry = byIdentity.get(identity(kind, id))
-                        if (!entry) throw new Error(`Missing referenced ${kind} migration entry ${id}`)
-                        await stage.verifyEntry(entry)
-                    }
-                    await stage.seal(manifest, manifestHash)
-                    await interrupt('after-seal')
-                    prepared = await dependencies.store.prepareReplacement(
-                        database,
-                        manifestHash,
-                        stage.payloadGeneration,
-                    )
-                    await interrupt('after-prepare')
-                    const seal = await stage.verifySeal()
-                    if (seal.manifestHash !== prepared.manifestHash
-                        || seal.payloadGeneration !== prepared.payloadGeneration) {
-                        throw new Error('Prepared replacement does not match the sealed payload stage')
-                    }
-                    await interrupt('before-activate')
-                    const activated = await dependencies.store.activatePreparedReplacement({ prepared, manifestHash })
-                    committed = true
-                    await interrupt('after-activate')
-                    const tuple = await dependencies.store.readActiveTuple()
-                    if (tuple.revision !== activated.revision
-                        || tuple.dataGeneration !== prepared.dataGeneration
-                        || tuple.payloadGeneration !== prepared.payloadGeneration) {
-                        throw new Error('Committed persistent tuple does not match its prepared replacement')
-                    }
-                    dependencies.installActiveTuple(tuple)
-                    await dependencies.publishDatabase(database, tuple)
-
-                    const requiredIdentities = new Set(required.map(([kind, id]) => identity(kind, id)))
-                    const unreferenced = manifest.entries
-                        .filter((entry) => entry.kind !== 'database'
-                            && !requiredIdentities.has(identity(entry.kind, entry.id)))
-                        .map((entry) => `${entry.kind}:${entry.id}`)
-                    if (previous.payloadGeneration !== 'legacy') {
-                        try {
-                            await dependencies.stages.removeGeneration(previous.payloadGeneration, tuple.payloadGeneration)
-                        } catch (error) {
-                            dependencies.onCleanupError?.(error)
-                        }
-                    }
-                    return { tuple, manifestHash, unreferenced }
-                } catch (error) {
-                    if (!committed) {
-                        let payloadRemoved = false
-                        try {
-                            const active = await dependencies.store.readActiveTuple()
-                            await dependencies.stages.removeGeneration(stage.payloadGeneration, active.payloadGeneration)
-                            payloadRemoved = true
-                        } catch (cleanupError) {
-                            dependencies.onCleanupError?.(cleanupError)
-                        }
-                        if (payloadRemoved && prepared) {
-                            try {
-                                await dependencies.store.discardPreparedReplacement(prepared)
-                            } catch (cleanupError) {
-                                dependencies.onCleanupError?.(cleanupError)
-                            }
-                        }
-                    }
-                    throw error
-                }
+                return activateDecodedPackage(decoded, previous)
             })
         },
 
@@ -221,6 +242,71 @@ export function createLosslessMigrationOrchestrator(
                 } finally {
                     await lease.release()
                 }
+            })
+        },
+
+        async migrateLegacyInPlace() {
+            return dependencies.runMigration('lossless-in-place', async () => {
+                const previous = await dependencies.store.readActiveTuple()
+                if (previous.payloadGeneration !== 'legacy') {
+                    return { status: 'already_migrated', tuple: previous }
+                }
+
+                const lease = await dependencies.store.acquireRevision(previous.revision)
+                let packageBytes: Uint8Array
+                try {
+                    const blobs = dependencies.blobs.open({ kind: 'legacy' })
+                    const cold = dependencies.cold.open({ kind: 'legacy' })
+                    const metadata = [...await blobs.list()].sort((left, right) => left.key.localeCompare(right.key))
+                    const liveInlays = new Set(metadata
+                        .filter((entry) => entry.kind === 'inlay')
+                        .map((entry) => entry.key))
+                    const rawInlayIds = [...new Set(await dependencies.listLegacyInlayAssetIds())].sort()
+                    async function* entries(): AsyncIterable<LosslessMigrationInputEntry> {
+                        yield {
+                            kind: 'database',
+                            id: 'database.risudat',
+                            metadata: {},
+                            data: await dependencies.encodeDatabase(lease),
+                        }
+                        for (const entry of metadata) {
+                            const data = await blobs.read(entry.key)
+                            if (data === null) throw new Error(`Missing live legacy blob ${entry.key}`)
+                            yield {
+                                kind: entry.kind,
+                                id: entry.key,
+                                metadata: migrationMetadata(entry),
+                                data,
+                            }
+                        }
+                        for (const id of rawInlayIds) {
+                            if (liveInlays.has(id)) continue
+                            const payload = await dependencies.readLegacyInlayPayload(id)
+                            if (!payload) throw new Error(`Missing raw legacy inlay ${id}`)
+                            if (payload.metadata.kind !== 'inlay') {
+                                throw new Error(`Invalid raw legacy inlay metadata ${id}`)
+                            }
+                            yield {
+                                kind: 'inlay',
+                                id,
+                                metadata: migrationMetadata(payload.metadata),
+                                data: payload.data,
+                            }
+                        }
+                        for (const id of [...await cold.list()].sort()) {
+                            const data = await cold.read(id)
+                            if (data === null) throw new Error(`Missing live legacy cold payload ${id}`)
+                            yield { kind: 'cold', id, metadata: {}, data }
+                        }
+                    }
+                    packageBytes = await encodeLosslessMigrationPackage(entries())
+                } finally {
+                    await lease.release()
+                }
+
+                const decoded = await decodeLosslessMigrationPackage(packageBytes)
+                const result = await activateDecodedPackage(decoded, previous)
+                return { status: 'migrated', ...result }
             })
         },
 

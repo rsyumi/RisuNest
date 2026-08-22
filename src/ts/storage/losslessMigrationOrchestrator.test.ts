@@ -1,5 +1,6 @@
 import { compressSync } from 'fflate'
 import { describe, expect, test, vi } from 'vitest'
+import type { BlobWriteMetadata } from './blobStore'
 import type { Database } from './database.svelte'
 import {
     decodeLosslessMigrationPackage,
@@ -17,10 +18,29 @@ import {
 } from './persistentDataStore'
 import { makeLosslessMigrationFixture, migrationFixtureReferences } from './tests/losslessMigrationFixtures'
 
+function writeMetadata(entry: LosslessMigrationInputEntry): BlobWriteMetadata {
+    if ((entry.kind === 'asset' && entry.metadata.kind === 'asset')
+        || (entry.kind === 'inlay' && entry.metadata.kind === 'inlay')) return entry.metadata
+    throw new TypeError(`Expected blob metadata for ${entry.kind}:${entry.id}`)
+}
+
 function fixture(options: {
-    onInterruption?: (point: string) => void | Promise<void>
+    onInterruption?: (point: string, entry?: { kind: string; id: string }) => void | Promise<void>
     onCleanupError?: (error: unknown) => void
     blobsOverride?: ReturnType<typeof createKeyValueRootedBlobStoreFactory>
+    listLegacyInlayAssetIds?: () => Promise<string[]>
+    readLegacyInlayPayload?: (id: string) => Promise<{
+        data: Uint8Array
+        metadata: {
+            kind: 'inlay'
+            mime: string
+            name: string
+            ext: string
+            inlayType: 'image' | 'audio' | 'video' | 'signature'
+            width?: number
+            height?: number
+        }
+    } | null>
 } = {}) {
     const values = new Map<string, Uint8Array>()
     const backend = {
@@ -61,22 +81,37 @@ function fixture(options: {
     }
     const install = vi.fn()
     const publish = vi.fn()
+    const runMigrationCalls = vi.fn()
+    const runMigration = async <T,>(reason: string, operation: () => Promise<T>): Promise<T> => {
+        runMigrationCalls(reason, operation)
+        return operation()
+    }
+    const listLegacyInlayAssetIds = vi.fn(options.listLegacyInlayAssetIds ?? (async () => []))
+    const readLegacyInlayPayload = vi.fn(options.readLegacyInlayPayload ?? (async () => null))
     const orchestrator = createLosslessMigrationOrchestrator({
         store: store as never,
         stages,
         blobs: options.blobsOverride ?? blobs,
         cold,
-        runMigration: async (_reason, operation) => operation(),
+        runMigration,
         decodeDatabase: async (bytes) => JSON.parse(new TextDecoder().decode(bytes)) as Database,
         prepareDatabase: async (database) => database,
         encodeDatabase: async () => new TextEncoder().encode(JSON.stringify(activeDatabase)),
         collectReferences: () => migrationFixtureReferences,
+        listLegacyInlayAssetIds,
+        readLegacyInlayPayload,
         installActiveTuple: install,
         publishDatabase: publish,
         onInterruption: options.onInterruption,
         onCleanupError: options.onCleanupError,
     })
-    return { values, backend, blobs, cold, stages, store, orchestrator, install, publish, getTuple: () => tuple }
+    return {
+        values, backend, blobs, cold, stages, store, orchestrator, install, publish,
+        runMigration: runMigrationCalls, listLegacyInlayAssetIds, readLegacyInlayPayload,
+        getTuple: () => tuple,
+        setTuple: (value: ActivePersistentTuple) => { tuple = value },
+        getDatabase: () => activeDatabase,
+    }
 }
 
 async function packageFixture(includeAsset = true) {
@@ -86,6 +121,178 @@ async function packageFixture(includeAsset = true) {
 }
 
 describe('lossless migration orchestrator', () => {
+    test('returns already_migrated without creating a stage, source read, or revision lease', async () => {
+        const target = fixture()
+        target.setTuple({ revision: 4, dataGeneration: 'data-4', payloadGeneration: 'generated_4' })
+        const createStage = vi.spyOn(target.stages, 'create')
+
+        const result = await target.orchestrator.migrateLegacyInPlace()
+
+        expect(result).toEqual({
+            status: 'already_migrated',
+            tuple: { revision: 4, dataGeneration: 'data-4', payloadGeneration: 'generated_4' },
+        })
+        expect(target.runMigration).toHaveBeenCalledOnce()
+        expect(target.runMigration).toHaveBeenCalledWith('lossless-in-place', expect.any(Function))
+        expect(createStage).not.toHaveBeenCalled()
+        expect(target.store.acquireRevision).not.toHaveBeenCalled()
+        expect(target.listLegacyInlayAssetIds).not.toHaveBeenCalled()
+        expect(target.readLegacyInlayPayload).not.toHaveBeenCalled()
+    })
+
+    test('migrates current legacy database, assets, all inlay kinds, and cold payloads', async () => {
+        const source = makeLosslessMigrationFixture()
+        const rawInlays = new Map(source
+            .filter((entry) => entry.kind === 'inlay')
+            .map((entry) => [entry.id, entry] as const))
+        const rawInlaySnapshots = new Map([...rawInlays].map(([id, entry]) => [id, entry.data.slice()]))
+        const target = fixture({
+            listLegacyInlayAssetIds: async () => [...rawInlays.keys()].reverse(),
+            readLegacyInlayPayload: async (id) => {
+                const entry = rawInlays.get(id)
+                return entry?.kind === 'inlay' && entry.metadata.kind === 'inlay'
+                    ? { data: entry.data, metadata: entry.metadata }
+                    : null
+            },
+        })
+        const legacyBlobs = target.blobs.open({ kind: 'legacy' })
+        for (const entry of source.filter((entry) => entry.kind === 'asset')) {
+            if (entry.kind !== 'asset') continue
+            await legacyBlobs.put(entry.id, entry.data, writeMetadata(entry))
+        }
+        const legacyCold = target.cold.open({ kind: 'legacy' })
+        for (const entry of source.filter((entry) => entry.kind === 'cold')) {
+            if (entry.kind === 'cold') await legacyCold.write(entry.id, entry.data)
+        }
+        target.values.set('database/database.bin', new Uint8Array([91, 92]))
+        const legacyValues = new Map([...target.values].map(([key, value]) => [key, value.slice()]))
+
+        const result = await target.orchestrator.migrateLegacyInPlace()
+
+        expect(result.status).toBe('migrated')
+        if (result.status !== 'migrated') throw new Error('Expected migration result')
+        expect(result.tuple).toEqual({ revision: 2, dataGeneration: 'data-2', payloadGeneration: 'import_1' })
+        const migratedBlobs = target.blobs.open({ kind: 'generation', id: 'import_1' })
+        for (const entry of source.filter((entry) => entry.kind === 'asset' || entry.kind === 'inlay')) {
+            expect(await migratedBlobs.read(entry.id)).toEqual(entry.data)
+            expect(await migratedBlobs.stat(entry.id)).toMatchObject(entry.metadata)
+        }
+        const migratedCold = target.cold.open({ kind: 'generation', id: 'import_1' })
+        for (const entry of source.filter((entry) => entry.kind === 'cold')) {
+            expect(await migratedCold.read(entry.id)).toEqual(entry.data)
+        }
+        for (const [key, value] of legacyValues) expect(target.values.get(key)).toEqual(value)
+        for (const [id, entry] of rawInlays) expect(entry.data).toEqual(rawInlaySnapshots.get(id))
+        expect(target.runMigration).toHaveBeenCalledTimes(1)
+        expect(target.store.acquireRevision).toHaveBeenCalledWith(1)
+        const lease = await target.store.acquireRevision.mock.results[0].value
+        expect(lease.release).toHaveBeenCalledOnce()
+        expect(target.publish).toHaveBeenCalledOnce()
+        expect(target.getDatabase()).toMatchObject({ marker: 'old' })
+    })
+
+    test('skips a raw legacy inlay when the live legacy BlobStore already owns that ID', async () => {
+        const target = fixture({
+            listLegacyInlayAssetIds: async () => ['image-inlay'],
+            readLegacyInlayPayload: async () => ({
+                data: new Uint8Array([99]),
+                metadata: {
+                    kind: 'inlay', mime: 'image/png', name: 'raw', ext: 'png', inlayType: 'image',
+                },
+            }),
+        })
+        const source = makeLosslessMigrationFixture()
+        const live = source.find((entry) => entry.kind === 'inlay' && entry.id === 'image-inlay')
+        if (!live || live.kind !== 'inlay') throw new Error('Missing fixture inlay')
+        const blobs = target.blobs.open({ kind: 'legacy' })
+        await blobs.put(live.id, live.data, writeMetadata(live))
+        for (const entry of source.filter((entry) => entry.kind === 'asset')) {
+            if (entry.kind === 'asset') await blobs.put(entry.id, entry.data, writeMetadata(entry))
+        }
+        for (const entry of source.filter((entry) => entry.kind === 'inlay' && entry.id !== 'image-inlay')) {
+            if (entry.kind === 'inlay') await blobs.put(entry.id, entry.data, writeMetadata(entry))
+        }
+        for (const entry of source.filter((entry) => entry.kind === 'cold')) {
+            if (entry.kind === 'cold') await target.cold.open({ kind: 'legacy' }).write(entry.id, entry.data)
+        }
+
+        const result = await target.orchestrator.migrateLegacyInPlace()
+
+        expect(result.status).toBe('migrated')
+        expect(target.readLegacyInlayPayload).not.toHaveBeenCalled()
+        expect(await target.blobs.open({ kind: 'generation', id: 'import_1' }).read('image-inlay')).toEqual(live.data)
+    })
+
+    test('preserves every legacy source after success and after a staging failure', async () => {
+        const source = makeLosslessMigrationFixture()
+        const rawInlays = new Map(source
+            .filter((entry) => entry.kind === 'inlay')
+            .map((entry) => [entry.id, entry] as const))
+        const rawSnapshots = new Map([...rawInlays].map(([id, entry]) => [id, entry.data.slice()]))
+        const target = fixture({
+            listLegacyInlayAssetIds: async () => [...rawInlays.keys()],
+            readLegacyInlayPayload: async (id) => {
+                const entry = rawInlays.get(id)
+                return entry?.metadata.kind === 'inlay'
+                    ? { data: entry.data, metadata: entry.metadata }
+                    : null
+            },
+            onInterruption: (point, entry) => {
+                if (point === 'after-entry' && entry?.kind === 'inlay') throw new Error('staging failed')
+            },
+        })
+        const blobs = target.blobs.open({ kind: 'legacy' })
+        const cold = target.cold.open({ kind: 'legacy' })
+        for (const entry of source) {
+            if (entry.kind === 'asset') {
+                await blobs.put(entry.id, entry.data, writeMetadata(entry))
+            }
+            if (entry.kind === 'cold') await cold.write(entry.id, entry.data)
+        }
+        target.values.set('database/database.bin', new Uint8Array([71, 72]))
+        const beforeValues = new Map([...target.values].map(([key, value]) => [key, value.slice()]))
+
+        await expect(target.orchestrator.migrateLegacyInPlace()).rejects.toThrow('staging failed')
+
+        expect(target.getTuple()).toEqual({ revision: 1, dataGeneration: 'data-1', payloadGeneration: 'legacy' })
+        for (const [key, value] of beforeValues) expect(target.values.get(key)).toEqual(value)
+        for (const [id, entry] of rawInlays) expect(entry.data).toEqual(rawSnapshots.get(id))
+        expect([...target.values.keys()].some((key) => key.includes('/import_1/'))).toBe(false)
+        const lease = await target.store.acquireRevision.mock.results[0].value
+        expect(lease.release).toHaveBeenCalledOnce()
+    })
+
+    test('owns reused legacy source scratch bytes before reading the next source', async () => {
+        const scratch = new Uint8Array(1)
+        const inlayIds = ['image-inlay', 'audio-inlay', 'video-inlay', 'signature-inlay']
+        const expected = new Map(inlayIds.map((id, index) => [id, index + 10]))
+        const target = fixture({
+            listLegacyInlayAssetIds: async () => inlayIds,
+            readLegacyInlayPayload: async (id) => {
+                scratch[0] = expected.get(id) ?? 0
+                const inlayType = id.split('-')[0] as 'image' | 'audio' | 'video' | 'signature'
+                return {
+                    data: scratch,
+                    metadata: { kind: 'inlay', mime: 'application/octet-stream', name: id, ext: 'bin', inlayType },
+                }
+            },
+        })
+        const source = makeLosslessMigrationFixture()
+        const blobs = target.blobs.open({ kind: 'legacy' })
+        for (const entry of source.filter((entry) => entry.kind === 'asset')) {
+            if (entry.kind === 'asset') await blobs.put(entry.id, entry.data, writeMetadata(entry))
+        }
+        for (const entry of source.filter((entry) => entry.kind === 'cold')) {
+            if (entry.kind === 'cold') await target.cold.open({ kind: 'legacy' }).write(entry.id, entry.data)
+        }
+
+        const result = await target.orchestrator.migrateLegacyInPlace()
+
+        expect(result.status).toBe('migrated')
+        const migrated = target.blobs.open({ kind: 'generation', id: 'import_1' })
+        for (const [id, value] of expected) expect(await migrated.read(id)).toEqual(new Uint8Array([value]))
+    })
+
     test('imports a complete package through seal, prepare, activation, and publication', async () => {
         const target = fixture()
         const result = await target.orchestrator.importPackage(await packageFixture())
