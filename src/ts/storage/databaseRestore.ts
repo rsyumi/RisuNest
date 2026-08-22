@@ -25,8 +25,9 @@ export const installRisuKeiBackup = (database: Database, dependencies: PluginRes
     installPluginRestore(database, 'risu-kei-backup', dependencies)
 
 interface AccountUnmigrationResourceDependencies {
-    assetKeys: Iterable<string>
     coldKeys: Iterable<string>
+    collectAssetKeys(selectedCold: ReadonlyMap<string, unknown>): Iterable<string>
+    isValidCold(value: unknown): boolean
     readLocalAsset(key: string): Promise<Uint8Array | null>
     readRemoteAsset(key: string): Promise<Uint8Array | null>
     writeLocalAsset(key: string, bytes: Uint8Array): Promise<void>
@@ -43,24 +44,36 @@ function equalBytes(left: Uint8Array | null, right: Uint8Array): boolean {
 export async function materializeAccountUnmigrationResources(
     dependencies: AccountUnmigrationResourceDependencies,
 ): Promise<void> {
-    for (const key of dependencies.assetKeys) {
+    const selectedCold = new Map<string, unknown>()
+    for (const key of dependencies.coldKeys) {
+        const local = await dependencies.readLocalCold(key)
+        if (local !== null) {
+            if (!dependencies.isValidCold(local)) {
+                throw new Error(`Invalid local cold payload: ${key}`)
+            }
+            selectedCold.set(key, local)
+            continue
+        }
+        const remote = await dependencies.readRemoteCold(key)
+        if (remote === null) throw new Error(`Missing account cold payload: ${key}`)
+        if (!dependencies.isValidCold(remote)) {
+            throw new Error(`Invalid account cold payload: ${key}`)
+        }
+        await dependencies.writeLocalCold(key, remote)
+        const verified = await dependencies.readLocalCold(key)
+        if (verified === null || JSON.stringify(verified) !== JSON.stringify(remote)) {
+            throw new Error(`Failed to verify local cold payload: ${key}`)
+        }
+        selectedCold.set(key, verified)
+    }
+
+    for (const key of dependencies.collectAssetKeys(selectedCold)) {
         if (await dependencies.readLocalAsset(key)) continue
         const remote = await dependencies.readRemoteAsset(key)
         if (!remote) throw new Error(`Missing account asset: ${key}`)
         await dependencies.writeLocalAsset(key, remote)
         if (!equalBytes(await dependencies.readLocalAsset(key), remote)) {
             throw new Error(`Failed to verify local asset: ${key}`)
-        }
-    }
-
-    for (const key of dependencies.coldKeys) {
-        if (await dependencies.readLocalCold(key) !== null) continue
-        const remote = await dependencies.readRemoteCold(key)
-        if (remote === null) throw new Error(`Missing account cold payload: ${key}`)
-        await dependencies.writeLocalCold(key, remote)
-        const verified = await dependencies.readLocalCold(key)
-        if (verified === null || JSON.stringify(verified) !== JSON.stringify(remote)) {
-            throw new Error(`Failed to verify local cold payload: ${key}`)
         }
     }
 }

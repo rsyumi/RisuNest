@@ -3,9 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mocks = vi.hoisted(() => {
     const cache = new Map<string, unknown>()
     const assets = new Map<string, unknown>()
+    const blobAssets = new Map<string, Uint8Array>()
+    const database = { account: { token: 'account-token', useSync: true }, characters: [] as any[] }
     return {
         cache,
         assets,
+        blobAssets,
+        database,
         fetchProtectedResource: vi.fn(),
         alertLogin: vi.fn(async () => 'new-token'),
         alertNormalWait: vi.fn(async () => undefined),
@@ -27,6 +31,11 @@ const mocks = vi.hoisted(() => {
             }),
             createInstance: vi.fn(),
         },
+        completeAccountUnmigration: vi.fn(),
+        getUncleanablesSync: vi.fn(),
+        getColdStorageItem: vi.fn(),
+        getAccountColdStorageItem: vi.fn(),
+        setLocalColdStorageItem: vi.fn(),
     }
 })
 
@@ -35,7 +44,7 @@ mocks.localforage.createInstance.mockReturnValue(mocks.cachedForage)
 vi.mock('localforage', () => ({ default: mocks.localforage }))
 vi.mock('uuid', () => ({ v4: () => 'fixed-uuid' }))
 vi.mock('./database.svelte', () => ({
-    getDatabase: () => ({ account: { token: 'account-token', useSync: true } }),
+    getDatabase: () => mocks.database,
 }))
 vi.mock('../alert', () => ({
     alertLogin: mocks.alertLogin,
@@ -45,13 +54,36 @@ vi.mock('../alert', () => ({
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: { keys: vi.fn() },
     getUncleanables: vi.fn(),
-    getUncleanablesSync: vi.fn(() => []),
+    getUncleanablesSync: mocks.getUncleanablesSync,
 }))
 vi.mock('../sionyw', () => ({ fetchProtectedResource: mocks.fetchProtectedResource }))
 vi.mock('../util', () => ({ sleep: mocks.sleep }))
 vi.mock('src/lang', () => ({ language: { activeTabChange: 'active tab changed' } }))
-vi.mock('./databaseRestore', () => ({ completeAccountUnmigration: vi.fn() }))
+vi.mock('./databaseRestore', async (importOriginal) => ({
+    ...await importOriginal<typeof import('./databaseRestore')>(),
+    completeAccountUnmigration: mocks.completeAccountUnmigration,
+}))
 vi.mock('./persistentDataRuntime.svelte', () => ({ replacePersistentDatabase: vi.fn() }))
+vi.mock('./platformBlobStore', () => ({
+    resolveBlobStore: async () => ({
+        read: async (key: string) => mocks.blobAssets.get(key) ?? null,
+    }),
+}))
+vi.mock('../drive/backupAssets', () => ({
+    selectLegacyBackupAssetKeys: (keys: string[]) => keys.filter((key) => key.startsWith('assets/')),
+}))
+vi.mock('./accountAssetAccess', () => ({
+    storeActiveAsset: async (_store: unknown, key: string, bytes: Uint8Array) => {
+        mocks.blobAssets.set(key, bytes.slice())
+    },
+}))
+vi.mock('../process/coldstorage.svelte', () => ({
+    getColdStorageItem: mocks.getColdStorageItem,
+    getAccountColdStorageItem: mocks.getAccountColdStorageItem,
+    isColdStorageBackupData: (value: unknown) => typeof value === 'object' && value !== null,
+    listColdDataKeys: async () => ['cold-character-key'],
+    setLocalColdStorageItem: mocks.setLocalColdStorageItem,
+}))
 
 function response(body: BodyInit | null, status = 200, headers?: HeadersInit): Response {
     return new Response(body, { status, headers })
@@ -85,6 +117,16 @@ beforeEach(() => {
     })
     mocks.cache.clear()
     mocks.assets.clear()
+    mocks.blobAssets.clear()
+    mocks.database.account = { token: 'account-token', useSync: true }
+    mocks.database.characters = []
+    mocks.completeAccountUnmigration.mockReset().mockImplementation(async (_database, dependencies) => {
+        await dependencies.prepareResources()
+    })
+    mocks.getUncleanablesSync.mockReset().mockReturnValue([])
+    mocks.getColdStorageItem.mockReset().mockResolvedValue(null)
+    mocks.getAccountColdStorageItem.mockReset().mockResolvedValue(null)
+    mocks.setLocalColdStorageItem.mockReset().mockResolvedValue(true)
     mocks.localforage.createInstance.mockReturnValue(mocks.cachedForage)
     localStorage.clear()
     vi.spyOn(Date, 'now').mockReturnValue(1_725_000_000_123)
@@ -431,5 +473,50 @@ describe('AccountStorage structured wire contract', () => {
             bytes: new Uint8Array([9]),
         })
         expect(forbidden.cancel).toHaveBeenCalledOnce()
+    })
+
+    it('unmigrates assets referenced by the retained local cold character before disabling account', async () => {
+        const localCold = {
+            character: {
+                type: 'character',
+                chaId: 'cold-character',
+                additionalAssets: [['local', 'assets/local-cold-only.png']],
+            },
+        }
+        const officialCold = {
+            character: {
+                type: 'character',
+                chaId: 'cold-character',
+                additionalAssets: [['official', 'assets/official-only.png']],
+            },
+        }
+        mocks.database.characters = [{
+            type: 'character',
+            chaId: 'cold-character',
+            coldstorage: 'cold-character-key',
+        }]
+        mocks.getColdStorageItem.mockResolvedValue(localCold)
+        mocks.getAccountColdStorageItem.mockResolvedValue(officialCold)
+        mocks.getUncleanablesSync.mockImplementation((_database, _mode, options) => (
+            options.chars.flatMap((character: any) => (
+                character.additionalAssets?.map((asset: string[]) => asset[1]) ?? []
+            ))
+        ))
+        mocks.fetchProtectedResource.mockResolvedValue(response(new Uint8Array([7, 6, 5])))
+        const events: string[] = []
+        mocks.completeAccountUnmigration.mockImplementation(async (_database, dependencies) => {
+            await dependencies.prepareResources()
+            events.push('disable-account')
+        })
+        const { unMigrationAccount } = await loadStorage()
+
+        await unMigrationAccount()
+
+        expect(mocks.getAccountColdStorageItem).not.toHaveBeenCalled()
+        expect(mocks.blobAssets.get('assets/local-cold-only.png')).toEqual(
+            new Uint8Array([7, 6, 5]),
+        )
+        expect(mocks.blobAssets.has('assets/official-only.png')).toBe(false)
+        expect(events).toEqual(['disable-account'])
     })
 })

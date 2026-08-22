@@ -2,7 +2,7 @@ import { writable } from "svelte/store"
 import { getDatabase } from "./database.svelte"
 import localforage from "localforage"
 import { alertLogin, alertNormalWait, alertStore } from "../alert"
-import { getUncleanables, getUncleanablesSync } from "../globalApi.svelte"
+import { getUncleanablesSync } from "../globalApi.svelte"
 import { encodeRisuSaveLegacy } from "./risuSave"
 import { v4 } from "uuid"
 import { language } from "src/lang"
@@ -281,13 +281,26 @@ export async function unMigrationAccount() {
     } = await import("../process/coldstorage.svelte")
     const blobStore = await resolveBlobStore()
     const accountStorage = new AccountStorage()
-    const assetKeys = selectLegacyBackupAssetKeys(await getUncleanables(db, 'pure'))
     const coldKeys = await listColdDataKeys(db)
 
     await completeAccountUnmigration(db, {
         prepareResources: () => materializeAccountUnmigrationResources({
-            assetKeys,
             coldKeys,
+            collectAssetKeys: (selectedCold) => {
+                const chars = db.characters.map((character) => {
+                    if (!character.coldstorage) return character
+                    const selected = selectedCold.get(character.coldstorage) as {
+                        character?: typeof character
+                    } | undefined
+                    return selected?.character?.chaId === character.chaId
+                        ? selected.character
+                        : character
+                })
+                return selectLegacyBackupAssetKeys(
+                    getUncleanablesSync(db, 'pure', { chars }),
+                )
+            },
+            isValidCold: isColdStorageBackupData,
             readLocalAsset: (key) => blobStore.read(key),
             readRemoteAsset: async (key) => {
                 const result = await accountStorage.readItem(key)

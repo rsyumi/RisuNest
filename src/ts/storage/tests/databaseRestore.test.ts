@@ -229,8 +229,9 @@ describe('account unmigration resource materialization', () => {
         const coldWrites: string[] = []
 
         await materializeAccountUnmigrationResources({
-            assetKeys: ['assets/local.png', 'assets/remote.png'],
             coldKeys: ['cold-local', 'cold-remote'],
+            collectAssetKeys: () => ['assets/local.png', 'assets/remote.png'],
+            isValidCold: (value) => typeof value === 'object' && value !== null,
             readLocalAsset: async (key) => localAssets.get(key) ?? null,
             readRemoteAsset: async (key) => key === 'assets/remote.png'
                 ? new Uint8Array([9, 8])
@@ -257,8 +258,9 @@ describe('account unmigration resource materialization', () => {
 
     it('fails before transition when a copied payload cannot be verified', async () => {
         await expect(materializeAccountUnmigrationResources({
-            assetKeys: ['assets/remote.png'],
             coldKeys: [],
+            collectAssetKeys: () => ['assets/remote.png'],
+            isValidCold: () => true,
             readLocalAsset: async () => null,
             readRemoteAsset: async () => new Uint8Array([9]),
             writeLocalAsset: async () => undefined,
@@ -266,5 +268,40 @@ describe('account unmigration resource materialization', () => {
             readRemoteCold: async () => null,
             writeLocalCold: async () => undefined,
         })).rejects.toThrow('Failed to verify local asset: assets/remote.png')
+    })
+
+    it('enumerates assets from the retained local cold character instead of official cold', async () => {
+        const localCold = {
+            character: { chaId: 'cold-character', additionalAssets: [['local', 'assets/local-only.png']] },
+        }
+        const remoteCold = {
+            character: { chaId: 'cold-character', additionalAssets: [['remote', 'assets/remote-only.png']] },
+        }
+        const copiedAssets: string[] = []
+        const localAssets = new Map<string, Uint8Array>()
+        const readRemoteCold = vi.fn(async () => remoteCold)
+
+        await materializeAccountUnmigrationResources({
+            coldKeys: ['cold-character-key'],
+            collectAssetKeys: (selectedCold) => {
+                const selected = selectedCold.get('cold-character-key') as typeof localCold
+                return selected.character.additionalAssets.map((asset) => asset[1])
+            },
+            isValidCold: () => true,
+            readLocalAsset: async (key) => localAssets.get(key) ?? null,
+            readRemoteAsset: async (key) => key === 'assets/local-only.png'
+                ? new Uint8Array([7])
+                : null,
+            writeLocalAsset: async (key, bytes) => {
+                copiedAssets.push(key)
+                localAssets.set(key, bytes.slice())
+            },
+            readLocalCold: async () => localCold,
+            readRemoteCold,
+            writeLocalCold: async () => undefined,
+        })
+
+        expect(readRemoteCold).not.toHaveBeenCalled()
+        expect(copiedAssets).toEqual(['assets/local-only.png'])
     })
 })

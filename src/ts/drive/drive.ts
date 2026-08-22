@@ -1,6 +1,6 @@
 import { alertError, alertInput, alertNormal, alertSelect, alertStore } from "../alert";
 import { getDatabase, type Database } from "../storage/database.svelte";
-import { forageStorage, getUncleanables, openURL } from "../globalApi.svelte";
+import { forageStorage, getUncleanables, getUncleanablesSync, openURL } from "../globalApi.svelte";
 import { resolveBlobStore } from "../storage/platformBlobStore";
 import {
     collectBackupAssetKeys,
@@ -13,7 +13,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
-import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
 import { publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installDriveRestore } from "../storage/databaseRestore";
 
@@ -291,7 +291,7 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
                 return
             }
         }
-        const requiredImages = (await getUncleanables(db))
+        const requiredImages = await getDriveRestoreRequiredImages(db)
         let ind = 0;
         let errorLogs:string[] = []
         for(const images of requiredImages){
@@ -358,6 +358,23 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
     else if(mode === 'backup'){
         location.search = ''
     }
+}
+
+async function getDriveRestoreRequiredImages(db:Database):Promise<string[]> {
+    const chars = []
+    for (const character of db.characters) {
+        if (!character.coldstorage) {
+            chars.push(character)
+            continue
+        }
+        const selected = await getColdStorageItem(character.coldstorage, {
+            accountFallback: true,
+        }) as { character?: typeof character } | null
+        chars.push(selected?.character?.chaId === character.chaId
+            ? selected.character
+            : character)
+    }
+    return getUncleanablesSync(db, 'basename', { chars })
 }
 
 async function restoreColdStorageFromDrive(
