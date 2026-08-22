@@ -1,14 +1,11 @@
 import { describe, expect, test, vi } from 'vitest'
 import {
+    createGatedColdPayloadStore,
     createKeyValueColdPayloadStore,
     createLegacyNodeColdPayloadStore,
     createLegacyBrowserOpfsColdPayloadStore,
     createLegacyOpfsColdPayloadStore,
     createLegacyTauriColdPayloadStore,
-    createRootedColdPayloadStoreFactory,
-    createGatedResolvingColdPayloadStore,
-    createPlatformRootedColdPayloadStoreFactory,
-    generatedColdPayloadKey,
 } from './platformColdPayloadStore'
 
 function memoryBackend(initial: Record<string, Uint8Array> = {}) {
@@ -22,7 +19,7 @@ function memoryBackend(initial: Record<string, Uint8Array> = {}) {
     }
 }
 
-describe('rooted cold payload storage', () => {
+describe('platform cold payload storage', () => {
     test('uses the exact flat browser OPFS legacy names', async () => {
         const values = new Map<string, Uint8Array>()
         const directory = {
@@ -71,73 +68,46 @@ describe('rooted cold payload storage', () => {
         expect(resolutions).toBe(2)
     })
 
-    test('shares the generated backend with the platform blob factory seam', async () => {
+
+    test('gates only cold writes and removals', async () => {
         const backend = memoryBackend()
         const legacy = createLegacyNodeColdPayloadStore(backend)
-        const factory = await createPlatformRootedColdPayloadStoreFactory(legacy, async () => backend)
-        const generated = factory.open({ kind: 'generation', id: 'shared' })
-
-        await generated.write('zero', new Uint8Array())
-
-        expect(backend.values.get(generatedColdPayloadKey('shared', 'zero'))).toEqual(new Uint8Array())
-        expect(await legacy.read('zero')).toBeNull()
-    })
-
-    test('gates only cold writes and refreshes before selecting one active root', async () => {
-        const backend = memoryBackend()
-        const factory = createRootedColdPayloadStoreFactory({
-            legacy: createLegacyNodeColdPayloadStore(backend),
-            generatedBackend: backend,
-        })
         const events: string[] = []
-        let root = { kind: 'generation' as const, id: 'old' }
-        const resolver = {
-            refresh: async () => { events.push('refresh'); root = { kind: 'generation', id: 'current' } },
-            getActiveColdRoot: () => { events.push(`resolve:${root.id}`); return root },
-        }
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) { events.push('lock'); return operation() },
-            async runMigration<T>(operation: () => Promise<T>) { return operation() },
         }
-        const store = createGatedResolvingColdPayloadStore(factory, resolver, gate)
+        const store = createGatedColdPayloadStore(legacy, gate)
 
         await store.write('same', new Uint8Array([7]))
-        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
-        expect(await factory.open({ kind: 'generation', id: 'current' }).read('same')).toEqual(new Uint8Array([7]))
+        expect(events).toEqual(['lock'])
+        expect(await legacy.read('same')).toEqual(new Uint8Array([7]))
 
         events.length = 0
         expect(await store.read('same')).toEqual(new Uint8Array([7]))
         expect(await store.list()).toEqual(['same'])
-        expect(events).toEqual(['resolve:current', 'resolve:current'])
+        expect(events).toEqual([])
 
-        events.length = 0
         await store.remove('same')
-        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
+        expect(events).toEqual(['lock'])
+        expect(await legacy.read('same')).toBeNull()
     })
 
     test('owns cold bytes before a deferred write gate proceeds', async () => {
         const backend = memoryBackend()
-        const factory = createRootedColdPayloadStoreFactory({
-            legacy: createLegacyNodeColdPayloadStore(backend),
-            generatedBackend: backend,
-        })
+        const legacy = createLegacyNodeColdPayloadStore(backend)
         let release!: () => void
         const blocked = new Promise<void>((resolve) => { release = resolve })
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
-            async runMigration<T>(operation: () => Promise<T>) { return operation() },
         }
-        const store = createGatedResolvingColdPayloadStore(factory, {
-            async refresh() {},
-            getActiveColdRoot() { return { kind: 'generation', id: 'current' } },
-        }, gate)
+        const store = createGatedColdPayloadStore(legacy, gate)
         const source = new Uint8Array([1])
         const pending = store.write('same', source)
         source[0] = 9
         release()
 
         await pending
-        expect(await factory.open({ kind: 'generation', id: 'current' }).read('same')).toEqual(new Uint8Array([1]))
+        expect(await legacy.read('same')).toEqual(new Uint8Array([1]))
     })
 
     test('preserves exact legacy Tauri, Node, and OPFS names', async () => {
@@ -154,37 +124,12 @@ describe('rooted cold payload storage', () => {
         ])
     })
 
-    test('isolates generated roots and distinguishes missing from zero bytes', async () => {
-        const backend = memoryBackend()
-        const factory = createRootedColdPayloadStoreFactory({
-            legacy: createKeyValueColdPayloadStore(backend, {
-                key: (id) => `coldstorage/${id}`, prefix: 'coldstorage/', suffix: '',
-            }),
-            generatedBackend: backend,
-        })
-        const first = factory.open({ kind: 'generation', id: 'first_1' })
-        const second = factory.open({ kind: 'generation', id: 'second-2' })
-
-        await first.write('same', new Uint8Array())
-        await second.write('same', new Uint8Array([2]))
-        expect(await first.read('same')).toEqual(new Uint8Array())
-        expect(await first.read('missing')).toBeNull()
-        expect(await second.read('same')).toEqual(new Uint8Array([2]))
-        expect(await first.list()).toEqual(['same'])
-        expect(await second.list()).toEqual(['same'])
-        await first.remove('same')
-        expect(await second.read('same')).toEqual(new Uint8Array([2]))
-    })
 
     test('lists sorted logical keys without reading payload bytes and copies writes', async () => {
         const backend = memoryBackend()
-        const factory = createRootedColdPayloadStoreFactory({
-            legacy: createKeyValueColdPayloadStore(backend, {
-                key: (id) => `coldstorage/${id}`, prefix: 'coldstorage/', suffix: '',
-            }),
-            generatedBackend: backend,
+        const store = createKeyValueColdPayloadStore(backend, {
+            key: (id) => `coldstorage/${id}`, prefix: 'coldstorage/', suffix: '',
         })
-        const store = factory.open({ kind: 'generation', id: 'stage' })
         const source = new Uint8Array([1])
         await store.write('z', source)
         source[0] = 9
@@ -196,10 +141,4 @@ describe('rooted cold payload storage', () => {
         expect(await store.read('z')).toEqual(new Uint8Array([1]))
     })
 
-    test('validates generated identifiers and uses UTF-8 key hex', () => {
-        expect(generatedColdPayloadKey('safe_1', '한글')).toBe(
-            'blobstore/generations/safe_1/coldstorage/ed959ceab880.bin',
-        )
-        expect(() => generatedColdPayloadKey('../escape', 'key')).toThrow(TypeError)
-    })
 })

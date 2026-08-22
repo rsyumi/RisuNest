@@ -1,6 +1,5 @@
 export interface StorageMutationGate {
     runWrite<T>(operation: () => Promise<T>): Promise<T>
-    runMigration<T>(operation: () => Promise<T>): Promise<T>
 }
 
 export interface StorageLockManager {
@@ -59,13 +58,6 @@ export function createInRealmStorageLockManager(): StorageLockManager {
     }
 }
 
-export class StorageMigrationUnsupportedError extends Error {
-    constructor() {
-        super('Persistent migration requires Web Locks in a multi-document browser')
-        this.name = 'StorageMigrationUnsupportedError'
-    }
-}
-
 const fallbackLocks = createInRealmStorageLockManager()
 
 function browserLocks(): StorageLockManager | null {
@@ -75,21 +67,11 @@ function browserLocks(): StorageLockManager | null {
 
 export function createStorageMutationGate(options: {
     locks?: StorageLockManager
-    allowInRealmMigration?: boolean
 } = {}): StorageMutationGate {
-    const nativeLocks = options.locks ?? browserLocks()
-    const locks = nativeLocks ?? fallbackLocks
-    const migrationSupported = nativeLocks !== null
-        || options.allowInRealmMigration === true
-        || typeof document === 'undefined'
-    const run = <T>(mode: 'shared' | 'exclusive', operation: () => Promise<T>) =>
-        locks.request('risuai-persistent-migration', { mode }, operation)
+    const locks = options.locks ?? browserLocks() ?? fallbackLocks
 
     return {
-        runWrite: (operation) => run('shared', operation),
-        runMigration(operation) {
-            if (!migrationSupported) return Promise.reject(new StorageMigrationUnsupportedError())
-            return run('exclusive', operation)
-        },
+        runWrite: (operation) =>
+            locks.request('risuai-persistent-storage', { mode: 'shared' }, operation),
     }
 }

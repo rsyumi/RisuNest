@@ -1,6 +1,5 @@
 import type { Database } from './database.svelte'
 import type {
-    ActivePersistentTuple,
     CharacterPage,
     CharacterQuery,
     ConversationPage,
@@ -10,8 +9,6 @@ import type {
     DataRevision,
     PersistentDataStore,
     PersistentRevisionLease,
-    PreparedPersistentReplacement,
-    PreparedReplacementActivation,
     Versioned,
     WorkingSetCommit,
     CharacterDetail,
@@ -39,15 +36,6 @@ export function createMutationGatedPersistentDataStore(
         commit: (input: WorkingSetCommit) => gate.runWrite(() => store.commit(input)),
         replaceFromDatabase: (database: Database, expectedRevision?: DataRevision) =>
             gate.runWrite(() => store.replaceFromDatabase(database, expectedRevision)),
-        prepareReplacement: (database, manifestHash, payloadGeneration) =>
-            store.prepareReplacement(database, manifestHash, payloadGeneration),
-        activatePreparedReplacement: (input: PreparedReplacementActivation) =>
-            store.activatePreparedReplacement(input),
-        discardPreparedReplacement: (prepared: PreparedPersistentReplacement) =>
-            store.discardPreparedReplacement(prepared),
-        listPreparedReplacements: () => store.listPreparedReplacements(),
-        readActivePayloadGeneration: () => store.readActivePayloadGeneration(),
-        readActiveTuple: (): Promise<ActivePersistentTuple> => store.readActiveTuple(),
         materializeDatabase: (revision?: DataRevision) => store.materializeDatabase(revision),
         acquireRevision: (revision: DataRevision): Promise<PersistentRevisionLease> =>
             store.acquireRevision(revision),

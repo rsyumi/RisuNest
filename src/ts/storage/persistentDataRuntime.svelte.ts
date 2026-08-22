@@ -95,8 +95,6 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),
             onBackgroundError: (error) => productionConfiguration.onBackgroundError?.(error),
             prepareDatabase: prepareDatabaseForPersistence,
-            runExclusiveMigration: (operation) =>
-                getPersistentStorageAuthority().gate.runMigration(operation),
         })
     }
     return productionRuntime

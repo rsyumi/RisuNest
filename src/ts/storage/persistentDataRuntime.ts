@@ -39,7 +39,6 @@ export interface PersistentDataRuntimeDependencies {
     officialPublisher?: OfficialRevisionPublisher | null
     getOfficialPublisher?(): OfficialRevisionPublisher | null
     clock?: SaveCoordinatorClock
-    runExclusiveMigration?<T>(operation: () => Promise<T>): Promise<T>
     onLocalRevision?(revision: DataRevision): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
@@ -56,8 +55,6 @@ export interface PersistentDataRuntime {
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
     replacePersistentDatabase(database: Database, reason: string): Promise<void>
-    runMigration<T>(reason: string, operation: () => Promise<T>): Promise<T>
-    adoptActivatedDatabase(database: Database, revision: DataRevision): Promise<void>
     publishCurrentOfficialRevision(): Promise<void>
 }
 
@@ -95,8 +92,6 @@ export function createPersistentDataRuntime(
             )
             : undefined,
         clock: dependencies.clock,
-        runExclusiveMigration: dependencies.runExclusiveMigration,
-        invalidateNavigation: () => workingSet.invalidateNavigation(),
         onLocalRevision: dependencies.onLocalRevision,
         onFlushPromise: dependencies.onFlushPromise,
         onBackgroundError: dependencies.onBackgroundError,
@@ -141,9 +136,6 @@ export function createPersistentDataRuntime(
             const prepared = await dependencies.prepareDatabase(database)
             await coordinator.replacePersistentDatabase(prepared, reason)
         },
-        runMigration: (reason, operation) => coordinator.runMigration(reason, operation),
-        adoptActivatedDatabase: (database, revision) =>
-            coordinator.adoptActivatedDatabase(database, revision),
         publishCurrentOfficialRevision: () => coordinator.publishCurrentOfficialRevision(),
     }
 }

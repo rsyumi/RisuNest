@@ -1,6 +1,5 @@
 import type { Chat, Database, Message } from './database.svelte'
 import type {
-    ActivePersistentTuple,
     CharacterDetail,
     CharacterPage,
     CharacterQuery,
@@ -14,18 +13,14 @@ import type {
     DataRevision,
     PersistentDataStore,
     PersistentRevisionLease,
-    PreparedPersistentReplacement,
-    PreparedReplacementActivation,
     Versioned,
     WorkingSetCommit,
 } from './persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
-import { assertGeneratedStorageRootId } from './storageRoot'
 
 const DATABASE_VERSION = 3
 const MESSAGE_PAGE_SIZE = 128
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
-const LEGACY_PAYLOAD_GENERATION = 'legacy'
 const STORE_NAMES = ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 const DATA_STORE_NAMES = ['root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 const activeSnapshotGenerations = new Set<string>()
@@ -53,14 +48,6 @@ interface PreparedGenerationCounts {
     characters: number
     conversations: number
     messagePages: number
-}
-
-interface PreparedReplacementMarker extends PreparedPersistentReplacement {
-    counts: PreparedGenerationCounts
-}
-
-interface GenerationCleanupMarker {
-    generation: string
 }
 
 export type PersistentGenerationCleanupErrorHandler = (
@@ -197,23 +184,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
         const transaction = this.database.transaction(['meta', 'root'], 'readwrite')
         const meta = transaction.objectStore('meta')
-        const [currentRevision, activePayloadGeneration] = await Promise.all([
-            requestResult(meta.get('currentRevision')),
-            requestResult(meta.get('activePayloadGeneration')),
-        ])
+        const currentRevision = await requestResult(meta.get('currentRevision'))
         meta.put({ key: 'schemaVersion', value: DATABASE_VERSION })
         if (!currentRevision) {
             const generation = this.generationFor(0)
             meta.put({ key: 'activeGeneration', value: generation })
-            meta.put({ key: 'activePayloadGeneration', value: LEGACY_PAYLOAD_GENERATION })
             meta.put({ key: 'currentRevision', value: 0 })
             transaction.objectStore('root').put({ key: generation, generation, value: {} })
-        } else if (!activePayloadGeneration) {
-            meta.put({ key: 'activePayloadGeneration', value: LEGACY_PAYLOAD_GENERATION })
         }
         await transactionDone(transaction)
         await this.sweepTemporaryGenerations()
-        await this.retryQueuedGenerationCleanup()
     }
 
     async readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
@@ -458,149 +438,6 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 transaction.abort()
             } catch {}
             throw error
-        }
-    }
-
-    async prepareReplacement(
-        databaseValue: Database,
-        manifestHash: string,
-        payloadGeneration: string,
-    ): Promise<PreparedPersistentReplacement> {
-        this.validatePreparedPayloadGeneration(payloadGeneration)
-        const database = this.requireDatabase()
-        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
-        const id = globalThis.crypto.randomUUID()
-        const dataGeneration = `prepared-${id}`
-        try {
-            const active = await this.readActive(transaction)
-            const counts = await this.stageDatabase(transaction, databaseValue, dataGeneration)
-            const prepared = {
-                id,
-                baseRevision: active.revision,
-                dataGeneration,
-                payloadGeneration,
-                manifestHash,
-            }
-            const marker: PreparedReplacementMarker = { ...prepared, counts }
-            transaction.objectStore('meta').put({
-                key: this.preparedMarkerKey(id),
-                value: marker,
-            })
-            await transactionDone(transaction)
-            return prepared
-        } catch (error) {
-            try {
-                transaction.abort()
-            } catch {}
-            throw error
-        }
-    }
-
-    async activatePreparedReplacement(
-        input: PreparedReplacementActivation,
-    ): Promise<{ revision: DataRevision }> {
-        this.validatePreparedPayloadGeneration(input.prepared.payloadGeneration)
-        const database = this.requireDatabase()
-        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
-        try {
-            const active = await this.readActive(transaction)
-            if (active.revision !== input.prepared.baseRevision) {
-                throw new RevisionConflictError(input.prepared.baseRevision, active.revision)
-            }
-            const markerRecord = await requestResult(
-                transaction.objectStore('meta').get(this.preparedMarkerKey(input.prepared.id)),
-            )
-            const marker = (
-                markerRecord as { value?: PreparedReplacementMarker } | undefined
-            )?.value
-            if (!marker || !this.matchesPreparedReplacement(marker, input.prepared)) {
-                throw new Error('Persistent prepared replacement is missing or does not match')
-            }
-            if (marker.manifestHash !== input.manifestHash) {
-                throw new Error('Persistent prepared replacement manifest does not match')
-            }
-            await this.validateGeneration(transaction, marker.dataGeneration, marker.counts)
-            const revision = active.revision + 1
-            this.setActiveTuple(
-                transaction,
-                revision,
-                marker.dataGeneration,
-                marker.payloadGeneration,
-            )
-            this.enqueueGenerationCleanup(transaction, active.generation)
-            transaction.objectStore('meta').delete(this.preparedMarkerKey(marker.id))
-            await transactionDone(transaction)
-            await this.retryQueuedGenerationCleanup()
-            return { revision }
-        } catch (error) {
-            try {
-                transaction.abort()
-            } catch {}
-            throw error
-        }
-    }
-
-    async discardPreparedReplacement(prepared: PreparedPersistentReplacement): Promise<void> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
-        try {
-            const active = await this.readActive(transaction)
-            const markerRecord = await requestResult(
-                transaction.objectStore('meta').get(this.preparedMarkerKey(prepared.id)),
-            )
-            const marker = (
-                markerRecord as { value?: PreparedReplacementMarker } | undefined
-            )?.value
-            if (
-                !marker ||
-                !this.matchesPreparedReplacement(marker, prepared) ||
-                marker.dataGeneration === active.generation ||
-                activeSnapshotGenerations.has(marker.dataGeneration)
-            ) {
-                await transactionDone(transaction)
-                return
-            }
-            await this.deleteGenerationFromTransaction(transaction, marker.dataGeneration)
-            transaction.objectStore('meta').delete(this.preparedMarkerKey(marker.id))
-            await transactionDone(transaction)
-        } catch (error) {
-            try {
-                transaction.abort()
-            } catch {}
-            throw error
-        }
-    }
-
-    async listPreparedReplacements(): Promise<PreparedPersistentReplacement[]> {
-        const transaction = this.requireDatabase().transaction('meta', 'readonly')
-        const markers = await this.readMetaValuesByPrefix<PreparedReplacementMarker>(
-            transaction.objectStore('meta'),
-            'preparedReplacement:',
-        )
-        await transactionDone(transaction)
-        return markers
-            .map(({ id, baseRevision, dataGeneration, payloadGeneration, manifestHash }) => ({
-                id,
-                baseRevision,
-                dataGeneration,
-                payloadGeneration,
-                manifestHash,
-            }))
-            .sort((left, right) => left.id.localeCompare(right.id))
-    }
-
-    async readActivePayloadGeneration(): Promise<string> {
-        return (await this.readActiveTuple()).payloadGeneration
-    }
-
-    async readActiveTuple(): Promise<ActivePersistentTuple> {
-        const transaction = this.requireDatabase().transaction('meta', 'readonly')
-        const active = await this.readActive(transaction)
-        await transactionDone(transaction)
-        return {
-            revision: active.revision,
-            dataGeneration: active.generation,
-            payloadGeneration: active.payloadGeneration,
         }
     }
 
@@ -1070,53 +907,6 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 transaction.objectStore(storeName).index('byGeneration'),
                 this.keyRangeFactory.only(generation),
             )
-        }
-    }
-
-    private enqueueGenerationCleanup(transaction: IDBTransaction, generation: string): void {
-        transaction.objectStore('meta').put({
-            key: this.generationCleanupMarkerKey(generation),
-            value: { generation } satisfies GenerationCleanupMarker,
-        })
-    }
-
-    private async retryQueuedGenerationCleanup(): Promise<void> {
-        const database = this.requireDatabase()
-        let queued: GenerationCleanupMarker[]
-        try {
-            const readTransaction = database.transaction('meta', 'readonly')
-            queued = await this.readMetaValuesByPrefix<GenerationCleanupMarker>(
-                readTransaction.objectStore('meta'),
-                'generationCleanup:',
-            )
-            await transactionDone(readTransaction)
-        } catch (error) {
-            this.reportCleanupError('queue', error)
-            return
-        }
-        for (const marker of queued) {
-            let transaction: IDBTransaction | undefined
-            try {
-                transaction = database.transaction([...STORE_NAMES], 'readwrite')
-                const active = await this.readActive(transaction)
-                if (
-                    marker.generation === active.generation ||
-                    activeSnapshotGenerations.has(marker.generation)
-                ) {
-                    await transactionDone(transaction)
-                    continue
-                }
-                await this.deleteGenerationFromTransaction(transaction, marker.generation)
-                transaction
-                    .objectStore('meta')
-                    .delete(this.generationCleanupMarkerKey(marker.generation))
-                await transactionDone(transaction)
-            } catch (error) {
-                try {
-                    transaction?.abort()
-                } catch {}
-                this.reportCleanupError(marker.generation, error)
-            }
         }
     }
 
@@ -1716,19 +1506,15 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     private async readActive(
         transaction: IDBTransaction,
-    ): Promise<{ revision: DataRevision; generation: string; payloadGeneration: string }> {
+    ): Promise<{ revision: DataRevision; generation: string }> {
         const store = transaction.objectStore('meta')
-        const [revisionRecord, generationRecord, payloadGenerationRecord] = await Promise.all([
+        const [revisionRecord, generationRecord] = await Promise.all([
             requestResult(store.get('currentRevision')),
             requestResult(store.get('activeGeneration')),
-            requestResult(store.get('activePayloadGeneration')),
         ])
         return {
             revision: (revisionRecord as { value: DataRevision }).value,
             generation: (generationRecord as { value: string }).value,
-            payloadGeneration:
-                (payloadGenerationRecord as { value?: string } | undefined)?.value ??
-                LEGACY_PAYLOAD_GENERATION,
         }
     }
 
@@ -1736,47 +1522,6 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const meta = transaction.objectStore('meta')
         meta.put({ key: 'activeGeneration', value: generation })
         meta.put({ key: 'currentRevision', value: revision })
-    }
-
-    private setActiveTuple(
-        transaction: IDBTransaction,
-        revision: DataRevision,
-        dataGeneration: string,
-        payloadGeneration: string,
-    ): void {
-        this.setActive(transaction, revision, dataGeneration)
-        transaction.objectStore('meta').put({
-            key: 'activePayloadGeneration',
-            value: payloadGeneration,
-        })
-    }
-
-    private preparedMarkerKey(id: string): string {
-        return `preparedReplacement:${id}`
-    }
-
-    private generationCleanupMarkerKey(generation: string): string {
-        return `generationCleanup:${generation}`
-    }
-
-    private validatePreparedPayloadGeneration(payloadGeneration: string): void {
-        assertGeneratedStorageRootId(payloadGeneration)
-        if (payloadGeneration === LEGACY_PAYLOAD_GENERATION) {
-            throw new TypeError('Prepared replacement requires a generated payload identifier')
-        }
-    }
-
-    private matchesPreparedReplacement(
-        marker: PreparedReplacementMarker,
-        prepared: PreparedPersistentReplacement,
-    ): boolean {
-        return (
-            marker.id === prepared.id &&
-            marker.baseRevision === prepared.baseRevision &&
-            marker.dataGeneration === prepared.dataGeneration &&
-            marker.payloadGeneration === prepared.payloadGeneration &&
-            marker.manifestHash === prepared.manifestHash
-        )
     }
 
     private putRoot(

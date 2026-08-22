@@ -1,8 +1,6 @@
 import type { BlobKeyValueBackend } from './blobStore'
-import type { ActiveColdRootResolver, ColdPayloadStore, RootedColdPayloadStoreFactory } from './coldPayloadStore'
-import { assertGeneratedStorageRootId, type BlobStorageRoot } from './storageRoot'
+import type { ColdPayloadStore } from './coldPayloadStore'
 import type { StorageMutationGate } from './storageMutationGate'
-import { getPlatformBlobKeyValueBackend } from './platformBlobStore'
 
 export interface ColdPayloadKeyMapper {
     key(logicalKey: string): string
@@ -111,117 +109,17 @@ export function createLegacyBrowserOpfsColdPayloadStore(
     }
 }
 
-function utf8Hex(value: string): string {
-    return Buffer.from(value, 'utf-8').toString('hex')
-}
-
-export function generatedColdPayloadKey(generation: string, logicalKey: string): string {
-    assertGeneratedStorageRootId(generation)
-    return `blobstore/generations/${generation}/coldstorage/${utf8Hex(logicalKey)}.bin`
-}
-
-function generatedMapper(generation: string): ColdPayloadKeyMapper {
-    assertGeneratedStorageRootId(generation)
-    const prefix = `blobstore/generations/${generation}/coldstorage/`
-    return {
-        key: (logicalKey) => generatedColdPayloadKey(generation, logicalKey),
-        prefix,
-        suffix: '.bin',
-    }
-}
-
-function decodeGeneratedKey(physicalKey: string, generation: string): string | null {
-    const { prefix, suffix } = generatedMapper(generation)
-    if (!physicalKey.startsWith(prefix) || !physicalKey.endsWith(suffix)) return null
-    const hex = physicalKey.slice(prefix.length, -suffix.length)
-    if (!hex || hex.length % 2 !== 0 || !/^[0-9a-f]+$/.test(hex)) return null
-    const decoded = Buffer.from(hex, 'hex').toString('utf-8')
-    return utf8Hex(decoded) === hex ? decoded : null
-}
-
-function createGeneratedColdPayloadStore(backend: BlobKeyValueBackend, generation: string): ColdPayloadStore {
-    const mapper = generatedMapper(generation)
-    return {
-        async read(key) {
-            const value = await backend.read(mapper.key(key))
-            return value === null ? null : value.slice()
-        },
-        async write(key, data) { await backend.write(mapper.key(key), data.slice()) },
-        async list() {
-            return (await backend.keys())
-                .map((key) => decodeGeneratedKey(key, generation))
-                .filter((key): key is string => key !== null)
-                .sort()
-        },
-        async remove(key) { await backend.remove(mapper.key(key)) },
-    }
-}
-
-export function createRootedColdPayloadStoreFactory(input: {
-    legacy: ColdPayloadStore
-    generatedBackend: BlobKeyValueBackend
-}): RootedColdPayloadStoreFactory {
-    const generated = new Map<string, ColdPayloadStore>()
-    return {
-        open(root: BlobStorageRoot) {
-            if (root.kind === 'legacy') return input.legacy
-            assertGeneratedStorageRootId(root.id)
-            let store = generated.get(root.id)
-            if (!store) {
-                store = createGeneratedColdPayloadStore(input.generatedBackend, root.id)
-                generated.set(root.id, store)
-            }
-            return store
-        },
-    }
-}
-
-export interface RefreshingActiveColdRootResolver extends ActiveColdRootResolver {
-    refresh(): Promise<unknown>
-}
-
-export function createResolvingColdPayloadStore(
-    factory: RootedColdPayloadStoreFactory,
-    resolver: ActiveColdRootResolver,
-): ColdPayloadStore {
-    const resolve = () => factory.open(resolver.getActiveColdRoot())
-    return {
-        async read(key) { return resolve().read(key) },
-        async write(key, data) { return resolve().write(key, data) },
-        async list() { return resolve().list() },
-        async remove(key) { return resolve().remove(key) },
-    }
-}
-
-export function createGatedResolvingColdPayloadStore(
-    factory: RootedColdPayloadStoreFactory,
-    resolver: RefreshingActiveColdRootResolver,
+export function createGatedColdPayloadStore(
+    store: ColdPayloadStore,
     gate: StorageMutationGate,
 ): ColdPayloadStore {
-    const resolve = () => factory.open(resolver.getActiveColdRoot())
-    const resolveAfterRefresh = async () => {
-        await resolver.refresh()
-        return resolve()
-    }
     return {
-        async read(key) { return resolve().read(key) },
+        read: (key) => store.read(key),
         async write(key, data) {
             const ownedData = data.slice()
-            return gate.runWrite(async () => (await resolveAfterRefresh()).write(key, ownedData))
+            return gate.runWrite(() => store.write(key, ownedData))
         },
-        async list() { return resolve().list() },
-        async remove(key) {
-            return gate.runWrite(async () => (await resolveAfterRefresh()).remove(key))
-        },
+        list: () => store.list(),
+        remove: (key) => gate.runWrite(() => store.remove(key)),
     }
-}
-
-export async function createPlatformRootedColdPayloadStoreFactory(
-    legacy: ColdPayloadStore,
-    resolveBackend: () => Promise<BlobKeyValueBackend> = getPlatformBlobKeyValueBackend,
-): Promise<RootedColdPayloadStoreFactory> {
-    return createRootedColdPayloadStoreFactory({
-        legacy,
-        generatedBackend: await resolveBackend(),
-    })
 }

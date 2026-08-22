@@ -1,18 +1,15 @@
 import { describe, expect, test, vi } from 'vitest'
 import {
+    createBackedBlobStore,
     createBrowserBlobBackend,
+    createGatedBlobStore,
     createOpfsBlobBackend,
-    createStorageRootedBlobStoreFactory,
+    createStorageBlobStore,
     createTauriBlobBackend,
-    createKeyValueRootedBlobStoreFactory,
-    createGatedResolvingBlobStore,
-    createRootPinnedGatedBlobStore,
-    createResolvingBlobStore,
     physicalBlobKeys,
     readBlobForFacade,
 } from './platformBlobStore'
 import { SeekMode } from '@tauri-apps/plugin-fs'
-import { isGeneratedStorageRootId } from './storageRoot'
 
 function memoryBackend() {
     const values = new Map<string, Uint8Array>()
@@ -27,83 +24,45 @@ function memoryBackend() {
     }
 }
 
-describe('rooted BlobStore mapping', () => {
-    test('keeps resolved reads pinned while routing writes through the active gated facade', async () => {
-        const metadata = { kind: 'asset' as const, mime: 'image/png', name: 'a.png', ext: 'png' }
-        const pinned = createKeyValueRootedBlobStoreFactory(memoryBackend().backend).open({ kind: 'legacy' })
-        await pinned.put('assets/pinned.png', new Uint8Array([1]), metadata)
-        const write = vi.fn(async () => ({ ...metadata, key: 'assets/current.png', size: 1 }))
-        const remove = vi.fn(async () => undefined)
-        const store = createRootPinnedGatedBlobStore(pinned, {
-            ...pinned,
-            put: write,
-            remove,
-        })
+describe('platform BlobStore', () => {
 
-        expect(await store.read('assets/pinned.png')).toEqual(new Uint8Array([1]))
-        await store.put('assets/current.png', new Uint8Array([2]), metadata)
-        await store.remove('assets/current.png')
-
-        expect(write).toHaveBeenCalledOnce()
-        expect(remove).toHaveBeenCalledOnce()
-    })
-
-    test('gates only writes, refreshes after locking, and resolves one concrete root', async () => {
+    test('gates writes and removals while leaving reads ungated', async () => {
         const { backend } = memoryBackend()
-        const factory = createKeyValueRootedBlobStoreFactory(backend)
         const events: string[] = []
-        let root = { kind: 'generation' as const, id: 'old' }
-        const resolver = {
-            async refresh() {
-                events.push('refresh')
-                root = { kind: 'generation', id: 'current' }
-            },
-            async getActiveRoot() {
-                events.push(`resolve:${root.id}`)
-                return root
-            },
-        }
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) {
                 events.push('lock')
                 return operation()
             },
-            async runMigration<T>(operation: () => Promise<T>) { return operation() },
         }
-        const store = createGatedResolvingBlobStore(factory, resolver, gate)
+        const store = createGatedBlobStore(createBackedBlobStore(backend), gate)
         const metadata = { kind: 'asset' as const, mime: 'application/octet-stream', name: 'a', ext: '' }
 
         await store.put('assets/a', new Uint8Array([1]), metadata)
-        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
-        expect(await factory.open({ kind: 'generation', id: 'current' }).read('assets/a')).toEqual(new Uint8Array([1]))
+        expect(events).toEqual(['lock'])
+        expect(await store.read('assets/a')).toEqual(new Uint8Array([1]))
 
         events.length = 0
         await store.read('assets/a')
         await store.stat('assets/a')
         await store.list()
         await store.resolveUrl('assets/a')
-        expect(events).toEqual([
-            'resolve:current', 'resolve:current', 'resolve:current', 'resolve:current',
-        ])
+        expect(events).toEqual([])
 
-        events.length = 0
         await store.remove('assets/a')
-        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
+        expect(events).toEqual(['lock'])
+        expect(await store.read('assets/a')).toBeNull()
     })
 
     test('owns blob bytes before a deferred write gate proceeds', async () => {
         const { backend } = memoryBackend()
-        const factory = createKeyValueRootedBlobStoreFactory(backend)
         let release!: () => void
         const blocked = new Promise<void>((resolve) => { release = resolve })
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
-            async runMigration<T>(operation: () => Promise<T>) { return operation() },
         }
-        const store = createGatedResolvingBlobStore(factory, {
-            async refresh() {},
-            async getActiveRoot() { return { kind: 'generation', id: 'current' } },
-        }, gate)
+        const backing = createBackedBlobStore(backend)
+        const store = createGatedBlobStore(backing, gate)
         const source = new Uint8Array([1])
         const pending = store.put('assets/a', source, {
             kind: 'asset', mime: 'application/octet-stream', name: 'a', ext: '',
@@ -112,76 +71,23 @@ describe('rooted BlobStore mapping', () => {
         release()
 
         await pending
-        expect(await factory.open({ kind: 'generation', id: 'current' }).read('assets/a')).toEqual(new Uint8Array([1]))
+        expect(await backing.read('assets/a')).toEqual(new Uint8Array([1]))
     })
 
     test('preserves legacy paths and encodes raw inlay ids', () => {
-        expect(physicalBlobKeys({ kind: 'legacy' }, 'assets/photo.jpg')).toEqual({
+        expect(physicalBlobKeys('assets/photo.jpg')).toEqual({
             payload: 'assets/photo.jpg',
             metadata: 'blobstore/metadata/6173736574732f70686f746f2e6a7067.json',
         })
-        expect(physicalBlobKeys({ kind: 'legacy' }, '../raw')).toEqual({
+        expect(physicalBlobKeys('../raw')).toEqual({
             payload: 'blobstore/inlays/2e2e2f726177.bin',
             metadata: 'blobstore/metadata/2e2e2f726177.json',
         })
     })
 
-    test('isolates equal logical keys across generated roots', async () => {
-        const { backend } = memoryBackend()
-        const factory = createKeyValueRootedBlobStoreFactory(backend)
-        const first = factory.open({ kind: 'generation', id: 'first_1' })
-        const second = factory.open({ kind: 'generation', id: 'second-2' })
-        const metadata = { kind: 'asset' as const, mime: 'image/png', name: 'same.png', ext: 'png' }
-        await first.put('assets/same.png', new Uint8Array([1]), metadata)
-        await second.put('assets/same.png', new Uint8Array([2]), metadata)
-        expect(await first.read('assets/same.png')).toEqual(new Uint8Array([1]))
-        expect(await second.read('assets/same.png')).toEqual(new Uint8Array([2]))
-        expect(await first.list()).toHaveLength(1)
-        await first.remove('assets/same.png')
-        expect(await second.read('assets/same.png')).toEqual(new Uint8Array([2]))
-    })
 
-    test('rejects unsafe generation identifiers', () => {
-        const { backend } = memoryBackend()
-        const factory = createKeyValueRootedBlobStoreFactory(backend)
-        expect(() => factory.open({ kind: 'generation', id: '../escape' })).toThrow(TypeError)
-    })
 
-    test.each([
-        ['safe', true],
-        ['safe_1-2', true],
-        ['a'.repeat(64), true],
-        ['', false],
-        ['../escape', false],
-        ['a'.repeat(65), false],
-        ['with space', false],
-    ])('shares generated-root validation for %j', (id, expected) => {
-        expect(isGeneratedStorageRootId(id)).toBe(expected)
-        const { backend } = memoryBackend()
-        const factory = createKeyValueRootedBlobStoreFactory(backend)
-        if (expected) {
-            expect(() => factory.open({ kind: 'generation', id })).not.toThrow()
-        } else {
-            expect(() => factory.open({ kind: 'generation', id })).toThrow(TypeError)
-        }
-    })
 
-    test('resolves one active root for a complete public operation', async () => {
-        const { backend } = memoryBackend()
-        const factory = createKeyValueRootedBlobStoreFactory(backend)
-        let calls = 0
-        const store = createResolvingBlobStore(factory, {
-            async getActiveRoot() {
-                calls += 1
-                return calls === 1 ? { kind: 'generation', id: 'one' } : { kind: 'generation', id: 'two' }
-            },
-        })
-        await store.put('assets/a', new Uint8Array([1]), {
-            kind: 'asset', mime: 'application/octet-stream', name: 'a', ext: '',
-        })
-        expect(calls).toBe(1)
-        expect(await factory.open({ kind: 'generation', id: 'one' }).read('assets/a')).toEqual(new Uint8Array([1]))
-    })
 
     test('refuses AccountStorage before invoking it', () => {
         const storage = {
@@ -190,7 +96,7 @@ describe('rooted BlobStore mapping', () => {
             keys: async () => { throw new Error('must not run') },
             removeItem: async () => { throw new Error('must not run') },
         }
-        expect(() => createStorageRootedBlobStoreFactory({ storage, isAccount: true })).toThrow(TypeError)
+        expect(() => createStorageBlobStore({ storage, isAccount: true })).toThrow(TypeError)
     })
 
     test('Tauri bounded reads clamp, seek once, fill, and close', async () => {
@@ -250,28 +156,10 @@ describe('rooted BlobStore mapping', () => {
             list: async () => [], remove: async () => {}, size: async () => 0,
             open: async () => { throw new Error('not used') }, resolveUrl: async (key) => `asset://${key}`,
         })
-        const store = createKeyValueRootedBlobStoreFactory(backend).open({ kind: 'legacy' })
+        const store = createBackedBlobStore(backend)
         expect(await store.resolveUrl('assets/missing')).toBeNull()
     })
 
-    test('Tauri resolves generated-root URLs from the isolated physical path', async () => {
-        const values = new Map<string, Uint8Array>()
-        const backend = createTauriBlobBackend({
-            exists: async (key) => values.has(key), mkdir: async () => {},
-            write: async (key, value) => void values.set(key, value.slice()),
-            read: async (key) => values.get(key)!,
-            list: async (prefix) => [...values.keys()].filter((key) => key.startsWith(prefix)),
-            remove: async (key) => void values.delete(key), size: async (key) => values.get(key)!.byteLength,
-            open: async () => { throw new Error('not used') }, resolveUrl: async (key) => `asset://${key}`,
-        })
-        const store = createKeyValueRootedBlobStoreFactory(backend).open({ kind: 'generation', id: 'stage_1' })
-        await store.put('assets/photo.jpg', new Uint8Array([1]), {
-            kind: 'asset', mime: 'image/jpeg', name: 'photo.jpg', ext: 'jpg',
-        })
-        expect(await store.resolveUrl('assets/photo.jpg')).toBe(
-            'asset://blobstore/generations/stage_1/assets/photo.jpg',
-        )
-    })
 
     test('Tauri bounded reads close after a read failure', async () => {
         let closes = 0
@@ -326,13 +214,13 @@ describe('rooted BlobStore mapping', () => {
     })
 
     test('facade rejects missing native blobs', async () => {
-        const store = createKeyValueRootedBlobStoreFactory(memoryBackend().backend).open({ kind: 'legacy' })
+        const store = createBackedBlobStore(memoryBackend().backend)
 
         await expect(readBlobForFacade(store, 'assets/missing', true)).rejects.toThrow('Missing asset')
     })
 
     test('facade preserves nullable browser reads', async () => {
-        const store = createKeyValueRootedBlobStoreFactory(memoryBackend().backend).open({ kind: 'legacy' })
+        const store = createBackedBlobStore(memoryBackend().backend)
 
         await expect(readBlobForFacade(store, 'assets/missing', false)).resolves.toBeNull()
     })

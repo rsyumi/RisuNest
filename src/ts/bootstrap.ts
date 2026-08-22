@@ -64,10 +64,7 @@ import {
 import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
 import { resolveBlobStore } from "./storage/platformBlobStore";
 import { OfficialAccountSnapshotAdapter } from "./storage/sync/officialAccountSnapshot";
-import {
-    initializePersistentMigrationAuthority,
-    refreshActivePayloadRoot,
-} from "./storage/persistentMigrationRuntime";
+import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
 import {
     initializeOfficialAccountBootstrap,
     publishOfficialRevisionIfChanged,
@@ -152,14 +149,13 @@ export async function loadData() {
             await forageStorage.Init()
         }
 
-        await initializePersistentMigrationAuthority()
+        await initializePersistentStorage()
         const runtime = getPersistentDataRuntime()
         const local = await bootstrapPersistentDatabase({
             store: runtime.store,
             loadLegacyCandidate: loadLegacyDatabaseCandidate,
             prepareDatabase: prepareDatabaseForPersistence,
         })
-        await refreshActivePayloadRoot()
         setDatabase(local.database)
         const accountStorage = new AccountStorage()
         const officialAdapter = new OfficialAccountSnapshotAdapter({
@@ -209,10 +205,7 @@ export async function loadData() {
             confirmInitialPush: async () =>
                 await alertInput('to overwrite your data, type "RISUAI"') === 'RISUAI',
             installDatabase: setDatabase,
-            initializeWorkingSet: async (database) => {
-                await refreshActivePayloadRoot()
-                await initializeActiveWorkingSet(database)
-            },
+            initializeWorkingSet: (database) => initializeActiveWorkingSet(database),
             onRemoteError: (error) => {
                 console.error(error)
                 alertError(error instanceof Error ? error : String(error))

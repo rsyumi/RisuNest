@@ -12,116 +12,44 @@ import {
     type BlobReadRange,
     type BlobStore,
 } from './blobStore'
-import { assertGeneratedStorageRootId, type BlobStorageRoot } from './storageRoot'
 import type { StorageMutationGate } from './storageMutationGate'
-export type { BlobStorageRoot } from './storageRoot'
-
-export interface RootedBlobStoreFactory {
-    open(root: BlobStorageRoot): BlobStore
-}
-
-export interface ActiveBlobRootResolver {
-    getActiveRoot(): Promise<BlobStorageRoot>
-}
-
-function rootPrefix(root: BlobStorageRoot): string {
-    if (root.kind === 'legacy') return ''
-    assertGeneratedStorageRootId(root.id)
-    return `blobstore/generations/${root.id}/`
-}
 
 function logicalKeyHex(key: string): string {
     return Buffer.from(key, 'utf-8').toString('hex')
 }
 
-export function physicalBlobKeys(root: BlobStorageRoot, logicalKey: string) {
-    const prefix = rootPrefix(root)
+export function physicalBlobKeys(logicalKey: string) {
     return {
         payload: logicalKey.startsWith('assets/')
-            ? `${prefix}${logicalKey}`
-            : `${prefix}blobstore/inlays/${logicalKeyHex(logicalKey)}.bin`,
-        metadata: `${prefix}blobstore/metadata/${logicalKeyHex(logicalKey)}.json`,
+            ? logicalKey
+            : `blobstore/inlays/${logicalKeyHex(logicalKey)}.bin`,
+        metadata: `blobstore/metadata/${logicalKeyHex(logicalKey)}.json`,
     }
 }
 
-function mapperFor(root: BlobStorageRoot): BlobPhysicalKeyMapper {
-    const prefix = rootPrefix(root)
-    return {
-        payload: (key) => physicalBlobKeys(root, key).payload,
-        metadata: (key) => physicalBlobKeys(root, key).metadata,
-        metadataPrefix: `${prefix}blobstore/metadata/`,
-        legacyAssetPrefix: `${prefix}assets/`,
-    }
+const blobKeyMapper: BlobPhysicalKeyMapper = {
+    payload: (key) => physicalBlobKeys(key).payload,
+    metadata: (key) => physicalBlobKeys(key).metadata,
+    metadataPrefix: 'blobstore/metadata/',
+    legacyAssetPrefix: 'assets/',
 }
 
-export function createKeyValueRootedBlobStoreFactory(backend: BlobKeyValueBackend): RootedBlobStoreFactory {
-    const stores = new Map<string, BlobStore>()
-    return {
-        open(root) {
-            const identity = root.kind === 'legacy' ? 'legacy' : `generation:${root.id}`
-            let store = stores.get(identity)
-            if (!store) {
-                store = createKeyValueBlobStore(backend, mapperFor(root))
-                stores.set(identity, store)
-            }
-            return store
-        },
-    }
+export function createBackedBlobStore(backend: BlobKeyValueBackend): BlobStore {
+    return createKeyValueBlobStore(backend, blobKeyMapper)
 }
 
-export function createResolvingBlobStore(factory: RootedBlobStoreFactory, resolver: ActiveBlobRootResolver): BlobStore {
-    const resolve = async () => factory.open(await resolver.getActiveRoot())
-    return {
-        async put(key, data, metadata) { return (await resolve()).put(key, data, metadata) },
-        async read(key, range) { return (await resolve()).read(key, range) },
-        async stat(key) { return (await resolve()).stat(key) },
-        async list(query) { return (await resolve()).list(query) },
-        async remove(key) { return (await resolve()).remove(key) },
-        async resolveUrl(key) { return (await resolve()).resolveUrl(key) },
-    }
-}
-
-export interface RefreshingActiveBlobRootResolver extends ActiveBlobRootResolver {
-    refresh(): Promise<unknown>
-}
-
-export function createGatedResolvingBlobStore(
-    factory: RootedBlobStoreFactory,
-    resolver: RefreshingActiveBlobRootResolver,
-    gate: StorageMutationGate,
-): BlobStore {
-    const resolve = async () => factory.open(await resolver.getActiveRoot())
-    const resolveAfterRefresh = async () => {
-        await resolver.refresh()
-        return resolve()
-    }
+export function createGatedBlobStore(store: BlobStore, gate: StorageMutationGate): BlobStore {
     return {
         async put(key, data, metadata) {
             const ownedData = data.slice()
             const ownedMetadata = { ...metadata }
-            return gate.runWrite(async () => (await resolveAfterRefresh()).put(key, ownedData, ownedMetadata))
+            return gate.runWrite(() => store.put(key, ownedData, ownedMetadata))
         },
-        async read(key, range) { return (await resolve()).read(key, range) },
-        async stat(key) { return (await resolve()).stat(key) },
-        async list(query) { return (await resolve()).list(query) },
-        async remove(key) {
-            return gate.runWrite(async () => (await resolveAfterRefresh()).remove(key))
-        },
-        async resolveUrl(key) { return (await resolve()).resolveUrl(key) },
-    }
-}
-
-export function createRootPinnedGatedBlobStore(
-    pinned: BlobStore,
-    gatedWrites: Pick<BlobStore, 'put' | 'remove'>,
-): BlobStore {
-    return {
-        put: (key, data, metadata) => gatedWrites.put(key, data, metadata),
-        read: (key, range) => pinned.read(key, range),
-        stat: (key) => pinned.stat(key),
-        list: (query) => pinned.list(query),
-        remove: (key) => gatedWrites.remove(key),
-        resolveUrl: (key) => pinned.resolveUrl(key),
+        read: (key, range) => store.read(key, range),
+        stat: (key) => store.stat(key),
+        list: (query) => store.list(query),
+        remove: (key) => gate.runWrite(() => store.remove(key)),
+        resolveUrl: (key) => store.resolveUrl(key),
     }
 }
 
@@ -276,22 +204,21 @@ export function createTauriBlobBackend(dependencies?: TauriBlobBackendDependenci
 }
 
 const browserLocalStorage = localforage.createInstance({ name: 'risuai' }) as unknown as KeyValueStorage
-const legacyRootResolver: ActiveBlobRootResolver = { async getActiveRoot() { return { kind: 'legacy' } } }
-let productionFactory: Promise<RootedBlobStoreFactory> | undefined
+let productionStore: Promise<BlobStore> | undefined
 let productionBackend: Promise<BlobKeyValueBackend> | undefined
 let storageProvider: () => Promise<KeyValueStorage | null> = async () => browserLocalStorage
 
 export function configureBlobStoreStorageProvider(provider: () => Promise<KeyValueStorage | null>): void {
     storageProvider = provider
-    productionFactory = undefined
+    productionStore = undefined
     productionBackend = undefined
 }
 
-export function createStorageRootedBlobStoreFactory(
+export function createStorageBlobStore(
     selected: { storage: KeyValueStorage; isAccount: boolean },
-): RootedBlobStoreFactory {
+): BlobStore {
     if (selected.isAccount) throw new TypeError('AccountStorage cannot be used as a BlobStore backend')
-    return createKeyValueRootedBlobStoreFactory(createStorageBlobKeyValueBackend(selected.storage))
+    return createBackedBlobStore(createStorageBlobKeyValueBackend(selected.storage))
 }
 
 export async function createBrowserBlobBackend(
@@ -321,51 +248,34 @@ export function getPlatformBlobKeyValueBackend(): Promise<BlobKeyValueBackend> {
     return productionBackend ??= createProductionBackend()
 }
 
-async function createProductionFactory(): Promise<RootedBlobStoreFactory> {
-    return createKeyValueRootedBlobStoreFactory(await getPlatformBlobKeyValueBackend())
+async function createProductionStore(): Promise<BlobStore> {
+    return createBackedBlobStore(await getPlatformBlobKeyValueBackend())
 }
 
-const deferredFactory: RootedBlobStoreFactory = {
-    open(root) {
-        const openStore = async () => (await (productionFactory ??= createProductionFactory())).open(root)
-        return {
-            async put(key, data, metadata) { return (await openStore()).put(key, data, metadata) },
-            async read(key, range) { return (await openStore()).read(key, range) },
-            async stat(key) { return (await openStore()).stat(key) },
-            async list(query) { return (await openStore()).list(query) },
-            async remove(key) { return (await openStore()).remove(key) },
-            async resolveUrl(key) { return (await openStore()).resolveUrl(key) },
-        }
-    },
+/** Defers backend selection so callers can hold a store before storage is initialized. */
+const deferredStore: BlobStore = {
+    async put(key, data, metadata) { return (await openProductionStore()).put(key, data, metadata) },
+    async read(key, range) { return (await openProductionStore()).read(key, range) },
+    async stat(key) { return (await openProductionStore()).stat(key) },
+    async list(query) { return (await openProductionStore()).list(query) },
+    async remove(key) { return (await openProductionStore()).remove(key) },
+    async resolveUrl(key) { return (await openProductionStore()).resolveUrl(key) },
 }
 
-let activeResolver: ActiveBlobRootResolver = legacyRootResolver
+function openProductionStore(): Promise<BlobStore> {
+    return productionStore ??= createProductionStore()
+}
+
 let gatedProductionStore: BlobStore | null = null
 
-export function setActiveBlobRootResolver(resolver: ActiveBlobRootResolver): void {
-    activeResolver = resolver
-}
-
-export function configureActiveBlobStore(
-    resolver: RefreshingActiveBlobRootResolver,
-    gate: StorageMutationGate,
-): void {
-    activeResolver = resolver
-    gatedProductionStore = createGatedResolvingBlobStore(deferredFactory, resolver, gate)
-}
-
-export function getRootedBlobStoreFactory(): RootedBlobStoreFactory {
-    return deferredFactory
+export function configureActiveBlobStore(gate: StorageMutationGate): void {
+    gatedProductionStore = createGatedBlobStore(deferredStore, gate)
 }
 
 export function getBlobStore(): BlobStore {
-    return gatedProductionStore
-        ?? createResolvingBlobStore(deferredFactory, { getActiveRoot: () => activeResolver.getActiveRoot() })
+    return gatedProductionStore ?? deferredStore
 }
 
 export async function resolveBlobStore(): Promise<BlobStore> {
-    const pinned = deferredFactory.open(await activeResolver.getActiveRoot())
-    return gatedProductionStore
-        ? createRootPinnedGatedBlobStore(pinned, gatedProductionStore)
-        : pinned
+    return getBlobStore()
 }

@@ -28,8 +28,6 @@ export interface SaveCoordinatorDependencies {
     captureCharacter(id: string): CompleteCharacter | null
     /** Installs the working copy synchronously and must not throw. */
     replaceDatabase(database: Database): void
-    runExclusiveMigration?<T>(operation: () => Promise<T>): Promise<T>
-    invalidateNavigation?(): void
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
     onLocalRevision?(revision: DataRevision): void
@@ -107,7 +105,6 @@ export class SaveCoordinator {
     private operationTail: Promise<void> = Promise.resolve()
     private flushPromise: Promise<void> | null = null
     private additionPromise: Promise<void> | null = null
-    private migrationPromise: Promise<void> | null = null
     private lastReportedFlushPromise: Promise<void> | null = null
     private pendingPublication: PinnedPublication | null = null
     private pendingPublicationRevision: DataRevision | null = null
@@ -209,59 +206,6 @@ export class SaveCoordinator {
                 reason,
             ),
         )
-    }
-
-    runMigration<T>(reason: string, operation: () => Promise<T>): Promise<T> {
-        this.assertInitialized()
-        const runExclusiveMigration = this.dependencies.runExclusiveMigration
-        if (!runExclusiveMigration) {
-            return Promise.reject(new Error('Persistent migration runner is not configured'))
-        }
-        this.cancelDebounce()
-        const promise = this.enqueue(async () => {
-            await this.flushIterations(reason, true)
-            return runExclusiveMigration(operation)
-        })
-        const notificationPromise = promise.then(() => undefined)
-        this.migrationPromise = notificationPromise
-        this.reportActivePromise()
-        void notificationPromise.then(
-            () => {
-                if (this.migrationPromise === notificationPromise) {
-                    this.migrationPromise = null
-                    this.reportActivePromise()
-                }
-            },
-            () => {
-                if (this.migrationPromise === notificationPromise) {
-                    this.migrationPromise = null
-                    this.reportActivePromise()
-                }
-            },
-        )
-        return promise
-    }
-
-    /** Called inside runMigration after persistent activation and payload-root installation. */
-    async adoptActivatedDatabase(database: Database, revision: DataRevision): Promise<void> {
-        this.assertInitialized()
-        this.dependencies.invalidateNavigation?.()
-        this.cancelDebounce()
-        const activated = canonicalClone(database)
-        const captured = this.captureDatabase(activated)
-        const stalePublication = this.pendingPublication
-        this.pendingPublication = null
-        this.pendingPublicationRevision = null
-        this.pendingCharacterAddition = null
-        this.reservedCharacterAddition = null
-        this.currentRevision = revision
-        this.rootBaseline = captured.rootCanonical
-        this.setCharacterBaseline(captured)
-        this.dirtyGeneration = 0
-        this.pendingByteCount = 0
-        this.dependencies.replaceDatabase(activated)
-        this.dependencies.onLocalRevision?.(revision)
-        if (stalePublication) await this.disposePublication(stalePublication)
     }
 
     publishCurrentOfficialRevision(): Promise<void> {
@@ -524,7 +468,7 @@ export class SaveCoordinator {
     }
 
     private reportActivePromise(): void {
-        const active = this.additionPromise ?? this.migrationPromise ?? this.flushPromise
+        const active = this.additionPromise ?? this.flushPromise
         if (active === this.lastReportedFlushPromise) return
         this.lastReportedFlushPromise = active
         this.dependencies.onFlushPromise?.(active)
