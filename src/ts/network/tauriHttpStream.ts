@@ -18,6 +18,7 @@ function createRequestLifecycle(options: TauriHttpStreamOptions) {
     let timer: ReturnType<typeof setTimeout> | undefined
     let signalCleaned = false
     let finished = false
+    let releaseBody: (() => void) | undefined
 
     const cleanupSignal = () => {
         if (signalCleaned) return
@@ -29,6 +30,7 @@ function createRequestLifecycle(options: TauriHttpStreamOptions) {
         if (finished) return
         finished = true
         cleanupSignal()
+        releaseBody?.()
         options.onFinish?.()
     }
     const abortFromCaller = () => {
@@ -49,7 +51,15 @@ function createRequestLifecycle(options: TauriHttpStreamOptions) {
         }, options.requestTimeoutMs)
     }
 
-    return { signal: controller.signal, finish }
+    return {
+        signal: controller.signal,
+        finish,
+        /** Lets an aborted or timed out request release the native response body. */
+        onRelease(release: () => void) {
+            if (finished) release()
+            else releaseBody = release
+        },
+    }
 }
 
 export async function fetchTauriHttpStream(options: TauriHttpStreamOptions): Promise<Response> {
@@ -76,6 +86,7 @@ export async function fetchTauriHttpStream(options: TauriHttpStreamOptions): Pro
     }
 
     const reader = response.body.getReader()
+    lifecycle.onRelease(() => void reader.cancel().catch(() => undefined))
     const body = new ReadableStream<Uint8Array>({
         async pull(controller) {
             try {

@@ -243,6 +243,31 @@ describe('fetchTauriHttpStream', () => {
         expect(caller.remove).toHaveBeenCalledWith('abort', expect.any(Function))
     })
 
+    test('releases the native body when the caller aborts an unread response', async () => {
+        const caller = trackedSignal()
+        const cancel = vi.fn(async () => undefined)
+        pluginFetch.mockImplementation(async () => pluginResponse(new ReadableStream<Uint8Array>({
+            pull(controller) {
+                controller.enqueue(new Uint8Array([1]))
+            },
+            cancel,
+        }, { highWaterMark: 0 })))
+        const onFinish = vi.fn()
+
+        await fetchTauriHttpStream({
+            url: 'https://example.test/discarded',
+            method: 'GET',
+            headers: {},
+            signal: caller.controller.signal,
+            onFinish,
+        })
+        caller.controller.abort()
+        await Promise.resolve()
+
+        expect(cancel).toHaveBeenCalledOnce()
+        expect(onFinish).toHaveBeenCalledOnce()
+    })
+
     test('forwards downstream cancellation and finalizes once', async () => {
         vi.useFakeTimers()
         const caller = trackedSignal()
