@@ -899,9 +899,13 @@ function formDataToString(formData: FormData): string {
 /**
  * A writer class for Tauri environment.
  */
+const TAURI_WRITER_FLUSH_BYTES = 4 * 1024 * 1024
+
 export class TauriWriter {
     path: string
     firstWrite: boolean = true
+    private pending: Uint8Array[] = []
+    private pendingBytes = 0
 
     /**
      * Creates an instance of TauriWriter.
@@ -913,22 +917,34 @@ export class TauriWriter {
     }
 
     /**
-     * Writes data to the file.
-     * 
-     * @param {Uint8Array} data - The data to write.
+     * Buffers data and appends it in large blocks, because every append reopens the destination
+     * and an Android content URI makes that round trip expensive.
      */
     async write(data: Uint8Array) {
-        await writeFile(this.path, data, {
-            append: !this.firstWrite
-        })
-        this.firstWrite = false
+        this.pending.push(data.slice())
+        this.pendingBytes += data.byteLength
+        if (this.pendingBytes >= TAURI_WRITER_FLUSH_BYTES) await this.flush()
     }
 
     /**
-     * Closes the writer. (No operation for TauriWriter)
+     * Flushes any buffered data.
      */
     async close() {
-        // do nothing
+        await this.flush()
+    }
+
+    private async flush() {
+        if (this.pending.length === 0) return
+        const block = new Uint8Array(this.pendingBytes)
+        let offset = 0
+        for (const chunk of this.pending) {
+            block.set(chunk, offset)
+            offset += chunk.byteLength
+        }
+        this.pending = []
+        this.pendingBytes = 0
+        await writeFile(this.path, block, { append: !this.firstWrite })
+        this.firstWrite = false
     }
 }
 
@@ -946,9 +962,11 @@ export class LocalWriter {
      * @param {string[]} [ext=['bin']] - The file extensions.
      * @returns {Promise<boolean>} - A promise that resolves to a boolean indicating success.
      */
-    async init(name = 'Binary', ext = ['bin']): Promise<boolean> {
+    async init(name = 'Binary', ext = ['bin'], defaultName?: string): Promise<boolean> {
         if (isTauri) {
+            // Android never appends the filter extension, so the suggested name has to carry it.
             const filePath = await save({
+                defaultPath: defaultName ?? `${name}.${ext[0] ?? 'bin'}`,
                 filters: [{
                     name: name,
                     extensions: ext
@@ -960,7 +978,7 @@ export class LocalWriter {
             this.writer = new TauriWriter(filePath)
             return true
         }
-        const writableStream = streamSaver.createWriteStream(name + '.' + ext[0])
+        const writableStream = streamSaver.createWriteStream(defaultName ?? `${name}.${ext[0]}`)
         this.writer = writableStream.getWriter()
         return true
     }
@@ -973,12 +991,13 @@ export class LocalWriter {
      */
     async writeBackup(name: string, data: Uint8Array): Promise<void> {
         const encodedName = new TextEncoder().encode(getBasename(name))
-        const nameLength = new Uint32Array([encodedName.byteLength])
-        await this.writer.write(new Uint8Array(nameLength.buffer))
-        await this.writer.write(encodedName)
-        const dataLength = new Uint32Array([data.byteLength])
-        await this.writer.write(new Uint8Array(dataLength.buffer))
-        await this.writer.write(data)
+        const record = new Uint8Array(8 + encodedName.byteLength + data.byteLength)
+        const header = new DataView(record.buffer)
+        header.setUint32(0, encodedName.byteLength, true)
+        record.set(encodedName, 4)
+        header.setUint32(4 + encodedName.byteLength, data.byteLength, true)
+        record.set(data, 8 + encodedName.byteLength)
+        await this.writer.write(record)
     }
 
     /**

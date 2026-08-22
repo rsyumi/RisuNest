@@ -303,7 +303,7 @@ export const languageSettingsItems: SettingItem[] = [
         options: {
             onClick: async () => {
                 try {
-                    const files = await selectFileByDom(['.json']);
+                    const files = await selectFileByDom(['json']);
                     if (!files || files.length === 0) return;
                     if (!files[0].name.endsWith('.json')) {
                         alertError('Invalid file type. Please select a .json file.');

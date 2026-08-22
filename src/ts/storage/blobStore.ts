@@ -118,7 +118,7 @@ export function createKeyValueBlobStore(
 
     return {
         async put(key, data, input) {
-                const ext = normalizeBlobExtension(input.ext)
+            const ext = normalizeBlobExtension(input.ext)
             const metadata = {
                 ...input,
                 key,
@@ -131,14 +131,15 @@ export function createKeyValueBlobStore(
             return metadata
         },
         async read(key, range) {
-                if (range) validateBlobReadRange(range)
-            const metadata = await stat(key)
+            if (range) validateBlobReadRange(range)
+            // Reading the payload is itself the liveness check, so no separate probe is needed.
+            const metadata = parseMetadata(await backend.read(keys.metadata(key)))
             if (!metadata) return null
             const payloadKey = keys.payload(key)
             if (range && backend.readRange) return backend.readRange(payloadKey, range)
             const data = await backend.read(payloadKey)
             if (!data) {
-                if (metadata.size === 0) return new Uint8Array()
+                if (metadata.size === 0 && await payloadExists(payloadKey)) return new Uint8Array()
                 return null
             }
             if (!range) return data
@@ -146,7 +147,7 @@ export function createKeyValueBlobStore(
         },
         stat,
         async list(query) {
-                const allKeys = await backend.keys()
+            const allKeys = await backend.keys()
             const keySet = new Set(allKeys)
             const results: BlobMetadata[] = []
             for (const metadataKey of allKeys.filter((key) => key.startsWith(keys.metadataPrefix))) {

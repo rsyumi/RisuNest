@@ -565,7 +565,7 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(2)
     })
 
-    it('does not retry an addition revision conflict and accepts no second pending addition', async () => {
+    it('does not retry an addition revision conflict and keeps its unfinished work', async () => {
         const { database, added } = makeAdditionDatabase()
         const gate = deferred<{ revision: number }>()
         const conflict = new RevisionConflictError(1, 2)
@@ -585,17 +585,62 @@ describe('SaveCoordinator', () => {
         }, 'new-character')
         await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
 
+        gate.reject(conflict)
+        await expect(first).rejects.toBe(conflict)
+
         expect(() => coordinator.commitCharacterAddition({
             characterId: 'char-other',
             estimatedBytes: 1,
             install: () => undefined,
         }, 'other-character')).toThrow('already pending')
-        gate.reject(conflict)
-        await expect(first).rejects.toBe(conflict)
-
         expect(commit).toHaveBeenCalledOnce()
         expect(coordinator.revision).toBe(1)
         expect(coordinator.pendingBytes).toBe(9)
+    })
+
+    it('defers a second import that starts while the first is still committing', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const other = structuredClone(added)
+        other.chaId = 'char-other'
+        other.name = 'Other'
+        const gate = deferred<{ revision: number }>()
+        let commits = 0
+        const commit = vi.fn(async () => {
+            commits += 1
+            return commits === 1 ? gate.promise : { revision: 3 }
+        })
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(1)
+        const first = coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 9,
+            install: () => database.characters.push(added),
+        }, 'new-character')
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+
+        let installedSecond = false
+        const second = coordinator.commitCharacterAddition({
+            characterId: other.chaId,
+            estimatedBytes: 1,
+            install: () => {
+                installedSecond = true
+                database.characters.push(other)
+            },
+        }, 'other-character')
+        expect(installedSecond).toBe(false)
+
+        gate.resolve({ revision: 2 })
+        await first
+        await second
+
+        expect(installedSecond).toBe(true)
+        expect(database.characters.map((item) => item.chaId)).toContain('char-other')
     })
 
     it('runs an earlier replacement before installing an addition', async () => {

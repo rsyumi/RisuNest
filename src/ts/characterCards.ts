@@ -1236,7 +1236,7 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
                 'charxJpeg': ['CharX Embeded Jpeg', 'jpeg']
             }
             const ext = nameExt[type]
-            await (localWriter as LocalWriter).init(ext[0], [ext[1]])
+            await (localWriter as LocalWriter).init(ext[0], [ext[1]], `${char.name || 'character'}.${ext[1]}`)
         }
         const writer = (type === 'charx' || type === 'charxJpeg') ? (new CharXWriter(localWriter)) : type === 'json' ? (new BlankWriter()) : (new PngChunk.streamWriter(img, localWriter))
         await writer.init()

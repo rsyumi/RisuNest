@@ -70,15 +70,20 @@ export function decodeBackupInlayEntry(name: string, entry: Uint8Array): BackupI
     if (!INLAY_ENTRY_NAME.test(name) || entry.byteLength < 4) return null
     const headerLength = new DataView(entry.buffer, entry.byteOffset, entry.byteLength).getUint32(0, true)
     if (headerLength === 0 || 4 + headerLength > entry.byteLength) return null
-    let header: Partial<InlayBlobMetadata>
+    let header: unknown
     try {
         header = JSON.parse(new TextDecoder().decode(entry.subarray(4, 4 + headerLength)))
     } catch {
         return null
     }
-    const { key, size: _size, ...metadata } = header
+    if (!header || typeof header !== 'object' || Array.isArray(header)) return null
+    const { key, size: _size, ...metadata } = header as Partial<InlayBlobMetadata>
     if (typeof key !== 'string' || key === '' || isLegacyBackupAssetKey(key)) return null
     if (metadata.kind !== 'inlay' || !INLAY_TYPES.has(metadata.inlayType as string)) return null
+    if (typeof metadata.mime !== 'string' || typeof metadata.name !== 'string'
+        || typeof metadata.ext !== 'string') {
+        return null
+    }
     return {
         key,
         metadata: metadata as BlobWriteMetadata,

@@ -98,6 +98,13 @@ describe('backup inlay entries', () => {
             name,
             encodeBackupInlayEntry({ ...metadata, key: 'assets/shadow.png' }, new Uint8Array([1])),
         )).toBeNull()
+        for (const header of ['null', '[]', '"text"', '{"key":"a","kind":"inlay","inlayType":"image"}']) {
+            const payload = new TextEncoder().encode(header)
+            const forged = new Uint8Array(4 + payload.byteLength)
+            new DataView(forged.buffer).setUint32(0, payload.byteLength, true)
+            forged.set(payload, 4)
+            expect(decodeBackupInlayEntry(name, forged)).toBeNull()
+        }
     })
 })
 

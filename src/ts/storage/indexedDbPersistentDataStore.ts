@@ -59,6 +59,10 @@ function reportGenerationCleanupError(generation: string, error: unknown): void 
     console.error(`Persistent data cleanup failed for generation ${generation}`, error)
 }
 
+function reportBlockedUpgrade(): void {
+    console.warn('Persistent data upgrade is waiting for another open document to close')
+}
+
 function requestResult<T>(request: IDBRequest<T>): Promise<T> {
     return new Promise((resolve, reject) => {
         request.onsuccess = () => resolve(request.result)
@@ -123,12 +127,15 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         private readonly keyRangeFactory: typeof IDBKeyRange = globalThis.IDBKeyRange,
         private readonly onCleanupError: PersistentGenerationCleanupErrorHandler =
             reportGenerationCleanupError,
+        private readonly onBlockedUpgrade: () => void = reportBlockedUpgrade,
     ) {}
 
     async open(): Promise<void> {
         if (this.database) return
 
         const request = this.indexedDbFactory.open(this.databaseName, DATABASE_VERSION)
+        // Another document holding the previous version would otherwise stall boot forever.
+        request.onblocked = () => this.onBlockedUpgrade()
         request.onupgradeneeded = () => {
             const database = request.result
             for (const storeName of STORE_NAMES) {
@@ -181,6 +188,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             )
         }
         this.database = await requestResult(request)
+        this.database.onversionchange = () => {
+            this.database?.close()
+            this.database = undefined
+        }
 
         const transaction = this.database.transaction(['meta', 'root'], 'readwrite')
         const meta = transaction.objectStore('meta')

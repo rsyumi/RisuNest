@@ -222,6 +222,13 @@ export class SaveCoordinator {
         if (!request.characterId) {
             throw new Error('Character addition requires a nonempty character ID')
         }
+        const inFlight = this.additionPromise
+        if (inFlight) {
+            // Two imports can overlap, so the later one waits instead of failing.
+            return inFlight
+                .catch(() => undefined)
+                .then(() => this.commitCharacterAddition(request, reason))
+        }
         if (this.pendingCharacterAddition || this.reservedCharacterAddition) {
             throw new Error('A character addition is already pending')
         }

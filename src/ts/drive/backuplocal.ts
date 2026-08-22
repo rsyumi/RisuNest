@@ -44,7 +44,7 @@ export async function SaveLocalBackup(){
     }
 
     const writer = new LocalWriter()
-    const r = await writer.init()
+    const r = await writer.init('RisuAI Backup', ['bin'], 'risu-backup.bin')
     if(!r){
         alertError('Failed')
         return
@@ -219,7 +219,7 @@ export async function SavePartialLocalBackup(){
     }
 
     const writer = new LocalWriter()
-    const r = await writer.init()
+    const r = await writer.init('RisuAI Backup', ['bin'], 'risu-partial-backup.bin')
     if(!r){
         alertError('Failed')
         return
@@ -428,7 +428,11 @@ export function LoadLocalBackup(){
                     else {
                         const inlayEntry = decodeBackupInlayEntry(name, data)
                         if (inlayEntry) {
-                            await blobStore.put(inlayEntry.key, inlayEntry.data, inlayEntry.metadata)
+                            try {
+                                await blobStore.put(inlayEntry.key, inlayEntry.data, inlayEntry.metadata)
+                            } catch (e) {
+                                console.error(`Failed to restore inlay ${inlayEntry.key}:`, e)
+                            }
                             offset += 4 + nameLength + 4 + dataLength;
                             await sleep(10);
                             continue;
