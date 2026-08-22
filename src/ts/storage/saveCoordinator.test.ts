@@ -111,6 +111,92 @@ describe('SaveCoordinator', () => {
         expect(exclusive).toHaveBeenCalledTimes(1)
     })
 
+    it('reports standalone dirty migration work until exclusive completion', async () => {
+        const database = makeDatabase()
+        const committed = deferred<{ revision: number }>()
+        const exclusive = deferred<void>()
+        const reported: Array<Promise<void> | null> = []
+        const result = { exact: true }
+        const store = makeStore(vi.fn(() => committed.promise))
+        const exclusiveRun = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            runExclusiveMigration: async (operation) => {
+                exclusiveRun()
+                await exclusive.promise
+                return operation()
+            },
+            onFlushPromise: (promise) => reported.push(promise),
+        })
+        coordinator.initialize(1)
+        database.username = 'Dirty'
+        coordinator.markPersistentDataDirty(1)
+
+        const migration = coordinator.runMigration('migration', async () => result)
+
+        expect(reported).toHaveLength(1)
+        expect(reported[0]).not.toBeNull()
+        await vi.waitFor(() => expect(store.commit).toHaveBeenCalledOnce())
+        committed.resolve({ revision: 2 })
+        await vi.waitFor(() => expect(exclusiveRun).toHaveBeenCalledOnce())
+        expect(reported).not.toContain(null)
+        exclusive.resolve()
+
+        await expect(migration).resolves.toBe(result)
+        await Promise.resolve()
+        expect(reported.at(-1)).toBeNull()
+        expect(reported.slice(0, -1)).not.toContain(null)
+    })
+
+    it('keeps migration notification active behind older work and recovers after exact failure', async () => {
+        const database = makeDatabase()
+        const olderCommit = deferred<{ revision: number }>()
+        const firstMigration = deferred<void>()
+        const failure = new Error('migration failed')
+        const recoveryResult = { recovered: true }
+        const reported: Array<Promise<void> | null> = []
+        const exclusive = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(vi.fn(() => olderCommit.promise)),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            runExclusiveMigration: async (operation) => {
+                exclusive()
+                return operation()
+            },
+            onFlushPromise: (promise) => reported.push(promise),
+        })
+        coordinator.initialize(1)
+        database.username = 'Older dirty work'
+        coordinator.markPersistentDataDirty(1)
+        const olderFlush = coordinator.flushPendingData('older')
+
+        const failing = coordinator.runMigration('failing', async () => {
+            await firstMigration.promise
+            throw failure
+        })
+        const recovery = coordinator.runMigration('recovery', async () => recoveryResult)
+
+        expect(reported[0]).toBe(olderFlush)
+        expect(reported).not.toContain(null)
+        olderCommit.resolve({ revision: 2 })
+        await olderFlush
+        await vi.waitFor(() => expect(exclusive).toHaveBeenCalledTimes(1))
+        expect(reported).not.toContain(null)
+        firstMigration.resolve()
+
+        await expect(failing).rejects.toBe(failure)
+        await expect(recovery).resolves.toBe(recoveryResult)
+        await Promise.resolve()
+        expect(exclusive).toHaveBeenCalledTimes(2)
+        expect(reported.at(-1)).toBeNull()
+        expect(reported.slice(0, -1)).not.toContain(null)
+    })
+
     it('orders two migrations and continues after an exact migration failure', async () => {
         const database = makeDatabase()
         const first = deferred<void>()

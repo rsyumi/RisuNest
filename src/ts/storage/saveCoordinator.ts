@@ -106,6 +106,7 @@ export class SaveCoordinator {
     private operationTail: Promise<void> = Promise.resolve()
     private flushPromise: Promise<void> | null = null
     private additionPromise: Promise<void> | null = null
+    private migrationPromise: Promise<void> | null = null
     private lastReportedFlushPromise: Promise<void> | null = null
     private pendingPublication: PinnedPublication | null = null
     private pendingPublicationRevision: DataRevision | null = null
@@ -215,10 +216,28 @@ export class SaveCoordinator {
             return Promise.reject(new Error('Persistent migration runner is not configured'))
         }
         this.cancelDebounce()
-        return this.enqueue(async () => {
+        const promise = this.enqueue(async () => {
             await this.flushIterations(reason, true)
             return runExclusiveMigration(operation)
         })
+        const notificationPromise = promise.then(() => undefined)
+        this.migrationPromise = notificationPromise
+        this.reportActivePromise()
+        void notificationPromise.then(
+            () => {
+                if (this.migrationPromise === notificationPromise) {
+                    this.migrationPromise = null
+                    this.reportActivePromise()
+                }
+            },
+            () => {
+                if (this.migrationPromise === notificationPromise) {
+                    this.migrationPromise = null
+                    this.reportActivePromise()
+                }
+            },
+        )
+        return promise
     }
 
     /** Called inside runMigration after persistent activation and payload-root installation. */
@@ -475,7 +494,7 @@ export class SaveCoordinator {
     }
 
     private reportActivePromise(): void {
-        const active = this.additionPromise ?? this.flushPromise
+        const active = this.additionPromise ?? this.migrationPromise ?? this.flushPromise
         if (active === this.lastReportedFlushPromise) return
         this.lastReportedFlushPromise = active
         this.dependencies.onFlushPromise?.(active)
