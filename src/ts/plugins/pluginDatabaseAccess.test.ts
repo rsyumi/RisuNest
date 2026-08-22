@@ -6,7 +6,15 @@ import type {
     ConversationWindow,
     PersistentDataStore,
 } from '../storage/persistentDataStore'
-import { createPluginDatabaseAccess } from './pluginDatabaseAccess'
+import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
+import {
+    createPluginDatabaseAccess,
+    createProductionPluginDatabaseAccess,
+} from './pluginDatabaseAccess'
+
+vi.mock('../storage/persistentDataStoreFactory', () => ({
+    getPersistentDataStore: vi.fn(),
+}))
 
 const characterPage: CharacterPage = {
     revision: 4,
@@ -85,6 +93,32 @@ function createHarness() {
 }
 
 describe('plugin database access', () => {
+    it('composes scalable API v3 queries with the shared production store', async () => {
+        const harness = createHarness()
+        vi.mocked(getPersistentDataStore).mockReturnValue(harness.store)
+        Object.defineProperty(harness.compatibilityDatabase, 'characters', {
+            get() {
+                throw new Error('scalable query touched DBState.db.characters')
+            },
+        })
+        const access = createProductionPluginDatabaseAccess({
+            flushPendingData: harness.flushPendingData,
+            getCompatibilityDatabase: () => harness.compatibilityDatabase,
+            snapshot: <T>(value: T) => harness.snapshot(value) as T,
+        })
+
+        await expect(access.queryCharacters({ limit: 500 })).resolves.toEqual(characterPage)
+
+        expect(harness.store.queryCharacters).toHaveBeenCalledWith({
+            search: undefined,
+            order: 'configured',
+            trash: false,
+            limit: 100,
+            cursor: undefined,
+        })
+        expect(harness.snapshot).not.toHaveBeenCalled()
+    })
+
     it('runs scalable queries without touching the compatibility character array', async () => {
         const harness = createHarness()
         Object.defineProperty(harness.compatibilityDatabase, 'characters', {

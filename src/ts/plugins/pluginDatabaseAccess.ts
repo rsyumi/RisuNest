@@ -1,4 +1,5 @@
 import type { Database } from '../storage/database.svelte'
+import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import type {
     CharacterPage,
     ConversationPage,
@@ -187,4 +188,13 @@ export function createPluginDatabaseAccess(
             return result
         },
     }
+}
+
+export function createProductionPluginDatabaseAccess(
+    dependencies: Omit<PluginDatabaseAccessDependencies, 'store'>,
+): PluginDatabaseAccess {
+    return createPluginDatabaseAccess({
+        ...dependencies,
+        store: getPersistentDataStore(),
+    })
 }

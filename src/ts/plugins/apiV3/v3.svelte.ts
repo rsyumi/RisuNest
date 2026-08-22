@@ -34,10 +34,9 @@ import {
     type AfterTTSResult,
     type TTSHookFn,
 } from "src/ts/process/ttsHooks";
-import { createPersistentDataStore } from "src/ts/storage/persistentDataStoreFactory";
 import { flushPendingData } from "src/ts/storage/persistentDataRuntime.svelte";
 import {
-    createPluginDatabaseAccess,
+    createProductionPluginDatabaseAccess,
     type PluginDatabaseAccess,
     type PluginCharacterQuery,
     type PluginConversationMessageQuery,
@@ -68,8 +67,7 @@ const documentEventListeners: Array<{type: string, listener: EventListenerOrEven
 let pluginDatabaseAccess: PluginDatabaseAccess | undefined
 
 function getPluginDatabaseAccess(): PluginDatabaseAccess {
-    return (pluginDatabaseAccess ??= createPluginDatabaseAccess({
-        store: createPersistentDataStore(),
+    return (pluginDatabaseAccess ??= createProductionPluginDatabaseAccess({
         flushPendingData,
         getCompatibilityDatabase: () => DBState.db,
         snapshot: <T>(value: T) => $state.snapshot(value) as T,
