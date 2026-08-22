@@ -46,7 +46,7 @@ import {
     replaceCharacterResources,
     replaceDatabaseRootResources,
 } from "./process/coldstorageData";
-import { isTauri, isNodeServer } from "./platform";
+import { isTauri, isTauriMobile, isNodeServer } from "./platform";
 import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
@@ -104,7 +104,20 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
         a.remove()
     }
 
-    if (isTauri) {
+    if (isTauriMobile) {
+        // Android resolves the download directory to app private storage the user cannot browse,
+        // so exports go through the system picker instead.
+        const extension = name.includes('.') ? name.split('.').pop()! : 'bin'
+        const target = await save({
+            defaultPath: name,
+            filters: [{ name: extension.toUpperCase(), extensions: [extension] }],
+        })
+        if (!target) {
+            return
+        }
+        await writeFile(target, data)
+    }
+    else if (isTauri) {
         await writeFile(name, data, { baseDir: BaseDirectory.Download })
     }
     else {

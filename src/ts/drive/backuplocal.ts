@@ -10,7 +10,7 @@ import {
     selectLegacyBackupAssetKeys,
     writeBackupAsset,
 } from "./backupAssets";
-import { isTauri } from "src/ts/platform"
+import { isTauri, isTauriDesktop } from "src/ts/platform"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase } from "../storage/database.svelte";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -488,7 +488,8 @@ export function LoadLocalBackup(){
                         type: "wait",
                         msg: "Success, Refreshing your app."
                     });
-                    if (isTauri) {
+                    // Android has no process relauncher, so the WebView reloads instead.
+                    if (isTauriDesktop) {
                         await relaunch();
                     } else {
                         location.search = '';
