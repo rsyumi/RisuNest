@@ -194,6 +194,23 @@ describe('ActiveWorkingSet', () => {
         expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
+    it('does not publish navigation invalidated by activated database adoption', async () => {
+        const detail = deferred<{ revision: number; value: Omit<character, 'chats'> } | null>()
+        const lease = makeLease({
+            characterId: 'char-a',
+            readCharacter: vi.fn(() => detail.promise),
+        })
+        const harness = makeHarness(lease)
+
+        const activation = harness.workingSet.activateCharacter('char-a')
+        await vi.waitFor(() => expect(harness.store.readCharacter).toHaveBeenCalledOnce())
+        harness.workingSet.invalidateNavigation()
+        detail.resolve({ revision: 1, value: makeCharacterDetail('char-a') })
+
+        expect(await activation).toBe(false)
+        expect(harness.publishedCharacters).toEqual([])
+    })
+
     it('does not replace from stale character preparation after newer navigation starts', async () => {
         const leaseA = makeLease({ characterId: 'char-a' })
         const leaseB = makeLease({ characterId: 'char-b' })

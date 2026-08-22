@@ -28,6 +28,10 @@ export class ActiveWorkingSet {
 
     constructor(private readonly dependencies: ActiveWorkingSetDependencies) {}
 
+    invalidateNavigation(): void {
+        this.navigationGeneration++
+    }
+
     async initializeActiveWorkingSet(database: Database): Promise<void> {
         await this.dependencies.store.open()
         const root = await this.dependencies.store.readRoot()

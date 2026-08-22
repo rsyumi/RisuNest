@@ -28,6 +28,8 @@ export interface SaveCoordinatorDependencies {
     captureCharacter(id: string): CompleteCharacter | null
     /** Installs the working copy synchronously and must not throw. */
     replaceDatabase(database: Database): void
+    runExclusiveMigration?<T>(operation: () => Promise<T>): Promise<T>
+    invalidateNavigation?(): void
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
     onLocalRevision?(revision: DataRevision): void
@@ -206,6 +208,41 @@ export class SaveCoordinator {
         )
     }
 
+    runMigration<T>(reason: string, operation: () => Promise<T>): Promise<T> {
+        this.assertInitialized()
+        const runExclusiveMigration = this.dependencies.runExclusiveMigration
+        if (!runExclusiveMigration) {
+            return Promise.reject(new Error('Persistent migration runner is not configured'))
+        }
+        this.cancelDebounce()
+        return this.enqueue(async () => {
+            await this.flushIterations(reason, true)
+            return runExclusiveMigration(operation)
+        })
+    }
+
+    /** Called inside runMigration after persistent activation and payload-root installation. */
+    async adoptActivatedDatabase(database: Database, revision: DataRevision): Promise<void> {
+        this.assertInitialized()
+        this.dependencies.invalidateNavigation?.()
+        this.cancelDebounce()
+        const activated = canonicalClone(database)
+        const captured = this.captureDatabase(activated)
+        const stalePublication = this.pendingPublication
+        this.pendingPublication = null
+        this.pendingPublicationRevision = null
+        this.pendingCharacterAddition = null
+        this.reservedCharacterAddition = null
+        this.currentRevision = revision
+        this.rootBaseline = captured.rootCanonical
+        this.characterBaseline = captured.characterCanonical
+        this.dirtyGeneration = 0
+        this.pendingByteCount = 0
+        this.dependencies.replaceDatabase(activated)
+        this.dependencies.onLocalRevision?.(revision)
+        if (stalePublication) await this.disposePublication(stalePublication)
+    }
+
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void> {
         this.assertInitialized()
         if (!request.characterId) {
@@ -245,7 +282,7 @@ export class SaveCoordinator {
         return promise
     }
 
-    private enqueue(operation: () => Promise<void>): Promise<void> {
+    private enqueue<T>(operation: () => Promise<T>): Promise<T> {
         const result = this.operationTail.then(operation, operation)
         this.operationTail = result.then(
             () => undefined,

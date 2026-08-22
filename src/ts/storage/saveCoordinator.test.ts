@@ -50,6 +50,8 @@ class SaveCoordinator extends ProductionSaveCoordinator {
     constructor(dependencies: TestCoordinatorDependencies) {
         super({
             ...dependencies,
+            runExclusiveMigration:
+                dependencies.runExclusiveMigration ?? ((operation) => operation()),
             captureCharacter: dependencies.captureCharacter ?? ((id) => {
                 const selected = dependencies.captureSelectedCharacter()
                 return selected?.chaId === id ? selected : null
@@ -66,6 +68,182 @@ describe('SaveCoordinator', () => {
         added.name = 'Added'
         return { database, added }
     }
+
+    it('flushes ordinary work before entering the exclusive migration runner', async () => {
+        const database = makeDatabase()
+        const committed = deferred<{ revision: number }>()
+        const store = makeStore(vi.fn(() => committed.promise))
+        const order: string[] = []
+        vi.mocked(store.commit).mockImplementation(async (input) => {
+            order.push('commit-start')
+            const result = await committed.promise
+            order.push('commit-end')
+            expect(input.expectedRevision).toBe(1)
+            return result
+        })
+        const exclusive = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            runExclusiveMigration: async (operation) => {
+                exclusive()
+                order.push('exclusive')
+                return operation()
+            },
+        })
+        coordinator.initialize(1)
+        database.username = 'Dirty'
+        coordinator.markPersistentDataDirty(1)
+
+        const result = { exact: true }
+        const migration = coordinator.runMigration('migration', async () => {
+            order.push('operation')
+            return result
+        })
+        await vi.waitFor(() => expect(store.commit).toHaveBeenCalledOnce())
+        expect(exclusive).not.toHaveBeenCalled()
+        committed.resolve({ revision: 2 })
+
+        await expect(migration).resolves.toBe(result)
+        expect(order).toEqual(['commit-start', 'commit-end', 'exclusive', 'operation'])
+        expect(exclusive).toHaveBeenCalledTimes(1)
+    })
+
+    it('orders two migrations and continues after an exact migration failure', async () => {
+        const database = makeDatabase()
+        const first = deferred<void>()
+        const failure = new Error('migration failed')
+        const order: string[] = []
+        const exclusive = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            runExclusiveMigration: async (operation) => {
+                exclusive()
+                return operation()
+            },
+        })
+        coordinator.initialize(1)
+
+        const failing = coordinator.runMigration('first', async () => {
+            order.push('first-start')
+            await first.promise
+            throw failure
+        })
+        const following = coordinator.runMigration('second', async () => {
+            order.push('second')
+            return 'result'
+        })
+        await vi.waitFor(() => expect(order).toEqual(['first-start']))
+        first.resolve()
+
+        await expect(failing).rejects.toBe(failure)
+        await expect(following).resolves.toBe('result')
+        expect(order).toEqual(['first-start', 'second'])
+        expect(exclusive).toHaveBeenCalledTimes(2)
+    })
+
+    it('does not enter migration when pending official publication still fails', async () => {
+        const database = makeDatabase()
+        const failure = new Error('publication failed')
+        const publication = {
+            publish: vi.fn().mockRejectedValue(failure),
+            dispose: vi.fn(async () => undefined),
+        }
+        const exclusive = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(vi.fn(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            }))),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: { pin: vi.fn(async () => publication) },
+            runExclusiveMigration: async (operation) => {
+                exclusive()
+                return operation()
+            },
+        })
+        coordinator.initialize(1)
+        database.username = 'Dirty'
+        coordinator.markPersistentDataDirty(1)
+
+        await expect(coordinator.runMigration('migration', async () => 'unused')).rejects.toBe(
+            failure,
+        )
+
+        expect(exclusive).not.toHaveBeenCalled()
+        expect(publication.publish).toHaveBeenCalledTimes(1)
+    })
+
+    it('adopts an activated database without writing it again and invalidates stale navigation', async () => {
+        let database = makeDatabase()
+        const activated = makeDatabase()
+        activated.username = 'Activated'
+        activated.characters[0].name = 'Activated character'
+        const store = makeStore()
+        const replaceDatabase = vi.fn((replacement: Database) => {
+            database = replacement
+        })
+        const invalidateNavigation = vi.fn()
+        const onLocalRevision = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase,
+            invalidateNavigation,
+            onLocalRevision,
+        })
+        coordinator.initialize(1)
+
+        await coordinator.adoptActivatedDatabase(activated, 8)
+
+        expect(invalidateNavigation).toHaveBeenCalledTimes(1)
+        expect(store.replaceFromDatabase).not.toHaveBeenCalled()
+        expect(replaceDatabase).toHaveBeenCalledTimes(1)
+        expect(database).toEqual(activated)
+        expect(coordinator.revision).toBe(8)
+        expect(coordinator.pendingBytes).toBe(0)
+        expect(onLocalRevision).toHaveBeenCalledWith(8)
+        expect(onLocalRevision).toHaveBeenCalledTimes(1)
+        await coordinator.flushPendingData('clean-after-adoption')
+        expect(store.commit).not.toHaveBeenCalled()
+    })
+
+    it('disposes an obsolete official publication during activated database adoption', async () => {
+        const database = makeDatabase()
+        const failure = new Error('publication failed')
+        const publication = {
+            publish: vi.fn().mockRejectedValue(failure),
+            dispose: vi.fn(async () => undefined),
+        }
+        const store = makeStore(vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        })))
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: (replacement) => Object.assign(database, replacement),
+            officialPublisher: { pin: vi.fn(async () => publication) },
+        })
+        coordinator.initialize(1)
+        database.username = 'Dirty'
+        coordinator.markPersistentDataDirty(1)
+        await expect(coordinator.flushPendingData('publish')).rejects.toBe(failure)
+
+        await coordinator.adoptActivatedDatabase(makeDatabase(), 4)
+
+        expect(publication.dispose).toHaveBeenCalledTimes(1)
+        await coordinator.flushPendingData('clean')
+        expect(publication.publish).toHaveBeenCalledTimes(1)
+        expect(store.commit).toHaveBeenCalledTimes(1)
+    })
 
     it('does not commit when the persistent working copy is clean', async () => {
         const database = makeDatabase()
