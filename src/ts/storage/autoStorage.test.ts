@@ -123,21 +123,18 @@ describe('AutoStorage account mode separation', () => {
         expect(mocks.localBackend.getItem).toHaveBeenNthCalledWith(2, 'assets/synthetic.png')
     })
 
-    it('retains local storage after a successful account publication', async () => {
-        localStorage.setItem('dosync', 'sync')
+    it('keeps a current-session local override across repeated initialization', async () => {
+        localStorage.setItem('accountst', 'able')
         const storage = new AutoStorage()
         await storage.Init()
-
-        await expect(storage.checkAccountSync()).resolves.toBe(true)
-
         expect(storage.isAccount).toBe(true)
-        expect(storage.realStorage).toBe(mocks.localBackend)
+
+        storage.setAccountModeForSession(false)
+        await storage.Init()
+
         expect(localStorage.getItem('accountst')).toBe('able')
-        expect(mocks.accountSetItem).toHaveBeenCalledWith(
-            'database/database.bin',
-            new Uint8Array([7, 8, 9]),
-        )
-        expect(mocks.clearDefaultStore).not.toHaveBeenCalled()
-        expect(mocks.localBackend.removeItem).not.toHaveBeenCalled()
+        expect(storage.isAccount).toBe(false)
+        expect(storage.realStorage).toBe(mocks.localBackend)
     })
+
 })

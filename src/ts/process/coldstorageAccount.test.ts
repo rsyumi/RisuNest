@@ -24,6 +24,36 @@ beforeEach(() => {
 })
 
 describe('official account cold storage transport', () => {
+    it('keeps an account-mode startup cold payload in the local authoritative store', async () => {
+        const files = new Map<string, Uint8Array>()
+        const directory = {
+            getFileHandle: vi.fn(async (name: string) => ({
+                createWritable: async () => ({
+                    write: async (value: Uint8Array) => { files.set(name, value.slice()) },
+                    close: async () => undefined,
+                }),
+                getFile: async () => ({
+                    arrayBuffer: async () => files.get(name)!.slice().buffer,
+                }),
+            })),
+        }
+        Object.defineProperty(navigator, 'storage', {
+            configurable: true,
+            value: { getDirectory: async () => directory },
+        })
+        const value = { message: [{ role: 'user', data: 'local cold payload' }] }
+        const { getColdStorageItem, setLocalColdStorageItem } = await import('./coldstorage.svelte')
+
+        await expect(setLocalColdStorageItem('cold-local', value)).resolves.toBe(true)
+        await expect(getColdStorageItem('cold-local', { accountFallback: true })).resolves.toEqual(value)
+
+        expect(mocks.fetchProtectedResource).not.toHaveBeenCalled()
+        expect(directory.getFileHandle).toHaveBeenCalledWith(
+            'coldstorage_cold-local.json',
+            { create: true },
+        )
+    })
+
     it('reads the exact remote key and decompresses a successful payload', async () => {
         const { compressSync } = await import('fflate')
         const value = { character: { chaId: 'synthetic-character' } }

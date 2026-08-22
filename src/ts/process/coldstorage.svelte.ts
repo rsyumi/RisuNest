@@ -188,6 +188,11 @@ export async function setColdStorageItem(key:string, value:any):Promise<boolean>
         return await setAccountColdStorageItem(key, value)
     }
 
+    return setLocalColdStorageItem(key, value)
+}
+
+export async function setLocalColdStorageItem(key:string, value:any):Promise<boolean> {
+
     const compressed = await compressColdStorageValue(value)
     if(!compressed){
         return false
@@ -421,13 +426,13 @@ export async function confirmIncompleteColdStorageOperation(
     return await alertConfirm(message)
 }
 
-export async function makeColdData(){
+export async function makeColdData():Promise<boolean>{
     try {
-        await compactColdStorageDatabase(DBState.db, {
+        return await compactColdStorageDatabase(DBState.db, {
             now: Date.now(),
             createId: () => crypto.randomUUID(),
-            write: setColdStorageItem,
-            read: getColdStorageItem,
+            write: setLocalColdStorageItem,
+            read: (key) => getColdStorageItem(key, { accountFallback: true }),
             replaceDatabase: replacePersistentDatabase,
             onProgress: (phase, remaining) => {
                 const target = phase === 'character' ? 'character' : 'chat'

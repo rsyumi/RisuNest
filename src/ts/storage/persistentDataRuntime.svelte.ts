@@ -11,13 +11,12 @@ import {
     capturePersistentRoot,
     captureSelectedPersistentCharacter,
     createPersistentDataRuntime,
-    type OfficialDatabaseStorage,
     type PersistentDataRuntime,
     type PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
+import type { OfficialRevisionPublisher } from './saveCoordinator'
 
 export type {
-    OfficialDatabaseStorage,
     PersistentDataRuntime,
     PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
@@ -69,14 +68,14 @@ function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
 }
 
 interface ProductionRuntimeConfiguration {
-    officialStorage: OfficialDatabaseStorage | null
+    officialPublisher: OfficialRevisionPublisher | null
     onLocalRevision?: (revision: DataRevision) => void
     onFlushPromise?: (promise: Promise<void> | null) => void
     onBackgroundError?: (error: unknown) => void
 }
 
 const productionConfiguration: ProductionRuntimeConfiguration = {
-    officialStorage: null,
+    officialPublisher: null,
 }
 let productionRuntime: PersistentDataRuntime | null = null
 
@@ -91,7 +90,7 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
         productionRuntime = createPersistentDataRuntime({
             store: getPersistentDataStore(),
             state: productionStateAdapter(),
-            getOfficialStorage: () => productionConfiguration.officialStorage,
+            getOfficialPublisher: () => productionConfiguration.officialPublisher,
             onLocalRevision: (revision) => productionConfiguration.onLocalRevision?.(revision),
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),
             onBackgroundError: (error) => productionConfiguration.onBackgroundError?.(error),

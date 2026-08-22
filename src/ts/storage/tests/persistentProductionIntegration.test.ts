@@ -195,23 +195,22 @@ describe('persistent production runtime', () => {
         )
     })
 
-    it('retries one exact pinned official snapshot and disposes it after success', async () => {
+    it('retries one exact dynamically selected publication and disposes it after success', async () => {
         const database = makeDatabase()
         const store = makeStore(`publisher-${crypto.randomUUID()}`)
         await store.open()
         await store.replaceFromDatabase(database)
         const adapter = makeAdapter(database)
-        const writes: Uint8Array[] = []
-        const officialStorage = {
-            setItem: vi.fn(async (_key: string, bytes: Uint8Array) => {
-                writes.push(bytes)
-                if (writes.length === 1) throw new Error('offline')
-            }),
-        }
+        const publish = vi.fn(async () => {
+            if (publish.mock.calls.length === 1) throw new Error('offline')
+        })
+        const dispose = vi.fn(async () => undefined)
+        const pin = vi.fn(async () => ({ publish, dispose }))
+        let officialPublisher = { pin }
         const runtime = createPersistentDataRuntime({
             store,
             state: adapter,
-            officialStorage,
+            getOfficialPublisher: () => officialPublisher,
             prepareDatabase: async (candidate) => structuredClone(candidate),
         })
         await runtime.initializeActiveWorkingSet(database)
@@ -219,37 +218,63 @@ describe('persistent production runtime', () => {
         runtime.markPersistentDataDirty(64)
 
         await expect(runtime.flushPendingData('first')).rejects.toThrow('offline')
+        officialPublisher = { pin: vi.fn() }
         await runtime.flushPendingData('retry')
 
-        expect(writes).toHaveLength(2)
-        expect(writes[1]).toBe(writes[0])
-        expect((await decodeRisuSave(writes[0])).username).toBe('Published')
+        expect(pin).toHaveBeenCalledOnce()
+        expect(publish).toHaveBeenCalledTimes(2)
+        expect(dispose).toHaveBeenCalledOnce()
         expect(runtime.revision).toBe(2)
     })
 
-    it('uses the official account storage selected after local initialization', async () => {
+    it('uses the official publisher selected after local initialization', async () => {
         const database = makeDatabase()
         const store = makeStore(`late-publisher-${crypto.randomUUID()}`)
         await store.open()
         await store.replaceFromDatabase(database)
         const adapter = makeAdapter(database)
-        const setItem = vi.fn(async (_key: string, _bytes: Uint8Array) => undefined)
-        let officialStorage: { setItem: typeof setItem } | null = null
+        const publish = vi.fn(async () => undefined)
+        const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
+        let officialPublisher: { pin: typeof pin } | null = null
         const runtime = createPersistentDataRuntime({
             store,
             state: adapter,
-            getOfficialStorage: () => officialStorage,
+            getOfficialPublisher: () => officialPublisher,
             prepareDatabase: async (candidate) => structuredClone(candidate),
-        })
+        }
+        )
         await runtime.initializeActiveWorkingSet(database)
-        officialStorage = { setItem }
+        officialPublisher = { pin }
         adapter.current().username = 'Account enabled'
         runtime.markPersistentDataDirty(64)
 
         await runtime.flushPendingData('account-enabled')
 
-        expect(setItem).toHaveBeenCalledOnce()
-        expect(setItem.mock.calls[0][0]).toBe('database/database.bin')
+        expect(pin).toHaveBeenCalledWith(2)
+        expect(publish).toHaveBeenCalledOnce()
+    })
+
+    it('uses an idempotent no-op publication when account mode remains disabled', async () => {
+        const database = makeDatabase()
+        const store = makeStore(`disabled-publisher-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const getOfficialPublisher = vi.fn(() => null)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            getOfficialPublisher,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        adapter.current().username = 'Local only'
+        runtime.markPersistentDataDirty(64)
+
+        await runtime.flushPendingData('local-only')
+
+        expect(getOfficialPublisher).toHaveBeenCalled()
+        expect(runtime.revision).toBe(2)
     })
 
     it('prepares a character activation replacement before storing it', async () => {

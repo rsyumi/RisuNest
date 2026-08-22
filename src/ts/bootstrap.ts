@@ -14,7 +14,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertError, alertMd, alertTOS, waitAlert } from "./alert";
+import { alertError, alertInput, alertMd, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { characterURLImport } from "./characterCards";
 import { loadRisuAccountData } from "./drive/accounter";
@@ -26,8 +26,13 @@ import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
-import type { AccountStorage } from "./storage/accountStorage";
-import { makeColdData } from "./process/coldstorage.svelte";
+import { AccountStorage } from "./storage/accountStorage";
+import {
+    getAccountColdStorageItem,
+    getColdStorageItem,
+    makeColdData,
+    setAccountColdStorageItem,
+} from "./process/coldstorage.svelte";
 import { getRemoteSaveCleanupAction, getRemoteSavePayloadName } from "./storage/remoteSaveCleanup";
 import {
     forageStorage,
@@ -48,16 +53,25 @@ import {
     bootstrapPersistentDatabase,
     listLegacyDatabaseBackups,
     readLegacyDatabaseCandidate,
-    replaceExplicitBootstrapCandidate,
     type LegacyDatabaseCandidate,
 } from "./storage/persistentBootstrap";
 import { getLegacyLocalStorage } from "./storage/legacyLocalStorage";
 import {
     getPersistentDataRuntime,
     initializeActiveWorkingSet,
-    replacePersistentDatabase,
+    configurePersistentDataRuntime,
 } from "./storage/persistentDataRuntime.svelte";
 import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
+import { resolveBlobStore } from "./storage/platformBlobStore";
+import { OfficialAccountSnapshotAdapter } from "./storage/sync/officialAccountSnapshot";
+import {
+    initializeOfficialAccountBootstrap,
+    publishOfficialRevisionIfChanged,
+} from "./storage/sync/officialAccountBootstrap";
+import {
+    configureOfficialAccountAssetReader,
+    createStructuredAccountAssetReader,
+} from "./storage/accountAssetAccess";
 export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
@@ -141,7 +155,60 @@ export async function loadData() {
             prepareDatabase: prepareDatabaseForPersistence,
         })
         setDatabase(local.database)
-        await initializeActiveWorkingSet(local.database)
+        const accountStorage = new AccountStorage()
+        const officialAdapter = new OfficialAccountSnapshotAdapter({
+            store: runtime.store,
+            resolveBlobs: resolveBlobStore,
+            account: accountStorage,
+            cold: {
+                readRemote: getAccountColdStorageItem,
+                async writeRemote(key, value, signal) {
+                    if (!await setAccountColdStorageItem(key, value, signal)) {
+                        throw new Error(`Failed to write official cold payload: ${key}`)
+                    }
+                },
+                readLocal: (key) => getColdStorageItem(key, { accountFallback: true }),
+            },
+            prepareCandidate: prepareDatabaseForPersistence,
+            markPublished: () => undefined,
+        })
+        const accountBootstrap = await initializeOfficialAccountBootstrap({
+            local,
+            store: runtime.store,
+            adapter: officialAdapter,
+            readRemoteDatabase: () => accountStorage.readItem('database/database.bin', {
+                progress: (value) => {
+                    LoadingStatusState.text =
+                        `Loading Remote Save File ${(value * 100).toFixed(2)}%`
+                },
+            }),
+            markers: localStorage,
+            accountMode: {
+                get isAccount() {
+                    return forageStorage.isAccount
+                },
+                set isAccount(enabled) {
+                    forageStorage.setAccountModeForSession(enabled)
+                },
+            },
+            configurePublisher: (officialPublisher) => {
+                configurePersistentDataRuntime({ officialPublisher })
+            },
+            assetReader: createStructuredAccountAssetReader(accountStorage),
+            configureAssetReader: configureOfficialAccountAssetReader,
+            chooseExistingRemote: async () => await alertSelect([
+                language.loadDataFromAccount,
+                language.saveCurrentDataToAccount,
+            ]) === '0' ? 'pull' : 'push',
+            confirmInitialPush: async () =>
+                await alertInput('to overwrite your data, type "RISUAI"') === 'RISUAI',
+            installDatabase: setDatabase,
+            initializeWorkingSet: initializeActiveWorkingSet,
+            onRemoteError: (error) => {
+                console.error(error)
+                alertError(error instanceof Error ? error : String(error))
+            },
+        })
         disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners()
 
         if (isTauriDesktop) {
@@ -151,24 +218,6 @@ export async function loadData() {
         }
 
         if (!isTauri) {
-            if (await forageStorage.checkAccountSync()) {
-                LoadingStatusState.text = 'Checking Account Sync...'
-                await replaceExplicitBootstrapCandidate({
-                    loadCandidate: () => (forageStorage.realStorage as AccountStorage).getItem(
-                        'database/database.bin',
-                        (value) => {
-                            LoadingStatusState.text =
-                                `Loading Remote Save File ${(value * 100).toFixed(2)}%`
-                        },
-                    ) as Promise<Uint8Array | null>,
-                    decodeCandidate: decodeRisuSave,
-                    replaceCandidate: (database) =>
-                        replacePersistentDatabase(database, 'account-bootstrap'),
-                    onError: (error) => console.error(error),
-                })
-            }
-            LoadingStatusState.text = 'Rechecking Account Sync...'
-            await forageStorage.checkAccountSync()
             LoadingStatusState.text = 'Checking Drive Sync...'
             if (await checkDriverInit()) return
             LoadingStatusState.text = 'Checking Service Worker...'
@@ -182,7 +231,12 @@ export async function loadData() {
         }
 
         LoadingStatusState.text = 'Checking For Format Update...'
-        await makeColdData()
+        const coldStorageChanged = await makeColdData()
+        await publishOfficialRevisionIfChanged(
+            coldStorageChanged && accountBootstrap.officialEnabled,
+            officialAdapter,
+            runtime.revision,
+        )
 
         LoadingStatusState.text = 'Loading Plugins...'
         try {

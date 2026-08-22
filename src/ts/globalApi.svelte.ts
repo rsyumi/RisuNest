@@ -39,7 +39,6 @@ import { initMobileGesture } from "./hotkey";
 import { fetch as TauriHTTPFetch } from '@tauri-apps/plugin-http';
 import { fetchTauriHttpStream } from './network/tauriHttpStream';
 import { moduleUpdate } from "./process/modules";
-import { AccountStorage } from "./storage/accountStorage";
 import { getColdStorageItem, makeColdData } from "./process/coldstorage.svelte";
 import {
     listCharacterResources,
@@ -66,11 +65,12 @@ import {
 import { installInternalBackup } from "./storage/databaseRestore";
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore } from "./storage/platformBlobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
+import { readActiveAsset, storeActiveAsset } from "./storage/accountAssetAccess";
 
 export const forageStorage = new AutoStorage()
 configureBlobStoreStorageProvider(async () => {
     await forageStorage.Init()
-    return forageStorage.isAccount ? null : forageStorage.realStorage as any
+    return forageStorage.realStorage as any
 })
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
@@ -236,8 +236,12 @@ let appDataDirPath = ''
  */
 export async function readImage(data: string) {
     if (!isTauri) await forageStorage.Init()
-    if (data.startsWith('assets/') && !forageStorage.isAccount) {
-        return await readBlobForFacade(await resolveBlobStore(), data, isTauri)
+    const isAsset = data.startsWith('assets/') && data.length > 'assets/'.length
+    if (isAsset) {
+        return await readActiveAsset(await resolveBlobStore(), data, {
+            officialAccount: forageStorage.isAccount,
+            tauri: isTauri,
+        })
     }
     if (isTauri) {
         if (data.startsWith('assets')) {
@@ -279,14 +283,7 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
         fileExtension = fileName.split('.').pop()
     }
     const form = `assets/${id}.${fileExtension}`
-    if (!isTauri && forageStorage.isAccount) {
-        const replacer = await forageStorage.setItem(form, data)
-        if (replacer) {
-            return replacer
-        }
-        return form
-    }
-    await (await resolveBlobStore()).put(form, data, {
+    await storeActiveAsset(await resolveBlobStore(), form, data, {
         kind: 'asset',
         mime: '',
         name: fileName || `${id}.${fileExtension}`,
@@ -303,8 +300,12 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
  */
 export async function loadAsset(id: string) {
     if (!isTauri) await forageStorage.Init()
-    if (!isTauri && forageStorage.isAccount) {
-        return await forageStorage.getItem(id) as unknown as Uint8Array
+    const isAsset = id.startsWith('assets/') && id.length > 'assets/'.length
+    if (isAsset) {
+        return await readActiveAsset(await resolveBlobStore(), id, {
+            officialAccount: forageStorage.isAccount,
+            tauri: isTauri,
+        })
     }
     return await readBlobForFacade(await resolveBlobStore(), id, isTauri)
 }
@@ -333,12 +334,6 @@ function estimateSnapshotBytes(value: unknown): number {
 
 export async function saveDb() {
     persistentSaveObserverInstallation.install(() => {
-        configurePersistentDataRuntime({
-            officialStorage:
-                forageStorage.isAccount && forageStorage.realStorage instanceof AccountStorage
-                    ? forageStorage.realStorage
-                    : null,
-        })
         const channel = window.BroadcastChannel ? new BroadcastChannel('risu-db') : null
         const disposeNotifications = installPersistentSaveNotifications({
             sessionId: v4(),

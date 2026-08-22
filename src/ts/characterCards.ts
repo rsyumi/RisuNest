@@ -14,11 +14,10 @@ import { type CharacterCardV3, type LorebookEntry } from '@risuai/ccardlib'
 import { reencodeImage } from "./process/files/inlays"
 import { PngChunk } from "./pngChunk"
 import type { OnnxModelFiles } from "./process/transformers"
-import { CharXImporter, CharXSkippableChecker, CharXWriter } from "./process/processzip"
+import { CharXImporter, CharXWriter } from "./process/processzip"
 import { exportModuleLegacy, readModule, type RisuModule } from "./process/modules"
 import { readFile } from "@tauri-apps/plugin-fs"
 import { onOpenUrl } from '@tauri-apps/plugin-deep-link';
-import { AccountStorage } from "./storage/accountStorage"
 import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
 
 
@@ -92,55 +91,8 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
             msg: 'Loading... (Reading)'
         })
 
-        let charXMode:'normal'|'skippable'|'signal' = 'normal'
-        let signal = ''
-        if(forageStorage.realStorage instanceof AccountStorage){
-
-            if(f.data instanceof ReadableStream){
-                const tee = f.data.tee()
-                const reader =tee[0].getReader()
-                f.data = tee[1]
-                const chunks:Uint8Array[] = []
-                let done = false
-                let readedBytes = 0
-                while(!done){
-                    const r = await reader.read()
-                    readedBytes += r.value ? r.value.length : 0
-                    if(r.done){
-                        done = true
-                    }
-                    else{
-                        chunks.push(r.value)
-                    }
-                    alertWait(`Loading... (Reading) ${readedBytes} Bytes`)
-                }
-                let offset = 0
-                const uint8 = new Uint8Array(readedBytes)
-                for(const chunk of chunks){
-                    uint8.set(chunk, offset)
-                    offset += chunk.length
-                }
-                const v = await CharXSkippableChecker(uint8)
-                signal = v.hash
-                charXMode = v.success ? 'skippable' : 'signal'
-            }
-            else{
-                const rsp = new Response(f.data as any)
-                f.data = new Uint8Array(await rsp.arrayBuffer())
-                const v = await CharXSkippableChecker(f.data)
-                signal = v.hash
-                charXMode = v.success ? 'skippable' : 'signal'
-            }
-        }
-        
         const importer = new CharXImporter()
         importer.alertInfo = true
-        if(charXMode === 'skippable'){
-            importer.skipSaving = true
-        }
-        if(charXMode === 'signal'){
-            importer.hashSignal = signal
-        }
         await importer.parse(f.data)
         const cardData = importer.cardData
         if(!cardData){

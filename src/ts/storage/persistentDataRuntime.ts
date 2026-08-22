@@ -7,7 +7,6 @@ import {
     type OfficialRevisionPublisher,
     type SaveCoordinatorClock,
 } from './saveCoordinator'
-import { streamRisuSaveFromStore } from './risuSaveStoreAdapter'
 
 type CompleteCharacter = character | groupChat
 type RootDatabase = Omit<Database, 'characters'>
@@ -34,15 +33,11 @@ export interface PersistentDataRuntimeStateAdapter {
     publishConversation(characterId: string, conversation: Chat): void
 }
 
-export interface OfficialDatabaseStorage {
-    setItem(key: string, value: Uint8Array): Promise<unknown>
-}
-
 export interface PersistentDataRuntimeDependencies {
     store: PersistentDataStore
     state: PersistentDataRuntimeStateAdapter
-    officialStorage?: OfficialDatabaseStorage | null
-    getOfficialStorage?(): OfficialDatabaseStorage | null
+    officialPublisher?: OfficialRevisionPublisher | null
+    getOfficialPublisher?(): OfficialRevisionPublisher | null
     clock?: SaveCoordinatorClock
     onLocalRevision?(revision: DataRevision): void
     onFlushPromise?(promise: Promise<void> | null): void
@@ -62,51 +57,19 @@ export interface PersistentDataRuntime {
     replacePersistentDatabase(database: Database, reason: string): Promise<void>
 }
 
-async function concatenateSnapshot(
-    store: PersistentDataStore,
-    revision: DataRevision,
-): Promise<Uint8Array> {
-    const chunks: Uint8Array[] = []
-    let length = 0
-    for await (const chunk of streamRisuSaveFromStore(store, revision)) {
-        chunks.push(chunk)
-        length += chunk.byteLength
-    }
-    const bytes = new Uint8Array(length)
-    let offset = 0
-    for (const chunk of chunks) {
-        bytes.set(chunk, offset)
-        offset += chunk.byteLength
-    }
-    return bytes
-}
-
-function createOfficialPublisher(
-    store: PersistentDataStore,
-    getStorage: () => OfficialDatabaseStorage | null,
+function createDynamicOfficialPublisher(
+    getPublisher: () => OfficialRevisionPublisher | null,
 ): OfficialRevisionPublisher {
     return {
         async pin(revision) {
-            const storage = getStorage()
-            if (!storage) {
+            const publisher = getPublisher()
+            if (!publisher) {
                 return {
                     publish: async () => undefined,
                     dispose: async () => undefined,
                 }
             }
-            let bytes: Uint8Array | null = await concatenateSnapshot(store, revision)
-            let disposed = false
-            return {
-                async publish() {
-                    if (disposed || !bytes) throw new Error('Pinned publication was disposed')
-                    await storage.setItem('database/database.bin', bytes)
-                },
-                async dispose() {
-                    if (disposed) return
-                    disposed = true
-                    bytes = null
-                },
-            }
+            return publisher.pin(revision)
         },
     }
 }
@@ -120,10 +83,10 @@ export function createPersistentDataRuntime(
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         captureCharacter: dependencies.state.captureCharacter,
         replaceDatabase: dependencies.state.replaceDatabase,
-        officialPublisher: dependencies.officialStorage || dependencies.getOfficialStorage
-            ? createOfficialPublisher(
-                dependencies.store,
-                dependencies.getOfficialStorage ?? (() => dependencies.officialStorage ?? null),
+        officialPublisher: dependencies.officialPublisher || dependencies.getOfficialPublisher
+            ? createDynamicOfficialPublisher(
+                dependencies.getOfficialPublisher
+                    ?? (() => dependencies.officialPublisher ?? null),
             )
             : undefined,
         clock: dependencies.clock,
