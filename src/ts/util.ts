@@ -7,7 +7,7 @@ import { readFile } from "@tauri-apps/plugin-fs"
 import { basename } from "@tauri-apps/api/path"
 import { createBlankChar, getCharImage } from "./characters"
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
-import { isIOS, isTauri } from "src/ts/platform"
+import { isIOS, isTauri, isTauriMobile } from "src/ts/platform"
 import type { Attachment } from "svelte/attachments"
 import { mount, unmount, type Snippet } from "svelte"
 import PopupList from "src/lib/UI/PopupList.svelte"
@@ -69,7 +69,9 @@ export async function selectSingleFile(ext:string[]){
 }
 
 export async function selectMultipleFile(ext:string[]){
-    if(!isTauri){
+    // The Android picker returns content URIs and drops extensions it does not know, so it uses
+    // the same DOM input that selectSingleFile already relies on everywhere.
+    if(!isTauri || isTauriMobile){
         const v = await selectFileByDom(ext, 'multiple')
         let arr:{name:string, data:Uint8Array}[] = []
         for(const file of v){
