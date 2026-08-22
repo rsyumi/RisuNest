@@ -108,7 +108,7 @@ export function createKeyValueBlobStore(
     }
 
     let initialized: Promise<void> | undefined
-    const initialize = () => initialized ??= (async () => {
+    const backfillLegacyMetadata = async () => {
         const allKeys = await backend.keys()
         const keySet = new Set(allKeys)
         for (const key of allKeys.filter((value) => value.startsWith(keys.legacyAssetPrefix))) {
@@ -128,14 +128,23 @@ export function createKeyValueBlobStore(
             }
             await backend.write(metadataKey, new TextEncoder().encode(JSON.stringify(metadata)))
         }
-    })()
+    }
+
+    const initialize = () => initialized ??= backfillLegacyMetadata().catch((error) => {
+        initialized = undefined
+        throw error
+    })
+
+    async function payloadExists(payloadKey: string): Promise<boolean> {
+        if (backend.size) return await backend.size(payloadKey) !== null
+        return (await backend.keys()).includes(payloadKey)
+    }
 
     async function stat(key: string): Promise<BlobMetadata | null> {
         await initialize()
         const metadata = parseMetadata(await backend.read(keys.metadata(key)))
         if (!metadata) return null
-        const allKeys = await backend.keys()
-        return allKeys.includes(keys.payload(key)) ? metadata : null
+        return await payloadExists(keys.payload(key)) ? metadata : null
     }
 
     return {

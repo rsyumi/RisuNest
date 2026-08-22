@@ -121,6 +121,65 @@ describe('BlobStore contract', () => {
         expect(await store.read('assets/orphan.bin', { start: 1, endExclusive: 2 })).toBeNull()
     })
 
+    test('reads an asset without enumerating the whole backend', async () => {
+        const values = new Map<string, Uint8Array>()
+        let keyScans = 0
+        const backend: BlobKeyValueBackend = {
+            async write(key, value) { values.set(key, value.slice()) },
+            async read(key) { return values.get(key)?.slice() ?? null },
+            async keys() { keyScans += 1; return [...values.keys()] },
+            async remove(key) { values.delete(key) },
+            async size(key) { return values.get(key)?.byteLength ?? null },
+            async resolveUrl(key) { return `file:///${key}` },
+        }
+        const store = createKeyValueBlobStore(backend, { kind: 'legacy' })
+        await store.put('assets/photo.png', new Uint8Array([1, 2]), {
+            kind: 'asset', mime: 'image/png', name: 'photo.png', ext: 'png',
+        })
+
+        const scansAfterWrite = keyScans
+        await store.read('assets/photo.png')
+        await store.stat('assets/photo.png')
+        await store.resolveUrl('assets/photo.png')
+
+        expect(keyScans).toBe(scansAfterWrite)
+    })
+
+    test('reports removed payloads as missing even when metadata survives', async () => {
+        const { store, values } = harness()
+        await store.put('assets/gone.png', new Uint8Array([1]), {
+            kind: 'asset', mime: 'image/png', name: 'gone.png', ext: 'png',
+        })
+        values.delete('assets/gone.png')
+
+        expect(await store.stat('assets/gone.png')).toBeNull()
+        expect(await store.resolveUrl('assets/gone.png')).toBeNull()
+    })
+
+    test('retries initialization after a transient backend failure', async () => {
+        const values = new Map<string, Uint8Array>()
+        let failNextScan = true
+        const backend: BlobKeyValueBackend = {
+            async write(key, value) { values.set(key, value.slice()) },
+            async read(key) { return values.get(key)?.slice() ?? null },
+            async keys() {
+                if (failNextScan) {
+                    failNextScan = false
+                    throw new Error('backend unavailable')
+                }
+                return [...values.keys()]
+            },
+            async remove(key) { values.delete(key) },
+        }
+        const store = createKeyValueBlobStore(backend, { kind: 'legacy' })
+
+        await expect(store.stat('assets/photo.png')).rejects.toThrow('backend unavailable')
+        await store.put('assets/photo.png', new Uint8Array([1]), {
+            kind: 'asset', mime: 'image/png', name: 'photo.png', ext: 'png',
+        })
+        expect(await store.read('assets/photo.png')).toEqual(new Uint8Array([1]))
+    })
+
     test('backfills zero-byte metadata when keys prove the Node payload exists', async () => {
         const values = new Map<string, Uint8Array>()
         values.set('assets/empty.bin', new Uint8Array())
