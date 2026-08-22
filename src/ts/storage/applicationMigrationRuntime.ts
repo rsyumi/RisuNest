@@ -4,8 +4,10 @@ import {
     createLosslessMigrationOrchestrator,
     type LosslessInPlaceMigrationResult,
     type LosslessMigrationImportResult,
+    type MigrationInterruptionPoint,
     type MigrationReferenceGraph,
 } from './losslessMigrationOrchestrator'
+import type { LosslessMigrationManifestEntry } from './losslessMigrationPackage'
 import type { MigrationPayloadStageFactory } from './migrationPayloadStage'
 import type { ActivePayloadRoot } from './activePayloadRoot'
 import type { PersistentDataStore, PersistentRevisionLease, ActivePersistentTuple } from './persistentDataStore'
@@ -42,6 +44,10 @@ export interface ApplicationMigrationRuntimeDependencies {
         data: Uint8Array
         metadata: BlobWriteMetadata
     } | null>
+    onInterruption?(
+        point: MigrationInterruptionPoint,
+        entry?: LosslessMigrationManifestEntry,
+    ): void | Promise<void>
     onCleanupError?(error: unknown): void
 }
 
@@ -59,6 +65,7 @@ export function createApplicationMigrationRuntime(
         collectReferences: dependencies.collectReferences,
         listLegacyInlayAssetIds: dependencies.listLegacyInlayAssetIds,
         readLegacyInlayPayload: dependencies.readLegacyInlayPayload,
+        onInterruption: dependencies.onInterruption,
         installActiveTuple: (tuple: ActivePersistentTuple) =>
             dependencies.activePayloadRoot.install(tuple),
         publishDatabase: (database: Database, tuple: ActivePersistentTuple) =>

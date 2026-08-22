@@ -33,6 +33,7 @@ export interface MigrationReferenceGraph {
 
 export type MigrationInterruptionPoint =
     | 'after-entry'
+    | 'after-verify'
     | 'after-seal'
     | 'after-prepare'
     | 'before-activate'
@@ -142,6 +143,7 @@ export function createLosslessMigrationOrchestrator(
                 if (!entry) throw new Error(`Missing referenced ${kind} migration entry ${id}`)
                 await stage.verifyEntry(entry)
             }
+            await interrupt('after-verify')
             await stage.seal(manifest, manifestHash)
             await interrupt('after-seal')
             prepared = await dependencies.store.prepareReplacement(
