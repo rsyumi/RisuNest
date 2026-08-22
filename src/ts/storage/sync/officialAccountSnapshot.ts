@@ -22,6 +22,7 @@ import type {
 import { decodeRisuSave } from '../risuSave'
 import { streamRisuSaveFromLease } from '../risuSaveStoreAdapter'
 import type { OfficialRevisionPublisher, PinnedPublication } from '../saveCoordinator'
+import type { OfficialAssetLedger } from './officialAssetLedger'
 import { officialAccountSnapshotCapability } from './types'
 
 const databaseKey = 'database/database.bin'
@@ -39,6 +40,7 @@ export interface OfficialAccountSnapshotDependencies {
     cold: OfficialColdStorageTransport
     prepareCandidate(database: Database): Promise<Database>
     markPublished(revision: DataRevision): Promise<void> | void
+    ledger: OfficialAssetLedger
 }
 
 export type OfficialPullResult =
@@ -48,12 +50,12 @@ export type OfficialPullResult =
 
 interface PinnedColdValue {
     value: unknown
-    remoteOnly: boolean
 }
 
 interface PinnedAsset {
     key: string
-    remoteOnly: boolean
+    /** The key the account already holds this asset under, or null when it must be uploaded. */
+    publishedAs: string | null
 }
 
 interface AssociatedProjection {
@@ -84,6 +86,10 @@ function addColdCharacterAssets(target: Set<string>, value: unknown): void {
             listCharacterResources(value.character as Database['characters'][number]),
         )
     }
+}
+
+async function fingerprintText(value: string): Promise<string> {
+    return fingerprintDatabase(new TextEncoder().encode(value))
 }
 
 async function fingerprintDatabase(bytes: Uint8Array): Promise<string> {
@@ -244,7 +250,7 @@ class OfficialPinnedPublication implements PinnedPublication {
         ) => void,
     ) {
         for (const asset of assets) {
-            if (asset.remoteOnly) this.replacements.set(asset.key, asset.key)
+            if (asset.publishedAs !== null) this.replacements.set(asset.key, asset.publishedAs)
         }
     }
 
@@ -257,15 +263,19 @@ class OfficialPinnedPublication implements PinnedPublication {
             const bytes = await this.blobs.read(asset.key)
             if (!bytes) throw new Error(`Missing pinned asset payload: ${asset.key}`)
             const result = await this.dependencies.account.writeItem(asset.key, bytes)
-            this.replacements.set(asset.key, requireWriteSuccess(result, asset.key))
+            const replacementKey = requireWriteSuccess(result, asset.key)
+            this.replacements.set(asset.key, replacementKey)
+            this.dependencies.ledger.record(asset.key, replacementKey)
         }
 
         const replacementRecord = Object.fromEntries(this.replacements)
         for (const [key, pinned] of this.coldValues) {
             if (this.completedColdKeys.has(key)) continue
             const projected = replaceColdStoragePayloadResources(pinned.value, replacementRecord)
-            if (!pinned.remoteOnly || canonical(projected) !== canonical(pinned.value)) {
+            const digest = await fingerprintText(canonical(projected))
+            if (digest !== this.dependencies.ledger.coldDigest(key)) {
                 await this.dependencies.cold.writeRemote(key, projected)
+                this.dependencies.ledger.recordCold(key, digest)
             }
             this.completedColdKeys.add(key)
         }
@@ -314,10 +324,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                     if (!isColdStorageBackupData(local)) {
                         throw new Error(`Invalid local cold payload: ${key}`)
                     }
-                    coldValues.set(key, {
-                        value: safeStructuredClone(local),
-                        remoteOnly: false,
-                    })
+                    coldValues.set(key, { value: safeStructuredClone(local) })
                     addColdCharacterAssets(assetKeys, local)
                     continue
                 }
@@ -326,22 +333,26 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 if (!isColdStorageBackupData(remote)) {
                     throw new Error(`Invalid official cold payload: ${key}`)
                 }
-                coldValues.set(key, {
-                    value: safeStructuredClone(remote),
-                    remoteOnly: true,
-                })
+                const pinnedRemote = safeStructuredClone(remote)
+                coldValues.set(key, { value: pinnedRemote })
+                this.dependencies.ledger.recordCold(key, await fingerprintText(canonical(pinnedRemote)))
                 addColdCharacterAssets(assetKeys, remote)
             }
 
             const assets: PinnedAsset[] = []
             for (const key of [...assetKeys].sort()) {
-                const local = await blobs.stat(key)
-                if (local) {
-                    assets.push({ key, remoteOnly: false })
+                const publishedAs = this.dependencies.ledger.publishedAs(key)
+                if (publishedAs !== null) {
+                    assets.push({ key, publishedAs })
+                    continue
+                }
+                if (await blobs.stat(key)) {
+                    assets.push({ key, publishedAs: null })
                     continue
                 }
                 requireRemoteValue(await this.dependencies.account.readItem(key), key)
-                assets.push({ key, remoteOnly: true })
+                this.dependencies.ledger.record(key, key)
+                assets.push({ key, publishedAs: key })
             }
 
             return new OfficialPinnedPublication(

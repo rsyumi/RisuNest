@@ -14,6 +14,11 @@ import { decodeRisuSave, encodeRisuSaveLegacy } from '../risuSave'
 import { streamRisuSaveFromStore } from '../risuSaveStoreAdapter'
 import { risuSaveFixtureDatabase } from '../tests/risuSaveFixtures'
 import {
+    createOfficialAssetLedger,
+    type LedgerStorage,
+    type OfficialAssetLedger,
+} from './officialAssetLedger'
+import {
     OfficialAccountSnapshotAdapter,
     type OfficialAccountSnapshotDependencies,
 } from './officialAccountSnapshot'
@@ -122,6 +127,16 @@ interface HarnessOptions {
     remoteCold?: Map<string, unknown>
     databaseRead?: AccountReadResult
     prepareCandidate?: (database: Database) => Promise<Database>
+    ledger?: OfficialAssetLedger
+}
+
+function memoryLedgerStorage(): LedgerStorage {
+    const values = new Map<string, string>()
+    return {
+        getItem: (key) => values.get(key) ?? null,
+        setItem: (key, value) => void values.set(key, value),
+        removeItem: (key) => void values.delete(key),
+    }
 }
 
 async function makeHarness(options: HarnessOptions = {}) {
@@ -168,6 +183,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     const markPublished = vi.fn()
     const prepareCandidate = options.prepareCandidate ?? vi.fn(async (value: Database) => structuredClone(value))
     const resolveBlobs = vi.fn(async () => blobStore)
+    const ledger = options.ledger ?? createOfficialAssetLedger(memoryLedgerStorage(), 'test-account')
     const adapter = new OfficialAccountSnapshotAdapter({
         store,
         resolveBlobs,
@@ -175,14 +191,17 @@ async function makeHarness(options: HarnessOptions = {}) {
         cold,
         prepareCandidate,
         markPublished,
+        ledger,
     })
     return {
         adapter,
         blobStore,
         cold,
+        localColdValues: localCold,
         database,
         events,
         imported,
+        ledger,
         markPublished,
         prepareCandidate,
         readItem,
@@ -340,6 +359,38 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(later.revision).toBe(harness.imported.revision + 1)
         expect(commit).not.toHaveBeenCalled()
         expect(replace).not.toHaveBeenCalled()
+    })
+
+    it('uploads each local asset once across publications', async () => {
+        const harness = await makeHarness()
+        const assetCount = resources(harness.database).length
+
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+        const afterFirst = harness.events.filter((event) => event.startsWith('asset:assets/')).length
+        const coldAfterFirst = harness.cold.writeRemote.mock.calls.length
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+
+        expect(afterFirst).toBe(assetCount)
+        expect(harness.events.filter((event) => event.startsWith('asset:assets/'))).toHaveLength(assetCount)
+        expect(harness.cold.writeRemote).toHaveBeenCalledTimes(coldAfterFirst)
+        expect(harness.writes.filter((write) => write.key === databaseKey)).toHaveLength(2)
+    })
+
+    it('uploads a cold payload again once its projected content changes', async () => {
+        const harness = await makeHarness()
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+        const coldAfterFirst = harness.cold.writeRemote.mock.calls.length
+        const changed = harness.cold.readLocal.mock.results.length > 0
+        expect(changed).toBe(true)
+        harness.cold.readLocal.mockImplementation(async (key: string) => {
+            const value = structuredClone(harness.localColdValues.get(key) ?? null) as Record<string, unknown> | null
+            if (value) value.changedMarker = 'edited'
+            return value
+        })
+
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+
+        expect(harness.cold.writeRemote.mock.calls.length).toBeGreaterThan(coldAfterFirst)
     })
 
     it('retries the same handle with completed state and exact cached database bytes', async () => {
@@ -700,6 +751,7 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
             },
             prepareCandidate: async (value) => structuredClone(value),
             markPublished: vi.fn(),
+            ledger: createOfficialAssetLedger(memoryLedgerStorage(), 'other-account'),
         })
 
         await expect(adapter.pull()).rejects.toBeInstanceOf(RevisionConflictError)

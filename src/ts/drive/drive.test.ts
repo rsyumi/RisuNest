@@ -1,4 +1,5 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
+import { createUnrecordedOfficialAssetLedger } from '../storage/sync/officialAssetLedger'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BlobMetadata, BlobStore } from '../storage/blobStore'
 import type { Database } from '../storage/database.svelte'
@@ -198,6 +199,7 @@ describe('Drive restore cold snapshot assets', () => {
             },
             prepareCandidate: async (candidate) => structuredClone(candidate),
             markPublished: vi.fn(),
+            ledger: createUnrecordedOfficialAssetLedger(),
         })
         state.replacePersistentDatabase.mockImplementation(async (candidate, reason) => {
             expect(reason).toBe('drive-restore')
