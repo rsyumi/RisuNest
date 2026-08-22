@@ -67,7 +67,6 @@ vi.mock('./process/files/inlays', () => ({ reencodeImage: vi.fn() }))
 vi.mock('./pngChunk', () => ({ PngChunk: {} }))
 vi.mock('./process/processzip', () => ({
     CharXImporter: class {},
-    CharXSkippableChecker: class {},
     CharXWriter: class {},
 }))
 vi.mock('./process/modules', () => ({ exportModuleLegacy: vi.fn(), readModule: vi.fn() }))
