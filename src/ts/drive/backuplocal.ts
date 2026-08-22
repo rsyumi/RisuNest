@@ -104,11 +104,22 @@ export async function SaveLocalBackup(){
         }
         alertWait(message)
 
-        const data = await readBackupAsset(blobStore, key, forageStorage.isAccount)
+        let data = await blobStore.read(key)
+        let readRemotely = false
+        if (data === null && forageStorage.isAccount) {
+            if (db.skipSavingAssetsOnWebSync) {
+                continue
+            }
+            data = await readBackupAsset(blobStore, key, true)
+            readRemotely = true
+        }
         if (data) {
             await writer.writeBackup(isTauri ? key.slice('assets/'.length) : key, data)
         } else {
             missingAssets.push(key)
+        }
+        if (readRemotely) {
+            await sleep(1000)
         }
     }
 
@@ -264,11 +275,19 @@ export async function SavePartialLocalBackup(){
         }
         alertWait(message)
 
-        const data = await readBackupAsset(blobStore, key, forageStorage.isAccount)
+        let data = await blobStore.read(key)
+        let readRemotely = false
+        if (data === null && forageStorage.isAccount) {
+            data = await readBackupAsset(blobStore, key, true)
+            readRemotely = true
+        }
         if (data) {
             await writer.writeBackup(key, data)
         } else {
             missingAssets.push(key)
+        }
+        if (readRemotely) {
+            await sleep(100)
         }
     }
 
