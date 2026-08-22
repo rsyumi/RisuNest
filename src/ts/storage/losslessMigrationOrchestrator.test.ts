@@ -374,6 +374,15 @@ describe('lossless migration orchestrator', () => {
         ]))
     })
 
+    test('boots a clean legacy store without an exclusive migration lock', async () => {
+        const target = fixture()
+
+        await target.orchestrator.recoverInterruptedMigrations()
+
+        expect(target.runMigration).not.toHaveBeenCalled()
+        expect(target.store.discardPreparedReplacement).not.toHaveBeenCalled()
+    })
+
     test('recovers inactive prepared roots payload-first and never auto-activates', async () => {
         const target = fixture()
         const stage = target.stages.create('legacy')

@@ -313,6 +313,16 @@ export function createLosslessMigrationOrchestrator(
         },
 
         async recoverInterruptedMigrations() {
+            const state = await dependencies.store.readActiveTuple()
+            const markers = await dependencies.store.listPreparedReplacements()
+            const staged = await dependencies.stages.listGenerations()
+            // Boot must not take the exclusive migration lock when no migration ever ran, because
+            // browsers without Web Locks cannot grant it and would fail to start.
+            const recoverable = markers.length > 0
+                || state.payloadGeneration !== 'legacy'
+                || staged.some((generation) => generation !== state.payloadGeneration)
+            if (!recoverable) return
+
             await dependencies.runMigration('lossless-recovery', async () => {
                 const active = await dependencies.store.readActiveTuple()
                 const prepared = await dependencies.store.listPreparedReplacements()
