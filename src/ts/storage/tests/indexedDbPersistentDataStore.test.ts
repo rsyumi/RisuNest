@@ -723,4 +723,40 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         })
         expect(orphan).toBeUndefined()
     })
+
+    it('records a durable lease so another document cannot sweep a live snapshot', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'leased-revision-snapshot'
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const { revision } = await store.replaceFromDatabase(fixtureDatabase)
+
+        const readLeases = async () => {
+            const request = indexedDB.open(databaseName)
+            const database = await new Promise<IDBDatabase>((resolve, reject) => {
+                request.onsuccess = () => resolve(request.result)
+                request.onerror = () => reject(request.error)
+            })
+            const transaction = database.transaction('meta', 'readonly')
+            const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+                const cursorRequest = transaction.objectStore('meta').getAllKeys(
+                    IDBKeyRange.bound('snapshotLease:', 'snapshotLease:￿'),
+                )
+                cursorRequest.onsuccess = () => resolve(cursorRequest.result)
+                cursorRequest.onerror = () => reject(cursorRequest.error)
+            })
+            database.close()
+            return keys
+        }
+
+        const lease = await store.acquireRevision(revision)
+        expect(await readLeases()).toHaveLength(1)
+
+        const second = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await second.open()
+        expect((await lease.readRoot()).value.username).toBe(fixtureDatabase.username)
+
+        await lease.release()
+        expect(await readLeases()).toHaveLength(0)
+    })
 })

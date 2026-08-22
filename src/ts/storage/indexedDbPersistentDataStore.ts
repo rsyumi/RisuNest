@@ -522,6 +522,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             )) as StoredRecord<Omit<Database, 'characters'>> | undefined
             if (!root) throw new RevisionConflictError(revision, active.revision)
             transaction.objectStore('root').put({ ...root, key: generation, generation })
+            transaction.objectStore('meta').put({
+                key: this.snapshotLeaseKey(generation),
+                value: generation,
+            })
             for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
                 await this.copyGeneration(
                     transaction.objectStore(storeName),
@@ -572,7 +576,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             release: async () => {
                 if (releasePromise) return releasePromise
                 released = true
-                releasePromise = this.deleteGeneration(generation).finally(() => {
+                releasePromise = this.releaseSnapshotLease(generation).finally(() => {
                     activeSnapshotGenerations.delete(generation)
                 })
                 return releasePromise
@@ -918,12 +922,41 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
+    private snapshotLeaseKey(generation: string): string {
+        return `snapshotLease:${generation}`
+    }
+
+    private async releaseSnapshotLease(generation: string): Promise<void> {
+        await this.deleteGeneration(generation)
+        const transaction = this.requireDatabase().transaction('meta', 'readwrite')
+        transaction.objectStore('meta').delete(this.snapshotLeaseKey(generation))
+        await transactionDone(transaction)
+    }
+
+    /**
+     * Removes snapshot copies abandoned by an interrupted export. A lease record keeps snapshots
+     * that another open document is still reading, which a module-local set cannot see.
+     */
     private async sweepTemporaryGenerations(): Promise<void> {
         const database = this.requireDatabase()
+        const leaseTransaction = database.transaction('meta', 'readonly')
+        const leased = new Set(await this.readMetaValuesByPrefix<string>(
+            leaseTransaction.objectStore('meta'),
+            'snapshotLease:',
+        ))
+        await transactionDone(leaseTransaction)
+
+        const snapshots = this.keyRangeFactory.bound('snapshot-', 'snapshot-￿')
+        const abandoned = (generation: string) =>
+            !leased.has(generation) && !activeSnapshotGenerations.has(generation)
         const transaction = database.transaction([...DATA_STORE_NAMES], 'readwrite')
         for (const storeName of DATA_STORE_NAMES) {
+            const store = transaction.objectStore(storeName)
+            // Only the root store is keyed by generation; the rest carry it on an index.
+            const request = storeName === 'root'
+                ? store.openKeyCursor(snapshots)
+                : store.index('byGeneration').openKeyCursor(snapshots)
             await new Promise<void>((resolve, reject) => {
-                const request = transaction.objectStore(storeName).openCursor()
                 request.onerror = () => reject(request.error)
                 request.onsuccess = () => {
                     const cursor = request.result
@@ -931,13 +964,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                         resolve()
                         return
                     }
-                    const generation = (cursor.value as StoredRecord<unknown>).generation
-                    if (
-                        generation.startsWith('snapshot-') &&
-                        !activeSnapshotGenerations.has(generation)
-                    ) {
-                        cursor.delete()
-                    }
+                    if (abandoned(String(cursor.key))) store.delete(cursor.primaryKey)
                     cursor.continue()
                 }
             })
