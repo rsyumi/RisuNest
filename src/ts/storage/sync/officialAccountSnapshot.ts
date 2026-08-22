@@ -56,6 +56,41 @@ interface PinnedAsset {
     remoteOnly: boolean
 }
 
+interface AssociatedProjection {
+    revision: DataRevision
+    databaseFingerprint: string
+}
+
+function isOfficialAssetKey(key: string): boolean {
+    return key.startsWith('assets/') && key.length > 'assets/'.length
+}
+
+function addOfficialAssets(target: Set<string>, values: readonly string[]): void {
+    for (const key of values) {
+        if (isOfficialAssetKey(key)) target.add(key)
+    }
+}
+
+function addColdCharacterAssets(target: Set<string>, value: unknown): void {
+    if (
+        value
+        && typeof value === 'object'
+        && 'character' in value
+        && value.character
+        && typeof value.character === 'object'
+    ) {
+        addOfficialAssets(
+            target,
+            listCharacterResources(value.character as Database['characters'][number]),
+        )
+    }
+}
+
+async function fingerprintDatabase(bytes: Uint8Array): Promise<string> {
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes as BufferSource)
+    return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('')
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
     if (!signal?.aborted) return
     throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
@@ -157,11 +192,12 @@ async function collectPinnedReferences(lease: PersistentRevisionLease): Promise<
     coldKeys: string[]
 }> {
     const root = (await lease.readRoot()).value
-    const assets = new Set(listDatabaseRootResources(root))
+    const assets = new Set<string>()
+    addOfficialAssets(assets, listDatabaseRootResources(root))
     const coldKeys = new Set<string>()
     for (const summary of await listCharacterSummaries(lease)) {
         const character = await readCompleteCharacter(lease, summary)
-        for (const key of listCharacterResources(character)) assets.add(key)
+        addOfficialAssets(assets, listCharacterResources(character))
         for (const key of listColdDataKeysFromCharacter(character)) coldKeys.add(key)
     }
     return {
@@ -190,6 +226,7 @@ class OfficialPinnedPublication implements PinnedPublication {
     private readonly replacements = new Map<string, string>()
     private readonly completedColdKeys = new Set<string>()
     private databaseBytes: Uint8Array | null = null
+    private databaseFingerprint: string | null = null
     private released = false
     private disposed = false
     private published = false
@@ -201,7 +238,10 @@ class OfficialPinnedPublication implements PinnedPublication {
         private readonly assets: readonly PinnedAsset[],
         private readonly coldValues: ReadonlyMap<string, PinnedColdValue>,
         private readonly dependencies: OfficialAccountSnapshotDependencies,
-        private readonly onPublished: (revision: DataRevision) => void,
+        private readonly onPublished: (
+            revision: DataRevision,
+            databaseFingerprint: string,
+        ) => void,
     ) {
         for (const asset of assets) {
             if (asset.remoteOnly) this.replacements.set(asset.key, asset.key)
@@ -233,10 +273,11 @@ class OfficialPinnedPublication implements PinnedPublication {
         this.databaseBytes ??= await concatenate(streamRisuSaveFromLease(this.lease, {
             replaceResources: replacementRecord,
         }))
+        this.databaseFingerprint ??= await fingerprintDatabase(this.databaseBytes)
         const result = await this.dependencies.account.writeItem(databaseKey, this.databaseBytes)
         requireWriteSuccess(result, databaseKey)
         await this.dependencies.markPublished(this.revision)
-        this.onPublished(this.revision)
+        this.onPublished(this.revision, this.databaseFingerprint)
         this.published = true
         await this.release()
     }
@@ -256,7 +297,7 @@ class OfficialPinnedPublication implements PinnedPublication {
 
 export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher {
     readonly capability = officialAccountSnapshotCapability
-    private associatedRevision: DataRevision | null = null
+    private associatedProjection: AssociatedProjection | null = null
 
     constructor(private readonly dependencies: OfficialAccountSnapshotDependencies) {}
 
@@ -265,17 +306,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         try {
             const blobs = await this.dependencies.resolveBlobs()
             const references = await collectPinnedReferences(lease)
-            const assets: PinnedAsset[] = []
-            for (const key of references.assets) {
-                const local = await blobs.stat(key)
-                if (local) {
-                    assets.push({ key, remoteOnly: false })
-                    continue
-                }
-                requireRemoteValue(await this.dependencies.account.readItem(key), key)
-                assets.push({ key, remoteOnly: true })
-            }
-
+            const assetKeys = new Set(references.assets)
             const coldValues = new Map<string, PinnedColdValue>()
             for (const key of references.coldKeys) {
                 const local = await this.dependencies.cold.readLocal(key)
@@ -287,6 +318,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                         value: safeStructuredClone(local),
                         remoteOnly: false,
                     })
+                    addColdCharacterAssets(assetKeys, local)
                     continue
                 }
                 const remote = await this.dependencies.cold.readRemote(key)
@@ -298,6 +330,18 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                     value: safeStructuredClone(remote),
                     remoteOnly: true,
                 })
+                addColdCharacterAssets(assetKeys, remote)
+            }
+
+            const assets: PinnedAsset[] = []
+            for (const key of [...assetKeys].sort()) {
+                const local = await blobs.stat(key)
+                if (local) {
+                    assets.push({ key, remoteOnly: false })
+                    continue
+                }
+                requireRemoteValue(await this.dependencies.account.readItem(key), key)
+                assets.push({ key, remoteOnly: true })
             }
 
             return new OfficialPinnedPublication(
@@ -307,8 +351,11 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 assets,
                 coldValues,
                 this.dependencies,
-                (publishedRevision) => {
-                    this.associatedRevision = publishedRevision
+                (publishedRevision, databaseFingerprint) => {
+                    this.associatedProjection = {
+                        revision: publishedRevision,
+                        databaseFingerprint,
+                    }
                 },
             )
         } catch (error) {
@@ -323,7 +370,13 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         const result = await this.dependencies.account.readItem(databaseKey, { signal })
         throwIfAborted(signal)
         if (result.kind === 'missing') return { kind: 'missing' }
-        if (result.kind === 'not-modified' && this.associatedRevision === expectedRevision) {
+        const databaseFingerprint = await fingerprintDatabase(result.bytes)
+        throwIfAborted(signal)
+        if (
+            result.kind === 'not-modified'
+            && this.associatedProjection?.revision === expectedRevision
+            && this.associatedProjection.databaseFingerprint === databaseFingerprint
+        ) {
             return { kind: 'unchanged' }
         }
 
@@ -333,15 +386,12 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         const candidate = await this.dependencies.prepareCandidate(decoded)
         validateCandidate(candidate)
 
-        const assetKeys = new Set(listDatabaseRootResources(candidate))
+        const assetKeys = new Set<string>()
+        addOfficialAssets(assetKeys, listDatabaseRootResources(candidate))
         const coldKeys = new Set<string>()
         for (const character of candidate.characters) {
-            for (const key of listCharacterResources(character)) assetKeys.add(key)
+            addOfficialAssets(assetKeys, listCharacterResources(character))
             for (const key of listColdDataKeysFromCharacter(character)) coldKeys.add(key)
-        }
-        for (const key of [...assetKeys].sort()) {
-            throwIfAborted(signal)
-            requireRemoteValue(await this.dependencies.account.readItem(key, { signal }), key)
         }
         for (const key of [...coldKeys].sort()) {
             throwIfAborted(signal)
@@ -350,6 +400,11 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             if (!isColdStorageBackupData(value)) {
                 throw new Error(`Invalid official cold payload: ${key}`)
             }
+            addColdCharacterAssets(assetKeys, value)
+        }
+        for (const key of [...assetKeys].sort()) {
+            throwIfAborted(signal)
+            requireRemoteValue(await this.dependencies.account.readItem(key, { signal }), key)
         }
 
         throwIfAborted(signal)
@@ -357,7 +412,10 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             candidate,
             expectedRevision,
         )
-        this.associatedRevision = activated.revision
+        this.associatedProjection = {
+            revision: activated.revision,
+            databaseFingerprint,
+        }
         return { kind: 'activated', revision: activated.revision }
     }
 }

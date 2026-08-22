@@ -1,6 +1,10 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
-import { coldStorageHeader, listCharacterResources } from '../../process/coldstorageData'
+import {
+    coldStorageHeader,
+    listCharacterResources,
+    listDatabaseRootResources,
+} from '../../process/coldstorageData'
 import type { AccountReadResult, AccountWriteResult } from '../accountStorage'
 import type { BlobMetadata, BlobStore } from '../blobStore'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
@@ -78,21 +82,11 @@ function makeDatabase(): Database {
 }
 
 function resources(database: Database): string[] {
-    return [
-        database.customBackground,
-        database.userIcon,
-        database.modules[0].assets[0][1],
-        database.modules[0].icon,
-        database.personas[0].icon,
-        database.personas[0].embeddedModule.assets[0][1],
-        database.personas[0].embeddedModule.icon,
-        (database.characterOrder[0] as any).imgFile,
-        database.characters[0].image,
-        database.characters[0].emotionImages[0][1],
-        (database.characters[0] as any).additionalAssets[0][1],
-        (database.characters[0] as any).vits.files.model,
-        (database.characters[0] as any).ccAssets[0].uri,
-    ].filter((value): value is string => !!value)
+    const { characters, ...root } = database
+    return [...new Set([
+        ...listDatabaseRootResources(root),
+        ...characters.flatMap((character) => listCharacterResources(character)),
+    ])]
 }
 
 function metadata(key: string, size: number): BlobMetadata {
@@ -266,6 +260,64 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         }
         expect(written.character.image).toBe('remote/assets/character.png')
         expect((localCold.get('cold-chat') as any).character.image).toBe('assets/mutated-after-pin.png')
+    })
+
+    it('pins and uploads an asset referenced only by a full cold character', async () => {
+        const database = makeDatabase()
+        const coldOnlyKey = 'assets/cold-only.ogg'
+        delete (database.characters[0] as any).additionalAssets
+        const coldCharacter = structuredClone(database.characters[0]) as any
+        coldCharacter.additionalAssets = [['cold audio', coldOnlyKey, 'ogg']]
+        const localBlobs = new Map(
+            resources(database).map((key, index) => [key, Uint8Array.of(index + 1)]),
+        )
+        localBlobs.set(coldOnlyKey, Uint8Array.of(99))
+        const harness = await makeHarness({
+            database,
+            blobs: localBlobs,
+            localCold: new Map([
+                ['cold-chat', { character: coldCharacter }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        await publication.publish()
+
+        expect(harness.blobStore.stat).toHaveBeenCalledWith(coldOnlyKey)
+        expect(harness.writeItem.mock.calls.some(([key]) => key === coldOnlyKey)).toBe(true)
+        const writtenCold = harness.cold.writeRemote.mock.calls.find(([key]) => key === 'cold-chat')![1] as any
+        expect(writtenCold.character.additionalAssets[0][1]).toBe(`remote/${coldOnlyKey}`)
+    })
+
+    it('leaves sentinel, URL, data URL, and Tauri path resources outside official asset I/O', async () => {
+        const database = makeDatabase() as any
+        database.customBackground = '-'
+        database.userIcon = 'https://example.invalid/user.png'
+        database.modules[0].icon = 'data:image/png;base64,AA=='
+        database.characters[0].image = 'C:\\app-data\\portrait.png'
+        const harness = await makeHarness({ database })
+
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        await publication.publish()
+
+        const excluded = [
+            '-',
+            'https://example.invalid/user.png',
+            'data:image/png;base64,AA==',
+            'C:\\app-data\\portrait.png',
+        ]
+        for (const key of excluded) {
+            expect(harness.blobStore.stat).not.toHaveBeenCalledWith(key)
+            expect(harness.readItem).not.toHaveBeenCalledWith(key)
+            expect(harness.writeItem.mock.calls.some(([written]) => written === key)).toBe(false)
+        }
+        const databaseWrite = harness.writes.find((write) => write.key === databaseKey)!
+        const projected = await decodeRisuSave(databaseWrite.bytes!) as any
+        expect(projected.customBackground).toBe('-')
+        expect(projected.userIcon).toBe('https://example.invalid/user.png')
+        expect(projected.modules[0].icon).toBe('data:image/png;base64,AA==')
+        expect(projected.characters[0].image).toBe('C:\\app-data\\portrait.png')
     })
 
     it('publishes the pinned snapshot after a later commit without creating a publication revision', async () => {
@@ -457,12 +509,116 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         expect(replace).not.toHaveBeenCalled()
     })
 
+    it('stages stale cached bytes when the revision matches but the fingerprint does not', async () => {
+        const local = makeDatabase()
+        const stale = makeDatabase()
+        stale.username = 'Cached A'
+        const fresh = makeDatabase()
+        fresh.username = 'Fresh B'
+        const staleBytes = encodeRisuSaveLegacy(stale, 'compression')
+        const freshBytes = encodeRisuSaveLegacy(fresh, 'compression')
+        const harness = await makeHarness({
+            database: local,
+            databaseRead: { kind: 'value', bytes: freshBytes },
+            remoteAssets: new Map(resources(fresh).map((key) => [key, Uint8Array.of(1)])),
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+        await harness.adapter.pull()
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'not-modified', bytes: staleBytes }
+            return { kind: 'value', bytes: Uint8Array.of(1) }
+        })
+
+        const result = await harness.adapter.pull()
+
+        expect(result.kind).toBe('activated')
+        expect((await harness.store.readRoot()).value.username).toBe('Cached A')
+    })
+
+    it('rejects an abort that arrives while fingerprinting associated cached bytes', async () => {
+        const database = makeDatabase()
+        const bytes = encodeRisuSaveLegacy(database, 'compression')
+        const harness = await makeHarness({
+            database,
+            databaseRead: { kind: 'value', bytes },
+            remoteAssets: new Map(resources(database).map((key) => [key, Uint8Array.of(1)])),
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+        await harness.adapter.pull()
+        harness.readItem.mockResolvedValue({ kind: 'not-modified', bytes })
+        const controller = new AbortController()
+        const originalDigest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle)
+        const digest = vi.spyOn(globalThis.crypto.subtle, 'digest').mockImplementation(
+            async (...args) => {
+                controller.abort()
+                return originalDigest(...args)
+            },
+        )
+
+        try {
+            await expect(harness.adapter.pull(controller.signal)).rejects.toMatchObject({
+                name: 'AbortError',
+            })
+        } finally {
+            digest.mockRestore()
+        }
+    })
+
+    it('validates cold-character-only assets and ignores non-account resource values before pull activation', async () => {
+        const remote = makeDatabase() as any
+        remote.customBackground = '-'
+        remote.userIcon = 'https://example.invalid/user.png'
+        remote.modules[0].icon = 'data:image/png;base64,AA=='
+        remote.characters[0].image = 'C:\\app-data\\portrait.png'
+        const coldOnlyKey = 'assets/pull-cold-only.bin'
+        const coldCharacter = structuredClone(remote.characters[0]) as any
+        coldCharacter.additionalAssets = [['cold only', coldOnlyKey, 'bin']]
+        delete remote.characters[0].additionalAssets
+        const bytes = encodeRisuSaveLegacy(remote, 'compression')
+        const remoteAssets = new Map(
+            resources(remote)
+                .filter((key) => key.startsWith('assets/'))
+                .map((key) => [key, Uint8Array.of(1)]),
+        )
+        const harness = await makeHarness({
+            databaseRead: { kind: 'value', bytes },
+            remoteAssets,
+            remoteCold: new Map([
+                ['cold-chat', { character: coldCharacter }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+
+        await expect(harness.adapter.pull()).rejects.toThrow(`Missing official asset: ${coldOnlyKey}`)
+
+        expect(replace).not.toHaveBeenCalled()
+        for (const key of [
+            '-',
+            'https://example.invalid/user.png',
+            'data:image/png;base64,AA==',
+            'C:\\app-data\\portrait.png',
+        ]) {
+            expect(harness.readItem).not.toHaveBeenCalledWith(key, expect.anything())
+        }
+    })
+
     it('rejects missing assets and invalid cold payloads before activation', async () => {
         const remote = makeDatabase()
         const bytes = encodeRisuSaveLegacy(remote, 'compression')
         const missingAsset = await makeHarness({
             databaseRead: { kind: 'value', bytes },
             remoteAssets: new Map(),
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
         })
         const missingReplace = vi.spyOn(missingAsset.store, 'replaceFromDatabase')
         await expect(missingAsset.adapter.pull()).rejects.toThrow('Missing official asset')
