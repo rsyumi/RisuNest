@@ -83,4 +83,61 @@ describe('migration payload stage', () => {
         await factory.removeGeneration('stage_2', 'legacy')
         expect([...fixture.values.keys()].some((key) => key.includes('/stage_2/'))).toBe(false)
     })
+
+    test('rejects mutations through a handle reopened after the physical seal exists', async () => {
+        const fixture = backendFixture()
+        const factory = createMigrationPayloadStageFactory({ ...fixture, createGenerationId: () => 'sealed_1' })
+        const stage = factory.create('legacy')
+        const database = new Uint8Array([9])
+        const manifest = createLosslessMigrationManifest([{
+            kind: 'database', id: 'database.risudat', metadata: {}, size: 1, sha256: await sha256(database),
+        }])
+        const manifestHash = await hashLosslessMigrationManifest(manifest)
+        await stage.seal(manifest, manifestHash)
+        const reopened = factory.open('sealed_1', 'legacy')
+        const late = new Uint8Array([1])
+
+        await expect(reopened.put({
+            kind: 'asset', id: 'assets/late.png',
+            metadata: { kind: 'asset', mime: 'image/png', name: 'late.png', ext: 'png' },
+            size: 1, sha256: await sha256(late), data: late,
+        })).rejects.toThrow(/sealed/i)
+        await expect(reopened.seal(manifest, manifestHash)).rejects.toThrow(/sealed/i)
+        expect(await fixture.blobs.open({ kind: 'generation', id: 'sealed_1' }).read('assets/late.png')).toBeNull()
+    })
+
+    test('does not bypass a physical seal after its first seal read fails', async () => {
+        const fixture = backendFixture()
+        fixture.values.set(
+            'blobstore/generations/sealed_retry/migration-manifest.json',
+            new TextEncoder().encode('{}'),
+        )
+        let failSealRead = true
+        const backend = {
+            ...fixture.backend,
+            async read(key: string) {
+                if (failSealRead && key.endsWith('/migration-manifest.json')) {
+                    failSealRead = false
+                    throw new Error('transient seal read failure')
+                }
+                return fixture.backend.read(key)
+            },
+        }
+        const factory = createMigrationPayloadStageFactory({
+            backend,
+            blobs: createKeyValueRootedBlobStoreFactory(backend),
+            cold: fixture.cold,
+        })
+        const stage = factory.open('sealed_retry', 'legacy')
+        const late = new Uint8Array([1])
+        const entry = {
+            kind: 'asset' as const, id: 'assets/late.png',
+            metadata: { kind: 'asset' as const, mime: 'image/png', name: 'late.png', ext: 'png' },
+            size: 1, sha256: await sha256(late), data: late,
+        }
+
+        await expect(stage.put(entry)).rejects.toThrow('transient seal read failure')
+        await expect(stage.put(entry)).rejects.toThrow(/sealed/i)
+        expect(await fixture.blobs.open({ kind: 'generation', id: 'sealed_retry' }).read(entry.id)).toBeNull()
+    })
 })

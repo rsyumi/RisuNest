@@ -16,13 +16,13 @@ export class ActivePayloadRoot implements ActiveBlobRootResolver, ActiveColdRoot
 
     install(tuple: ActivePersistentTuple): void {
         rootFromTuple(tuple)
-        this.tuple = tuple
+        this.tuple = Object.freeze({ ...tuple })
     }
 
     async refresh(): Promise<ActivePersistentTuple> {
         const tuple = await this.store.readActiveTuple()
         this.install(tuple)
-        return tuple
+        return this.current()
     }
 
     current(): ActivePersistentTuple {

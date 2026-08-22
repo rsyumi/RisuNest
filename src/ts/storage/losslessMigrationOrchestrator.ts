@@ -179,7 +179,11 @@ export function createLosslessMigrationOrchestrator(
                             dependencies.onCleanupError?.(cleanupError)
                         }
                         if (payloadRemoved && prepared) {
-                            await dependencies.store.discardPreparedReplacement(prepared)
+                            try {
+                                await dependencies.store.discardPreparedReplacement(prepared)
+                            } catch (cleanupError) {
+                                dependencies.onCleanupError?.(cleanupError)
+                            }
                         }
                     }
                     throw error
@@ -195,21 +199,25 @@ export function createLosslessMigrationOrchestrator(
                     const root = payloadRoot(tuple)
                     const blobs = dependencies.blobs.open(root)
                     const cold = dependencies.cold.open(root)
-                    const database = await dependencies.encodeDatabase(lease)
-                    const entries: LosslessMigrationInputEntry[] = [{
-                        kind: 'database', id: 'database.risudat', metadata: {}, data: database,
-                    }]
-                    for (const metadata of [...await blobs.list()].sort((a, b) => a.key.localeCompare(b.key))) {
-                        const data = await blobs.read(metadata.key)
-                        if (data === null) throw new Error(`Missing live blob ${metadata.key}`)
-                        entries.push({ kind: metadata.kind, id: metadata.key, metadata: migrationMetadata(metadata), data })
+                    async function* entries(): AsyncIterable<LosslessMigrationInputEntry> {
+                        yield {
+                            kind: 'database',
+                            id: 'database.risudat',
+                            metadata: {},
+                            data: await dependencies.encodeDatabase(lease),
+                        }
+                        for (const metadata of [...await blobs.list()].sort((a, b) => a.key.localeCompare(b.key))) {
+                            const data = await blobs.read(metadata.key)
+                            if (data === null) throw new Error(`Missing live blob ${metadata.key}`)
+                            yield { kind: metadata.kind, id: metadata.key, metadata: migrationMetadata(metadata), data }
+                        }
+                        for (const id of await cold.list()) {
+                            const data = await cold.read(id)
+                            if (data === null) throw new Error(`Missing live cold payload ${id}`)
+                            yield { kind: 'cold', id, metadata: {}, data }
+                        }
                     }
-                    for (const id of await cold.list()) {
-                        const data = await cold.read(id)
-                        if (data === null) throw new Error(`Missing live cold payload ${id}`)
-                        entries.push({ kind: 'cold', id, metadata: {}, data })
-                    }
-                    return await encodeLosslessMigrationPackage(entries)
+                    return await encodeLosslessMigrationPackage(entries())
                 } finally {
                     await lease.release()
                 }

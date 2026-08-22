@@ -134,8 +134,14 @@ export function createMigrationPayloadStageFactory(input: {
         const cold = input.cold.open(root)
         const identities = new Set<string>()
         let sealed = false
+        let sealStateChecked = false
 
-        const requireMutable = () => {
+        const requireMutable = async () => {
+            if (sealed) throw new Error('Migration payload stage is sealed')
+            if (!sealStateChecked) {
+                sealed = await input.backend.read(sealKey(payloadGeneration)) !== null
+                sealStateChecked = true
+            }
             if (sealed) throw new Error('Migration payload stage is sealed')
         }
 
@@ -162,7 +168,7 @@ export function createMigrationPayloadStageFactory(input: {
         return {
             payloadGeneration,
             async put(entry) {
-                requireMutable()
+                await requireMutable()
                 if (entry.kind === 'database') throw new Error('Database bytes are not payload-stage entries')
                 const identity = `${entry.kind}\0${entry.id}`
                 if (identities.has(identity)) throw new Error(`Duplicate staged migration entry ${entry.id}`)
@@ -186,7 +192,7 @@ export function createMigrationPayloadStageFactory(input: {
                 return decodeCold(data)
             },
             async seal(manifest, manifestHash) {
-                requireMutable()
+                await requireMutable()
                 const canonical = createLosslessMigrationManifest(manifest.entries)
                 if (await hashLosslessMigrationManifest(canonical) !== manifestHash) {
                     throw new Error('Migration manifest hash mismatch before sealing')
@@ -211,6 +217,7 @@ export function createMigrationPayloadStageFactory(input: {
                 }
                 await input.backend.write(sealKey(payloadGeneration), encoder.encode(JSON.stringify(seal)))
                 sealed = true
+                sealStateChecked = true
                 await this.verifySeal()
             },
             async verifySeal() {
@@ -219,6 +226,7 @@ export function createMigrationPayloadStageFactory(input: {
                     throw new Error('Migration payload seal does not match its stage')
                 }
                 sealed = true
+                sealStateChecked = true
                 return seal
             },
         }

@@ -70,4 +70,18 @@ describe('storage mutation gate', () => {
         await expect(next).resolves.toBe('continued')
         expect(maximum).toBe(1)
     })
+
+    test.each([
+        ['shared write', 'runWrite', 'runMigration'],
+        ['exclusive migration', 'runMigration', 'runWrite'],
+    ] as const)('releases a %s lock when its callback throws synchronously', async (_name, failing, following) => {
+        const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
+        const error = new Error('synchronous failure')
+
+        await expect(gate[failing](() => { throw error })).rejects.toBe(error)
+        await expect(Promise.race([
+            gate[following](async () => 'continued'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('stranded'), 50)),
+        ])).resolves.toBe('continued')
+    })
 })

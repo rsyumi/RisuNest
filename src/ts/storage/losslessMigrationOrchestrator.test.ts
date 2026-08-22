@@ -10,10 +10,18 @@ import { createKeyValueRootedBlobStoreFactory } from './platformBlobStore'
 import { createKeyValueColdPayloadStore, createRootedColdPayloadStoreFactory } from './platformColdPayloadStore'
 import { createMigrationPayloadStageFactory } from './migrationPayloadStage'
 import { createLosslessMigrationOrchestrator } from './losslessMigrationOrchestrator'
-import type { ActivePersistentTuple, PreparedPersistentReplacement } from './persistentDataStore'
+import {
+    RevisionConflictError,
+    type ActivePersistentTuple,
+    type PreparedPersistentReplacement,
+} from './persistentDataStore'
 import { makeLosslessMigrationFixture, migrationFixtureReferences } from './tests/losslessMigrationFixtures'
 
-function fixture(onInterruption?: (point: string) => void | Promise<void>) {
+function fixture(options: {
+    onInterruption?: (point: string) => void | Promise<void>
+    onCleanupError?: (error: unknown) => void
+    blobsOverride?: ReturnType<typeof createKeyValueRootedBlobStoreFactory>
+} = {}) {
     const values = new Map<string, Uint8Array>()
     const backend = {
         write: async (key: string, value: Uint8Array) => void values.set(key, value.slice()),
@@ -56,7 +64,7 @@ function fixture(onInterruption?: (point: string) => void | Promise<void>) {
     const orchestrator = createLosslessMigrationOrchestrator({
         store: store as never,
         stages,
-        blobs,
+        blobs: options.blobsOverride ?? blobs,
         cold,
         runMigration: async (_reason, operation) => operation(),
         decodeDatabase: async (bytes) => JSON.parse(new TextDecoder().decode(bytes)) as Database,
@@ -65,7 +73,8 @@ function fixture(onInterruption?: (point: string) => void | Promise<void>) {
         collectReferences: () => migrationFixtureReferences,
         installActiveTuple: install,
         publishDatabase: publish,
-        onInterruption,
+        onInterruption: options.onInterruption,
+        onCleanupError: options.onCleanupError,
     })
     return { values, backend, blobs, cold, stages, store, orchestrator, install, publish, getTuple: () => tuple }
 }
@@ -98,9 +107,9 @@ describe('lossless migration orchestrator', () => {
     })
 
     test('cleans an interrupted sealed stage and leaves the old tuple authoritative', async () => {
-        const target = fixture((point) => {
+        const target = fixture({ onInterruption: (point) => {
             if (point === 'after-seal') throw new Error('simulated interruption')
-        })
+        } })
         await expect(target.orchestrator.importPackage(await packageFixture())).rejects.toThrow('simulated interruption')
         expect(target.getTuple()).toEqual({ revision: 1, dataGeneration: 'data-1', payloadGeneration: 'legacy' })
         expect([...target.values.keys()].some((key) => key.includes('/import_1/'))).toBe(false)
@@ -129,6 +138,35 @@ describe('lossless migration orchestrator', () => {
         expect(lease.release).toHaveBeenCalledOnce()
     })
 
+    test('snapshots each exported source before a backend reuses its read buffer', async () => {
+        const scratch = new Uint8Array(1)
+        const metadata = [
+            { key: 'assets/first.png', kind: 'asset' as const, size: 1, mime: 'image/png', name: 'first.png', ext: 'png' },
+            { key: 'assets/second.png', kind: 'asset' as const, size: 1, mime: 'image/png', name: 'second.png', ext: 'png' },
+        ]
+        const blobsOverride = {
+            open: () => ({
+                put: vi.fn(), stat: vi.fn(), remove: vi.fn(), resolveUrl: vi.fn(),
+                list: async () => metadata,
+                read: async (key: string) => {
+                    scratch[0] = key.includes('first') ? 1 : 2
+                    return scratch
+                },
+            }),
+        } as never
+        const target = fixture({ blobsOverride })
+        const decoded = await decodeLosslessMigrationPackage(await target.orchestrator.exportPackage())
+        const values = new Map<string, number>()
+        for await (const entry of decoded.entries()) {
+            if (entry.kind === 'asset') values.set(entry.id, entry.data[0])
+        }
+
+        expect(values).toEqual(new Map([
+            ['assets/first.png', 1],
+            ['assets/second.png', 2],
+        ]))
+    })
+
     test('recovers inactive prepared roots payload-first and never auto-activates', async () => {
         const target = fixture()
         const stage = target.stages.create('legacy')
@@ -144,5 +182,25 @@ describe('lossless migration orchestrator', () => {
         expect(target.store.discardPreparedReplacement).toHaveBeenCalledWith(handle)
         expect(target.store.activatePreparedReplacement).not.toHaveBeenCalled()
         expect([...target.values.keys()].some((key) => key.includes(`/${stage.payloadGeneration}/`))).toBe(false)
+    })
+
+    test('preserves the activation conflict when prepared-marker cleanup also fails', async () => {
+        const onCleanupError = vi.fn()
+        const target = fixture({ onCleanupError })
+        const conflict = new RevisionConflictError(1, 2)
+        const cleanup = new Error('discard failed')
+        target.store.activatePreparedReplacement.mockRejectedValueOnce(conflict)
+        target.store.discardPreparedReplacement.mockRejectedValueOnce(cleanup)
+
+        await expect(target.orchestrator.importPackage(await packageFixture())).rejects.toBe(conflict)
+
+        expect(target.store.activatePreparedReplacement).toHaveBeenCalledOnce()
+        expect(target.getTuple()).toEqual({ revision: 1, dataGeneration: 'data-1', payloadGeneration: 'legacy' })
+        expect(await target.store.listPreparedReplacements()).toHaveLength(1)
+        expect(onCleanupError).toHaveBeenCalledWith(cleanup)
+
+        await target.orchestrator.recoverInterruptedMigrations()
+        expect(await target.store.listPreparedReplacements()).toHaveLength(0)
+        expect(target.store.discardPreparedReplacement).toHaveBeenCalledTimes(2)
     })
 })

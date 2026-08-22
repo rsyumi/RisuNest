@@ -34,7 +34,7 @@ export function createInRealmStorageLockManager(): StorageLockManager {
     const start = (job: QueuedOperation) => {
         if (job.mode === 'shared') sharedCount++
         else exclusive = true
-        void job.operation().then(
+        void Promise.resolve().then(job.operation).then(
             (value) => finish(job, true, value),
             (error) => finish(job, false, error),
         )
