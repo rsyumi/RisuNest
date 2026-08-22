@@ -5,6 +5,8 @@ import {
     createLegacyOpfsColdPayloadStore,
     createLegacyTauriColdPayloadStore,
     createRootedColdPayloadStoreFactory,
+    createGatedResolvingColdPayloadStore,
+    createPlatformRootedColdPayloadStoreFactory,
     generatedColdPayloadKey,
 } from './platformColdPayloadStore'
 
@@ -20,6 +22,75 @@ function memoryBackend(initial: Record<string, Uint8Array> = {}) {
 }
 
 describe('rooted cold payload storage', () => {
+    test('shares the generated backend with the platform blob factory seam', async () => {
+        const backend = memoryBackend()
+        const legacy = createLegacyNodeColdPayloadStore(backend)
+        const factory = await createPlatformRootedColdPayloadStoreFactory(legacy, async () => backend)
+        const generated = factory.open({ kind: 'generation', id: 'shared' })
+
+        await generated.write('zero', new Uint8Array())
+
+        expect(backend.values.get(generatedColdPayloadKey('shared', 'zero'))).toEqual(new Uint8Array())
+        expect(await legacy.read('zero')).toBeNull()
+    })
+
+    test('gates only cold writes and refreshes before selecting one active root', async () => {
+        const backend = memoryBackend()
+        const factory = createRootedColdPayloadStoreFactory({
+            legacy: createLegacyNodeColdPayloadStore(backend),
+            generatedBackend: backend,
+        })
+        const events: string[] = []
+        let root = { kind: 'generation' as const, id: 'old' }
+        const resolver = {
+            refresh: async () => { events.push('refresh'); root = { kind: 'generation', id: 'current' } },
+            getActiveColdRoot: () => { events.push(`resolve:${root.id}`); return root },
+        }
+        const gate = {
+            async runWrite<T>(operation: () => Promise<T>) { events.push('lock'); return operation() },
+            async runMigration<T>(operation: () => Promise<T>) { return operation() },
+        }
+        const store = createGatedResolvingColdPayloadStore(factory, resolver, gate)
+
+        await store.write('same', new Uint8Array([7]))
+        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
+        expect(await factory.open({ kind: 'generation', id: 'current' }).read('same')).toEqual(new Uint8Array([7]))
+
+        events.length = 0
+        expect(await store.read('same')).toEqual(new Uint8Array([7]))
+        expect(await store.list()).toEqual(['same'])
+        expect(events).toEqual(['resolve:current', 'resolve:current'])
+
+        events.length = 0
+        await store.remove('same')
+        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
+    })
+
+    test('owns cold bytes before a deferred write gate proceeds', async () => {
+        const backend = memoryBackend()
+        const factory = createRootedColdPayloadStoreFactory({
+            legacy: createLegacyNodeColdPayloadStore(backend),
+            generatedBackend: backend,
+        })
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const gate = {
+            async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
+            async runMigration<T>(operation: () => Promise<T>) { return operation() },
+        }
+        const store = createGatedResolvingColdPayloadStore(factory, {
+            async refresh() {},
+            getActiveColdRoot() { return { kind: 'generation', id: 'current' } },
+        }, gate)
+        const source = new Uint8Array([1])
+        const pending = store.write('same', source)
+        source[0] = 9
+        release()
+
+        await pending
+        expect(await factory.open({ kind: 'generation', id: 'current' }).read('same')).toEqual(new Uint8Array([1]))
+    })
+
     test('preserves exact legacy Tauri, Node, and OPFS names', async () => {
         const backend = memoryBackend()
         const tauri = createLegacyTauriColdPayloadStore(backend)

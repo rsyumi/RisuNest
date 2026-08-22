@@ -6,6 +6,7 @@ import {
     getInlayAssetBlob,
     listInlayAssets,
     migrateLegacyInlayAsset,
+    readLegacyInlayPayload,
     postInlayAsset,
     removeInlayAsset,
     saveInlayedSignature,
@@ -520,6 +521,30 @@ describe('set -> remove -> get', () => {
 })
 
 describe('BlobStore inlay compatibility', () => {
+    test('reads all historical inlay kinds as exact bytes and metadata without mutation', async () => {
+        const fixtures: Array<[string, InlayAsset, Uint8Array, string]> = [
+            ['image', { data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }), ext: 'png', name: 'a.png', type: 'image', width: 2, height: 1 }, new Uint8Array([1, 2]), 'image/png'],
+            ['audio', { data: 'data:audio/mpeg;base64,AwQ=', ext: 'mp3', name: 'a.mp3', type: 'audio' }, new Uint8Array([3, 4]), 'audio/mpeg'],
+            ['video', { data: new Blob([new Uint8Array()], { type: 'video/webm' }), ext: 'webm', name: 'a.webm', type: 'video' }, new Uint8Array(), 'video/webm'],
+            ['signature', { data: '{"source":"synthetic"}', ext: 'json', name: 'sig', type: 'signature' }, new TextEncoder().encode('{"source":"synthetic"}'), 'application/json'],
+        ]
+        for (const [id, asset, bytes, mime] of fixtures) store.set(id, asset)
+        const before = new Map(store)
+
+        for (const [id, asset, bytes, mime] of fixtures) {
+            expect(await readLegacyInlayPayload(id)).toEqual({
+                data: bytes,
+                metadata: {
+                    kind: 'inlay', inlayType: asset.type, mime, name: asset.name, ext: asset.ext,
+                    ...(asset.width === undefined ? {} : { width: asset.width }),
+                    ...(asset.height === undefined ? {} : { height: asset.height }),
+                },
+            })
+        }
+        expect(store).toEqual(before)
+        expect(await readLegacyInlayPayload('missing')).toBeNull()
+    })
+
     test('round trips image, audio, video, and signature bytes', async () => {
         const fixtures: [string, InlayAsset, Uint8Array][] = [
             ['image', { data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }), ext: 'png', name: 'a.png', type: 'image', width: 2, height: 1 }, new Uint8Array([1, 2])],

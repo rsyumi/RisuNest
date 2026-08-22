@@ -13,6 +13,7 @@ import {
     type BlobStore,
 } from './blobStore'
 import { assertGeneratedStorageRootId, type BlobStorageRoot } from './storageRoot'
+import type { StorageMutationGate } from './storageMutationGate'
 export type { BlobStorageRoot } from './storageRoot'
 
 export interface RootedBlobStoreFactory {
@@ -76,6 +77,36 @@ export function createResolvingBlobStore(factory: RootedBlobStoreFactory, resolv
         async stat(key) { return (await resolve()).stat(key) },
         async list(query) { return (await resolve()).list(query) },
         async remove(key) { return (await resolve()).remove(key) },
+        async resolveUrl(key) { return (await resolve()).resolveUrl(key) },
+    }
+}
+
+export interface RefreshingActiveBlobRootResolver extends ActiveBlobRootResolver {
+    refresh(): Promise<unknown>
+}
+
+export function createGatedResolvingBlobStore(
+    factory: RootedBlobStoreFactory,
+    resolver: RefreshingActiveBlobRootResolver,
+    gate: StorageMutationGate,
+): BlobStore {
+    const resolve = async () => factory.open(await resolver.getActiveRoot())
+    const resolveAfterRefresh = async () => {
+        await resolver.refresh()
+        return resolve()
+    }
+    return {
+        async put(key, data, metadata) {
+            const ownedData = data.slice()
+            const ownedMetadata = { ...metadata }
+            return gate.runWrite(async () => (await resolveAfterRefresh()).put(key, ownedData, ownedMetadata))
+        },
+        async read(key, range) { return (await resolve()).read(key, range) },
+        async stat(key) { return (await resolve()).stat(key) },
+        async list(query) { return (await resolve()).list(query) },
+        async remove(key) {
+            return gate.runWrite(async () => (await resolveAfterRefresh()).remove(key))
+        },
         async resolveUrl(key) { return (await resolve()).resolveUrl(key) },
     }
 }

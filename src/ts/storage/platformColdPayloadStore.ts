@@ -1,6 +1,8 @@
 import type { BlobKeyValueBackend } from './blobStore'
-import type { ColdPayloadStore, RootedColdPayloadStoreFactory } from './coldPayloadStore'
+import type { ActiveColdRootResolver, ColdPayloadStore, RootedColdPayloadStoreFactory } from './coldPayloadStore'
 import { assertGeneratedStorageRootId, type BlobStorageRoot } from './storageRoot'
+import type { StorageMutationGate } from './storageMutationGate'
+import { getPlatformBlobKeyValueBackend } from './platformBlobStore'
 
 export interface ColdPayloadKeyMapper {
     key(logicalKey: string): string
@@ -120,4 +122,54 @@ export function createRootedColdPayloadStoreFactory(input: {
             return store
         },
     }
+}
+
+export interface RefreshingActiveColdRootResolver extends ActiveColdRootResolver {
+    refresh(): Promise<unknown>
+}
+
+export function createResolvingColdPayloadStore(
+    factory: RootedColdPayloadStoreFactory,
+    resolver: ActiveColdRootResolver,
+): ColdPayloadStore {
+    const resolve = () => factory.open(resolver.getActiveColdRoot())
+    return {
+        async read(key) { return resolve().read(key) },
+        async write(key, data) { return resolve().write(key, data) },
+        async list() { return resolve().list() },
+        async remove(key) { return resolve().remove(key) },
+    }
+}
+
+export function createGatedResolvingColdPayloadStore(
+    factory: RootedColdPayloadStoreFactory,
+    resolver: RefreshingActiveColdRootResolver,
+    gate: StorageMutationGate,
+): ColdPayloadStore {
+    const resolve = () => factory.open(resolver.getActiveColdRoot())
+    const resolveAfterRefresh = async () => {
+        await resolver.refresh()
+        return resolve()
+    }
+    return {
+        async read(key) { return resolve().read(key) },
+        async write(key, data) {
+            const ownedData = data.slice()
+            return gate.runWrite(async () => (await resolveAfterRefresh()).write(key, ownedData))
+        },
+        async list() { return resolve().list() },
+        async remove(key) {
+            return gate.runWrite(async () => (await resolveAfterRefresh()).remove(key))
+        },
+    }
+}
+
+export async function createPlatformRootedColdPayloadStoreFactory(
+    legacy: ColdPayloadStore,
+    resolveBackend: () => Promise<BlobKeyValueBackend> = getPlatformBlobKeyValueBackend,
+): Promise<RootedColdPayloadStoreFactory> {
+    return createRootedColdPayloadStoreFactory({
+        legacy,
+        generatedBackend: await resolveBackend(),
+    })
 }

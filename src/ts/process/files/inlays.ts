@@ -4,7 +4,7 @@ import { getImageType } from "src/ts/media";
 import { getDatabase } from "../../storage/database.svelte";
 import { getModelInfo, LLMFlags, LLMFormat } from "src/ts/model/modellist";
 import { asBuffer } from "../../util";
-import { type BlobMetadata, type BlobStore, type InlayBlobMetadata } from "../../storage/blobStore";
+import { type BlobMetadata, type BlobStore, type BlobWriteMetadata, type InlayBlobMetadata } from "../../storage/blobStore";
 import { resolveBlobStore } from "../../storage/platformBlobStore";
 
 export type InlayAsset = {
@@ -205,30 +205,43 @@ export async function readLegacyInlayAsset(id: string): Promise<InlayAsset | nul
     return await inlayStorage.getItem<InlayAsset | null>(id)
 }
 
+export async function readLegacyInlayPayload(id: string): Promise<{
+    data: Uint8Array
+    metadata: BlobWriteMetadata
+} | null> {
+    const asset = await readLegacyInlayAsset(id)
+    if (!asset) return null
+    const { bytes, mime } = await inlayBytes(asset)
+    return {
+        data: bytes,
+        metadata: {
+            kind: 'inlay',
+            inlayType: asset.type,
+            mime,
+            name: asset.name,
+            ext: asset.ext,
+            ...(asset.width === undefined ? {} : { width: asset.width }),
+            ...(asset.height === undefined ? {} : { height: asset.height }),
+        },
+    }
+}
+
 async function migrateLegacyInlayAssetInStore(id: string, blobStore: BlobStore): Promise<BlobMetadata | null> {
     const existing = await blobStore.stat(id)
     if (existing?.kind === 'inlay') return existing
-    const legacy = await readLegacyInlayAsset(id)
-    if (!legacy) return null
-    const { bytes, mime } = await inlayBytes(legacy)
+    const legacy = await readLegacyInlayPayload(id)
+    if (!legacy || legacy.metadata.kind !== 'inlay') return null
+    const { data: bytes, metadata } = legacy
     let written: BlobMetadata
     try {
-        written = await blobStore.put(id, bytes, {
-            kind: 'inlay',
-            inlayType: legacy.type,
-            mime,
-            name: legacy.name,
-            ext: legacy.ext,
-            width: legacy.width,
-            height: legacy.height,
-        })
+        written = await blobStore.put(id, bytes, metadata)
         const verifiedMetadata = await blobStore.stat(id)
         const verifiedBytes = await blobStore.read(id)
         if (!verifiedMetadata || verifiedMetadata.kind !== 'inlay' || !verifiedBytes
-            || written.kind !== 'inlay' || verifiedMetadata.inlayType !== legacy.type
-            || verifiedMetadata.name !== legacy.name
-            || verifiedMetadata.ext !== legacy.ext.replace(/^\.+/, '').toLowerCase()
-            || verifiedMetadata.width !== legacy.width || verifiedMetadata.height !== legacy.height
+            || written.kind !== 'inlay' || verifiedMetadata.inlayType !== metadata.inlayType
+            || verifiedMetadata.name !== metadata.name
+            || verifiedMetadata.ext !== metadata.ext.replace(/^\.+/, '').toLowerCase()
+            || verifiedMetadata.width !== metadata.width || verifiedMetadata.height !== metadata.height
             || verifiedMetadata.mime !== written.mime || verifiedMetadata.size !== bytes.byteLength
             || !bytesEqual(verifiedBytes, bytes)) {
             await blobStore.remove(id)

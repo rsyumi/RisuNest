@@ -1,5 +1,6 @@
 import { safeStructuredClone } from "../polyfill"
 import type { Database, character, groupChat } from "../storage/database.svelte"
+import { compress, decompress } from 'fflate'
 
 export const coldStorageHeader = '\uEF01COLDSTORAGE\uEF01'
 
@@ -20,6 +21,38 @@ export function isColdStorageBackupData(data: unknown): boolean {
     return !!data
         && typeof data === 'object'
         && ('character' in data || 'message' in data)
+}
+
+function compressBytes(data: Uint8Array): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+        compress(data, (error, result) => error ? reject(error) : resolve(result))
+    })
+}
+
+function decompressBytes(data: Uint8Array): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+        decompress(data, (error, result) => error ? reject(error) : resolve(result))
+    })
+}
+
+export async function encodeColdStoragePayload(value: unknown): Promise<Uint8Array> {
+    if (!isColdStorageBackupData(value)) {
+        throw new TypeError('Cold storage payload has an unsupported value')
+    }
+    return compressBytes(new TextEncoder().encode(JSON.stringify(value)))
+}
+
+export async function decodeColdStoragePayload(data: Uint8Array): Promise<unknown> {
+    let value: unknown
+    try {
+        value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await decompressBytes(data)))
+    } catch {
+        throw new TypeError('Cold storage payload is not valid compressed JSON')
+    }
+    if (!isColdStorageBackupData(value)) {
+        throw new TypeError('Cold storage payload has an unsupported value')
+    }
+    return value
 }
 
 function replaceData(

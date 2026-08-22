@@ -12,9 +12,24 @@ import {
     replaceCharacterResources,
     replaceColdStoragePayloadResources,
     replaceDatabaseRootResources,
+    decodeColdStoragePayload,
+    encodeColdStoragePayload,
 } from './coldstorageData'
 
 describe('coldstorageData', () => {
+    it.each([
+        { character: { name: 'Current' } },
+        { message: [{ data: 'Current chat' }] },
+        [{ data: 'Legacy chat' }],
+    ])('round trips current and legacy compressed JSON payloads', async (value) => {
+        expect(await decodeColdStoragePayload(await encodeColdStoragePayload(value))).toEqual(value)
+    })
+
+    it('rejects unsupported values and invalid compressed JSON', async () => {
+        await expect(encodeColdStoragePayload({ unrelated: true })).rejects.toThrow('unsupported')
+        await expect(decodeColdStoragePayload(new Uint8Array([1, 2, 3]))).rejects.toThrow('compressed JSON')
+    })
+
     it('lists and replaces the exact database root resource fields symmetrically', () => {
         const root = {
             customBackground: 'assets/background.png',

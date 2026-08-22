@@ -5,6 +5,7 @@ import {
     createStorageRootedBlobStoreFactory,
     createTauriBlobBackend,
     createKeyValueRootedBlobStoreFactory,
+    createGatedResolvingBlobStore,
     createResolvingBlobStore,
     physicalBlobKeys,
     readBlobForFacade,
@@ -26,6 +27,73 @@ function memoryBackend() {
 }
 
 describe('rooted BlobStore mapping', () => {
+    test('gates only writes, refreshes after locking, and resolves one concrete root', async () => {
+        const { backend } = memoryBackend()
+        const factory = createKeyValueRootedBlobStoreFactory(backend)
+        const events: string[] = []
+        let root = { kind: 'generation' as const, id: 'old' }
+        const resolver = {
+            async refresh() {
+                events.push('refresh')
+                root = { kind: 'generation', id: 'current' }
+            },
+            async getActiveRoot() {
+                events.push(`resolve:${root.id}`)
+                return root
+            },
+        }
+        const gate = {
+            async runWrite<T>(operation: () => Promise<T>) {
+                events.push('lock')
+                return operation()
+            },
+            async runMigration<T>(operation: () => Promise<T>) { return operation() },
+        }
+        const store = createGatedResolvingBlobStore(factory, resolver, gate)
+        const metadata = { kind: 'asset' as const, mime: 'application/octet-stream', name: 'a', ext: '' }
+
+        await store.put('assets/a', new Uint8Array([1]), metadata)
+        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
+        expect(await factory.open({ kind: 'generation', id: 'current' }).read('assets/a')).toEqual(new Uint8Array([1]))
+
+        events.length = 0
+        await store.read('assets/a')
+        await store.stat('assets/a')
+        await store.list()
+        await store.resolveUrl('assets/a')
+        expect(events).toEqual([
+            'resolve:current', 'resolve:current', 'resolve:current', 'resolve:current',
+        ])
+
+        events.length = 0
+        await store.remove('assets/a')
+        expect(events).toEqual(['lock', 'refresh', 'resolve:current'])
+    })
+
+    test('owns blob bytes before a deferred write gate proceeds', async () => {
+        const { backend } = memoryBackend()
+        const factory = createKeyValueRootedBlobStoreFactory(backend)
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const gate = {
+            async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
+            async runMigration<T>(operation: () => Promise<T>) { return operation() },
+        }
+        const store = createGatedResolvingBlobStore(factory, {
+            async refresh() {},
+            async getActiveRoot() { return { kind: 'generation', id: 'current' } },
+        }, gate)
+        const source = new Uint8Array([1])
+        const pending = store.put('assets/a', source, {
+            kind: 'asset', mime: 'application/octet-stream', name: 'a', ext: '',
+        })
+        source[0] = 9
+        release()
+
+        await pending
+        expect(await factory.open({ kind: 'generation', id: 'current' }).read('assets/a')).toEqual(new Uint8Array([1]))
+    })
+
     test('preserves legacy paths and encodes raw inlay ids', () => {
         expect(physicalBlobKeys({ kind: 'legacy' }, 'assets/photo.jpg')).toEqual({
             payload: 'assets/photo.jpg',
