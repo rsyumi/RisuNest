@@ -7,8 +7,8 @@ import {
     storeActiveAsset,
 } from './accountAssetAccess'
 
-function makeBlobStore() {
-    const read = vi.fn(async () => new Uint8Array([1, 2, 3]))
+function makeBlobStore(value: Uint8Array | null = new Uint8Array([1, 2, 3])) {
+    const read = vi.fn(async () => value)
     const put = vi.fn(async () => undefined)
     return {
         read,
@@ -20,8 +20,22 @@ function makeBlobStore() {
 describe('account asset access', () => {
     beforeEach(() => configureOfficialAccountAssetReader(null))
 
-    it('reads remote-only bytes after official account bootstrap succeeds', async () => {
+    it('uses active BlobStore bytes before the official account reader', async () => {
         const local = makeBlobStore()
+        const readRemote = vi.fn(async () => new Uint8Array([9, 8, 7]))
+        configureOfficialAccountAssetReader(readRemote)
+
+        await expect(readActiveAsset(local.store, 'assets/local.png', {
+            officialAccount: true,
+            tauri: false,
+        })).resolves.toEqual(new Uint8Array([1, 2, 3]))
+
+        expect(local.read).toHaveBeenCalledWith('assets/local.png')
+        expect(readRemote).not.toHaveBeenCalled()
+    })
+
+    it('reads remote-only bytes after official account bootstrap succeeds', async () => {
+        const local = makeBlobStore(null)
         const readRemote = vi.fn(async () => new Uint8Array([9, 8, 7]))
         configureOfficialAccountAssetReader(readRemote)
 
@@ -30,12 +44,12 @@ describe('account asset access', () => {
             tauri: false,
         })).resolves.toEqual(new Uint8Array([9, 8, 7]))
 
+        expect(local.read).toHaveBeenCalledWith('assets/remote.png')
         expect(readRemote).toHaveBeenCalledWith('assets/remote.png')
-        expect(local.read).not.toHaveBeenCalled()
     })
 
     it('reads remote-only bytes for Tauri byte consumers in account mode', async () => {
-        const local = makeBlobStore()
+        const local = makeBlobStore(null)
         const readRemote = vi.fn(async () => new Uint8Array([6, 5, 4]))
         configureOfficialAccountAssetReader(readRemote)
 
@@ -44,8 +58,8 @@ describe('account asset access', () => {
             tauri: true,
         })).resolves.toEqual(new Uint8Array([6, 5, 4]))
 
+        expect(local.read).toHaveBeenCalledWith('assets/remote.ogg')
         expect(readRemote).toHaveBeenCalledWith('assets/remote.ogg')
-        expect(local.read).not.toHaveBeenCalled()
     })
 
     it('uses local BlobStore bytes while official account access is disabled', async () => {

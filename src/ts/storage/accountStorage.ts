@@ -2,7 +2,7 @@ import { writable } from "svelte/store"
 import { getDatabase } from "./database.svelte"
 import localforage from "localforage"
 import { alertLogin, alertNormalWait, alertStore } from "../alert"
-import { forageStorage, getUncleanables, getUncleanablesSync } from "../globalApi.svelte"
+import { getUncleanables, getUncleanablesSync } from "../globalApi.svelte"
 import { encodeRisuSaveLegacy } from "./risuSave"
 import { v4 } from "uuid"
 import { language } from "src/lang"
@@ -266,24 +266,56 @@ export class AccountStorage{
 }
 
 export async function unMigrationAccount() {
-    const keys = await forageStorage.keys()
     const db = getDatabase()
-    let i = 0;
     const MigrationStorage = localforage.createInstance({name: "risuai"})
-    
-    for(const key of keys){
-        if(key === 'database/database.bin'){
-            continue
-        }
-        alertStore.set({
-            type: "wait",
-            msg: `Migrating your data...(${i}/${keys.length})`
-        })
-        await MigrationStorage.setItem(key,await forageStorage.getItem(key))
-        i += 1
-    }
+    const { materializeAccountUnmigrationResources } = await import("./databaseRestore")
+    const { resolveBlobStore } = await import("./platformBlobStore")
+    const { selectLegacyBackupAssetKeys } = await import("../drive/backupAssets")
+    const { storeActiveAsset } = await import("./accountAssetAccess")
+    const {
+        getAccountColdStorageItem,
+        getColdStorageItem,
+        isColdStorageBackupData,
+        listColdDataKeys,
+        setLocalColdStorageItem,
+    } = await import("../process/coldstorage.svelte")
+    const blobStore = await resolveBlobStore()
+    const accountStorage = new AccountStorage()
+    const assetKeys = selectLegacyBackupAssetKeys(await getUncleanables(db, 'pure'))
+    const coldKeys = await listColdDataKeys(db)
 
     await completeAccountUnmigration(db, {
+        prepareResources: () => materializeAccountUnmigrationResources({
+            assetKeys,
+            coldKeys,
+            readLocalAsset: (key) => blobStore.read(key),
+            readRemoteAsset: async (key) => {
+                const result = await accountStorage.readItem(key)
+                return result.kind === 'missing' ? null : result.bytes
+            },
+            writeLocalAsset: async (key, bytes) => {
+                const name = key.replace(/\\/g, '/').split('/').pop() ?? key
+                await storeActiveAsset(blobStore, key, bytes, {
+                    kind: 'asset',
+                    mime: '',
+                    name,
+                    ext: name.split('.').pop() ?? '',
+                })
+            },
+            readLocalCold: (key) => getColdStorageItem(key, { accountFallback: true }),
+            readRemoteCold: async (key) => {
+                const value = await getAccountColdStorageItem(key)
+                if (value !== null && !isColdStorageBackupData(value)) {
+                    throw new Error(`Invalid account cold payload: ${key}`)
+                }
+                return value
+            },
+            writeLocalCold: async (key, value) => {
+                if (!await setLocalColdStorageItem(key, value)) {
+                    throw new Error(`Failed to write local cold payload: ${key}`)
+                }
+            },
+        }),
         replaceDatabase: replacePersistentDatabase,
         captureAcceptedDatabase: getDatabase,
         writeLegacyMirror: async (database) => {

@@ -55,6 +55,7 @@ export interface PersistentDataRuntime {
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
     replacePersistentDatabase(database: Database, reason: string): Promise<void>
+    publishCurrentOfficialRevision(): Promise<void>
 }
 
 function createDynamicOfficialPublisher(
@@ -134,5 +135,6 @@ export function createPersistentDataRuntime(
             const prepared = await dependencies.prepareDatabase(database)
             await coordinator.replacePersistentDatabase(prepared, reason)
         },
+        publishCurrentOfficialRevision: () => coordinator.publishCurrentOfficialRevision(),
     }
 }

@@ -118,3 +118,6 @@ export const activateConversation = (id: string): Promise<boolean> =>
     getPersistentDataRuntime().activateConversation(id)
 export const replacePersistentDatabase = (database: Database, reason: string): Promise<void> =>
     getPersistentDataRuntime().replacePersistentDatabase(database, reason)
+
+export const publishCurrentOfficialRevision = (): Promise<void> =>
+    getPersistentDataRuntime().publishCurrentOfficialRevision()

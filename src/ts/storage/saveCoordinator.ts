@@ -262,6 +262,15 @@ export class SaveCoordinator {
         if (stalePublication) await this.disposePublication(stalePublication)
     }
 
+    publishCurrentOfficialRevision(): Promise<void> {
+        this.assertInitialized()
+        if (!this.dependencies.officialPublisher) return Promise.resolve()
+        return this.enqueue(async () => {
+            this.pendingPublicationRevision ??= this.revision
+            await this.publishPendingRevision()
+        })
+    }
+
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void> {
         this.assertInitialized()
         if (!request.characterId) {

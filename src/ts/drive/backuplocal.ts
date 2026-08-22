@@ -1,9 +1,15 @@
 import { BaseDirectory, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
-import { LocalWriter, forageStorage } from "../globalApi.svelte";
+import { getUncleanables, LocalWriter, forageStorage } from "../globalApi.svelte";
 import { resolveBlobStore } from "../storage/platformBlobStore";
-import { isLegacyBackupAssetKey, selectLegacyBackupAssetKeys } from "./backupAssets";
+import {
+    collectBackupAssetKeys,
+    isLegacyBackupAssetKey,
+    readBackupAsset,
+    selectLegacyBackupAssetKeys,
+    writeBackupAsset,
+} from "./backupAssets";
 import { isTauri } from "src/ts/platform"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase } from "../storage/database.svelte";
@@ -11,9 +17,8 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
-import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
-import { DBState } from "../stores.svelte";
-import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
+import { publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installLocalBackup } from "../storage/databaseRestore";
 
 function getBasename(data:string){
@@ -83,71 +88,27 @@ export async function SaveLocalBackup(){
     }
     const missingAssets: string[] = []
 
-    if(!forageStorage.isAccount){
-        const assets = await blobStore.list({ kind: 'asset' })
-        let i = 0;
-        for(let asset of assets){
-            i += 1;
-            let message = `Saving local Backup... (${i} / ${assets.length})`
-            if (missingAssets.length > 0) {
-                const skippedItems = missingAssets.map(key => {
-                    const assetInfo = assetMap.get(key);
-                    return assetInfo ? `'${assetInfo.assetName}' from ${assetInfo.charName}` : `'${key}'`;
-                }).join(', ');
-                message += `\n(Skipping... ${skippedItems})`;
-            }
-            alertWait(message)
-
-            const key = asset.key
-            const data = await blobStore.read(key)
-            if (data) {
-                await writer.writeBackup(isTauri ? key.slice('assets/'.length) : key, data)
-            } else {
-                missingAssets.push(key)
-            }
+    const backupAssetKeys = await collectBackupAssetKeys(
+        blobStore,
+        await getUncleanables(db, 'pure'),
+    )
+    for(let i=0;i<backupAssetKeys.length;i++){
+        const key = backupAssetKeys[i]
+        let message = `Saving local Backup... (${i + 1} / ${backupAssetKeys.length})`
+        if (missingAssets.length > 0) {
+            const skippedItems = missingAssets.map(key => {
+                const assetInfo = assetMap.get(key);
+                return assetInfo ? `'${assetInfo.assetName}' from ${assetInfo.charName}` : `'${key}'`;
+            }).join(', ');
+            message += `\n(Skipping... ${skippedItems})`;
         }
-    }
-    else{
-        const keys = selectLegacyBackupAssetKeys(await forageStorage.keys())
+        alertWait(message)
 
-        for(let i=0;i<keys.length;i++){
-            const key = keys[i]
-            let message = `Saving local Backup... (${i + 1} / ${keys.length})`
-            if (missingAssets.length > 0) {
-                const skippedItems = missingAssets.map(key => {
-                    const assetInfo = assetMap.get(key);
-                    return assetInfo ? `'${assetInfo.assetName}' from ${assetInfo.charName}` : `'${key}'`;
-                }).join(', ');
-                message += `\n(Skipping... ${skippedItems})`;
-            }
-            alertWait(message)
-
-            let data: Uint8Array | undefined;
-            let isCached = false;
-            if(forageStorage.isAccount && key.startsWith('assets/')){
-                if(DBState.db.skipSavingAssetsOnWebSync){
-                    continue
-                }
-
-                const cached = await localforage.getItem(key) as ArrayBuffer;
-                if(cached) {
-                    isCached = true;
-                    data = new Uint8Array(cached);
-                }
-            }
-            
-            if (!data) {
-                data = await forageStorage.getItem(key) as unknown as Uint8Array
-            }
-
-            if (data) {
-                await writer.writeBackup(key, data)
-            } else {
-                missingAssets.push(key)
-            }
-            if(forageStorage.isAccount && !isCached){
-                await sleep(1000)
-            }
+        const data = await readBackupAsset(blobStore, key, forageStorage.isAccount)
+        if (data) {
+            await writer.writeBackup(isTauri ? key.slice('assets/'.length) : key, data)
+        } else {
+            missingAssets.push(key)
         }
     }
 
@@ -290,74 +251,24 @@ export async function SavePartialLocalBackup(){
     
     const missingAssets: string[] = []
 
-    if(!forageStorage.isAccount){
-        const assets = await blobStore.list({ kind: 'asset' })
-        let i = 0;
-        for(let asset of assets){
-            const keyWithPrefix = asset.key
-            
-            // Only process if this asset is in our map (profile images only)
-            if(!assetMap.has(keyWithPrefix)){
-                continue
-            }
-            
-            i += 1;
-            let message = `Saving partial local backup... (${i} / ${assetMap.size})`
-            if (missingAssets.length > 0) {
-                const skippedItems = missingAssets.map(key => {
-                    const assetInfo = assetMap.get(key);
-                    return assetInfo ? `'${assetInfo.assetName}' from ${assetInfo.charName}` : `'${key}'`;
-                }).join(', ');
-                message += `\n(Skipping... ${skippedItems})`;
-            }
-            alertWait(message)
-
-            const data = await blobStore.read(keyWithPrefix)
-            if (data) {
-                await writer.writeBackup(keyWithPrefix, data)
-            } else {
-                missingAssets.push(keyWithPrefix)
-            }
+    const assetKeys = selectLegacyBackupAssetKeys(Array.from(assetMap.keys()))
+    for(let i=0;i<assetKeys.length;i++){
+        const key = assetKeys[i]
+        let message = `Saving partial local backup... (${i + 1} / ${assetKeys.length})`
+        if (missingAssets.length > 0) {
+            const skippedItems = missingAssets.map(key => {
+                const assetInfo = assetMap.get(key);
+                return assetInfo ? `'${assetInfo.assetName}' from ${assetInfo.charName}` : `'${key}'`;
+            }).join(', ');
+            message += `\n(Skipping... ${skippedItems})`;
         }
-    }
-    else{
-        const keys = await forageStorage.keys()
-        const assetKeys = selectLegacyBackupAssetKeys(Array.from(assetMap.keys()))
+        alertWait(message)
 
-        for(let i=0;i<assetKeys.length;i++){
-            const key = assetKeys[i]
-            let message = `Saving partial local backup... (${i + 1} / ${assetKeys.length})`
-            if (missingAssets.length > 0) {
-                const skippedItems = missingAssets.map(key => {
-                    const assetInfo = assetMap.get(key);
-                    return assetInfo ? `'${assetInfo.assetName}' from ${assetInfo.charName}` : `'${key}'`;
-                }).join(', ');
-                message += `\n(Skipping... ${skippedItems})`;
-            }
-            alertWait(message)
-
-            let data: Uint8Array | undefined;
-            let isCached = false;
-            if(forageStorage.isAccount && key.startsWith('assets/')){
-                const cached = await localforage.getItem(key) as ArrayBuffer;
-                if(cached) {
-                    isCached = true;
-                    data = new Uint8Array(cached);
-                }
-            }
-            
-            if (!data) {
-                data = await forageStorage.getItem(key) as unknown as Uint8Array
-            }
-
-            if (data) {
-                await writer.writeBackup(key, data)
-            } else {
-                missingAssets.push(key)
-            }
-            if(forageStorage.isAccount && !isCached){
-                await sleep(100)
-            }
+        const data = await readBackupAsset(blobStore, key, forageStorage.isAccount)
+        if (data) {
+            await writer.writeBackup(key, data)
+        } else {
+            missingAssets.push(key)
         }
     }
 
@@ -485,7 +396,7 @@ export function LoadLocalBackup(){
                                 const jsonData = JSON.parse(text)
 
                                 if (isColdStorageBackupData(jsonData)) {
-                                    if(await setColdStorageItem(coldStorageKey, jsonData)){
+                                    if(await setLocalColdStorageItem(coldStorageKey, jsonData)){
                                         restoredColdStorageKeys.add(coldStorageKey)
                                     } else {
                                         console.error(`Failed to restore cold storage item ${coldStorageKey}`)
@@ -500,19 +411,10 @@ export function LoadLocalBackup(){
 
                         if (!handledAsColdStorage) {
                             const key = `assets/${name}`
-                            if (forageStorage.isAccount) {
-                                await forageStorage.setItem('assets/' + name, data);
-                            } else if (isLegacyBackupAssetKey(key)) {
-                                await blobStore.put(key, data, {
-                                    kind: 'asset', mime: '', name, ext: name.split('.').pop() ?? '',
-                                })
-                            }
+                            if (isLegacyBackupAssetKey(key)) await writeBackupAsset(blobStore, key, data)
                         }
                     }
                     await sleep(10);
-                    if (forageStorage.isAccount) {
-                        await sleep(1000);
-                    }
 
                     offset += 4 + nameLength + 4 + dataLength;
                 }
@@ -542,7 +444,7 @@ export function LoadLocalBackup(){
                 if(restoredColdStorageKeys.has(key)){
                     continue
                 }
-                const existingColdStorage = await getColdStorageItem(key)
+                const existingColdStorage = await getColdStorageItem(key, { accountFallback: true })
                 if(!isColdStorageBackupData(existingColdStorage)){
                     missingColdStorageKeys.push(key)
                 }
@@ -553,6 +455,7 @@ export function LoadLocalBackup(){
 
             await installLocalBackup(dbData, {
                 replaceDatabase: replacePersistentDatabase,
+                publishAcceptedRevision: publishCurrentOfficialRevision,
                 writeLocalMirror: async () => {
                     if (isTauri) {
                         await writeFile('database/database.bin', db, { baseDir: BaseDirectory.AppData });

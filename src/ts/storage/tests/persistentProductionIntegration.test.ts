@@ -272,9 +272,41 @@ describe('persistent production runtime', () => {
         runtime.markPersistentDataDirty(64)
 
         await runtime.flushPendingData('local-only')
+        await runtime.publishCurrentOfficialRevision()
 
         expect(getOfficialPublisher).toHaveBeenCalled()
         expect(runtime.revision).toBe(2)
+    })
+
+    it('publishes an accepted replacement revision and retains its exact handle for retry', async () => {
+        const database = makeDatabase()
+        const store = makeStore(`replacement-publisher-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const publish = vi.fn(async () => {
+            if (publish.mock.calls.length === 1) throw new Error('official offline')
+        })
+        const dispose = vi.fn(async () => undefined)
+        const pin = vi.fn(async () => ({ publish, dispose }))
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            officialPublisher: { pin },
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const replacement = structuredClone(database)
+        replacement.username = 'Restored account backup'
+        await runtime.replacePersistentDatabase(replacement, 'account-restore')
+
+        await expect(runtime.publishCurrentOfficialRevision()).rejects.toThrow('official offline')
+        await runtime.publishCurrentOfficialRevision()
+
+        expect(pin).toHaveBeenCalledOnce()
+        expect(pin).toHaveBeenCalledWith(2)
+        expect(publish).toHaveBeenCalledTimes(2)
+        expect(dispose).toHaveBeenCalledOnce()
     })
 
     it('prepares a character activation replacement before storing it', async () => {

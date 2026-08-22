@@ -7,6 +7,7 @@ import {
     installInternalBackup,
     installLocalBackup,
     installRisuKeiBackup,
+    materializeAccountUnmigrationResources,
 } from '../databaseRestore'
 
 const database = {
@@ -54,11 +55,12 @@ describe('local backup restore', () => {
 
         await installLocalBackup(database, {
             replaceDatabase: async () => { events.push('replace') },
+            publishAcceptedRevision: async () => { events.push('publish') },
             writeLocalMirror: async () => { events.push('local-mirror') },
             relaunch: async () => { events.push('relaunch') },
         })
 
-        expect(events).toEqual(['replace', 'local-mirror', 'relaunch'])
+        expect(events).toEqual(['replace', 'publish', 'local-mirror', 'relaunch'])
     })
 
     it('does not write or relaunch when replacement fails', async () => {
@@ -67,9 +69,25 @@ describe('local backup restore', () => {
 
         await expect(installLocalBackup(database, {
             replaceDatabase: async () => { throw new Error('replacement failed') },
+            publishAcceptedRevision: vi.fn(),
             writeLocalMirror,
             relaunch,
         })).rejects.toThrow('replacement failed')
+
+        expect(writeLocalMirror).not.toHaveBeenCalled()
+        expect(relaunch).not.toHaveBeenCalled()
+    })
+
+    it('retains publication retry ownership and does not mirror or relaunch on publish failure', async () => {
+        const writeLocalMirror = vi.fn()
+        const relaunch = vi.fn()
+
+        await expect(installLocalBackup(database, {
+            replaceDatabase: async () => undefined,
+            publishAcceptedRevision: async () => { throw new Error('official offline') },
+            writeLocalMirror,
+            relaunch,
+        })).rejects.toThrow('official offline')
 
         expect(writeLocalMirror).not.toHaveBeenCalled()
         expect(relaunch).not.toHaveBeenCalled()
@@ -82,10 +100,11 @@ describe('Drive restore', () => {
 
         await installDriveRestore(database, {
             replaceDatabase: async () => { events.push('replace') },
+            publishAcceptedRevision: async () => { events.push('publish') },
             relaunch: async () => { events.push('relaunch') },
         })
 
-        expect(events).toEqual(['replace', 'relaunch'])
+        expect(events).toEqual(['replace', 'publish', 'relaunch'])
     })
 
     it('does not relaunch when replacement fails', async () => {
@@ -93,8 +112,21 @@ describe('Drive restore', () => {
 
         await expect(installDriveRestore(database, {
             replaceDatabase: async () => { throw new Error('replacement failed') },
+            publishAcceptedRevision: vi.fn(),
             relaunch,
         })).rejects.toThrow('replacement failed')
+
+        expect(relaunch).not.toHaveBeenCalled()
+    })
+
+    it('does not relaunch when accepted-revision publication fails', async () => {
+        const relaunch = vi.fn()
+
+        await expect(installDriveRestore(database, {
+            replaceDatabase: async () => undefined,
+            publishAcceptedRevision: async () => { throw new Error('official offline') },
+            relaunch,
+        })).rejects.toThrow('official offline')
 
         expect(relaunch).not.toHaveBeenCalled()
     })
@@ -111,6 +143,7 @@ describe('completeAccountUnmigration', () => {
         let mirrored: Database | undefined
 
         await completeAccountUnmigration(live, {
+            prepareResources: async () => { events.push('resources') },
             replaceDatabase: async (candidate, reason) => {
                 events.push('replace')
                 expect(reason).toBe('account-unmigration')
@@ -126,7 +159,7 @@ describe('completeAccountUnmigration', () => {
             },
         })
 
-        expect(events).toEqual(['replace', 'mirror', 'finalize'])
+        expect(events).toEqual(['resources', 'replace', 'mirror', 'finalize'])
         expect(mirrored).toEqual(accepted)
         expect(mirrored).not.toBe(accepted)
         expect(live).toEqual(original)
@@ -138,6 +171,7 @@ describe('completeAccountUnmigration', () => {
         const finalize = vi.fn()
 
         await expect(completeAccountUnmigration(live, {
+            prepareResources: async () => undefined,
             replaceDatabase: async () => undefined,
             captureAcceptedDatabase: () => live,
             writeLegacyMirror: async () => {
@@ -156,6 +190,7 @@ describe('completeAccountUnmigration', () => {
         const finalize = vi.fn()
 
         await expect(completeAccountUnmigration(structuredClone(database), {
+            prepareResources: async () => undefined,
             replaceDatabase: async () => { throw new Error('replacement failed') },
             captureAcceptedDatabase,
             writeLegacyMirror,
@@ -165,5 +200,71 @@ describe('completeAccountUnmigration', () => {
         expect(captureAcceptedDatabase).not.toHaveBeenCalled()
         expect(writeLegacyMirror).not.toHaveBeenCalled()
         expect(finalize).not.toHaveBeenCalled()
+    })
+
+    it('does not replace, mirror, or clear flags when remote-only materialization fails', async () => {
+        const replaceDatabase = vi.fn()
+        const writeLegacyMirror = vi.fn()
+        const finalize = vi.fn()
+
+        await expect(completeAccountUnmigration(structuredClone(database), {
+            prepareResources: async () => { throw new Error('remote asset missing') },
+            replaceDatabase,
+            captureAcceptedDatabase: () => database,
+            writeLegacyMirror,
+            finalize,
+        })).rejects.toThrow('remote asset missing')
+
+        expect(replaceDatabase).not.toHaveBeenCalled()
+        expect(writeLegacyMirror).not.toHaveBeenCalled()
+        expect(finalize).not.toHaveBeenCalled()
+    })
+})
+
+describe('account unmigration resource materialization', () => {
+    it('retains local payloads and copies verified remote-only assets and cold data', async () => {
+        const localAssets = new Map([['assets/local.png', new Uint8Array([1])]])
+        const localCold = new Map<string, unknown>([['cold-local', { message: ['local'] }]])
+        const assetWrites: string[] = []
+        const coldWrites: string[] = []
+
+        await materializeAccountUnmigrationResources({
+            assetKeys: ['assets/local.png', 'assets/remote.png'],
+            coldKeys: ['cold-local', 'cold-remote'],
+            readLocalAsset: async (key) => localAssets.get(key) ?? null,
+            readRemoteAsset: async (key) => key === 'assets/remote.png'
+                ? new Uint8Array([9, 8])
+                : null,
+            writeLocalAsset: async (key, bytes) => {
+                assetWrites.push(key)
+                localAssets.set(key, bytes.slice())
+            },
+            readLocalCold: async (key) => localCold.get(key) ?? null,
+            readRemoteCold: async (key) => key === 'cold-remote'
+                ? { message: ['remote'] }
+                : null,
+            writeLocalCold: async (key, value) => {
+                coldWrites.push(key)
+                localCold.set(key, structuredClone(value))
+            },
+        })
+
+        expect(assetWrites).toEqual(['assets/remote.png'])
+        expect(coldWrites).toEqual(['cold-remote'])
+        expect(localAssets.get('assets/remote.png')).toEqual(new Uint8Array([9, 8]))
+        expect(localCold.get('cold-remote')).toEqual({ message: ['remote'] })
+    })
+
+    it('fails before transition when a copied payload cannot be verified', async () => {
+        await expect(materializeAccountUnmigrationResources({
+            assetKeys: ['assets/remote.png'],
+            coldKeys: [],
+            readLocalAsset: async () => null,
+            readRemoteAsset: async () => new Uint8Array([9]),
+            writeLocalAsset: async () => undefined,
+            readLocalCold: async () => null,
+            readRemoteCold: async () => null,
+            writeLocalCold: async () => undefined,
+        })).rejects.toThrow('Failed to verify local asset: assets/remote.png')
     })
 })

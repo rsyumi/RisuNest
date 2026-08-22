@@ -25,14 +25,13 @@ export async function readActiveAsset(
     key: string,
     mode: { officialAccount: boolean, tauri: boolean },
 ): Promise<Uint8Array | null> {
-    let value: Uint8Array | null
-    if (mode.officialAccount
+    let value = await blobStore.read(key)
+    if (value === null
+        && mode.officialAccount
         && key.startsWith('assets/')
         && key.length > 'assets/'.length
         && officialAccountAssetReader) {
         value = await officialAccountAssetReader(key)
-    } else {
-        value = await blobStore.read(key)
     }
     if (value === null && mode.tauri) throw new Error(`Missing asset: ${key}`)
     return value

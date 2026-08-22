@@ -2,15 +2,19 @@ import { alertError, alertInput, alertNormal, alertSelect, alertStore } from "..
 import { getDatabase, type Database } from "../storage/database.svelte";
 import { forageStorage, getUncleanables, openURL } from "../globalApi.svelte";
 import { resolveBlobStore } from "../storage/platformBlobStore";
-import { selectLegacyBackupAssetKeys } from "./backupAssets";
+import {
+    collectBackupAssetKeys,
+    readBackupAsset,
+    writeBackupAsset,
+} from "./backupAssets";
 import { isTauri } from "src/ts/platform"
 import { language } from "../../lang";
 import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
-import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys, setColdStorageItem } from "../process/coldstorage.svelte";
-import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
+import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
+import { publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installDriveRestore } from "../storage/databaseRestore";
 
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
@@ -138,36 +142,20 @@ async function backupDrive(ACCESS_TOKEN:string) {
         return
     }
 
-    if(!forageStorage.isAccount){
-        const assets = await blobStore.list({ kind: 'asset' })
-        let i = 0;
-        for(let asset of assets){
-            i += 1;
-            alertStore.set({
-                type: "wait",
-                msg: `Uploading Backup... (${i} / ${assets.length})`
-            })
-            const key = asset.key
-            const formatedKey = newFormatKeys(isTauri ? key.slice('assets/'.length) : key)
-            if(!fileNames.includes(formatedKey)){
-                const data = await blobStore.read(key)
-                if (data) await createFileInFolder(ACCESS_TOKEN, formatedKey, data)
-            }
-        }
-    }
-    else{
-        const keys = selectLegacyBackupAssetKeys(await forageStorage.keys())
-
-        for(let i=0;i<keys.length;i++){
-            alertStore.set({
-                type: "wait",
-                msg: `Uploading Backup... (${i} / ${keys.length})`
-            })
-            const key = keys[i]
-            const formatedKey = newFormatKeys(key)
-            if(!fileNames.includes(formatedKey)){
-                await createFileInFolder(ACCESS_TOKEN, formatedKey, await forageStorage.getItem(key) as unknown as Uint8Array)
-            }
+    const assetKeys = await collectBackupAssetKeys(
+        blobStore,
+        await getUncleanables(getDatabase(), 'pure'),
+    )
+    for(let i=0;i<assetKeys.length;i++){
+        alertStore.set({
+            type: "wait",
+            msg: `Uploading Backup... (${i + 1} / ${assetKeys.length})`
+        })
+        const key = assetKeys[i]
+        const formatedKey = newFormatKeys(key)
+        if(!fileNames.includes(formatedKey)){
+            const data = await readBackupAsset(blobStore, key, forageStorage.isAccount)
+            if (data) await createFileInFolder(ACCESS_TOKEN, formatedKey, data)
         }
     }
 
@@ -212,20 +200,16 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         })
     }
     const files:DriveFile[] = await getFilesInFolder(ACCESS_TOKEN)
-    let foragekeys:string[] = []
-    let loadedForageKeys = false
     let db = getDatabase()
 
     async function checkImageExists(images:string) {
         if(db?.account?.useSync){
             return false
         }
-        if (!forageStorage.isAccount) return await blobStore.stat(`assets/${images}`) !== null
-        if(!loadedForageKeys){
-            foragekeys = await forageStorage.keys()
-            loadedForageKeys = true
-        }
-        return foragekeys.includes('assets/' + images)
+        const key = `assets/${images}`
+        if (await blobStore.stat(key)) return true
+        return forageStorage.isAccount
+            && await readBackupAsset(blobStore, key, true) !== null
     }
     const fileNames = files.map((d) => {
         return d.name
@@ -335,13 +319,7 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
                             for(const file of files){
                                 if(file.name === formatedImage){
                                     const fData = await getFileData(ACCESS_TOKEN, file.id)
-                                    if(forageStorage.isAccount){
-                                        await forageStorage.setItem('assets/' + images, fData)
-                                    } else {
-                                        await blobStore.put(`assets/${images}`, fData, {
-                                            kind: 'asset', mime: '', name: images, ext: images.split('.').pop() ?? '',
-                                        })
-                                    }
+                                    await writeBackupAsset(blobStore, `assets/${images}`, fData)
                                     tries = 3
                                 }
                             }
@@ -360,6 +338,7 @@ async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<voi
         db.didFirstSetup = true
         await installDriveRestore(db, {
             replaceDatabase: replacePersistentDatabase,
+            publishAcceptedRevision: publishCurrentOfficialRevision,
             relaunch: async () => {
                 lastSaved = Date.now()
                 localStorage.setItem('risu_lastsaved', `${lastSaved}`)
@@ -409,7 +388,7 @@ async function restoreColdStorageFromDrive(
         try {
             const jsonData = JSON.parse(new TextDecoder().decode(await getFileData(ACCESS_TOKEN, file.id)))
             if(isColdStorageBackupData(jsonData)){
-                if(!await setColdStorageItem(key, jsonData)){
+                if(!await setLocalColdStorageItem(key, jsonData)){
                     failures.push(key)
                 }
             }
