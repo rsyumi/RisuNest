@@ -401,8 +401,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (active.revision !== input.expectedRevision) {
                 throw new RevisionConflictError(input.expectedRevision, active.revision)
             }
-            if (input.replaceCharacter) this.validateReplacementCharacter(input.replaceCharacter)
-            if (input.addCharacter) this.validateAddedCharacter(input.addCharacter)
+            if (input.replaceCharacter) {
+                this.validateCharacterInput(input.replaceCharacter, 'Selected character replacement')
+            }
+            if (input.addCharacter) {
+                this.validateCharacterInput(input.addCharacter, 'Character addition')
+            }
 
             const revision = active.revision + 1
             const generation = active.generation
@@ -1138,27 +1142,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         this.putCharacterRecords(transaction, generation, detail, configuredIndex, conversationCount)
     }
 
-    private validateReplacementCharacter(character: Database['characters'][number]): void {
+    private validateCharacterInput(
+        character: Database['characters'][number],
+        context: string,
+    ): void {
         if (!character.chaId) {
-            throw new Error('Selected character replacement requires a nonempty character ID')
+            throw new Error(`${context} requires a nonempty character ID`)
         }
         const conversationIds = new Set<string>()
         for (const conversation of character.chats) {
             if (!conversation.id || conversationIds.has(conversation.id)) {
-                throw new Error('Selected character replacement requires unique, nonempty chat IDs')
-            }
-            conversationIds.add(conversation.id)
-        }
-    }
-
-    private validateAddedCharacter(character: Database['characters'][number]): void {
-        if (!character.chaId) {
-            throw new Error('Character addition requires a nonempty character ID')
-        }
-        const conversationIds = new Set<string>()
-        for (const conversation of character.chats) {
-            if (!conversation.id || conversationIds.has(conversation.id)) {
-                throw new Error('Character addition requires unique, nonempty chat IDs')
+                throw new Error(`${context} requires unique, nonempty chat IDs`)
             }
             conversationIds.add(conversation.id)
         }
