@@ -1367,6 +1367,58 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(4)
     })
 
+    it('re-arms the flush debounce when a replacement leaves dirty state behind', async () => {
+        vi.useFakeTimers()
+        try {
+            let db = makeDatabase()
+            const gate = deferred<{ revision: number }>()
+            const commit = vi.fn()
+                .mockImplementationOnce(() => gate.promise)
+                .mockImplementation(async ({ expectedRevision }: { expectedRevision: number }) => ({
+                    revision: expectedRevision + 1,
+                }))
+            const store = {
+                commit,
+                replaceFromDatabase: vi.fn(async () => ({ revision: 3 })),
+            } as unknown as PersistentDataStore
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(db),
+                captureSelectedCharacter: () => db.characters[0],
+                replaceDatabase: (replacement) => {
+                    db = replacement
+                },
+            })
+            coordinator.initialize(1)
+            db.username = 'Edit one'
+            coordinator.markPersistentDataDirty(1)
+            const flushing = coordinator.flushPendingData('first')
+            await vi.advanceTimersByTimeAsync(0)
+            const candidate = makeDatabase()
+            candidate.username = 'Replacement'
+            const replacing = coordinator.replacePersistentDatabase(candidate, 'replace')
+            gate.resolve({ revision: 2 })
+            await Promise.resolve()
+            db.username = 'Edit two'
+            coordinator.markPersistentDataDirty(1)
+            await flushing
+            await replacing
+
+            expect(commit).toHaveBeenCalledTimes(1)
+            expect(db.username).toBe('Edit two')
+
+            await vi.advanceTimersByTimeAsync(500)
+
+            expect(commit).toHaveBeenCalledTimes(2)
+            expect(commit.mock.calls[1][0]).toMatchObject({
+                expectedRevision: 3,
+                root: { username: 'Edit two' },
+            })
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('finishes flushing after the selected character is deselected', async () => {
         const database = makeDatabase()
         let selectedIndex = 0

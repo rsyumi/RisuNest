@@ -436,6 +436,8 @@ export class SaveCoordinator {
         if (this.dirtyGeneration === capturedGeneration) {
             this.cancelDebounce()
             this.pendingByteCount = 0
+        } else if (!this.flushPromise && !this.additionPromise) {
+            this.armDebounce()
         }
     }
 
