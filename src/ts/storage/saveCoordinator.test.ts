@@ -657,7 +657,7 @@ describe('SaveCoordinator', () => {
         expect(commit.mock.calls[0][0].addCharacter).toMatchObject({ chaId: 'char-added' })
     })
 
-    it('does not retry an addition revision conflict and keeps its unfinished work', async () => {
+    it('surfaces the pending conflict to a later import instead of blocking it', async () => {
         const { database, added } = makeAdditionDatabase()
         const gate = deferred<{ revision: number }>()
         const conflict = new RevisionConflictError(1, 2)
@@ -679,15 +679,53 @@ describe('SaveCoordinator', () => {
 
         gate.reject(conflict)
         await expect(first).rejects.toBe(conflict)
+        expect(commit).toHaveBeenCalledOnce()
 
-        expect(() => coordinator.commitCharacterAddition({
+        const secondInstall = vi.fn()
+        await expect(coordinator.commitCharacterAddition({
             characterId: 'char-other',
             estimatedBytes: 1,
-            install: () => undefined,
-        }, 'other-character')).toThrow('already pending')
-        expect(commit).toHaveBeenCalledOnce()
+            install: secondInstall,
+        }, 'other-character')).rejects.toBe(conflict)
+
+        expect(secondInstall).not.toHaveBeenCalled()
+        expect(commit).toHaveBeenCalledTimes(2)
         expect(coordinator.revision).toBe(1)
         expect(coordinator.pendingBytes).toBe(9)
+    })
+
+    it('lets a later import succeed after a transient addition failure', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const other = structuredClone(added)
+        other.chaId = 'char-other'
+        other.name = 'Other'
+        const commit = vi.fn()
+            .mockRejectedValueOnce(new Error('write failed'))
+            .mockImplementation(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(1)
+
+        await expect(coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(added),
+        }, 'new-character')).rejects.toThrow('write failed')
+
+        await coordinator.commitCharacterAddition({
+            characterId: other.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(other),
+        }, 'other-character')
+
+        expect(commit.mock.calls[1][0].addCharacter).toMatchObject({ chaId: 'char-added' })
+        expect(commit.mock.calls[2][0].addCharacter).toMatchObject({ chaId: 'char-other' })
+        expect(coordinator.revision).toBe(3)
     })
 
     it('defers a second import that starts while the first is still committing', async () => {

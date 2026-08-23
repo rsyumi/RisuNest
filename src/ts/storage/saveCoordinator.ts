@@ -225,7 +225,12 @@ export class SaveCoordinator {
                 .catch(() => undefined)
                 .then(() => this.commitCharacterAddition(request, reason))
         }
-        if (this.pendingCharacterAddition || this.reservedCharacterAddition) {
+        if (this.pendingCharacterAddition) {
+            // A previous addition failed and left its work pending; retry it before this import.
+            return this.flushPendingData(reason)
+                .then(() => this.commitCharacterAddition(request, reason))
+        }
+        if (this.reservedCharacterAddition) {
             throw new Error('A character addition is already pending')
         }
         const reserved: ReservedCharacterAddition = {
