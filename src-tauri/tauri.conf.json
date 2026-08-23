@@ -23,7 +23,8 @@
       {
         "ext": [
           "risum", "risup", "charx"
-        ]
+        ],
+        "mimeType": "application/octet-stream"
       }
     ]
   },

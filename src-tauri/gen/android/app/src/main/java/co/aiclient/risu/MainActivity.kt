@@ -1,17 +1,25 @@
 package co.aiclient.risu
 
 import android.content.ComponentCallbacks2
+import android.content.ContentResolver
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.view.ViewGroup
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.IntentCompat
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updateLayoutParams
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import java.io.File
 
 private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
@@ -67,6 +75,29 @@ internal class BackNavigationPolicy(
   }
 }
 
+internal fun sanitizeOpenedFileName(name: String): String {
+  val leaf = name.substringAfterLast('/').substringAfterLast('\\')
+  val safe = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
+  return safe.ifBlank { "opened-file" }
+}
+
+internal fun escapeJsStringLiteral(value: String): String = buildString {
+  for (character in value) {
+    when {
+      character == '\\' -> append("\\\\")
+      character == '"' -> append("\\\"")
+      character == '\u2028' || character == '\u2029' || character < ' ' ->
+        append("\\u%04x".format(character.code))
+      else -> append(character)
+    }
+  }
+}
+
+internal fun openedFilesScript(paths: List<String>): String {
+  val values = paths.joinToString(",") { "\"${escapeJsStringLiteral(it)}\"" }
+  return "window.tauriOpenedFiles=[$values];"
+}
+
 internal class LifecycleFlushDispatcher(
   private val dispatch: (String) -> Unit,
 ) {
@@ -94,6 +125,7 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     lifecycleWebView = webView
+    injectOpenedFiles(webView)
 
     val contentRoot = findViewById<ViewGroup>(android.R.id.content)
     ViewCompat.setOnApplyWindowInsetsListener(contentRoot) { _, windowInsets ->
@@ -159,5 +191,67 @@ class MainActivity : TauriActivity() {
       "window.dispatchEvent(new CustomEvent('$NATIVE_LIFECYCLE_EVENT',{detail:{reason:'$reason'}}));",
       null,
     )
+  }
+
+  private fun injectOpenedFiles(webView: WebView) {
+    val openedFiles = copyOpenedFiles(launchOpenedFileUris(intent))
+    if (openedFiles.isEmpty()) {
+      return
+    }
+    val script = openedFilesScript(openedFiles)
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+      WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("*"))
+    } else {
+      webView.evaluateJavascript(script, null)
+    }
+  }
+
+  private fun launchOpenedFileUris(intent: Intent?): List<Uri> {
+    intent ?: return emptyList()
+    return when (intent.action) {
+      Intent.ACTION_VIEW, "org.chromium.arc.intent.action.VIEW" -> listOfNotNull(intent.data)
+      Intent.ACTION_SEND ->
+        listOfNotNull(IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java))
+      Intent.ACTION_SEND_MULTIPLE ->
+        IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+          ?.filterNotNull()
+          .orEmpty()
+      else -> emptyList()
+    }
+  }
+
+  private fun copyOpenedFiles(uris: List<Uri>): List<String> {
+    if (uris.isEmpty()) {
+      return emptyList()
+    }
+    val directory = File(cacheDir, "opened_files")
+    directory.mkdirs()
+    val stamp = System.currentTimeMillis()
+    return uris.mapIndexedNotNull { index, uri ->
+      try {
+        val target = File(directory, "$stamp-$index-${resolveDisplayName(uri)}")
+        contentResolver.openInputStream(uri)?.use { input ->
+          target.outputStream().use { output -> input.copyTo(output) }
+        } ?: return@mapIndexedNotNull null
+        target.absolutePath
+      } catch (error: Exception) {
+        null
+      }
+    }
+  }
+
+  private fun resolveDisplayName(uri: Uri): String {
+    if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+      contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (column >= 0 && cursor.moveToFirst()) {
+          val name = cursor.getString(column)
+          if (!name.isNullOrBlank()) {
+            return sanitizeOpenedFileName(name)
+          }
+        }
+      }
+    }
+    return sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file")
   }
 }
