@@ -331,11 +331,47 @@ export let saving = $state({
 
 const persistentSaveObserverInstallation = createPersistentSaveObserverInstallation()
 
-function estimateSnapshotBytes(value: unknown): number {
+const SAVE_ESTIMATE_REFRESH_MS = 1000
+
+/** Reads every reactive leaf so the surrounding effect reruns on any change, without cloning. */
+function subscribeDeep(value: unknown): void {
+    if (value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) subscribeDeep(value[i])
+        return
+    }
+    for (const key in value as Record<string, unknown>) {
+        subscribeDeep((value as Record<string, unknown>)[key])
+    }
+}
+
+function measureJsonLength(read: () => unknown): number {
     try {
-        return new TextEncoder().encode(JSON.stringify(value)).byteLength
+        return JSON.stringify(read())?.length ?? 0
     } catch {
         return 0
+    }
+}
+
+/**
+ * Serializing the observed state on every keystroke is too expensive, so a full
+ * measurement runs at most once per refresh window and dirty marks in between
+ * reuse the last known estimate.
+ */
+export function createThrottledSizeEstimator(read: () => unknown): () => number {
+    let lastEstimate = -1
+    let timer: ReturnType<typeof setTimeout> | undefined
+    return () => {
+        if (lastEstimate < 0) {
+            lastEstimate = measureJsonLength(read)
+        }
+        else if (timer === undefined) {
+            timer = setTimeout(() => {
+                timer = undefined
+                lastEstimate = measureJsonLength(read)
+            }, SAVE_ESTIMATE_REFRESH_MS)
+        }
+        return lastEstimate
     }
 }
 
@@ -355,20 +391,25 @@ export async function saveDb() {
             reportError: (error) => alertError(error instanceof Error ? error : String(error)),
         })
         const disposeEffects = $effect.root(() => {
-            $effect(() => {
+            const estimateRootBytes = createThrottledSizeEstimator(() => {
                 const root: Record<string, unknown> = {}
                 for (const key in DBState.db) {
-                    if (key !== 'characters') {
-                        root[key] = $state.snapshot(DBState.db[key])
-                    }
+                    if (key !== 'characters') root[key] = DBState.db[key]
                 }
-                markPersistentDataDirty(estimateSnapshotBytes(root))
+                return root
+            })
+            const estimateCharacterBytes = createThrottledSizeEstimator(
+                () => DBState.db.characters?.[selIdState.selId] ?? null,
+            )
+            $effect(() => {
+                for (const key in DBState.db) {
+                    if (key !== 'characters') subscribeDeep(DBState.db[key])
+                }
+                markPersistentDataDirty(estimateRootBytes())
             })
             $effect(() => {
-                const character = DBState.db.characters?.[selIdState.selId]
-                markPersistentDataDirty(
-                    estimateSnapshotBytes(character ? $state.snapshot(character) : null),
-                )
+                subscribeDeep(DBState.db.characters?.[selIdState.selId] ?? null)
+                markPersistentDataDirty(estimateCharacterBytes())
             })
         })
         return () => {
