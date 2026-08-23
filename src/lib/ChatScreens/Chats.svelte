@@ -48,6 +48,16 @@
         }) => void
     }
     let mountInstances: Map<number, ChatInstance> = new Map();
+    let mountedElements: Map<number, HTMLElement> = new Map();
+    type ContainDecision = {
+        index: number
+        totalLength: number
+        isStreaming: boolean
+        isComment: boolean
+        captureAll: boolean
+        result: boolean
+    }
+    let containDecisions: Map<number, ContainDecision> = new Map();
 
     //Non-cryptographic hash function to generate a unique hash for each message
     function hashCode(str:string):number {
@@ -97,18 +107,39 @@
             const messageLargePortrait = message.role === 'user' ? (userIconPortrait ?? false) : ((currentCharacter as character).largePortrait ?? false);
             const reloadPointer = reloadPointerMap[i] ?? 0;
             const activeStreamingMessage = i === activeStreamingIndex && message.role === 'char';
-            const containMessage = shouldContainChatMessage({
+            const hashMessageData = activeStreamingMessage ? '' : message.data;
+            let hashd = hashMessageData + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString();
+            const currentHash = hashCode(hashd);
+            currentHashes.add(currentHash);
+            const containInput = {
                 index: i,
                 totalLength: messages.length,
                 isStreaming: currentChat?.isStreaming === true && i === messages.length - 1,
                 isComment: message.isComment ?? false,
                 data: message.data,
                 captureAll: loadPages === Infinity,
-            });
-            const hashMessageData = activeStreamingMessage ? '' : message.data;
-            let hashd = hashMessageData + (message.chatId ?? '') + i.toString() + messageLargePortrait.toString() + message.disabled?.toString() + reloadPointer.toString();
-            const currentHash = hashCode(hashd);
-            currentHashes.add(currentHash);
+            };
+            const cachedDecision = containDecisions.get(currentHash);
+            let containMessage: boolean;
+            if(cachedDecision
+                && cachedDecision.index === containInput.index
+                && cachedDecision.totalLength === containInput.totalLength
+                && cachedDecision.isStreaming === containInput.isStreaming
+                && cachedDecision.isComment === containInput.isComment
+                && cachedDecision.captureAll === containInput.captureAll){
+                containMessage = cachedDecision.result;
+            }
+            else{
+                containMessage = shouldContainChatMessage(containInput);
+                containDecisions.set(currentHash, {
+                    index: containInput.index,
+                    totalLength: containInput.totalLength,
+                    isStreaming: containInput.isStreaming,
+                    isComment: containInput.isComment,
+                    captureAll: containInput.captureAll,
+                    result: containMessage,
+                });
+            }
             if(!hashes.has(currentHash)){
                 const b = document.createElement('div');
                 b.setAttribute('x-hashed', currentHash.toString());
@@ -139,16 +170,17 @@
 
                 })
                 mountInstances.set(currentHash, inst);
-                const nextElement = nextHash === 0 ? null : chatBody.querySelector(`[x-hashed="${nextHash}"]`);
+                mountedElements.set(currentHash, b);
+                const nextElement = nextHash === 0 ? null : mountedElements.get(nextHash) ?? null;
                 if(nextElement){
-                    chatBody.insertBefore(b, nextElement?.nextSibling);
+                    chatBody.insertBefore(b, nextElement.nextSibling);
                 }
                 else{
                     chatBody.prepend(b);
                 }
             }
             else{
-                const element = chatBody.querySelector(`[x-hashed="${currentHash}"]`);
+                const element = mountedElements.get(currentHash);
                 element?.classList.toggle('is-settled-history', containMessage);
                 mountInstances.get(currentHash)?.updateStreamingDisplay?.({
                     isOptimizedStreamingMessage: activeStreamingMessage,
@@ -168,10 +200,12 @@
                 unmount(inst);
                 mountInstances.delete(hash);
             }
-            const element = chatBody.querySelector(`[x-hashed="${hash}"]`);
+            const element = mountedElements.get(hash);
             if(element){
-                chatBody.removeChild(element);
+                element.remove();
+                mountedElements.delete(hash);
             }
+            containDecisions.delete(hash);
         });
 
         hashes = currentHashes;
@@ -185,6 +219,8 @@
             unmount(inst);
         });
         mountInstances.clear();
+        mountedElements.clear();
+        containDecisions.clear();
     })
 
     function checkIfAtBottom() {
