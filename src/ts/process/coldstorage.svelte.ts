@@ -46,7 +46,7 @@ async function decompress(data:Uint8Array) {
 
 export async function getColdStorageItem(key:string, opts:{
     accountFallback?:boolean
-} = {}) {
+} = {}):Promise<any> {
 
     if(forageStorage.isAccount && !opts.accountFallback){
         const value = await getAccountColdStorageItem(key)
