@@ -67,6 +67,16 @@ describe('ByteBudgetLru', () => {
         expect(cache.sizeBytes).toBe(2)
     })
 
+    it('drops the previous value when a same-key replace is oversized', () => {
+        const cache = createCache(4)
+        cache.set('item', 'ab')
+
+        expect(cache.set('item', 'abcde')).toBe(false)
+        expect(cache.get('item')).toBeUndefined()
+        expect(cache.size).toBe(0)
+        expect(cache.sizeBytes).toBe(0)
+    })
+
     it('enforces an optional entry limit using LRU recency', () => {
         const cache = new ByteBudgetLru<string, string>(
             100,

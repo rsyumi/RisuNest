@@ -60,4 +60,40 @@ class MainActivityBehaviorTest {
   fun `keyboard inset remains available to the web view`() {
     assertEquals(0, nativeMarginInsetTypes() and WindowInsetsCompat.Type.ime())
   }
+
+  @Test
+  fun `opened file names keep only a safe leaf name`() {
+    assertEquals("a.charx", sanitizeOpenedFileName("a.charx"))
+    assertEquals("b.risum", sanitizeOpenedFileName("primary:Download/b.risum"))
+    assertEquals("c_d.risup", sanitizeOpenedFileName("c d.risup"))
+    assertEquals("opened-file", sanitizeOpenedFileName("///"))
+  }
+
+  @Test
+  fun `opened files script escapes JS string hazards`() {
+    val script = openedFilesScript(listOf("/data/opened/a\"b\\c\nd.charx"))
+
+    assertEquals(
+      "window.tauriOpenedFiles=[\"/data/opened/a\\\"b\\\\c\\u000ad.charx\"];",
+      script,
+    )
+  }
+
+  @Test
+  fun `exit flush finishes once per token`() {
+    val gate = ExitFlushGate()
+    gate.begin("exit-1")
+
+    assertEquals(true, gate.shouldFinish("exit-1"))
+    assertEquals(false, gate.shouldFinish("exit-1"))
+  }
+
+  @Test
+  fun `stale exit flush tokens do not finish the activity`() {
+    val gate = ExitFlushGate()
+    gate.begin("exit-2")
+
+    assertEquals(false, gate.shouldFinish("exit-1"))
+    assertEquals(true, gate.shouldFinish("exit-2"))
+  }
 }

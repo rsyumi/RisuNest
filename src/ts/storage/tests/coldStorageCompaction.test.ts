@@ -121,6 +121,32 @@ describe('compactColdStorageDatabase', () => {
         expect(replaceDatabase).not.toHaveBeenCalled()
     })
 
+    it('skips the whole-database clone when nothing is eligible', async () => {
+        const now = 20 * 24 * 60 * 60 * 1000
+        const live = fixtureDatabase()
+        live.characters[0].lastInteraction = now
+        live.characters[0].chats[0].lastDate = now
+        ;(live as any).cloneTrap = new Proxy({}, {
+            ownKeys() { throw new Error('database must not be cloned') },
+        })
+        const write = vi.fn(async () => true)
+        const read = vi.fn(async () => null)
+        const replaceDatabase = vi.fn(async () => undefined)
+
+        const changed = await compactColdStorageDatabase(live, {
+            now,
+            createId: () => 'unused',
+            write,
+            read,
+            replaceDatabase,
+        })
+
+        expect(changed).toBe(false)
+        expect(write).not.toHaveBeenCalled()
+        expect(read).not.toHaveBeenCalled()
+        expect(replaceDatabase).not.toHaveBeenCalled()
+    })
+
     it('diagnoses a failed verification read and leaves the candidate unpublished', async () => {
         const live = fixtureDatabase()
         const failures: unknown[] = []

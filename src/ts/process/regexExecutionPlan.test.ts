@@ -118,6 +118,15 @@ describe('regex execution plans', () => {
         expect(executeRegexPlanSync(plan, input, identity).data).toBe(expected)
     })
 
+    it('replaces at position 0 when a sticky rule with actions tests first', () => {
+        const plan = getRegexExecutionPlan([
+            script('foo', 'X', 'y<no_end_nl>'),
+        ], 'editoutput')
+
+        expect(executeRegexPlanSync(plan, 'foofoo', identity).data).toBe('Xfoo')
+        expect(executeRegexPlanSync(plan, 'foofoo', identity).data).toBe('Xfoo')
+    })
+
     it('isolates an invalid regex and continues with later rules', () => {
         const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
         const plan = getRegexExecutionPlan([
@@ -149,6 +158,17 @@ describe('regex execution plans', () => {
         expect(executeRegexPlanSync(plan, 'a', parse).data).toBe('b')
         expect(executeRegexPlanSync(plan, 'a', parse).data).toBe('b')
         expect(patternParses).toBe(2)
+    })
+
+    it('keeps a recently reused plan when the cache evicts', () => {
+        const scriptSets = Array.from({ length: 32 }, (_value, index) => [script(`plan-${index}`, 'x')])
+        const plans = scriptSets.map((set) => getRegexExecutionPlan(set, 'editoutput'))
+
+        expect(getRegexExecutionPlan(scriptSets[0], 'editoutput')).toBe(plans[0])
+        getRegexExecutionPlan([script('plan-extra', 'x')], 'editoutput')
+
+        expect(getRegexExecutionPlan(scriptSets[0], 'editoutput')).toBe(plans[0])
+        expect(getRegexExecutionPlan(scriptSets[1], 'editoutput')).not.toBe(plans[1])
     })
 
     it('rejects stateful actions from worker eligibility', () => {

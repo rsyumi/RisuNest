@@ -29,6 +29,35 @@ function latestChatTime(chat: any): number {
     return latest
 }
 
+type DatabaseCharacter = Database['characters'][number]
+
+function isColdCharacter(character: DatabaseCharacter, now: number, coldTime: number): boolean {
+    if (character.coldstorage) {
+        return false
+    }
+    return (character.lastInteraction ?? now) < coldTime
+}
+
+function isColdChat(character: DatabaseCharacter, chat: any, coldTime: number): boolean {
+    if (character.coldstorage) {
+        return false
+    }
+    if ((chat.message?.length ?? 0) < 4) {
+        return false
+    }
+    if (chat.message?.[0]?.data?.startsWith(coldStorageHeader)) {
+        return false
+    }
+    return latestChatTime(chat) < coldTime
+}
+
+function hasCompactionCandidates(database: Database, now: number, coldTime: number): boolean {
+    return database.characters.some((character) => (
+        isColdCharacter(character, now, coldTime)
+        || character.chats.some((chat) => isColdChat(character, chat, coldTime))
+    ))
+}
+
 function isVerifiedCharacterPayload(value: any): boolean {
     return Boolean(value && (Array.isArray(value) || value.character))
 }
@@ -45,14 +74,17 @@ export async function compactColdStorageDatabase(
         return false
     }
 
-    const candidate = safeStructuredClone(database)
     const coldTime = dependencies.now - tenDays
+    if (!hasCompactionCandidates(database, dependencies.now, coldTime)) {
+        return false
+    }
+
+    const candidate = safeStructuredClone(database)
     let changed = false
 
     const characterTasks = candidate.characters.map((_character, index) => async () => {
         const character = candidate.characters[index]
-        const lastInteraction = character.lastInteraction ?? dependencies.now
-        if (lastInteraction >= coldTime || character.coldstorage) {
+        if (!isColdCharacter(character, dependencies.now, coldTime)) {
             return
         }
 
@@ -110,16 +142,7 @@ export async function compactColdStorageDatabase(
             chatTasks.push(async () => {
                 const currentCharacter = candidate.characters[characterIndex]
                 const chat = currentCharacter.chats[chatIndex]
-                if (currentCharacter.coldstorage) {
-                    return
-                }
-                if ((chat.message?.length ?? 0) < 4) {
-                    return
-                }
-                if (chat.message?.[0]?.data?.startsWith(coldStorageHeader)) {
-                    return
-                }
-                if (latestChatTime(chat) >= coldTime) {
+                if (!isColdChat(currentCharacter, chat, coldTime)) {
                     return
                 }
 

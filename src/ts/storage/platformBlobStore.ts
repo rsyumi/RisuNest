@@ -72,6 +72,8 @@ export function createStorageBlobKeyValueBackend(storage: KeyValueStorage): Blob
     }
 }
 
+const opfsHexNamePattern = /^(?:[0-9a-f]{2})+$/
+
 export function createOpfsBlobBackend(directory: FileSystemDirectoryHandle): BlobKeyValueBackend {
     const fileName = (key: string) => Buffer.from(key, 'utf-8').toString('hex')
     const readFileObject = async (key: string): Promise<File | null> => {
@@ -105,7 +107,10 @@ export function createOpfsBlobBackend(directory: FileSystemDirectoryHandle): Blo
         },
         async keys() {
             const keys: string[] = []
-            for await (const entry of directory.values()) keys.push(Buffer.from(entry.name, 'hex').toString('utf-8'))
+            for await (const entry of directory.values()) {
+                if (entry.kind === 'directory' || !opfsHexNamePattern.test(entry.name)) continue
+                keys.push(Buffer.from(entry.name, 'hex').toString('utf-8'))
+            }
             return keys
         },
         async remove(key) {

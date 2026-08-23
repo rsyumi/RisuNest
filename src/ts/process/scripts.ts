@@ -13,7 +13,7 @@ import { pluginV2 } from "../plugins/plugins.svelte";
 import { runTrigger } from "./triggers";
 import { ByteBudgetLru } from "../util/byteBudgetLru";
 import { canExecuteRegexPlanInWorker, executeRegexPlanSync, getRegexExecutionPlan, type RegexExecutionPlanEntry, type RegexExecutionResult } from "./regexExecutionPlan";
-import { RegexExecutionTimeoutError, getSharedRegexWorkerClient } from "./regexWorkerClient";
+import { RegexExecutionTimeoutError, getSharedRegexWorkerClient, isRegexWorkerAvailable } from "./regexWorkerClient";
 
 const SCRIPT_CACHE_BUDGET = 8 * 1024 * 1024
 const SCRIPT_CACHE_ENTRY_LIMIT = 1000
@@ -23,6 +23,7 @@ export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 export interface ProcessScriptOptions {
     cache?: 'normal' | 'bypass'
     signal?: AbortSignal
+    /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
     regexWorker?: boolean
 }
 
@@ -216,6 +217,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                     else if((outScript.startsWith('@@inject') || entry.actions.includes('inject')) && chatID !== -1){
                         const selchar = db.characters[get(selectedCharID)]
                         selchar.chats[selchar.chatPage].message[chatID].data = data
+                        reg.lastIndex = 0
                         data = data.replace(reg, "")
                     }
                     else if(
@@ -223,7 +225,9 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                         entry.actions.includes('move_top') || entry.actions.includes('move_bottom')
                     ){
                         const isGlobal = flag.includes('g')
+                        reg.lastIndex = 0
                         const matchAll = isGlobal ? data.matchAll(reg) : [data.match(reg)]
+                        reg.lastIndex = 0
                         data = data.replace(reg, "")
                         for(const matched of matchAll){
                             if(matched){
@@ -254,6 +258,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                         }
                     }
                     else{
+                        reg.lastIndex = 0
                         data = parse(data.replace(reg, outScript))
                     }
                 }
@@ -272,6 +277,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                             pointer--
                         }
 
+                        reg.lastIndex = 0
                         const r = lastChat.match(reg)
                         if(!v){
                             data = data + r[0]
@@ -310,7 +316,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
             }
         }
     }
-    else if(options.regexWorker && mode === 'editoutput' && canExecuteRegexPlanInWorker(plan, data)){
+    else if((options.regexWorker ?? isRegexWorkerAvailable()) && mode === 'editoutput' && canExecuteRegexPlanInWorker(plan, data)){
         let result: RegexExecutionResult
         try {
             result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })
