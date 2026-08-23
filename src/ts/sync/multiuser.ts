@@ -1,9 +1,10 @@
 import { v4 } from 'uuid';
 import { alertError, alertInput, alertNormal, alertStore, alertWait } from '../alert';
 import { get, writable } from 'svelte/store';
-import { setDatabase, type character, saveImage, type Chat, getCurrentChat, setCurrentChat, getDatabase } from '../storage/database.svelte';
+import { setDatabase, type character, saveImage, type Chat, getCurrentChat, setCurrentChat, getDatabase, type Database } from '../storage/database.svelte';
+import { assignIds } from '../storage/databasePreparation';
 import { selectedCharID } from '../stores.svelte';
-import { findCharacterIndexbyId, sleep } from '../util';
+import { sleep } from '../util';
 import type { DataConnection, Peer } from 'peerjs';
 import { readImage } from '../globalApi.svelte';
 import { doingChat } from '../process/index.svelte';
@@ -47,6 +48,28 @@ interface RequestChat{
 }
 
 type ReciveData = ReciveFirst|RequestFirst|ReciveAsset|RequestSync|ReciveSync|RequestChatSafe|ResponseChatSafe|RequestChat
+
+export function installReceivedCharacter(db:Database, incoming:character):number{
+    incoming.chaId = '§temp'
+    incoming.chatPage = 0
+    incoming.chats = (incoming.chats ?? []).filter((chat) => !!chat)
+    const existingIndex = db.characters.findIndex((candidate) => candidate.chaId === '§temp')
+    if(existingIndex === -1){
+        db.characters.push(incoming)
+    }
+    else{
+        db.characters[existingIndex] = incoming
+    }
+    assignIds(db)
+    return db.characters.findIndex((candidate) => candidate.chaId === '§temp')
+}
+
+export function normalizeIncomingChat(chat:Chat, fallbackId?:string):Chat{
+    if(!chat.id){
+        chat.id = fallbackId || v4()
+    }
+    return chat
+}
 
 let conn:DataConnection
 let peer:Peer
@@ -144,7 +167,7 @@ export async function createMultiuserRoom(){
                 const db = getDatabase()
                 const selectedCharId = get(selectedCharID)
                 const char = db.characters[selectedCharId]
-                char.chats[char.chatPage] = data.data
+                char.chats[char.chatPage] = normalizeIncomingChat(data.data, char.chats[char.chatPage]?.id)
                 db.characters[selectedCharId] = char
                 latestSyncChat = data.data
                 setDatabase(db)
@@ -290,18 +313,8 @@ export async function joinMultiuserRoom(){
                 case 'receive-char':{
                     //create temp character
                     const db = getDatabase()
-                    const cha = data.data
-                    cha.chaId = '§temp'
-                    cha.chatPage = 0
-                    const ind = findCharacterIndexbyId('§temp')
                     const selectedcharIndex = get(selectedCharID)
-                    if(ind === -1){
-                        db.characters.push(cha)
-                    }
-                    else{
-                        db.characters[ind] = cha
-                    }
-                    const tempInd = findCharacterIndexbyId('§temp')
+                    const tempInd = installReceivedCharacter(db, data.data)
                     if(selectedcharIndex !== tempInd){
                         selectedCharID.set(tempInd)
                     }
@@ -318,7 +331,7 @@ export async function joinMultiuserRoom(){
                     })
                     const selectedCharId = get(selectedCharID)
                     const char = safeStructuredClone(db.characters[selectedCharId])
-                    char.chats[char.chatPage] = data.data
+                    char.chats[char.chatPage] = normalizeIncomingChat(data.data, char.chats[char.chatPage]?.id)
                     db.characters[selectedCharId] = char
                     latestSyncChat = data.data
                     setDatabase(db)
