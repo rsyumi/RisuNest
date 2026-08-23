@@ -211,178 +211,57 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     }
 
     async readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'root'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'root'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const record = (await requestResult(
-            transaction.objectStore('root').get(generation),
-        )) as StoredRecord<Omit<Database, 'characters'>> | undefined
-        await transactionDone(transaction)
+        const record = await this.readRootRecordFromTransaction(transaction, generation)
         return { revision, value: record?.value ?? ({} as Omit<Database, 'characters'>) }
     }
 
     async queryCharacters(input: CharacterQuery): Promise<CharacterPage> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'catalog'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'catalog'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const store = transaction.objectStore('catalog')
-        const index = store.index(
-            input.order === 'configured' ? 'byGenerationConfigured' : 'byGenerationRecent',
-        )
-        const search = input.search?.trim().toLocaleLowerCase()
-        const range =
-            input.order === 'configured'
-                ? this.keyRangeFactory.bound([generation, 0], [generation, MAX_INDEX_VALUE])
-                : this.keyRangeFactory.bound(
-                      [generation, -MAX_INDEX_VALUE, 0],
-                      [generation, 0, MAX_INDEX_VALUE],
-                  )
-        const result = await cursorPage<CharacterSummary>(
-            index,
-            range,
-            input,
-            (item) =>
-                item.trashed === input.trash &&
-                (!search || item.name.toLocaleLowerCase().includes(search)),
-            )
-        await transactionDone(transaction)
-        return { revision, ...result }
+        return this.queryCharactersFromTransaction(transaction, revision, generation, input)
     }
 
     async readCharacter(id: string): Promise<Versioned<CharacterDetail> | null> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'characters'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'characters'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const record = (await requestResult(
-            transaction.objectStore('characters').get(this.characterKey(generation, id)),
-        )) as StoredRecord<CharacterDetail> | undefined
-        await transactionDone(transaction)
-        return record ? { revision, value: record.value } : null
+        return this.readCharacterFromTransaction(transaction, revision, generation, id)
     }
 
     async queryConversations(input: ConversationQuery): Promise<ConversationPage> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'conversations'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'conversations'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const index = transaction.objectStore('conversations').index(
-            input.order === 'configured'
-                ? 'byGenerationCharacterConfigured'
-                : 'byGenerationCharacterRecent',
-        )
-        const prefix = [generation, input.characterId]
-        const range =
-            input.order === 'configured'
-                ? this.keyRangeFactory.bound([...prefix, 0], [...prefix, MAX_INDEX_VALUE])
-                : this.keyRangeFactory.bound(
-                      [...prefix, -MAX_INDEX_VALUE, 0],
-                      [...prefix, 0, MAX_INDEX_VALUE],
-                  )
-        const result = await cursorPage<StoredConversation>(index, range, input, () => true)
-        await transactionDone(transaction)
-        return {
-            revision,
-            items: result.items.map((item) => item.summary),
-            nextCursor: result.nextCursor,
-        }
+        return this.queryConversationsFromTransaction(transaction, revision, generation, input)
     }
 
     async readConversation(
         characterId: string,
         conversationId: string,
     ): Promise<Versioned<Chat> | null> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(
+        const transaction = this.requireDatabase().transaction(
             ['meta', 'conversations', 'messagePages'],
             'readonly',
         )
         const { revision, generation } = await this.readActive(transaction)
-        const record = (await requestResult(
-            transaction
-                .objectStore('conversations')
-                .get(this.conversationKey(generation, characterId, conversationId)),
-        )) as StoredRecord<StoredConversation> | undefined
-        if (!record) {
-            await transactionDone(transaction)
-            return null
-        }
-        const message = await this.readMessagesFromTransaction(
+        return this.readConversationFromTransaction(
             transaction,
+            revision,
             generation,
             characterId,
             conversationId,
         )
-        await transactionDone(transaction)
-        return { revision, value: { ...record.value.detail, message } }
     }
 
     async readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(
+        const transaction = this.requireDatabase().transaction(
             ['meta', 'conversations', 'messagePages'],
             'readonly',
         )
         const { revision, generation } = await this.readActive(transaction)
-        const conversation = (await requestResult(
-            transaction
-                .objectStore('conversations')
-                .get(this.conversationKey(generation, input.characterId, input.conversationId)),
-        )) as StoredRecord<StoredConversation> | undefined
-        if (!conversation) {
-            await transactionDone(transaction)
-            return null
-        }
-
-        const totalMessages = conversation.value.summary.messageCount
-        let startIndex: number
-        let endIndex: number
-        let anchorPage: StoredMessagePage | undefined
-        if (input.anchorMessageId !== undefined) {
-            const anchor = await this.findMessage(
-                transaction,
-                generation,
-                input.characterId,
-                input.conversationId,
-                input.anchorMessageId,
-                totalMessages,
-            )
-            if (!anchor) {
-                await transactionDone(transaction)
-                return null
-            }
-            anchorPage = anchor.page
-            startIndex = Math.max(0, anchor.index - Math.max(0, input.before ?? 0))
-            endIndex = Math.min(totalMessages, anchor.index + Math.max(0, input.after ?? 0) + 1)
-        } else {
-            endIndex = totalMessages
-            startIndex = Math.max(0, endIndex - Math.max(0, input.limit ?? MESSAGE_PAGE_SIZE))
-        }
-        const messages = await this.readMessageRange(
-            transaction,
-            generation,
-            input.characterId,
-            input.conversationId,
-            startIndex,
-            endIndex,
-            anchorPage,
-        )
-
-        const result = {
-            revision,
-            value: {
-                characterId: input.characterId,
-                conversationId: input.conversationId,
-                messages,
-                startIndex,
-                endIndex,
-                totalMessages,
-                hasMoreBefore: startIndex > 0,
-                hasMoreAfter: endIndex < totalMessages,
-            },
-        }
-        await transactionDone(transaction)
-        return result
+        return this.readConversationWindowFromTransaction(transaction, revision, generation, input)
     }
 
     async commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
@@ -570,27 +449,58 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             revision,
             readRoot: async () => {
                 assertActive()
-                return this.readRootAt(revision, generation)
+                const record = await this.readRootRecordFromTransaction(
+                    this.requireDatabase().transaction('root', 'readonly'),
+                    generation,
+                )
+                if (!record) throw new Error('Persistent snapshot root is missing')
+                return { revision, value: record.value }
             },
             queryCharacters: async (input) => {
                 assertActive()
-                return this.queryCharactersAt(revision, generation, input)
+                return this.queryCharactersFromTransaction(
+                    this.requireDatabase().transaction('catalog', 'readonly'),
+                    revision,
+                    generation,
+                    input,
+                )
             },
             readCharacter: async (id) => {
                 assertActive()
-                return this.readCharacterAt(revision, generation, id)
+                return this.readCharacterFromTransaction(
+                    this.requireDatabase().transaction('characters', 'readonly'),
+                    revision,
+                    generation,
+                    id,
+                )
             },
             queryConversations: async (input) => {
                 assertActive()
-                return this.queryConversationsAt(revision, generation, input)
+                return this.queryConversationsFromTransaction(
+                    this.requireDatabase().transaction('conversations', 'readonly'),
+                    revision,
+                    generation,
+                    input,
+                )
             },
             readConversation: async (characterId, conversationId) => {
                 assertActive()
-                return this.readConversationAt(revision, generation, characterId, conversationId)
+                return this.readConversationFromTransaction(
+                    this.requireDatabase().transaction(['conversations', 'messagePages'], 'readonly'),
+                    revision,
+                    generation,
+                    characterId,
+                    conversationId,
+                )
             },
             readConversationWindow: async (input) => {
                 assertActive()
-                return this.readConversationWindowAt(revision, generation, input)
+                return this.readConversationWindowFromTransaction(
+                    this.requireDatabase().transaction(['conversations', 'messagePages'], 'readonly'),
+                    revision,
+                    generation,
+                    input,
+                )
             },
             release: async () => {
                 if (releasePromise) return releasePromise
@@ -603,25 +513,23 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    private async readRootAt(
-        revision: DataRevision,
+    private async readRootRecordFromTransaction(
+        transaction: IDBTransaction,
         generation: string,
-    ): Promise<Versioned<Omit<Database, 'characters'>>> {
-        const transaction = this.requireDatabase().transaction('root', 'readonly')
+    ): Promise<StoredRecord<Omit<Database, 'characters'>> | undefined> {
         const record = (await requestResult(
             transaction.objectStore('root').get(generation),
         )) as StoredRecord<Omit<Database, 'characters'>> | undefined
         await transactionDone(transaction)
-        if (!record) throw new Error('Persistent snapshot root is missing')
-        return { revision, value: record.value }
+        return record
     }
 
-    private async queryCharactersAt(
+    private async queryCharactersFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         input: CharacterQuery,
     ): Promise<CharacterPage> {
-        const transaction = this.requireDatabase().transaction('catalog', 'readonly')
         const index = transaction.objectStore('catalog').index(
             input.order === 'configured' ? 'byGenerationConfigured' : 'byGenerationRecent',
         )
@@ -645,12 +553,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return { revision, ...result }
     }
 
-    private async readCharacterAt(
+    private async readCharacterFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         id: string,
     ): Promise<Versioned<CharacterDetail> | null> {
-        const transaction = this.requireDatabase().transaction('characters', 'readonly')
         const record = (await requestResult(
             transaction.objectStore('characters').get(this.characterKey(generation, id)),
         )) as StoredRecord<CharacterDetail> | undefined
@@ -658,12 +566,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return record ? { revision, value: record.value } : null
     }
 
-    private async queryConversationsAt(
+    private async queryConversationsFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         input: ConversationQuery,
     ): Promise<ConversationPage> {
-        const transaction = this.requireDatabase().transaction('conversations', 'readonly')
         const index = transaction.objectStore('conversations').index(
             input.order === 'configured'
                 ? 'byGenerationCharacterConfigured'
@@ -686,16 +594,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    private async readConversationAt(
+    private async readConversationFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         characterId: string,
         conversationId: string,
     ): Promise<Versioned<Chat> | null> {
-        const transaction = this.requireDatabase().transaction(
-            ['conversations', 'messagePages'],
-            'readonly',
-        )
         const record = (await requestResult(
             transaction
                 .objectStore('conversations')
@@ -715,15 +620,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return { revision, value: { ...record.value.detail, message } }
     }
 
-    private async readConversationWindowAt(
+    private async readConversationWindowFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null> {
-        const transaction = this.requireDatabase().transaction(
-            ['conversations', 'messagePages'],
-            'readonly',
-        )
         const conversation = (await requestResult(
             transaction
                 .objectStore('conversations')
