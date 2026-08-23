@@ -1398,8 +1398,13 @@ export async function fetchNative(url: string, arg: {
             throughProxy = false
         }
     }
-    const useTauriHttp = isTauri && !(window.userScriptFetch && !throughProxy)
-    const timeoutSignal = useTauriHttp ? null : buildTimeoutSignal(arg.signal, arg.requestTimeoutMs)
+    const route: 'userscript' | 'tauri' | 'proxy' | 'plain' =
+        window.userScriptFetch && !throughProxy ? 'userscript'
+            : isTauri ? 'tauri'
+                : throughProxy ? 'proxy'
+                    : 'plain'
+    // The Tauri stream route manages its own composed timeout signal.
+    const timeoutSignal = route === 'tauri' ? null : buildTimeoutSignal(arg.signal, arg.requestTimeoutMs)
     const requestSignal = timeoutSignal?.signal ?? arg.signal
     const shouldLogFetch = arg.logFetch ?? true
     let fetchLogIndex: number | null = null
@@ -1415,7 +1420,7 @@ export async function fetchNative(url: string, arg: {
         })
     }
     try {
-        if (window.userScriptFetch && !throughProxy) {
+        if (route === 'userscript') {
             return await window.userScriptFetch(url, {
             body: realBody as any,
             headers: headers,
@@ -1423,7 +1428,7 @@ export async function fetchNative(url: string, arg: {
             signal: requestSignal
         })
         }
-        else if (isTauri) {
+        else if (route === 'tauri') {
             const decoder = shouldLogFetch && fetchLogIndex !== null ? new TextDecoder() : null
             const responseParts: string[] = []
             return await fetchTauriHttpStream({
@@ -1442,7 +1447,7 @@ export async function fetchNative(url: string, arg: {
                 } : undefined,
             })
         }
-    else if (throughProxy) {
+    else if (route === 'proxy') {
         const useProxyJobWs = isNodeServer
             && arg.interceptor === 'openai_streaming'
             && arg.method === 'POST'
