@@ -1,8 +1,8 @@
 <script lang="ts">
     import { changeChar, getCharImage, removeChar } from "../../ts/characters";
-    import { type Database } from "../../ts/storage/database.svelte";
+    import { getDatabase, type Database } from "../../ts/storage/database.svelte";
+    import { replacePersistentDatabase } from "../../ts/storage/persistentDataRuntime.svelte";
     import { DBState } from 'src/ts/stores.svelte';
-    import { findCharacterIndexbyId } from "../../ts/util";
     import BarIcon from "../SideBars/BarIcon.svelte";
     import { ArrowLeft, User, Users, SquareMousePointer, TrashIcon, Undo2Icon } from "@lucide/svelte";
     import { selectedCharID } from "../../ts/stores.svelte";
@@ -138,11 +138,13 @@
                         <h4 class="text-textcolor font-bold text-lg mb-1">{char.name || "Unnamed"}</h4>
                         <span class="text-textcolor2">{parseMultilangString(char.desc)['en'] || parseMultilangString(char.desc)['xx'] || 'No description'}</span>
                         <div class="flex gap-2 justify-end">
-                            <button class="hover:text-textcolor text-textcolor2" onclick={() => {
-                                const restoreIdx = findCharacterIndexbyId(char.chaId)
+                            <button class="hover:text-textcolor text-textcolor2" onclick={async () => {
+                                const candidate = getDatabase({ snapshot: true })
+                                const restoreIdx = candidate.characters.findIndex((c) => c.chaId === char.chaId)
                                 if (restoreIdx !== -1) {
-                                    DBState.db.characters[restoreIdx].trashTime = undefined
-                                    checkCharOrder()
+                                    candidate.characters[restoreIdx].trashTime = undefined
+                                    checkCharOrder(candidate)
+                                    await replacePersistentDatabase(candidate, 'character-restore')
                                 }
                             }}>
                                 <Undo2Icon />
