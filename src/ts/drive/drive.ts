@@ -113,14 +113,6 @@ export async function checkDriverInit() {
 }
 
 let lastSaved:number = parseInt(localStorage.getItem('risu_lastsaved') ?? '-1')
-let BackupDb:Database = null
-
-
-export function syncDrive() {
-    BackupDb = safeStructuredClone(getDatabase())
-    return
-}
-
 
 async function backupDrive(ACCESS_TOKEN:string) {
     await forageStorage.Init()
