@@ -20,6 +20,11 @@ export function createStructuredAccountAssetReader(
     }
 }
 
+function isAccountAssetKey(key: string): boolean {
+    const normalized = key.replace(/\\/g, '/')
+    return normalized.startsWith('assets/') && normalized.length > 'assets/'.length
+}
+
 export async function readActiveAsset(
     blobStore: BlobStore,
     key: string,
@@ -28,8 +33,7 @@ export async function readActiveAsset(
     let value = await blobStore.read(key)
     if (value === null
         && mode.officialAccount
-        && key.startsWith('assets/')
-        && key.length > 'assets/'.length
+        && isAccountAssetKey(key)
         && officialAccountAssetReader) {
         value = await officialAccountAssetReader(key)
     }

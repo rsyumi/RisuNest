@@ -183,7 +183,6 @@
             Login
         </button>
     {/if}
-    <!-- <Button onclick={autoServerBackup}>Auto Server Backups</Button> -->
 
 </div>
 {#if openIframe}
