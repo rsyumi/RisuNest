@@ -1,3 +1,4 @@
+import { isLegacyBackupAssetKey } from '../../drive/backupAssets'
 import {
     isColdStorageBackupData,
     listCharacterResources,
@@ -58,6 +59,8 @@ interface PinnedColdValue {
 
 interface PinnedAsset {
     key: string
+    /** The local blob key holding this asset's payload. */
+    localKey: string
     /** The key the account already holds this asset under, or null when it must be uploaded. */
     publishedAs: string | null
 }
@@ -68,7 +71,11 @@ interface AssociatedProjection {
 }
 
 function isOfficialAssetKey(key: string): boolean {
-    return key.startsWith('assets/') && key.length > 'assets/'.length
+    return isLegacyBackupAssetKey(key)
+}
+
+function normalizeLegacyAssetKey(key: string): string {
+    return key.replace(/\\/g, '/')
 }
 
 function addOfficialAssets(target: Set<string>, values: readonly string[]): void {
@@ -116,11 +123,13 @@ function requireWriteSuccess(result: AccountWriteResult, key: string): string {
     return result.replacementKey
 }
 
-function requireRemoteValue(result: AccountReadResult, key: string): Uint8Array {
-    if (result.kind === 'missing') {
-        throw new Error(`Missing official asset: ${key}`)
+function requireRemoteAsset(result: AccountReadResult, key: string): boolean {
+    if (result.kind !== 'missing') return true
+    if (normalizeLegacyAssetKey(key) !== key) {
+        console.warn(`Skipping a legacy official asset without a payload: ${key}`)
+        return false
     }
-    return result.bytes
+    throw new Error(`Missing official asset: ${key}`)
 }
 
 function validateCandidate(value: unknown): asserts value is Database {
@@ -252,7 +261,7 @@ class OfficialPinnedPublication implements PinnedPublication {
 
         for (const asset of this.assets) {
             if (this.replacements.has(asset.key)) continue
-            const bytes = await this.blobs.read(asset.key)
+            const bytes = await this.blobs.read(asset.localKey)
             if (!bytes) throw new Error(`Missing pinned asset payload: ${asset.key}`)
             const result = await this.dependencies.account.writeItem(asset.key, bytes)
             const replacementKey = requireWriteSuccess(result, asset.key)
@@ -335,16 +344,23 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             for (const key of [...assetKeys].sort()) {
                 const publishedAs = this.dependencies.ledger.publishedAs(key)
                 if (publishedAs !== null) {
-                    assets.push({ key, publishedAs })
+                    assets.push({ key, localKey: key, publishedAs })
                     continue
                 }
                 if (await blobs.stat(key)) {
-                    assets.push({ key, publishedAs: null })
+                    assets.push({ key, localKey: key, publishedAs: null })
                     continue
                 }
-                requireRemoteValue(await this.dependencies.account.readItem(key), key)
+                const normalized = normalizeLegacyAssetKey(key)
+                if (normalized !== key && await blobs.stat(normalized)) {
+                    assets.push({ key, localKey: normalized, publishedAs: null })
+                    continue
+                }
+                if (!requireRemoteAsset(await this.dependencies.account.readItem(key), key)) {
+                    continue
+                }
                 this.dependencies.ledger.record(key, key)
-                assets.push({ key, publishedAs: key })
+                assets.push({ key, localKey: key, publishedAs: key })
             }
 
             return new OfficialPinnedPublication(
@@ -407,7 +423,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         }
         for (const key of [...assetKeys].sort()) {
             throwIfAborted(signal)
-            requireRemoteValue(await this.dependencies.account.readItem(key, { signal }), key)
+            requireRemoteAsset(await this.dependencies.account.readItem(key, { signal }), key)
         }
 
         throwIfAborted(signal)

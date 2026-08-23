@@ -309,6 +309,46 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(writtenCold.character.additionalAssets[0][1]).toBe(`remote/${coldOnlyKey}`)
     })
 
+    it('pins a legacy backslash asset key and uploads its normalized local payload', async () => {
+        const database = makeDatabase() as any
+        const legacyKey = 'assets\\windows.gif'
+        database.characters[0].additionalAssets = [['legacy', legacyKey, 'gif']]
+        const localBlobs = new Map(
+            resources(database)
+                .filter((key) => key !== legacyKey)
+                .map((key, index): [string, Uint8Array] => [key, Uint8Array.of(index + 1)]),
+        )
+        localBlobs.set('assets/windows.gif', Uint8Array.of(77))
+        const harness = await makeHarness({ database, blobs: localBlobs })
+
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        await publication.publish()
+
+        const upload = harness.writes.find((write) => write.key === legacyKey)
+        expect(upload?.bytes).toEqual(Uint8Array.of(77))
+        const databaseWrite = harness.writes.find((write) => write.key === databaseKey)
+        const projected = await decodeRisuSave(databaseWrite!.bytes!) as any
+        expect(projected.characters[0].additionalAssets[0][1]).toBe(`remote/${legacyKey}`)
+    })
+
+    it('publishes without a legacy backslash asset whose payload no longer exists anywhere', async () => {
+        const database = makeDatabase() as any
+        const legacyKey = 'assets\\gone.gif'
+        database.characters[0].additionalAssets = [['legacy', legacyKey, 'gif']]
+        const localBlobs = new Map(
+            resources(database)
+                .filter((key) => key !== legacyKey)
+                .map((key, index): [string, Uint8Array] => [key, Uint8Array.of(index + 1)]),
+        )
+        const harness = await makeHarness({ database, blobs: localBlobs })
+
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        await publication.publish()
+
+        expect(harness.writes.some((write) => write.key === legacyKey)).toBe(false)
+        expect(harness.writes.some((write) => write.key === databaseKey)).toBe(true)
+    })
+
     it('leaves sentinel, URL, data URL, and Tauri path resources outside official asset I/O', async () => {
         const database = makeDatabase() as any
         database.customBackground = '-'
@@ -686,6 +726,29 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         const invalidReplace = vi.spyOn(invalidCold.store, 'replaceFromDatabase')
         await expect(invalidCold.adapter.pull()).rejects.toThrow('Invalid official cold payload')
         expect(invalidReplace).not.toHaveBeenCalled()
+    })
+
+    it('activates a remote snapshot that references a legacy backslash asset the account lacks', async () => {
+        const remote = makeDatabase() as any
+        remote.characters[0].additionalAssets = [['legacy', 'assets\\windows.gif', 'gif']]
+        const bytes = encodeRisuSaveLegacy(remote, 'compression')
+        const harness = await makeHarness({
+            databaseRead: { kind: 'value', bytes },
+            remoteAssets: new Map(
+                resources(remote)
+                    .filter((key) => key !== 'assets\\windows.gif')
+                    .map((key) => [key, Uint8Array.of(1)]),
+            ),
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+
+        const result = await harness.adapter.pull()
+
+        expect(result.kind).toBe('activated')
+        expect(harness.readItem).toHaveBeenCalledWith('assets\\windows.gif', expect.anything())
     })
 
     it('checks abort immediately before the single replacement', async () => {
