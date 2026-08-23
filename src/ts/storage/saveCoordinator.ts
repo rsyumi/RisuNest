@@ -408,14 +408,16 @@ export class SaveCoordinator {
     }
 
     private capture(): CapturedState {
-        const root = canonicalClone(this.dependencies.captureRoot())
+        const rootCanonical = canonicalJson(this.dependencies.captureRoot())
         const characterValue = this.dependencies.captureSelectedCharacter()
-        const character = characterValue ? canonicalClone(characterValue) : null
+        const characterCanonical = characterValue ? canonicalJson(characterValue) : null
         return {
-            root,
-            rootCanonical: canonicalJson(root),
-            character,
-            characterCanonical: character ? canonicalJson(character) : null,
+            root: JSON.parse(rootCanonical) as RootDatabase,
+            rootCanonical,
+            character: characterCanonical
+                ? (JSON.parse(characterCanonical) as CompleteCharacter)
+                : null,
+            characterCanonical,
         }
     }
 
@@ -426,9 +428,9 @@ export class SaveCoordinator {
         const character = selectedId ? characters.find((candidate) => candidate.chaId === selectedId) ?? null : null
         return {
             root,
-            rootCanonical: canonicalJson(root),
+            rootCanonical: JSON.stringify(root),
             character,
-            characterCanonical: character ? canonicalJson(character) : null,
+            characterCanonical: character ? JSON.stringify(character) : null,
         }
     }
 
@@ -443,8 +445,8 @@ export class SaveCoordinator {
         if (!value || value.chaId !== pending.characterId) {
             throw new Error(`Installed character ${pending.characterId} is not available`)
         }
-        const character = canonicalClone(value)
-        return { pending, character, canonical: canonicalJson(character) }
+        const canonical = canonicalJson(value)
+        return { pending, character: JSON.parse(canonical) as CompleteCharacter, canonical }
     }
 
     private beginReservedAddition(reserved: ReservedCharacterAddition): void {
