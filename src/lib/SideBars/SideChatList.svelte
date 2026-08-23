@@ -12,9 +12,9 @@
     import Button from "../UI/GUI/Button.svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
 
-    import { exportChat, importChat, exportAllChats } from "src/ts/characters";
+    import { addNewChat, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
-    import { findCharacterbyId, sleep, sortableOptions } from "src/ts/util";
+    import { sleep, sortableOptions } from "src/ts/util";
     import { createMultiuserRoom } from "src/ts/sync/multiuser";
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
@@ -137,24 +137,7 @@
 </script>
 <div class="flex flex-col w-full h-[calc(100%-2rem)] max-h-[calc(100%-2rem)]">
     <Button className="relative bottom-2" onclick={async () => {
-        const cha = chara
-        const len = chara.chats.length
-        let chats = chara.chats
-        const newChat: Chat = {
-            message:[], note:'', name:`New Chat ${len + 1}`, localLore:[], fmIndex: -1, id: v4()
-        }
-        if(cha.type === 'group'){
-            cha.characters.map((c) => {
-                newChat.message.push({
-                    saying: c,
-                    role: 'char',
-                    data: findCharacterbyId(c).firstMessage
-                })
-            })
-        }
-        chats.unshift(newChat)
-        chara.chats = chats
-        await changeChatTo(newChat.id)
+        await addNewChat(chara)
     }}>{language.newChat}</Button>
 
     {#key sorted}
@@ -330,14 +313,7 @@
                                 }
                                 const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
                                 if(d){
-                                    let chats = chara.chats
-                                    const selectedChatId = chats[chara.chatPage]?.id
-                                    const survivingId = selectedChatId === chat.id
-                                        ? chats.find((candidate) => candidate.id !== chat.id)?.id
-                                        : selectedChatId
-                                    chats.splice(chara.chats.indexOf(chat), 1)
-                                    chara.chats = chats
-                                    if(survivingId) await changeChatTo(survivingId)
+                                    await removeChat(chara, chat.id)
                                 }
                             }}>
                                 <TrashIcon size={18}/>
@@ -443,14 +419,7 @@
                         }
                         const d = await alertConfirm(`${language.removeConfirm}${chat.name}`)
                         if(d){
-                            let chats = chara.chats
-                            const selectedChatId = chats[chara.chatPage]?.id
-                            const survivingId = selectedChatId === chat.id
-                                ? chats.find((candidate) => candidate.id !== chat.id)?.id
-                                : selectedChatId
-                            chats.splice(i, 1)
-                            chara.chats = chats
-                            if(survivingId) await changeChatTo(survivingId)
+                            await removeChat(chara, chat.id)
                         }
                     }}>
                         <TrashIcon size={18}/>
