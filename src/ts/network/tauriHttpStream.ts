@@ -1,5 +1,8 @@
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http'
 
+/** Matches the whole-request default of the removed Rust streamed_fetch. */
+export const DEFAULT_REQUEST_TIMEOUT_MS = 240_000
+
 export type TauriHttpStreamFinish = () => void
 
 export interface TauriHttpStreamOptions {
@@ -44,11 +47,12 @@ function createRequestLifecycle(options: TauriHttpStreamOptions) {
     else if (options.signal) {
         options.signal.addEventListener('abort', abortFromCaller, { once: true })
     }
-    if (options.requestTimeoutMs !== undefined && options.requestTimeoutMs > 0 && !controller.signal.aborted) {
+    const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    if (requestTimeoutMs > 0 && !controller.signal.aborted) {
         timer = setTimeout(() => {
             controller.abort(new DOMException('The operation timed out', 'TimeoutError'))
             finish()
-        }, options.requestTimeoutMs)
+        }, requestTimeoutMs)
     }
 
     return {
