@@ -427,15 +427,15 @@ describe('SaveCoordinator', () => {
     })
 
     it.each([
-        ['added', (chats: { id: string }[]) => chats.push({
+        ['added', (chats: { id?: string }[]) => chats.push({
             id: 'three',
             name: 'Three',
             message: [],
             localLore: [],
             note: '',
         } as never)],
-        ['removed', (chats: { id: string }[]) => chats.splice(0, 1)],
-        ['reordered', (chats: { id: string }[]) => chats.reverse()],
+        ['removed', (chats: { id?: string }[]) => chats.splice(0, 1)],
+        ['reordered', (chats: { id?: string }[]) => chats.reverse()],
     ] as const)('replaces the whole character when chats are %s', async (_label, mutate) => {
         const database = makeChattyDatabase()
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
