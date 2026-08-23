@@ -1083,7 +1083,6 @@ export const languageSpanish = {
     "blockMode": "Modo Bloque",
     "helpBlock": "Ayuda",
     "hideChatIcon": "Ocultar Icono de UI",
-    "loadInternalBackup": "Cargar Respaldo Interno",
     "createCopy": "Crear una Copia",
     "bindPersona": "Vincular Persona",
     "chatOptions": "Opciones de Chat",

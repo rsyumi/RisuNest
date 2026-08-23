@@ -1074,7 +1074,6 @@ export const languageChineseTraditional = {
     "blockMode": "區塊",
     "helpBlock": "幫助",
     "hideChatIcon": "隱藏頭像",
-    "loadInternalBackup": "讀取內部備份",
     "createCopy": "新建副本",
     "bindPersona": "綁定人設",
     "chatOptions": "對話選項",

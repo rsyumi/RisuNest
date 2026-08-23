@@ -1245,7 +1245,6 @@ export const languageEnglish = {
     blockMode: "Block",
     helpBlock: "Help",
     hideChatIcon: "Hide Icon UI",
-    loadInternalBackup: "Load Internal Backup",
     createCopy: "Create a Copy",
     bindPersona: "Bind Persona",
     chatOptions: "Chat Options",

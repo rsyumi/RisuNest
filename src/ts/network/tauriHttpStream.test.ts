@@ -8,7 +8,7 @@ vi.mock('@tauri-apps/plugin-http', () => ({
     fetch: pluginFetch,
 }))
 
-import { fetchTauriHttpStream } from './tauriHttpStream'
+import { DEFAULT_REQUEST_TIMEOUT_MS, fetchTauriHttpStream } from './tauriHttpStream'
 
 function pluginResponse(
     body: ReadableStream<Uint8Array> | null,
@@ -170,6 +170,62 @@ describe('fetchTauriHttpStream', () => {
         expect(vi.getTimerCount()).toBe(0)
         expect(caller.remove).toHaveBeenCalledWith('abort', expect.any(Function))
         expect(onFinish).toHaveBeenCalledOnce()
+    })
+
+    test('defaults the whole-request timeout to 240 seconds when unspecified', async () => {
+        vi.useFakeTimers()
+        const cancellationError = new Error('stalled connection cancelled')
+        let effectiveSignal: AbortSignal | undefined
+        pluginFetch.mockImplementation(async (_url, init) => {
+            effectiveSignal = init?.signal
+            return pluginResponse(new ReadableStream<Uint8Array>({
+                start(controller) {
+                    effectiveSignal!.addEventListener('abort', () => controller.error(cancellationError), { once: true })
+                },
+            }, { highWaterMark: 0 }))
+        })
+        const onFinish = vi.fn()
+
+        const response = await fetchTauriHttpStream({
+            url: 'https://example.test/stalled',
+            method: 'GET',
+            headers: {},
+            onFinish,
+        })
+        const reader = response.body!.getReader()
+        const pendingRead = reader.read()
+        pendingRead.catch(() => undefined)
+
+        await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_TIMEOUT_MS - 1)
+        expect(effectiveSignal?.aborted).toBe(false)
+        await vi.advanceTimersByTimeAsync(1)
+        expect(effectiveSignal?.aborted).toBe(true)
+        expect((effectiveSignal?.reason as DOMException).name).toBe('TimeoutError')
+        await expect(pendingRead).rejects.toBe(cancellationError)
+        expect(vi.getTimerCount()).toBe(0)
+        expect(onFinish).toHaveBeenCalledOnce()
+    })
+
+    test('a nonpositive explicit timeout disables the default whole-request timer', async () => {
+        vi.useFakeTimers()
+        pluginFetch.mockImplementation(async () => pluginResponse(new ReadableStream<Uint8Array>({
+            pull(controller) {
+                controller.enqueue(new Uint8Array([1]))
+            },
+        }, { highWaterMark: 0 })))
+
+        const response = await fetchTauriHttpStream({
+            url: 'https://example.test/no-timeout',
+            method: 'GET',
+            headers: {},
+            requestTimeoutMs: 0,
+        })
+        expect(vi.getTimerCount()).toBe(0)
+
+        await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_TIMEOUT_MS + 1)
+        const reader = response.body!.getReader()
+        expect(await reader.read()).toMatchObject({ done: false, value: new Uint8Array([1]) })
+        await reader.cancel()
     })
 
     test('propagates caller abort before headers and cleans up once', async () => {

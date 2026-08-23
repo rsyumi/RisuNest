@@ -29,7 +29,6 @@ import { decodeRisuSave } from "./storage/risuSave";
 import { AutoStorage } from "./storage/autoStorage";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
-import { autoServerBackup } from "./kei/backup";
 import { save } from "@tauri-apps/plugin-dialog";
 import { language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
@@ -63,6 +62,7 @@ import {
     installPersistentSaveNotifications,
 } from "./storage/persistentSaveNotifications";
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore } from "./storage/platformBlobStore";
+import { inferBlobMime } from "./storage/blobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
 import { readActiveAsset, storeActiveAsset } from "./storage/accountAssetAccess";
 
@@ -140,11 +140,51 @@ let fileCache: {
     res: []
 }
 
-const browserAssetByteCache = new ByteBudgetLru<string, Uint8Array>(
+const browserAssetDataUrlCache = new ByteBudgetLru<string, string>(
     16 * 1024 * 1024,
-    (_loc, data) => data.byteLength,
+    (_loc, dataUrl) => dataUrl.length,
 )
-const pendingBrowserAssetReads = new Map<string, Promise<Uint8Array>>()
+const pendingBrowserAssetReads = new Map<string, Promise<string | null>>()
+const tauriAssetUrlCache = new Map<string, string>()
+
+function buildAssetDataUrl(mime: string | undefined, data: Uint8Array): string {
+    return `data:${mime || 'application/octet-stream'};base64,${Buffer.from(data).toString('base64')}`
+}
+
+/** Resolves a local blob to a data URL, or null when the local store misses it. */
+async function readBrowserAssetDataUrl(loc: string): Promise<string | null> {
+    const cached = browserAssetDataUrlCache.get(loc)
+    if (cached !== undefined) return cached
+    let pending = pendingBrowserAssetReads.get(loc)
+    if (!pending) {
+        pending = (async () => {
+            const blobStore = loc.startsWith('assets/') ? await resolveBlobStore() : null
+            const data = blobStore
+                ? await blobStore.read(loc)
+                : await forageStorage.getItem(loc) as unknown as Uint8Array
+            if (!data) return null
+            const metadata = await blobStore?.stat(loc)
+            const dataUrl = buildAssetDataUrl(metadata?.mime, data)
+            browserAssetDataUrlCache.set(loc, dataUrl)
+            return dataUrl
+        })()
+        pendingBrowserAssetReads.set(loc, pending)
+        const cleanup = () => {
+            pendingBrowserAssetReads.delete(loc)
+        }
+        void pending.then(cleanup, cleanup)
+    }
+    return await pending
+}
+
+/** Resolves a Tauri asset URL once per key; the URL only depends on the key. */
+async function resolveTauriAssetUrl(loc: string): Promise<string | null> {
+    const cached = tauriAssetUrlCache.get(loc)
+    if (cached !== undefined) return cached
+    const url = await (await resolveBlobStore()).resolveUrl(loc)
+    if (url) tauriAssetUrlCache.set(loc, url)
+    return url
+}
 
 let checkedPaths: string[] = []
 
@@ -158,10 +198,22 @@ export async function getFileSrc(loc: string) {
     await forageStorage.Init()
     const route = selectAssetSourceRoute(loc, isTauri, forageStorage.isAccount)
     if (route === 'account') {
+        // Freshly imported assets only exist locally until the next publish
+        // uploads them, so the local blob store wins over the hub URL.
+        if (loc.startsWith('assets/')) {
+            try {
+                const local = isTauri
+                    ? await resolveTauriAssetUrl(loc)
+                    : await readBrowserAssetDataUrl(loc)
+                if (local) return local
+            } catch (error) {
+                console.error(error)
+            }
+        }
         return hubURL + `/rs/` + loc
     }
     if (route === 'tauri-asset') {
-        const url = await (await resolveBlobStore()).resolveUrl(loc)
+        const url = await resolveTauriAssetUrl(loc)
         if (!url) console.error(new Error(`Missing asset: ${loc}`))
         return url ?? ''
     }
@@ -212,25 +264,9 @@ export async function getFileSrc(loc: string) {
             }
         }
         else {
-            let data = browserAssetByteCache.get(loc)
-            if (!data) {
-                let pending = pendingBrowserAssetReads.get(loc)
-                if (!pending) {
-                    pending = readLocalFile().then((value) => {
-                        if (!value) throw new Error(`Missing asset: ${loc}`)
-                        return value
-                    })
-                    pendingBrowserAssetReads.set(loc, pending)
-                    const cleanup = () => {
-                        pendingBrowserAssetReads.delete(loc)
-                    }
-                    void pending.then(cleanup, cleanup)
-                }
-                data = await pending
-                browserAssetByteCache.set(loc, data)
-            }
-            const metadata = await blobStore?.stat(loc)
-            return `data:${metadata?.mime ?? 'application/octet-stream'};base64,${Buffer.from(data).toString('base64')}`
+            const dataUrl = await readBrowserAssetDataUrl(loc)
+            if (dataUrl === null) throw new Error(`Missing asset: ${loc}`)
+            return dataUrl
         }
     } catch (error) {
         console.error(error)
@@ -301,6 +337,11 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
         name: fileName || `${id}.${fileExtension}`,
         ext: fileExtension,
     })
+    tauriAssetUrlCache.delete(form)
+    pendingBrowserAssetReads.delete(form)
+    if (browserAssetDataUrlCache.get(form) !== undefined) {
+        browserAssetDataUrlCache.set(form, buildAssetDataUrl(inferBlobMime('', fileExtension), data))
+    }
     return form
 }
 
@@ -331,11 +372,47 @@ export let saving = $state({
 
 const persistentSaveObserverInstallation = createPersistentSaveObserverInstallation()
 
-function estimateSnapshotBytes(value: unknown): number {
+const SAVE_ESTIMATE_REFRESH_MS = 1000
+
+/** Reads every reactive leaf so the surrounding effect reruns on any change, without cloning. */
+function subscribeDeep(value: unknown): void {
+    if (value === null || typeof value !== 'object') return
+    if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) subscribeDeep(value[i])
+        return
+    }
+    for (const key in value as Record<string, unknown>) {
+        subscribeDeep((value as Record<string, unknown>)[key])
+    }
+}
+
+function measureJsonLength(read: () => unknown): number {
     try {
-        return new TextEncoder().encode(JSON.stringify(value)).byteLength
+        return JSON.stringify(read())?.length ?? 0
     } catch {
         return 0
+    }
+}
+
+/**
+ * Serializing the observed state on every keystroke is too expensive, so a full
+ * measurement runs at most once per refresh window and dirty marks in between
+ * reuse the last known estimate.
+ */
+export function createThrottledSizeEstimator(read: () => unknown): () => number {
+    let lastEstimate = -1
+    let timer: ReturnType<typeof setTimeout> | undefined
+    return () => {
+        if (lastEstimate < 0) {
+            lastEstimate = measureJsonLength(read)
+        }
+        else if (timer === undefined) {
+            timer = setTimeout(() => {
+                timer = undefined
+                lastEstimate = measureJsonLength(read)
+            }, SAVE_ESTIMATE_REFRESH_MS)
+        }
+        return lastEstimate
     }
 }
 
@@ -355,20 +432,25 @@ export async function saveDb() {
             reportError: (error) => alertError(error instanceof Error ? error : String(error)),
         })
         const disposeEffects = $effect.root(() => {
-            $effect(() => {
+            const estimateRootBytes = createThrottledSizeEstimator(() => {
                 const root: Record<string, unknown> = {}
                 for (const key in DBState.db) {
-                    if (key !== 'characters') {
-                        root[key] = $state.snapshot(DBState.db[key])
-                    }
+                    if (key !== 'characters') root[key] = DBState.db[key]
                 }
-                markPersistentDataDirty(estimateSnapshotBytes(root))
+                return root
+            })
+            const estimateCharacterBytes = createThrottledSizeEstimator(
+                () => DBState.db.characters?.[selIdState.selId] ?? null,
+            )
+            $effect(() => {
+                for (const key in DBState.db) {
+                    if (key !== 'characters') subscribeDeep(DBState.db[key])
+                }
+                markPersistentDataDirty(estimateRootBytes())
             })
             $effect(() => {
-                const character = DBState.db.characters?.[selIdState.selId]
-                markPersistentDataDirty(
-                    estimateSnapshotBytes(character ? $state.snapshot(character) : null),
-                )
+                subscribeDeep(DBState.db.characters?.[selIdState.selId] ?? null)
+                markPersistentDataDirty(estimateCharacterBytes())
             })
         })
         return () => {
@@ -1398,8 +1480,13 @@ export async function fetchNative(url: string, arg: {
             throughProxy = false
         }
     }
-    const useTauriHttp = isTauri && !(window.userScriptFetch && !throughProxy)
-    const timeoutSignal = useTauriHttp ? null : buildTimeoutSignal(arg.signal, arg.requestTimeoutMs)
+    const route: 'userscript' | 'tauri' | 'proxy' | 'plain' =
+        window.userScriptFetch && !throughProxy ? 'userscript'
+            : isTauri ? 'tauri'
+                : throughProxy ? 'proxy'
+                    : 'plain'
+    // The Tauri stream route manages its own composed timeout signal.
+    const timeoutSignal = route === 'tauri' ? null : buildTimeoutSignal(arg.signal, arg.requestTimeoutMs)
     const requestSignal = timeoutSignal?.signal ?? arg.signal
     const shouldLogFetch = arg.logFetch ?? true
     let fetchLogIndex: number | null = null
@@ -1415,7 +1502,7 @@ export async function fetchNative(url: string, arg: {
         })
     }
     try {
-        if (window.userScriptFetch && !throughProxy) {
+        if (route === 'userscript') {
             return await window.userScriptFetch(url, {
             body: realBody as any,
             headers: headers,
@@ -1423,7 +1510,7 @@ export async function fetchNative(url: string, arg: {
             signal: requestSignal
         })
         }
-        else if (isTauri) {
+        else if (route === 'tauri') {
             const decoder = shouldLogFetch && fetchLogIndex !== null ? new TextDecoder() : null
             const responseParts: string[] = []
             return await fetchTauriHttpStream({
@@ -1442,7 +1529,7 @@ export async function fetchNative(url: string, arg: {
                 } : undefined,
             })
         }
-    else if (throughProxy) {
+    else if (route === 'proxy') {
         const useProxyJobWs = isNodeServer
             && arg.interceptor === 'openai_streaming'
             && arg.method === 'POST'
