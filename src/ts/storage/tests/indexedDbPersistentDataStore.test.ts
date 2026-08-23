@@ -41,6 +41,19 @@ async function readRawRecord(
     return value
 }
 
+async function writeRawRecords(
+    indexedDB: IDBFactory,
+    databaseName: string,
+    storeName: string,
+    records: Array<Record<string, unknown>>,
+): Promise<void> {
+    const database = await openDatabase(indexedDB, databaseName)
+    const transaction = database.transaction(storeName, 'readwrite')
+    for (const record of records) transaction.objectStore(storeName).put(record)
+    await completeTransaction(transaction)
+    database.close()
+}
+
 async function createVersion1Database(
     indexedDB: IDBFactory,
     databaseName: string,
@@ -774,5 +787,60 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
 
         await lease.release()
         expect(await readLeases()).toHaveLength(0)
+    })
+
+    it('keeps a fresh crash-leaked snapshot lease and its generation across open', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `fresh-leased-snapshot-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const generation = 'snapshot-crashed-fresh'
+        await writeRawRecords(indexedDB, databaseName, 'root', [
+            { key: generation, generation, value: { username: 'Crashed' } },
+        ])
+        await writeRawRecords(indexedDB, databaseName, 'meta', [
+            { key: `snapshotLease:${generation}`, value: generation, createdAt: Date.now() },
+        ])
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+
+        expect(await readRawRecord(indexedDB, databaseName, 'root', generation)).toMatchObject({
+            generation,
+        })
+        expect(
+            await readRawRecord(indexedDB, databaseName, 'meta', `snapshotLease:${generation}`),
+        ).toMatchObject({ value: generation })
+    })
+
+    it('reclaims stale and legacy snapshot leases with their generations on open', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `stale-leased-snapshot-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const stale = 'snapshot-crashed-stale'
+        const legacy = 'snapshot-crashed-legacy'
+        await writeRawRecords(indexedDB, databaseName, 'root', [
+            { key: stale, generation: stale, value: {} },
+            { key: legacy, generation: legacy, value: {} },
+        ])
+        await writeRawRecords(indexedDB, databaseName, 'meta', [
+            {
+                key: `snapshotLease:${stale}`,
+                value: stale,
+                createdAt: Date.now() - 25 * 60 * 60 * 1000,
+            },
+            { key: `snapshotLease:${legacy}`, value: legacy },
+        ])
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+
+        for (const generation of [stale, legacy]) {
+            expect(await readRawRecord(indexedDB, databaseName, 'root', generation)).toBeUndefined()
+            expect(
+                await readRawRecord(indexedDB, databaseName, 'meta', `snapshotLease:${generation}`),
+            ).toBeUndefined()
+        }
     })
 })

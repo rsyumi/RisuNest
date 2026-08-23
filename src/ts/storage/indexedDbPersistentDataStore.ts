@@ -20,6 +20,7 @@ import { RevisionConflictError, SnapshotReleasedError } from './persistentDataSt
 
 const DATABASE_VERSION = 3
 const MESSAGE_PAGE_SIZE = 128
+const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
 const STORE_NAMES = ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 const DATA_STORE_NAMES = ['root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
@@ -543,6 +544,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             transaction.objectStore('meta').put({
                 key: this.snapshotLeaseKey(generation),
                 value: generation,
+                createdAt: Date.now(),
             })
             for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
                 await this.copyGeneration(
@@ -953,15 +955,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     /**
      * Removes snapshot copies abandoned by an interrupted export. A lease record keeps snapshots
-     * that another open document is still reading, which a module-local set cannot see.
+     * that another open document is still reading, which a module-local set cannot see; leases
+     * older than the TTL are treated as crash leftovers and reclaimed with their generations.
      */
     private async sweepTemporaryGenerations(): Promise<void> {
         const database = this.requireDatabase()
-        const leaseTransaction = database.transaction('meta', 'readonly')
-        const leased = new Set(await this.readMetaValuesByPrefix<string>(
-            leaseTransaction.objectStore('meta'),
-            'snapshotLease:',
-        ))
+        const cutoff = Date.now() - SNAPSHOT_LEASE_TTL_MS
+        const leaseTransaction = database.transaction('meta', 'readwrite')
+        const meta = leaseTransaction.objectStore('meta')
+        const leaseRecords = await this.readMetaRecordsByPrefix<string>(meta, 'snapshotLease:')
+        const leased = new Set<string>()
+        for (const record of leaseRecords) {
+            const live =
+                activeSnapshotGenerations.has(record.value) || (record.createdAt ?? 0) >= cutoff
+            if (live) leased.add(record.value)
+            else meta.delete(record.key)
+        }
         await transactionDone(leaseTransaction)
 
         const snapshots = this.keyRangeFactory.bound('snapshot-', 'snapshot-￿')
@@ -990,9 +999,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         await transactionDone(transaction)
     }
 
-    private readMetaValuesByPrefix<T>(store: IDBObjectStore, prefix: string): Promise<T[]> {
+    private readMetaRecordsByPrefix<T>(
+        store: IDBObjectStore,
+        prefix: string,
+    ): Promise<Array<{ key: string; value: T; createdAt?: number }>> {
         return new Promise((resolve, reject) => {
-            const values: T[] = []
+            const records: Array<{ key: string; value: T; createdAt?: number }> = []
             const request = store.openCursor(
                 this.keyRangeFactory.bound(prefix, `${prefix}\uffff`),
             )
@@ -1000,10 +1012,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             request.onsuccess = () => {
                 const cursor = request.result
                 if (!cursor) {
-                    resolve(values)
+                    resolve(records)
                     return
                 }
-                values.push((cursor.value as { value: T }).value)
+                records.push(cursor.value as { key: string; value: T; createdAt?: number })
                 cursor.continue()
             }
         })
