@@ -1,5 +1,10 @@
 import type { Database, character, groupChat } from './database.svelte'
-import type { DataRevision, PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
+import type {
+    ConversationMutation,
+    DataRevision,
+    PersistentDataStore,
+    WorkingSetCommit,
+} from './persistentDataStore'
 
 const SAVE_DEBOUNCE_MS = 500
 const PENDING_BYTE_LIMIT = 1_048_576
@@ -294,7 +299,9 @@ export class SaveCoordinator {
                 captured.character &&
                 captured.characterCanonical !== this.characterBaseline
             ) {
-                commit.replaceCharacter = captured.character
+                const conversations = this.diffSelectedConversations(captured)
+                if (conversations) commit.conversations = conversations
+                else commit.replaceCharacter = captured.character
             }
 
             let replacementIsAddition = false
@@ -303,14 +310,15 @@ export class SaveCoordinator {
                     commit.addCharacter = addition.character
                 } else if (
                     addition.canonical !== addition.pending.baseline &&
-                    !commit.replaceCharacter
+                    !commit.replaceCharacter &&
+                    !commit.conversations
                 ) {
                     commit.replaceCharacter = addition.character
                     replacementIsAddition = true
                 }
             }
 
-            if (commit.root || commit.replaceCharacter || commit.addCharacter) {
+            if (commit.root || commit.replaceCharacter || commit.addCharacter || commit.conversations) {
                 const committed = await this.dependencies.store.commit(commit)
                 this.currentRevision = committed.revision
                 if (commit.root) this.rootBaseline = captured.rootCanonical
@@ -328,6 +336,12 @@ export class SaveCoordinator {
                         addition.pending.baseline = detached
                             ? detached.canonical
                             : captured.characterCanonical!
+                    }
+                }
+                if (commit.conversations && captured.character) {
+                    this.setCharacterBaseline(captured)
+                    if (addition && captured.character.chaId === addition.pending.characterId) {
+                        addition.pending.baseline = captured.characterCanonical!
                     }
                 }
                 if (replacementIsAddition && addition) {
@@ -428,6 +442,52 @@ export class SaveCoordinator {
     private setCharacterBaseline(captured: CapturedState): void {
         this.characterBaseline = captured.characterCanonical
         this.characterBaselineId = captured.character?.chaId ?? null
+    }
+
+    /**
+     * Builds conversation-level mutations when only chat content changed for the tracked
+     * selected character. Returns null whenever a full character replacement is required:
+     * detail changes, added/removed/reordered chats, or chats the mutation channel cannot
+     * address safely (missing or duplicate ids).
+     */
+    private diffSelectedConversations(captured: CapturedState): ConversationMutation[] | null {
+        const character = captured.character
+        if (!character || this.characterBaseline === null) return null
+        if (this.characterBaselineId !== character.chaId) return null
+        const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+        const capturedChats = character.chats
+        const baselineChats = baseline.chats
+        if (!Array.isArray(capturedChats) || !Array.isArray(baselineChats)) return null
+        if (capturedChats.length !== baselineChats.length) return null
+        const { chats: _capturedChats, ...capturedDetail } = character
+        const { chats: _baselineChats, ...baselineDetail } = baseline
+        if (JSON.stringify(capturedDetail) !== JSON.stringify(baselineDetail)) return null
+
+        const mutations: ConversationMutation[] = []
+        const seenIds = new Set<string>()
+        for (let index = 0; index < capturedChats.length; index++) {
+            const capturedChat = capturedChats[index]
+            const baselineChat = baselineChats[index]
+            const conversationId = capturedChat?.id
+            if (!conversationId || conversationId !== baselineChat?.id) return null
+            if (seenIds.has(conversationId)) return null
+            seenIds.add(conversationId)
+            if (JSON.stringify(capturedChat) === JSON.stringify(baselineChat)) continue
+            if (!Array.isArray(capturedChat.message) || !Array.isArray(baselineChat.message)) {
+                return null
+            }
+            const { message, ...conversation } = capturedChat
+            mutations.push({
+                type: 'replace-range',
+                characterId: character.chaId,
+                conversationId,
+                start: 0,
+                deleteCount: baselineChat.message.length,
+                messages: message,
+                conversation,
+            })
+        }
+        return mutations.length > 0 ? mutations : null
     }
 
     /** Returns the last tracked character when the selection moved away before its edits were committed. */

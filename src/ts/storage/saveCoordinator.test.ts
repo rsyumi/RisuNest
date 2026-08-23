@@ -342,6 +342,174 @@ describe('SaveCoordinator', () => {
         })
     })
 
+    function makeChattyDatabase() {
+        const database = makeDatabase()
+        database.characters[0].chats = [
+            {
+                id: 'one',
+                name: 'One',
+                message: [{ role: 'user', data: 'hello one' }],
+                localLore: [],
+                note: '',
+            },
+            {
+                id: 'two',
+                name: 'Two',
+                message: [
+                    { role: 'user', data: 'hello two' },
+                    { role: 'char', data: 'reply two' },
+                ],
+                localLore: [],
+                note: '',
+            },
+        ]
+        return database
+    }
+
+    it('commits only the edited conversation when just chat content changes', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(2)
+
+        database.characters[0].chats[1].message.push({ role: 'user', data: 'follow-up' })
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('message-edit')
+
+        expect(commit).toHaveBeenCalledTimes(1)
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('replaceCharacter')
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('root')
+        expect(commit.mock.calls[0][0].conversations).toEqual([
+            {
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'two',
+                start: 0,
+                deleteCount: 2,
+                messages: [
+                    { role: 'user', data: 'hello two' },
+                    { role: 'char', data: 'reply two' },
+                    { role: 'user', data: 'follow-up' },
+                ],
+                conversation: { id: 'two', name: 'Two', localLore: [], note: '' },
+            },
+        ])
+        expect(coordinator.revision).toBe(3)
+
+        await coordinator.flushPendingData('clean')
+        expect(commit).toHaveBeenCalledTimes(1)
+    })
+
+    it('replaces the whole character when a character field changes alongside chats', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(2)
+
+        database.characters[0].name = 'Alpha renamed'
+        database.characters[0].chats[0].message.push({ role: 'char', data: 'more' })
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('detail-edit')
+
+        expect(commit).toHaveBeenCalledTimes(1)
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('conversations')
+        expect(commit.mock.calls[0][0].replaceCharacter).toMatchObject({ name: 'Alpha renamed' })
+    })
+
+    it.each([
+        ['added', (chats: { id: string }[]) => chats.push({
+            id: 'three',
+            name: 'Three',
+            message: [],
+            localLore: [],
+            note: '',
+        } as never)],
+        ['removed', (chats: { id: string }[]) => chats.splice(0, 1)],
+        ['reordered', (chats: { id: string }[]) => chats.reverse()],
+    ] as const)('replaces the whole character when chats are %s', async (_label, mutate) => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(2)
+
+        mutate(database.characters[0].chats)
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('structure-edit')
+
+        expect(commit).toHaveBeenCalledTimes(1)
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('conversations')
+        expect(commit.mock.calls[0][0].replaceCharacter.chats.map((chat: { id: string }) => chat.id))
+            .toEqual(database.characters[0].chats.map((chat) => chat.id))
+
+        await coordinator.flushPendingData('clean')
+        expect(commit).toHaveBeenCalledTimes(1)
+    })
+
+    it('replaces the whole character when a chat is missing an id', async () => {
+        const database = makeChattyDatabase()
+        delete database.characters[0].chats[1].id
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(2)
+
+        database.characters[0].chats[1].message.push({ role: 'user', data: 'anonymous' })
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('missing-id')
+
+        expect(commit).toHaveBeenCalledTimes(1)
+        expect(commit.mock.calls[0][0]).not.toHaveProperty('conversations')
+        expect(commit.mock.calls[0][0]).toHaveProperty('replaceCharacter')
+    })
+
+    it('keeps conversation edits dirty when the mutation commit fails', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn()
+            .mockRejectedValueOnce(new Error('write failed'))
+            .mockImplementation(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(2)
+
+        database.characters[0].chats[0].message.push({ role: 'user', data: 'retry me' })
+        coordinator.markPersistentDataDirty(5)
+        await expect(coordinator.flushPendingData('fails')).rejects.toThrow('write failed')
+
+        expect(coordinator.revision).toBe(2)
+        expect(coordinator.pendingBytes).toBe(5)
+
+        await coordinator.flushPendingData('retry')
+
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].conversations).toMatchObject([
+            { conversationId: 'one', deleteCount: 1 },
+        ])
+        expect(coordinator.revision).toBe(3)
+    })
+
     it('reports a successful local revision once before official publication', async () => {
         const database = makeDatabase()
         const events: string[] = []
