@@ -926,6 +926,7 @@ export async function changeChar(index: number, arg:{
             },
         } : undefined
         const activated = await activateCharacter(chaId, activationOptions)
+            || await activateCharacter(chaId, activationOptions)
         if(!activated) return false
         const selectedIndex = DBState.db.characters.findIndex((character) => character.chaId === chaId)
         if(selectedIndex === -1) return false

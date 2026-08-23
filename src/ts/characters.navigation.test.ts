@@ -274,6 +274,37 @@ describe('runtime chat identity', () => {
     })
 })
 
+describe('character activation retry', () => {
+    beforeEach(() => {
+        mocks.database.characters = []
+        mocks.nextId = 0
+        vi.clearAllMocks()
+        mocks.activateCharacter.mockResolvedValue(true)
+    })
+
+    it('retries activation once when the first attempt fails', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        mocks.activateCharacter.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+
+        const changed = await changeChar(0)
+
+        expect(changed).toBe(true)
+        expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
+    })
+
+    it('gives up after exactly one retry', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        mocks.activateCharacter.mockResolvedValue(false)
+
+        const changed = await changeChar(0)
+
+        expect(changed).toBe(false)
+        expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
+    })
+})
+
 describe('chat list operations', () => {
     const buildCharacter = () => {
         const character = createBlankChar()
