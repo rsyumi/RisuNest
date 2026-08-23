@@ -89,3 +89,34 @@ export function createUnrecordedOfficialAssetLedger(): OfficialAssetLedger {
         clear: () => undefined,
     }
 }
+
+/**
+ * Resolves the recording ledger from the live account id on every call, so a session that only
+ * learns its account identity after the first pull still records replacement keys.
+ */
+export function createAccountScopedOfficialAssetLedger(
+    storage: LedgerStorage,
+    resolveAccountId: () => string | undefined,
+): OfficialAssetLedger {
+    const unrecorded = createUnrecordedOfficialAssetLedger()
+    let boundId: string | null = null
+    let bound: OfficialAssetLedger = unrecorded
+    const resolve = (): OfficialAssetLedger => {
+        const accountId = resolveAccountId()
+        if (!accountId) {
+            boundId = null
+            bound = unrecorded
+        } else if (accountId !== boundId) {
+            boundId = accountId
+            bound = createOfficialAssetLedger(storage, accountId)
+        }
+        return bound
+    }
+    return {
+        publishedAs: (key) => resolve().publishedAs(key),
+        record: (key, replacementKey) => resolve().record(key, replacementKey),
+        coldDigest: (key) => resolve().coldDigest(key),
+        recordCold: (key, digest) => resolve().recordCold(key, digest),
+        clear: () => resolve().clear(),
+    }
+}

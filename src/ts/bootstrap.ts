@@ -66,10 +66,7 @@ import {
     initializeOfficialAccountBootstrap,
     publishOfficialRevisionIfChanged,
 } from "./storage/sync/officialAccountBootstrap";
-import {
-    createOfficialAssetLedger,
-    createUnrecordedOfficialAssetLedger,
-} from "./storage/sync/officialAssetLedger";
+import { createAccountScopedOfficialAssetLedger } from "./storage/sync/officialAssetLedger";
 import {
     configureOfficialAccountAssetReader,
     createStructuredAccountAssetReader,
@@ -105,7 +102,6 @@ export async function loadData() {
             prepareDatabase: prepareDatabaseForPersistence,
         })
         setDatabase(local.database)
-        const accountId = local.database.account?.id
         const accountStorage = new AccountStorage()
         const officialAdapter = new OfficialAccountSnapshotAdapter({
             store: runtime.store,
@@ -122,9 +118,10 @@ export async function loadData() {
             },
             prepareCandidate: prepareDatabaseForPersistence,
             markPublished: () => undefined,
-            ledger: accountId
-                ? createOfficialAssetLedger(localStorage, accountId)
-                : createUnrecordedOfficialAssetLedger(),
+            ledger: createAccountScopedOfficialAssetLedger(
+                localStorage,
+                () => getDatabase().account?.id,
+            ),
             association: createOfficialAssociationMarkers(localStorage),
         })
         const accountBootstrap = await initializeOfficialAccountBootstrap({
