@@ -5,9 +5,12 @@ import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.view.ViewGroup
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -22,7 +25,9 @@ import androidx.webkit.WebViewFeature
 import java.io.File
 
 private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
+private const val EXIT_FLUSH_TIMEOUT_MILLIS = 1_500L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
+private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
 private const val EXIT_REASON = "exit"
@@ -112,10 +117,29 @@ internal class LifecycleFlushDispatcher(
   }
 }
 
+internal class ExitFlushGate {
+  private var pendingToken: String? = null
+
+  fun begin(token: String) {
+    pendingToken = token
+  }
+
+  fun shouldFinish(token: String): Boolean {
+    if (pendingToken != token) {
+      return false
+    }
+    pendingToken = null
+    return true
+  }
+}
+
 class MainActivity : TauriActivity() {
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
   private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
+  private val exitFlushGate = ExitFlushGate()
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private var exitFlushSequence = 0L
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
@@ -125,6 +149,7 @@ class MainActivity : TauriActivity() {
   override fun onWebViewCreate(webView: WebView) {
     super.onWebViewCreate(webView)
     lifecycleWebView = webView
+    webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
     injectOpenedFiles(webView)
 
     val contentRoot = findViewById<ViewGroup>(android.R.id.content)
@@ -166,10 +191,7 @@ class MainActivity : TauriActivity() {
                 Toast.LENGTH_SHORT,
               ).show()
             }
-            BackNavigationAction.EXIT -> {
-              dispatchLifecycleFlush(EXIT_REASON)
-              finishAndRemoveTask()
-            }
+            BackNavigationAction.EXIT -> requestExitFlushThenFinish()
           }
         }
       },
@@ -191,6 +213,36 @@ class MainActivity : TauriActivity() {
       "window.dispatchEvent(new CustomEvent('$NATIVE_LIFECYCLE_EVENT',{detail:{reason:'$reason'}}));",
       null,
     )
+  }
+
+  private fun requestExitFlushThenFinish() {
+    val webView = lifecycleWebView
+    if (webView == null) {
+      finishAndRemoveTask()
+      return
+    }
+    val token = "exit-${++exitFlushSequence}"
+    exitFlushGate.begin(token)
+    webView.evaluateJavascript(
+      "window.dispatchEvent(new CustomEvent('$NATIVE_LIFECYCLE_EVENT'," +
+        "{detail:{reason:'$EXIT_REASON',ackToken:'$token'}}));",
+      null,
+    )
+    mainHandler.postDelayed({ finishForExitFlush(token) }, EXIT_FLUSH_TIMEOUT_MILLIS)
+  }
+
+  private fun finishForExitFlush(token: String) {
+    if (exitFlushGate.shouldFinish(token)) {
+      finishAndRemoveTask()
+    }
+  }
+
+  private inner class LifecycleFlushBridge {
+    @JavascriptInterface
+    fun onFlushComplete(token: String?) {
+      token ?: return
+      mainHandler.post { finishForExitFlush(token) }
+    }
   }
 
   private fun injectOpenedFiles(webView: WebView) {

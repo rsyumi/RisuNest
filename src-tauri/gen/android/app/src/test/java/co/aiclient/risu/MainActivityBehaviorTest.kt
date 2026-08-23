@@ -78,4 +78,22 @@ class MainActivityBehaviorTest {
       script,
     )
   }
+
+  @Test
+  fun `exit flush finishes once per token`() {
+    val gate = ExitFlushGate()
+    gate.begin("exit-1")
+
+    assertEquals(true, gate.shouldFinish("exit-1"))
+    assertEquals(false, gate.shouldFinish("exit-1"))
+  }
+
+  @Test
+  fun `stale exit flush tokens do not finish the activity`() {
+    val gate = ExitFlushGate()
+    gate.begin("exit-2")
+
+    assertEquals(false, gate.shouldFinish("exit-1"))
+    assertEquals(true, gate.shouldFinish("exit-2"))
+  }
 }

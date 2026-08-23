@@ -100,6 +100,61 @@ describe('registerLifecycleCommitListeners', () => {
         dispose()
     })
 
+    it('acknowledges the native ack token after the flush settles', async () => {
+        const onFlushComplete = vi.fn()
+        ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+        let resolveFlush!: () => void
+        const flush = vi.fn(() => new Promise<void>((resolve) => { resolveFlush = resolve }))
+        const dispose = registerLifecycleCommitListeners(flush)
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit', ackToken: 'exit-1' },
+        }))
+
+        expect(flush).toHaveBeenCalledWith('exit')
+        expect(onFlushComplete).not.toHaveBeenCalled()
+
+        resolveFlush()
+        await vi.waitFor(() => expect(onFlushComplete).toHaveBeenCalledWith('exit-1'))
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('acknowledges the native ack token when the flush fails', async () => {
+        const onFlushComplete = vi.fn()
+        ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const flush = vi.fn(async () => { throw new Error('flush failed') })
+        const dispose = registerLifecycleCommitListeners(flush)
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit', ackToken: 'exit-2' },
+        }))
+
+        await vi.waitFor(() => expect(onFlushComplete).toHaveBeenCalledWith('exit-2'))
+        errorLog.mockRestore()
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('sends no acknowledgement without an ack token', async () => {
+        const onFlushComplete = vi.fn()
+        ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+        const flush = vi.fn(async () => undefined)
+        const dispose = registerLifecycleCommitListeners(flush)
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit' },
+        }))
+        await Promise.resolve()
+        await Promise.resolve()
+        await Promise.resolve()
+
+        expect(onFlushComplete).not.toHaveBeenCalled()
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
     it('removes all listeners and can be disposed twice', () => {
         const flush = vi.fn(async () => undefined)
         const dispose = registerLifecycleCommitListeners(flush)
