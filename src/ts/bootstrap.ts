@@ -39,6 +39,7 @@ import {
     saveDb,
     getUncleanables,
     getBasename,
+    invalidateAssetSourceCache,
     setUsingSw
 } from "./globalApi.svelte";
 import { isTauri, isTauriDesktop } from "./platform";
@@ -353,6 +354,7 @@ async function cleanChunks(options:{
                 const n = getBasename(asset.name)
                 if (!uncleanable.has(n)) {
                     await blobStore.remove('assets/' + asset.name)
+                    invalidateAssetSourceCache('assets/' + asset.name)
                 }
             } catch (error) {
                 console.log('error', asset.name)
@@ -423,6 +425,7 @@ async function cleanChunks(options:{
                 const n = getBasename(asset)
                 if(!uncleanable.has(n)) {
                     await blobStore.remove(asset)
+                    invalidateAssetSourceCache(asset)
                 }
             }
             else if (asset.endsWith('.meta')){

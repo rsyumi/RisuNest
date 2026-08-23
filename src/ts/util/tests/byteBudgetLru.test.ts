@@ -95,4 +95,14 @@ describe('ByteBudgetLru', () => {
         expect(cache.size).toBe(2)
         expect(cache.sizeBytes).toBe(4)
     })
+
+    it('deletes an entry and releases its bytes', () => {
+        const cache = new ByteBudgetLru<string, string>(100, (_key, value) => value.length)
+        cache.set('a', 'aaaa')
+        expect(cache.delete('a')).toBe(true)
+        expect(cache.get('a')).toBeUndefined()
+        expect(cache.size).toBe(0)
+        expect(cache.sizeBytes).toBe(0)
+        expect(cache.delete('a')).toBe(false)
+    })
 })

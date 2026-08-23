@@ -47,6 +47,16 @@ export class ByteBudgetLru<K, V> {
         return this.entries.has(key)
     }
 
+    delete(key: K): boolean {
+        const value = this.entries.get(key)
+        if (value === undefined) {
+            return false
+        }
+        this.entries.delete(key)
+        this.retainedBytes -= this.measure(key, value)
+        return true
+    }
+
     clear(): void {
         this.entries.clear()
         this.retainedBytes = 0

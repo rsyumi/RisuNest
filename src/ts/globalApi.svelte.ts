@@ -165,7 +165,9 @@ async function readBrowserAssetDataUrl(loc: string): Promise<string | null> {
             if (!data) return null
             const metadata = await blobStore?.stat(loc)
             const dataUrl = buildAssetDataUrl(metadata?.mime, data)
-            browserAssetDataUrlCache.set(loc, dataUrl)
+            if (pendingBrowserAssetReads.get(loc) === pending) {
+                browserAssetDataUrlCache.set(loc, dataUrl)
+            }
             return dataUrl
         })()
         pendingBrowserAssetReads.set(loc, pending)
@@ -175,6 +177,12 @@ async function readBrowserAssetDataUrl(loc: string): Promise<string | null> {
         void pending.then(cleanup, cleanup)
     }
     return await pending
+}
+
+export function invalidateAssetSourceCache(key: string): void {
+    tauriAssetUrlCache.delete(key)
+    browserAssetDataUrlCache.delete(key)
+    pendingBrowserAssetReads.delete(key)
 }
 
 /** Resolves a Tauri asset URL once per key; the URL only depends on the key. */
