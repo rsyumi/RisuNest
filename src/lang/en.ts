@@ -830,6 +830,8 @@ export const languageEnglish = {
     backupConfirm: "Do you really want to save backup?",
     backupLoadConfirm: "Do you really want to load backup? All datas will be lost!",
     backupLoadConfirm2: "Do you really, really want to load backup? All datas will be lost!",
+    loadPocketRisuBackup: "Import PocketRisu Backup",
+    pocketRisuImportConfirm: "This imports a backup file exported from PocketRisu, including its inlay media. Current data will be replaced. Continue?",
     pasteAuthCode: "Please copy the auth code from popup and paste it in here:",
     others: "Others",
     presets: "Presets",

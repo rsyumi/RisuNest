@@ -14,6 +14,7 @@ import {
     selectLegacyBackupAssetKeys,
     writeBackupAsset,
 } from "./backupAssets";
+import { classifyPocketRisuEntry, PocketRisuInlayImporter } from "./pocketRisuBackup";
 import { isTauri, isTauriDesktop } from "src/ts/platform"
 import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
 import { getDatabase } from "../storage/database.svelte";
@@ -363,6 +364,9 @@ export function LoadLocalBackup(){
             input.remove();
             await forageStorage.Init()
             const blobStore = await resolveBlobStore()
+            const pocketRisuInlays = new PocketRisuInlayImporter(async (id, bytes, metadata) => {
+                await blobStore.put(id, bytes, metadata)
+            })
 
             const reader = file.stream().getReader();
             const CHUNK_SIZE = 1024 * 1024; // 1MB chunk size
@@ -437,6 +441,15 @@ export function LoadLocalBackup(){
                             await sleep(10);
                             continue;
                         }
+                        const pocketRisuEntry = classifyPocketRisuEntry(name)
+                        if (pocketRisuEntry) {
+                            if (pocketRisuEntry.kind !== 'skip') {
+                                await pocketRisuInlays.add(pocketRisuEntry, new Uint8Array(data))
+                            }
+                            offset += 4 + nameLength + 4 + dataLength;
+                            await sleep(10);
+                            continue;
+                        }
                         const coldStorageKey = getColdStorageBackupKey(name)
                         let handledAsColdStorage = false
 
@@ -470,6 +483,11 @@ export function LoadLocalBackup(){
                     offset += 4 + nameLength + 4 + dataLength;
                 }
                 remainingBuffer = remainingBuffer.slice(offset);
+            }
+
+            await pocketRisuInlays.finish()
+            if (pocketRisuInlays.failedIds.length > 0) {
+                console.error('Failed to import PocketRisu inlays:', pocketRisuInlays.failedIds)
             }
 
             if(!pendingDatabase){

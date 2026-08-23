@@ -71,6 +71,15 @@
     {language.loadBackupLocal}
 </Button>
 
+<Button
+    onclick={async () => {
+        if((await alertConfirm(language.pocketRisuImportConfirm)) && (await alertConfirm(language.backupLoadConfirm2))){
+            LoadLocalBackup()
+        }
+    }} className="mt-2">
+    {language.loadPocketRisuBackup}
+</Button>
+
 {#if forageStorage.isAccount}
     <Button
         onclick={async () => {
