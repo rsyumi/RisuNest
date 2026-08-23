@@ -279,14 +279,22 @@ export class SaveCoordinator {
         while (true) {
             const generation = this.dirtyGeneration
             const captured = this.capture()
-            const detached = captured.character ? null : this.captureDetachedCharacter()
+            const selectionSwitched =
+                captured.character !== null &&
+                this.characterBaselineId !== null &&
+                captured.character.chaId !== this.characterBaselineId
+            const detached =
+                !captured.character || selectionSwitched ? this.captureDetachedCharacter() : null
             const addition = this.capturePendingAddition()
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
-            if (captured.characterCanonical !== this.characterBaseline && captured.character) {
+            if (detached) {
+                commit.replaceCharacter = detached.character
+            } else if (
+                captured.character &&
+                captured.characterCanonical !== this.characterBaseline
+            ) {
                 commit.replaceCharacter = captured.character
-            } else if (detached) {
-                commit.replaceCharacter = detached
             }
 
             let replacementIsAddition = false
@@ -307,12 +315,19 @@ export class SaveCoordinator {
                 this.currentRevision = committed.revision
                 if (commit.root) this.rootBaseline = captured.rootCanonical
                 if (commit.replaceCharacter && !replacementIsAddition) {
-                    this.setCharacterBaseline(captured)
+                    if (detached && captured.character) {
+                        this.characterBaseline = detached.canonical
+                        this.characterBaselineId = detached.character.chaId
+                    } else {
+                        this.setCharacterBaseline(captured)
+                    }
                     if (
                         addition &&
                         commit.replaceCharacter.chaId === addition.pending.characterId
                     ) {
-                        addition.pending.baseline = canonicalJson(commit.replaceCharacter)
+                        addition.pending.baseline = detached
+                            ? detached.canonical
+                            : captured.characterCanonical!
                     }
                 }
                 if (replacementIsAddition && addition) {
@@ -415,13 +430,14 @@ export class SaveCoordinator {
         this.characterBaselineId = captured.character?.chaId ?? null
     }
 
-    /** Returns the last selected character when the selection was cleared before its edits were committed. */
-    private captureDetachedCharacter(): CompleteCharacter | null {
+    /** Returns the last tracked character when the selection moved away before its edits were committed. */
+    private captureDetachedCharacter(): { character: CompleteCharacter; canonical: string } | null {
         if (this.characterBaseline === null || this.characterBaselineId === null) return null
         const retained = this.dependencies.captureCharacter(this.characterBaselineId)
         if (!retained) return null
         const canonical = canonicalJson(retained)
-        return canonical === this.characterBaseline ? null : JSON.parse(canonical) as CompleteCharacter
+        if (canonical === this.characterBaseline) return null
+        return { character: JSON.parse(canonical) as CompleteCharacter, canonical }
     }
 
     private capture(): CapturedState {

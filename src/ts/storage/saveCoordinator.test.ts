@@ -1253,6 +1253,44 @@ describe('SaveCoordinator', () => {
         })
     })
 
+    it('rescues the previous character edits when the selection switches directly', async () => {
+        const database = makeDatabase()
+        const second = structuredClone(database.characters[0])
+        second.chaId = 'char-b'
+        second.name = 'Beta'
+        database.characters.push(second)
+        let selectedIndex = 0
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[selectedIndex] ?? null,
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(1)
+        expect(coordinator.adoptHydratedCharacter(1, database.characters[0])).toBe(true)
+
+        database.characters[0].name = 'Alpha edited'
+        selectedIndex = 1
+        coordinator.markPersistentDataDirty(4)
+
+        await coordinator.flushPendingData('switched')
+
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[0][0].replaceCharacter).toMatchObject({
+            chaId: 'char-a',
+            name: 'Alpha edited',
+        })
+        expect(commit.mock.calls[1][0].replaceCharacter).toMatchObject({
+            chaId: 'char-b',
+            name: 'Beta',
+        })
+
+        await coordinator.flushPendingData('clean')
+        expect(commit).toHaveBeenCalledTimes(2)
+    })
+
     it('does not publish or change baselines when replacement fails', async () => {
         const database = makeDatabase()
         const replaceDatabase = vi.fn()
