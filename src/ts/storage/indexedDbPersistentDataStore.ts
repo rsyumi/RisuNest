@@ -43,14 +43,6 @@ interface StoredConversation {
     detail: Omit<Chat, 'message'>
 }
 
-interface PreparedGenerationCounts {
-    root: number
-    catalog: number
-    characters: number
-    conversations: number
-    messagePages: number
-}
-
 export type PersistentGenerationCleanupErrorHandler = (
     generation: string,
     error: unknown,
@@ -819,11 +811,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         transaction: IDBTransaction,
         databaseValue: Database,
         generation: string,
-    ): Promise<PreparedGenerationCounts> {
+    ): Promise<void> {
         const ids = new Set<string>()
         const conversationIds = new Set<string>()
-        let conversationCount = 0
-        let messagePageCount = 0
         const { characters, ...root } = databaseValue
         this.putRoot(transaction, generation, root)
         for (let index = 0; index < characters.length; index++) {
@@ -834,16 +824,14 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             ids.add(character.chaId)
             const { chats, ...detail } = character
             this.putCharacterRecords(transaction, generation, detail, index, chats.length)
-            const characterConversationIds = new Set<string>()
             for (let conversationIndex = 0; conversationIndex < chats.length; conversationIndex++) {
                 const conversation = chats[conversationIndex]
-                if (!conversation.id || characterConversationIds.has(conversation.id)) {
+                // Stored keys join ids with ':', so the composite must stay unique across characters.
+                const compositeId = `${character.chaId}:${conversation.id}`
+                if (!conversation.id || conversationIds.has(compositeId)) {
                     throw new Error(`Character ${character.chaId} requires unique conversation IDs`)
                 }
-                characterConversationIds.add(conversation.id)
-                conversationIds.add(`${character.chaId}:${conversation.id}`)
-                conversationCount++
-                messagePageCount += Math.ceil(conversation.message.length / MESSAGE_PAGE_SIZE)
+                conversationIds.add(compositeId)
                 this.putConversation(
                     transaction,
                     generation,
@@ -852,73 +840,6 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     conversationIndex,
                 )
             }
-        }
-
-        const stagedCatalog = await this.generationRecords<CharacterSummary>(
-            transaction.objectStore('catalog'),
-            generation,
-        )
-        if (
-            stagedCatalog.length !== characters.length ||
-            stagedCatalog.some((item) => !ids.has(item.value.id))
-        ) {
-            throw new Error('Persistent data staging validation failed')
-        }
-        const stagedConversations = await this.generationRecords<StoredConversation>(
-            transaction.objectStore('conversations'),
-            generation,
-        )
-        if (
-            stagedConversations.length !== conversationCount ||
-            stagedConversations.some(
-                (item) =>
-                    !conversationIds.has(
-                        `${item.value.summary.characterId}:${item.value.summary.id}`,
-                    ),
-            )
-        ) {
-            throw new Error('Persistent conversation staging validation failed')
-        }
-        const counts = {
-            root: 1,
-            catalog: characters.length,
-            characters: characters.length,
-            conversations: conversationCount,
-            messagePages: messagePageCount,
-        }
-        await this.validateGeneration(transaction, generation, counts)
-        return counts
-    }
-
-    private async validateGeneration(
-        transaction: IDBTransaction,
-        generation: string,
-        expected: PreparedGenerationCounts,
-    ): Promise<void> {
-        const root = await requestResult(transaction.objectStore('root').get(generation))
-        const counts = {
-            root: root ? 1 : 0,
-            catalog: await requestResult(
-                transaction.objectStore('catalog').index('byGeneration').count(generation),
-            ),
-            characters: await requestResult(
-                transaction.objectStore('characters').index('byGeneration').count(generation),
-            ),
-            conversations: await requestResult(
-                transaction.objectStore('conversations').index('byGeneration').count(generation),
-            ),
-            messagePages: await requestResult(
-                transaction.objectStore('messagePages').index('byGeneration').count(generation),
-            ),
-        }
-        if (
-            Object.keys(expected).some(
-                (key) =>
-                    counts[key as keyof typeof counts] !==
-                    expected[key as keyof typeof expected],
-            )
-        ) {
-            throw new Error('Persistent prepared replacement data validation failed')
         }
     }
 
