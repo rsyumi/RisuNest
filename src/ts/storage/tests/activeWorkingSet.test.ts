@@ -159,6 +159,50 @@ describe('ActiveWorkingSet', () => {
         ).toBeLessThan(harness.publishCharacter.mock.invocationCallOrder[0])
     })
 
+    it('hydrates conversations concurrently while preserving configured order', async () => {
+        const chats = ['chat-a', 'chat-b', 'chat-c', 'chat-d', 'chat-e'].map(makeChat)
+        const pending = new Map<
+            string,
+            ReturnType<typeof deferred<{ revision: number; value: Chat } | null>>
+        >()
+        const lease = makeLease({
+            characterId: 'char-a',
+            chats,
+            readConversation: vi.fn((_characterId: string, conversationId: string) => {
+                const entry = deferred<{ revision: number; value: Chat } | null>()
+                pending.set(conversationId, entry)
+                return entry.promise
+            }),
+        })
+        const harness = makeHarness(lease)
+        vi.mocked(lease.queryConversations).mockResolvedValue({
+            revision: 1,
+            items: chats.map((chat, index) => ({
+                id: chat.id!,
+                characterId: 'char-a',
+                name: chat.name,
+                configuredIndex: index,
+                recentAt: 0,
+                messageCount: 0,
+            })),
+        })
+
+        const activation = harness.workingSet.activateCharacter('char-a')
+        await vi.waitFor(() => expect(pending.size).toBe(chats.length))
+        for (const chat of [...chats].reverse()) {
+            pending.get(chat.id!)!.resolve({ revision: 1, value: structuredClone(chat) })
+        }
+
+        expect(await activation).toBe(true)
+        expect(harness.publishedCharacters[0].chats.map((chat) => chat.id)).toEqual([
+            'chat-a',
+            'chat-b',
+            'chat-c',
+            'chat-d',
+            'chat-e',
+        ])
+    })
+
     it('publishes only the newest rapid character navigation', async () => {
         const a = deferred<ReturnType<PersistentRevisionLease['readCharacter']> extends Promise<infer T> ? T : never>()
         const leaseA = makeLease({
