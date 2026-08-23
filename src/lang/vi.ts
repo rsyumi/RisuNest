@@ -1083,7 +1083,6 @@ export const languageVietnamese = {
     "blockMode": "Khối",
     "helpBlock": "Trợ giúp",
     "hideChatIcon": "Ẩn giao diện biểu tượng",
-    "loadInternalBackup": "Tải sao lưu nội bộ",
     "createCopy": "Tạo bản sao",
     "bindPersona": "Liên kết Persona",
     "chatOptions": "Tùy chọn trò chuyện",

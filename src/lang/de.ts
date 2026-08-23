@@ -1083,7 +1083,6 @@ export const languageGerman = {
     "blockMode": "Block",
     "helpBlock": "Hilfe",
     "hideChatIcon": "Icon-UI ausblenden",
-    "loadInternalBackup": "Internes Backup laden",
     "createCopy": "Kopie erstellen",
     "bindPersona": "Persona binden",
     "chatOptions": "Chat-Optionen",

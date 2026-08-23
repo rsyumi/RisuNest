@@ -1104,7 +1104,6 @@ export const languageKorean = {
     "blockMode": "블록",
     "helpBlock": "도움말",
     "hideChatIcon": "아이콘 UI 숨기기",
-    "loadInternalBackup": "내부 백업 불러오기",
     "createCopy": "복사본 생성",
     "bindPersona": "페르소나 바인드",
     "chatOptions": "채팅 옵션",

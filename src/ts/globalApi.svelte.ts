@@ -29,7 +29,6 @@ import { decodeRisuSave } from "./storage/risuSave";
 import { AutoStorage } from "./storage/autoStorage";
 import { updateAnimationSpeed } from "./gui/animation";
 import { updateColorScheme, updateTextThemeAndCSS } from "./gui/colorscheme";
-import { autoServerBackup } from "./kei/backup";
 import { save } from "@tauri-apps/plugin-dialog";
 import { language } from "src/lang";
 import { startObserveDom } from "./observer.svelte";
