@@ -339,6 +339,7 @@ async function cleanChunks(options:{
     }
 
     const uncleanable = new Set(await getUncleanables(db))
+    const blobStore = await resolveBlobStore()
     if (isTauri) {
         const assets = await readDir('assets', { baseDir: BaseDirectory.AppData })
         console.log(assets)
@@ -346,7 +347,7 @@ async function cleanChunks(options:{
             try {
                 const n = getBasename(asset.name)
                 if (!uncleanable.has(n)) {
-                    await remove('assets/' + asset.name, { baseDir: BaseDirectory.AppData })
+                    await blobStore.remove('assets/' + asset.name)
                 }
             } catch (error) {
                 console.log('error', asset.name)
@@ -416,7 +417,7 @@ async function cleanChunks(options:{
             if (asset.startsWith('assets/')) {
                 const n = getBasename(asset)
                 if(!uncleanable.has(n)) {
-                    await forageStorage.removeItem(asset)
+                    await blobStore.remove(asset)
                 }
             }
             else if (asset.endsWith('.meta')){
