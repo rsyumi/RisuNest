@@ -523,7 +523,7 @@ describe('SaveCoordinator', () => {
         })
     })
 
-    it('retries exact remote publication before persisting later addition edits', async () => {
+    it('publishes only the newest revision after addition edits committed while offline', async () => {
         const { database, added } = makeAdditionDatabase()
         const publish = vi.fn().mockRejectedValueOnce(new Error('offline')).mockResolvedValue(undefined)
         const handle = { publish, dispose: vi.fn(async () => undefined) }
@@ -550,7 +550,7 @@ describe('SaveCoordinator', () => {
 
         expect(pin).toHaveBeenCalledTimes(2)
         expect(pin.mock.calls.map((call) => call[0])).toEqual([2, 3])
-        expect(publish).toHaveBeenCalledTimes(3)
+        expect(publish).toHaveBeenCalledTimes(2)
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0].replaceCharacter.name).toBe('Edited while offline')
     })
@@ -966,7 +966,37 @@ describe('SaveCoordinator', () => {
         expect(coordinator.pendingBytes).toBe(25)
     })
 
-    it('retries the same pinned publication before another local commit', async () => {
+    it('commits locally even when the official publish fails and retries the pin later', async () => {
+        const database = makeDatabase()
+        const publish = vi.fn().mockRejectedValueOnce(new Error('offline')).mockResolvedValue(undefined)
+        const handle = { publish, dispose: vi.fn(async () => undefined) }
+        const pin = vi.fn().mockResolvedValue(handle)
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(1)
+        database.username = 'Offline edit'
+        coordinator.markPersistentDataDirty(1)
+
+        await expect(coordinator.flushPendingData('offline')).rejects.toThrow('offline')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(coordinator.revision).toBe(2)
+
+        await coordinator.flushPendingData('retry')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(pin).toHaveBeenCalledTimes(1)
+        expect(publish).toHaveBeenCalledTimes(2)
+        expect(pin).toHaveBeenCalledWith(2)
+    })
+
+    it('supersedes a failed publication with the newer local revision', async () => {
         const database = makeDatabase()
         const publish = vi.fn().mockRejectedValueOnce(new Error('remote')).mockResolvedValueOnce(undefined)
         const handle = { publish, dispose: vi.fn(async () => undefined) }
@@ -988,10 +1018,60 @@ describe('SaveCoordinator', () => {
 
         await coordinator.flushPendingData('retry')
 
-        expect(publish).toHaveBeenCalledTimes(3)
+        expect(publish).toHaveBeenCalledTimes(2)
         expect(pin).toHaveBeenCalledTimes(2)
+        expect(pin).toHaveBeenNthCalledWith(1, 2)
+        expect(pin).toHaveBeenNthCalledWith(2, 3)
+        expect(handle.dispose).toHaveBeenCalledTimes(2)
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0].expectedRevision).toBe(2)
+    })
+
+    it('reports repeated background publish failures once until a flush succeeds', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            let offline = true
+            const publish = vi.fn(async () => {
+                if (offline) throw new Error('offline')
+            })
+            const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
+            const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+            const onBackgroundError = vi.fn()
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+                officialPublisher: { pin },
+                onBackgroundError,
+            })
+            coordinator.initialize(1)
+
+            database.username = 'Edit one'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            expect(onBackgroundError).toHaveBeenCalledTimes(1)
+
+            database.username = 'Edit two'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            expect(onBackgroundError).toHaveBeenCalledTimes(1)
+
+            offline = false
+            database.username = 'Edit three'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+
+            offline = true
+            database.username = 'Edit four'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            expect(onBackgroundError).toHaveBeenCalledTimes(2)
+            expect(commit).toHaveBeenCalledTimes(4)
+        } finally {
+            vi.useRealTimers()
+        }
     })
 
     it('retries pinning the committed revision before creating a newer local revision', async () => {

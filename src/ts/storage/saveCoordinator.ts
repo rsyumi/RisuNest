@@ -110,6 +110,7 @@ export class SaveCoordinator {
     private pendingPublicationRevision: DataRevision | null = null
     private pendingCharacterAddition: PendingCharacterAddition | null = null
     private reservedCharacterAddition: ReservedCharacterAddition | null = null
+    private lastBackgroundErrorMessage: string | null = null
 
     constructor(private readonly dependencies: SaveCoordinatorDependencies) {
         this.clock = dependencies.clock ?? defaultClock()
@@ -136,6 +137,7 @@ export class SaveCoordinator {
         this.pendingPublicationRevision = null
         this.pendingCharacterAddition = null
         this.reservedCharacterAddition = null
+        this.lastBackgroundErrorMessage = null
     }
 
     adoptHydratedCharacter(revision: DataRevision, character: CompleteCharacter): boolean {
@@ -274,10 +276,6 @@ export class SaveCoordinator {
     }
 
     private async flushIterations(_reason: string, publishOfficial: boolean): Promise<void> {
-        if (this.pendingPublicationRevision !== null) {
-            await this.publishPendingRevision()
-        }
-
         while (true) {
             const generation = this.dirtyGeneration
             const captured = this.capture()
@@ -326,8 +324,7 @@ export class SaveCoordinator {
                 }
                 this.dependencies.onLocalRevision?.(committed.revision)
                 if (publishOfficial && this.dependencies.officialPublisher) {
-                    this.pendingPublicationRevision = committed.revision
-                    await this.publishPendingRevision()
+                    await this.stagePublication(committed.revision)
                 }
             }
 
@@ -343,11 +340,26 @@ export class SaveCoordinator {
                     (currentAddition.pending.locallyAdded &&
                         currentAddition.canonical === currentAddition.pending.baseline))
             ) {
+                if (publishOfficial && this.pendingPublicationRevision !== null) {
+                    await this.publishPendingRevision()
+                    continue
+                }
                 this.pendingCharacterAddition = null
                 this.pendingByteCount = 0
+                this.lastBackgroundErrorMessage = null
                 return
             }
         }
+    }
+
+    /** Marks a committed revision for official publication, superseding any stale pinned one. */
+    private async stagePublication(revision: DataRevision): Promise<void> {
+        if (this.pendingPublicationRevision !== revision && this.pendingPublication) {
+            const stale = this.pendingPublication
+            this.pendingPublication = null
+            await this.disposePublication(stale)
+        }
+        this.pendingPublicationRevision = revision
     }
 
     private async runReplacement(
@@ -485,7 +497,14 @@ export class SaveCoordinator {
     }
 
     private startBackgroundFlush(reason: string): void {
-        void this.flushPendingData(reason).catch((error) => this.dependencies.onBackgroundError?.(error))
+        void this.flushPendingData(reason).catch((error) => this.reportBackgroundError(error))
+    }
+
+    private reportBackgroundError(error: unknown): void {
+        const message = error instanceof Error ? error.message : String(error)
+        if (message === this.lastBackgroundErrorMessage) return
+        this.lastBackgroundErrorMessage = message
+        this.dependencies.onBackgroundError?.(error)
     }
 
     private reportActivePromise(): void {
