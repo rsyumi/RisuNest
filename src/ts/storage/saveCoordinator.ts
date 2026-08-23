@@ -452,9 +452,12 @@ export class SaveCoordinator {
     private beginReservedAddition(reserved: ReservedCharacterAddition): void {
         const request = reserved.request
         if (!request) return
-        request.install()
-        reserved.request = null
-        this.reservedCharacterAddition = null
+        try {
+            request.install()
+        } finally {
+            reserved.request = null
+            if (this.reservedCharacterAddition === reserved) this.reservedCharacterAddition = null
+        }
         this.pendingCharacterAddition = {
             characterId: request.characterId,
             token: reserved.token,

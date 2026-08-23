@@ -626,6 +626,37 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(2)
     })
 
+    it('releases the reservation when install throws so later additions still run', async () => {
+        const { database, added } = makeAdditionDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(1)
+
+        await expect(coordinator.commitCharacterAddition({
+            characterId: 'char-broken',
+            estimatedBytes: 1,
+            install: () => {
+                throw new Error('install failed')
+            },
+        }, 'broken')).rejects.toThrow('install failed')
+        expect(commit).not.toHaveBeenCalled()
+
+        await coordinator.commitCharacterAddition({
+            characterId: added.chaId,
+            estimatedBytes: 1,
+            install: () => database.characters.push(added),
+        }, 'new-character')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0].addCharacter).toMatchObject({ chaId: 'char-added' })
+    })
+
     it('does not retry an addition revision conflict and keeps its unfinished work', async () => {
         const { database, added } = makeAdditionDatabase()
         const gate = deferred<{ revision: number }>()
