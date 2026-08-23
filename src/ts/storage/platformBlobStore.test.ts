@@ -177,6 +177,22 @@ describe('platform BlobStore', () => {
         expect(closes).toBe(1)
     })
 
+    test('OPFS keys skip foreign non-hex names in the shared root', async () => {
+        const entries = [
+            { kind: 'file', name: Buffer.from('assets/a.png', 'utf-8').toString('hex') },
+            { kind: 'file', name: 'coldstorage_3f6b.json' },
+            { kind: 'file', name: 'ABCDEF' },
+            { kind: 'file', name: 'abc' },
+            { kind: 'directory', name: '6162' },
+        ]
+        const directory = {
+            values: async function* () { yield* entries },
+        } as unknown as FileSystemDirectoryHandle
+        const backend = createOpfsBlobBackend(directory)
+
+        expect(await backend.keys()).toEqual(['assets/a.png'])
+    })
+
     test('OPFS bounded reads use File.slice', async () => {
         const sliceCalls: [number, number][] = []
         const file = new File([new Uint8Array([0, 1, 2, 3])], 'value')
