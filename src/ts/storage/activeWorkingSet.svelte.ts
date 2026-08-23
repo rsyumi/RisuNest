@@ -3,6 +3,8 @@ import type { DataRevision, PersistentDataStore } from './persistentDataStore'
 
 type CompleteCharacter = character | groupChat
 
+const CONVERSATION_HYDRATION_CONCURRENCY = 8
+
 export interface WorkingSetCoordinator {
     readonly revision: DataRevision
     initialize(revision: DataRevision, database: Database): void
@@ -110,14 +112,29 @@ export class ActiveWorkingSet {
                 if (summary.characterId !== id) {
                     throw new Error(`Conversation ${summary.id} returned mismatched character ID`)
                 }
-                const conversation = await this.dependencies.store.readConversation(id, summary.id)
+            }
+            for (
+                let start = 0;
+                start < page.items.length;
+                start += CONVERSATION_HYDRATION_CONCURRENCY
+            ) {
+                const chunk = page.items.slice(start, start + CONVERSATION_HYDRATION_CONCURRENCY)
+                const conversations = await Promise.all(
+                    chunk.map((summary) => this.dependencies.store.readConversation(id, summary.id)),
+                )
                 if (!this.isCurrent(generation, revision)) return null
-                if (!conversation) throw new Error(`Conversation ${summary.id} was not found for ${id}`)
-                if (conversation.revision !== revision) return null
-                if (conversation.value.id !== summary.id) {
-                    throw new Error(`Conversation ${summary.id} returned mismatched ID`)
+                for (let index = 0; index < chunk.length; index++) {
+                    const summary = chunk[index]
+                    const conversation = conversations[index]
+                    if (!conversation) {
+                        throw new Error(`Conversation ${summary.id} was not found for ${id}`)
+                    }
+                    if (conversation.revision !== revision) return null
+                    if (conversation.value.id !== summary.id) {
+                        throw new Error(`Conversation ${summary.id} returned mismatched ID`)
+                    }
+                    chats.push(conversation.value)
                 }
-                chats.push(conversation.value)
             }
             cursor = page.nextCursor
         } while (cursor !== undefined)

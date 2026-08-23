@@ -20,6 +20,7 @@ import { RevisionConflictError, SnapshotReleasedError } from './persistentDataSt
 
 const DATABASE_VERSION = 3
 const MESSAGE_PAGE_SIZE = 128
+const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
 const STORE_NAMES = ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 const DATA_STORE_NAMES = ['root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
@@ -40,14 +41,6 @@ interface StoredMessagePage extends StoredRecord<Message[]> {
 interface StoredConversation {
     summary: ConversationSummary
     detail: Omit<Chat, 'message'>
-}
-
-interface PreparedGenerationCounts {
-    root: number
-    catalog: number
-    characters: number
-    conversations: number
-    messagePages: number
 }
 
 export type PersistentGenerationCleanupErrorHandler = (
@@ -84,9 +77,12 @@ function cursorPage<T>(
     input: { limit: number; cursor?: string },
     predicate: (value: T) => boolean,
 ): Promise<{ items: T[]; nextCursor?: string }> {
+    if (!(input.limit > 0)) {
+        throw new RangeError('Query limit must be a positive number')
+    }
     const parsedOffset = input.cursor === undefined ? 0 : Number.parseInt(input.cursor, 10)
     const offset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0
-    const limit = Math.max(0, input.limit)
+    const limit = input.limit
     return new Promise((resolve, reject) => {
         const items: T[] = []
         let matched = 0
@@ -120,6 +116,7 @@ function cursorPage<T>(
 
 export class IndexedDbPersistentDataStore implements PersistentDataStore {
     private database?: IDBDatabase
+    private openPromise?: Promise<void>
 
     constructor(
         private readonly databaseName: string,
@@ -132,7 +129,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     async open(): Promise<void> {
         if (this.database) return
+        this.openPromise ??= this.openDatabase().finally(() => {
+            this.openPromise = undefined
+        })
+        return this.openPromise
+    }
 
+    private async openDatabase(): Promise<void> {
         const request = this.indexedDbFactory.open(this.databaseName, DATABASE_VERSION)
         // Another document holding the previous version would otherwise stall boot forever.
         request.onblocked = () => this.onBlockedUpgrade()
@@ -208,178 +211,57 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     }
 
     async readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'root'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'root'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const record = (await requestResult(
-            transaction.objectStore('root').get(generation),
-        )) as StoredRecord<Omit<Database, 'characters'>> | undefined
-        await transactionDone(transaction)
+        const record = await this.readRootRecordFromTransaction(transaction, generation)
         return { revision, value: record?.value ?? ({} as Omit<Database, 'characters'>) }
     }
 
     async queryCharacters(input: CharacterQuery): Promise<CharacterPage> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'catalog'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'catalog'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const store = transaction.objectStore('catalog')
-        const index = store.index(
-            input.order === 'configured' ? 'byGenerationConfigured' : 'byGenerationRecent',
-        )
-        const search = input.search?.trim().toLocaleLowerCase()
-        const range =
-            input.order === 'configured'
-                ? this.keyRangeFactory.bound([generation, 0], [generation, MAX_INDEX_VALUE])
-                : this.keyRangeFactory.bound(
-                      [generation, -MAX_INDEX_VALUE, 0],
-                      [generation, 0, MAX_INDEX_VALUE],
-                  )
-        const result = await cursorPage<CharacterSummary>(
-            index,
-            range,
-            input,
-            (item) =>
-                item.trashed === input.trash &&
-                (!search || item.name.toLocaleLowerCase().includes(search)),
-            )
-        await transactionDone(transaction)
-        return { revision, ...result }
+        return this.queryCharactersFromTransaction(transaction, revision, generation, input)
     }
 
     async readCharacter(id: string): Promise<Versioned<CharacterDetail> | null> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'characters'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'characters'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const record = (await requestResult(
-            transaction.objectStore('characters').get(this.characterKey(generation, id)),
-        )) as StoredRecord<CharacterDetail> | undefined
-        await transactionDone(transaction)
-        return record ? { revision, value: record.value } : null
+        return this.readCharacterFromTransaction(transaction, revision, generation, id)
     }
 
     async queryConversations(input: ConversationQuery): Promise<ConversationPage> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(['meta', 'conversations'], 'readonly')
+        const transaction = this.requireDatabase().transaction(['meta', 'conversations'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        const index = transaction.objectStore('conversations').index(
-            input.order === 'configured'
-                ? 'byGenerationCharacterConfigured'
-                : 'byGenerationCharacterRecent',
-        )
-        const prefix = [generation, input.characterId]
-        const range =
-            input.order === 'configured'
-                ? this.keyRangeFactory.bound([...prefix, 0], [...prefix, MAX_INDEX_VALUE])
-                : this.keyRangeFactory.bound(
-                      [...prefix, -MAX_INDEX_VALUE, 0],
-                      [...prefix, 0, MAX_INDEX_VALUE],
-                  )
-        const result = await cursorPage<StoredConversation>(index, range, input, () => true)
-        await transactionDone(transaction)
-        return {
-            revision,
-            items: result.items.map((item) => item.summary),
-            nextCursor: result.nextCursor,
-        }
+        return this.queryConversationsFromTransaction(transaction, revision, generation, input)
     }
 
     async readConversation(
         characterId: string,
         conversationId: string,
     ): Promise<Versioned<Chat> | null> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(
+        const transaction = this.requireDatabase().transaction(
             ['meta', 'conversations', 'messagePages'],
             'readonly',
         )
         const { revision, generation } = await this.readActive(transaction)
-        const record = (await requestResult(
-            transaction
-                .objectStore('conversations')
-                .get(this.conversationKey(generation, characterId, conversationId)),
-        )) as StoredRecord<StoredConversation> | undefined
-        if (!record) {
-            await transactionDone(transaction)
-            return null
-        }
-        const message = await this.readMessagesFromTransaction(
+        return this.readConversationFromTransaction(
             transaction,
+            revision,
             generation,
             characterId,
             conversationId,
         )
-        await transactionDone(transaction)
-        return { revision, value: { ...record.value.detail, message } }
     }
 
     async readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null> {
-        const database = this.requireDatabase()
-        const transaction = database.transaction(
+        const transaction = this.requireDatabase().transaction(
             ['meta', 'conversations', 'messagePages'],
             'readonly',
         )
         const { revision, generation } = await this.readActive(transaction)
-        const conversation = (await requestResult(
-            transaction
-                .objectStore('conversations')
-                .get(this.conversationKey(generation, input.characterId, input.conversationId)),
-        )) as StoredRecord<StoredConversation> | undefined
-        if (!conversation) {
-            await transactionDone(transaction)
-            return null
-        }
-
-        const totalMessages = conversation.value.summary.messageCount
-        let startIndex: number
-        let endIndex: number
-        let anchorPage: StoredMessagePage | undefined
-        if (input.anchorMessageId !== undefined) {
-            const anchor = await this.findMessage(
-                transaction,
-                generation,
-                input.characterId,
-                input.conversationId,
-                input.anchorMessageId,
-                totalMessages,
-            )
-            if (!anchor) {
-                await transactionDone(transaction)
-                return null
-            }
-            anchorPage = anchor.page
-            startIndex = Math.max(0, anchor.index - Math.max(0, input.before ?? 0))
-            endIndex = Math.min(totalMessages, anchor.index + Math.max(0, input.after ?? 0) + 1)
-        } else {
-            endIndex = totalMessages
-            startIndex = Math.max(0, endIndex - Math.max(0, input.limit ?? MESSAGE_PAGE_SIZE))
-        }
-        const messages = await this.readMessageRange(
-            transaction,
-            generation,
-            input.characterId,
-            input.conversationId,
-            startIndex,
-            endIndex,
-            anchorPage,
-        )
-
-        const result = {
-            revision,
-            value: {
-                characterId: input.characterId,
-                conversationId: input.conversationId,
-                messages,
-                startIndex,
-                endIndex,
-                totalMessages,
-                hasMoreBefore: startIndex > 0,
-                hasMoreAfter: endIndex < totalMessages,
-            },
-        }
-        await transactionDone(transaction)
-        return result
+        return this.readConversationWindowFromTransaction(transaction, revision, generation, input)
     }
 
     async commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
@@ -390,8 +272,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (active.revision !== input.expectedRevision) {
                 throw new RevisionConflictError(input.expectedRevision, active.revision)
             }
-            if (input.replaceCharacter) this.validateReplacementCharacter(input.replaceCharacter)
-            if (input.addCharacter) this.validateAddedCharacter(input.addCharacter)
+            if (input.replaceCharacter) {
+                this.validateCharacterInput(input.replaceCharacter, 'Selected character replacement')
+            }
+            if (input.addCharacter) {
+                this.validateCharacterInput(input.addCharacter, 'Character addition')
+            }
 
             const revision = active.revision + 1
             const generation = active.generation
@@ -536,6 +422,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             transaction.objectStore('meta').put({
                 key: this.snapshotLeaseKey(generation),
                 value: generation,
+                createdAt: Date.now(),
             })
             for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
                 await this.copyGeneration(
@@ -562,27 +449,58 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             revision,
             readRoot: async () => {
                 assertActive()
-                return this.readRootAt(revision, generation)
+                const record = await this.readRootRecordFromTransaction(
+                    this.requireDatabase().transaction('root', 'readonly'),
+                    generation,
+                )
+                if (!record) throw new Error('Persistent snapshot root is missing')
+                return { revision, value: record.value }
             },
             queryCharacters: async (input) => {
                 assertActive()
-                return this.queryCharactersAt(revision, generation, input)
+                return this.queryCharactersFromTransaction(
+                    this.requireDatabase().transaction('catalog', 'readonly'),
+                    revision,
+                    generation,
+                    input,
+                )
             },
             readCharacter: async (id) => {
                 assertActive()
-                return this.readCharacterAt(revision, generation, id)
+                return this.readCharacterFromTransaction(
+                    this.requireDatabase().transaction('characters', 'readonly'),
+                    revision,
+                    generation,
+                    id,
+                )
             },
             queryConversations: async (input) => {
                 assertActive()
-                return this.queryConversationsAt(revision, generation, input)
+                return this.queryConversationsFromTransaction(
+                    this.requireDatabase().transaction('conversations', 'readonly'),
+                    revision,
+                    generation,
+                    input,
+                )
             },
             readConversation: async (characterId, conversationId) => {
                 assertActive()
-                return this.readConversationAt(revision, generation, characterId, conversationId)
+                return this.readConversationFromTransaction(
+                    this.requireDatabase().transaction(['conversations', 'messagePages'], 'readonly'),
+                    revision,
+                    generation,
+                    characterId,
+                    conversationId,
+                )
             },
             readConversationWindow: async (input) => {
                 assertActive()
-                return this.readConversationWindowAt(revision, generation, input)
+                return this.readConversationWindowFromTransaction(
+                    this.requireDatabase().transaction(['conversations', 'messagePages'], 'readonly'),
+                    revision,
+                    generation,
+                    input,
+                )
             },
             release: async () => {
                 if (releasePromise) return releasePromise
@@ -595,25 +513,23 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    private async readRootAt(
-        revision: DataRevision,
+    private async readRootRecordFromTransaction(
+        transaction: IDBTransaction,
         generation: string,
-    ): Promise<Versioned<Omit<Database, 'characters'>>> {
-        const transaction = this.requireDatabase().transaction('root', 'readonly')
+    ): Promise<StoredRecord<Omit<Database, 'characters'>> | undefined> {
         const record = (await requestResult(
             transaction.objectStore('root').get(generation),
         )) as StoredRecord<Omit<Database, 'characters'>> | undefined
         await transactionDone(transaction)
-        if (!record) throw new Error('Persistent snapshot root is missing')
-        return { revision, value: record.value }
+        return record
     }
 
-    private async queryCharactersAt(
+    private async queryCharactersFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         input: CharacterQuery,
     ): Promise<CharacterPage> {
-        const transaction = this.requireDatabase().transaction('catalog', 'readonly')
         const index = transaction.objectStore('catalog').index(
             input.order === 'configured' ? 'byGenerationConfigured' : 'byGenerationRecent',
         )
@@ -637,12 +553,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return { revision, ...result }
     }
 
-    private async readCharacterAt(
+    private async readCharacterFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         id: string,
     ): Promise<Versioned<CharacterDetail> | null> {
-        const transaction = this.requireDatabase().transaction('characters', 'readonly')
         const record = (await requestResult(
             transaction.objectStore('characters').get(this.characterKey(generation, id)),
         )) as StoredRecord<CharacterDetail> | undefined
@@ -650,12 +566,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return record ? { revision, value: record.value } : null
     }
 
-    private async queryConversationsAt(
+    private async queryConversationsFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         input: ConversationQuery,
     ): Promise<ConversationPage> {
-        const transaction = this.requireDatabase().transaction('conversations', 'readonly')
         const index = transaction.objectStore('conversations').index(
             input.order === 'configured'
                 ? 'byGenerationCharacterConfigured'
@@ -678,16 +594,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    private async readConversationAt(
+    private async readConversationFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         characterId: string,
         conversationId: string,
     ): Promise<Versioned<Chat> | null> {
-        const transaction = this.requireDatabase().transaction(
-            ['conversations', 'messagePages'],
-            'readonly',
-        )
         const record = (await requestResult(
             transaction
                 .objectStore('conversations')
@@ -707,15 +620,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return { revision, value: { ...record.value.detail, message } }
     }
 
-    private async readConversationWindowAt(
+    private async readConversationWindowFromTransaction(
+        transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null> {
-        const transaction = this.requireDatabase().transaction(
-            ['conversations', 'messagePages'],
-            'readonly',
-        )
         const conversation = (await requestResult(
             transaction
                 .objectStore('conversations')
@@ -803,11 +713,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         transaction: IDBTransaction,
         databaseValue: Database,
         generation: string,
-    ): Promise<PreparedGenerationCounts> {
+    ): Promise<void> {
         const ids = new Set<string>()
         const conversationIds = new Set<string>()
-        let conversationCount = 0
-        let messagePageCount = 0
         const { characters, ...root } = databaseValue
         this.putRoot(transaction, generation, root)
         for (let index = 0; index < characters.length; index++) {
@@ -818,16 +726,14 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             ids.add(character.chaId)
             const { chats, ...detail } = character
             this.putCharacterRecords(transaction, generation, detail, index, chats.length)
-            const characterConversationIds = new Set<string>()
             for (let conversationIndex = 0; conversationIndex < chats.length; conversationIndex++) {
                 const conversation = chats[conversationIndex]
-                if (!conversation.id || characterConversationIds.has(conversation.id)) {
+                // Stored keys join ids with ':', so the composite must stay unique across characters.
+                const compositeId = `${character.chaId}:${conversation.id}`
+                if (!conversation.id || conversationIds.has(compositeId)) {
                     throw new Error(`Character ${character.chaId} requires unique conversation IDs`)
                 }
-                characterConversationIds.add(conversation.id)
-                conversationIds.add(`${character.chaId}:${conversation.id}`)
-                conversationCount++
-                messagePageCount += Math.ceil(conversation.message.length / MESSAGE_PAGE_SIZE)
+                conversationIds.add(compositeId)
                 this.putConversation(
                     transaction,
                     generation,
@@ -836,73 +742,6 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     conversationIndex,
                 )
             }
-        }
-
-        const stagedCatalog = await this.generationRecords<CharacterSummary>(
-            transaction.objectStore('catalog'),
-            generation,
-        )
-        if (
-            stagedCatalog.length !== characters.length ||
-            stagedCatalog.some((item) => !ids.has(item.value.id))
-        ) {
-            throw new Error('Persistent data staging validation failed')
-        }
-        const stagedConversations = await this.generationRecords<StoredConversation>(
-            transaction.objectStore('conversations'),
-            generation,
-        )
-        if (
-            stagedConversations.length !== conversationCount ||
-            stagedConversations.some(
-                (item) =>
-                    !conversationIds.has(
-                        `${item.value.summary.characterId}:${item.value.summary.id}`,
-                    ),
-            )
-        ) {
-            throw new Error('Persistent conversation staging validation failed')
-        }
-        const counts = {
-            root: 1,
-            catalog: characters.length,
-            characters: characters.length,
-            conversations: conversationCount,
-            messagePages: messagePageCount,
-        }
-        await this.validateGeneration(transaction, generation, counts)
-        return counts
-    }
-
-    private async validateGeneration(
-        transaction: IDBTransaction,
-        generation: string,
-        expected: PreparedGenerationCounts,
-    ): Promise<void> {
-        const root = await requestResult(transaction.objectStore('root').get(generation))
-        const counts = {
-            root: root ? 1 : 0,
-            catalog: await requestResult(
-                transaction.objectStore('catalog').index('byGeneration').count(generation),
-            ),
-            characters: await requestResult(
-                transaction.objectStore('characters').index('byGeneration').count(generation),
-            ),
-            conversations: await requestResult(
-                transaction.objectStore('conversations').index('byGeneration').count(generation),
-            ),
-            messagePages: await requestResult(
-                transaction.objectStore('messagePages').index('byGeneration').count(generation),
-            ),
-        }
-        if (
-            Object.keys(expected).some(
-                (key) =>
-                    counts[key as keyof typeof counts] !==
-                    expected[key as keyof typeof expected],
-            )
-        ) {
-            throw new Error('Persistent prepared replacement data validation failed')
         }
     }
 
@@ -946,15 +785,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     /**
      * Removes snapshot copies abandoned by an interrupted export. A lease record keeps snapshots
-     * that another open document is still reading, which a module-local set cannot see.
+     * that another open document is still reading, which a module-local set cannot see; leases
+     * older than the TTL are treated as crash leftovers and reclaimed with their generations.
      */
     private async sweepTemporaryGenerations(): Promise<void> {
         const database = this.requireDatabase()
-        const leaseTransaction = database.transaction('meta', 'readonly')
-        const leased = new Set(await this.readMetaValuesByPrefix<string>(
-            leaseTransaction.objectStore('meta'),
-            'snapshotLease:',
-        ))
+        const cutoff = Date.now() - SNAPSHOT_LEASE_TTL_MS
+        const leaseTransaction = database.transaction('meta', 'readwrite')
+        const meta = leaseTransaction.objectStore('meta')
+        const leaseRecords = await this.readMetaRecordsByPrefix<string>(meta, 'snapshotLease:')
+        const leased = new Set<string>()
+        for (const record of leaseRecords) {
+            const live =
+                activeSnapshotGenerations.has(record.value) || (record.createdAt ?? 0) >= cutoff
+            if (live) leased.add(record.value)
+            else meta.delete(record.key)
+        }
         await transactionDone(leaseTransaction)
 
         const snapshots = this.keyRangeFactory.bound('snapshot-', 'snapshot-￿')
@@ -983,9 +829,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         await transactionDone(transaction)
     }
 
-    private readMetaValuesByPrefix<T>(store: IDBObjectStore, prefix: string): Promise<T[]> {
+    private readMetaRecordsByPrefix<T>(
+        store: IDBObjectStore,
+        prefix: string,
+    ): Promise<Array<{ key: string; value: T; createdAt?: number }>> {
         return new Promise((resolve, reject) => {
-            const values: T[] = []
+            const records: Array<{ key: string; value: T; createdAt?: number }> = []
             const request = store.openCursor(
                 this.keyRangeFactory.bound(prefix, `${prefix}\uffff`),
             )
@@ -993,10 +842,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             request.onsuccess = () => {
                 const cursor = request.result
                 if (!cursor) {
-                    resolve(values)
+                    resolve(records)
                     return
                 }
-                values.push((cursor.value as { value: T }).value)
+                records.push(cursor.value as { key: string; value: T; createdAt?: number })
                 cursor.continue()
             }
         })
@@ -1116,27 +965,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         this.putCharacterRecords(transaction, generation, detail, configuredIndex, conversationCount)
     }
 
-    private validateReplacementCharacter(character: Database['characters'][number]): void {
+    private validateCharacterInput(
+        character: Database['characters'][number],
+        context: string,
+    ): void {
         if (!character.chaId) {
-            throw new Error('Selected character replacement requires a nonempty character ID')
+            throw new Error(`${context} requires a nonempty character ID`)
         }
         const conversationIds = new Set<string>()
         for (const conversation of character.chats) {
             if (!conversation.id || conversationIds.has(conversation.id)) {
-                throw new Error('Selected character replacement requires unique, nonempty chat IDs')
-            }
-            conversationIds.add(conversation.id)
-        }
-    }
-
-    private validateAddedCharacter(character: Database['characters'][number]): void {
-        if (!character.chaId) {
-            throw new Error('Character addition requires a nonempty character ID')
-        }
-        const conversationIds = new Set<string>()
-        for (const conversation of character.chats) {
-            if (!conversation.id || conversationIds.has(conversation.id)) {
-                throw new Error('Character addition requires unique, nonempty chat IDs')
+                throw new Error(`${context} requires unique, nonempty chat IDs`)
             }
             conversationIds.add(conversation.id)
         }
