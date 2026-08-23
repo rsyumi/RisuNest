@@ -149,18 +149,14 @@ export class SaveCoordinator {
         this.assertInitialized()
         this.dirtyGeneration++
         const bytes = Number.isFinite(estimatedBytes) && estimatedBytes > 0 ? estimatedBytes : 0
-        this.pendingByteCount += bytes
+        const previousBytes = this.pendingByteCount
+        this.pendingByteCount = Math.max(previousBytes, bytes)
         this.cancelDebounce()
-        if (this.pendingByteCount >= PENDING_BYTE_LIMIT) {
+        if (this.pendingByteCount >= PENDING_BYTE_LIMIT && previousBytes < PENDING_BYTE_LIMIT) {
             this.startBackgroundFlush('byte-limit')
             return
         }
-        if (!this.flushPromise) {
-            this.debounceHandle = this.clock.setTimeout(() => {
-                this.debounceHandle = undefined
-                this.startBackgroundFlush('debounce')
-            }, SAVE_DEBOUNCE_MS)
-        }
+        if (!this.flushPromise) this.armDebounce()
     }
 
     flushPendingData(reason: string): Promise<void> {
@@ -468,6 +464,14 @@ export class SaveCoordinator {
             ? request.estimatedBytes
             : 0
         this.pendingByteCount += bytes
+    }
+
+    private armDebounce(): void {
+        if (this.debounceHandle !== undefined) return
+        this.debounceHandle = this.clock.setTimeout(() => {
+            this.debounceHandle = undefined
+            this.startBackgroundFlush('debounce')
+        }, SAVE_DEBOUNCE_MS)
     }
 
     private startBackgroundFlush(reason: string): void {

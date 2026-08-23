@@ -209,6 +209,67 @@ describe('SaveCoordinator', () => {
         }
     })
 
+    it('treats byte estimates as absolute pending size instead of summing them', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            const store = makeStore(vi.fn(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            })))
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+            })
+            coordinator.initialize(1)
+            database.username = 'Large snapshots'
+
+            coordinator.markPersistentDataDirty(600_000)
+            coordinator.markPersistentDataDirty(600_000)
+
+            expect(coordinator.pendingBytes).toBe(600_000)
+            await vi.advanceTimersByTimeAsync(0)
+            expect(store.commit).not.toHaveBeenCalled()
+            await vi.advanceTimersByTimeAsync(500)
+            expect(store.commit).toHaveBeenCalledTimes(1)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('starts one immediate flush while estimates stay above the byte limit', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            const gate = deferred<{ revision: number }>()
+            const commit = vi.fn().mockImplementationOnce(() => gate.promise)
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+            })
+            coordinator.initialize(1)
+            database.username = 'Huge'
+
+            coordinator.markPersistentDataDirty(2_097_152)
+            await vi.advanceTimersByTimeAsync(0)
+            expect(commit).toHaveBeenCalledTimes(1)
+            coordinator.markPersistentDataDirty(2_097_152)
+            coordinator.markPersistentDataDirty(2_097_152)
+            await vi.advanceTimersByTimeAsync(0)
+            expect(commit).toHaveBeenCalledTimes(1)
+
+            gate.resolve({ revision: 2 })
+            await vi.advanceTimersByTimeAsync(500)
+            expect(commit).toHaveBeenCalledTimes(1)
+            expect(coordinator.pendingBytes).toBe(0)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('clamps invalid estimated byte counts to zero while retaining dirty work', async () => {
         const database = makeDatabase()
         const coordinator = new SaveCoordinator({
