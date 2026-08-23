@@ -1,4 +1,5 @@
 import type { customscript } from '../storage/database.svelte'
+import { ByteBudgetLru } from '../util/byteBudgetLru'
 
 const PLAN_CACHE_LIMIT = 32
 const metadataPattern = /<(.+?)>/g
@@ -39,7 +40,11 @@ export interface RegexExecutionResult {
     errors: RegexExecutionError[]
 }
 
-const planCache = new Map<string, RegexExecutionPlan>()
+const planCache = new ByteBudgetLru<string, RegexExecutionPlan>(
+    Number.POSITIVE_INFINITY,
+    () => 0,
+    PLAN_CACHE_LIMIT,
+)
 let nextPlanRevision = 1
 
 function makePlanKey(scripts: customscript[], mode: string): string {
@@ -129,8 +134,6 @@ export function getRegexExecutionPlan(scripts: customscript[], mode: string): Re
     const key = makePlanKey(scripts, mode)
     const cached = planCache.get(key)
     if (cached !== undefined) {
-        planCache.delete(key)
-        planCache.set(key, cached)
         return cached
     }
 
@@ -159,14 +162,6 @@ export function getRegexExecutionPlan(scripts: customscript[], mode: string): Re
     }
 
     planCache.set(key, plan)
-    while (planCache.size > PLAN_CACHE_LIMIT) {
-        const oldest = planCache.keys().next().value
-        if (oldest === undefined) {
-            break
-        }
-        planCache.delete(oldest)
-    }
-
     return plan
 }
 

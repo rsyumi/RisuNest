@@ -160,6 +160,17 @@ describe('regex execution plans', () => {
         expect(patternParses).toBe(2)
     })
 
+    it('keeps a recently reused plan when the cache evicts', () => {
+        const scriptSets = Array.from({ length: 32 }, (_value, index) => [script(`plan-${index}`, 'x')])
+        const plans = scriptSets.map((set) => getRegexExecutionPlan(set, 'editoutput'))
+
+        expect(getRegexExecutionPlan(scriptSets[0], 'editoutput')).toBe(plans[0])
+        getRegexExecutionPlan([script('plan-extra', 'x')], 'editoutput')
+
+        expect(getRegexExecutionPlan(scriptSets[0], 'editoutput')).toBe(plans[0])
+        expect(getRegexExecutionPlan(scriptSets[1], 'editoutput')).not.toBe(plans[1])
+    })
+
     it('rejects stateful actions from worker eligibility', () => {
         const directivePlan = getRegexExecutionPlan([
             script('a', '@@emo happy'),
