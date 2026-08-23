@@ -1,5 +1,10 @@
 import type { Database, character, groupChat } from './database.svelte'
-import type { DataRevision, PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
+import type {
+    ConversationMutation,
+    DataRevision,
+    PersistentDataStore,
+    WorkingSetCommit,
+} from './persistentDataStore'
 
 const SAVE_DEBOUNCE_MS = 500
 const PENDING_BYTE_LIMIT = 1_048_576
@@ -110,6 +115,7 @@ export class SaveCoordinator {
     private pendingPublicationRevision: DataRevision | null = null
     private pendingCharacterAddition: PendingCharacterAddition | null = null
     private reservedCharacterAddition: ReservedCharacterAddition | null = null
+    private lastBackgroundErrorMessage: string | null = null
 
     constructor(private readonly dependencies: SaveCoordinatorDependencies) {
         this.clock = dependencies.clock ?? defaultClock()
@@ -136,6 +142,7 @@ export class SaveCoordinator {
         this.pendingPublicationRevision = null
         this.pendingCharacterAddition = null
         this.reservedCharacterAddition = null
+        this.lastBackgroundErrorMessage = null
     }
 
     adoptHydratedCharacter(revision: DataRevision, character: CompleteCharacter): boolean {
@@ -149,18 +156,14 @@ export class SaveCoordinator {
         this.assertInitialized()
         this.dirtyGeneration++
         const bytes = Number.isFinite(estimatedBytes) && estimatedBytes > 0 ? estimatedBytes : 0
-        this.pendingByteCount += bytes
+        const previousBytes = this.pendingByteCount
+        this.pendingByteCount = Math.max(previousBytes, bytes)
         this.cancelDebounce()
-        if (this.pendingByteCount >= PENDING_BYTE_LIMIT) {
+        if (this.pendingByteCount >= PENDING_BYTE_LIMIT && previousBytes < PENDING_BYTE_LIMIT) {
             this.startBackgroundFlush('byte-limit')
             return
         }
-        if (!this.flushPromise) {
-            this.debounceHandle = this.clock.setTimeout(() => {
-                this.debounceHandle = undefined
-                this.startBackgroundFlush('debounce')
-            }, SAVE_DEBOUNCE_MS)
-        }
+        if (!this.flushPromise) this.armDebounce()
     }
 
     flushPendingData(reason: string): Promise<void> {
@@ -229,7 +232,12 @@ export class SaveCoordinator {
                 .catch(() => undefined)
                 .then(() => this.commitCharacterAddition(request, reason))
         }
-        if (this.pendingCharacterAddition || this.reservedCharacterAddition) {
+        if (this.pendingCharacterAddition) {
+            // A previous addition failed and left its work pending; retry it before this import.
+            return this.flushPendingData(reason)
+                .then(() => this.commitCharacterAddition(request, reason))
+        }
+        if (this.reservedCharacterAddition) {
             throw new Error('A character addition is already pending')
         }
         const reserved: ReservedCharacterAddition = {
@@ -273,21 +281,27 @@ export class SaveCoordinator {
     }
 
     private async flushIterations(_reason: string, publishOfficial: boolean): Promise<void> {
-        if (this.pendingPublicationRevision !== null) {
-            await this.publishPendingRevision()
-        }
-
         while (true) {
             const generation = this.dirtyGeneration
             const captured = this.capture()
-            const detached = captured.character ? null : this.captureDetachedCharacter()
+            const selectionSwitched =
+                captured.character !== null &&
+                this.characterBaselineId !== null &&
+                captured.character.chaId !== this.characterBaselineId
+            const detached =
+                !captured.character || selectionSwitched ? this.captureDetachedCharacter() : null
             const addition = this.capturePendingAddition()
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
-            if (captured.characterCanonical !== this.characterBaseline && captured.character) {
-                commit.replaceCharacter = captured.character
-            } else if (detached) {
-                commit.replaceCharacter = detached
+            if (detached) {
+                commit.replaceCharacter = detached.character
+            } else if (
+                captured.character &&
+                captured.characterCanonical !== this.characterBaseline
+            ) {
+                const conversations = this.diffSelectedConversations(captured)
+                if (conversations) commit.conversations = conversations
+                else commit.replaceCharacter = captured.character
             }
 
             let replacementIsAddition = false
@@ -296,24 +310,38 @@ export class SaveCoordinator {
                     commit.addCharacter = addition.character
                 } else if (
                     addition.canonical !== addition.pending.baseline &&
-                    !commit.replaceCharacter
+                    !commit.replaceCharacter &&
+                    !commit.conversations
                 ) {
                     commit.replaceCharacter = addition.character
                     replacementIsAddition = true
                 }
             }
 
-            if (commit.root || commit.replaceCharacter || commit.addCharacter) {
+            if (commit.root || commit.replaceCharacter || commit.addCharacter || commit.conversations) {
                 const committed = await this.dependencies.store.commit(commit)
                 this.currentRevision = committed.revision
                 if (commit.root) this.rootBaseline = captured.rootCanonical
                 if (commit.replaceCharacter && !replacementIsAddition) {
-                    this.setCharacterBaseline(captured)
+                    if (detached && captured.character) {
+                        this.characterBaseline = detached.canonical
+                        this.characterBaselineId = detached.character.chaId
+                    } else {
+                        this.setCharacterBaseline(captured)
+                    }
                     if (
                         addition &&
                         commit.replaceCharacter.chaId === addition.pending.characterId
                     ) {
-                        addition.pending.baseline = canonicalJson(commit.replaceCharacter)
+                        addition.pending.baseline = detached
+                            ? detached.canonical
+                            : captured.characterCanonical!
+                    }
+                }
+                if (commit.conversations && captured.character) {
+                    this.setCharacterBaseline(captured)
+                    if (addition && captured.character.chaId === addition.pending.characterId) {
+                        addition.pending.baseline = captured.characterCanonical!
                     }
                 }
                 if (replacementIsAddition && addition) {
@@ -325,8 +353,7 @@ export class SaveCoordinator {
                 }
                 this.dependencies.onLocalRevision?.(committed.revision)
                 if (publishOfficial && this.dependencies.officialPublisher) {
-                    this.pendingPublicationRevision = committed.revision
-                    await this.publishPendingRevision()
+                    await this.stagePublication(committed.revision)
                 }
             }
 
@@ -342,11 +369,26 @@ export class SaveCoordinator {
                     (currentAddition.pending.locallyAdded &&
                         currentAddition.canonical === currentAddition.pending.baseline))
             ) {
+                if (publishOfficial && this.pendingPublicationRevision !== null) {
+                    await this.publishPendingRevision()
+                    continue
+                }
                 this.pendingCharacterAddition = null
                 this.pendingByteCount = 0
+                this.lastBackgroundErrorMessage = null
                 return
             }
         }
+    }
+
+    /** Marks a committed revision for official publication, superseding any stale pinned one. */
+    private async stagePublication(revision: DataRevision): Promise<void> {
+        if (this.pendingPublicationRevision !== revision && this.pendingPublication) {
+            const stale = this.pendingPublication
+            this.pendingPublication = null
+            await this.disposePublication(stale)
+        }
+        this.pendingPublicationRevision = revision
     }
 
     private async runReplacement(
@@ -381,8 +423,8 @@ export class SaveCoordinator {
             const index = publishedParts.characters.findIndex(
                 (characterValue) => characterValue.chaId === live.character!.chaId,
             )
+            // A character absent from the replacement was removed by it; do not resurrect it.
             if (index >= 0) published.characters[index] = canonicalClone(live.character)
-            else published.characters.push(canonicalClone(live.character))
         }
 
         this.dependencies.replaceDatabase(published)
@@ -394,6 +436,8 @@ export class SaveCoordinator {
         if (this.dirtyGeneration === capturedGeneration) {
             this.cancelDebounce()
             this.pendingByteCount = 0
+        } else if (!this.flushPromise && !this.additionPromise) {
+            this.armDebounce()
         }
     }
 
@@ -402,24 +446,73 @@ export class SaveCoordinator {
         this.characterBaselineId = captured.character?.chaId ?? null
     }
 
-    /** Returns the last selected character when the selection was cleared before its edits were committed. */
-    private captureDetachedCharacter(): CompleteCharacter | null {
+    /**
+     * Builds conversation-level mutations when only chat content changed for the tracked
+     * selected character. Returns null whenever a full character replacement is required:
+     * detail changes, added/removed/reordered chats, or chats the mutation channel cannot
+     * address safely (missing or duplicate ids).
+     */
+    private diffSelectedConversations(captured: CapturedState): ConversationMutation[] | null {
+        const character = captured.character
+        if (!character || this.characterBaseline === null) return null
+        if (this.characterBaselineId !== character.chaId) return null
+        const baseline = JSON.parse(this.characterBaseline) as CompleteCharacter
+        const capturedChats = character.chats
+        const baselineChats = baseline.chats
+        if (!Array.isArray(capturedChats) || !Array.isArray(baselineChats)) return null
+        if (capturedChats.length !== baselineChats.length) return null
+        const { chats: _capturedChats, ...capturedDetail } = character
+        const { chats: _baselineChats, ...baselineDetail } = baseline
+        if (JSON.stringify(capturedDetail) !== JSON.stringify(baselineDetail)) return null
+
+        const mutations: ConversationMutation[] = []
+        const seenIds = new Set<string>()
+        for (let index = 0; index < capturedChats.length; index++) {
+            const capturedChat = capturedChats[index]
+            const baselineChat = baselineChats[index]
+            const conversationId = capturedChat?.id
+            if (!conversationId || conversationId !== baselineChat?.id) return null
+            if (seenIds.has(conversationId)) return null
+            seenIds.add(conversationId)
+            if (JSON.stringify(capturedChat) === JSON.stringify(baselineChat)) continue
+            if (!Array.isArray(capturedChat.message) || !Array.isArray(baselineChat.message)) {
+                return null
+            }
+            const { message, ...conversation } = capturedChat
+            mutations.push({
+                type: 'replace-range',
+                characterId: character.chaId,
+                conversationId,
+                start: 0,
+                deleteCount: baselineChat.message.length,
+                messages: message,
+                conversation,
+            })
+        }
+        return mutations.length > 0 ? mutations : null
+    }
+
+    /** Returns the last tracked character when the selection moved away before its edits were committed. */
+    private captureDetachedCharacter(): { character: CompleteCharacter; canonical: string } | null {
         if (this.characterBaseline === null || this.characterBaselineId === null) return null
         const retained = this.dependencies.captureCharacter(this.characterBaselineId)
         if (!retained) return null
         const canonical = canonicalJson(retained)
-        return canonical === this.characterBaseline ? null : JSON.parse(canonical) as CompleteCharacter
+        if (canonical === this.characterBaseline) return null
+        return { character: JSON.parse(canonical) as CompleteCharacter, canonical }
     }
 
     private capture(): CapturedState {
-        const root = canonicalClone(this.dependencies.captureRoot())
+        const rootCanonical = canonicalJson(this.dependencies.captureRoot())
         const characterValue = this.dependencies.captureSelectedCharacter()
-        const character = characterValue ? canonicalClone(characterValue) : null
+        const characterCanonical = characterValue ? canonicalJson(characterValue) : null
         return {
-            root,
-            rootCanonical: canonicalJson(root),
-            character,
-            characterCanonical: character ? canonicalJson(character) : null,
+            root: JSON.parse(rootCanonical) as RootDatabase,
+            rootCanonical,
+            character: characterCanonical
+                ? (JSON.parse(characterCanonical) as CompleteCharacter)
+                : null,
+            characterCanonical,
         }
     }
 
@@ -430,9 +523,9 @@ export class SaveCoordinator {
         const character = selectedId ? characters.find((candidate) => candidate.chaId === selectedId) ?? null : null
         return {
             root,
-            rootCanonical: canonicalJson(root),
+            rootCanonical: JSON.stringify(root),
             character,
-            characterCanonical: character ? canonicalJson(character) : null,
+            characterCanonical: character ? JSON.stringify(character) : null,
         }
     }
 
@@ -447,16 +540,19 @@ export class SaveCoordinator {
         if (!value || value.chaId !== pending.characterId) {
             throw new Error(`Installed character ${pending.characterId} is not available`)
         }
-        const character = canonicalClone(value)
-        return { pending, character, canonical: canonicalJson(character) }
+        const canonical = canonicalJson(value)
+        return { pending, character: JSON.parse(canonical) as CompleteCharacter, canonical }
     }
 
     private beginReservedAddition(reserved: ReservedCharacterAddition): void {
         const request = reserved.request
         if (!request) return
-        request.install()
-        reserved.request = null
-        this.reservedCharacterAddition = null
+        try {
+            request.install()
+        } finally {
+            reserved.request = null
+            if (this.reservedCharacterAddition === reserved) this.reservedCharacterAddition = null
+        }
         this.pendingCharacterAddition = {
             characterId: request.characterId,
             token: reserved.token,
@@ -470,8 +566,23 @@ export class SaveCoordinator {
         this.pendingByteCount += bytes
     }
 
+    private armDebounce(): void {
+        if (this.debounceHandle !== undefined) return
+        this.debounceHandle = this.clock.setTimeout(() => {
+            this.debounceHandle = undefined
+            this.startBackgroundFlush('debounce')
+        }, SAVE_DEBOUNCE_MS)
+    }
+
     private startBackgroundFlush(reason: string): void {
-        void this.flushPendingData(reason).catch((error) => this.dependencies.onBackgroundError?.(error))
+        void this.flushPendingData(reason).catch((error) => this.reportBackgroundError(error))
+    }
+
+    private reportBackgroundError(error: unknown): void {
+        const message = error instanceof Error ? error.message : String(error)
+        if (message === this.lastBackgroundErrorMessage) return
+        this.lastBackgroundErrorMessage = message
+        this.dependencies.onBackgroundError?.(error)
     }
 
     private reportActivePromise(): void {
