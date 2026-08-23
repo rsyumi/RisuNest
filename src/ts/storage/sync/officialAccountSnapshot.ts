@@ -21,7 +21,11 @@ import type {
 } from '../persistentDataStore'
 import { decodeRisuSave } from '../risuSave'
 import { streamRisuSaveFromLease } from '../risuSaveStoreAdapter'
-import type { OfficialRevisionPublisher, PinnedPublication } from '../saveCoordinator'
+import {
+    canonicalJson,
+    type OfficialRevisionPublisher,
+    type PinnedPublication,
+} from '../saveCoordinator'
 import type { OfficialAssetLedger } from './officialAssetLedger'
 import { officialAccountSnapshotCapability } from './types'
 
@@ -134,18 +138,6 @@ function validateCandidate(value: unknown): asserts value is Database {
             throw new Error('Invalid character in official database snapshot')
         }
     }
-}
-
-function canonical(value: unknown): string {
-    if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
-    if (value && typeof value === 'object') {
-        return `{${Object.keys(value as object)
-            .sort()
-            .filter((key) => (value as Record<string, unknown>)[key] !== undefined)
-            .map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`)
-            .join(',')}}`
-    }
-    return JSON.stringify(value)
 }
 
 async function listCharacterSummaries(
@@ -272,7 +264,7 @@ class OfficialPinnedPublication implements PinnedPublication {
         for (const [key, pinned] of this.coldValues) {
             if (this.completedColdKeys.has(key)) continue
             const projected = replaceColdStoragePayloadResources(pinned.value, replacementRecord)
-            const digest = await fingerprintText(canonical(projected))
+            const digest = await fingerprintText(canonicalJson(projected))
             if (digest !== this.dependencies.ledger.coldDigest(key)) {
                 await this.dependencies.cold.writeRemote(key, projected)
                 this.dependencies.ledger.recordCold(key, digest)
@@ -335,7 +327,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 }
                 const pinnedRemote = safeStructuredClone(remote)
                 coldValues.set(key, { value: pinnedRemote })
-                this.dependencies.ledger.recordCold(key, await fingerprintText(canonical(pinnedRemote)))
+                this.dependencies.ledger.recordCold(key, await fingerprintText(canonicalJson(pinnedRemote)))
                 addColdCharacterAssets(assetKeys, remote)
             }
 
