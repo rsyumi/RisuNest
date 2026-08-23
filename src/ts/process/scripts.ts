@@ -13,7 +13,7 @@ import { pluginV2 } from "../plugins/plugins.svelte";
 import { runTrigger } from "./triggers";
 import { ByteBudgetLru } from "../util/byteBudgetLru";
 import { canExecuteRegexPlanInWorker, executeRegexPlanSync, getRegexExecutionPlan, type RegexExecutionPlanEntry, type RegexExecutionResult } from "./regexExecutionPlan";
-import { RegexExecutionTimeoutError, getSharedRegexWorkerClient } from "./regexWorkerClient";
+import { RegexExecutionTimeoutError, getSharedRegexWorkerClient, isRegexWorkerAvailable } from "./regexWorkerClient";
 
 const SCRIPT_CACHE_BUDGET = 8 * 1024 * 1024
 const SCRIPT_CACHE_ENTRY_LIMIT = 1000
@@ -23,6 +23,7 @@ export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 export interface ProcessScriptOptions {
     cache?: 'normal' | 'bypass'
     signal?: AbortSignal
+    /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
     regexWorker?: boolean
 }
 
@@ -315,7 +316,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
             }
         }
     }
-    else if(options.regexWorker && mode === 'editoutput' && canExecuteRegexPlanInWorker(plan, data)){
+    else if((options.regexWorker ?? isRegexWorkerAvailable()) && mode === 'editoutput' && canExecuteRegexPlanInWorker(plan, data)){
         let result: RegexExecutionResult
         try {
             result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })

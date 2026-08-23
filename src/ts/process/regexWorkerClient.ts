@@ -225,3 +225,7 @@ export function getSharedRegexWorkerClient(): RegexWorkerClient {
     sharedRegexWorkerClient ??= new RegexWorkerClient()
     return sharedRegexWorkerClient
 }
+
+export function isRegexWorkerAvailable(): boolean {
+    return typeof Worker !== 'undefined'
+}

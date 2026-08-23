@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => {
         cbsFirstError: null as Error | null,
         workerFailure: null as unknown,
         workerCalls: 0,
+        workerAvailable: false,
+        workerData: 'worker-output',
     }
     const charEmotionStore = {
         set(value: Record<string, [string, string, number][]>) {
@@ -75,10 +77,14 @@ vi.mock('./regexWorkerClient', async (importOriginal) => {
     const original = await importOriginal<typeof import('./regexWorkerClient')>()
     return {
         ...original,
+        isRegexWorkerAvailable: () => mocks.state.workerAvailable,
         getSharedRegexWorkerClient: () => ({
             execute: async () => {
                 mocks.state.workerCalls++
-                throw mocks.state.workerFailure
+                if(mocks.state.workerFailure !== null){
+                    throw mocks.state.workerFailure
+                }
+                return { data: mocks.state.workerData, errors: [] }
             },
         }),
     }
@@ -121,6 +127,8 @@ describe('processScriptFull result caching', () => {
         mocks.state.cbsFirstError = null
         mocks.state.workerFailure = null
         mocks.state.workerCalls = 0
+        mocks.state.workerAvailable = false
+        mocks.state.workerData = 'worker-output'
     })
 
     it('treats a cached empty string as a hit', async () => {
@@ -211,6 +219,52 @@ describe('processScriptFull result caching', () => {
             {},
             { cache: 'bypass', regexWorker: true },
         )).rejects.toBe(timeout)
+    })
+
+    it('offloads eligible editoutput plans without a caller flag when a Worker is available', async () => {
+        const character = makeCharacter([makeScript('cat', 'dog')])
+        mocks.state.workerAvailable = true
+
+        const first = await processScriptFull(character, 'a cat here', 'editoutput')
+        const second = await processScriptFull(character, 'a cat here', 'editoutput')
+
+        expect(mocks.state.workerCalls).toBe(1)
+        expect(first.data).toBe('worker-output')
+        expect(second.data).toBe('worker-output')
+    })
+
+    it('keeps the UI thread when the caller opts out of the Worker', async () => {
+        const character = makeCharacter([makeScript('cat', 'dog')])
+        mocks.state.workerAvailable = true
+
+        const result = await processScriptFull(
+            character,
+            'a cat here',
+            'editoutput',
+            -1,
+            {},
+            { cache: 'bypass', regexWorker: false },
+        )
+
+        expect(mocks.state.workerCalls).toBe(0)
+        expect(result.data).toBe('a dog here')
+    })
+
+    it('does not offload non-editoutput modes', async () => {
+        const character = makeCharacter([{ ...makeScript('cat', 'dog'), type: 'editinput' }])
+        mocks.state.workerAvailable = true
+
+        const result = await processScriptFull(
+            character,
+            'a cat here',
+            'editinput',
+            -1,
+            {},
+            { cache: 'bypass' },
+        )
+
+        expect(mocks.state.workerCalls).toBe(0)
+        expect(result.data).toBe('a dog here')
     })
 
     it('replaces sticky-flag matches at position 0 on repeated executions', async () => {
