@@ -29,7 +29,9 @@ describe('official account cold storage transport', () => {
         const directory = {
             getFileHandle: vi.fn(async (name: string) => ({
                 createWritable: async () => ({
-                    write: async (value: Uint8Array) => { files.set(name, value.slice()) },
+                    write: async (value: ArrayBuffer | Uint8Array) => {
+                        files.set(name, value instanceof Uint8Array ? value.slice() : new Uint8Array(value.slice(0)))
+                    },
                     close: async () => undefined,
                 }),
                 getFile: async () => ({
@@ -37,12 +39,13 @@ describe('official account cold storage transport', () => {
                 }),
             })),
         }
-        Object.defineProperty(navigator, 'storage', {
-            configurable: true,
-            value: { getDirectory: async () => directory },
-        })
         const value = { message: [{ role: 'user', data: 'local cold payload' }] }
-        const { getColdStorageItem, setLocalColdStorageItem } = await import('./coldstorage.svelte')
+        const { getColdStorageItem, setLocalColdStorageItem, configureLocalColdStorageRuntime } = await import('./coldstorage.svelte')
+        const { createLocalColdStorageRuntime } = await import('../storage/localColdStorageRuntime')
+        const { createLegacyBrowserOpfsColdPayloadStore } = await import('../storage/platformColdPayloadStore')
+        configureLocalColdStorageRuntime(createLocalColdStorageRuntime(
+            createLegacyBrowserOpfsColdPayloadStore(async () => directory as unknown as FileSystemDirectoryHandle),
+        ))
 
         await expect(setLocalColdStorageItem('cold-local', value)).resolves.toBe(true)
         await expect(getColdStorageItem('cold-local', { accountFallback: true })).resolves.toEqual(value)
