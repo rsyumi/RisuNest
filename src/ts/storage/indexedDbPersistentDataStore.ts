@@ -85,9 +85,12 @@ function cursorPage<T>(
     input: { limit: number; cursor?: string },
     predicate: (value: T) => boolean,
 ): Promise<{ items: T[]; nextCursor?: string }> {
+    if (!(input.limit > 0)) {
+        throw new RangeError('Query limit must be a positive number')
+    }
     const parsedOffset = input.cursor === undefined ? 0 : Number.parseInt(input.cursor, 10)
     const offset = Number.isFinite(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0
-    const limit = Math.max(0, input.limit)
+    const limit = input.limit
     return new Promise((resolve, reject) => {
         const items: T[] = []
         let matched = 0

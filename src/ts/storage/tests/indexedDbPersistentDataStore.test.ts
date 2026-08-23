@@ -180,6 +180,24 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         expect((await store.readRoot()).revision).toBe(0)
     })
 
+    it('rejects non-positive query limits instead of returning a stuck cursor', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `non-positive-limit-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+
+        await expect(
+            store.queryCharacters({ order: 'configured', trash: false, limit: 0 }),
+        ).rejects.toThrow(RangeError)
+        await expect(
+            store.queryConversations({ characterId: 'char-a', order: 'configured', limit: -1 }),
+        ).rejects.toThrow(RangeError)
+    })
+
     it('atomically adds one complete character with root and selected edits across reopen', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `atomic-character-addition-${databaseSequence++}`
