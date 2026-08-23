@@ -102,6 +102,7 @@ export async function loadData() {
             prepareDatabase: prepareDatabaseForPersistence,
         })
         setDatabase(local.database)
+        performance.mark('boot:local-data-ready')
         const accountStorage = new AccountStorage()
         const officialAdapter = new OfficialAccountSnapshotAdapter({
             store: runtime.store,
@@ -166,6 +167,7 @@ export async function loadData() {
                     : 'Official account pull skipped: local revisions were never published. Keeping local data until the next publish.')
             },
         })
+        performance.mark('boot:account-ready')
         disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners()
 
         if (isTauriDesktop) {
@@ -195,12 +197,14 @@ export async function loadData() {
             runtime.revision,
         )
 
+        performance.mark('boot:cold-storage-ready')
         LoadingStatusState.text = 'Loading Plugins...'
         try {
             await loadPlugins()
         } catch (error) {
             console.error(error)
         }
+        performance.mark('boot:plugins-ready')
         if (getDatabase().account) {
             LoadingStatusState.text = 'Checking Account Data...'
             try {
@@ -238,6 +242,7 @@ export async function loadData() {
             MobileGUI.set(true)
         }
         loadedStore.set(true)
+        performance.mark('boot:interactive')
         selectedCharID.set(-1)
         startObserveDom()
         registerModelDynamic()
