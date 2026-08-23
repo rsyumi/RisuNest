@@ -20,7 +20,9 @@ import {
 } from './officialAssetLedger'
 import {
     OfficialAccountSnapshotAdapter,
+    createOfficialAssociationMarkers,
     type OfficialAccountSnapshotDependencies,
+    type OfficialAssociationMarkers,
 } from './officialAccountSnapshot'
 
 vi.mock('../database.svelte', () => ({
@@ -121,6 +123,7 @@ function makeBlobStore(values: ReadonlyMap<string, Uint8Array>): BlobStore {
 
 interface HarnessOptions {
     database?: Database
+    accountId?: string
     blobs?: Map<string, Uint8Array>
     remoteAssets?: Map<string, Uint8Array>
     localCold?: Map<string, unknown>
@@ -128,6 +131,7 @@ interface HarnessOptions {
     databaseRead?: AccountReadResult
     prepareCandidate?: (database: Database) => Promise<Database>
     ledger?: OfficialAssetLedger
+    association?: OfficialAssociationMarkers
 }
 
 function memoryLedgerStorage(): LedgerStorage {
@@ -141,6 +145,9 @@ function memoryLedgerStorage(): LedgerStorage {
 
 async function makeHarness(options: HarnessOptions = {}) {
     const database = options.database ?? makeDatabase()
+    if (options.accountId) {
+        database.account = { id: options.accountId, token: 'token', data: {} }
+    }
     const store = new IndexedDbPersistentDataStore(
         `official-adapter-${crypto.randomUUID()}`,
         new IDBFactory(),
@@ -184,7 +191,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     const prepareCandidate = options.prepareCandidate ?? vi.fn(async (value: Database) => structuredClone(value))
     const resolveBlobs = vi.fn(async () => blobStore)
     const ledger = options.ledger ?? createOfficialAssetLedger(memoryLedgerStorage(), 'test-account')
-    const adapter = new OfficialAccountSnapshotAdapter({
+    const dependencies: OfficialAccountSnapshotDependencies = {
         store,
         resolveBlobs,
         account: { readItem, writeItem },
@@ -192,9 +199,12 @@ async function makeHarness(options: HarnessOptions = {}) {
         prepareCandidate,
         markPublished,
         ledger,
-    })
+        association: options.association,
+    }
+    const adapter = new OfficialAccountSnapshotAdapter(dependencies)
     return {
         adapter,
+        restartAdapter: () => new OfficialAccountSnapshotAdapter(dependencies),
         blobStore,
         cold,
         localColdValues: localCold,
@@ -307,6 +317,46 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(harness.writeItem.mock.calls.some(([key]) => key === coldOnlyKey)).toBe(true)
         const writtenCold = harness.cold.writeRemote.mock.calls.find(([key]) => key === 'cold-chat')![1] as any
         expect(writtenCold.character.additionalAssets[0][1]).toBe(`remote/${coldOnlyKey}`)
+    })
+
+    it('pins a legacy backslash asset key and uploads its normalized local payload', async () => {
+        const database = makeDatabase() as any
+        const legacyKey = 'assets\\windows.gif'
+        database.characters[0].additionalAssets = [['legacy', legacyKey, 'gif']]
+        const localBlobs = new Map(
+            resources(database)
+                .filter((key) => key !== legacyKey)
+                .map((key, index): [string, Uint8Array] => [key, Uint8Array.of(index + 1)]),
+        )
+        localBlobs.set('assets/windows.gif', Uint8Array.of(77))
+        const harness = await makeHarness({ database, blobs: localBlobs })
+
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        await publication.publish()
+
+        const upload = harness.writes.find((write) => write.key === legacyKey)
+        expect(upload?.bytes).toEqual(Uint8Array.of(77))
+        const databaseWrite = harness.writes.find((write) => write.key === databaseKey)
+        const projected = await decodeRisuSave(databaseWrite!.bytes!) as any
+        expect(projected.characters[0].additionalAssets[0][1]).toBe(`remote/${legacyKey}`)
+    })
+
+    it('publishes without a legacy backslash asset whose payload no longer exists anywhere', async () => {
+        const database = makeDatabase() as any
+        const legacyKey = 'assets\\gone.gif'
+        database.characters[0].additionalAssets = [['legacy', legacyKey, 'gif']]
+        const localBlobs = new Map(
+            resources(database)
+                .filter((key) => key !== legacyKey)
+                .map((key, index): [string, Uint8Array] => [key, Uint8Array.of(index + 1)]),
+        )
+        const harness = await makeHarness({ database, blobs: localBlobs })
+
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        await publication.publish()
+
+        expect(harness.writes.some((write) => write.key === legacyKey)).toBe(false)
+        expect(harness.writes.some((write) => write.key === databaseKey)).toBe(true)
     })
 
     it('leaves sentinel, URL, data URL, and Tauri path resources outside official asset I/O', async () => {
@@ -688,6 +738,29 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         expect(invalidReplace).not.toHaveBeenCalled()
     })
 
+    it('activates a remote snapshot that references a legacy backslash asset the account lacks', async () => {
+        const remote = makeDatabase() as any
+        remote.characters[0].additionalAssets = [['legacy', 'assets\\windows.gif', 'gif']]
+        const bytes = encodeRisuSaveLegacy(remote, 'compression')
+        const harness = await makeHarness({
+            databaseRead: { kind: 'value', bytes },
+            remoteAssets: new Map(
+                resources(remote)
+                    .filter((key) => key !== 'assets\\windows.gif')
+                    .map((key) => [key, Uint8Array.of(1)]),
+            ),
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+
+        const result = await harness.adapter.pull()
+
+        expect(result.kind).toBe('activated')
+        expect(harness.readItem).toHaveBeenCalledWith('assets\\windows.gif', expect.anything())
+    })
+
     it('checks abort immediately before the single replacement', async () => {
         const remote = makeDatabase()
         const bytes = encodeRisuSaveLegacy(remote, 'compression')
@@ -757,6 +830,122 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         await expect(adapter.pull()).rejects.toBeInstanceOf(RevisionConflictError)
         expect(replace).toHaveBeenCalledTimes(1)
         expect((await first.readRoot()).value.username).toBe('Concurrent wins')
+    })
+})
+
+describe('OfficialAccountSnapshotAdapter persisted association', () => {
+    const accountId = 'assoc-account'
+
+    async function publishHarness(options: HarnessOptions = {}) {
+        const association = options.association
+            ?? createOfficialAssociationMarkers(memoryLedgerStorage())
+        const harness = await makeHarness({ accountId, association, ...options })
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+        const publishedBytes = harness.writes.find((write) => write.key === databaseKey)!.bytes!
+        return { ...harness, association, publishedBytes }
+    }
+
+    it('pulls a changed remote normally after a restart with a clean published state', async () => {
+        const harness = await publishHarness({
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+        const remote = makeDatabase()
+        remote.account = { id: accountId, token: 'token', data: {} }
+        remote.username = 'Remote after restart'
+        const remoteBytes = encodeRisuSaveLegacy(remote, 'compression')
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: remoteBytes }
+            return { kind: 'value', bytes: Uint8Array.of(1) }
+        })
+        const restarted = harness.restartAdapter()
+
+        const result = await restarted.pull()
+
+        expect(result.kind).toBe('activated')
+        expect((await harness.store.readRoot()).value.username).toBe('Remote after restart')
+    })
+
+    it('treats an unchanged remote as a no-op pull after a restart', async () => {
+        const harness = await publishHarness()
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'not-modified', bytes: harness.publishedBytes }
+            return { kind: 'missing' }
+        })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+        const restarted = harness.restartAdapter()
+
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'unchanged' })
+        expect(replace).not.toHaveBeenCalled()
+    })
+
+    it('keeps unpublished local commits across a restart instead of restoring the published snapshot', async () => {
+        const harness = await publishHarness()
+        const root = (await harness.store.readRoot()).value
+        await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: harness.publishedBytes }
+            return { kind: 'missing' }
+        })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+        const restarted = harness.restartAdapter()
+
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'kept-local', conflict: false })
+        expect(replace).not.toHaveBeenCalled()
+        expect(harness.prepareCandidate).not.toHaveBeenCalled()
+        expect((await harness.store.readRoot()).value.username).toBe('Offline edit')
+    })
+
+    it('flags the conflict but still keeps unpublished local commits when the remote changed too', async () => {
+        const harness = await publishHarness()
+        const root = (await harness.store.readRoot()).value
+        await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        const remote = makeDatabase()
+        remote.username = 'Other device'
+        const remoteBytes = encodeRisuSaveLegacy(remote, 'compression')
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: remoteBytes }
+            return { kind: 'value', bytes: Uint8Array.of(1) }
+        })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+        const restarted = harness.restartAdapter()
+
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'kept-local', conflict: true })
+        expect(replace).not.toHaveBeenCalled()
+        expect((await harness.store.readRoot()).value.username).toBe('Offline edit')
+    })
+
+    it('publishes after a skipped pull and re-associates the new revision', async () => {
+        const harness = await publishHarness()
+        const root = (await harness.store.readRoot()).value
+        const later = await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: harness.publishedBytes }
+            return { kind: 'missing' }
+        })
+        const restarted = harness.restartAdapter()
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'kept-local', conflict: false })
+
+        await (await restarted.pin(later.revision)).publish()
+
+        const republished = harness.writes.filter((write) => write.key === databaseKey).at(-1)!.bytes!
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'not-modified', bytes: republished }
+            return { kind: 'missing' }
+        })
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'unchanged' })
+        await expect(harness.restartAdapter().pull()).resolves.toEqual({ kind: 'unchanged' })
     })
 })
 

@@ -132,6 +132,32 @@ describe('official account production bootstrap', () => {
         ])
     })
 
+    it('keeps the local working set when the pull preserves unpublished revisions', async () => {
+        const harness = makeHarness({
+            accountEnabled: true,
+            pull: async () => ({ kind: 'kept-local', conflict: true }),
+        })
+        harness.dependencies.onPullSkipped = vi.fn((input) => {
+            harness.events.push(`skip:${input.conflict}`)
+        })
+
+        const result = await initializeOfficialAccountBootstrap(harness.dependencies)
+
+        expect(result).toMatchObject({ database: harness.local, revision: 1, officialEnabled: true })
+        expect(harness.dependencies.store.materializeDatabase).not.toHaveBeenCalled()
+        expect(harness.adapter.pin).not.toHaveBeenCalled()
+        expect(harness.dependencies.onPullSkipped).toHaveBeenCalledWith({ conflict: true })
+        expect(harness.events).toEqual([
+            'publisher:off',
+            'asset:off',
+            'skip:true',
+            'publisher:on',
+            'asset:on',
+            'install',
+            'initialize',
+        ])
+    })
+
     it('publishes the local revision explicitly when a new account has no remote database', async () => {
         const harness = makeHarness({ syncRequested: true })
 

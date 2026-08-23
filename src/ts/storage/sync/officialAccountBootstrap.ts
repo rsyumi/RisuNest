@@ -36,6 +36,8 @@ export interface OfficialAccountBootstrapDependencies {
     installDatabase(database: Database): void
     initializeWorkingSet(database: Database): Promise<void>
     onRemoteError(error: unknown): void
+    /** Reports a boot pull skipped because local revisions were never published. */
+    onPullSkipped?(input: { conflict: boolean }): void
 }
 
 export interface OfficialAccountBootstrapResult {
@@ -108,6 +110,9 @@ export async function initializeOfficialAccountBootstrap(
                 const pulled = await dependencies.adapter.pull()
                 if (pulled.kind === 'activated') revision = pulled.revision
                 if (pulled.kind === 'missing') action = 'push'
+                if (pulled.kind === 'kept-local') {
+                    dependencies.onPullSkipped?.({ conflict: pulled.conflict })
+                }
             }
 
             if (action === 'push') {

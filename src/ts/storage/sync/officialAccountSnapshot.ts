@@ -1,3 +1,4 @@
+import { isLegacyBackupAssetKey } from '../../drive/backupAssets'
 import {
     isColdStorageBackupData,
     listCharacterResources,
@@ -21,7 +22,11 @@ import type {
 } from '../persistentDataStore'
 import { decodeRisuSave } from '../risuSave'
 import { streamRisuSaveFromLease } from '../risuSaveStoreAdapter'
-import type { OfficialRevisionPublisher, PinnedPublication } from '../saveCoordinator'
+import {
+    canonicalJson,
+    type OfficialRevisionPublisher,
+    type PinnedPublication,
+} from '../saveCoordinator'
 import type { OfficialAssetLedger } from './officialAssetLedger'
 import { officialAccountSnapshotCapability } from './types'
 
@@ -33,6 +38,16 @@ export interface OfficialColdStorageTransport {
     readLocal(key: string): Promise<unknown | null>
 }
 
+export interface OfficialAssociationRecord {
+    revision: DataRevision
+    databaseFingerprint: string
+}
+
+export interface OfficialAssociationMarkers {
+    load(accountId: string): OfficialAssociationRecord | null
+    save(accountId: string, record: OfficialAssociationRecord): void
+}
+
 export interface OfficialAccountSnapshotDependencies {
     store: PersistentDataStore
     resolveBlobs(): Promise<BlobStore>
@@ -41,11 +56,14 @@ export interface OfficialAccountSnapshotDependencies {
     prepareCandidate(database: Database): Promise<Database>
     markPublished(revision: DataRevision): Promise<void> | void
     ledger: OfficialAssetLedger
+    /** Persists the published association so a restart can tell local from remote progress. */
+    association?: OfficialAssociationMarkers
 }
 
 export type OfficialPullResult =
     | { kind: 'missing' }
     | { kind: 'unchanged' }
+    | { kind: 'kept-local'; conflict: boolean }
     | { kind: 'activated'; revision: DataRevision }
 
 interface PinnedColdValue {
@@ -54,17 +72,18 @@ interface PinnedColdValue {
 
 interface PinnedAsset {
     key: string
+    /** The local blob key holding this asset's payload. */
+    localKey: string
     /** The key the account already holds this asset under, or null when it must be uploaded. */
     publishedAs: string | null
 }
 
-interface AssociatedProjection {
-    revision: DataRevision
-    databaseFingerprint: string
+function isOfficialAssetKey(key: string): boolean {
+    return isLegacyBackupAssetKey(key)
 }
 
-function isOfficialAssetKey(key: string): boolean {
-    return key.startsWith('assets/') && key.length > 'assets/'.length
+function normalizeLegacyAssetKey(key: string): string {
+    return key.replace(/\\/g, '/')
 }
 
 function addOfficialAssets(target: Set<string>, values: readonly string[]): void {
@@ -112,11 +131,13 @@ function requireWriteSuccess(result: AccountWriteResult, key: string): string {
     return result.replacementKey
 }
 
-function requireRemoteValue(result: AccountReadResult, key: string): Uint8Array {
-    if (result.kind === 'missing') {
-        throw new Error(`Missing official asset: ${key}`)
+function requireRemoteAsset(result: AccountReadResult, key: string): boolean {
+    if (result.kind !== 'missing') return true
+    if (normalizeLegacyAssetKey(key) !== key) {
+        console.warn(`Skipping a legacy official asset without a payload: ${key}`)
+        return false
     }
-    return result.bytes
+    throw new Error(`Missing official asset: ${key}`)
 }
 
 function validateCandidate(value: unknown): asserts value is Database {
@@ -136,16 +157,39 @@ function validateCandidate(value: unknown): asserts value is Database {
     }
 }
 
-function canonical(value: unknown): string {
-    if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
-    if (value && typeof value === 'object') {
-        return `{${Object.keys(value as object)
-            .sort()
-            .filter((key) => (value as Record<string, unknown>)[key] !== undefined)
-            .map((key) => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`)
-            .join(',')}}`
+export function createOfficialAssociationMarkers(storage: {
+    getItem(key: string): string | null
+    setItem(key: string, value: string): void
+}): OfficialAssociationMarkers {
+    const storageKey = (accountId: string) => `officialAssociation:${accountId}`
+    return {
+        load(accountId) {
+            const raw = storage.getItem(storageKey(accountId))
+            if (!raw) return null
+            try {
+                const parsed = JSON.parse(raw) as Partial<OfficialAssociationRecord>
+                if (
+                    typeof parsed?.revision !== 'number'
+                    || typeof parsed?.databaseFingerprint !== 'string'
+                ) {
+                    return null
+                }
+                return {
+                    revision: parsed.revision,
+                    databaseFingerprint: parsed.databaseFingerprint,
+                }
+            } catch {
+                return null
+            }
+        },
+        save(accountId, record) {
+            try {
+                storage.setItem(storageKey(accountId), JSON.stringify(record))
+            } catch (error) {
+                console.error('Failed to persist the official sync association', error)
+            }
+        },
     }
-    return JSON.stringify(value)
 }
 
 async function listCharacterSummaries(
@@ -194,6 +238,7 @@ async function readCompleteCharacter(
 }
 
 async function collectPinnedReferences(lease: PersistentRevisionLease): Promise<{
+    accountId: string | undefined
     assets: string[]
     coldKeys: string[]
 }> {
@@ -207,6 +252,7 @@ async function collectPinnedReferences(lease: PersistentRevisionLease): Promise<
         for (const key of listColdDataKeysFromCharacter(character)) coldKeys.add(key)
     }
     return {
+        accountId: root.account?.id,
         assets: [...assets].sort(),
         coldKeys: [...coldKeys].sort(),
     }
@@ -260,7 +306,7 @@ class OfficialPinnedPublication implements PinnedPublication {
 
         for (const asset of this.assets) {
             if (this.replacements.has(asset.key)) continue
-            const bytes = await this.blobs.read(asset.key)
+            const bytes = await this.blobs.read(asset.localKey)
             if (!bytes) throw new Error(`Missing pinned asset payload: ${asset.key}`)
             const result = await this.dependencies.account.writeItem(asset.key, bytes)
             const replacementKey = requireWriteSuccess(result, asset.key)
@@ -272,7 +318,7 @@ class OfficialPinnedPublication implements PinnedPublication {
         for (const [key, pinned] of this.coldValues) {
             if (this.completedColdKeys.has(key)) continue
             const projected = replaceColdStoragePayloadResources(pinned.value, replacementRecord)
-            const digest = await fingerprintText(canonical(projected))
+            const digest = await fingerprintText(canonicalJson(projected))
             if (digest !== this.dependencies.ledger.coldDigest(key)) {
                 await this.dependencies.cold.writeRemote(key, projected)
                 this.dependencies.ledger.recordCold(key, digest)
@@ -307,9 +353,23 @@ class OfficialPinnedPublication implements PinnedPublication {
 
 export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher {
     readonly capability = officialAccountSnapshotCapability
-    private associatedProjection: AssociatedProjection | null = null
+    private associatedProjection: OfficialAssociationRecord | null = null
 
     constructor(private readonly dependencies: OfficialAccountSnapshotDependencies) {}
+
+    private resolveAssociation(accountId: string | undefined): OfficialAssociationRecord | null {
+        if (this.associatedProjection) return this.associatedProjection
+        if (!accountId) return null
+        return this.dependencies.association?.load(accountId) ?? null
+    }
+
+    private rememberAssociation(
+        accountId: string | undefined,
+        record: OfficialAssociationRecord,
+    ): void {
+        this.associatedProjection = record
+        if (accountId) this.dependencies.association?.save(accountId, record)
+    }
 
     async pin(revision: DataRevision): Promise<PinnedPublication> {
         const lease = await this.dependencies.store.acquireRevision(revision)
@@ -335,7 +395,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 }
                 const pinnedRemote = safeStructuredClone(remote)
                 coldValues.set(key, { value: pinnedRemote })
-                this.dependencies.ledger.recordCold(key, await fingerprintText(canonical(pinnedRemote)))
+                this.dependencies.ledger.recordCold(key, await fingerprintText(canonicalJson(pinnedRemote)))
                 addColdCharacterAssets(assetKeys, remote)
             }
 
@@ -343,16 +403,23 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             for (const key of [...assetKeys].sort()) {
                 const publishedAs = this.dependencies.ledger.publishedAs(key)
                 if (publishedAs !== null) {
-                    assets.push({ key, publishedAs })
+                    assets.push({ key, localKey: key, publishedAs })
                     continue
                 }
                 if (await blobs.stat(key)) {
-                    assets.push({ key, publishedAs: null })
+                    assets.push({ key, localKey: key, publishedAs: null })
                     continue
                 }
-                requireRemoteValue(await this.dependencies.account.readItem(key), key)
+                const normalized = normalizeLegacyAssetKey(key)
+                if (normalized !== key && await blobs.stat(normalized)) {
+                    assets.push({ key, localKey: normalized, publishedAs: null })
+                    continue
+                }
+                if (!requireRemoteAsset(await this.dependencies.account.readItem(key), key)) {
+                    continue
+                }
                 this.dependencies.ledger.record(key, key)
-                assets.push({ key, publishedAs: key })
+                assets.push({ key, localKey: key, publishedAs: key })
             }
 
             return new OfficialPinnedPublication(
@@ -363,10 +430,10 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 coldValues,
                 this.dependencies,
                 (publishedRevision, databaseFingerprint) => {
-                    this.associatedProjection = {
+                    this.rememberAssociation(references.accountId, {
                         revision: publishedRevision,
                         databaseFingerprint,
-                    }
+                    })
                 },
             )
         } catch (error) {
@@ -377,18 +444,22 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
 
     async pull(signal?: AbortSignal): Promise<OfficialPullResult> {
         throwIfAborted(signal)
-        const expectedRevision = (await this.dependencies.store.readRoot()).revision
+        const localRoot = await this.dependencies.store.readRoot()
+        const expectedRevision = localRoot.revision
+        const association = this.resolveAssociation(localRoot.value.account?.id)
         const result = await this.dependencies.account.readItem(databaseKey, { signal })
         throwIfAborted(signal)
         if (result.kind === 'missing') return { kind: 'missing' }
         const databaseFingerprint = await fingerprintDatabase(result.bytes)
         throwIfAborted(signal)
-        if (
-            result.kind === 'not-modified'
-            && this.associatedProjection?.revision === expectedRevision
-            && this.associatedProjection.databaseFingerprint === databaseFingerprint
-        ) {
-            return { kind: 'unchanged' }
+        if (association) {
+            const remoteChanged = association.databaseFingerprint !== databaseFingerprint
+            if (!remoteChanged && association.revision === expectedRevision) {
+                return { kind: 'unchanged' }
+            }
+            if (expectedRevision > association.revision) {
+                return { kind: 'kept-local', conflict: remoteChanged }
+            }
         }
 
         throwIfAborted(signal)
@@ -415,7 +486,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         }
         for (const key of [...assetKeys].sort()) {
             throwIfAborted(signal)
-            requireRemoteValue(await this.dependencies.account.readItem(key, { signal }), key)
+            requireRemoteAsset(await this.dependencies.account.readItem(key, { signal }), key)
         }
 
         throwIfAborted(signal)
@@ -423,10 +494,10 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             candidate,
             expectedRevision,
         )
-        this.associatedProjection = {
+        this.rememberAssociation(candidate.account?.id ?? localRoot.value.account?.id, {
             revision: activated.revision,
             databaseFingerprint,
-        }
+        })
         return { kind: 'activated', revision: activated.revision }
     }
 }

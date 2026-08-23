@@ -57,16 +57,16 @@ import {
 } from "./storage/persistentDataRuntime.svelte";
 import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
 import { resolveBlobStore } from "./storage/platformBlobStore";
-import { OfficialAccountSnapshotAdapter } from "./storage/sync/officialAccountSnapshot";
+import {
+    OfficialAccountSnapshotAdapter,
+    createOfficialAssociationMarkers,
+} from "./storage/sync/officialAccountSnapshot";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
 import {
     initializeOfficialAccountBootstrap,
     publishOfficialRevisionIfChanged,
 } from "./storage/sync/officialAccountBootstrap";
-import {
-    createOfficialAssetLedger,
-    createUnrecordedOfficialAssetLedger,
-} from "./storage/sync/officialAssetLedger";
+import { createAccountScopedOfficialAssetLedger } from "./storage/sync/officialAssetLedger";
 import {
     configureOfficialAccountAssetReader,
     createStructuredAccountAssetReader,
@@ -102,7 +102,6 @@ export async function loadData() {
             prepareDatabase: prepareDatabaseForPersistence,
         })
         setDatabase(local.database)
-        const accountId = local.database.account?.id
         const accountStorage = new AccountStorage()
         const officialAdapter = new OfficialAccountSnapshotAdapter({
             store: runtime.store,
@@ -119,9 +118,11 @@ export async function loadData() {
             },
             prepareCandidate: prepareDatabaseForPersistence,
             markPublished: () => undefined,
-            ledger: accountId
-                ? createOfficialAssetLedger(localStorage, accountId)
-                : createUnrecordedOfficialAssetLedger(),
+            ledger: createAccountScopedOfficialAssetLedger(
+                localStorage,
+                () => getDatabase().account?.id,
+            ),
+            association: createOfficialAssociationMarkers(localStorage),
         })
         const accountBootstrap = await initializeOfficialAccountBootstrap({
             local,
@@ -158,6 +159,11 @@ export async function loadData() {
             onRemoteError: (error) => {
                 console.error(error)
                 alertError(error instanceof Error ? error : String(error))
+            },
+            onPullSkipped: ({ conflict }) => {
+                console.warn(conflict
+                    ? 'Official account pull skipped: local revisions were never published and the remote save also changed. Keeping local data; the next publish overwrites the remote save.'
+                    : 'Official account pull skipped: local revisions were never published. Keeping local data until the next publish.')
             },
         })
         disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners()
@@ -333,6 +339,7 @@ async function cleanChunks(options:{
     }
 
     const uncleanable = new Set(await getUncleanables(db))
+    const blobStore = await resolveBlobStore()
     if (isTauri) {
         const assets = await readDir('assets', { baseDir: BaseDirectory.AppData })
         console.log(assets)
@@ -340,7 +347,7 @@ async function cleanChunks(options:{
             try {
                 const n = getBasename(asset.name)
                 if (!uncleanable.has(n)) {
-                    await remove('assets/' + asset.name, { baseDir: BaseDirectory.AppData })
+                    await blobStore.remove('assets/' + asset.name)
                 }
             } catch (error) {
                 console.log('error', asset.name)
@@ -410,7 +417,7 @@ async function cleanChunks(options:{
             if (asset.startsWith('assets/')) {
                 const n = getBasename(asset)
                 if(!uncleanable.has(n)) {
-                    await forageStorage.removeItem(asset)
+                    await blobStore.remove(asset)
                 }
             }
             else if (asset.endsWith('.meta')){
