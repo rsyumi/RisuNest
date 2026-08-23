@@ -63,6 +63,7 @@ import {
     installPersistentSaveNotifications,
 } from "./storage/persistentSaveNotifications";
 import { configureBlobStoreStorageProvider, readBlobForFacade, resolveBlobStore } from "./storage/platformBlobStore";
+import { inferBlobMime } from "./storage/blobStore";
 import { selectAssetSourceRoute } from "./storage/assetSourceRoute";
 import { readActiveAsset, storeActiveAsset } from "./storage/accountAssetAccess";
 
@@ -140,11 +141,51 @@ let fileCache: {
     res: []
 }
 
-const browserAssetByteCache = new ByteBudgetLru<string, Uint8Array>(
+const browserAssetDataUrlCache = new ByteBudgetLru<string, string>(
     16 * 1024 * 1024,
-    (_loc, data) => data.byteLength,
+    (_loc, dataUrl) => dataUrl.length,
 )
-const pendingBrowserAssetReads = new Map<string, Promise<Uint8Array>>()
+const pendingBrowserAssetReads = new Map<string, Promise<string | null>>()
+const tauriAssetUrlCache = new Map<string, string>()
+
+function buildAssetDataUrl(mime: string | undefined, data: Uint8Array): string {
+    return `data:${mime || 'application/octet-stream'};base64,${Buffer.from(data).toString('base64')}`
+}
+
+/** Resolves a local blob to a data URL, or null when the local store misses it. */
+async function readBrowserAssetDataUrl(loc: string): Promise<string | null> {
+    const cached = browserAssetDataUrlCache.get(loc)
+    if (cached !== undefined) return cached
+    let pending = pendingBrowserAssetReads.get(loc)
+    if (!pending) {
+        pending = (async () => {
+            const blobStore = loc.startsWith('assets/') ? await resolveBlobStore() : null
+            const data = blobStore
+                ? await blobStore.read(loc)
+                : await forageStorage.getItem(loc) as unknown as Uint8Array
+            if (!data) return null
+            const metadata = await blobStore?.stat(loc)
+            const dataUrl = buildAssetDataUrl(metadata?.mime, data)
+            browserAssetDataUrlCache.set(loc, dataUrl)
+            return dataUrl
+        })()
+        pendingBrowserAssetReads.set(loc, pending)
+        const cleanup = () => {
+            pendingBrowserAssetReads.delete(loc)
+        }
+        void pending.then(cleanup, cleanup)
+    }
+    return await pending
+}
+
+/** Resolves a Tauri asset URL once per key; the URL only depends on the key. */
+async function resolveTauriAssetUrl(loc: string): Promise<string | null> {
+    const cached = tauriAssetUrlCache.get(loc)
+    if (cached !== undefined) return cached
+    const url = await (await resolveBlobStore()).resolveUrl(loc)
+    if (url) tauriAssetUrlCache.set(loc, url)
+    return url
+}
 
 let checkedPaths: string[] = []
 
@@ -158,10 +199,22 @@ export async function getFileSrc(loc: string) {
     await forageStorage.Init()
     const route = selectAssetSourceRoute(loc, isTauri, forageStorage.isAccount)
     if (route === 'account') {
+        // Freshly imported assets only exist locally until the next publish
+        // uploads them, so the local blob store wins over the hub URL.
+        if (loc.startsWith('assets/')) {
+            try {
+                const local = isTauri
+                    ? await resolveTauriAssetUrl(loc)
+                    : await readBrowserAssetDataUrl(loc)
+                if (local) return local
+            } catch (error) {
+                console.error(error)
+            }
+        }
         return hubURL + `/rs/` + loc
     }
     if (route === 'tauri-asset') {
-        const url = await (await resolveBlobStore()).resolveUrl(loc)
+        const url = await resolveTauriAssetUrl(loc)
         if (!url) console.error(new Error(`Missing asset: ${loc}`))
         return url ?? ''
     }
@@ -212,25 +265,9 @@ export async function getFileSrc(loc: string) {
             }
         }
         else {
-            let data = browserAssetByteCache.get(loc)
-            if (!data) {
-                let pending = pendingBrowserAssetReads.get(loc)
-                if (!pending) {
-                    pending = readLocalFile().then((value) => {
-                        if (!value) throw new Error(`Missing asset: ${loc}`)
-                        return value
-                    })
-                    pendingBrowserAssetReads.set(loc, pending)
-                    const cleanup = () => {
-                        pendingBrowserAssetReads.delete(loc)
-                    }
-                    void pending.then(cleanup, cleanup)
-                }
-                data = await pending
-                browserAssetByteCache.set(loc, data)
-            }
-            const metadata = await blobStore?.stat(loc)
-            return `data:${metadata?.mime ?? 'application/octet-stream'};base64,${Buffer.from(data).toString('base64')}`
+            const dataUrl = await readBrowserAssetDataUrl(loc)
+            if (dataUrl === null) throw new Error(`Missing asset: ${loc}`)
+            return dataUrl
         }
     } catch (error) {
         console.error(error)
@@ -301,6 +338,11 @@ export async function saveAsset(data: Uint8Array, customId: string = '', fileNam
         name: fileName || `${id}.${fileExtension}`,
         ext: fileExtension,
     })
+    tauriAssetUrlCache.delete(form)
+    pendingBrowserAssetReads.delete(form)
+    if (browserAssetDataUrlCache.get(form) !== undefined) {
+        browserAssetDataUrlCache.set(form, buildAssetDataUrl(inferBlobMime('', fileExtension), data))
+    }
     return form
 }
 
