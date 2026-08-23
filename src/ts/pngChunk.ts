@@ -86,7 +86,7 @@ class StreamChunkWriter{
             crc / 0x100 % 0x100,
             crc % 0x100
         ]))
-        this.writer.close()
+        await this.writer.close()
     }
 }
 
