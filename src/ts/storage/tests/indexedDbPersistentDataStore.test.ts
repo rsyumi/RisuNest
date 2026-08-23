@@ -151,6 +151,22 @@ persistentDataStoreContract(async () => {
 })
 
 describe('IndexedDbPersistentDataStore I/O shape', () => {
+    it('shares a single in-flight open across concurrent callers', async () => {
+        const indexedDB = new IDBFactory()
+        const openSpy = vi.spyOn(indexedDB, 'open')
+        const store = new IndexedDbPersistentDataStore(
+            `concurrent-open-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+
+        await Promise.all([store.open(), store.open()])
+
+        expect(openSpy).toHaveBeenCalledTimes(1)
+        openSpy.mockRestore()
+        expect((await store.readRoot()).revision).toBe(0)
+    })
+
     it('atomically adds one complete character with root and selected edits across reopen', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `atomic-character-addition-${databaseSequence++}`

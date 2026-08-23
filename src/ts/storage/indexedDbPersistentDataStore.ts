@@ -120,6 +120,7 @@ function cursorPage<T>(
 
 export class IndexedDbPersistentDataStore implements PersistentDataStore {
     private database?: IDBDatabase
+    private openPromise?: Promise<void>
 
     constructor(
         private readonly databaseName: string,
@@ -132,7 +133,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     async open(): Promise<void> {
         if (this.database) return
+        this.openPromise ??= this.openDatabase().finally(() => {
+            this.openPromise = undefined
+        })
+        return this.openPromise
+    }
 
+    private async openDatabase(): Promise<void> {
         const request = this.indexedDbFactory.open(this.databaseName, DATABASE_VERSION)
         // Another document holding the previous version would otherwise stall boot forever.
         request.onblocked = () => this.onBlockedUpgrade()
