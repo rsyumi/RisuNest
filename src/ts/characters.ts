@@ -912,7 +912,7 @@ export async function changeChar(index: number, arg:{
     reseter();
     try {
         const coldStorageKey = DBState.db.characters.find((character) => character.chaId === chaId)?.coldstorage
-        const activated = await activateCharacter(chaId, coldStorageKey ? {
+        const activationOptions = coldStorageKey ? {
             async prepare() {
                 const coldData = await getColdStorageItem(coldStorageKey)
                 if(!coldData?.character || coldData.character.chaId !== chaId){
@@ -924,7 +924,9 @@ export async function changeChar(index: number, arg:{
                 candidate.characters[candidateIndex] = coldData.character
                 return { database: candidate, reason: 'cold-character-restore' }
             },
-        } : undefined)
+        } : undefined
+        const activated = await activateCharacter(chaId, activationOptions)
+            || await activateCharacter(chaId, activationOptions)
         if(!activated) return false
         const selectedIndex = DBState.db.characters.findIndex((character) => character.chaId === chaId)
         if(selectedIndex === -1) return false
@@ -937,4 +939,50 @@ export async function changeChar(index: number, arg:{
         alertError(error)
         return false
     }
+}
+
+export async function addNewChat(character: character | groupChat): Promise<boolean> {
+    const chats = character.chats
+    const newChat: Chat = {
+        message: [],
+        note: '',
+        name: `New Chat ${chats.length + 1}`,
+        localLore: [],
+        fmIndex: -1,
+        id: uuidv4(),
+    }
+    if(character.type === 'group'){
+        for(const memberId of character.characters){
+            newChat.message.push({
+                saying: memberId,
+                role: 'char',
+                data: findCharacterbyId(memberId).firstMessage,
+            })
+        }
+    }
+    chats.unshift(newChat)
+    character.chats = chats
+    return await changeChatTo(newChat.id)
+}
+
+export async function removeChat(character: character | groupChat, chatId: string): Promise<boolean> {
+    const chats = character.chats
+    const removeIndex = chats.findIndex((chat) => chat.id === chatId)
+    if(removeIndex === -1) return false
+    const selectedChatId = chats[character.chatPage]?.id
+    const survivingId = selectedChatId === chatId
+        ? chats.find((candidate) => candidate.id !== chatId)?.id
+        : selectedChatId
+    chats.splice(removeIndex, 1)
+    character.chats = chats
+    const survivingIndex = survivingId
+        ? chats.findIndex((chat) => chat.id === survivingId)
+        : -1
+    character.chatPage = survivingIndex !== -1
+        ? survivingIndex
+        : Math.max(0, Math.min(character.chatPage, chats.length - 1))
+    if(survivingId && !(await changeChatTo(survivingId))){
+        await changeChatTo(survivingId)
+    }
+    return true
 }

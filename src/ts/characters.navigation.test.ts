@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
     alertConfirm: vi.fn(async () => true),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
     alertError: vi.fn(),
+    changeChatTo: vi.fn(async (_idOrIndex?: string | number) => true),
+    findCharacterbyId: vi.fn(),
 }))
 
 vi.mock('uuid', () => ({
@@ -42,7 +44,7 @@ vi.mock('./alert', async () => {
 vi.mock('../lang', () => ({ language: { errors: {} } }))
 vi.mock('./util', () => ({
     checkNullish: (value: unknown) => value === null || value === undefined,
-    findCharacterbyId: vi.fn(),
+    findCharacterbyId: mocks.findCharacterbyId,
     findCharacterIndexbyId: vi.fn(),
     getUserName: vi.fn(),
     selectMultipleFile: vi.fn(),
@@ -60,7 +62,7 @@ vi.mock('./stores.svelte', async () => {
 })
 vi.mock('./globalApi.svelte', () => ({
     AppendableBuffer: class {},
-    changeChatTo: vi.fn(),
+    changeChatTo: mocks.changeChatTo,
     checkCharOrder: vi.fn(),
     downloadFile: vi.fn(),
     getFileSrc: vi.fn(),
@@ -84,12 +86,14 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
 
 import {
     addCharacter,
+    addNewChat,
     changeChar,
     characterFormatUpdate,
     createBlankChar,
     createNewCharacter,
     createNewGroup,
     removeChar,
+    removeChat,
 } from './characters'
 import { MobileGUIStack } from './stores.svelte'
 
@@ -267,5 +271,136 @@ describe('runtime chat identity', () => {
         const formatted = characterFormatUpdate(character)
 
         expect(formatted.chats[0].id).toBeTruthy()
+    })
+})
+
+describe('character activation retry', () => {
+    beforeEach(() => {
+        mocks.database.characters = []
+        mocks.nextId = 0
+        vi.clearAllMocks()
+        mocks.activateCharacter.mockResolvedValue(true)
+    })
+
+    it('retries activation once when the first attempt fails', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        mocks.activateCharacter.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+
+        const changed = await changeChar(0)
+
+        expect(changed).toBe(true)
+        expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
+    })
+
+    it('gives up after exactly one retry', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        mocks.activateCharacter.mockResolvedValue(false)
+
+        const changed = await changeChar(0)
+
+        expect(changed).toBe(false)
+        expect(mocks.activateCharacter).toHaveBeenCalledTimes(2)
+    })
+})
+
+describe('chat list operations', () => {
+    const buildCharacter = () => {
+        const character = createBlankChar()
+        character.chats = [
+            { message: [], note: '', name: 'Chat A', localLore: [], id: 'chat-a' },
+            { message: [], note: '', name: 'Chat B', localLore: [], id: 'chat-b' },
+            { message: [], note: '', name: 'Chat C', localLore: [], id: 'chat-c' },
+        ]
+        character.chatPage = 1
+        return character
+    }
+
+    beforeEach(() => {
+        mocks.database.characters = []
+        mocks.nextId = 0
+        vi.clearAllMocks()
+        mocks.changeChatTo.mockResolvedValue(true)
+    })
+
+    it('keeps the selected chat when another chat is removed', async () => {
+        const character = buildCharacter()
+
+        const removed = await removeChat(character, 'chat-c')
+
+        expect(removed).toBe(true)
+        expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-a', 'chat-b'])
+        expect(character.chatPage).toBe(1)
+        expect(mocks.changeChatTo).toHaveBeenCalledWith('chat-b')
+    })
+
+    it('moves to a surviving chat when the selected chat is removed', async () => {
+        const character = buildCharacter()
+
+        await removeChat(character, 'chat-b')
+
+        expect(character.chats.map((chat: any) => chat.id)).toEqual(['chat-a', 'chat-c'])
+        expect(character.chatPage).toBe(0)
+        expect(mocks.changeChatTo).toHaveBeenCalledWith('chat-a')
+    })
+
+    it('repairs the chat page synchronously even when activation fails twice', async () => {
+        const character = buildCharacter()
+        character.chatPage = 2
+        mocks.changeChatTo.mockResolvedValue(false)
+
+        await removeChat(character, 'chat-c')
+
+        expect(character.chats).toHaveLength(2)
+        expect(character.chatPage).toBeLessThan(character.chats.length)
+        expect(character.chats[character.chatPage]).toBeTruthy()
+        expect(mocks.changeChatTo).toHaveBeenCalledTimes(2)
+    })
+
+    it('retries activation once before settling for the repaired page', async () => {
+        const character = buildCharacter()
+        mocks.changeChatTo.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+
+        await removeChat(character, 'chat-b')
+
+        expect(mocks.changeChatTo).toHaveBeenCalledTimes(2)
+        expect(mocks.changeChatTo).toHaveBeenNthCalledWith(2, 'chat-a')
+    })
+
+    it('does nothing for an unknown chat id', async () => {
+        const character = buildCharacter()
+
+        const removed = await removeChat(character, 'missing')
+
+        expect(removed).toBe(false)
+        expect(character.chats).toHaveLength(3)
+        expect(character.chatPage).toBe(1)
+        expect(mocks.changeChatTo).not.toHaveBeenCalled()
+    })
+
+    it('adds a new chat in front and activates it', async () => {
+        const character = buildCharacter()
+
+        const added = await addNewChat(character)
+
+        expect(added).toBe(true)
+        expect(character.chats).toHaveLength(4)
+        expect(character.chats[0].name).toBe('New Chat 4')
+        expect(character.chats[0].id).toBeTruthy()
+        expect(mocks.changeChatTo).toHaveBeenCalledWith(character.chats[0].id)
+    })
+
+    it('seeds group chats with member first messages', async () => {
+        const character = buildCharacter() as any
+        character.type = 'group'
+        character.characters = ['member-1']
+        mocks.findCharacterbyId.mockReturnValue({ firstMessage: 'hello there' })
+
+        await addNewChat(character)
+
+        expect(character.chats[0].message).toEqual([
+            { saying: 'member-1', role: 'char', data: 'hello there' },
+        ])
     })
 })
