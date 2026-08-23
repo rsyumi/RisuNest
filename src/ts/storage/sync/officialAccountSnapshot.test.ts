@@ -20,7 +20,9 @@ import {
 } from './officialAssetLedger'
 import {
     OfficialAccountSnapshotAdapter,
+    createOfficialAssociationMarkers,
     type OfficialAccountSnapshotDependencies,
+    type OfficialAssociationMarkers,
 } from './officialAccountSnapshot'
 
 vi.mock('../database.svelte', () => ({
@@ -121,6 +123,7 @@ function makeBlobStore(values: ReadonlyMap<string, Uint8Array>): BlobStore {
 
 interface HarnessOptions {
     database?: Database
+    accountId?: string
     blobs?: Map<string, Uint8Array>
     remoteAssets?: Map<string, Uint8Array>
     localCold?: Map<string, unknown>
@@ -128,6 +131,7 @@ interface HarnessOptions {
     databaseRead?: AccountReadResult
     prepareCandidate?: (database: Database) => Promise<Database>
     ledger?: OfficialAssetLedger
+    association?: OfficialAssociationMarkers
 }
 
 function memoryLedgerStorage(): LedgerStorage {
@@ -141,6 +145,9 @@ function memoryLedgerStorage(): LedgerStorage {
 
 async function makeHarness(options: HarnessOptions = {}) {
     const database = options.database ?? makeDatabase()
+    if (options.accountId) {
+        database.account = { id: options.accountId, token: 'token', data: {} }
+    }
     const store = new IndexedDbPersistentDataStore(
         `official-adapter-${crypto.randomUUID()}`,
         new IDBFactory(),
@@ -184,7 +191,7 @@ async function makeHarness(options: HarnessOptions = {}) {
     const prepareCandidate = options.prepareCandidate ?? vi.fn(async (value: Database) => structuredClone(value))
     const resolveBlobs = vi.fn(async () => blobStore)
     const ledger = options.ledger ?? createOfficialAssetLedger(memoryLedgerStorage(), 'test-account')
-    const adapter = new OfficialAccountSnapshotAdapter({
+    const dependencies: OfficialAccountSnapshotDependencies = {
         store,
         resolveBlobs,
         account: { readItem, writeItem },
@@ -192,9 +199,12 @@ async function makeHarness(options: HarnessOptions = {}) {
         prepareCandidate,
         markPublished,
         ledger,
-    })
+        association: options.association,
+    }
+    const adapter = new OfficialAccountSnapshotAdapter(dependencies)
     return {
         adapter,
+        restartAdapter: () => new OfficialAccountSnapshotAdapter(dependencies),
         blobStore,
         cold,
         localColdValues: localCold,
@@ -820,6 +830,122 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         await expect(adapter.pull()).rejects.toBeInstanceOf(RevisionConflictError)
         expect(replace).toHaveBeenCalledTimes(1)
         expect((await first.readRoot()).value.username).toBe('Concurrent wins')
+    })
+})
+
+describe('OfficialAccountSnapshotAdapter persisted association', () => {
+    const accountId = 'assoc-account'
+
+    async function publishHarness(options: HarnessOptions = {}) {
+        const association = options.association
+            ?? createOfficialAssociationMarkers(memoryLedgerStorage())
+        const harness = await makeHarness({ accountId, association, ...options })
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+        const publishedBytes = harness.writes.find((write) => write.key === databaseKey)!.bytes!
+        return { ...harness, association, publishedBytes }
+    }
+
+    it('pulls a changed remote normally after a restart with a clean published state', async () => {
+        const harness = await publishHarness({
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+        const remote = makeDatabase()
+        remote.account = { id: accountId, token: 'token', data: {} }
+        remote.username = 'Remote after restart'
+        const remoteBytes = encodeRisuSaveLegacy(remote, 'compression')
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: remoteBytes }
+            return { kind: 'value', bytes: Uint8Array.of(1) }
+        })
+        const restarted = harness.restartAdapter()
+
+        const result = await restarted.pull()
+
+        expect(result.kind).toBe('activated')
+        expect((await harness.store.readRoot()).value.username).toBe('Remote after restart')
+    })
+
+    it('treats an unchanged remote as a no-op pull after a restart', async () => {
+        const harness = await publishHarness()
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'not-modified', bytes: harness.publishedBytes }
+            return { kind: 'missing' }
+        })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+        const restarted = harness.restartAdapter()
+
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'unchanged' })
+        expect(replace).not.toHaveBeenCalled()
+    })
+
+    it('keeps unpublished local commits across a restart instead of restoring the published snapshot', async () => {
+        const harness = await publishHarness()
+        const root = (await harness.store.readRoot()).value
+        await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: harness.publishedBytes }
+            return { kind: 'missing' }
+        })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+        const restarted = harness.restartAdapter()
+
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'kept-local', conflict: false })
+        expect(replace).not.toHaveBeenCalled()
+        expect(harness.prepareCandidate).not.toHaveBeenCalled()
+        expect((await harness.store.readRoot()).value.username).toBe('Offline edit')
+    })
+
+    it('flags the conflict but still keeps unpublished local commits when the remote changed too', async () => {
+        const harness = await publishHarness()
+        const root = (await harness.store.readRoot()).value
+        await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        const remote = makeDatabase()
+        remote.username = 'Other device'
+        const remoteBytes = encodeRisuSaveLegacy(remote, 'compression')
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: remoteBytes }
+            return { kind: 'value', bytes: Uint8Array.of(1) }
+        })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+        const restarted = harness.restartAdapter()
+
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'kept-local', conflict: true })
+        expect(replace).not.toHaveBeenCalled()
+        expect((await harness.store.readRoot()).value.username).toBe('Offline edit')
+    })
+
+    it('publishes after a skipped pull and re-associates the new revision', async () => {
+        const harness = await publishHarness()
+        const root = (await harness.store.readRoot()).value
+        const later = await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: harness.publishedBytes }
+            return { kind: 'missing' }
+        })
+        const restarted = harness.restartAdapter()
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'kept-local', conflict: false })
+
+        await (await restarted.pin(later.revision)).publish()
+
+        const republished = harness.writes.filter((write) => write.key === databaseKey).at(-1)!.bytes!
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'not-modified', bytes: republished }
+            return { kind: 'missing' }
+        })
+        await expect(restarted.pull()).resolves.toEqual({ kind: 'unchanged' })
+        await expect(harness.restartAdapter().pull()).resolves.toEqual({ kind: 'unchanged' })
     })
 })
 

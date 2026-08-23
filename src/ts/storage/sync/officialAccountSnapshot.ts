@@ -38,6 +38,16 @@ export interface OfficialColdStorageTransport {
     readLocal(key: string): Promise<unknown | null>
 }
 
+export interface OfficialAssociationRecord {
+    revision: DataRevision
+    databaseFingerprint: string
+}
+
+export interface OfficialAssociationMarkers {
+    load(accountId: string): OfficialAssociationRecord | null
+    save(accountId: string, record: OfficialAssociationRecord): void
+}
+
 export interface OfficialAccountSnapshotDependencies {
     store: PersistentDataStore
     resolveBlobs(): Promise<BlobStore>
@@ -46,11 +56,14 @@ export interface OfficialAccountSnapshotDependencies {
     prepareCandidate(database: Database): Promise<Database>
     markPublished(revision: DataRevision): Promise<void> | void
     ledger: OfficialAssetLedger
+    /** Persists the published association so a restart can tell local from remote progress. */
+    association?: OfficialAssociationMarkers
 }
 
 export type OfficialPullResult =
     | { kind: 'missing' }
     | { kind: 'unchanged' }
+    | { kind: 'kept-local'; conflict: boolean }
     | { kind: 'activated'; revision: DataRevision }
 
 interface PinnedColdValue {
@@ -63,11 +76,6 @@ interface PinnedAsset {
     localKey: string
     /** The key the account already holds this asset under, or null when it must be uploaded. */
     publishedAs: string | null
-}
-
-interface AssociatedProjection {
-    revision: DataRevision
-    databaseFingerprint: string
 }
 
 function isOfficialAssetKey(key: string): boolean {
@@ -149,6 +157,41 @@ function validateCandidate(value: unknown): asserts value is Database {
     }
 }
 
+export function createOfficialAssociationMarkers(storage: {
+    getItem(key: string): string | null
+    setItem(key: string, value: string): void
+}): OfficialAssociationMarkers {
+    const storageKey = (accountId: string) => `officialAssociation:${accountId}`
+    return {
+        load(accountId) {
+            const raw = storage.getItem(storageKey(accountId))
+            if (!raw) return null
+            try {
+                const parsed = JSON.parse(raw) as Partial<OfficialAssociationRecord>
+                if (
+                    typeof parsed?.revision !== 'number'
+                    || typeof parsed?.databaseFingerprint !== 'string'
+                ) {
+                    return null
+                }
+                return {
+                    revision: parsed.revision,
+                    databaseFingerprint: parsed.databaseFingerprint,
+                }
+            } catch {
+                return null
+            }
+        },
+        save(accountId, record) {
+            try {
+                storage.setItem(storageKey(accountId), JSON.stringify(record))
+            } catch (error) {
+                console.error('Failed to persist the official sync association', error)
+            }
+        },
+    }
+}
+
 async function listCharacterSummaries(
     lease: PersistentRevisionLease,
 ): Promise<CharacterSummary[]> {
@@ -195,6 +238,7 @@ async function readCompleteCharacter(
 }
 
 async function collectPinnedReferences(lease: PersistentRevisionLease): Promise<{
+    accountId: string | undefined
     assets: string[]
     coldKeys: string[]
 }> {
@@ -208,6 +252,7 @@ async function collectPinnedReferences(lease: PersistentRevisionLease): Promise<
         for (const key of listColdDataKeysFromCharacter(character)) coldKeys.add(key)
     }
     return {
+        accountId: root.account?.id,
         assets: [...assets].sort(),
         coldKeys: [...coldKeys].sort(),
     }
@@ -308,9 +353,23 @@ class OfficialPinnedPublication implements PinnedPublication {
 
 export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher {
     readonly capability = officialAccountSnapshotCapability
-    private associatedProjection: AssociatedProjection | null = null
+    private associatedProjection: OfficialAssociationRecord | null = null
 
     constructor(private readonly dependencies: OfficialAccountSnapshotDependencies) {}
+
+    private resolveAssociation(accountId: string | undefined): OfficialAssociationRecord | null {
+        if (this.associatedProjection) return this.associatedProjection
+        if (!accountId) return null
+        return this.dependencies.association?.load(accountId) ?? null
+    }
+
+    private rememberAssociation(
+        accountId: string | undefined,
+        record: OfficialAssociationRecord,
+    ): void {
+        this.associatedProjection = record
+        if (accountId) this.dependencies.association?.save(accountId, record)
+    }
 
     async pin(revision: DataRevision): Promise<PinnedPublication> {
         const lease = await this.dependencies.store.acquireRevision(revision)
@@ -371,10 +430,10 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 coldValues,
                 this.dependencies,
                 (publishedRevision, databaseFingerprint) => {
-                    this.associatedProjection = {
+                    this.rememberAssociation(references.accountId, {
                         revision: publishedRevision,
                         databaseFingerprint,
-                    }
+                    })
                 },
             )
         } catch (error) {
@@ -385,18 +444,22 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
 
     async pull(signal?: AbortSignal): Promise<OfficialPullResult> {
         throwIfAborted(signal)
-        const expectedRevision = (await this.dependencies.store.readRoot()).revision
+        const localRoot = await this.dependencies.store.readRoot()
+        const expectedRevision = localRoot.revision
+        const association = this.resolveAssociation(localRoot.value.account?.id)
         const result = await this.dependencies.account.readItem(databaseKey, { signal })
         throwIfAborted(signal)
         if (result.kind === 'missing') return { kind: 'missing' }
         const databaseFingerprint = await fingerprintDatabase(result.bytes)
         throwIfAborted(signal)
-        if (
-            result.kind === 'not-modified'
-            && this.associatedProjection?.revision === expectedRevision
-            && this.associatedProjection.databaseFingerprint === databaseFingerprint
-        ) {
-            return { kind: 'unchanged' }
+        if (association) {
+            const remoteChanged = association.databaseFingerprint !== databaseFingerprint
+            if (!remoteChanged && association.revision === expectedRevision) {
+                return { kind: 'unchanged' }
+            }
+            if (expectedRevision > association.revision) {
+                return { kind: 'kept-local', conflict: remoteChanged }
+            }
         }
 
         throwIfAborted(signal)
@@ -431,10 +494,10 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             candidate,
             expectedRevision,
         )
-        this.associatedProjection = {
+        this.rememberAssociation(candidate.account?.id ?? localRoot.value.account?.id, {
             revision: activated.revision,
             databaseFingerprint,
-        }
+        })
         return { kind: 'activated', revision: activated.revision }
     }
 }

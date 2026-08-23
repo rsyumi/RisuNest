@@ -57,7 +57,10 @@ import {
 } from "./storage/persistentDataRuntime.svelte";
 import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
 import { resolveBlobStore } from "./storage/platformBlobStore";
-import { OfficialAccountSnapshotAdapter } from "./storage/sync/officialAccountSnapshot";
+import {
+    OfficialAccountSnapshotAdapter,
+    createOfficialAssociationMarkers,
+} from "./storage/sync/officialAccountSnapshot";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
 import {
     initializeOfficialAccountBootstrap,
@@ -122,6 +125,7 @@ export async function loadData() {
             ledger: accountId
                 ? createOfficialAssetLedger(localStorage, accountId)
                 : createUnrecordedOfficialAssetLedger(),
+            association: createOfficialAssociationMarkers(localStorage),
         })
         const accountBootstrap = await initializeOfficialAccountBootstrap({
             local,
@@ -158,6 +162,11 @@ export async function loadData() {
             onRemoteError: (error) => {
                 console.error(error)
                 alertError(error instanceof Error ? error : String(error))
+            },
+            onPullSkipped: ({ conflict }) => {
+                console.warn(conflict
+                    ? 'Official account pull skipped: local revisions were never published and the remote save also changed. Keeping local data; the next publish overwrites the remote save.'
+                    : 'Official account pull skipped: local revisions were never published. Keeping local data until the next publish.')
             },
         })
         disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners()
