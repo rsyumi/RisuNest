@@ -21,14 +21,14 @@ export class ByteBudgetLru<K, V> {
 
     set(key: K, value: V): boolean {
         const bytes = this.measure(key, value)
-        if (this.maxBytes <= 0 || bytes > this.maxBytes) {
-            return false
-        }
-
         const existing = this.entries.get(key)
         if (existing !== undefined) {
             this.retainedBytes -= this.measure(key, existing)
             this.entries.delete(key)
+        }
+
+        if (this.maxBytes <= 0 || bytes > this.maxBytes) {
+            return false
         }
 
         this.entries.set(key, value)
