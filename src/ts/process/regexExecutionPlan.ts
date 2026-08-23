@@ -210,6 +210,7 @@ export function executeRegexPlanSync(
             regex.lastIndex = 0
             if (entry.actions.length > 0) {
                 if (regex.test(data)) {
+                    regex.lastIndex = 0
                     data = parse(data.replace(regex, entry.replacement))
                 }
             }

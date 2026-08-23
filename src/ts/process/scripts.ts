@@ -216,6 +216,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                     else if((outScript.startsWith('@@inject') || entry.actions.includes('inject')) && chatID !== -1){
                         const selchar = db.characters[get(selectedCharID)]
                         selchar.chats[selchar.chatPage].message[chatID].data = data
+                        reg.lastIndex = 0
                         data = data.replace(reg, "")
                     }
                     else if(
@@ -223,7 +224,9 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                         entry.actions.includes('move_top') || entry.actions.includes('move_bottom')
                     ){
                         const isGlobal = flag.includes('g')
+                        reg.lastIndex = 0
                         const matchAll = isGlobal ? data.matchAll(reg) : [data.match(reg)]
+                        reg.lastIndex = 0
                         data = data.replace(reg, "")
                         for(const matched of matchAll){
                             if(matched){
@@ -254,6 +257,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                         }
                     }
                     else{
+                        reg.lastIndex = 0
                         data = parse(data.replace(reg, outScript))
                     }
                 }
@@ -272,6 +276,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                             pointer--
                         }
 
+                        reg.lastIndex = 0
                         const r = lastChat.match(reg)
                         if(!v){
                             data = data + r[0]

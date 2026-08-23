@@ -213,6 +213,19 @@ describe('processScriptFull result caching', () => {
         )).rejects.toBe(timeout)
     })
 
+    it('replaces sticky-flag matches at position 0 on repeated executions', async () => {
+        const character = makeCharacter([
+            makeScript('foo', 'X', 'y<no_end_nl>'),
+            makeScript('never-matches', '@@emo happy'),
+        ])
+
+        const first = await processScriptFull(character, 'foofoo', 'editoutput', -1, {}, { cache: 'bypass' })
+        const second = await processScriptFull(character, 'foofoo', 'editoutput', -1, {}, { cache: 'bypass' })
+
+        expect(first.data).toBe('Xfoo')
+        expect(second.data).toBe('Xfoo')
+    })
+
     it('keeps no more than 1,000 completed results', async () => {
         const character = makeCharacter([makeScript('^', '@@emo happy')])
 

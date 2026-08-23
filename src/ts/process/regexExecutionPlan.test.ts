@@ -118,6 +118,15 @@ describe('regex execution plans', () => {
         expect(executeRegexPlanSync(plan, input, identity).data).toBe(expected)
     })
 
+    it('replaces at position 0 when a sticky rule with actions tests first', () => {
+        const plan = getRegexExecutionPlan([
+            script('foo', 'X', 'y<no_end_nl>'),
+        ], 'editoutput')
+
+        expect(executeRegexPlanSync(plan, 'foofoo', identity).data).toBe('Xfoo')
+        expect(executeRegexPlanSync(plan, 'foofoo', identity).data).toBe('Xfoo')
+    })
+
     it('isolates an invalid regex and continues with later rules', () => {
         const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
         const plan = getRegexExecutionPlan([
