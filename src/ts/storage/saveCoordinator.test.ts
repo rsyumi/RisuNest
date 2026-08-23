@@ -1050,6 +1050,41 @@ describe('SaveCoordinator', () => {
         expect(staleHandle.dispose).toHaveBeenCalledOnce()
     })
 
+    it('does not resurrect a character the replacement removed', async () => {
+        vi.useFakeTimers()
+        try {
+            let db = makeDatabase()
+            const replacementGate = deferred<{ revision: number }>()
+            const store = {
+                commit: vi.fn(),
+                replaceFromDatabase: vi.fn(() => replacementGate.promise),
+            } as unknown as PersistentDataStore
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(db),
+                captureSelectedCharacter: () => db.characters[0] ?? null,
+                replaceDatabase: (replacement) => {
+                    db = replacement
+                },
+            })
+            coordinator.initialize(1)
+
+            const candidate = makeDatabase()
+            candidate.characters = []
+            const replacing = coordinator.replacePersistentDatabase(candidate, 'remove-character')
+            db.characters[0].name = 'Edited after enqueue'
+            coordinator.markPersistentDataDirty(1)
+            replacementGate.resolve({ revision: 2 })
+            await replacing
+
+            expect(db.characters).toEqual([])
+            await vi.advanceTimersByTimeAsync(500)
+            expect(store.commit).not.toHaveBeenCalled()
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('reports a successful replacement revision and reports nothing on failure', async () => {
         let database = makeDatabase()
         const revisions: number[] = []

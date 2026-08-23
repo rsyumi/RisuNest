@@ -423,8 +423,8 @@ export class SaveCoordinator {
             const index = publishedParts.characters.findIndex(
                 (characterValue) => characterValue.chaId === live.character!.chaId,
             )
+            // A character absent from the replacement was removed by it; do not resurrect it.
             if (index >= 0) published.characters[index] = canonicalClone(live.character)
-            else published.characters.push(canonicalClone(live.character))
         }
 
         this.dependencies.replaceDatabase(published)
