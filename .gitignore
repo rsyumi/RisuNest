@@ -8,6 +8,7 @@ pnpm-debug.log*
 lerna-debug.log*
 package-lock.json
 node_modules
+/.pnpm-store/
 dist/
 save/
 dist-web/
@@ -46,6 +47,7 @@ __pycache__/
 dist.zip
 /scripts/*
 !/scripts/exportPersistentFixture.ts
+!/scripts/phase3AndroidSmoke.mjs
 .env
 /server/node/ssl/certificate
 .worktrees/
