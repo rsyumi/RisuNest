@@ -555,6 +555,9 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
     let export_started = Instant::now();
     let export_materialize_started = Instant::now();
     let exported = store.materialize(None).expect("materialize export");
+    let export_materialize_us = elapsed_us(export_materialize_started);
+    let export_traversal = export_traversal(&mut store);
+    let export_total_us = elapsed_us(export_started);
     assert_fixture_shape(&exported, TURNS_PER_CHAT + 1, STRESS_TURNS);
     assert_eq!(
         exported["characters"][0]["chats"][0]["message"]
@@ -564,9 +567,6 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
         TURNS_PER_CHAT + 1
     );
     drop(exported);
-    let export_materialize_us = elapsed_us(export_materialize_started);
-    let export_traversal = export_traversal(&mut store);
-    let export_total_us = elapsed_us(export_started);
 
     let snapshot_started = Instant::now();
     let snapshot = store

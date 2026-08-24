@@ -111,10 +111,9 @@ export function summarizeG6(entries, startTime, endTime) {
 
 export function aggregateProcessMemory(processIds, processRows) {
     const uniqueIds = [...new Set(processIds)]
-    const wanted = new Set(uniqueIds)
     const processes = uniqueIds
         .map((pid) => processRows.find((row) => row.pid === pid))
-        .filter((row) => row && wanted.has(row.pid))
+        .filter((row) => row)
         .map(({ pid, workingSetBytes, privateBytes }) => ({ pid, workingSetBytes, privateBytes }))
     return {
         processCount: processes.length,
@@ -362,6 +361,7 @@ async function observeOperation(operation, sample) {
     let settled = false
     const samples = [await sample('before')]
     const promise = operation().finally(() => { settled = true })
+    promise.catch(() => {})
     while (!settled) {
         await delay(50)
         if (!settled) samples.push(await sample(`sample-${samples.length}`))
@@ -539,6 +539,7 @@ async function runBenchmark(options) {
         ])
         await evaluate(page, INSTALL_LONG_TASK_OBSERVER)
         await waitForInteractive(page, options.timeoutMs)
+        // Probe the store IPC so readiness failures surface before any measured operation.
         await evaluate(page, `globalThis.__TAURI_INTERNALS__.invoke('pds_snapshot_list')`)
 
         const boot = await collectBootEvidence(page)
