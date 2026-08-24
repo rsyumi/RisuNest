@@ -8,6 +8,8 @@ import type {
 
 const SAVE_DEBOUNCE_MS = 500
 const PENDING_BYTE_LIMIT = 1_048_576
+/** Official publishes upload the full database snapshot, so they are spaced like upstream's save loop. */
+const OFFICIAL_PUBLISH_MIN_INTERVAL_MS = 3_000
 
 type CompleteCharacter = character | groupChat
 type RootDatabase = Omit<Database, 'characters'>
@@ -35,6 +37,7 @@ export interface SaveCoordinatorDependencies {
     replaceDatabase(database: Database): void
     officialPublisher?: OfficialRevisionPublisher
     clock?: SaveCoordinatorClock
+    now?(): number
     onLocalRevision?(revision: DataRevision): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
@@ -113,6 +116,8 @@ export class SaveCoordinator {
     private lastReportedFlushPromise: Promise<void> | null = null
     private pendingPublication: PinnedPublication | null = null
     private pendingPublicationRevision: DataRevision | null = null
+    private lastOfficialPublishAttemptAt: number | null = null
+    private officialPublishRetryHandle: unknown
     private pendingCharacterAddition: PendingCharacterAddition | null = null
     private reservedCharacterAddition: ReservedCharacterAddition | null = null
     private lastBackgroundErrorMessage: string | null = null
@@ -132,6 +137,7 @@ export class SaveCoordinator {
 
     initialize(revision: DataRevision, database?: Database): void {
         this.cancelDebounce()
+        this.cancelOfficialPublishRetry()
         const captured = database ? this.captureDatabase(database) : this.capture()
         this.currentRevision = revision
         this.rootBaseline = captured.rootCanonical
@@ -140,6 +146,7 @@ export class SaveCoordinator {
         this.pendingByteCount = 0
         this.pendingPublication = null
         this.pendingPublicationRevision = null
+        this.lastOfficialPublishAttemptAt = null
         this.pendingCharacterAddition = null
         this.reservedCharacterAddition = null
         this.lastBackgroundErrorMessage = null
@@ -374,8 +381,15 @@ export class SaveCoordinator {
                         currentAddition.canonical === currentAddition.pending.baseline))
             ) {
                 if (publishOfficial && this.pendingPublicationRevision !== null) {
-                    await this.publishPendingRevision()
-                    continue
+                    const delay = this.officialPublishDelayMs()
+                    if (delay <= 0) {
+                        await this.publishPendingRevision()
+                        continue
+                    }
+                    this.armOfficialPublishRetry(delay)
+                    this.pendingCharacterAddition = null
+                    this.pendingByteCount = 0
+                    return
                 }
                 this.pendingCharacterAddition = null
                 this.pendingByteCount = 0
@@ -407,6 +421,7 @@ export class SaveCoordinator {
         const stalePublication = this.pendingPublication
         this.pendingPublication = null
         this.pendingPublicationRevision = null
+        this.cancelOfficialPublishRetry()
         if (this.pendingCharacterAddition?.token === supersededAdditionToken) {
             this.pendingCharacterAddition = null
         }
@@ -603,10 +618,39 @@ export class SaveCoordinator {
             this.pendingPublication = await this.dependencies.officialPublisher.pin(revision)
         }
         const publication = this.pendingPublication
-        await publication.publish()
+        try {
+            await publication.publish()
+        } finally {
+            this.lastOfficialPublishAttemptAt = this.currentTime()
+        }
+        this.cancelOfficialPublishRetry()
         this.pendingPublication = null
         this.pendingPublicationRevision = null
         await this.disposePublication(publication)
+    }
+
+    private officialPublishDelayMs(): number {
+        if (this.lastOfficialPublishAttemptAt === null) return 0
+        const elapsed = this.currentTime() - this.lastOfficialPublishAttemptAt
+        return Math.max(0, OFFICIAL_PUBLISH_MIN_INTERVAL_MS - elapsed)
+    }
+
+    private armOfficialPublishRetry(delay: number): void {
+        if (this.officialPublishRetryHandle !== undefined) return
+        this.officialPublishRetryHandle = this.clock.setTimeout(() => {
+            this.officialPublishRetryHandle = undefined
+            this.startBackgroundFlush('official-publish-interval')
+        }, delay)
+    }
+
+    private cancelOfficialPublishRetry(): void {
+        if (this.officialPublishRetryHandle === undefined) return
+        this.clock.clearTimeout(this.officialPublishRetryHandle)
+        this.officialPublishRetryHandle = undefined
+    }
+
+    private currentTime(): number {
+        return this.dependencies.now?.() ?? Date.now()
     }
 
     private async disposePublication(publication: PinnedPublication): Promise<void> {

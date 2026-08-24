@@ -693,6 +693,7 @@ describe('SaveCoordinator', () => {
 
     it('publishes only the newest revision after addition edits committed while offline', async () => {
         const { database, added } = makeAdditionDatabase()
+        let nowValue = 0
         const publish = vi.fn().mockRejectedValueOnce(new Error('offline')).mockResolvedValue(undefined)
         const handle = { publish, dispose: vi.fn(async () => undefined) }
         const pin = vi.fn(async (_revision: number) => handle)
@@ -704,6 +705,7 @@ describe('SaveCoordinator', () => {
             captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
             replaceDatabase: () => undefined,
             officialPublisher: { pin },
+            now: () => nowValue,
         })
         coordinator.initialize(1)
 
@@ -714,6 +716,7 @@ describe('SaveCoordinator', () => {
         }, 'new-character')).rejects.toThrow('offline')
         added.name = 'Edited while offline'
         coordinator.markPersistentDataDirty(1)
+        nowValue = 4000
         await coordinator.flushPendingData('retry')
 
         expect(pin).toHaveBeenCalledTimes(2)
@@ -1171,6 +1174,7 @@ describe('SaveCoordinator', () => {
 
     it('commits locally even when the official publish fails and retries the pin later', async () => {
         const database = makeDatabase()
+        let nowValue = 0
         const publish = vi.fn().mockRejectedValueOnce(new Error('offline')).mockResolvedValue(undefined)
         const handle = { publish, dispose: vi.fn(async () => undefined) }
         const pin = vi.fn().mockResolvedValue(handle)
@@ -1181,6 +1185,7 @@ describe('SaveCoordinator', () => {
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
             officialPublisher: { pin },
+            now: () => nowValue,
         })
         coordinator.initialize(1)
         database.username = 'Offline edit'
@@ -1191,6 +1196,7 @@ describe('SaveCoordinator', () => {
         expect(commit).toHaveBeenCalledOnce()
         expect(coordinator.revision).toBe(2)
 
+        nowValue = 4000
         await coordinator.flushPendingData('retry')
 
         expect(commit).toHaveBeenCalledOnce()
@@ -1201,6 +1207,7 @@ describe('SaveCoordinator', () => {
 
     it('supersedes a failed publication with the newer local revision', async () => {
         const database = makeDatabase()
+        let nowValue = 0
         const publish = vi.fn().mockRejectedValueOnce(new Error('remote')).mockResolvedValueOnce(undefined)
         const handle = { publish, dispose: vi.fn(async () => undefined) }
         const pin = vi.fn().mockResolvedValue(handle)
@@ -1211,6 +1218,7 @@ describe('SaveCoordinator', () => {
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
             officialPublisher: { pin },
+            now: () => nowValue,
         })
         coordinator.initialize(1)
         database.username = 'Local one'
@@ -1219,6 +1227,7 @@ describe('SaveCoordinator', () => {
         database.username = 'Local two'
         coordinator.markPersistentDataDirty(1)
 
+        nowValue = 4000
         await coordinator.flushPendingData('retry')
 
         expect(publish).toHaveBeenCalledTimes(2)
@@ -1230,9 +1239,124 @@ describe('SaveCoordinator', () => {
         expect(commit.mock.calls[1][0].expectedRevision).toBe(2)
     })
 
+    it('spaces official publishes at least three seconds apart and publishes the newest revision', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            const publish = vi.fn(async () => undefined)
+            const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
+            const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+                officialPublisher: { pin },
+            })
+            coordinator.initialize(1)
+
+            database.username = 'First edit'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            expect(pin).toHaveBeenCalledTimes(1)
+            expect(pin).toHaveBeenCalledWith(2)
+
+            database.username = 'Second edit'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            database.username = 'Third edit'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            expect(commit).toHaveBeenCalledTimes(3)
+            expect(pin).toHaveBeenCalledTimes(1)
+            expect(coordinator.hasPendingOfficialPublication).toBe(true)
+
+            await vi.advanceTimersByTimeAsync(2000)
+            expect(pin).toHaveBeenCalledTimes(2)
+            expect(pin).toHaveBeenLastCalledWith(4)
+            expect(coordinator.hasPendingOfficialPublication).toBe(false)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('publishes immediately on explicit request despite the publish interval', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            const publish = vi.fn(async () => undefined)
+            const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
+            const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+            const coordinator = new SaveCoordinator({
+                store: makeStore(commit),
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+                officialPublisher: { pin },
+            })
+            coordinator.initialize(1)
+            database.username = 'First edit'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            database.username = 'Second edit'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            expect(pin).toHaveBeenCalledTimes(1)
+            expect(coordinator.hasPendingOfficialPublication).toBe(true)
+
+            await coordinator.publishCurrentOfficialRevision()
+
+            expect(pin).toHaveBeenCalledTimes(2)
+            expect(pin).toHaveBeenLastCalledWith(3)
+            expect(coordinator.hasPendingOfficialPublication).toBe(false)
+            await vi.advanceTimersByTimeAsync(4000)
+            expect(pin).toHaveBeenCalledTimes(2)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
+    it('drops a deferred publication when an authoritative replacement supersedes it', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            const publish = vi.fn(async () => undefined)
+            const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
+            const store = {
+                commit: vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 })),
+                replaceFromDatabase: vi.fn(async () => ({ revision: 9 })),
+            } as unknown as PersistentDataStore
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+                officialPublisher: { pin },
+            })
+            coordinator.initialize(1)
+            database.username = 'First edit'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            database.username = 'Second edit'
+            coordinator.markPersistentDataDirty(1)
+            await vi.advanceTimersByTimeAsync(500)
+            expect(pin).toHaveBeenCalledTimes(1)
+            expect(coordinator.hasPendingOfficialPublication).toBe(true)
+
+            await coordinator.replacePersistentDatabase(makeDatabase(), 'authoritative')
+
+            expect(coordinator.hasPendingOfficialPublication).toBe(false)
+            await vi.advanceTimersByTimeAsync(4000)
+            expect(pin).toHaveBeenCalledTimes(1)
+        } finally {
+            vi.useRealTimers()
+        }
+    })
+
     it('exposes whether an official publication is still pending', async () => {
         const database = makeDatabase()
         let offline = true
+        let nowValue = 0
         const publish = vi.fn(async () => {
             if (offline) throw new Error('offline')
         })
@@ -1244,6 +1368,7 @@ describe('SaveCoordinator', () => {
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
             officialPublisher: { pin },
+            now: () => nowValue,
         })
         coordinator.initialize(1)
         expect(coordinator.hasPendingOfficialPublication).toBe(false)
@@ -1254,6 +1379,7 @@ describe('SaveCoordinator', () => {
         expect(coordinator.hasPendingOfficialPublication).toBe(true)
 
         offline = false
+        nowValue = 4000
         await coordinator.flushPendingData('online')
         expect(coordinator.hasPendingOfficialPublication).toBe(false)
     })
@@ -1293,11 +1419,13 @@ describe('SaveCoordinator', () => {
             database.username = 'Edit three'
             coordinator.markPersistentDataDirty(1)
             await vi.advanceTimersByTimeAsync(500)
+            await vi.advanceTimersByTimeAsync(2000)
 
             offline = true
             database.username = 'Edit four'
             coordinator.markPersistentDataDirty(1)
             await vi.advanceTimersByTimeAsync(500)
+            await vi.advanceTimersByTimeAsync(2500)
             expect(onBackgroundError).toHaveBeenCalledTimes(2)
             expect(commit).toHaveBeenCalledTimes(4)
         } finally {
