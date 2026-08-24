@@ -245,7 +245,7 @@
     }
 
     async function saveTranslationEdit() {
-        if (!editTranslationKey) return
+        if (editTranslationKey === null) return
 
         await updateTranslationCache(editTranslationKey, editTranslationText)
         editTranslationKey = null

@@ -165,7 +165,11 @@
                 alertError(`Error while parsing chat message: ${translated}, ${error.message}, ${error.stack}`)
                 return data
             }
-            return await markParsing(data, charArg, chatID, requestedRevision, (tries ?? 0) + 1)
+            const retried = await markParsing(data, charArg, chatID, requestedRevision, (tries ?? 0) + 1)
+            if (retried !== undefined) {
+                lastParsedQueue = retried
+            }
+            return retried
         }
         finally{
             //since trimMarkdown is fast, we don't need to cache it
