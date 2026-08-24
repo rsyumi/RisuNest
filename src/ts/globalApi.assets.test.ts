@@ -169,6 +169,15 @@ describe('getFileSrc account route', () => {
 })
 
 describe('getFileSrc tauri asset route', () => {
+    test('resolves a native asset without initializing AutoStorage', async () => {
+        state.isTauri = true
+        state.blobStore = createFakeBlobStore({ 'assets/native.png': { data: new Uint8Array([7]), mime: 'image/png' } })
+        const init = vi.spyOn(forageStorage, 'Init')
+
+        await expect(getFileSrc('assets/native.png')).resolves.toBe('asset:///data/assets/native.png')
+        expect(init).not.toHaveBeenCalled()
+    })
+
     test('memoizes the resolved URL per key and invalidates it on saveAsset', async () => {
         state.isTauri = true
         state.blobStore = createFakeBlobStore({ 'assets/avatar.png': { data: new Uint8Array([7]), mime: 'image/png' } })

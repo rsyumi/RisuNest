@@ -27,6 +27,7 @@ function makeHarness(input: {
     const markers = new Map<string, string>()
     if (input.accountEnabled) markers.set('accountst', 'able')
     if (input.syncRequested) markers.set('dosync', 'sync')
+    const getMarker = vi.fn((key: string) => markers.get(key) ?? null)
     const events: string[] = []
     const publication = {
         publish: vi.fn(async () => { events.push('push') }),
@@ -40,6 +41,7 @@ function makeHarness(input: {
         }),
     }
     const dependencies: OfficialAccountBootstrapDependencies = {
+        isTauri: false,
         local: { database: local, revision: 1 },
         store: {
             materializeDatabase: vi.fn(async () => {
@@ -51,7 +53,7 @@ function makeHarness(input: {
         readRemoteDatabase: vi.fn(async (): Promise<AccountReadResult> =>
             input.remoteRead ?? { kind: 'missing' }),
         markers: {
-            getItem: (key) => markers.get(key) ?? null,
+            getItem: getMarker,
             setItem: (key, value) => {
                 events.push(`marker:${key}`)
                 markers.set(key, value)
@@ -71,7 +73,7 @@ function makeHarness(input: {
         initializeWorkingSet: vi.fn(async () => { events.push('initialize') }),
         onRemoteError: vi.fn((error) => { events.push(`error:${(error as Error).message}`) }),
     }
-    return { adapter, dependencies, events, local, markers, publication }
+    return { adapter, dependencies, events, getMarker, local, markers, publication }
 }
 
 describe('official account production bootstrap', () => {
@@ -104,6 +106,24 @@ describe('official account production bootstrap', () => {
             'install',
             'initialize',
         ])
+    })
+
+    it('skips legacy official account bootstrap on Tauri while installing local SQLite data', async () => {
+        const harness = makeHarness({ accountEnabled: true, syncRequested: true })
+        harness.local.account = { token: 'synthetic-token', useSync: true } as Database['account']
+        harness.dependencies.isTauri = true
+
+        const result = await initializeOfficialAccountBootstrap(harness.dependencies)
+
+        expect(result).toMatchObject({ database: harness.local, revision: 1, officialEnabled: false })
+        expect(harness.getMarker).not.toHaveBeenCalled()
+        expect(harness.dependencies.readRemoteDatabase).not.toHaveBeenCalled()
+        expect(harness.adapter.pull).not.toHaveBeenCalled()
+        expect(harness.adapter.pin).not.toHaveBeenCalled()
+        expect(harness.dependencies.installDatabase).toHaveBeenCalledWith(harness.local)
+        expect(harness.dependencies.initializeWorkingSet).toHaveBeenCalledWith(harness.local)
+        expect(harness.dependencies.accountMode.isAccount).toBe(false)
+        expect(harness.events).toEqual(['publisher:off', 'asset:off', 'install', 'initialize'])
     })
 
     it('activates a fresh remote revision before installing the final working set', async () => {

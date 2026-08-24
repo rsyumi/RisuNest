@@ -203,7 +203,7 @@ let checkedPaths: string[] = []
  * @returns {Promise<string>} - A promise that resolves to the source URL of the file.
  */
 export async function getFileSrc(loc: string) {
-    await forageStorage.Init()
+    if (!isTauri) await forageStorage.Init()
     const route = selectAssetSourceRoute(loc, isTauri, forageStorage.isAccount)
     if (route === 'account') {
         // Freshly imported assets only exist locally until the next publish

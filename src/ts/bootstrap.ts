@@ -163,6 +163,7 @@ export async function loadData() {
         })
         let officialReconcilePublish = false
         const accountBootstrap = await initializeOfficialAccountBootstrap({
+            isTauri,
             local,
             store: runtime.store,
             adapter: officialAdapter,

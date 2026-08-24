@@ -19,6 +19,7 @@ interface AccountMarkers {
 }
 
 export interface OfficialAccountBootstrapDependencies {
+    isTauri: boolean
     local: {
         database: Database
         revision: DataRevision
@@ -90,11 +91,11 @@ export async function initializeOfficialAccountBootstrap(
     dependencies.configurePublisher(null)
     dependencies.configureAssetReader(null)
     dependencies.accountMode.isAccount = false
-    const wasEnabled = dependencies.markers.getItem('accountst') === 'able'
+    const wasEnabled = !dependencies.isTauri && dependencies.markers.getItem('accountst') === 'able'
     let revision = dependencies.local.revision
     let officialEnabled = false
 
-    if (accountSyncRequested(dependencies)) {
+    if (!dependencies.isTauri && accountSyncRequested(dependencies)) {
         try {
             let action: 'pull' | 'push'
             if (wasEnabled) {
