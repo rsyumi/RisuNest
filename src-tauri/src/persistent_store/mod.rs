@@ -488,4 +488,6 @@ pub(super) fn read_target(connection: &Connection, lease: Option<&str>) -> Store
 }
 
 #[cfg(test)]
+mod benchmark;
+#[cfg(test)]
 mod tests;

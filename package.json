@@ -16,6 +16,8 @@
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
     "benchmark:phase1": "vitest bench src/ts/process/phase1Algorithms.bench.ts --run --pool=forks --maxWorkers=1 --no-file-parallelism",
+    "benchmark:phase3": "set VITE_DISABLE_REALM=true&& cargo test --manifest-path src-tauri/Cargo.toml --release --locked --lib persistent_store::benchmark::phase3_step5_measurements -- --ignored --exact --nocapture --test-threads=1",
+    "benchmark:phase3:tauri": "set VITE_DISABLE_REALM=true&& node benchmarks/phase3/tauri-cdp.mjs",
     "tauri": "tauri",
     "android:init": "tauri android init --ci --skip-targets-install",
     "android:build:emulator": "tauri android build --debug --apk --target x86_64 --ci",
