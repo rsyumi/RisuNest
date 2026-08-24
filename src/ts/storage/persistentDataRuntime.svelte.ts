@@ -121,3 +121,6 @@ export const replacePersistentDatabase = (database: Database, reason: string): P
 
 export const publishCurrentOfficialRevision = (): Promise<void> =>
     getPersistentDataRuntime().publishCurrentOfficialRevision()
+
+export const hasPendingOfficialPublication = (): boolean =>
+    getPersistentDataRuntime().hasPendingOfficialPublication()

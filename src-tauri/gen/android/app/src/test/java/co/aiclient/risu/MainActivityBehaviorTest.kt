@@ -96,4 +96,22 @@ class MainActivityBehaviorTest {
     assertEquals(false, gate.shouldFinish("exit-1"))
     assertEquals(true, gate.shouldFinish("exit-2"))
   }
+
+  @Test
+  fun `a held exit flush token does not finish the activity`() {
+    val gate = ExitFlushGate()
+    gate.begin("exit-1")
+    gate.cancel("exit-1")
+
+    assertEquals(false, gate.shouldFinish("exit-1"))
+  }
+
+  @Test
+  fun `cancel ignores stale exit flush tokens`() {
+    val gate = ExitFlushGate()
+    gate.begin("exit-2")
+    gate.cancel("exit-1")
+
+    assertEquals(true, gate.shouldFinish("exit-2"))
+  }
 }

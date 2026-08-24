@@ -155,6 +155,139 @@ describe('registerLifecycleCommitListeners', () => {
         delete (window as any).RisuLifecycleBridge
     })
 
+    describe('exit sync policy', () => {
+        function makeBridge() {
+            const bridge = {
+                onFlushComplete: vi.fn(),
+                onFlushHold: vi.fn(),
+                requestExit: vi.fn(),
+            }
+            ;(window as any).RisuLifecycleBridge = bridge
+            return bridge
+        }
+
+        function dispatchExit(token = 'exit-1'): void {
+            window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+                detail: { reason: 'exit', ackToken: token },
+            }))
+        }
+
+        afterEach(() => {
+            delete (window as any).RisuLifecycleBridge
+        })
+
+        it('holds the native exit, flushes, then exits when nothing is pending', async () => {
+            const bridge = makeBridge()
+            const flush = vi.fn(async () => undefined)
+            const policy = {
+                isSyncActive: () => true,
+                hasPendingSync: vi.fn(() => false),
+                confirmExit: vi.fn(async () => true),
+            }
+            const dispose = registerLifecycleCommitListeners(flush, policy)
+
+            dispatchExit()
+
+            expect(bridge.onFlushHold).toHaveBeenCalledWith('exit-1')
+            expect(flush).toHaveBeenCalledWith('exit')
+            await vi.waitFor(() => expect(bridge.requestExit).toHaveBeenCalledTimes(1))
+            expect(policy.confirmExit).not.toHaveBeenCalled()
+            expect(bridge.onFlushComplete).not.toHaveBeenCalled()
+            dispose()
+        })
+
+        it('stays open when sync is pending and the user declines the exit', async () => {
+            const bridge = makeBridge()
+            const flush = vi.fn(async () => undefined)
+            const policy = {
+                isSyncActive: () => true,
+                hasPendingSync: vi.fn(() => true),
+                confirmExit: vi.fn(async () => false),
+            }
+            const dispose = registerLifecycleCommitListeners(flush, policy)
+
+            dispatchExit()
+
+            await vi.waitFor(() => expect(policy.confirmExit).toHaveBeenCalledTimes(1))
+            expect(bridge.requestExit).not.toHaveBeenCalled()
+            expect(bridge.onFlushComplete).not.toHaveBeenCalled()
+            dispose()
+        })
+
+        it('exits when sync is pending but the user confirms', async () => {
+            const bridge = makeBridge()
+            const flush = vi.fn(async () => undefined)
+            const policy = {
+                isSyncActive: () => true,
+                hasPendingSync: vi.fn(() => true),
+                confirmExit: vi.fn(async () => true),
+            }
+            const dispose = registerLifecycleCommitListeners(flush, policy)
+
+            dispatchExit()
+
+            await vi.waitFor(() => expect(bridge.requestExit).toHaveBeenCalledTimes(1))
+            dispose()
+        })
+
+        it('still asks before exiting when the exit flush fails', async () => {
+            const bridge = makeBridge()
+            const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+            const flush = vi.fn(async () => {
+                throw new Error('flush failed')
+            })
+            const policy = {
+                isSyncActive: () => true,
+                hasPendingSync: vi.fn(() => true),
+                confirmExit: vi.fn(async () => false),
+            }
+            const dispose = registerLifecycleCommitListeners(flush, policy)
+
+            dispatchExit()
+
+            await vi.waitFor(() => expect(policy.confirmExit).toHaveBeenCalledTimes(1))
+            expect(bridge.requestExit).not.toHaveBeenCalled()
+            errorLog.mockRestore()
+            dispose()
+        })
+
+        it('uses the plain acknowledge path when sync is inactive', async () => {
+            const bridge = makeBridge()
+            const flush = vi.fn(async () => undefined)
+            const policy = {
+                isSyncActive: () => false,
+                hasPendingSync: vi.fn(() => true),
+                confirmExit: vi.fn(async () => true),
+            }
+            const dispose = registerLifecycleCommitListeners(flush, policy)
+
+            dispatchExit('exit-9')
+
+            await vi.waitFor(() => expect(bridge.onFlushComplete).toHaveBeenCalledWith('exit-9'))
+            expect(bridge.onFlushHold).not.toHaveBeenCalled()
+            expect(bridge.requestExit).not.toHaveBeenCalled()
+            dispose()
+        })
+
+        it('falls back to the acknowledge path when the bridge cannot hold the exit', async () => {
+            const onFlushComplete = vi.fn()
+            ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+            const flush = vi.fn(async () => undefined)
+            const policy = {
+                isSyncActive: () => true,
+                hasPendingSync: vi.fn(() => true),
+                confirmExit: vi.fn(async () => true),
+            }
+            const dispose = registerLifecycleCommitListeners(flush, policy)
+
+            dispatchExit('exit-5')
+
+            await vi.waitFor(() => expect(onFlushComplete).toHaveBeenCalledWith('exit-5'))
+            expect(policy.confirmExit).not.toHaveBeenCalled()
+            dispose()
+        })
+    })
+
     it('removes all listeners and can be disposed twice', () => {
         const flush = vi.fn(async () => undefined)
         const dispose = registerLifecycleCommitListeners(flush)

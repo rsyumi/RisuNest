@@ -1230,6 +1230,34 @@ describe('SaveCoordinator', () => {
         expect(commit.mock.calls[1][0].expectedRevision).toBe(2)
     })
 
+    it('exposes whether an official publication is still pending', async () => {
+        const database = makeDatabase()
+        let offline = true
+        const publish = vi.fn(async () => {
+            if (offline) throw new Error('offline')
+        })
+        const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(1)
+        expect(coordinator.hasPendingOfficialPublication).toBe(false)
+
+        database.username = 'Offline edit'
+        coordinator.markPersistentDataDirty(1)
+        await expect(coordinator.flushPendingData('offline')).rejects.toThrow('offline')
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+
+        offline = false
+        await coordinator.flushPendingData('online')
+        expect(coordinator.hasPendingOfficialPublication).toBe(false)
+    })
+
     it('reports repeated background publish failures once until a flush succeeds', async () => {
         vi.useFakeTimers()
         try {

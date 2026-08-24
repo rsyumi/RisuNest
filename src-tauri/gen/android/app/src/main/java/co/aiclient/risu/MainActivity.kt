@@ -124,6 +124,12 @@ internal class ExitFlushGate {
     pendingToken = token
   }
 
+  fun cancel(token: String) {
+    if (pendingToken == token) {
+      pendingToken = null
+    }
+  }
+
   fun shouldFinish(token: String): Boolean {
     if (pendingToken != token) {
       return false
@@ -242,6 +248,17 @@ class MainActivity : TauriActivity() {
     fun onFlushComplete(token: String?) {
       token ?: return
       mainHandler.post { finishForExitFlush(token) }
+    }
+
+    @JavascriptInterface
+    fun onFlushHold(token: String?) {
+      token ?: return
+      mainHandler.post { exitFlushGate.cancel(token) }
+    }
+
+    @JavascriptInterface
+    fun requestExit() {
+      mainHandler.post { finishAndRemoveTask() }
     }
   }
 

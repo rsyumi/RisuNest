@@ -220,6 +220,10 @@ export class SaveCoordinator {
         })
     }
 
+    get hasPendingOfficialPublication(): boolean {
+        return this.pendingPublicationRevision !== null
+    }
+
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void> {
         this.assertInitialized()
         if (!request.characterId) {

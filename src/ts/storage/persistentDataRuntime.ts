@@ -56,6 +56,7 @@ export interface PersistentDataRuntime {
     activateConversation(id: string): Promise<boolean>
     replacePersistentDatabase(database: Database, reason: string): Promise<void>
     publishCurrentOfficialRevision(): Promise<void>
+    hasPendingOfficialPublication(): boolean
 }
 
 function createDynamicOfficialPublisher(
@@ -137,5 +138,6 @@ export function createPersistentDataRuntime(
             await coordinator.replacePersistentDatabase(prepared, reason)
         },
         publishCurrentOfficialRevision: () => coordinator.publishCurrentOfficialRevision(),
+        hasPendingOfficialPublication: () => coordinator.hasPendingOfficialPublication,
     }
 }
