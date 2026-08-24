@@ -1,0 +1,209 @@
+import { invoke } from '@tauri-apps/api/core'
+
+import type { Chat, Database } from './database.svelte'
+import {
+    RevisionConflictError,
+    SnapshotReleasedError,
+    type CharacterDetail,
+    type CharacterPage,
+    type CharacterQuery,
+    type ConversationPage,
+    type ConversationQuery,
+    type ConversationWindow,
+    type ConversationWindowQuery,
+    type DataRevision,
+    type PersistentDataStore,
+    type PersistentRevisionLease,
+    type Versioned,
+    type WorkingSetCommit,
+} from './persistentDataStore'
+
+const MAX_STAGED_CHARACTER_COUNT = 16
+const MAX_STAGED_CHARACTER_BYTES = 4 * 1024 * 1024
+const textEncoder = new TextEncoder()
+
+interface NativeStoreError {
+    code?: string
+    message?: string
+    expected?: number
+    actual?: number
+}
+
+function restoreStoreError(error: unknown): unknown {
+    if (error instanceof Error) return error
+
+    let nativeError = error
+    if (typeof nativeError === 'string') {
+        try {
+            nativeError = JSON.parse(nativeError)
+        } catch {
+            return new Error(String(nativeError))
+        }
+    }
+    if (!nativeError || typeof nativeError !== 'object') return error
+
+    const { code, message, expected, actual } = nativeError as NativeStoreError
+    if (code === 'revision-conflict' && expected !== undefined && actual !== undefined) {
+        return new RevisionConflictError(expected, actual)
+    }
+    if (code === 'snapshot-released') return new SnapshotReleasedError()
+    if ((code === 'validation' || code === 'store-error') && message !== undefined) {
+        return new Error(message)
+    }
+    return error
+}
+
+async function invokeStore<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+    try {
+        return args === undefined ? await invoke<T>(command) : await invoke<T>(command, args)
+    } catch (error) {
+        throw restoreStoreError(error)
+    }
+}
+
+function characterBatches(
+    characters: Database['characters'],
+): Array<Database['characters']> {
+    const batches: Array<Database['characters']> = []
+    let batch: Database['characters'] = []
+    let batchBytes = 2
+
+    for (const character of characters) {
+        const characterBytes = textEncoder.encode(JSON.stringify(character)).byteLength
+        const separatorBytes = batch.length === 0 ? 0 : 1
+        if (
+            batch.length > 0 &&
+            (batch.length >= MAX_STAGED_CHARACTER_COUNT ||
+                batchBytes + separatorBytes + characterBytes > MAX_STAGED_CHARACTER_BYTES)
+        ) {
+            batches.push(batch)
+            batch = []
+            batchBytes = 2
+        }
+        batchBytes += (batch.length === 0 ? 0 : 1) + characterBytes
+        batch.push(character)
+    }
+
+    if (batch.length > 0) batches.push(batch)
+    return batches
+}
+
+export class SqlitePersistentDataStore implements PersistentDataStore {
+    async open(): Promise<void> {
+        await invokeStore<{ revision: DataRevision }>('pds_open')
+    }
+
+    readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
+        return invokeStore('pds_read_root', {})
+    }
+
+    queryCharacters(input: CharacterQuery): Promise<CharacterPage> {
+        return invokeStore('pds_query_characters', { query: input })
+    }
+
+    readCharacter(id: string): Promise<Versioned<CharacterDetail> | null> {
+        return invokeStore('pds_read_character', { id })
+    }
+
+    queryConversations(input: ConversationQuery): Promise<ConversationPage> {
+        return invokeStore('pds_query_conversations', { query: input })
+    }
+
+    readConversation(
+        characterId: string,
+        conversationId: string,
+    ): Promise<Versioned<Chat> | null> {
+        return invokeStore('pds_read_conversation', { characterId, conversationId })
+    }
+
+    readConversationWindow(
+        input: ConversationWindowQuery,
+    ): Promise<Versioned<ConversationWindow> | null> {
+        return invokeStore('pds_read_conversation_window', { query: input })
+    }
+
+    commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
+        return invokeStore('pds_commit', { commit: input })
+    }
+
+    async replaceFromDatabase(
+        database: Database,
+        expectedRevision?: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
+        try {
+            const { characters, ...root } = database
+            await invokeStore<void>('pds_replace_put_root', { stagingId, root })
+            for (const batch of characterBatches(characters)) {
+                await invokeStore<void>('pds_replace_add_characters', {
+                    stagingId,
+                    characters: batch,
+                })
+            }
+            return await invokeStore('pds_replace_commit', {
+                stagingId,
+                ...(expectedRevision === undefined ? {} : { expectedRevision }),
+            })
+        } catch (error) {
+            try {
+                await invokeStore<void>('pds_replace_abort', { stagingId })
+            } catch {}
+            throw error
+        }
+    }
+
+    materializeDatabase(revision?: DataRevision): Promise<Database> {
+        return revision === undefined
+            ? invokeStore('pds_materialize', {})
+            : invokeStore('pds_materialize', { revision })
+    }
+
+    async acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease> {
+        const { lease } = await invokeStore<{ lease: string }>('pds_acquire_revision', {
+            revision,
+        })
+        let released = false
+        let releasePromise: Promise<void> | undefined
+        const assertActive = () => {
+            if (released) throw new SnapshotReleasedError()
+        }
+
+        return {
+            revision,
+            readRoot: async () => {
+                assertActive()
+                return invokeStore('pds_read_root', { lease })
+            },
+            queryCharacters: async (input) => {
+                assertActive()
+                return invokeStore('pds_query_characters', { query: input, lease })
+            },
+            readCharacter: async (id) => {
+                assertActive()
+                return invokeStore('pds_read_character', { id, lease })
+            },
+            queryConversations: async (input) => {
+                assertActive()
+                return invokeStore('pds_query_conversations', { query: input, lease })
+            },
+            readConversation: async (characterId, conversationId) => {
+                assertActive()
+                return invokeStore('pds_read_conversation', {
+                    characterId,
+                    conversationId,
+                    lease,
+                })
+            },
+            readConversationWindow: async (input) => {
+                assertActive()
+                return invokeStore('pds_read_conversation_window', { query: input, lease })
+            },
+            release: () => {
+                if (releasePromise) return releasePromise
+                released = true
+                releasePromise = invokeStore<void>('pds_release_revision', { lease })
+                return releasePromise
+            },
+        }
+    }
+}
