@@ -8,7 +8,6 @@ import {
 } from '../../process/coldstorageData'
 import { safeStructuredClone } from '../../polyfill'
 import type {
-    AccountReadResult,
     AccountStorage,
     AccountWriteResult,
 } from '../accountStorage'
@@ -151,15 +150,6 @@ function requireWriteSuccess(result: AccountWriteResult, key: string): string {
         throw new Error(`Official account write returned no key for ${key}`)
     }
     return result.replacementKey
-}
-
-function requireRemoteAsset(result: AccountReadResult, key: string): boolean {
-    if (result.kind !== 'missing') return true
-    if (normalizeLegacyAssetKey(key) !== key) {
-        console.warn(`Skipping a legacy official asset without a payload: ${key}`)
-        return false
-    }
-    throw new Error(`Missing official asset: ${key}`)
 }
 
 function validateCandidate(value: unknown): asserts value is Database {
@@ -377,6 +367,8 @@ class OfficialPinnedPublication implements PinnedPublication {
 export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher {
     readonly capability = officialAccountSnapshotCapability
     private associatedProjection: OfficialAssociationRecord | null = null
+    /** Keys already known to be unavailable everywhere; skipping them keeps publishes from re-probing. */
+    private readonly unavailableRemoteAssets = new Set<string>()
 
     constructor(private readonly dependencies: OfficialAccountSnapshotDependencies) {}
 
@@ -407,18 +399,18 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             const coldValues = new Map<string, PinnedColdValue>()
             for (const key of references.coldKeys) {
                 const local = await this.dependencies.cold.readLocal(key)
-                if (local !== null) {
-                    if (!isColdStorageBackupData(local)) {
-                        throw new Error(`Invalid local cold payload: ${key}`)
-                    }
+                if (local !== null && isColdStorageBackupData(local)) {
                     coldValues.set(key, { value: safeStructuredClone(local) })
                     addColdCharacterAssets(assetKeys, local)
                     continue
                 }
+                if (local !== null) {
+                    console.warn(`Ignoring an invalid local cold payload: ${key}`)
+                }
                 const remote = await this.dependencies.cold.readRemote(key)
-                if (remote === null) throw new Error(`Missing official cold payload: ${key}`)
-                if (!isColdStorageBackupData(remote)) {
-                    throw new Error(`Invalid official cold payload: ${key}`)
+                if (remote === null || !isColdStorageBackupData(remote)) {
+                    console.warn(`Skipping the official publish of an unavailable cold payload: ${key}`)
+                    continue
                 }
                 const pinnedRemote = safeStructuredClone(remote)
                 coldValues.set(key, { value: pinnedRemote })
@@ -442,7 +434,11 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                     assets.push({ key, localKey: normalized, publishedAs: null })
                     continue
                 }
-                if (!requireRemoteAsset(await this.dependencies.account.readItem(key), key)) {
+                if (this.unavailableRemoteAssets.has(key)) continue
+                const remote = await this.dependencies.account.readItem(key)
+                if (remote.kind === 'missing') {
+                    this.unavailableRemoteAssets.add(key)
+                    console.warn(`Skipping an official asset that is missing locally and in the account: ${key}`)
                     continue
                 }
                 this.dependencies.ledger.record(key, key)
@@ -519,27 +515,8 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         const candidate = await this.dependencies.prepareCandidate(decoded)
         validateCandidate(candidate)
 
-        const assetKeys = new Set<string>()
-        addOfficialAssets(assetKeys, listDatabaseRootResources(candidate))
-        const coldKeys = new Set<string>()
-        for (const character of candidate.characters) {
-            addOfficialAssets(assetKeys, listCharacterResources(character))
-            for (const key of listColdDataKeysFromCharacter(character)) coldKeys.add(key)
-        }
-        for (const key of [...coldKeys].sort()) {
-            throwIfAborted(signal)
-            const value = await this.dependencies.cold.readRemote(key, signal)
-            if (value === null) throw new Error(`Missing official cold payload: ${key}`)
-            if (!isColdStorageBackupData(value)) {
-                throw new Error(`Invalid official cold payload: ${key}`)
-            }
-            addColdCharacterAssets(assetKeys, value)
-        }
-        for (const key of [...assetKeys].sort()) {
-            throwIfAborted(signal)
-            requireRemoteAsset(await this.dependencies.account.readItem(key, { signal }), key)
-        }
-
+        // Referenced assets and cold payloads load lazily on use, matching the upstream client;
+        // a missing one degrades that item instead of failing the whole pull.
         throwIfAborted(signal)
         const activated = await this.dependencies.store.replaceFromDatabase(
             candidate,

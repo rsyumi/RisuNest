@@ -502,12 +502,51 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(harness.cold.writeRemote.mock.calls[0][0]).toBe('cold-chat')
     })
 
-    it('releases a lease when pin validation fails locally and remotely', async () => {
+    it('publishes without assets that are unavailable everywhere and probes each missing key once', async () => {
         const database = makeDatabase()
-        const harness = await makeHarness({ database, blobs: new Map(), remoteAssets: new Map() })
+        const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        try {
+            const harness = await makeHarness({ database, blobs: new Map(), remoteAssets: new Map() })
+
+            await (await harness.adapter.pin(harness.imported.revision)).publish()
+
+            expect(harness.writes.some((write) => write.key.startsWith('assets/'))).toBe(false)
+            const databaseWrite = harness.writes.find((write) => write.key === databaseKey)
+            const projected = await decodeRisuSave(databaseWrite!.bytes!) as Database
+            expect(resources(projected)).toEqual(resources(database))
+
+            const probesAfterFirst = harness.readItem.mock.calls.length
+            await (await harness.adapter.pin(harness.imported.revision)).publish()
+            expect(harness.readItem.mock.calls.length).toBe(probesAfterFirst)
+        } finally {
+            consoleWarn.mockRestore()
+        }
+    })
+
+    it('publishes without a cold payload that is unavailable everywhere', async () => {
+        const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+        try {
+            const harness = await makeHarness({
+                localCold: new Map<string, unknown>([
+                    ['cold-chat', { message: [{ data: 'local chat' }] }],
+                ]),
+            })
+
+            await (await harness.adapter.pin(harness.imported.revision)).publish()
+
+            expect(harness.cold.writeRemote.mock.calls.map(([key]) => key)).toEqual(['cold-chat'])
+            expect(harness.writes.some((write) => write.key === databaseKey)).toBe(true)
+        } finally {
+            consoleWarn.mockRestore()
+        }
+    })
+
+    it('releases the lease when reading a cold payload fails during pin', async () => {
+        const harness = await makeHarness({ localCold: new Map() })
+        harness.cold.readRemote.mockRejectedValue(new Error('cold offline'))
         const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
 
-        await expect(harness.adapter.pin(harness.imported.revision)).rejects.toThrow('Missing official asset')
+        await expect(harness.adapter.pin(harness.imported.revision)).rejects.toThrow('cold offline')
         const lease = await acquireRevision.mock.results[0].value
         await expect(lease.readRoot()).rejects.toThrow('released')
         expect(harness.writeItem).not.toHaveBeenCalled()
@@ -678,94 +717,23 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         }
     })
 
-    it('validates cold-character-only assets and ignores non-account resource values before pull activation', async () => {
-        const remote = makeDatabase() as any
-        remote.customBackground = '-'
-        remote.userIcon = 'https://example.invalid/user.png'
-        remote.modules[0].icon = 'data:image/png;base64,AA=='
-        remote.characters[0].image = 'C:\\app-data\\portrait.png'
-        const coldOnlyKey = 'assets/pull-cold-only.bin'
-        const coldCharacter = structuredClone(remote.characters[0]) as any
-        coldCharacter.additionalAssets = [['cold only', coldOnlyKey, 'bin']]
-        delete remote.characters[0].additionalAssets
-        const bytes = encodeRisuSaveLegacy(remote, 'compression')
-        const remoteAssets = new Map(
-            resources(remote)
-                .filter((key) => key.startsWith('assets/'))
-                .map((key) => [key, Uint8Array.of(1)]),
-        )
-        const harness = await makeHarness({
-            databaseRead: { kind: 'value', bytes },
-            remoteAssets,
-            remoteCold: new Map([
-                ['cold-chat', { character: coldCharacter }],
-                ['cold-message', { message: [] }],
-            ]),
-        })
-        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
-
-        await expect(harness.adapter.pull()).rejects.toThrow(`Missing official asset: ${coldOnlyKey}`)
-
-        expect(replace).not.toHaveBeenCalled()
-        for (const key of [
-            '-',
-            'https://example.invalid/user.png',
-            'data:image/png;base64,AA==',
-            'C:\\app-data\\portrait.png',
-        ]) {
-            expect(harness.readItem).not.toHaveBeenCalledWith(key, expect.anything())
-        }
-    })
-
-    it('rejects missing assets and invalid cold payloads before activation', async () => {
-        const remote = makeDatabase()
-        const bytes = encodeRisuSaveLegacy(remote, 'compression')
-        const missingAsset = await makeHarness({
-            databaseRead: { kind: 'value', bytes },
-            remoteAssets: new Map(),
-            remoteCold: new Map([
-                ['cold-chat', { message: [] }],
-                ['cold-message', { message: [] }],
-            ]),
-        })
-        const missingReplace = vi.spyOn(missingAsset.store, 'replaceFromDatabase')
-        await expect(missingAsset.adapter.pull()).rejects.toThrow('Missing official asset')
-        expect(missingReplace).not.toHaveBeenCalled()
-
-        const invalidCold = await makeHarness({
-            databaseRead: { kind: 'value', bytes },
-            remoteAssets: new Map(resources(remote).map((key) => [key, Uint8Array.of(1)])),
-            remoteCold: new Map<string, unknown>([
-                ['cold-chat', 'invalid'],
-                ['cold-message', { message: [] }],
-            ]),
-        })
-        const invalidReplace = vi.spyOn(invalidCold.store, 'replaceFromDatabase')
-        await expect(invalidCold.adapter.pull()).rejects.toThrow('Invalid official cold payload')
-        expect(invalidReplace).not.toHaveBeenCalled()
-    })
-
-    it('activates a remote snapshot that references a legacy backslash asset the account lacks', async () => {
+    it('activates without probing account assets or cold payloads', async () => {
         const remote = makeDatabase() as any
         remote.characters[0].additionalAssets = [['legacy', 'assets\\windows.gif', 'gif']]
         const bytes = encodeRisuSaveLegacy(remote, 'compression')
         const harness = await makeHarness({
             databaseRead: { kind: 'value', bytes },
-            remoteAssets: new Map(
-                resources(remote)
-                    .filter((key) => key !== 'assets\\windows.gif')
-                    .map((key) => [key, Uint8Array.of(1)]),
-            ),
-            remoteCold: new Map([
-                ['cold-chat', { message: [] }],
-                ['cold-message', { message: [] }],
-            ]),
+            remoteAssets: new Map(),
+            remoteCold: new Map(),
         })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
 
         const result = await harness.adapter.pull()
 
         expect(result.kind).toBe('activated')
-        expect(harness.readItem).toHaveBeenCalledWith('assets\\windows.gif', expect.anything())
+        expect(replace).toHaveBeenCalledTimes(1)
+        expect(harness.readItem.mock.calls.map(([key]) => key)).toEqual([databaseKey])
+        expect(harness.cold.readRemote).not.toHaveBeenCalled()
     })
 
     it('checks abort immediately before the single replacement', async () => {
@@ -774,15 +742,10 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         const controller = new AbortController()
         const harness = await makeHarness({
             databaseRead: { kind: 'value', bytes },
-            remoteAssets: new Map(resources(remote).map((key) => [key, Uint8Array.of(1)])),
-            remoteCold: new Map([
-                ['cold-chat', { message: [] }],
-                ['cold-message', { message: [] }],
-            ]),
-        })
-        harness.cold.readRemote.mockImplementation(async (key: string) => {
-            if (key === 'cold-message') controller.abort()
-            return { message: [] }
+            prepareCandidate: vi.fn(async (value: Database) => {
+                controller.abort()
+                return structuredClone(value)
+            }),
         })
         const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
 
@@ -804,10 +767,6 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
         const concurrent = makeDatabase()
         concurrent.username = 'Concurrent wins'
         let raced = false
-        const remoteCold = new Map<string, unknown>([
-            ['cold-chat', { message: [] }],
-            ['cold-message', { message: [] }],
-        ])
         const replace = vi.spyOn(first, 'replaceFromDatabase')
         const adapter = new OfficialAccountSnapshotAdapter({
             store: first,
@@ -820,16 +779,16 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
             },
             cold: {
                 readLocal: vi.fn(async () => null),
-                readRemote: vi.fn(async (key: string) => {
-                    if (!raced) {
-                        raced = true
-                        await second.replaceFromDatabase(concurrent, imported.revision)
-                    }
-                    return remoteCold.get(key) ?? null
-                }),
+                readRemote: vi.fn(async () => null),
                 writeRemote: vi.fn(),
             },
-            prepareCandidate: async (value) => structuredClone(value),
+            prepareCandidate: async (value) => {
+                if (!raced) {
+                    raced = true
+                    await second.replaceFromDatabase(concurrent, imported.revision)
+                }
+                return structuredClone(value)
+            },
             markPublished: vi.fn(),
             ledger: createOfficialAssetLedger(memoryLedgerStorage(), 'other-account'),
         })
