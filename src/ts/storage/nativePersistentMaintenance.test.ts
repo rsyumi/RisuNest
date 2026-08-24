@@ -2,9 +2,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
     invoke: vi.fn(),
+    isTauriMobile: true,
+    relaunch: vi.fn(),
 }))
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
+vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: mocks.relaunch }))
+vi.mock('../platform', () => ({
+    get isTauriMobile() {
+        return mocks.isTauriMobile
+    },
+}))
 
 import {
     checkpointNativePersistentStore,
@@ -12,6 +20,7 @@ import {
     createPeriodicNativeSnapshotIfDue,
     listNativePersistentSnapshots,
     requestNativePersistentSnapshotRestore,
+    restartNativeApp,
     restoreNativePersistentSnapshot,
     schedulePeriodicNativeSnapshot,
 } from './nativePersistentMaintenance'
@@ -19,8 +28,13 @@ import {
 describe('native persistent maintenance', () => {
     beforeEach(() => {
         mocks.invoke.mockReset()
+        mocks.isTauriMobile = true
+        mocks.relaunch.mockReset()
         vi.useRealTimers()
         vi.unstubAllGlobals()
+        delete (window as Window & {
+            RisuLifecycleBridge?: unknown
+        }).RisuLifecycleBridge
     })
 
     it('maps checkpoints to the native persistent store command', async () => {
@@ -236,5 +250,34 @@ describe('native persistent maintenance', () => {
         ).rejects.toBe(requestError)
 
         expect(restart).not.toHaveBeenCalled()
+    })
+
+    it('requests an Android cold restart through the lifecycle bridge', async () => {
+        const requestRestart = vi.fn()
+        ;(window as Window & {
+            RisuLifecycleBridge?: { requestRestart(): void }
+        }).RisuLifecycleBridge = { requestRestart }
+
+        await restartNativeApp()
+
+        expect(requestRestart).toHaveBeenCalledOnce()
+        expect(mocks.relaunch).not.toHaveBeenCalled()
+    })
+
+    it('does not fall back to the unsupported process relauncher on Android', async () => {
+        await expect(restartNativeApp()).rejects.toThrow(
+            'Android restart bridge is unavailable',
+        )
+
+        expect(mocks.relaunch).not.toHaveBeenCalled()
+    })
+
+    it('uses the process relauncher outside Tauri mobile', async () => {
+        mocks.isTauriMobile = false
+        mocks.relaunch.mockResolvedValue(undefined)
+
+        await restartNativeApp()
+
+        expect(mocks.relaunch).toHaveBeenCalledOnce()
     })
 })

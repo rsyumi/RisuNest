@@ -7,6 +7,38 @@ import org.junit.Test
 
 class MainActivityBehaviorTest {
   @Test
+  fun `cold restart relaunches the task before terminating the process`() {
+    val operations = mutableListOf<String>()
+    val dispatcher = ColdRestartDispatcher(
+      relaunchTask = { operations.add("relaunch-task") },
+      terminateProcess = { operations.add("terminate-process") },
+    )
+
+    dispatcher.restart()
+
+    assertEquals(listOf("relaunch-task", "terminate-process"), operations)
+  }
+
+  @Test
+  fun `cold restart keeps the process alive when task relaunch fails`() {
+    val operations = mutableListOf<String>()
+    val dispatcher = ColdRestartDispatcher(
+      relaunchTask = {
+        operations.add("relaunch-task")
+        error("launch failed")
+      },
+      terminateProcess = { operations.add("terminate-process") },
+    )
+
+    try {
+      dispatcher.restart()
+    } catch (_: IllegalStateException) {
+    }
+
+    assertEquals(listOf("relaunch-task"), operations)
+  }
+
+  @Test
   fun `activity stop requests a lifecycle flush`() {
     val reasons = mutableListOf<String>()
     val dispatcher = LifecycleFlushDispatcher(reasons::add)

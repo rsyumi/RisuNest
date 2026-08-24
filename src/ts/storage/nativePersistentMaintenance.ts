@@ -1,4 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
+import { relaunch } from '@tauri-apps/plugin-process'
+import { isTauriMobile } from '../platform'
 
 const PERIODIC_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000
 
@@ -23,6 +25,16 @@ export interface NativeSnapshotRestoreActions {
     onEmpty(): void | Promise<void>
 }
 
+interface NativeRestartBridge {
+    requestRestart?: () => void
+}
+
+function nativeRestartBridge(): NativeRestartBridge | undefined {
+    return (window as Window & {
+        RisuLifecycleBridge?: NativeRestartBridge
+    }).RisuLifecycleBridge
+}
+
 export async function checkpointNativePersistentStore(
     mode: NativeCheckpointMode,
 ): Promise<void> {
@@ -43,6 +55,19 @@ export async function requestNativePersistentSnapshotRestore(
     path: string,
 ): Promise<void> {
     await invoke('pds_snapshot_restore_request', { path })
+}
+
+export async function restartNativeApp(): Promise<void> {
+    if (!isTauriMobile) {
+        await relaunch()
+        return
+    }
+
+    const bridge = nativeRestartBridge()
+    if (typeof bridge?.requestRestart !== 'function') {
+        throw new Error('Android restart bridge is unavailable')
+    }
+    bridge.requestRestart()
 }
 
 export async function createPeriodicNativeSnapshotIfDue(

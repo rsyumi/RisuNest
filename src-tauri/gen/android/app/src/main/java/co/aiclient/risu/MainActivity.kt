@@ -139,12 +139,32 @@ internal class ExitFlushGate {
   }
 }
 
+internal class ColdRestartDispatcher(
+  private val relaunchTask: () -> Unit,
+  private val terminateProcess: () -> Unit,
+) {
+  fun restart() {
+    relaunchTask()
+    terminateProcess()
+  }
+}
+
 class MainActivity : TauriActivity() {
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
   private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
   private val exitFlushGate = ExitFlushGate()
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val coldRestartDispatcher by lazy {
+    ColdRestartDispatcher(
+      relaunchTask = {
+        startActivity(Intent.makeRestartActivityTask(componentName))
+      },
+      terminateProcess = {
+        android.os.Process.killProcess(android.os.Process.myPid())
+      },
+    )
+  }
   private var exitFlushSequence = 0L
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -259,6 +279,11 @@ class MainActivity : TauriActivity() {
     @JavascriptInterface
     fun requestExit() {
       mainHandler.post { finishAndRemoveTask() }
+    }
+
+    @JavascriptInterface
+    fun requestRestart() {
+      mainHandler.post { coldRestartDispatcher.restart() }
     }
   }
 

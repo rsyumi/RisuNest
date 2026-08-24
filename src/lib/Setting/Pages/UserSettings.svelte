@@ -16,8 +16,10 @@
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
     import { loginToSionyw, testSionywLogin } from "src/ts/sionyw";
     import { cleanColdStorage } from "src/ts/process/coldstorage.svelte";
-    import { restoreNativePersistentSnapshot } from "src/ts/storage/nativePersistentMaintenance";
-    import { relaunch } from "@tauri-apps/plugin-process";
+    import {
+        restartNativeApp,
+        restoreNativePersistentSnapshot,
+    } from "src/ts/storage/nativePersistentMaintenance";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     let popup:Window = null
@@ -92,7 +94,7 @@
                         return snapshots[selected]?.path ?? null
                     },
                     confirm: () => alertConfirm(language.restoreLocalSnapshotConfirm),
-                    restart: relaunch,
+                    restart: restartNativeApp,
                     onEmpty: () => alertNormal(language.noLocalSnapshots),
                 })
             } catch (error) {
