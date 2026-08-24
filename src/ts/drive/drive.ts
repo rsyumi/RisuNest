@@ -115,7 +115,7 @@ export async function checkDriverInit() {
 let lastSaved:number = parseInt(localStorage.getItem('risu_lastsaved') ?? '-1')
 
 async function backupDrive(ACCESS_TOKEN:string) {
-    await forageStorage.Init()
+    if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     alertStore.set({
         type: "wait",
@@ -183,7 +183,7 @@ type DriveFile = {
 }
 
 async function loadDrive(ACCESS_TOKEN:string, mode: 'backup'|'sync'):Promise<void|"noSync"> {
-    await forageStorage.Init()
+    if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     if(mode === 'backup'){
         alertStore.set({

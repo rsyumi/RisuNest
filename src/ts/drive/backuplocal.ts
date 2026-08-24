@@ -34,7 +34,7 @@ function getBasename(data:string){
 }
 
 export async function SaveLocalBackup(){
-    await forageStorage.Init()
+    if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     alertWait("Saving local backup...")
     const db = getDatabase()
@@ -195,7 +195,7 @@ export async function SaveLocalBackup(){
  * - Ideal for backing up core visual identity without bulk data
  */
 export async function SavePartialLocalBackup(){
-    await forageStorage.Init()
+    if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     // First confirmation: Explain the difference from regular backup
     const firstConfirm = await alertConfirm(language.partialBackupFirstConfirm)
@@ -362,7 +362,7 @@ export function LoadLocalBackup(){
             }
             const file = input.files[0];
             input.remove();
-            await forageStorage.Init()
+            if (!isTauri) await forageStorage.Init()
             const blobStore = await resolveBlobStore()
             const pocketRisuInlays = new PocketRisuInlayImporter(async (id, bytes, metadata) => {
                 await blobStore.put(id, bytes, metadata)

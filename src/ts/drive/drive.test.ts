@@ -14,6 +14,7 @@ const state = vi.hoisted(() => ({
     alertSelect: vi.fn(async () => '0'),
     blobStore: null as BlobStore | null,
     currentDatabase: null as Database | null,
+    forageInit: vi.fn(async () => undefined),
     localCold: new Map<string, unknown>(),
     officialCold: new Map<string, unknown>(),
     publishCurrentOfficialRevision: vi.fn<() => Promise<void>>(),
@@ -35,7 +36,7 @@ vi.mock('../storage/database.svelte', () => ({
 
 vi.mock('../globalApi.svelte', () => ({
     forageStorage: {
-        Init: vi.fn(async () => undefined),
+        Init: state.forageInit,
         isAccount: true,
     },
     getUncleanablesSync: vi.fn((_database: Database, _mode: string, options: {
@@ -243,6 +244,7 @@ describe('Drive restore cold snapshot assets', () => {
         expect(accountWrites).toContain('assets/drive-only.png')
         expect(accountWrites).not.toContain('assets/account-only.png')
         expect(accountWrites.at(-1)).toBe('database/database.bin')
+        expect(state.forageInit).not.toHaveBeenCalled()
         expect(state.alertError).not.toHaveBeenCalled()
     })
 })
