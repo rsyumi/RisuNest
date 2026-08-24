@@ -334,6 +334,16 @@ async function copyPrivateFile(serial, remotePath, outputPath) {
     await writeFile(outputPath, result.stdout)
 }
 
+async function copyPrivateFileIfPresent(serial, remotePath, outputPath) {
+    const result = adb(serial, ['exec-out', 'run-as', PACKAGE, 'cat', remotePath], {
+        binary: true,
+        allowFailure: true,
+    })
+    if (result.status !== 0 || result.stdout.length === 0) return false
+    await writeFile(outputPath, result.stdout)
+    return true
+}
+
 async function collectEvidence(options) {
     const serial = requireSerial(options)
     const label = safeLabel(options.label)
@@ -360,6 +370,9 @@ async function collectEvidence(options) {
 
     const databasePath = resolve(outputDirectory, 'persistent.db')
     await copyPrivateFile(serial, 'files/persistent/persistent.db', databasePath)
+    // The store runs in WAL mode, so commits since the last truncate checkpoint
+    // live only in the -wal sidecar; without it the inspection under-reports.
+    await copyPrivateFileIfPresent(serial, 'files/persistent/persistent.db-wal', `${databasePath}-wal`)
     const inspections = { active: await inspectDatabase(databasePath), snapshots: [] }
 
     const snapshotFiles = String(
@@ -382,11 +395,13 @@ async function collectEvidence(options) {
 }
 
 async function main() {
-    assertRealmDisabled()
     const { command, options } = parseArguments(process.argv.slice(2))
     if (command === 'help' || command === '--help') {
         process.stdout.write(usage())
-    } else if (command === 'generate') {
+        return
+    }
+    assertRealmDisabled()
+    if (command === 'generate') {
         await generateFixtures()
     } else if (command === 'fresh-install') {
         await freshInstall(options)
