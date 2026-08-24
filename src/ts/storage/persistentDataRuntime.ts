@@ -39,6 +39,7 @@ export interface PersistentDataRuntimeDependencies {
     officialPublisher?: OfficialRevisionPublisher | null
     getOfficialPublisher?(): OfficialRevisionPublisher | null
     clock?: SaveCoordinatorClock
+    now?(): number
     onLocalRevision?(revision: DataRevision): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
@@ -93,6 +94,7 @@ export function createPersistentDataRuntime(
             )
             : undefined,
         clock: dependencies.clock,
+        now: dependencies.now,
         onLocalRevision: dependencies.onLocalRevision,
         onFlushPromise: dependencies.onFlushPromise,
         onBackgroundError: dependencies.onBackgroundError,

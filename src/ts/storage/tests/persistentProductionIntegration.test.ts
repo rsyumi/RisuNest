@@ -207,10 +207,12 @@ describe('persistent production runtime', () => {
         const dispose = vi.fn(async () => undefined)
         const pin = vi.fn(async () => ({ publish, dispose }))
         let officialPublisher = { pin }
+        let nowValue = 0
         const runtime = createPersistentDataRuntime({
             store,
             state: adapter,
             getOfficialPublisher: () => officialPublisher,
+            now: () => nowValue,
             prepareDatabase: async (candidate) => structuredClone(candidate),
         })
         await runtime.initializeActiveWorkingSet(database)
@@ -219,6 +221,7 @@ describe('persistent production runtime', () => {
 
         await expect(runtime.flushPendingData('first')).rejects.toThrow('offline')
         officialPublisher = { pin: vi.fn() }
+        nowValue = 4000
         await runtime.flushPendingData('retry')
 
         expect(pin).toHaveBeenCalledOnce()
