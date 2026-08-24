@@ -25,6 +25,7 @@ import { hasher } from "./parser/parser.svelte";
 import { characterURLImport, hubURL } from "./characterCards";
 import { defaultJailbreak, defaultMainPrompt, oldJailbreak, oldMainPrompt } from "./storage/defaultPrompts";
 import { loadRisuAccountData } from "./drive/accounter";
+import { saveDbKei } from "./kei/backup";
 import { decodeRisuSave } from "./storage/risuSave";
 import { AutoStorage } from "./storage/autoStorage";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -438,6 +439,7 @@ export async function saveDb() {
                 saving.state = value
             },
             reportError: (error) => alertError(error instanceof Error ? error : String(error)),
+            onSaveCommitted: saveDbKei,
         })
         const disposeEffects = $effect.root(() => {
             const estimateRootBytes = createThrottledSizeEstimator(() => {

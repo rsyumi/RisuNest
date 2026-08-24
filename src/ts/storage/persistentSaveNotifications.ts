@@ -19,6 +19,7 @@ export interface PersistentSaveNotificationDependencies {
     showForeignRevisionWarning(): void
     setSaving(saving: boolean): void
     reportError?(error: unknown): void
+    onSaveCommitted?(): void
 }
 
 export interface PersistentSaveObserverInstallation {
@@ -57,7 +58,10 @@ export function installPersistentSaveNotifications(
         }
     }
     dependencies.configureRuntime({
-        onLocalRevision: () => dependencies.channel?.postMessage(dependencies.sessionId),
+        onLocalRevision: () => {
+            dependencies.channel?.postMessage(dependencies.sessionId)
+            dependencies.onSaveCommitted?.()
+        },
         onFlushPromise: (promise) => dependencies.setSaving(promise !== null),
         onBackgroundError: (error) => dependencies.reportError?.(error),
     })
