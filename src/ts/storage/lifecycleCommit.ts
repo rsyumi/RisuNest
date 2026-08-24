@@ -1,4 +1,6 @@
 import { flushPendingData } from './persistentDataRuntime.svelte'
+import { isTauri } from '../platform'
+import { checkpointNativePersistentStore } from './nativePersistentMaintenance'
 
 export type LifecycleCommitReason =
     | 'pagehide'
@@ -8,6 +10,7 @@ export type LifecycleCommitReason =
     | 'exit'
 
 type LifecycleFlush = (reason: LifecycleCommitReason) => Promise<void>
+type LifecycleCheckpoint = (mode: 'truncate') => Promise<void>
 
 export interface LifecycleExitSyncPolicy {
     isSyncActive(): boolean
@@ -63,30 +66,48 @@ function requestNativeExit(): void {
     }
 }
 
+const productionCheckpoint: LifecycleCheckpoint | undefined = isTauri
+    ? checkpointNativePersistentStore
+    : undefined
+
+async function settleLifecycleCommit(
+    reason: LifecycleCommitReason,
+    flush: LifecycleFlush,
+    checkpoint?: LifecycleCheckpoint,
+): Promise<void> {
+    try {
+        await flush(reason)
+    } catch (error) {
+        console.error(`Lifecycle flush failed for ${reason}`, error)
+    }
+
+    if (!checkpoint) return
+
+    try {
+        await checkpoint('truncate')
+    } catch (error) {
+        console.error(`Lifecycle checkpoint failed for ${reason}`, error)
+    }
+}
+
 export function registerLifecycleCommitListeners(
     flush: LifecycleFlush = flushPendingData,
     exitSyncPolicy?: LifecycleExitSyncPolicy,
+    checkpoint: LifecycleCheckpoint | undefined = productionCheckpoint,
 ): () => void {
     const requestFlush = (reason: LifecycleCommitReason, ackToken?: string) => {
-        void flush(reason)
-            .catch((error) => {
-                console.error(`Lifecycle flush failed for ${reason}`, error)
-            })
-            .finally(() => {
-                if (ackToken !== undefined) {
-                    acknowledgeNativeFlush(ackToken)
-                }
-            })
+        void settleLifecycleCommit(reason, flush, checkpoint).then(() => {
+            if (ackToken !== undefined) {
+                acknowledgeNativeFlush(ackToken)
+            }
+        })
     }
     const requestExitFlush = (ackToken: string) => {
         if (!exitSyncPolicy?.isSyncActive() || !holdNativeExit(ackToken)) {
             requestFlush('exit', ackToken)
             return
         }
-        void flush('exit')
-            .catch((error) => {
-                console.error('Lifecycle flush failed for exit', error)
-            })
+        void settleLifecycleCommit('exit', flush, checkpoint)
             .then(async () => {
                 if (!exitSyncPolicy.hasPendingSync() || await exitSyncPolicy.confirmExit()) {
                     requestNativeExit()

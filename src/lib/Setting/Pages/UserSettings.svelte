@@ -5,7 +5,7 @@
     
     import { DBState } from 'src/ts/stores.svelte';
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
-    import { alertConfirm} from "src/ts/alert";
+    import { alertConfirm, alertError, alertNormal, alertSelect } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
     import { isTauri, isNodeServer } from "src/ts/platform"
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
@@ -16,6 +16,8 @@
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
     import { loginToSionyw, testSionywLogin } from "src/ts/sionyw";
     import { cleanColdStorage } from "src/ts/process/coldstorage.svelte";
+    import { restoreNativePersistentSnapshot } from "src/ts/storage/nativePersistentMaintenance";
+    import { relaunch } from "@tauri-apps/plugin-process";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     let popup:Window = null
@@ -71,6 +73,35 @@
     }} className="mt-2">
     {language.loadBackupLocal}
 </Button>
+
+{#if isTauri}
+    <Button
+        onclick={async () => {
+            try {
+                await restoreNativePersistentSnapshot({
+                    choose: async (snapshots) => {
+                        const labels = snapshots.map((snapshot) => {
+                            const date = new Date(snapshot.modifiedAt).toLocaleString()
+                            const size = (snapshot.bytes / (1024 * 1024)).toFixed(1)
+                            return `${date} (${size} MiB)`
+                        })
+                        const selected = Number(await alertSelect(
+                            [...labels, language.cancel],
+                            language.chooseLocalSnapshot,
+                        ))
+                        return snapshots[selected]?.path ?? null
+                    },
+                    confirm: () => alertConfirm(language.restoreLocalSnapshotConfirm),
+                    restart: relaunch,
+                    onEmpty: () => alertNormal(language.noLocalSnapshots),
+                })
+            } catch (error) {
+                alertError(error instanceof Error ? error : String(error))
+            }
+        }} className="mt-2">
+        {language.restoreLocalSnapshot}
+    </Button>
+{/if}
 
 <Button
     onclick={async () => {

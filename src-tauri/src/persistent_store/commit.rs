@@ -130,6 +130,24 @@ pub(super) fn replace_commit(
     Ok(RevisionResult { revision })
 }
 
+pub(super) fn validate_replace_commit(
+    connection: &Connection,
+    staging_id: &str,
+    expected_revision: Option<i64>,
+) -> StoreResult<i64> {
+    require_staging(connection, staging_id)?;
+    let actual_revision = current_revision(connection)?;
+    if let Some(expected) = expected_revision {
+        if expected != actual_revision {
+            return Err(StoreError::RevisionConflict {
+                expected,
+                actual: actual_revision,
+            });
+        }
+    }
+    Ok(actual_revision)
+}
+
 pub(super) fn replace_abort(connection: &mut Connection, staging_id: &str) -> StoreResult<()> {
     if !staging_id.starts_with("staging-") {
         return Err(validation("Invalid staging generation"));
@@ -148,11 +166,11 @@ fn put_root(transaction: &Transaction<'_>, generation: &str, root: &Value) -> St
     Ok(())
 }
 
-fn require_staging(transaction: &Transaction<'_>, staging_id: &str) -> StoreResult<()> {
+fn require_staging(connection: &Connection, staging_id: &str) -> StoreResult<()> {
     if !staging_id.starts_with("staging-") {
         return Err(validation("Invalid staging generation"));
     }
-    let exists = transaction
+    let exists = connection
         .query_row(
             "SELECT 1 FROM root WHERE generation = ?1",
             [staging_id],

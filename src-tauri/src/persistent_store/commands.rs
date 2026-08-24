@@ -47,7 +47,7 @@ fn with_store_mut<T>(
     operation(store)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_open(
     app: AppHandle,
     state: State<'_, PersistentStoreState>,
@@ -75,7 +75,7 @@ pub(crate) fn pds_open(
     Ok(RevisionResult { revision })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_read_root(
     state: State<'_, PersistentStoreState>,
     lease: Option<String>,
@@ -83,7 +83,7 @@ pub(crate) fn pds_read_root(
     with_store(state, |store| store.read_root(lease.as_deref()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_query_characters(
     state: State<'_, PersistentStoreState>,
     query: CharacterQuery,
@@ -94,7 +94,7 @@ pub(crate) fn pds_query_characters(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_read_character(
     state: State<'_, PersistentStoreState>,
     id: String,
@@ -103,7 +103,7 @@ pub(crate) fn pds_read_character(
     with_store(state, |store| store.read_character(&id, lease.as_deref()))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_query_conversations(
     state: State<'_, PersistentStoreState>,
     query: ConversationQuery,
@@ -114,7 +114,7 @@ pub(crate) fn pds_query_conversations(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_read_conversation(
     state: State<'_, PersistentStoreState>,
     character_id: String,
@@ -126,7 +126,7 @@ pub(crate) fn pds_read_conversation(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_read_conversation_window(
     state: State<'_, PersistentStoreState>,
     query: ConversationWindowQuery,
@@ -137,7 +137,7 @@ pub(crate) fn pds_read_conversation_window(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_commit(
     state: State<'_, PersistentStoreState>,
     commit: WorkingSetCommit,
@@ -145,14 +145,14 @@ pub(crate) fn pds_commit(
     with_store_mut(state, |store| store.commit(&commit))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_replace_begin(
     state: State<'_, PersistentStoreState>,
 ) -> Result<StagingResult, StoreError> {
     with_store_mut(state, PersistentStore::replace_begin)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_replace_put_root(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
@@ -161,7 +161,7 @@ pub(crate) fn pds_replace_put_root(
     with_store_mut(state, |store| store.replace_put_root(&staging_id, &root))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_replace_add_characters(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
@@ -172,7 +172,7 @@ pub(crate) fn pds_replace_add_characters(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_replace_commit(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
@@ -183,7 +183,7 @@ pub(crate) fn pds_replace_commit(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_replace_abort(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
@@ -191,7 +191,7 @@ pub(crate) fn pds_replace_abort(
     with_store_mut(state, |store| store.replace_abort(&staging_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_materialize(
     state: State<'_, PersistentStoreState>,
     revision: Option<i64>,
@@ -199,7 +199,7 @@ pub(crate) fn pds_materialize(
     with_store(state, |store| store.materialize(revision))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_acquire_revision(
     state: State<'_, PersistentStoreState>,
     revision: i64,
@@ -207,7 +207,7 @@ pub(crate) fn pds_acquire_revision(
     with_store_mut(state, |store| store.acquire_revision(revision))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_release_revision(
     state: State<'_, PersistentStoreState>,
     lease: String,
@@ -215,7 +215,7 @@ pub(crate) fn pds_release_revision(
     with_store_mut(state, |store| store.release_revision(&lease))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_checkpoint(
     state: State<'_, PersistentStoreState>,
     mode: CheckpointMode,
@@ -223,7 +223,7 @@ pub(crate) fn pds_checkpoint(
     with_store(state, |store| store.checkpoint(mode))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_snapshot_create(
     state: State<'_, PersistentStoreState>,
     reason: String,
@@ -231,14 +231,14 @@ pub(crate) fn pds_snapshot_create(
     with_store(state, |store| store.snapshot_create(&reason))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_snapshot_list(
     state: State<'_, PersistentStoreState>,
 ) -> Result<Vec<SnapshotInfo>, StoreError> {
     with_store(state, PersistentStore::snapshot_list)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_snapshot_restore_request(
     state: State<'_, PersistentStoreState>,
     path: String,
@@ -248,7 +248,7 @@ pub(crate) fn pds_snapshot_restore_request(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_get_app_kv(
     state: State<'_, PersistentStoreState>,
     key: String,
@@ -256,7 +256,7 @@ pub(crate) fn pds_get_app_kv(
     with_store(state, |store| store.get_app_kv(&key))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub(crate) fn pds_set_app_kv(
     state: State<'_, PersistentStoreState>,
     key: String,

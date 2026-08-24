@@ -67,6 +67,7 @@ import {
 import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
 import { formatNameList, summarizeSyncConflict } from "./storage/sync/syncConflictSummary";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
+import { schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
     initializeOfficialAccountBootstrap,
     publishOfficialRevisionIfChanged,
@@ -295,6 +296,7 @@ export async function loadData() {
         startObserveDom()
         registerModelDynamic()
         await saveDb()
+        if (isTauri) schedulePeriodicNativeSnapshot()
         moduleUpdate()
         cleanChunks()
         void alertTOS().then((accepted) => {

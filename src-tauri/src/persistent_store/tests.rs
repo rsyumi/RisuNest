@@ -3,6 +3,12 @@ use super::{
     ConversationWindowQuery, PersistentStore, QueryOrder, StoreError, WorkingSetCommit,
 };
 use serde_json::{json, Value};
+use std::{
+    fs::{self, OpenOptions},
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("../../fixtures/persistent-fixture.json"))
@@ -805,6 +811,324 @@ fn checkpoints_accept_both_documented_modes() {
     store
         .checkpoint(CheckpointMode::Truncate)
         .expect("truncate checkpoint");
+}
+
+fn snapshots_dir(directory: &tempfile::TempDir) -> PathBuf {
+    directory.path().join("persistent/snapshots")
+}
+
+fn sparse_snapshot(path: &Path, bytes: u64) {
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .expect("create sparse snapshot");
+    file.set_len(bytes).expect("size sparse snapshot");
+    thread::sleep(Duration::from_millis(10));
+}
+
+fn stage_root(store: &mut PersistentStore, username: &str) -> String {
+    let staging = store.replace_begin().expect("begin staged replacement");
+    store
+        .replace_put_root(&staging.staging_id, &json!({ "username": username }))
+        .expect("stage replacement root");
+    staging.staging_id
+}
+
+#[test]
+fn ninth_snapshot_removes_the_oldest_and_leaves_eight() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let mut created = Vec::new();
+
+    for index in 0..9 {
+        created.push(
+            store
+                .snapshot_create(&format!("rotation-{index}"))
+                .expect("create rotating snapshot")
+                .path,
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let listed = store.snapshot_list().expect("list rotated snapshots");
+    assert_eq!(listed.len(), 8);
+    assert!(!Path::new(&created[0]).exists());
+    assert!(created[1..].iter().all(|path| Path::new(path).is_file()));
+}
+
+#[test]
+fn byte_rotation_uses_the_512_mib_floor_and_removes_oldest_first() {
+    const MIB: u64 = 1024 * 1024;
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let snapshots = snapshots_dir(&directory);
+    let mut sparse = Vec::new();
+    for index in 0..6 {
+        let path = snapshots.join(format!("persistent-sparse-{index}.db"));
+        sparse_snapshot(&path, 100 * MIB);
+        sparse.push(path);
+    }
+
+    let created = store
+        .snapshot_create("floor-rotation")
+        .expect("create snapshot and rotate");
+    let listed = store.snapshot_list().expect("list floor-rotated snapshots");
+    let total: u64 = listed.iter().map(|snapshot| snapshot.bytes).sum();
+
+    assert!(total <= 512 * MIB);
+    assert!(!sparse[0].exists());
+    assert!(sparse[1..].iter().all(|path| path.is_file()));
+    assert!(Path::new(&created.path).is_file());
+}
+
+#[test]
+fn byte_rotation_uses_four_times_current_logical_database_size() {
+    const MIB: u64 = 1024 * 1024;
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let store = PersistentStore::open(directory.path()).expect("open persistent store");
+    store
+        .connection
+        .execute_batch(
+            "CREATE TABLE rotation_payload (value BLOB);\n             INSERT INTO rotation_payload VALUES (zeroblob(140 * 1024 * 1024));",
+        )
+        .expect("grow logical database above the rotation floor branch");
+    let page_count: i64 = store
+        .connection
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .expect("read page count");
+    let page_size: i64 = store
+        .connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .expect("read page size");
+    let logical_bytes = (page_count * page_size) as u64;
+    assert!(logical_bytes * 4 > 512 * MIB);
+
+    let snapshots = snapshots_dir(&directory);
+    let sparse_bytes = logical_bytes * 3 / 4;
+    let mut sparse = Vec::new();
+    for index in 0..5 {
+        let path = snapshots.join(format!("persistent-large-sparse-{index}.db"));
+        sparse_snapshot(&path, sparse_bytes);
+        sparse.push(path);
+    }
+
+    let created = store
+        .snapshot_create("large-rotation")
+        .expect("create snapshot and rotate using logical size");
+    let listed = store.snapshot_list().expect("list size-rotated snapshots");
+    let total: u64 = listed.iter().map(|snapshot| snapshot.bytes).sum();
+
+    assert!(total <= logical_bytes * 4);
+    assert!(!sparse[0].exists());
+    assert!(sparse[1..].iter().all(|path| path.is_file()));
+    assert!(Path::new(&created.path).is_file());
+}
+
+#[test]
+fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
+    let (directory, mut store, database) = open_fixture();
+    let target = store
+        .snapshot_create("restore-target")
+        .expect("create restore target");
+    for index in 0..7 {
+        store
+            .snapshot_create(&format!("fill-{index}"))
+            .expect("fill snapshot rotation");
+        thread::sleep(Duration::from_millis(10));
+    }
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Current before restore" })),
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+        })
+        .expect("change current data");
+    store
+        .snapshot_restore_request(Path::new(&target.path))
+        .expect("request restore");
+    drop(store);
+
+    let restored = PersistentStore::open(directory.path()).expect("apply pending restore");
+    assert_eq!(
+        restored
+            .materialize(None)
+            .expect("materialize restored data"),
+        database
+    );
+    assert!(Path::new(&target.path).is_file());
+    assert!(!snapshots_dir(&directory)
+        .join("pending-restore.json")
+        .exists());
+    assert!(
+        restored
+            .snapshot_list()
+            .expect("list rotated restore snapshots")
+            .len()
+            <= 8
+    );
+
+    let pre_restore = restored
+        .snapshot_list()
+        .expect("list restore snapshots")
+        .into_iter()
+        .find(|snapshot| snapshot.path.contains("pre-restore"))
+        .expect("pre-restore snapshot remains after rotation");
+    let connection =
+        rusqlite::Connection::open(pre_restore.path).expect("open pre-restore snapshot");
+    let value: String = connection
+        .query_row(
+            "SELECT value FROM root WHERE generation = 'revision-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read pre-restore root");
+    assert_eq!(
+        serde_json::from_str::<Value>(&value).expect("parse root")["username"],
+        "Current before restore"
+    );
+}
+
+#[test]
+fn invalid_restore_candidates_preserve_current_data_and_clear_marker() {
+    for wrong_version in [false, true] {
+        let (directory, mut store, database) = open_fixture();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root: Some(json!({ "username": "Current protected data" })),
+                character: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+            })
+            .expect("change current data");
+        let expected = store.materialize(None).expect("materialize current data");
+        assert_ne!(expected, database);
+        let candidate = snapshots_dir(&directory).join(if wrong_version {
+            "persistent-wrong-version.db"
+        } else {
+            "persistent-corrupt.db"
+        });
+        if wrong_version {
+            let connection =
+                rusqlite::Connection::open(&candidate).expect("create wrong-version database");
+            connection
+                .execute_batch("PRAGMA user_version = 2;")
+                .expect("set wrong schema version");
+        } else {
+            fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
+        }
+        store
+            .snapshot_restore_request(&candidate)
+            .expect("write pending marker");
+        drop(store);
+
+        let reopened =
+            PersistentStore::open(directory.path()).expect("reopen after rejected restore");
+        assert_eq!(
+            reopened
+                .materialize(None)
+                .expect("read preserved current data"),
+            expected
+        );
+        assert!(!snapshots_dir(&directory)
+            .join("pending-restore.json")
+            .exists());
+    }
+}
+
+#[test]
+fn replacements_snapshot_only_nonzero_revisions_and_abort_on_snapshot_failure() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let seed = stage_root(&mut store, "Seed");
+    store
+        .replace_commit(&seed, Some(0))
+        .expect("activate revision one");
+    assert!(store
+        .snapshot_list()
+        .expect("list seed snapshots")
+        .is_empty());
+
+    let replacement = stage_root(&mut store, "Revision two");
+    store
+        .replace_commit(&replacement, Some(1))
+        .expect("activate protected replacement");
+    let snapshots = store.snapshot_list().expect("list pre-replace snapshots");
+    assert_eq!(snapshots.len(), 1);
+    let snapshot =
+        rusqlite::Connection::open(&snapshots[0].path).expect("open pre-replace snapshot");
+    let revision: String = snapshot
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'currentRevision'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read snapshotted revision");
+    assert_eq!(revision, "1");
+    drop(snapshot);
+
+    let failed = stage_root(&mut store, "Must not activate");
+    for entry in fs::read_dir(snapshots_dir(&directory)).expect("read snapshots directory") {
+        let path = entry.expect("read snapshot entry").path();
+        fs::remove_file(path).expect("remove snapshot file");
+    }
+    fs::remove_dir(snapshots_dir(&directory)).expect("remove snapshots directory");
+    fs::write(snapshots_dir(&directory), b"blocks directory creation")
+        .expect("block snapshot directory");
+    assert!(store.replace_commit(&failed, Some(2)).is_err());
+    assert_eq!(store.revision().expect("read preserved revision"), 2);
+    assert_eq!(
+        store.read_root(None).expect("read preserved root").value["username"],
+        "Revision two"
+    );
+}
+
+#[test]
+fn checkpoint_truncate_reports_busy_and_truncates_when_unblocked() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let store = PersistentStore::open(directory.path()).expect("open persistent store");
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0; INSERT INTO app_kv VALUES ('first', '1');")
+        .expect("create initial WAL frames");
+    let database_path = directory.path().join("persistent/persistent.db");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    store
+        .checkpoint(CheckpointMode::Passive)
+        .expect("passive checkpoint");
+    assert!(fs::metadata(&wal_path).expect("read passive WAL").len() > 0);
+
+    let reader = rusqlite::Connection::open(&database_path).expect("open blocking reader");
+    reader
+        .execute_batch("BEGIN; SELECT value FROM app_kv WHERE key = 'first';")
+        .expect("hold read snapshot");
+    store
+        .connection
+        .execute("INSERT INTO app_kv VALUES ('second', '2')", [])
+        .expect("write newer WAL frame");
+    store
+        .connection
+        .busy_timeout(Duration::ZERO)
+        .expect("disable checkpoint wait");
+    assert!(store.checkpoint(CheckpointMode::Truncate).is_err());
+    reader
+        .execute_batch("ROLLBACK")
+        .expect("release read snapshot");
+
+    store
+        .checkpoint(CheckpointMode::Truncate)
+        .expect("truncate checkpoint");
+    assert_eq!(
+        fs::metadata(&wal_path).expect("read truncated WAL").len(),
+        0
+    );
 }
 
 #[test]

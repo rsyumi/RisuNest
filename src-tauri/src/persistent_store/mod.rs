@@ -381,6 +381,11 @@ impl PersistentStore {
         staging_id: &str,
         expected_revision: Option<i64>,
     ) -> StoreResult<RevisionResult> {
+        let revision =
+            commit::validate_replace_commit(&self.connection, staging_id, expected_revision)?;
+        if revision > 0 {
+            snapshot::create(&self.connection, &self.snapshots_dir, "pre-replace")?;
+        }
         commit::replace_commit(&mut self.connection, staging_id, expected_revision)
     }
 

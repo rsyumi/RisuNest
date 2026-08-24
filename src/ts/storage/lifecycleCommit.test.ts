@@ -2,9 +2,15 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+const { checkpointNativePersistentStore } = vi.hoisted(() => ({
+    checkpointNativePersistentStore: vi.fn(async () => undefined),
+}))
+
 vi.mock('./persistentDataRuntime.svelte', () => ({
     flushPendingData: vi.fn(async () => undefined),
 }))
+vi.mock('./nativePersistentMaintenance', () => ({ checkpointNativePersistentStore }))
+vi.mock('../platform', () => ({ isTauri: false }))
 
 import { registerLifecycleCommitListeners } from './lifecycleCommit'
 
@@ -120,6 +126,87 @@ describe('registerLifecycleCommitListeners', () => {
         delete (window as any).RisuLifecycleBridge
     })
 
+    it('flushes, checkpoints with truncate, then acknowledges a native event', async () => {
+        const order: string[] = []
+        const onFlushComplete = vi.fn(() => order.push('ack'))
+        ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+        const flush = vi.fn(async () => { order.push('flush') })
+        const checkpoint = vi.fn(async () => { order.push('checkpoint') })
+        const dispose = registerLifecycleCommitListeners(flush, undefined, checkpoint)
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'stop', ackToken: 'stop-1' },
+        }))
+
+        await vi.waitFor(() => expect(onFlushComplete).toHaveBeenCalledWith('stop-1'))
+        expect(order).toEqual(['flush', 'checkpoint', 'ack'])
+        expect(checkpoint).toHaveBeenCalledWith('truncate')
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('attempts the checkpoint and acknowledges after a flush rejection', async () => {
+        const onFlushComplete = vi.fn()
+        ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const flush = vi.fn(async () => { throw new Error('flush failed') })
+        const checkpoint = vi.fn(async () => undefined)
+        const dispose = registerLifecycleCommitListeners(flush, undefined, checkpoint)
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'trim-memory', ackToken: 'trim-1' },
+        }))
+
+        await vi.waitFor(() => expect(onFlushComplete).toHaveBeenCalledWith('trim-1'))
+        expect(checkpoint).toHaveBeenCalledWith('truncate')
+        expect(errorLog).toHaveBeenCalledWith(
+            'Lifecycle flush failed for trim-memory',
+            expect.any(Error),
+        )
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('logs a checkpoint rejection and still acknowledges', async () => {
+        const onFlushComplete = vi.fn()
+        ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const checkpointError = new Error('checkpoint failed')
+        const checkpoint = vi.fn(async () => { throw checkpointError })
+        const dispose = registerLifecycleCommitListeners(
+            vi.fn(async () => undefined),
+            undefined,
+            checkpoint,
+        )
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit', ackToken: 'exit-checkpoint' },
+        }))
+
+        await vi.waitFor(() => expect(onFlushComplete).toHaveBeenCalledWith('exit-checkpoint'))
+        expect(errorLog).toHaveBeenCalledWith(
+            'Lifecycle checkpoint failed for exit',
+            checkpointError,
+        )
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('does not checkpoint on the web production path', async () => {
+        const onFlushComplete = vi.fn()
+        ;(window as any).RisuLifecycleBridge = { onFlushComplete }
+        const dispose = registerLifecycleCommitListeners(vi.fn(async () => undefined))
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'stop', ackToken: 'web-stop' },
+        }))
+
+        await vi.waitFor(() => expect(onFlushComplete).toHaveBeenCalledWith('web-stop'))
+        expect(checkpointNativePersistentStore).not.toHaveBeenCalled()
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
     it('acknowledges the native ack token when the flush fails', async () => {
         const onFlushComplete = vi.fn()
         ;(window as any).RisuLifecycleBridge = { onFlushComplete }
@@ -193,6 +280,35 @@ describe('registerLifecycleCommitListeners', () => {
             await vi.waitFor(() => expect(bridge.requestExit).toHaveBeenCalledTimes(1))
             expect(policy.confirmExit).not.toHaveBeenCalled()
             expect(bridge.onFlushComplete).not.toHaveBeenCalled()
+            dispose()
+        })
+
+        it('waits for the checkpoint before evaluating a held exit', async () => {
+            const bridge = makeBridge()
+            let settleCheckpoint!: () => void
+            const checkpoint = vi.fn(() => new Promise<void>((resolve) => {
+                settleCheckpoint = resolve
+            }))
+            const policy = {
+                isSyncActive: () => true,
+                hasPendingSync: vi.fn(() => false),
+                confirmExit: vi.fn(async () => true),
+            }
+            const dispose = registerLifecycleCommitListeners(
+                vi.fn(async () => undefined),
+                policy,
+                checkpoint,
+            )
+
+            dispatchExit()
+            await vi.waitFor(() => expect(checkpoint).toHaveBeenCalledTimes(1))
+
+            expect(policy.hasPendingSync).not.toHaveBeenCalled()
+            expect(policy.confirmExit).not.toHaveBeenCalled()
+            expect(bridge.requestExit).not.toHaveBeenCalled()
+
+            settleCheckpoint()
+            await vi.waitFor(() => expect(bridge.requestExit).toHaveBeenCalledTimes(1))
             dispose()
         })
 

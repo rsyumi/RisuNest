@@ -6,6 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -15,6 +16,8 @@ use uuid::Uuid;
 const LEASE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const PENDING_RESTORE_FILE: &str = "pending-restore.json";
 const DATABASE_FILE: &str = "persistent.db";
+const MAX_SNAPSHOTS: usize = 8;
+const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Deserialize, Serialize)]
 struct PendingRestore {
@@ -147,11 +150,20 @@ pub(super) fn release_revision(connection: &mut Connection, lease: &str) -> Stor
 }
 
 pub(super) fn checkpoint(connection: &Connection, mode: CheckpointMode) -> StoreResult<()> {
-    let mode = match mode {
-        CheckpointMode::Passive => "PASSIVE",
-        CheckpointMode::Truncate => "TRUNCATE",
+    let (mode, reject_busy) = match mode {
+        CheckpointMode::Passive => ("PASSIVE", false),
+        CheckpointMode::Truncate => ("TRUNCATE", true),
     };
-    connection.execute_batch(&format!("PRAGMA wal_checkpoint({mode})"))?;
+    let (busy, _, _): (i64, i64, i64) =
+        connection.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if reject_busy && busy != 0 {
+        return Err(StoreError::Store {
+            message: "truncate checkpoint could not complete because the database is busy"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -161,6 +173,7 @@ pub(super) fn create(
     reason: &str,
 ) -> StoreResult<SnapshotCreated> {
     fs::create_dir_all(snapshots_dir)?;
+    let current_bytes = logical_database_bytes(connection)?;
     let stamp: String =
         connection.query_row("SELECT strftime('%Y%m%d-%H%M%f', 'now')", [], |row| {
             row.get(0)
@@ -170,11 +183,17 @@ pub(super) fn create(
     let started = Instant::now();
     connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
     let metadata = fs::metadata(&path)?;
-    Ok(SnapshotCreated {
+    let created = SnapshotCreated {
         path: path.to_string_lossy().into_owned(),
         bytes: metadata.len(),
         duration_ms: started.elapsed().as_millis() as u64,
-    })
+    };
+    let mut protected = vec![path];
+    if let Some(target) = pending_restore_target(snapshots_dir)? {
+        protected.push(target);
+    }
+    rotate(snapshots_dir, current_bytes, &protected)?;
+    Ok(created)
 }
 
 pub(super) fn list(snapshots_dir: &Path) -> StoreResult<Vec<SnapshotInfo>> {
@@ -243,6 +262,58 @@ fn validate_snapshot_path(snapshots_dir: &Path, path: &Path) -> StoreResult<Path
         ));
     }
     Ok(path)
+}
+
+fn logical_database_bytes(connection: &Connection) -> StoreResult<u64> {
+    let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    Ok((page_count as u64).saturating_mul(page_size as u64))
+}
+
+fn pending_restore_target(snapshots_dir: &Path) -> StoreResult<Option<PathBuf>> {
+    let marker = snapshots_dir.join(PENDING_RESTORE_FILE);
+    if !marker.is_file() {
+        return Ok(None);
+    }
+    let pending: PendingRestore = serde_json::from_slice(&fs::read(marker)?)?;
+    Ok(Some(validate_snapshot_path(snapshots_dir, &pending.path)?))
+}
+
+fn rotate(
+    snapshots_dir: &Path,
+    current_database_bytes: u64,
+    protected: &[PathBuf],
+) -> StoreResult<()> {
+    let byte_budget = current_database_bytes
+        .saturating_mul(4)
+        .max(MIN_SNAPSHOT_BYTES);
+    let protected = protected
+        .iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect::<HashSet<_>>();
+    let mut snapshots = list(snapshots_dir)?;
+    snapshots.sort_by(|left, right| {
+        left.modified_at
+            .cmp(&right.modified_at)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut total = snapshots
+        .iter()
+        .fold(0u64, |sum, snapshot| sum.saturating_add(snapshot.bytes));
+
+    while snapshots.len() > MAX_SNAPSHOTS || total > byte_budget {
+        let Some(index) = snapshots.iter().position(|snapshot| {
+            fs::canonicalize(&snapshot.path)
+                .map(|path| !protected.contains(&path))
+                .unwrap_or(true)
+        }) else {
+            break;
+        };
+        let snapshot = snapshots.remove(index);
+        fs::remove_file(&snapshot.path)?;
+        total = total.saturating_sub(snapshot.bytes);
+    }
+    Ok(())
 }
 
 fn validate_restore_database(path: &Path) -> StoreResult<()> {
