@@ -1,0 +1,965 @@
+{
+  "apiType": "fixture-provider",
+  "username": "Fixture User",
+  "formatversion": 4,
+  "characters": [
+    {
+      "type": "character",
+      "chaId": "char-b",
+      "name": "Beta",
+      "image": "char-b.png",
+      "firstMessage": "Hello from Beta",
+      "desc": "Beta description",
+      "notes": "",
+      "chats": [
+        {
+          "id": "conv-beta",
+          "name": "Beta chat",
+          "note": "",
+          "localLore": [],
+          "message": [
+            {
+              "role": "user",
+              "data": "message-000",
+              "chatId": "msg-000",
+              "time": 1700000000000
+            },
+            {
+              "role": "char",
+              "data": "message-001",
+              "chatId": "msg-001",
+              "time": 1700000000001
+            },
+            {
+              "role": "user",
+              "data": "message-002",
+              "chatId": "msg-002",
+              "time": 1700000000002
+            }
+          ],
+          "lastDate": 200
+        }
+      ],
+      "chatFolders": [],
+      "chatPage": 0,
+      "viewScreen": "none",
+      "bias": [],
+      "emotionImages": [],
+      "globalLore": [],
+      "sdData": [],
+      "customscript": [],
+      "triggerscript": [],
+      "utilityBot": false,
+      "exampleMessage": "",
+      "creatorNotes": "",
+      "systemPrompt": "",
+      "postHistoryInstructions": "",
+      "replaceGlobalNote": "",
+      "additionalText": "",
+      "alternateGreetings": [],
+      "tags": [],
+      "creator": "fixture",
+      "characterVersion": "1",
+      "personality": "",
+      "scenario": "",
+      "firstMsgIndex": 0,
+      "lastInteraction": 200
+    },
+    {
+      "type": "character",
+      "chaId": "char-a",
+      "name": "Alpha",
+      "image": "char-a.png",
+      "firstMessage": "Hello from Alpha",
+      "desc": "Alpha description",
+      "notes": "",
+      "chats": [
+        {
+          "id": "conv-long",
+          "name": "Long chat",
+          "note": "",
+          "localLore": [],
+          "message": [
+            {
+              "role": "user",
+              "data": "message-000",
+              "chatId": "msg-000",
+              "time": 1700000000000
+            },
+            {
+              "role": "char",
+              "data": "message-001",
+              "chatId": "msg-001",
+              "time": 1700000000001
+            },
+            {
+              "role": "user",
+              "data": "message-002",
+              "chatId": "msg-002",
+              "time": 1700000000002
+            },
+            {
+              "role": "char",
+              "data": "message-003",
+              "chatId": "msg-003",
+              "time": 1700000000003
+            },
+            {
+              "role": "user",
+              "data": "message-004",
+              "chatId": "msg-004",
+              "time": 1700000000004
+            },
+            {
+              "role": "char",
+              "data": "message-005",
+              "chatId": "msg-005",
+              "time": 1700000000005
+            },
+            {
+              "role": "user",
+              "data": "message-006",
+              "chatId": "msg-006",
+              "time": 1700000000006
+            },
+            {
+              "role": "char",
+              "data": "message-007",
+              "chatId": "msg-007",
+              "time": 1700000000007
+            },
+            {
+              "role": "user",
+              "data": "message-008",
+              "chatId": "msg-008",
+              "time": 1700000000008
+            },
+            {
+              "role": "char",
+              "data": "message-009",
+              "chatId": "msg-009",
+              "time": 1700000000009
+            },
+            {
+              "role": "user",
+              "data": "message-010",
+              "chatId": "msg-010",
+              "time": 1700000000010
+            },
+            {
+              "role": "char",
+              "data": "message-011",
+              "chatId": "msg-011",
+              "time": 1700000000011
+            },
+            {
+              "role": "user",
+              "data": "message-012",
+              "chatId": "msg-012",
+              "time": 1700000000012
+            },
+            {
+              "role": "char",
+              "data": "message-013",
+              "chatId": "msg-013",
+              "time": 1700000000013
+            },
+            {
+              "role": "user",
+              "data": "message-014",
+              "chatId": "msg-014",
+              "time": 1700000000014
+            },
+            {
+              "role": "char",
+              "data": "message-015",
+              "chatId": "msg-015",
+              "time": 1700000000015
+            },
+            {
+              "role": "user",
+              "data": "message-016",
+              "chatId": "msg-016",
+              "time": 1700000000016
+            },
+            {
+              "role": "char",
+              "data": "message-017",
+              "chatId": "msg-017",
+              "time": 1700000000017
+            },
+            {
+              "role": "user",
+              "data": "message-018",
+              "chatId": "msg-018",
+              "time": 1700000000018
+            },
+            {
+              "role": "char",
+              "data": "message-019",
+              "chatId": "msg-019",
+              "time": 1700000000019
+            },
+            {
+              "role": "user",
+              "data": "message-020",
+              "chatId": "msg-020",
+              "time": 1700000000020
+            },
+            {
+              "role": "char",
+              "data": "message-021",
+              "chatId": "msg-021",
+              "time": 1700000000021
+            },
+            {
+              "role": "user",
+              "data": "message-022",
+              "chatId": "msg-022",
+              "time": 1700000000022
+            },
+            {
+              "role": "char",
+              "data": "message-023",
+              "chatId": "msg-023",
+              "time": 1700000000023
+            },
+            {
+              "role": "user",
+              "data": "message-024",
+              "chatId": "msg-024",
+              "time": 1700000000024
+            },
+            {
+              "role": "char",
+              "data": "message-025",
+              "chatId": "msg-025",
+              "time": 1700000000025
+            },
+            {
+              "role": "user",
+              "data": "message-026",
+              "chatId": "msg-026",
+              "time": 1700000000026
+            },
+            {
+              "role": "char",
+              "data": "message-027",
+              "chatId": "msg-027",
+              "time": 1700000000027
+            },
+            {
+              "role": "user",
+              "data": "message-028",
+              "chatId": "msg-028",
+              "time": 1700000000028
+            },
+            {
+              "role": "char",
+              "data": "message-029",
+              "chatId": "msg-029",
+              "time": 1700000000029
+            },
+            {
+              "role": "user",
+              "data": "message-030",
+              "chatId": "msg-030",
+              "time": 1700000000030
+            },
+            {
+              "role": "char",
+              "data": "message-031",
+              "chatId": "msg-031",
+              "time": 1700000000031
+            },
+            {
+              "role": "user",
+              "data": "message-032",
+              "chatId": "msg-032",
+              "time": 1700000000032
+            },
+            {
+              "role": "char",
+              "data": "message-033",
+              "chatId": "msg-033",
+              "time": 1700000000033
+            },
+            {
+              "role": "user",
+              "data": "message-034",
+              "chatId": "msg-034",
+              "time": 1700000000034
+            },
+            {
+              "role": "char",
+              "data": "message-035",
+              "chatId": "msg-035",
+              "time": 1700000000035
+            },
+            {
+              "role": "user",
+              "data": "message-036",
+              "chatId": "msg-036",
+              "time": 1700000000036
+            },
+            {
+              "role": "char",
+              "data": "message-037",
+              "chatId": "msg-037",
+              "time": 1700000000037
+            },
+            {
+              "role": "user",
+              "data": "message-038",
+              "chatId": "msg-038",
+              "time": 1700000000038
+            },
+            {
+              "role": "char",
+              "data": "message-039",
+              "chatId": "msg-039",
+              "time": 1700000000039
+            },
+            {
+              "role": "user",
+              "data": "message-040",
+              "chatId": "msg-040",
+              "time": 1700000000040
+            },
+            {
+              "role": "char",
+              "data": "message-041",
+              "chatId": "msg-041",
+              "time": 1700000000041
+            },
+            {
+              "role": "user",
+              "data": "message-042",
+              "chatId": "msg-042",
+              "time": 1700000000042
+            },
+            {
+              "role": "char",
+              "data": "message-043",
+              "chatId": "msg-043",
+              "time": 1700000000043
+            },
+            {
+              "role": "user",
+              "data": "message-044",
+              "chatId": "msg-044",
+              "time": 1700000000044
+            },
+            {
+              "role": "char",
+              "data": "message-045",
+              "chatId": "msg-045",
+              "time": 1700000000045
+            },
+            {
+              "role": "user",
+              "data": "message-046",
+              "chatId": "msg-046",
+              "time": 1700000000046
+            },
+            {
+              "role": "char",
+              "data": "message-047",
+              "chatId": "msg-047",
+              "time": 1700000000047
+            },
+            {
+              "role": "user",
+              "data": "message-048",
+              "chatId": "msg-048",
+              "time": 1700000000048
+            },
+            {
+              "role": "char",
+              "data": "message-049",
+              "chatId": "msg-049",
+              "time": 1700000000049
+            },
+            {
+              "role": "user",
+              "data": "message-050",
+              "chatId": "msg-050",
+              "time": 1700000000050
+            },
+            {
+              "role": "char",
+              "data": "message-051",
+              "chatId": "msg-051",
+              "time": 1700000000051
+            },
+            {
+              "role": "user",
+              "data": "message-052",
+              "chatId": "msg-052",
+              "time": 1700000000052
+            },
+            {
+              "role": "char",
+              "data": "message-053",
+              "chatId": "msg-053",
+              "time": 1700000000053
+            },
+            {
+              "role": "user",
+              "data": "message-054",
+              "chatId": "msg-054",
+              "time": 1700000000054
+            },
+            {
+              "role": "char",
+              "data": "message-055",
+              "chatId": "msg-055",
+              "time": 1700000000055
+            },
+            {
+              "role": "user",
+              "data": "message-056",
+              "chatId": "msg-056",
+              "time": 1700000000056
+            },
+            {
+              "role": "char",
+              "data": "message-057",
+              "chatId": "msg-057",
+              "time": 1700000000057
+            },
+            {
+              "role": "user",
+              "data": "message-058",
+              "chatId": "msg-058",
+              "time": 1700000000058
+            },
+            {
+              "role": "char",
+              "data": "message-059",
+              "chatId": "msg-059",
+              "time": 1700000000059
+            },
+            {
+              "role": "user",
+              "data": "message-060",
+              "chatId": "msg-060",
+              "time": 1700000000060
+            },
+            {
+              "role": "char",
+              "data": "message-061",
+              "chatId": "msg-061",
+              "time": 1700000000061
+            },
+            {
+              "role": "user",
+              "data": "message-062",
+              "chatId": "msg-062",
+              "time": 1700000000062
+            },
+            {
+              "role": "char",
+              "data": "message-063",
+              "chatId": "msg-063",
+              "time": 1700000000063
+            },
+            {
+              "role": "user",
+              "data": "message-064",
+              "chatId": "msg-064",
+              "time": 1700000000064
+            },
+            {
+              "role": "char",
+              "data": "message-065",
+              "chatId": "msg-065",
+              "time": 1700000000065
+            },
+            {
+              "role": "user",
+              "data": "message-066",
+              "chatId": "msg-066",
+              "time": 1700000000066
+            },
+            {
+              "role": "char",
+              "data": "message-067",
+              "chatId": "msg-067",
+              "time": 1700000000067
+            },
+            {
+              "role": "user",
+              "data": "message-068",
+              "chatId": "msg-068",
+              "time": 1700000000068
+            },
+            {
+              "role": "char",
+              "data": "message-069",
+              "chatId": "msg-069",
+              "time": 1700000000069
+            },
+            {
+              "role": "user",
+              "data": "message-070",
+              "chatId": "msg-070",
+              "time": 1700000000070
+            },
+            {
+              "role": "char",
+              "data": "message-071",
+              "chatId": "msg-071",
+              "time": 1700000000071
+            },
+            {
+              "role": "user",
+              "data": "message-072",
+              "chatId": "msg-072",
+              "time": 1700000000072
+            },
+            {
+              "role": "char",
+              "data": "message-073",
+              "chatId": "msg-073",
+              "time": 1700000000073
+            },
+            {
+              "role": "user",
+              "data": "message-074",
+              "chatId": "msg-074",
+              "time": 1700000000074
+            },
+            {
+              "role": "char",
+              "data": "message-075",
+              "chatId": "msg-075",
+              "time": 1700000000075
+            },
+            {
+              "role": "user",
+              "data": "message-076",
+              "chatId": "msg-076",
+              "time": 1700000000076
+            },
+            {
+              "role": "char",
+              "data": "message-077",
+              "chatId": "msg-077",
+              "time": 1700000000077
+            },
+            {
+              "role": "user",
+              "data": "message-078",
+              "chatId": "msg-078",
+              "time": 1700000000078
+            },
+            {
+              "role": "char",
+              "data": "message-079",
+              "chatId": "msg-079",
+              "time": 1700000000079
+            },
+            {
+              "role": "user",
+              "data": "message-080",
+              "chatId": "msg-080",
+              "time": 1700000000080
+            },
+            {
+              "role": "char",
+              "data": "message-081",
+              "chatId": "msg-081",
+              "time": 1700000000081
+            },
+            {
+              "role": "user",
+              "data": "message-082",
+              "chatId": "msg-082",
+              "time": 1700000000082
+            },
+            {
+              "role": "char",
+              "data": "message-083",
+              "chatId": "msg-083",
+              "time": 1700000000083
+            },
+            {
+              "role": "user",
+              "data": "message-084",
+              "chatId": "msg-084",
+              "time": 1700000000084
+            },
+            {
+              "role": "char",
+              "data": "message-085",
+              "chatId": "msg-085",
+              "time": 1700000000085
+            },
+            {
+              "role": "user",
+              "data": "message-086",
+              "chatId": "msg-086",
+              "time": 1700000000086
+            },
+            {
+              "role": "char",
+              "data": "message-087",
+              "chatId": "msg-087",
+              "time": 1700000000087
+            },
+            {
+              "role": "user",
+              "data": "message-088",
+              "chatId": "msg-088",
+              "time": 1700000000088
+            },
+            {
+              "role": "char",
+              "data": "message-089",
+              "chatId": "msg-089",
+              "time": 1700000000089
+            },
+            {
+              "role": "user",
+              "data": "message-090",
+              "chatId": "msg-090",
+              "time": 1700000000090
+            },
+            {
+              "role": "char",
+              "data": "message-091",
+              "chatId": "msg-091",
+              "time": 1700000000091
+            },
+            {
+              "role": "user",
+              "data": "message-092",
+              "chatId": "msg-092",
+              "time": 1700000000092
+            },
+            {
+              "role": "char",
+              "data": "message-093",
+              "chatId": "msg-093",
+              "time": 1700000000093
+            },
+            {
+              "role": "user",
+              "data": "message-094",
+              "chatId": "msg-094",
+              "time": 1700000000094
+            },
+            {
+              "role": "char",
+              "data": "message-095",
+              "chatId": "msg-095",
+              "time": 1700000000095
+            },
+            {
+              "role": "user",
+              "data": "message-096",
+              "chatId": "msg-096",
+              "time": 1700000000096
+            },
+            {
+              "role": "char",
+              "data": "message-097",
+              "chatId": "msg-097",
+              "time": 1700000000097
+            },
+            {
+              "role": "user",
+              "data": "message-098",
+              "chatId": "msg-098",
+              "time": 1700000000098
+            },
+            {
+              "role": "char",
+              "data": "message-099",
+              "chatId": "msg-099",
+              "time": 1700000000099
+            },
+            {
+              "role": "user",
+              "data": "message-100",
+              "chatId": "msg-100",
+              "time": 1700000000100
+            },
+            {
+              "role": "char",
+              "data": "message-101",
+              "chatId": "msg-101",
+              "time": 1700000000101
+            },
+            {
+              "role": "user",
+              "data": "message-102",
+              "chatId": "msg-102",
+              "time": 1700000000102
+            },
+            {
+              "role": "char",
+              "data": "message-103",
+              "chatId": "msg-103",
+              "time": 1700000000103
+            },
+            {
+              "role": "user",
+              "data": "message-104",
+              "chatId": "msg-104",
+              "time": 1700000000104
+            },
+            {
+              "role": "char",
+              "data": "message-105",
+              "chatId": "msg-105",
+              "time": 1700000000105
+            },
+            {
+              "role": "user",
+              "data": "message-106",
+              "chatId": "msg-106",
+              "time": 1700000000106
+            },
+            {
+              "role": "char",
+              "data": "message-107",
+              "chatId": "msg-107",
+              "time": 1700000000107
+            },
+            {
+              "role": "user",
+              "data": "message-108",
+              "chatId": "msg-108",
+              "time": 1700000000108
+            },
+            {
+              "role": "char",
+              "data": "message-109",
+              "chatId": "msg-109",
+              "time": 1700000000109
+            },
+            {
+              "role": "user",
+              "data": "message-110",
+              "chatId": "msg-110",
+              "time": 1700000000110
+            },
+            {
+              "role": "char",
+              "data": "message-111",
+              "chatId": "msg-111",
+              "time": 1700000000111
+            },
+            {
+              "role": "user",
+              "data": "message-112",
+              "chatId": "msg-112",
+              "time": 1700000000112
+            },
+            {
+              "role": "char",
+              "data": "message-113",
+              "chatId": "msg-113",
+              "time": 1700000000113
+            },
+            {
+              "role": "user",
+              "data": "message-114",
+              "chatId": "msg-114",
+              "time": 1700000000114
+            },
+            {
+              "role": "char",
+              "data": "message-115",
+              "chatId": "msg-115",
+              "time": 1700000000115
+            },
+            {
+              "role": "user",
+              "data": "message-116",
+              "chatId": "msg-116",
+              "time": 1700000000116
+            },
+            {
+              "role": "char",
+              "data": "message-117",
+              "chatId": "msg-117",
+              "time": 1700000000117
+            },
+            {
+              "role": "user",
+              "data": "message-118",
+              "chatId": "msg-118",
+              "time": 1700000000118
+            },
+            {
+              "role": "char",
+              "data": "message-119",
+              "chatId": "msg-119",
+              "time": 1700000000119
+            },
+            {
+              "role": "user",
+              "data": "message-120",
+              "chatId": "msg-120",
+              "time": 1700000000120
+            },
+            {
+              "role": "char",
+              "data": "message-121",
+              "chatId": "msg-121",
+              "time": 1700000000121
+            },
+            {
+              "role": "user",
+              "data": "message-122",
+              "chatId": "msg-122",
+              "time": 1700000000122
+            },
+            {
+              "role": "char",
+              "data": "message-123",
+              "chatId": "msg-123",
+              "time": 1700000000123
+            },
+            {
+              "role": "user",
+              "data": "message-124",
+              "chatId": "msg-124",
+              "time": 1700000000124
+            },
+            {
+              "role": "char",
+              "data": "message-125",
+              "chatId": "msg-125",
+              "time": 1700000000125
+            },
+            {
+              "role": "user",
+              "data": "message-126",
+              "chatId": "msg-126",
+              "time": 1700000000126
+            },
+            {
+              "role": "char",
+              "data": "message-127",
+              "chatId": "msg-127",
+              "time": 1700000000127
+            },
+            {
+              "role": "user",
+              "data": "message-128",
+              "chatId": "msg-128",
+              "time": 1700000000128
+            },
+            {
+              "role": "char",
+              "data": "message-129",
+              "chatId": "msg-129",
+              "time": 1700000000129
+            }
+          ],
+          "lastDate": 300
+        },
+        {
+          "id": "conv-short",
+          "name": "Short chat",
+          "note": "",
+          "localLore": [],
+          "message": [
+            {
+              "role": "user",
+              "data": "message-000",
+              "chatId": "msg-000",
+              "time": 1700000000000
+            },
+            {
+              "role": "char",
+              "data": "message-001",
+              "chatId": "msg-001",
+              "time": 1700000000001
+            }
+          ],
+          "lastDate": 250
+        }
+      ],
+      "chatFolders": [],
+      "chatPage": 0,
+      "viewScreen": "none",
+      "bias": [],
+      "emotionImages": [],
+      "globalLore": [],
+      "sdData": [],
+      "customscript": [],
+      "triggerscript": [],
+      "utilityBot": false,
+      "exampleMessage": "",
+      "creatorNotes": "",
+      "systemPrompt": "",
+      "postHistoryInstructions": "",
+      "replaceGlobalNote": "",
+      "additionalText": "",
+      "alternateGreetings": [],
+      "tags": [],
+      "creator": "fixture",
+      "characterVersion": "1",
+      "personality": "",
+      "scenario": "",
+      "firstMsgIndex": 0,
+      "lastInteraction": 300
+    },
+    {
+      "type": "character",
+      "chaId": "char-c",
+      "name": "Gamma",
+      "image": "char-c.png",
+      "firstMessage": "Hello from Gamma",
+      "desc": "Gamma description",
+      "notes": "",
+      "chats": [
+        {
+          "id": "conv-trash",
+          "name": "Trashed chat",
+          "note": "",
+          "localLore": [],
+          "message": [
+            {
+              "role": "user",
+              "data": "message-000",
+              "chatId": "msg-000",
+              "time": 1700000000000
+            }
+          ],
+          "lastDate": 400
+        }
+      ],
+      "chatFolders": [],
+      "chatPage": 0,
+      "viewScreen": "none",
+      "bias": [],
+      "emotionImages": [],
+      "globalLore": [],
+      "sdData": [],
+      "customscript": [],
+      "triggerscript": [],
+      "utilityBot": false,
+      "exampleMessage": "",
+      "creatorNotes": "",
+      "systemPrompt": "",
+      "postHistoryInstructions": "",
+      "replaceGlobalNote": "",
+      "additionalText": "",
+      "alternateGreetings": [],
+      "tags": [],
+      "creator": "fixture",
+      "characterVersion": "1",
+      "personality": "",
+      "scenario": "",
+      "firstMsgIndex": 0,
+      "lastInteraction": 400,
+      "trashTime": 350
+    }
+  ]
+}

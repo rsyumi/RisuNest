@@ -1,3 +1,5 @@
+mod persistent_store;
+
 use base64::{engine::general_purpose, Engine as _};
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};
 use oauth2::{
@@ -444,6 +446,7 @@ pub fn run() {
     }
 
     builder
+        .manage(persistent_store::PersistentStoreState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_shell::init())
@@ -468,6 +471,28 @@ pub fn run() {
             #[cfg(desktop)]
             install_py_dependencies,
             oauth_login,
+            persistent_store::commands::pds_open,
+            persistent_store::commands::pds_read_root,
+            persistent_store::commands::pds_query_characters,
+            persistent_store::commands::pds_read_character,
+            persistent_store::commands::pds_query_conversations,
+            persistent_store::commands::pds_read_conversation,
+            persistent_store::commands::pds_read_conversation_window,
+            persistent_store::commands::pds_commit,
+            persistent_store::commands::pds_replace_begin,
+            persistent_store::commands::pds_replace_put_root,
+            persistent_store::commands::pds_replace_add_characters,
+            persistent_store::commands::pds_replace_commit,
+            persistent_store::commands::pds_replace_abort,
+            persistent_store::commands::pds_materialize,
+            persistent_store::commands::pds_acquire_revision,
+            persistent_store::commands::pds_release_revision,
+            persistent_store::commands::pds_checkpoint,
+            persistent_store::commands::pds_snapshot_create,
+            persistent_store::commands::pds_snapshot_list,
+            persistent_store::commands::pds_snapshot_restore_request,
+            persistent_store::commands::pds_get_app_kv,
+            persistent_store::commands::pds_set_app_kv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -44,7 +44,8 @@ recc.md
 __pycache__/
 .tauri/
 dist.zip
-/scripts/
+/scripts/*
+!/scripts/exportPersistentFixture.ts
 .env
 /server/node/ssl/certificate
 .worktrees/
