@@ -20,7 +20,7 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `cold restart keeps the process alive when task relaunch fails`() {
+  fun `cold restart does not terminate the process itself when relaunch throws`() {
     val operations = mutableListOf<String>()
     val dispatcher = ColdRestartDispatcher(
       relaunchTask = {

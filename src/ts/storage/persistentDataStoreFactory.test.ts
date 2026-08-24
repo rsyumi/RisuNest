@@ -21,7 +21,6 @@ async function createStore(isTauri: boolean) {
 
 describe('createPersistentDataStore', () => {
     beforeEach(() => {
-        localStorage.clear()
         vi.clearAllMocks()
         Object.assign(globalThis, {
             indexedDB: new IDBFactory(),
@@ -33,22 +32,11 @@ describe('createPersistentDataStore', () => {
         vi.resetModules()
     })
 
-    test('selects SQLite by default in Tauri', async () => {
+    test('Tauri always selects SQLite', async () => {
         expect((await createStore(true)).store).toBeInstanceOf(sqlite.SqlitePersistentDataStore)
     })
 
-    test.each(['', 'indexeddb', 'IndexedDB', 'sqlite', ' IndexedDB '])(
-        'keeps SQLite in Tauri regardless of the obsolete backend override %j',
-        async (value) => {
-            localStorage.setItem('risuForcePersistentBackend', value)
-
-            expect((await createStore(true)).store).toBeInstanceOf(sqlite.SqlitePersistentDataStore)
-        },
-    )
-
-    test('selects IndexedDB outside Tauri', async () => {
-        localStorage.setItem('risuForcePersistentBackend', 'indexeddb')
-
+    test('non-Tauri selects IndexedDB', async () => {
         const { store, IndexedDbPersistentDataStore } = await createStore(false)
         expect(store).toBeInstanceOf(IndexedDbPersistentDataStore)
     })

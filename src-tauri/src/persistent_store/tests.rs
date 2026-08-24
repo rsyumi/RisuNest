@@ -78,7 +78,7 @@ fn opens_new_store_at_revision_zero() {
 
 #[test]
 fn staged_fixture_round_trips_through_materialize() {
-    let (_, store, database) = open_fixture();
+    let (_directory, store, database) = open_fixture();
 
     assert_eq!(
         store.read_root(None).expect("read root").value,
@@ -92,7 +92,7 @@ fn staged_fixture_round_trips_through_materialize() {
 
 #[test]
 fn character_catalog_honors_order_search_trash_and_cursor() {
-    let (_, store, _) = open_fixture();
+    let (_directory, store, _) = open_fixture();
     let configured = |search: Option<&str>, trash, cursor: Option<&str>| CharacterQuery {
         search: search.map(str::to_owned),
         order: QueryOrder::Configured,
@@ -205,7 +205,7 @@ fn character_search_uses_rust_unicode_lowercase_matching() {
 
 #[test]
 fn conversation_catalog_honors_configured_recent_and_cursor() {
-    let (_, store, _) = open_fixture();
+    let (_directory, store, _) = open_fixture();
     let query = |order, cursor: Option<&str>| ConversationQuery {
         character_id: "char-a".to_owned(),
         order,
@@ -258,7 +258,7 @@ fn conversation_catalog_honors_configured_recent_and_cursor() {
 
 #[test]
 fn conversation_windows_cover_latest_and_anchor_boundaries() {
-    let (_, store, _) = open_fixture();
+    let (_directory, store, _) = open_fixture();
     let window = |anchor: Option<&str>, before, after| ConversationWindowQuery {
         character_id: "char-a".to_owned(),
         conversation_id: "conv-long".to_owned(),
@@ -294,7 +294,7 @@ fn conversation_windows_cover_latest_and_anchor_boundaries() {
 
 #[test]
 fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
-    let (_, mut store, _) = open_fixture();
+    let (_directory, mut store, _) = open_fixture();
     let revision = commit(
         &mut store,
         1,
@@ -377,7 +377,7 @@ fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
 
 #[test]
 fn cas_conflict_preserves_current_revision() {
-    let (_, mut store, _) = open_fixture();
+    let (_directory, mut store, _) = open_fixture();
     let result = store.commit(&WorkingSetCommit {
         expected_revision: 0,
         root: Some(json!({ "username": "stale" })),
@@ -400,7 +400,7 @@ fn cas_conflict_preserves_current_revision() {
 
 #[test]
 fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
-    let (_, mut store, database) = open_fixture();
+    let (_directory, mut store, database) = open_fixture();
     let mut replacement = database["characters"][1].clone();
     let mut chats = replacement["chats"]
         .as_array()
@@ -493,7 +493,7 @@ fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
 
 #[test]
 fn replacement_uses_the_greatest_configured_index_after_a_gap() {
-    let (_, mut store, database) = open_fixture();
+    let (_directory, mut store, database) = open_fixture();
     let deleted = store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
@@ -505,6 +505,14 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
             delete_character_id: Some("char-a".to_owned()),
         })
         .expect("delete middle configured character");
+    assert!(store
+        .read_character("char-a", None)
+        .expect("read deleted character")
+        .is_none());
+    assert!(store
+        .read_conversation("char-a", "conv-long", None)
+        .expect("read deleted conversation")
+        .is_none());
     let mut replacement = database["characters"][1].clone();
     replacement["chaId"] = json!("char-new");
     replacement["name"] = json!("New character");
@@ -542,7 +550,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
 
 #[test]
 fn invalid_character_replacements_leave_revision_and_data_unchanged() {
-    let (_, mut store, database) = open_fixture();
+    let (_directory, mut store, database) = open_fixture();
     let original = store
         .read_conversation("char-a", "conv-long", None)
         .expect("read original conversation");
@@ -562,6 +570,10 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
         Err(StoreError::Validation { .. })
     ));
     assert_eq!(store.revision().expect("read unchanged revision"), 1);
+    assert_eq!(
+        store.read_root(None).expect("read unchanged root").value["username"],
+        "Fixture User"
+    );
     assert_eq!(
         store
             .read_conversation("char-a", "conv-long", None)
@@ -627,7 +639,7 @@ fn reopen_recovers_committed_data_and_sweeps_abandoned_staging() {
 
 #[test]
 fn invalid_staged_replacement_is_aborted_without_activation() {
-    let (_, mut store, database) = open_fixture();
+    let (_directory, mut store, database) = open_fixture();
     let staging = store.replace_begin().expect("begin invalid staging");
     store
         .replace_put_root(&staging.staging_id, &json!({ "username": "invalid" }))
@@ -654,7 +666,7 @@ fn invalid_staged_replacement_is_aborted_without_activation() {
 
 #[test]
 fn revision_leases_are_isolated_then_released() {
-    let (_, mut store, _) = open_fixture();
+    let (_directory, mut store, _) = open_fixture();
     let lease = store.acquire_revision(1).expect("acquire revision lease");
     store
         .commit(&WorkingSetCommit {
@@ -684,7 +696,7 @@ fn revision_leases_are_isolated_then_released() {
 
 #[test]
 fn releasing_a_non_snapshot_generation_cannot_delete_active_data() {
-    let (_, mut store, database) = open_fixture();
+    let (_directory, mut store, database) = open_fixture();
 
     assert!(matches!(
         store.release_revision("revision-1"),
@@ -698,7 +710,7 @@ fn releasing_a_non_snapshot_generation_cannot_delete_active_data() {
 
 #[test]
 fn conversation_mutations_recalculate_character_summary() {
-    let (_, mut store, _) = open_fixture();
+    let (_directory, mut store, _) = open_fixture();
     let revision = commit(
         &mut store,
         1,
@@ -724,8 +736,385 @@ fn conversation_mutations_recalculate_character_summary() {
 }
 
 #[test]
+fn character_detail_update_preserves_index_and_conversations() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut detail = database["characters"][1].clone();
+    detail
+        .as_object_mut()
+        .expect("character object")
+        .remove("chats");
+    detail["name"] = json!("Alpha Renamed");
+    detail["lastInteraction"] = json!(999);
+
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: None,
+            character: Some(detail.clone()),
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+        })
+        .expect("commit character detail update");
+
+    let items = store
+        .query_characters(
+            &CharacterQuery {
+                search: None,
+                order: QueryOrder::Configured,
+                trash: false,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("query configured characters")
+        .items;
+    let alpha = items
+        .iter()
+        .find(|item| item.id == "char-a")
+        .expect("alpha summary");
+    assert_eq!(alpha.name, "Alpha Renamed");
+    assert_eq!(alpha.configured_index, 1);
+    assert_eq!(alpha.recent_at, 999);
+    assert_eq!(alpha.conversation_count, 2);
+    assert_eq!(
+        store
+            .read_character("char-a", None)
+            .expect("read updated detail")
+            .expect("character exists")
+            .value,
+        detail
+    );
+    assert_eq!(
+        store
+            .read_conversation("char-a", "conv-short", None)
+            .expect("read untouched conversation")
+            .expect("conversation exists")
+            .value["message"]
+            .as_array()
+            .expect("messages")
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn replace_range_updates_conversation_detail_and_preserves_recent_at_without_it() {
+    let (_directory, mut store, _) = open_fixture();
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-short".to_owned(),
+            start: 2,
+            delete_count: 0,
+            messages: vec![message("appended")],
+            conversation: Some(json!({
+                "id": "conv-short", "name": "Renamed chat", "note": "updated",
+                "localLore": [], "lastDate": 999
+            })),
+        },
+    );
+
+    let query = |store: &PersistentStore| {
+        store
+            .query_conversations(
+                &ConversationQuery {
+                    character_id: "char-a".to_owned(),
+                    order: QueryOrder::Recent,
+                    limit: 10,
+                    cursor: None,
+                },
+                None,
+            )
+            .expect("query conversations")
+            .items
+    };
+    let items = query(&store);
+    let short = items
+        .iter()
+        .find(|item| item.id == "conv-short")
+        .expect("short summary");
+    assert_eq!(short.name, "Renamed chat");
+    assert_eq!(short.recent_at, 999);
+    assert_eq!(short.message_count, 3);
+    assert_eq!(
+        store
+            .read_conversation("char-a", "conv-short", None)
+            .expect("read updated conversation")
+            .expect("conversation exists")
+            .value["note"],
+        "updated"
+    );
+
+    commit(
+        &mut store,
+        revision,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-short".to_owned(),
+            start: 3,
+            delete_count: 0,
+            messages: vec![message("later")],
+            conversation: None,
+        },
+    );
+    let items = query(&store);
+    let short = items
+        .iter()
+        .find(|item| item.id == "conv-short")
+        .expect("short summary after append");
+    assert_eq!(short.recent_at, 999);
+    assert_eq!(short.message_count, 4);
+}
+
+#[test]
+fn summary_recent_at_falls_back_to_message_time_then_zero() {
+    let (_directory, mut store, _) = open_fixture();
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-from-message".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: vec![message("timed")],
+            conversation: Some(json!({ "name": "From message", "note": "", "localLore": [] })),
+        },
+    );
+    let revision = commit(
+        &mut store,
+        revision,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-empty".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: vec![],
+            conversation: Some(json!({ "name": "Empty", "note": "", "localLore": [] })),
+        },
+    );
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: revision,
+            root: None,
+            character: None,
+            replace_character: None,
+            add_character: Some(json!({ "chaId": "char-zero", "name": "Zero", "chats": [] })),
+            conversations: None,
+            delete_character_id: None,
+        })
+        .expect("add character without lastInteraction");
+
+    let conversations = store
+        .query_conversations(
+            &ConversationQuery {
+                character_id: "char-a".to_owned(),
+                order: QueryOrder::Configured,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("query conversations")
+        .items;
+    let recent_at = |id: &str| {
+        conversations
+            .iter()
+            .find(|item| item.id == id)
+            .expect("conversation summary")
+            .recent_at
+    };
+    assert_eq!(recent_at("conv-from-message"), 1_800_000_000_000);
+    assert_eq!(recent_at("conv-empty"), 0);
+
+    let characters = store
+        .query_characters(
+            &CharacterQuery {
+                search: None,
+                order: QueryOrder::Configured,
+                trash: false,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("query characters")
+        .items;
+    assert_eq!(
+        characters
+            .iter()
+            .find(|item| item.id == "char-zero")
+            .expect("zero summary")
+            .recent_at,
+        0
+    );
+}
+
+#[test]
+fn replace_range_clamps_out_of_bounds_indices() {
+    let (_directory, mut store, _) = open_fixture();
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-short".to_owned(),
+            start: 50,
+            delete_count: 5,
+            messages: vec![message("tail")],
+            conversation: None,
+        },
+    );
+    commit(
+        &mut store,
+        revision,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-short".to_owned(),
+            start: -3,
+            delete_count: 100,
+            messages: vec![message("only")],
+            conversation: None,
+        },
+    );
+
+    let window = store
+        .read_conversation_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-short".to_owned(),
+                limit: None,
+                anchor_message_id: None,
+                before: None,
+                after: None,
+            },
+            None,
+        )
+        .expect("read clamped window")
+        .expect("conversation exists");
+    assert_eq!(window.value.total_messages, 1);
+    assert_eq!(window.value.messages[0]["chatId"], "only");
+}
+
+#[test]
+fn revision_leases_isolate_conversation_reads() {
+    let (_directory, mut store, _) = open_fixture();
+    let lease = store.acquire_revision(1).expect("acquire revision lease");
+    commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-short".to_owned(),
+            start: 2,
+            delete_count: 0,
+            messages: vec![message("live-only")],
+            conversation: None,
+        },
+    );
+
+    let window = |store: &PersistentStore, lease: Option<&str>| {
+        store
+            .read_conversation_window(
+                &ConversationWindowQuery {
+                    character_id: "char-a".to_owned(),
+                    conversation_id: "conv-short".to_owned(),
+                    limit: None,
+                    anchor_message_id: None,
+                    before: None,
+                    after: None,
+                },
+                lease,
+            )
+            .expect("read conversation window")
+            .expect("conversation exists")
+    };
+    assert_eq!(window(&store, Some(&lease.lease)).value.total_messages, 2);
+    assert_eq!(window(&store, None).value.total_messages, 3);
+    assert_eq!(
+        store
+            .query_conversations(
+                &ConversationQuery {
+                    character_id: "char-a".to_owned(),
+                    order: QueryOrder::Configured,
+                    limit: 10,
+                    cursor: None,
+                },
+                Some(&lease.lease),
+            )
+            .expect("query leased conversations")
+            .items
+            .iter()
+            .find(|item| item.id == "conv-short")
+            .expect("leased short summary")
+            .message_count,
+        2
+    );
+
+    store.release_revision(&lease.lease).expect("release lease");
+    assert!(matches!(
+        store.read_conversation_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-short".to_owned(),
+                limit: None,
+                anchor_message_id: None,
+                before: None,
+                after: None,
+            },
+            Some(&lease.lease),
+        ),
+        Err(StoreError::SnapshotReleased)
+    ));
+}
+
+#[test]
+fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
+    let (directory, mut store, _) = open_fixture();
+    let lease = store.acquire_revision(1).expect("acquire revision lease");
+    drop(store);
+
+    let store = PersistentStore::open(directory.path()).expect("reopen with fresh lease");
+    assert_eq!(
+        store
+            .read_root(Some(&lease.lease))
+            .expect("fresh lease survives reopen")
+            .value["username"],
+        "Fixture User"
+    );
+    store
+        .connection
+        .execute(
+            "UPDATE snapshot_leases SET created_at = created_at - 90000000",
+            [],
+        )
+        .expect("age lease past the ttl");
+    drop(store);
+
+    let store = PersistentStore::open(directory.path()).expect("reopen after expiry");
+    assert!(matches!(
+        store.read_root(Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    let orphan_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM root WHERE generation = ?1",
+            [lease.lease.as_str()],
+            |row| row.get(0),
+        )
+        .expect("count swept generation rows");
+    assert_eq!(orphan_rows, 0);
+}
+
+#[test]
 fn app_kv_round_trips_json() {
-    let (_, store, _) = open_fixture();
+    let (_directory, store, _) = open_fixture();
     let value = json!({ "sourceRevision": 1, "imported": true });
     store.set_app_kv("migration", &value).expect("write app kv");
     assert_eq!(
@@ -803,7 +1192,7 @@ fn snapshots_create_list_and_restore_on_reopen() {
 
 #[test]
 fn checkpoints_accept_both_documented_modes() {
-    let (_, store, _) = open_fixture();
+    let (_directory, store, _) = open_fixture();
 
     store
         .checkpoint(CheckpointMode::Passive)

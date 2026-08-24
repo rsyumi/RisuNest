@@ -50,7 +50,7 @@ class NativeStoreBoundary {
                 const staging = this.requireStaging(stagingId)
                 const expectedRevision = args.expectedRevision as number | undefined
                 if (expectedRevision !== undefined && expectedRevision !== this.revision) {
-                    throw new Error(`revision conflict: expected ${expectedRevision}, actual ${this.revision}`)
+                    throw { code: 'revision-conflict', expected: expectedRevision, actual: this.revision }
                 }
                 if (!staging.root) throw new Error('staged root is required')
                 this.database = { ...structuredClone(staging.root), characters: structuredClone(staging.characters) }

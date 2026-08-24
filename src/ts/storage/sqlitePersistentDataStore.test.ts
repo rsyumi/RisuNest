@@ -91,6 +91,13 @@ describe('SqlitePersistentDataStore', () => {
         )
     })
 
+    it('restores native store errors as ordinary errors', async () => {
+        mocks.invoke.mockRejectedValue({ code: 'store-error', message: 'disk I/O error' })
+        const store = new SqlitePersistentDataStore()
+
+        await expect(store.readRoot()).rejects.toEqual(new Error('disk I/O error'))
+    })
+
     it('replaces a database in staged 16-character batches before committing', async () => {
         mocks.invoke
             .mockResolvedValueOnce({ stagingId: 'staging-1' })
