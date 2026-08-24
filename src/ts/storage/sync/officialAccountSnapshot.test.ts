@@ -23,6 +23,9 @@ import {
     createOfficialAssociationMarkers,
     type OfficialAccountSnapshotDependencies,
     type OfficialAssociationMarkers,
+    type OfficialSyncConflictBackupInput,
+    type OfficialSyncConflictContext,
+    type OfficialSyncConflictHandler,
 } from './officialAccountSnapshot'
 
 vi.mock('../database.svelte', () => ({
@@ -132,6 +135,8 @@ interface HarnessOptions {
     prepareCandidate?: (database: Database) => Promise<Database>
     ledger?: OfficialAssetLedger
     association?: OfficialAssociationMarkers
+    conflict?: OfficialSyncConflictHandler
+    now?: () => number
 }
 
 function memoryLedgerStorage(): LedgerStorage {
@@ -200,6 +205,8 @@ async function makeHarness(options: HarnessOptions = {}) {
         markPublished,
         ledger,
         association: options.association,
+        conflict: options.conflict,
+        now: options.now,
     }
     const adapter = new OfficialAccountSnapshotAdapter(dependencies)
     return {
@@ -946,6 +953,184 @@ describe('OfficialAccountSnapshotAdapter persisted association', () => {
         })
         await expect(restarted.pull()).resolves.toEqual({ kind: 'unchanged' })
         await expect(harness.restartAdapter().pull()).resolves.toEqual({ kind: 'unchanged' })
+    })
+})
+
+describe('OfficialAccountSnapshotAdapter conflict resolution', () => {
+    const accountId = 'conflict-account'
+
+    interface ConflictOptions {
+        conflict?: OfficialSyncConflictHandler
+        now?: () => number
+    }
+
+    async function divergedHarness(options: ConflictOptions = {}) {
+        const association = createOfficialAssociationMarkers(memoryLedgerStorage())
+        const harness = await makeHarness({
+            accountId,
+            association,
+            conflict: options.conflict,
+            now: options.now,
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+        const root = (await harness.store.readRoot()).value
+        await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        const remote = makeDatabase()
+        remote.account = { id: accountId, token: 'token', data: {} }
+        remote.username = 'Other device'
+        const remoteBytes = encodeRisuSaveLegacy(remote, 'compression')
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: remoteBytes }
+            return { kind: 'value', bytes: Uint8Array.of(1) }
+        })
+        return { ...harness, association, remoteBytes }
+    }
+
+    it('keeps local data and backs up the remote snapshot when the user chooses keep-local', async () => {
+        const resolve = vi.fn(async (_context: OfficialSyncConflictContext) => 'keep-local' as const)
+        const backup = vi.fn(async (_input: OfficialSyncConflictBackupInput) => undefined)
+        const harness = await divergedHarness({ conflict: { resolve, backup }, now: () => 111 })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+
+        await expect(harness.restartAdapter().pull()).resolves.toEqual({
+            kind: 'kept-local',
+            conflict: true,
+        })
+
+        expect(replace).not.toHaveBeenCalled()
+        expect((await harness.store.readRoot()).value.username).toBe('Offline edit')
+        expect(resolve).toHaveBeenCalledTimes(1)
+        const context = resolve.mock.calls[0][0]
+        expect(context.remote.username).toBe('Other device')
+        expect(context.syncedAt).toBe(111)
+        expect(backup).toHaveBeenCalledTimes(1)
+        const input = backup.mock.calls[0][0]
+        expect(input.side).toBe('remote')
+        expect(input.bytes).toEqual(harness.remoteBytes)
+        expect(input.characterCount).toBe(context.remote.characters.length)
+    })
+
+    it('activates the remote and backs up the local snapshot when the user chooses load-remote', async () => {
+        const resolve = vi.fn(async (_context: OfficialSyncConflictContext) => 'load-remote' as const)
+        const backup = vi.fn(async (_input: OfficialSyncConflictBackupInput) => undefined)
+        const harness = await divergedHarness({ conflict: { resolve, backup } })
+
+        const result = await harness.restartAdapter().pull()
+
+        expect(result.kind).toBe('activated')
+        expect((await harness.store.readRoot()).value.username).toBe('Other device')
+        expect(backup).toHaveBeenCalledTimes(1)
+        const input = backup.mock.calls[0][0]
+        expect(input.side).toBe('local')
+        expect(input.characterCount).toBeGreaterThan(0)
+        const backedUp = await decodeRisuSave(input.bytes) as Database
+        expect(backedUp.username).toBe('Offline edit')
+    })
+
+    it('aborts the pull when the local backup cannot be written', async () => {
+        const resolve = vi.fn(async (_context: OfficialSyncConflictContext) => 'load-remote' as const)
+        const backup = vi.fn(async () => {
+            throw new Error('backup failed')
+        })
+        const harness = await divergedHarness({ conflict: { resolve, backup } })
+        const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
+
+        await expect(harness.restartAdapter().pull()).rejects.toThrow('backup failed')
+        expect(replace).not.toHaveBeenCalled()
+        expect((await harness.store.readRoot()).value.username).toBe('Offline edit')
+    })
+
+    it('propagates a failed remote backup instead of silently keeping local', async () => {
+        const resolve = vi.fn(async (_context: OfficialSyncConflictContext) => 'keep-local' as const)
+        const backup = vi.fn(async () => {
+            throw new Error('backup failed')
+        })
+        const harness = await divergedHarness({ conflict: { resolve, backup } })
+
+        await expect(harness.restartAdapter().pull()).rejects.toThrow('backup failed')
+        expect((await harness.store.readRoot()).value.username).toBe('Offline edit')
+    })
+
+    it('does not consult the conflict handler when only local advanced', async () => {
+        const resolve = vi.fn(async (_context: OfficialSyncConflictContext) => 'load-remote' as const)
+        const backup = vi.fn(async () => undefined)
+        const harness = await makeHarness({
+            accountId,
+            association: createOfficialAssociationMarkers(memoryLedgerStorage()),
+            conflict: { resolve, backup },
+        })
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+        const publishedBytes = harness.writes.find((write) => write.key === databaseKey)!.bytes!
+        const root = (await harness.store.readRoot()).value
+        await harness.store.commit({
+            expectedRevision: harness.imported.revision,
+            root: { ...root, username: 'Offline edit' },
+        })
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: publishedBytes }
+            return { kind: 'missing' }
+        })
+
+        await expect(harness.restartAdapter().pull()).resolves.toEqual({
+            kind: 'kept-local',
+            conflict: false,
+        })
+        expect(resolve).not.toHaveBeenCalled()
+        expect(backup).not.toHaveBeenCalled()
+    })
+
+    it('stamps the sync time on publish and on pull activation', async () => {
+        const association = createOfficialAssociationMarkers(memoryLedgerStorage())
+        let time = 500
+        const harness = await makeHarness({
+            accountId,
+            association,
+            now: () => time,
+            remoteCold: new Map([
+                ['cold-chat', { message: [] }],
+                ['cold-message', { message: [] }],
+            ]),
+        })
+
+        await (await harness.adapter.pin(harness.imported.revision)).publish()
+        expect(association.load(accountId)?.syncedAt).toBe(500)
+
+        time = 900
+        const remote = makeDatabase()
+        remote.account = { id: accountId, token: 'token', data: {} }
+        remote.username = 'Remote after publish'
+        const remoteBytes = encodeRisuSaveLegacy(remote, 'compression')
+        harness.readItem.mockImplementation(async (key: string): Promise<AccountReadResult> => {
+            if (key === databaseKey) return { kind: 'value', bytes: remoteBytes }
+            return { kind: 'value', bytes: Uint8Array.of(1) }
+        })
+
+        const result = await harness.restartAdapter().pull()
+        expect(result.kind).toBe('activated')
+        expect(association.load(accountId)?.syncedAt).toBe(900)
+    })
+})
+
+describe('createOfficialAssociationMarkers', () => {
+    it('loads legacy records without a sync time and round-trips records with one', () => {
+        const storage = memoryLedgerStorage()
+        storage.setItem(
+            'officialAssociation:acc',
+            JSON.stringify({ revision: 3, databaseFingerprint: 'abc' }),
+        )
+        const markers = createOfficialAssociationMarkers(storage)
+
+        expect(markers.load('acc')).toEqual({ revision: 3, databaseFingerprint: 'abc' })
+
+        markers.save('acc', { revision: 4, databaseFingerprint: 'def', syncedAt: 42 })
+        expect(markers.load('acc')).toEqual({ revision: 4, databaseFingerprint: 'def', syncedAt: 42 })
     })
 })
 

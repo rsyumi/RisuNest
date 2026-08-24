@@ -41,11 +41,30 @@ export interface OfficialColdStorageTransport {
 export interface OfficialAssociationRecord {
     revision: DataRevision
     databaseFingerprint: string
+    syncedAt?: number
 }
 
 export interface OfficialAssociationMarkers {
     load(accountId: string): OfficialAssociationRecord | null
     save(accountId: string, record: OfficialAssociationRecord): void
+}
+
+export type OfficialSyncConflictChoice = 'keep-local' | 'load-remote'
+
+export interface OfficialSyncConflictContext {
+    remote: Database
+    syncedAt: number | null
+}
+
+export interface OfficialSyncConflictBackupInput {
+    side: 'local' | 'remote'
+    bytes: Uint8Array
+    characterCount: number
+}
+
+export interface OfficialSyncConflictHandler {
+    resolve(context: OfficialSyncConflictContext): Promise<OfficialSyncConflictChoice>
+    backup(input: OfficialSyncConflictBackupInput): Promise<void>
 }
 
 export interface OfficialAccountSnapshotDependencies {
@@ -58,6 +77,9 @@ export interface OfficialAccountSnapshotDependencies {
     ledger: OfficialAssetLedger
     /** Persists the published association so a restart can tell local from remote progress. */
     association?: OfficialAssociationMarkers
+    /** Decides diverged pulls and archives the overwritten side; absent means keep local. */
+    conflict?: OfficialSyncConflictHandler
+    now?(): number
 }
 
 export type OfficialPullResult =
@@ -177,6 +199,7 @@ export function createOfficialAssociationMarkers(storage: {
                 return {
                     revision: parsed.revision,
                     databaseFingerprint: parsed.databaseFingerprint,
+                    syncedAt: typeof parsed.syncedAt === 'number' ? parsed.syncedAt : undefined,
                 }
             } catch {
                 return null
@@ -371,6 +394,10 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         if (accountId) this.dependencies.association?.save(accountId, record)
     }
 
+    private stampTime(): number {
+        return this.dependencies.now?.() ?? Date.now()
+    }
+
     async pin(revision: DataRevision): Promise<PinnedPublication> {
         const lease = await this.dependencies.store.acquireRevision(revision)
         try {
@@ -433,6 +460,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                     this.rememberAssociation(references.accountId, {
                         revision: publishedRevision,
                         databaseFingerprint,
+                        syncedAt: this.stampTime(),
                     })
                 },
             )
@@ -452,19 +480,42 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         if (result.kind === 'missing') return { kind: 'missing' }
         const databaseFingerprint = await fingerprintDatabase(result.bytes)
         throwIfAborted(signal)
+        let decoded: Database | null = null
         if (association) {
             const remoteChanged = association.databaseFingerprint !== databaseFingerprint
             if (!remoteChanged && association.revision === expectedRevision) {
                 return { kind: 'unchanged' }
             }
             if (expectedRevision > association.revision) {
-                return { kind: 'kept-local', conflict: remoteChanged }
+                const conflict = remoteChanged ? this.dependencies.conflict : undefined
+                if (!conflict) return { kind: 'kept-local', conflict: remoteChanged }
+                throwIfAborted(signal)
+                const parsed = await decodeRisuSave(result.bytes)
+                validateCandidate(parsed)
+                decoded = parsed
+                const choice = await conflict.resolve({
+                    remote: parsed,
+                    syncedAt: association.syncedAt ?? null,
+                })
+                throwIfAborted(signal)
+                if (choice === 'keep-local') {
+                    await conflict.backup({
+                        side: 'remote',
+                        bytes: result.bytes,
+                        characterCount: parsed.characters.length,
+                    })
+                    return { kind: 'kept-local', conflict: true }
+                }
+                await this.backupLocalRevision(conflict, expectedRevision)
             }
         }
 
         throwIfAborted(signal)
-        const decoded = await decodeRisuSave(result.bytes)
-        validateCandidate(decoded)
+        if (!decoded) {
+            const parsed = await decodeRisuSave(result.bytes)
+            validateCandidate(parsed)
+            decoded = parsed
+        }
         const candidate = await this.dependencies.prepareCandidate(decoded)
         validateCandidate(candidate)
 
@@ -497,7 +548,22 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         this.rememberAssociation(candidate.account?.id ?? localRoot.value.account?.id, {
             revision: activated.revision,
             databaseFingerprint,
+            syncedAt: this.stampTime(),
         })
         return { kind: 'activated', revision: activated.revision }
+    }
+
+    private async backupLocalRevision(
+        conflict: OfficialSyncConflictHandler,
+        revision: DataRevision,
+    ): Promise<void> {
+        const lease = await this.dependencies.store.acquireRevision(revision)
+        try {
+            const bytes = await concatenate(streamRisuSaveFromLease(lease))
+            const characterCount = (await listCharacterSummaries(lease)).length
+            await conflict.backup({ side: 'local', bytes, characterCount })
+        } finally {
+            await lease.release()
+        }
     }
 }

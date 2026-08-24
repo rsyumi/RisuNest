@@ -14,7 +14,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
 import { loadPlugins } from "./plugins/plugins.svelte";
-import { alertError, alertInput, alertMd, alertSelect, alertTOS, waitAlert } from "./alert";
+import { alertConfirm, alertError, alertInput, alertMd, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { characterURLImport } from "./characterCards";
 import { loadRisuAccountData } from "./drive/accounter";
@@ -55,6 +55,8 @@ import {
     getPersistentDataRuntime,
     initializeActiveWorkingSet,
     configurePersistentDataRuntime,
+    hasPendingOfficialPublication,
+    publishCurrentOfficialRevision,
 } from "./storage/persistentDataRuntime.svelte";
 import { registerLifecycleCommitListeners } from "./storage/lifecycleCommit";
 import { resolveBlobStore } from "./storage/platformBlobStore";
@@ -62,6 +64,8 @@ import {
     OfficialAccountSnapshotAdapter,
     createOfficialAssociationMarkers,
 } from "./storage/sync/officialAccountSnapshot";
+import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
+import { formatNameList, summarizeSyncConflict } from "./storage/sync/syncConflictSummary";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
 import {
     initializeOfficialAccountBootstrap,
@@ -125,7 +129,39 @@ export async function loadData() {
                 () => getDatabase().account?.id,
             ),
             association: createOfficialAssociationMarkers(localStorage),
+            conflict: {
+                resolve: async ({ remote, syncedAt }) => {
+                    const summary = summarizeSyncConflict(local.database, remote)
+                    const details = [language.syncConflictDetected]
+                    if (syncedAt !== null) {
+                        details.push(language.syncConflictLastSynced
+                            .replace('{date}', new Date(syncedAt).toLocaleString()))
+                    }
+                    if (summary.localOnlyNames.length > 0) {
+                        details.push(language.syncConflictLocalOnly
+                            .replace('{names}', formatNameList(summary.localOnlyNames)))
+                    }
+                    if (summary.remoteOnlyNames.length > 0) {
+                        details.push(language.syncConflictRemoteOnly
+                            .replace('{names}', formatNameList(summary.remoteOnlyNames)))
+                    }
+                    if (summary.changedNames.length > 0) {
+                        details.push(language.syncConflictChanged
+                            .replace('{names}', formatNameList(summary.changedNames)))
+                    }
+                    details.push(language.syncConflictBackupNotice)
+                    const choice = await alertSelect([
+                        language.syncConflictKeepLocal,
+                        language.syncConflictLoadRemote,
+                    ], details.join(' '))
+                    return choice === '1' ? 'load-remote' : 'keep-local'
+                },
+                backup: async ({ side, bytes, characterCount }) => {
+                    await getSyncConflictBackupStore().save({ side, bytes, characterCount })
+                },
+            },
         })
+        let officialReconcilePublish = false
         const accountBootstrap = await initializeOfficialAccountBootstrap({
             local,
             store: runtime.store,
@@ -163,13 +199,23 @@ export async function loadData() {
                 alertError(error instanceof Error ? error : String(error))
             },
             onPullSkipped: ({ conflict }) => {
+                officialReconcilePublish = true
                 console.warn(conflict
-                    ? 'Official account pull skipped: local revisions were never published and the remote save also changed. Keeping local data; the next publish overwrites the remote save.'
-                    : 'Official account pull skipped: local revisions were never published. Keeping local data until the next publish.')
+                    ? 'Official account sync conflict resolved by keeping local data; republishing over the remote save.'
+                    : 'Official account pull skipped: local revisions were never published. Republishing local data.')
             },
         })
         performance.mark('boot:account-ready')
-        disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners()
+        if (officialReconcilePublish && accountBootstrap.officialEnabled) {
+            publishCurrentOfficialRevision().catch((error) => {
+                console.error('Official reconcile publish failed', error)
+            })
+        }
+        disposeLifecycleCommitListeners ??= registerLifecycleCommitListeners(undefined, {
+            isSyncActive: () => forageStorage.isAccount,
+            hasPendingSync: () => hasPendingOfficialPublication(),
+            confirmExit: () => alertConfirm(language.exitSyncPendingWarning),
+        })
 
         if (isTauriDesktop) {
             LoadingStatusState.text = 'Checking Update...'

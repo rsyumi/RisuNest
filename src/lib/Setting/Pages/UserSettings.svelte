@@ -11,6 +11,7 @@
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
     import { LoadLocalBackup, SaveLocalBackup, SavePartialLocalBackup } from "src/ts/drive/backuplocal";
+    import { openSyncConflictBackups } from "src/ts/storage/sync/syncConflictRestore";
     import Button from "src/lib/UI/GUI/Button.svelte";
     import { exportAsDataset } from "src/ts/storage/exportAsDataset";
     import { loginToSionyw, testSionywLogin } from "src/ts/sionyw";
@@ -78,6 +79,13 @@
         }
     }} className="mt-2">
     {language.loadPocketRisuBackup}
+</Button>
+
+<Button
+    onclick={() => {
+        openSyncConflictBackups()
+    }} className="mt-2">
+    {language.syncConflictBackups}
 </Button>
 
 {#if forageStorage.isAccount}
