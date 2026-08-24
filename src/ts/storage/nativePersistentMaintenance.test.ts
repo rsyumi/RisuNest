@@ -100,13 +100,15 @@ describe('native persistent maintenance', () => {
         await expect(createPeriodicNativeSnapshotIfDue()).resolves.toEqual(created)
     })
 
-    it('registers one idle callback and runs periodic maintenance from it', async () => {
+    it('registers one idle callback plus the hourly re-check and runs maintenance', async () => {
         let idleCallback: (() => void) | undefined
         const requestIdleCallback = vi.fn((callback: () => void) => {
             idleCallback = callback
             return 1
         })
         vi.stubGlobal('requestIdleCallback', requestIdleCallback)
+        const setIntervalSpy = vi.fn()
+        vi.stubGlobal('setInterval', setIntervalSpy)
         mocks.invoke.mockResolvedValueOnce([
             { path: 'recent.db', bytes: 1, modifiedAt: Date.now() },
         ])
@@ -114,12 +116,13 @@ describe('native persistent maintenance', () => {
         schedulePeriodicNativeSnapshot()
 
         expect(requestIdleCallback).toHaveBeenCalledTimes(1)
+        expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 60 * 60 * 1000)
         expect(mocks.invoke).not.toHaveBeenCalled()
         idleCallback?.()
         await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('pds_snapshot_list'))
     })
 
-    it('falls back to one timer and logs maintenance failures', async () => {
+    it('falls back to a timer and logs maintenance failures', async () => {
         vi.useFakeTimers()
         vi.stubGlobal('requestIdleCallback', undefined)
         const error = new Error('snapshot list failed')
@@ -127,10 +130,25 @@ describe('native persistent maintenance', () => {
         mocks.invoke.mockRejectedValueOnce(error)
 
         schedulePeriodicNativeSnapshot()
-        await vi.runAllTimersAsync()
+        await vi.advanceTimersByTimeAsync(0)
 
         expect(consoleError).toHaveBeenCalledWith('Periodic native snapshot failed', error)
         consoleError.mockRestore()
+    })
+
+    it('re-checks hourly so long sessions still create periodic snapshots', async () => {
+        vi.useFakeTimers()
+        vi.stubGlobal('requestIdleCallback', undefined)
+        mocks.invoke.mockResolvedValue([
+            { path: 'recent.db', bytes: 1, modifiedAt: Date.now() },
+        ])
+
+        schedulePeriodicNativeSnapshot()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(mocks.invoke).toHaveBeenCalledTimes(1)
+
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1000)
+        expect(mocks.invoke).toHaveBeenCalledTimes(2)
     })
 
     it('reports an empty snapshot list without prompting', async () => {

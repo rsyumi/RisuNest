@@ -3,6 +3,7 @@ import { relaunch } from '@tauri-apps/plugin-process'
 import { isTauriMobile } from '../platform'
 
 const PERIODIC_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000
+const PERIODIC_SNAPSHOT_CHECK_INTERVAL_MS = 60 * 60 * 1000
 
 export type NativeCheckpointMode = 'passive' | 'truncate'
 
@@ -93,6 +94,7 @@ export function schedulePeriodicNativeSnapshot(): void {
     } else {
         globalThis.setTimeout(run, 0)
     }
+    globalThis.setInterval(run, PERIODIC_SNAPSHOT_CHECK_INTERVAL_MS)
 }
 
 export async function restoreNativePersistentSnapshot(

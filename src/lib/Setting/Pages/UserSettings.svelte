@@ -84,8 +84,11 @@
                     choose: async (snapshots) => {
                         const labels = snapshots.map((snapshot) => {
                             const date = new Date(snapshot.modifiedAt).toLocaleString()
-                            const size = (snapshot.bytes / (1024 * 1024)).toFixed(1)
-                            return `${date} (${size} MiB)`
+                            const mib = snapshot.bytes / (1024 * 1024)
+                            const size = mib >= 1
+                                ? `${mib.toFixed(1)} MiB`
+                                : `${Math.max(1, Math.round(snapshot.bytes / 1024))} KiB`
+                            return `${date} (${size})`
                         })
                         const selected = Number(await alertSelect(
                             [...labels, language.cancel],
