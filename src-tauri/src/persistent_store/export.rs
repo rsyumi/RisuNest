@@ -734,6 +734,7 @@ mod tests {
                 root: None,
                 replace_presets: None,
                 character: None,
+                character_details: None,
                 replace_character: None,
                 add_character: None,
                 conversations: None,
