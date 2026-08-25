@@ -114,7 +114,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
 vi.mock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: vi.fn(() => ({})) }))
 vi.mock('@tauri-apps/plugin-http', () => ({ fetch: vi.fn() }))
 
-import { createThrottledSizeEstimator, forageStorage, getFileSrc, saveAsset } from './globalApi.svelte'
+import { createThrottledSizeEstimator, forageStorage, getFileSrc, LocalWriter, saveAsset } from './globalApi.svelte'
 
 function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime: string } }) {
     return {
@@ -262,5 +262,55 @@ describe('createThrottledSizeEstimator', () => {
         cyclic.self = cyclic
         const estimate = createThrottledSizeEstimator(() => cyclic)
         expect(estimate()).toBe(0)
+    })
+})
+
+describe('LocalWriter streamed backup entries', () => {
+    test('writes the legacy length-prefixed entry without joining payload chunks', async () => {
+        const writes: Uint8Array[] = []
+        const localWriter = new LocalWriter()
+        localWriter.writer = {
+            write: vi.fn(async (value: Uint8Array) => void writes.push(value.slice())),
+            close: vi.fn(async () => undefined),
+        } as any
+
+        await localWriter.writeBackupStream('db', 5, (async function* () {
+            yield Uint8Array.of(1, 2)
+            yield Uint8Array.of(3, 4, 5)
+        })())
+
+        expect(writes).toEqual([
+            Uint8Array.of(2, 0, 0, 0, 100, 98, 5, 0, 0, 0),
+            Uint8Array.of(1, 2),
+            Uint8Array.of(3, 4, 5),
+        ])
+    })
+
+    test('closes the payload iterator when the destination rejects a chunk', async () => {
+        const destinationError = new Error('destination failed')
+        let cleaned = false
+        let writes = 0
+        const localWriter = new LocalWriter()
+        localWriter.writer = {
+            write: vi.fn(async () => {
+                writes += 1
+                if (writes === 2) throw destinationError
+            }),
+            close: vi.fn(async () => undefined),
+        } as any
+
+        const payload = (async function* () {
+            try {
+                yield Uint8Array.of(1, 2)
+                yield Uint8Array.of(3)
+            } finally {
+                cleaned = true
+            }
+        })()
+
+        await expect(localWriter.writeBackupStream('db', 3, payload)).rejects.toBe(
+            destinationError,
+        )
+        expect(cleaned).toBe(true)
     })
 })

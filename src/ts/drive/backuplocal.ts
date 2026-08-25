@@ -1,4 +1,4 @@
-import { BaseDirectory, readFile, writeFile } from "@tauri-apps/plugin-fs";
+import { BaseDirectory, open, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
 import { LocalWriter, forageStorage } from "../globalApi.svelte";
@@ -28,16 +28,66 @@ import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersis
 import { installLocalBackup } from "../storage/databaseRestore";
 import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
 
-export function readPinnedLocalBackupDatabase(
+const NATIVE_BACKUP_READ_BYTES = 1024 * 1024
+
+export async function* streamNativeBackupFile(
+    path: string,
+    byteLength: number,
+): AsyncGenerator<Uint8Array> {
+    let file: Awaited<ReturnType<typeof open>> | undefined
+    let primaryError: unknown
+    try {
+        file = await open(path, { read: true })
+        const buffer = new Uint8Array(NATIVE_BACKUP_READ_BYTES)
+        let readBytes = 0
+        while (true) {
+            const length = await file.read(buffer)
+            if (length === null) break
+            if (length <= 0 || length > buffer.byteLength) {
+                throw new Error('Native backup source returned an invalid read length')
+            }
+            if (readBytes + length > byteLength) {
+                throw new Error('Native backup source exceeded its declared length')
+            }
+            readBytes += length
+            yield buffer.slice(0, length)
+        }
+        if (readBytes !== byteLength) {
+            throw new Error('Native backup source ended before its declared length')
+        }
+    } catch (error) {
+        primaryError = error
+        throw error
+    } finally {
+        if (file) {
+            try {
+                await file.close()
+            } catch (error) {
+                if (primaryError === undefined) throw error
+            }
+        }
+    }
+}
+
+type LocalBackupDatabaseWriter = Pick<LocalWriter, 'writeBackup' | 'writeBackupStream'>
+
+export function writePinnedLocalBackupDatabase(
+    writer: LocalBackupDatabaseWriter,
     pinned: PinnedRisuSaveExport,
-): Promise<Uint8Array> {
+): Promise<void> {
     if (pinned.withNativeFile) {
         return pinned.withNativeFile(
             { omitAccount: true },
-            (file) => readFile(file.path),
+            (file) => writer.writeBackupStream(
+                'database.risudat',
+                file.bytes,
+                streamNativeBackupFile(file.path, file.bytes),
+            ),
         )
     }
-    return pinned.collectBytes({ omitAccount: true })
+    return pinned.collectBytes({ omitAccount: true }).then((bytes) => (
+        writer.writeBackup('database.risudat', bytes)
+    ))
 }
 
 function getBasename(data:string){
@@ -179,19 +229,19 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
         await writer.writeBackup(payload.backupName, encoded)
     }
 
-    let dbData = await readPinnedLocalBackupDatabase(pinned)
+    alertWait(`Saving local Backup... (Saving database)`)
 
     if(forageStorage.isAccount && location.origin.endsWith('risuai.xyz')){
+        const dbData = await pinned.collectBytes({ omitAccount: true })
         const time = Date.now()
         const key = (await (await fetch(`https://sv.risuai.xyz/cryptokey?key=${time}`)).json()).key
         const encrypted = await encryptBuffer(dbData, key)
         await writer.writeBackup('encryption.risudat', new TextEncoder().encode(JSON.stringify({ time, type: 'account' })))
-        dbData = new Uint8Array(encrypted)
+        await writer.writeBackup('database.risudat', new Uint8Array(encrypted))
+    } else {
+        await writePinnedLocalBackupDatabase(writer, pinned)
     }
 
-    alertWait(`Saving local Backup... (Saving database)`) 
-
-    await writer.writeBackup('database.risudat', dbData)
     await writer.close()
 
     if (missingAssets.length > 0) {
@@ -355,11 +405,8 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
         await writer.writeBackup(payload.backupName, encoded)
     }
 
-    const dbData = await readPinnedLocalBackupDatabase(pinned)
-
     alertWait(`Saving partial local backup... (Saving database)`) 
-
-    await writer.writeBackup('database.risudat', dbData)
+    await writePinnedLocalBackupDatabase(writer, pinned)
     await writer.close()
 
     if (missingAssets.length > 0) {

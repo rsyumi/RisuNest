@@ -303,6 +303,9 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         ])
         expect(harness.events.at(-1)).toBe(`asset:${databaseKey}`)
 
+        const databaseCalls = harness.writeItem.mock.calls.filter(([key]) => key === databaseKey)
+        expect(databaseCalls).toHaveLength(1)
+        expect(databaseCalls[0][1]).toBeInstanceOf(Uint8Array)
         const databaseWrite = harness.writes.find((write) => write.key === databaseKey)
         const projected = await decodeRisuSave(databaseWrite!.bytes!) as Database
         for (const key of resources(projected)) {

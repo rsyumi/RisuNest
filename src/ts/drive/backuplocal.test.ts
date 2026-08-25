@@ -14,6 +14,9 @@ const state = vi.hoisted(() => ({
     runtime: null as PersistentDataRuntime | null,
     written: new Map<string, Uint8Array>(),
     nativeFile: new Uint8Array([7, 8, 9]),
+    openNativeFile: vi.fn(),
+    nativeFileClose: vi.fn(async () => undefined),
+    fullReadFile: vi.fn(async () => new Uint8Array([99])),
     snapshotSeenByColdStorage: null as Database | null,
     coldStoragePayloads: [] as Array<{
         key: string
@@ -45,6 +48,21 @@ vi.mock('../globalApi.svelte', () => ({
 
         async writeBackup(name: string, bytes: Uint8Array) {
             state.written.set(name, bytes.slice())
+        }
+
+        async writeBackupStream(
+            name: string,
+            byteLength: number,
+            chunks: AsyncIterable<Uint8Array>,
+        ) {
+            const value = new Uint8Array(byteLength)
+            let offset = 0
+            for await (const chunk of chunks) {
+                value.set(chunk, offset)
+                offset += chunk.byteLength
+            }
+            if (offset !== byteLength) throw new Error('unexpected test stream length')
+            state.written.set(name, value)
         }
 
         async close() {}
@@ -90,8 +108,8 @@ vi.mock('src/ts/platform', () => ({
 
 vi.mock('@tauri-apps/plugin-fs', () => ({
     BaseDirectory: {},
-    open: vi.fn(),
-    readFile: vi.fn(async () => state.nativeFile.slice()),
+    open: state.openNativeFile,
+    readFile: state.fullReadFile,
     writeFile: vi.fn(),
 }))
 
@@ -124,6 +142,20 @@ describe('local backup persistent snapshot', () => {
         state.missingColdStorageKeys = []
         state.invalidColdStorageKeys = []
         state.blobStore = emptyBlobStore()
+        state.nativeFileClose.mockClear()
+        state.fullReadFile.mockClear()
+        state.openNativeFile.mockReset()
+        let offset = 0
+        state.openNativeFile.mockResolvedValue({
+            read: vi.fn(async (buffer: Uint8Array) => {
+                if (offset >= state.nativeFile.byteLength) return null
+                const length = Math.min(2, state.nativeFile.byteLength - offset)
+                buffer.set(state.nativeFile.subarray(offset, offset + length))
+                offset += length
+                return length
+            }),
+            close: state.nativeFileClose,
+        })
     })
 
     it('writes database and cold enumeration from the flushed store revision', async () => {
@@ -312,15 +344,33 @@ describe('local backup persistent snapshot', () => {
         expect(state.written.size).toBe(0)
     })
 
-    it('reads a native pinned export once for the bytes-only local writer boundary', async () => {
+    it('streams a native pinned export into the local backup entry', async () => {
         const collectBytes = vi.fn(async () => new Uint8Array([1]))
-        const withNativeFile = vi.fn(async (_options, callback) => callback({
-            path: 'C:\\app\\persistent\\exports\\risusave-test.risudat',
-            bytes: 3,
-        }))
-        const { readPinnedLocalBackupDatabase } = await import('./backuplocal')
+        const events: string[] = []
+        const withNativeFile = vi.fn(async (_options, callback) => {
+            try {
+                return await callback({
+                    path: 'C:\\app\\persistent\\exports\\risusave-test.risudat',
+                    bytes: 3,
+                })
+            } finally {
+                events.push('cleanup')
+            }
+        })
+        const writeBackupStream = vi.fn(async (
+            name: string,
+            byteLength: number,
+            chunks: AsyncIterable<Uint8Array>,
+        ) => {
+            const values: number[] = []
+            for await (const chunk of chunks) values.push(...chunk)
+            expect(name).toBe('database.risudat')
+            expect(byteLength).toBe(3)
+            expect(values).toEqual([7, 8, 9])
+        })
+        const { writePinnedLocalBackupDatabase } = await import('./backuplocal')
 
-        await expect(readPinnedLocalBackupDatabase({
+        await expect(writePinnedLocalBackupDatabase({ writeBackupStream } as any, {
             revision: 3,
             mutationGeneration: 0,
             countCharacters: vi.fn(),
@@ -328,10 +378,99 @@ describe('local backup persistent snapshot', () => {
             stream: vi.fn(),
             collectBytes,
             withNativeFile,
-        })).resolves.toEqual(new Uint8Array([7, 8, 9]))
+        })).resolves.toBeUndefined()
 
         expect(withNativeFile).toHaveBeenCalledOnce()
         expect(withNativeFile.mock.calls[0][0]).toEqual({ omitAccount: true })
+        expect(writeBackupStream).toHaveBeenCalledOnce()
+        expect(state.openNativeFile).toHaveBeenCalledWith(
+            'C:\\app\\persistent\\exports\\risusave-test.risudat',
+            { read: true },
+        )
+        expect(state.nativeFileClose).toHaveBeenCalledOnce()
+        expect(events).toEqual(['cleanup'])
+        expect(state.fullReadFile).not.toHaveBeenCalled()
         expect(collectBytes).not.toHaveBeenCalled()
+    })
+
+    it('closes and cleans the native export when its source read fails', async () => {
+        const sourceError = new Error('source failed')
+        state.openNativeFile.mockResolvedValueOnce({
+            read: vi.fn().mockRejectedValue(sourceError),
+            close: state.nativeFileClose,
+        })
+        const cleanup = vi.fn()
+        const withNativeFile = vi.fn(async (_options, callback) => {
+            try {
+                return await callback({ path: 'native.risudat', bytes: 3 })
+            } finally {
+                cleanup()
+            }
+        })
+        const writer = {
+            writeBackupStream: async (_name: string, _length: number, chunks: AsyncIterable<Uint8Array>) => {
+                for await (const _chunk of chunks) {
+                    // consume the source
+                }
+            },
+        }
+        const { writePinnedLocalBackupDatabase } = await import('./backuplocal')
+
+        await expect(writePinnedLocalBackupDatabase(writer as any, {
+            revision: 3,
+            mutationGeneration: 0,
+            countCharacters: vi.fn(),
+            materializeDatabase: vi.fn(),
+            stream: vi.fn(),
+            collectBytes: vi.fn(),
+            withNativeFile,
+        })).rejects.toBe(sourceError)
+
+        expect(state.nativeFileClose).toHaveBeenCalledOnce()
+        expect(cleanup).toHaveBeenCalledOnce()
+    })
+
+    it('closes and cleans the native export when the destination fails', async () => {
+        const destinationError = new Error('destination failed')
+        const cleanup = vi.fn()
+        const withNativeFile = vi.fn(async (_options, callback) => {
+            try {
+                return await callback({ path: 'native.risudat', bytes: 3 })
+            } finally {
+                cleanup()
+            }
+        })
+        const writer = {
+            writeBackupStream: async (_name: string, _length: number, chunks: AsyncIterable<Uint8Array>) => {
+                for await (const _chunk of chunks) throw destinationError
+            },
+        }
+        const { writePinnedLocalBackupDatabase } = await import('./backuplocal')
+
+        await expect(writePinnedLocalBackupDatabase(writer as any, {
+            revision: 3,
+            mutationGeneration: 0,
+            countCharacters: vi.fn(),
+            materializeDatabase: vi.fn(),
+            stream: vi.fn(),
+            collectBytes: vi.fn(),
+            withNativeFile,
+        })).rejects.toBe(destinationError)
+
+        expect(state.nativeFileClose).toHaveBeenCalledOnce()
+        expect(cleanup).toHaveBeenCalledOnce()
+    })
+
+    it('closes the native source when a chunk consumer returns early', async () => {
+        const { streamNativeBackupFile } = await import('./backuplocal')
+        const chunks = streamNativeBackupFile('native.risudat', 3)
+
+        await expect(chunks.next()).resolves.toEqual({
+            done: false,
+            value: new Uint8Array([7, 8]),
+        })
+        await chunks.return(undefined)
+
+        expect(state.nativeFileClose).toHaveBeenCalledOnce()
     })
 })

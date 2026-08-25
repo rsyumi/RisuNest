@@ -1100,6 +1100,35 @@ export class LocalWriter {
         await this.writer.write(record)
     }
 
+    async writeBackupStream(
+        name: string,
+        byteLength: number,
+        chunks: AsyncIterable<Uint8Array>,
+    ): Promise<void> {
+        if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > 0xffffffff) {
+            throw new Error('Backup entry length is outside the supported range')
+        }
+        const encodedName = new TextEncoder().encode(getBasename(name))
+        const headerBytes = new Uint8Array(8 + encodedName.byteLength)
+        const header = new DataView(headerBytes.buffer)
+        header.setUint32(0, encodedName.byteLength, true)
+        headerBytes.set(encodedName, 4)
+        header.setUint32(4 + encodedName.byteLength, byteLength, true)
+        await this.writer.write(headerBytes)
+
+        let written = 0
+        for await (const chunk of chunks) {
+            if (written + chunk.byteLength > byteLength) {
+                throw new Error('Backup entry stream exceeded its declared length')
+            }
+            if (chunk.byteLength > 0) await this.writer.write(chunk)
+            written += chunk.byteLength
+        }
+        if (written !== byteLength) {
+            throw new Error('Backup entry stream ended before its declared length')
+        }
+    }
+
     /**
      * Writes data to the file.
      * 
