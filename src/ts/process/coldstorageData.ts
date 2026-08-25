@@ -72,7 +72,7 @@ function addResource(resources: string[], value: string | undefined) {
 }
 
 export function listDatabaseRootResources(
-    root: Omit<Database, 'characters' | 'botPresets'>,
+    root: Omit<Database, 'characters' | 'botPresets' | 'pluginCustomStorage'>,
 ): string[] {
     const resources: string[] = []
     addResource(resources, root.customBackground)

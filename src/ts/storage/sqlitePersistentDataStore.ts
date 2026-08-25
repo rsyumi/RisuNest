@@ -19,6 +19,7 @@ import {
     type PersistentDataStore,
     type PersistentRevisionLease,
     type PersistentRoot,
+    type PluginStorageCatalog,
     type PresetCatalog,
     type Versioned,
     type WorkingSetCommit,
@@ -136,6 +137,14 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_read_conversation_window', { query: input })
     }
 
+    queryPluginStorage(): Promise<PluginStorageCatalog> {
+        return invokeStore('pds_query_plugin_storage', {})
+    }
+
+    readPluginStorage(key: string): Promise<Versioned<unknown> | null> {
+        return invokeStore('pds_read_plugin_storage', { key })
+    }
+
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         return invokeStore('pds_commit', { commit: input })
     }
@@ -224,6 +233,14 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             readConversationWindow: async (input) => {
                 assertActive()
                 return invokeStore('pds_read_conversation_window', { query: input, lease })
+            },
+            queryPluginStorage: async () => {
+                assertActive()
+                return invokeStore('pds_query_plugin_storage', { lease })
+            },
+            readPluginStorage: async (key) => {
+                assertActive()
+                return invokeStore('pds_read_plugin_storage', { key, lease })
             },
             release: () => {
                 if (releasePromise) return releasePromise

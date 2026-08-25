@@ -1,6 +1,6 @@
 use super::{
-    active_generation, current_revision, ConversationMutation, RevisionResult, StagingResult,
-    StoreError, StoreResult, WorkingSetCommit,
+    active_generation, current_revision, ConversationMutation, PluginStorageMutation,
+    RevisionResult, StagingResult, StoreError, StoreResult, WorkingSetCommit,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
@@ -53,6 +53,9 @@ pub(super) fn commit(
     for mutation in input.conversations.as_deref().unwrap_or_default() {
         apply_conversation_mutation(&transaction, &generation, mutation)?;
     }
+    for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
+        apply_plugin_storage_mutation(&transaction, &generation, mutation)?;
+    }
 
     let revision = actual_revision + 1;
     set_active(&transaction, revision, &generation)?;
@@ -75,7 +78,14 @@ pub(super) fn replace_put_root(
 ) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
-    put_root(&transaction, staging_id, root)?;
+    let mut staged_root = object(root, "Persistent root")?.clone();
+    if let Some(plugin_storage) = staged_root.remove("pluginCustomStorage") {
+        let plugin_storage = plugin_storage
+            .as_object()
+            .ok_or_else(|| validation("pluginCustomStorage must be a JSON object"))?;
+        replace_plugin_storage(&transaction, staging_id, plugin_storage)?;
+    }
+    put_root(&transaction, staging_id, &Value::Object(staged_root))?;
     transaction.commit()?;
     Ok(())
 }
@@ -177,11 +187,88 @@ fn put_root(transaction: &Transaction<'_>, generation: &str, root: &Value) -> St
     let mut root = object(root, "Persistent root")?.clone();
     root.remove("characters");
     root.remove("botPresets");
+    root.remove("pluginCustomStorage");
     transaction.execute(
         "INSERT INTO root (generation, value) VALUES (?1, ?2) ON CONFLICT(generation) DO UPDATE SET value = excluded.value",
         params![generation, serde_json::to_string(&root)?],
     )?;
     Ok(())
+}
+
+fn replace_plugin_storage(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    values: &Map<String, Value>,
+) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM plugin_storage WHERE generation = ?1",
+        [generation],
+    )?;
+    for (ordinal, (key, value)) in values.iter().enumerate() {
+        put_plugin_storage(transaction, generation, key, value, Some(ordinal as i64))?;
+    }
+    Ok(())
+}
+
+fn put_plugin_storage(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    key: &str,
+    value: &Value,
+    ordinal: Option<i64>,
+) -> StoreResult<()> {
+    let serialized = serde_json::to_string(value)?;
+    transaction.execute(
+        "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
+         VALUES (
+             ?1,
+             ?2,
+             ?3,
+             COALESCE(
+                 ?4,
+                 (SELECT COALESCE(MAX(ordinal) + 1, 0)
+                  FROM plugin_storage WHERE generation = ?1)
+             ),
+             ?5
+         )
+         ON CONFLICT(generation, storage_key) DO UPDATE SET
+             byte_size = excluded.byte_size,
+             value = excluded.value",
+        params![
+            generation,
+            key,
+            serialized.len() as i64,
+            ordinal,
+            serialized
+        ],
+    )?;
+    Ok(())
+}
+
+fn apply_plugin_storage_mutation(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    mutation: &PluginStorageMutation,
+) -> StoreResult<()> {
+    match mutation {
+        PluginStorageMutation::Set { key, value } => {
+            put_plugin_storage(transaction, generation, key, value, None)
+        }
+        PluginStorageMutation::Delete { key } => {
+            transaction.execute(
+                "DELETE FROM plugin_storage WHERE generation = ?1 AND storage_key = ?2",
+                params![generation, key],
+            )?;
+            Ok(())
+        }
+        PluginStorageMutation::Clear => {
+            transaction.execute(
+                "DELETE FROM plugin_storage WHERE generation = ?1",
+                [generation],
+            )?;
+            Ok(())
+        }
+    }
 }
 
 fn replace_presets(
@@ -720,6 +807,10 @@ fn delete_character_contents(
 }
 
 fn delete_generation(transaction: &Transaction<'_>, generation: &str) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM plugin_storage WHERE generation = ?1",
+        [generation],
+    )?;
     transaction.execute("DELETE FROM messages WHERE generation = ?1", [generation])?;
     transaction.execute(
         "DELETE FROM conversations WHERE generation = ?1",
@@ -757,6 +848,10 @@ fn move_generation(transaction: &Transaction<'_>, source: &str, target: &str) ->
     )?;
     transaction.execute(
         "UPDATE messages SET generation = ?2 WHERE generation = ?1",
+        params![source, target],
+    )?;
+    transaction.execute(
+        "UPDATE plugin_storage SET generation = ?2 WHERE generation = ?1",
         params![source, target],
     )?;
     Ok(())

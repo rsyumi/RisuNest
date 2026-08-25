@@ -1,4 +1,4 @@
-use super::{read_target, StoreError, StoreResult};
+use super::{compare_plugin_storage_keys, read_target, StoreError, StoreResult};
 use flate2::{write::GzEncoder, Compression, GzBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,8 @@ pub(super) fn create(
     let modules = root.remove("modules");
     let loadouts = root.remove("loadouts");
     let plugins = root.remove("plugins");
-    let plugin_storage = root.remove("pluginCustomStorage");
+    root.remove("pluginCustomStorage");
+    let plugin_storage = plugin_storage_value(connection, &target.generation)?;
     if omit_account {
         root.remove("account");
     }
@@ -117,7 +118,7 @@ pub(super) fn create(
         &mut file,
         PLUGIN_STORAGE,
         "pluginStorage",
-        plugin_storage.as_ref(),
+        Some(&plugin_storage),
     )?;
     for character_id in &character_ids {
         write_block(&mut file, CHARACTER_WITH_CHAT, character_id, |writer| {
@@ -139,6 +140,35 @@ pub(super) fn create(
         path: final_path.to_string_lossy().into_owned(),
         bytes,
     })
+}
+
+fn plugin_storage_value(connection: &Connection, generation: &str) -> StoreResult<Value> {
+    let mut statement = connection.prepare(
+        "SELECT storage_key, value, ordinal FROM plugin_storage
+         WHERE generation = ?1",
+    )?;
+    let mut values = statement
+        .query_map([generation], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .map(|row| {
+            let (key, value, ordinal) = row?;
+            Ok((key, serde_json::from_str(&value)?, ordinal))
+        })
+        .collect::<StoreResult<Vec<(String, Value, i64)>>>()?;
+    values.sort_by(|(left, _, left_ordinal), (right, _, right_ordinal)| {
+        compare_plugin_storage_keys(left, *left_ordinal, right, *right_ordinal)
+    });
+    Ok(Value::Object(
+        values
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect::<Map<String, Value>>(),
+    ))
 }
 
 pub(super) fn cleanup(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
@@ -657,6 +687,7 @@ mod tests {
             blocks[1].value,
             json!([{ "name": "Preset A" }, { "name": "Preset B" }])
         );
+        assert_eq!(blocks[5].value, json!({ "plugin": { "enabled": true } }));
         assert_eq!(blocks[6].value["chats"][0]["message"][0]["data"], "trash");
         assert_eq!(blocks[7].value["chats"][0]["message"][1]["data"], "world");
         assert_eq!(exported.bytes, fs::metadata(&exported.path).unwrap().len());
@@ -689,6 +720,84 @@ mod tests {
         )
         .is_err());
         cleanup(&store.snapshots_dir, Path::new(&second.path)).unwrap();
+    }
+
+    #[test]
+    fn exports_plugin_storage_in_legacy_object_key_order() {
+        use crate::persistent_store::{PluginStorageMutation, WorkingSetCommit};
+
+        let (_directory, mut store, _revision, initial_lease) = fixture();
+        store.release_revision(&initial_lease).unwrap();
+        let committed = store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root: None,
+                replace_presets: None,
+                character: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: Some(vec![
+                    PluginStorageMutation::Clear,
+                    PluginStorageMutation::Set {
+                        key: "zeta".to_owned(),
+                        value: json!("first string"),
+                    },
+                    PluginStorageMutation::Set {
+                        key: "10".to_owned(),
+                        value: json!("ten"),
+                    },
+                    PluginStorageMutation::Set {
+                        key: "2".to_owned(),
+                        value: json!(0),
+                    },
+                    PluginStorageMutation::Set {
+                        key: "01".to_owned(),
+                        value: json!("non-index"),
+                    },
+                    PluginStorageMutation::Set {
+                        key: "4294967294".to_owned(),
+                        value: json!(true),
+                    },
+                    PluginStorageMutation::Set {
+                        key: "4294967295".to_owned(),
+                        value: json!(false),
+                    },
+                    PluginStorageMutation::Set {
+                        key: "\u{ffff}x".to_owned(),
+                        value: json!("unicode"),
+                    },
+                ]),
+            })
+            .unwrap();
+        let lease = store.acquire_revision(committed.revision).unwrap().lease;
+
+        let exported = create(&store.connection, &store.snapshots_dir, &lease, false).unwrap();
+        let plugin_storage = &read_blocks(Path::new(&exported.path))
+            .into_iter()
+            .find(|block| block.block_type == PLUGIN_STORAGE)
+            .unwrap()
+            .value;
+
+        assert_eq!(
+            plugin_storage
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "2",
+                "10",
+                "4294967294",
+                "zeta",
+                "01",
+                "4294967295",
+                "\u{ffff}x",
+            ]
+        );
+        assert_eq!(plugin_storage["2"], json!(0));
     }
 
     #[test]

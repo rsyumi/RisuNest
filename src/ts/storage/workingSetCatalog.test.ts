@@ -76,6 +76,7 @@ describe('working-set catalog', () => {
         ])
         expect(database.characterOrder).toEqual(root.characterOrder)
         expect(database.characterOrder).toBe(root.characterOrder)
+        expect(database.pluginCustomStorage).toEqual({})
     })
 
     it('uses resident chat length when a hydrated character has no catalog marker', () => {

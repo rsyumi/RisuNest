@@ -72,6 +72,7 @@ export const fixtureDatabase = {
         { name: 'Preset Beta', image: 'preset-beta.png', mainPrompt: 'second' },
         { name: 'Preset Alpha', mainPrompt: 'first' },
     ],
+    pluginCustomStorage: {},
     characters: [
         makeCharacter({
             id: 'char-b',

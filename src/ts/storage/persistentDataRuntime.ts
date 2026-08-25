@@ -5,6 +5,7 @@ import type {
     DataRevision,
     PersistentDataStore,
     PersistentRoot,
+    PluginStorageMutation,
 } from './persistentDataStore'
 import {
     SaveCoordinator,
@@ -40,8 +41,22 @@ type CompleteCharacter = character | groupChat
 type RootDatabase = PersistentRoot
 
 export function capturePersistentRoot(database: Database): RootDatabase {
-    const { characters: _characters, botPresets: _botPresets, ...root } = database
+    const {
+        characters: _characters,
+        botPresets: _botPresets,
+        pluginCustomStorage: _pluginCustomStorage,
+        ...root
+    } = database
     return root
+}
+
+export function capturePersistentPluginStorage(
+    database: Database,
+): Database['pluginCustomStorage'] | null {
+    if (isCatalogPresetWorkingSet(database.botPresets)) return null
+    return Object.prototype.hasOwnProperty.call(database, 'pluginCustomStorage')
+        ? database.pluginCustomStorage ?? {}
+        : null
 }
 
 export function capturePersistentPresets(database: Database): botPreset[] | null {
@@ -171,6 +186,8 @@ export function publishPersistentCharacterMutationToWorkingSet(
 
 export interface PersistentDataRuntimeStateAdapter {
     captureRoot(): RootDatabase
+    capturePluginStorage?(): Database['pluginCustomStorage'] | null
+    publishPluginStorageWorkingSet?(storage: Database['pluginCustomStorage']): void
     capturePresets?(): botPreset[] | null
     captureSelectedCharacter(): CompleteCharacter | null
     captureCharacter(id: string): CompleteCharacter | null
@@ -238,6 +255,10 @@ export interface PersistentDataRuntime {
         database: Database,
         reason: string,
         options?: PersistentReplacementOptions,
+    ): Promise<void>
+    mutatePersistentPluginStorage(
+        reason: string,
+        mutations: readonly PluginStorageMutation[],
     ): Promise<void>
     mutatePersistentPresets(reason: string, mutate: PersistentPresetMutation): Promise<void>
     mutatePersistentCharacterDetail(
@@ -360,6 +381,8 @@ export function createPersistentDataRuntime(
     const coordinator = new SaveCoordinator({
         store: dependencies.store,
         captureRoot: dependencies.state.captureRoot,
+        capturePluginStorage: dependencies.state.capturePluginStorage,
+        publishPluginStorageWorkingSet: dependencies.state.publishPluginStorageWorkingSet,
         capturePresets: dependencies.state.capturePresets,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         captureCharacter: dependencies.state.captureCharacter,
@@ -462,6 +485,8 @@ export function createPersistentDataRuntime(
                 options,
             )
         },
+        mutatePersistentPluginStorage: (reason, mutations) =>
+            coordinator.mutatePersistentPluginStorage(reason, mutations),
         mutatePersistentPresets: (reason, mutate) =>
             coordinator.mutatePersistentPresets(reason, mutate),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>

@@ -57,7 +57,12 @@ export async function bootstrapPersistentDatabase(
         const { revision } = await dependencies.store.replaceFromDatabase(database, 0)
         const profile = selectPluginCompatibilityProfile(database.plugins ?? [])
         if (profile === 'scalable-v3' && dependencies.projectScalableWorkingSet) {
-            const { characters: _characters, botPresets: _botPresets, ...storedRoot } = database
+            const {
+                characters: _characters,
+                botPresets: _botPresets,
+                pluginCustomStorage: _pluginCustomStorage,
+                ...storedRoot
+            } = database
             const root = await canonicalizePresetSelection(
                 dependencies.store,
                 revision,

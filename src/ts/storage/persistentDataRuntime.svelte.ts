@@ -5,7 +5,11 @@ import type { Chat, Database, character, groupChat } from './database.svelte'
 import { getDatabase, setDatabase } from './database.svelte'
 import { prepareDatabaseForPersistence } from './databasePreparation'
 import { getPersistentDataStore, getPersistentStorageAuthority } from './persistentDataStoreFactory'
-import type { CharacterDetail, DataRevision } from './persistentDataStore'
+import type {
+    CharacterDetail,
+    DataRevision,
+    PluginStorageMutation,
+} from './persistentDataStore'
 import type {
     CharacterAdditionRequest,
     PersistentCharacterDetailMutation,
@@ -19,6 +23,7 @@ import type {
 import type { CharacterActivationOptions } from './activeWorkingSet.svelte'
 import {
     capturePersistentRoot,
+    capturePersistentPluginStorage,
     capturePersistentPresets,
     captureResidentPersistentCharacter,
     captureSelectedPersistentCharacter,
@@ -37,6 +42,7 @@ import {
     hydrateWorkingSetCharacterDetail,
     isCatalogPresetWorkingSet,
 } from './workingSetCatalog'
+import { notifyPluginStorageAuthorityReplacement } from '../plugins/pluginStorageStore'
 
 export type {
     PersistentDataRuntime,
@@ -50,6 +56,13 @@ function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
     return {
         captureRoot() {
             return capturePersistentRoot(getDatabase())
+        },
+        capturePluginStorage() {
+            return capturePersistentPluginStorage(getDatabase())
+        },
+        publishPluginStorageWorkingSet(storage) {
+            getDatabase().pluginCustomStorage = storage
+            notifyPluginStorageAuthorityReplacement(storage)
         },
         capturePresets() {
             return capturePersistentPresets(getDatabase())
@@ -86,6 +99,11 @@ function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
                 forceScalableProjection,
             ) ?? database
             setDatabase(replacement)
+            notifyPluginStorageAuthorityReplacement(
+                forceScalableProjection || isCatalogPresetWorkingSet(replacement.botPresets)
+                    ? null
+                    : replacement.pluginCustomStorage ?? {},
+            )
             restoreStableWorkingSetSelection(
                 replacement,
                 selectedCharacterId,
@@ -136,6 +154,7 @@ function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
         installCompleteDatabase(database) {
             workingSetResidency.clear()
             setDatabase(database)
+            notifyPluginStorageAuthorityReplacement(database.pluginCustomStorage ?? {})
         },
         restoreSelection(characterId, conversationId) {
             restoreStableWorkingSetSelection(
@@ -305,6 +324,10 @@ export const replacePersistentDatabase = (
     reason: string,
     options?: PersistentReplacementOptions,
 ): Promise<void> => getPersistentDataRuntime().replacePersistentDatabase(database, reason, options)
+export const mutatePersistentPluginStorage = (
+    reason: string,
+    mutations: readonly PluginStorageMutation[],
+): Promise<void> => getPersistentDataRuntime().mutatePersistentPluginStorage(reason, mutations)
 export const mutatePersistentPresets = (
     reason: string,
     mutate: PersistentPresetMutation,

@@ -1,9 +1,9 @@
 use super::export::ExportedRisuSave;
 use super::{
     CharacterPage, CharacterQuery, CheckpointMode, ConversationPage, ConversationQuery,
-    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore, PresetCatalog,
-    RevisionResult, SnapshotCreated, SnapshotInfo, StagingResult, StoreError, StoreResult,
-    Versioned, WorkingSetCommit,
+    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore,
+    PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated, SnapshotInfo,
+    StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -152,6 +152,25 @@ pub(crate) fn pds_read_conversation_window(
 ) -> Result<Option<Versioned<ConversationWindow>>, StoreError> {
     with_store(state, |store| {
         store.read_conversation_window(&query, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_query_plugin_storage(
+    state: State<'_, PersistentStoreState>,
+    lease: Option<String>,
+) -> Result<PluginStorageCatalog, StoreError> {
+    with_store(state, |store| store.query_plugin_storage(lease.as_deref()))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_plugin_storage(
+    state: State<'_, PersistentStoreState>,
+    key: String,
+    lease: Option<String>,
+) -> Result<Option<Versioned<Value>>, StoreError> {
+    with_store(state, |store| {
+        store.read_plugin_storage(&key, lease.as_deref())
     })
 }
 

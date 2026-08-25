@@ -1,8 +1,8 @@
 use super::{
-    active_generation, current_revision, read_target, CharacterPage, CharacterQuery,
-    CharacterSummary, ConversationPage, ConversationQuery, ConversationSummary, ConversationWindow,
-    ConversationWindowQuery, PresetCatalog, PresetSummary, QueryOrder, StoreError, StoreResult,
-    Versioned,
+    active_generation, compare_plugin_storage_keys, current_revision, read_target, CharacterPage,
+    CharacterQuery, CharacterSummary, ConversationPage, ConversationQuery, ConversationSummary,
+    ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary,
+    PresetCatalog, PresetSummary, QueryOrder, StoreError, StoreResult, Versioned,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
@@ -62,6 +62,58 @@ pub(super) fn read_preset(
         .query_row(
             "SELECT value FROM bot_presets WHERE generation = ?1 AND preset_id = ?2",
             params![target.generation, id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            Ok(Versioned {
+                revision: target.revision,
+                value: serde_json::from_str(&value)?,
+            })
+        })
+        .transpose()
+}
+
+pub(super) fn query_plugin_storage(
+    connection: &Connection,
+    lease: Option<&str>,
+) -> StoreResult<PluginStorageCatalog> {
+    let target = read_target(connection, lease)?;
+    let mut statement = connection.prepare(
+        "SELECT storage_key, byte_size, ordinal FROM plugin_storage
+         WHERE generation = ?1",
+    )?;
+    let mut items = statement
+        .query_map([&target.generation], |row| {
+            Ok((
+                PluginStorageSummary {
+                    key: row.get(0)?,
+                    byte_size: row.get(1)?,
+                },
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    items.sort_by(|(left, left_ordinal), (right, right_ordinal)| {
+        compare_plugin_storage_keys(&left.key, *left_ordinal, &right.key, *right_ordinal)
+    });
+    Ok(PluginStorageCatalog {
+        revision: target.revision,
+        items: items.into_iter().map(|(item, _)| item).collect(),
+    })
+}
+
+pub(super) fn read_plugin_storage(
+    connection: &Connection,
+    key: &str,
+    lease: Option<&str>,
+) -> StoreResult<Option<Versioned<Value>>> {
+    let target = read_target(connection, lease)?;
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM plugin_storage WHERE generation = ?1 AND storage_key = ?2",
+            params![target.generation, key],
             |row| row.get(0),
         )
         .optional()?;
@@ -376,6 +428,36 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
         presets
     };
     database.insert("botPresets".to_owned(), Value::Array(presets));
+    let plugin_storage = {
+        let mut statement = transaction.prepare(
+            "SELECT storage_key, value, ordinal FROM plugin_storage
+             WHERE generation = ?1",
+        )?;
+        let mut values = statement
+            .query_map([&generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (key, value, ordinal) = row?;
+                Ok((key, serde_json::from_str(&value)?, ordinal))
+            })
+            .collect::<StoreResult<Vec<(String, Value, i64)>>>()?;
+        values.sort_by(|(left, _, left_ordinal), (right, _, right_ordinal)| {
+            compare_plugin_storage_keys(left, *left_ordinal, right, *right_ordinal)
+        });
+        values
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect::<Map<String, Value>>()
+    };
+    database.insert(
+        "pluginCustomStorage".to_owned(),
+        Value::Object(plugin_storage),
+    );
     transaction.commit()?;
     Ok(Value::Object(database))
 }

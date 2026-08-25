@@ -1,4 +1,4 @@
-import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginCompatibility, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
+import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginCompatibility, pluginStorageStore, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
 import { getDatabase } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
@@ -81,6 +81,9 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
             applyPreparedPluginDatabaseUpdate(database, true),
         applyCompatibilityDatabase: async (database) =>
             applyPreparedPluginDatabaseUpdate(database, false),
+        readPluginStorageSnapshot: () => pluginStorageStore.snapshot(),
+        mutatePluginStorage: (mutations) => pluginStorageStore.mutate(mutations),
+        invalidatePluginStorage: () => pluginStorageStore.invalidate(),
         materializeDatabaseSnapshot: materializePersistentDatabaseSnapshotWithRevision,
         replacePersistentDatabase,
         prepareAuthoritativeDatabaseUpdate: async (database) => {
@@ -1265,13 +1268,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             
             return v;
         },
-        _getPluginStorage: oldApis.pluginStorage.getItem,
-        _setPluginStorage: oldApis.pluginStorage.setItem,
-        _removePluginStorage: oldApis.pluginStorage.removeItem,
-        _clearPluginStorage: oldApis.pluginStorage.clear,
-        _keyPluginStorage: oldApis.pluginStorage.key,
-        _keysPluginStorage: oldApis.pluginStorage.keys,
-        _lengthPluginStorage: oldApis.pluginStorage.length,
+        _getPluginStorage: pluginStorageStore.getItem,
+        _setPluginStorage: pluginStorageStore.setItem,
+        _removePluginStorage: pluginStorageStore.removeItem,
+        _clearPluginStorage: pluginStorageStore.clear,
+        _keyPluginStorage: pluginStorageStore.key,
+        _keysPluginStorage: pluginStorageStore.keys,
+        _lengthPluginStorage: pluginStorageStore.length,
         _getSafeLocalStorage: oldApis.safeLocalStorage.getItem,
         _setSafeLocalStorage: oldApis.safeLocalStorage.setItem,
         _removeSafeLocalStorage: oldApis.safeLocalStorage.removeItem,

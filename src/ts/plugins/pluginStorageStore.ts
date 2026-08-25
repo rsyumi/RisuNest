@@ -1,0 +1,355 @@
+import {
+    RevisionConflictError,
+    type PersistentDataStore,
+    type PluginStorageMutation,
+    type PluginStorageSummary,
+} from '../storage/persistentDataStore'
+
+export const PLUGIN_STORAGE_CACHE_BYTE_BUDGET = 64 * 1024 * 1024
+
+interface PluginStorageStoreDependencies {
+    store: PersistentDataStore | (() => PersistentDataStore)
+    mutate(mutations: PluginStorageMutation[]): Promise<void>
+}
+
+export interface PluginStorageStore {
+    getItem(key: string): Promise<unknown | null>
+    setItem(key: string, value: unknown): Promise<void>
+    removeItem(key: string): Promise<void>
+    clear(): Promise<void>
+    key(index: number): Promise<string | null>
+    keys(): Promise<string[]>
+    length(): Promise<number>
+    snapshot(): Promise<Record<string, unknown>>
+    mutate(mutations: readonly PluginStorageMutation[]): Promise<void>
+    invalidate(): void
+    preloadCompatibility(): Promise<void>
+    preloadCompatibilityValues(storage: Record<string, unknown>): void
+    setEvictionAllowed(allowed: boolean): void
+    synchronizeCompatibilityStorage(storage: Record<string, unknown>): void
+    synchronizeCompatibilityMutation(mutation: PluginStorageMutation): void
+}
+
+let lifecycleStore: PluginStorageStore | null = null
+
+export function registerPluginStorageLifecycle(store: PluginStorageStore): () => void {
+    lifecycleStore = store
+    return () => {
+        if (lifecycleStore === store) lifecycleStore = null
+    }
+}
+
+export function notifyPluginStorageAuthorityReplacement(
+    compatibilityStorage: Record<string, unknown> | null,
+): void {
+    if (compatibilityStorage === null) lifecycleStore?.invalidate()
+    else lifecycleStore?.synchronizeCompatibilityStorage(compatibilityStorage)
+}
+
+export function observePluginStorageValue<T>(value: T, onMutation: (value: T) => void): T {
+    if (!value || typeof value !== 'object') return value
+    const proxies = new WeakMap<object, object>()
+    const observe = (candidate: object): object => {
+        const prototype = Object.getPrototypeOf(candidate)
+        if (!Array.isArray(candidate) && prototype !== Object.prototype && prototype !== null) {
+            return candidate
+        }
+        const existing = proxies.get(candidate)
+        if (existing) return existing
+        const proxy = new Proxy(candidate, {
+            get(target, property, receiver) {
+                const nested = Reflect.get(target, property, receiver)
+                return nested && typeof nested === 'object' ? observe(nested) : nested
+            },
+            set(target, property, nextValue) {
+                const changed = Reflect.set(target, property, nextValue)
+                if (changed) onMutation(value)
+                return changed
+            },
+            deleteProperty(target, property) {
+                const changed = Reflect.deleteProperty(target, property)
+                if (changed) onMutation(value)
+                return changed
+            },
+        })
+        proxies.set(candidate, proxy)
+        return proxy
+    }
+    return observe(value) as T
+}
+
+export function readCompatibilityPluginStorageValue(
+    storage: Record<string, unknown>,
+    key: string,
+): unknown | null {
+    return Object.prototype.hasOwnProperty.call(storage, key) ? storage[key] : null
+}
+
+interface CacheEntry {
+    value: unknown
+    byteSize: number
+}
+
+function serializedByteSize(value: unknown): number {
+    return new TextEncoder().encode(JSON.stringify(value) ?? 'null').byteLength
+}
+
+export function createPluginStorageStore(
+    dependencies: PluginStorageStoreDependencies,
+    byteBudget = PLUGIN_STORAGE_CACHE_BYTE_BUDGET,
+): PluginStorageStore {
+    const index = new Map<string, PluginStorageSummary>()
+    const cache = new Map<string, CacheEntry>()
+    const pendingReads = new Map<string, { generation: number; promise: Promise<unknown | null> }>()
+    const keyGenerations = new Map<string, number>()
+    let cacheBytes = 0
+    let initialized = false
+    let initializePromise: Promise<void> | null = null
+    let evictionAllowed = true
+    let lifecycleGeneration = 0
+    let authorityGeneration = 0
+
+    const getStore = (): PersistentDataStore =>
+        typeof dependencies.store === 'function'
+            ? dependencies.store()
+            : dependencies.store
+
+    const acquirePinnedPluginStorageLease = async () => {
+        const store = getStore()
+        await store.open()
+        for (let attempt = 0; ; attempt++) {
+            const catalog = await store.queryPluginStorage()
+            try {
+                return await store.acquireRevision(catalog.revision)
+            } catch (error) {
+                if (!(error instanceof RevisionConflictError) || attempt >= 2) throw error
+            }
+        }
+    }
+
+    const initialize = async (): Promise<void> => {
+        while (!initialized) {
+            let pending = initializePromise
+            if (!pending) {
+                const expectedGeneration = lifecycleGeneration
+                const loading = (async () => {
+                    const store = getStore()
+                    await store.open()
+                    const catalog = await store.queryPluginStorage()
+                    if (expectedGeneration !== lifecycleGeneration) return
+                    index.clear()
+                    for (const item of catalog.items) index.set(item.key, item)
+                    initialized = true
+                })()
+                const finalPromise = loading.finally(() => {
+                    if (initializePromise === finalPromise) initializePromise = null
+                })
+                initializePromise = finalPromise
+                pending = finalPromise
+            }
+            await pending
+        }
+    }
+
+    const removeCached = (key: string) => {
+        const cached = cache.get(key)
+        if (!cached) return
+        cache.delete(key)
+        cacheBytes -= cached.byteSize
+    }
+
+    const evict = () => {
+        if (!evictionAllowed) return
+        while (cacheBytes > byteBudget && cache.size > 0) {
+            removeCached(cache.keys().next().value as string)
+        }
+    }
+
+    const putCached = (key: string, value: unknown, byteSize: number) => {
+        removeCached(key)
+        cache.set(key, { value: structuredClone(value), byteSize })
+        cacheBytes += byteSize
+        evict()
+    }
+
+    const replaceCachedStorage = (storage: Record<string, unknown>) => {
+        authorityGeneration++
+        lifecycleGeneration++
+        pendingReads.clear()
+        keyGenerations.clear()
+        initialized = true
+        index.clear()
+        cache.clear()
+        cacheBytes = 0
+        for (const [key, value] of Object.entries(storage)) {
+            const byteSize = serializedByteSize(value)
+            index.set(key, { key, byteSize })
+            putCached(key, value, byteSize)
+        }
+    }
+
+    const bumpKeyGeneration = (key: string): number => {
+        const generation = (keyGenerations.get(key) ?? 0) + 1
+        keyGenerations.set(key, generation)
+        pendingReads.delete(key)
+        return generation
+    }
+
+    const resetCachedState = () => {
+        lifecycleGeneration++
+        initialized = false
+        initializePromise = null
+        index.clear()
+        cache.clear()
+        pendingReads.clear()
+        keyGenerations.clear()
+        cacheBytes = 0
+    }
+
+    const invalidate = () => {
+        authorityGeneration++
+        resetCachedState()
+    }
+
+    const read = async (key: string): Promise<unknown | null> => {
+        await initialize()
+        const cached = cache.get(key)
+        if (cached) {
+            cache.delete(key)
+            cache.set(key, cached)
+            return structuredClone(cached.value)
+        }
+        if (!index.has(key)) return null
+        const keyGeneration = keyGenerations.get(key) ?? 0
+        const pending = pendingReads.get(key)
+        if (pending?.generation === keyGeneration) return pending.promise
+        const readLifecycleGeneration = lifecycleGeneration
+        const reading = getStore().readPluginStorage(key).then((record) => {
+            const isCurrent =
+                readLifecycleGeneration === lifecycleGeneration &&
+                keyGeneration === (keyGenerations.get(key) ?? 0)
+            if (!record) {
+                if (isCurrent) index.delete(key)
+                return null
+            }
+            const byteSize = index.get(key)?.byteSize ?? serializedByteSize(record.value)
+            if (isCurrent) {
+                putCached(key, record.value, byteSize)
+            }
+            return structuredClone(record.value)
+        }).finally(() => {
+            const pending = pendingReads.get(key)
+            if (pending?.promise === reading) pendingReads.delete(key)
+        })
+        pendingReads.set(key, { generation: keyGeneration, promise: reading })
+        return reading
+    }
+
+    const applyCommittedMutation = (mutation: PluginStorageMutation) => {
+        if (mutation.type === 'clear') {
+            resetCachedState()
+            initialized = true
+            return
+        }
+        bumpKeyGeneration(mutation.key)
+        if (mutation.type === 'delete') {
+            index.delete(mutation.key)
+            removeCached(mutation.key)
+            return
+        }
+        const byteSize = serializedByteSize(mutation.value)
+        index.set(mutation.key, { key: mutation.key, byteSize })
+        putCached(mutation.key, mutation.value, byteSize)
+    }
+
+    const mutate = async (mutations: readonly PluginStorageMutation[]) => {
+        await initialize()
+        if (mutations.length === 0) return
+        const expectedAuthorityGeneration = authorityGeneration
+        await dependencies.mutate([...mutations])
+        if (expectedAuthorityGeneration !== authorityGeneration) return
+        for (const mutation of mutations) applyCommittedMutation(mutation)
+    }
+
+    const orderedKeys = (): string[] => Object.keys(
+        Object.fromEntries([...index.keys()].map((key) => [key, true])),
+    )
+
+    return {
+        getItem: read,
+        async setItem(key, value) {
+            await mutate([{ type: 'set', key, value }])
+        },
+        async removeItem(key) {
+            await mutate([{ type: 'delete', key }])
+        },
+        async clear() {
+            await mutate([{ type: 'clear' }])
+        },
+        async key(position) {
+            await initialize()
+            return orderedKeys()[position] ?? null
+        },
+        async keys() {
+            await initialize()
+            return orderedKeys()
+        },
+        async length() {
+            await initialize()
+            return index.size
+        },
+        async snapshot() {
+            const lease = await acquirePinnedPluginStorageLease()
+            try {
+                const pinnedCatalog = await lease.queryPluginStorage()
+                const storage: Record<string, unknown> = {}
+                for (const item of pinnedCatalog.items) {
+                    const record = await lease.readPluginStorage(item.key)
+                    if (record) storage[item.key] = structuredClone(record.value)
+                }
+                return storage
+            } finally {
+                await lease.release()
+            }
+        },
+        mutate,
+        invalidate,
+        async preloadCompatibility() {
+            await initialize()
+            authorityGeneration++
+            lifecycleGeneration++
+            pendingReads.clear()
+            keyGenerations.clear()
+            evictionAllowed = false
+            const lease = await acquirePinnedPluginStorageLease()
+            try {
+                const pinnedCatalog = await lease.queryPluginStorage()
+                index.clear()
+                cache.clear()
+                cacheBytes = 0
+                for (const item of pinnedCatalog.items) {
+                    index.set(item.key, item)
+                    const record = await lease.readPluginStorage(item.key)
+                    if (record) putCached(item.key, record.value, item.byteSize)
+                }
+            } finally {
+                await lease.release()
+            }
+        },
+        preloadCompatibilityValues(storage) {
+            evictionAllowed = false
+            replaceCachedStorage(storage)
+        },
+        setEvictionAllowed(allowed) {
+            evictionAllowed = allowed
+            evict()
+        },
+        synchronizeCompatibilityStorage(storage) {
+            replaceCachedStorage(storage)
+        },
+        synchronizeCompatibilityMutation(mutation) {
+            authorityGeneration++
+            applyCommittedMutation(mutation)
+        },
+    }
+}

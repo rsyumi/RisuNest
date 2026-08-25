@@ -104,6 +104,9 @@ describe('RisuSave persistent store adapter', () => {
         await store.commit({
             expectedRevision: imported.revision,
             root: { ...root, username: 'Later User' },
+            pluginStorage: [
+                { type: 'set', key: 'fixture', value: { value: 'later' } },
+            ],
         })
         const remaining = await concatenate({
             [Symbol.asyncIterator]: () => iterator,
@@ -112,9 +115,40 @@ describe('RisuSave persistent store adapter', () => {
         exported.set(header.value)
         exported.set(remaining, header.value.length)
 
-        expect((await decodeRisuSave(exported)).username).toBe('Snapshot User')
+        const decoded = await decodeRisuSave(exported)
+        expect(decoded.username).toBe('Snapshot User')
+        expect(decoded.pluginCustomStorage).toEqual({ fixture: { value: 'stored' } })
         expect((await store.readRoot()).value.username).toBe('Later User')
+        expect((await store.readPluginStorage('fixture'))?.value).toEqual({ value: 'later' })
         expect(materialize).not.toHaveBeenCalled()
+    })
+
+    it('exports plugin storage in legacy Object.keys order from the pinned catalog', async () => {
+        const database = structuredClone(risuSaveFixtureDatabase)
+        const storage: Record<string, unknown> = {}
+        storage.zeta = 'first string'
+        storage['10'] = 'ten'
+        storage['2'] = 0
+        storage['01'] = 'non-index'
+        storage['4294967294'] = true
+        storage['4294967295'] = false
+        storage['\uffffx'] = 'unicode'
+        database.pluginCustomStorage = storage
+        const store = new IndexedDbPersistentDataStore(
+            'risu-save-plugin-order',
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(database)
+
+        const decoded = await decodeRisuSave(
+            await concatenate(streamRisuSaveFromStore(store, imported.revision)),
+        )
+
+        expect(Object.keys(decoded.pluginCustomStorage)).toEqual(Object.keys(storage))
+        expect(decoded.pluginCustomStorage['2']).toBe(0)
+        expect(decoded.pluginCustomStorage['\uffffx']).toBe('unicode')
     })
 
     it('streams a supplied lease without releasing it or materializing a database', async () => {

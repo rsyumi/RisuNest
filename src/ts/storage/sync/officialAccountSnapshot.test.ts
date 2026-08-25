@@ -445,6 +445,9 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         const later = await harness.store.commit({
             expectedRevision: harness.imported.revision,
             root: { ...root, username: 'Later local user' },
+            pluginStorage: [
+                { type: 'set', key: 'fixture', value: { value: 'later' } },
+            ],
         })
         const commit = vi.spyOn(harness.store, 'commit')
         const replace = vi.spyOn(harness.store, 'replaceFromDatabase')
@@ -452,8 +455,13 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         await publication.publish()
 
         const databaseWrite = harness.writes.find((write) => write.key === databaseKey)
-        expect((await decodeRisuSave(databaseWrite!.bytes!)).username).toBe('Snapshot User')
+        const published = await decodeRisuSave(databaseWrite!.bytes!)
+        expect(published.username).toBe('Snapshot User')
+        expect(published.pluginCustomStorage).toEqual({ fixture: { value: 'stored' } })
         expect((await harness.store.readRoot()).value.username).toBe('Later local user')
+        expect((await harness.store.readPluginStorage('fixture'))?.value).toEqual({
+            value: 'later',
+        })
         expect(harness.markPublished).toHaveBeenCalledWith(harness.imported.revision)
         expect(later.revision).toBe(harness.imported.revision + 1)
         expect(commit).not.toHaveBeenCalled()

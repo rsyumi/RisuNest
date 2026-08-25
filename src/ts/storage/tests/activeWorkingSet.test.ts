@@ -91,6 +91,8 @@ function makeLease(input: {
                 return chat ? { revision, value: structuredClone(chat) } : null
             }),
         readConversationWindow: vi.fn(),
+        queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
+        readPluginStorage: vi.fn(async () => null),
         release: vi.fn(async () => undefined),
     }
 }

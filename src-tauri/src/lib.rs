@@ -492,6 +492,8 @@ pub fn run() {
             persistent_store::commands::pds_query_conversations,
             persistent_store::commands::pds_read_conversation,
             persistent_store::commands::pds_read_conversation_window,
+            persistent_store::commands::pds_query_plugin_storage,
+            persistent_store::commands::pds_read_plugin_storage,
             persistent_store::commands::pds_commit,
             persistent_store::commands::pds_replace_begin,
             persistent_store::commands::pds_replace_put_root,

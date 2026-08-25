@@ -35,6 +35,8 @@ export function createMutationGatedPersistentDataStore(
         readConversationWindow: (
             input: ConversationWindowQuery,
         ): Promise<Versioned<ConversationWindow> | null> => store.readConversationWindow(input),
+        queryPluginStorage: () => store.queryPluginStorage(),
+        readPluginStorage: (key: string) => store.readPluginStorage(key),
         commit: (input: WorkingSetCommit) => gate.runWrite(() => store.commit(input)),
         replaceFromDatabase: (database: Database, expectedRevision?: DataRevision) =>
             gate.runWrite(() => store.replaceFromDatabase(database, expectedRevision)),

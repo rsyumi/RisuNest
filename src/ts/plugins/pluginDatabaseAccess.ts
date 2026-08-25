@@ -8,6 +8,7 @@ import type {
     ConversationWindow,
     DataRevision,
     PersistentDataStore,
+    PluginStorageMutation,
 } from '../storage/persistentDataStore'
 import type { PluginCompatibilityProfile } from './pluginCompatibility'
 
@@ -48,6 +49,9 @@ export interface PluginDatabaseAccessDependencies {
     getNavigationGeneration(): number
     applyCompatibilityDatabaseLite(database: Record<string, unknown>): void
     applyCompatibilityDatabase(database: Record<string, unknown>): Promise<void>
+    readPluginStorageSnapshot(): Promise<Record<string, unknown>>
+    mutatePluginStorage(mutations: readonly PluginStorageMutation[]): Promise<void>
+    invalidatePluginStorage(): void
     materializeDatabaseSnapshot(reason: string): Promise<{
         database: Database
         revision: DataRevision
@@ -74,7 +78,10 @@ export interface PluginDatabaseAccess {
         includeOnly: string[] | 'all',
         allowedKeys: readonly string[],
     ): Promise<Record<string, unknown>>
-    setDatabaseLite(database: Record<string, unknown>, allowedKeys: readonly string[]): void
+    setDatabaseLite(
+        database: Record<string, unknown>,
+        allowedKeys: readonly string[],
+    ): void | Promise<void>
     setDatabase(
         database: Record<string, unknown>,
         allowedKeys: readonly string[],
@@ -111,6 +118,42 @@ function nonnegativeWindow(value: number | undefined, name: string): number {
 
 function hasCharacterUpdate(database: Record<string, unknown>): boolean {
     return Object.prototype.hasOwnProperty.call(database, 'characters')
+}
+
+function pluginStorageMutations(
+    update: Record<string, unknown>,
+    allowedKeys: readonly string[],
+): PluginStorageMutation[] {
+    const allowedKeySet = new Set(allowedKeys)
+    const hasExplicitStorage =
+        allowedKeySet.has('pluginCustomStorage') &&
+        Object.prototype.hasOwnProperty.call(update, 'pluginCustomStorage')
+    const mutations: PluginStorageMutation[] = []
+    if (hasExplicitStorage) {
+        mutations.push({ type: 'clear' })
+        const storage = { ...(update.pluginCustomStorage as Record<string, unknown>) }
+        for (const key of Object.keys(update).filter((key) => !allowedKeySet.has(key)).sort()) {
+            storage[key] = update[key]
+        }
+        for (const key of Object.keys(storage)) {
+            mutations.push({ type: 'set', key, value: storage[key] })
+        }
+        return mutations
+    }
+    for (const key of Object.keys(update).filter((key) => !allowedKeySet.has(key)).sort()) {
+        mutations.push({ type: 'set', key, value: update[key] })
+    }
+    return mutations
+}
+
+function compatibilityOnlyUpdate(
+    update: Record<string, unknown>,
+    allowedKeys: readonly string[],
+): Record<string, unknown> {
+    const allowedKeySet = new Set(allowedKeys)
+    return Object.fromEntries(Object.entries(update).filter(([key]) =>
+        key !== 'pluginCustomStorage' && allowedKeySet.has(key),
+    ))
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -300,12 +343,21 @@ export function createPluginDatabaseAccess(
             const needsCharacters = requestedKeys.includes('characters')
             if (!needsCharacters) {
                 const compatibilityDatabase = dependencies.getCompatibilityDatabase()
-                return Object.fromEntries(requestedKeys.map((key) => [
-                    key,
-                    dependencies.snapshot(
-                        (compatibilityDatabase as unknown as Record<string, unknown>)[key],
-                    ),
-                ]))
+                const result: Record<string, unknown> = {}
+                for (const key of requestedKeys) {
+                    if (
+                        key === 'pluginCustomStorage' &&
+                        dependencies.getCompatibilityProfile() === 'scalable-v3'
+                    ) {
+                        await dependencies.flushPendingData('plugin-storage-snapshot')
+                        result[key] = await dependencies.readPluginStorageSnapshot()
+                    } else {
+                        result[key] = dependencies.snapshot(
+                            (compatibilityDatabase as unknown as Record<string, unknown>)[key],
+                        )
+                    }
+                }
+                return result
             }
             const compatibilityProfile = dependencies.getCompatibilityProfile()
             let sourceDatabase: Database
@@ -327,7 +379,7 @@ export function createPluginDatabaseAccess(
             return result
         },
 
-        setDatabaseLite(database, _allowedKeys) {
+        setDatabaseLite(database, allowedKeys) {
             validatePluginDatabaseUpdate(database)
             if (
                 dependencies.getCompatibilityProfile() === 'scalable-v3' &&
@@ -336,7 +388,16 @@ export function createPluginDatabaseAccess(
                 throw new Error(SCALABLE_CHARACTER_SET_ERROR)
             }
             const prepared = dependencies.snapshot(database)
-            dependencies.applyCompatibilityDatabaseLite(prepared)
+            if (dependencies.getCompatibilityProfile() !== 'scalable-v3') {
+                dependencies.applyCompatibilityDatabaseLite(prepared)
+                return
+            }
+            const compatibilityUpdate = compatibilityOnlyUpdate(prepared, allowedKeys)
+            if (Object.keys(compatibilityUpdate).length > 0) {
+                dependencies.applyCompatibilityDatabaseLite(compatibilityUpdate)
+            }
+            const mutations = pluginStorageMutations(prepared, allowedKeys)
+            if (mutations.length > 0) return dependencies.mutatePluginStorage(mutations)
         },
 
         async setDatabase(database, allowedKeys) {
@@ -364,6 +425,12 @@ export function createPluginDatabaseAccess(
             if (hasCharacterUpdate(preparedUpdate)) {
                 validateCompleteCharacters(preparedUpdate.characters)
             }
+            const compatibilityUpdate = compatibilityOnlyUpdate(preparedUpdate, allowedKeys)
+            const storageMutations = pluginStorageMutations(preparedUpdate, allowedKeys)
+            if (Object.keys(compatibilityUpdate).length === 0) {
+                await dependencies.mutatePluginStorage(storageMutations)
+                return
+            }
             const materialized = await dependencies.materializeDatabaseSnapshot(
                 'plugin-database-set',
             )
@@ -385,6 +452,7 @@ export function createPluginDatabaseAccess(
                 expectedRevision: materialized.revision,
                 expectedMutationGeneration: materialized.mutationGeneration,
             })
+            dependencies.invalidatePluginStorage()
         },
     }
 }

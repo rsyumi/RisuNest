@@ -4,6 +4,7 @@ import type {
     ConversationMutation,
     DataRevision,
     PersistentDataStore,
+    PluginStorageMutation,
     PersistentRoot,
     WorkingSetCommit,
 } from './persistentDataStore'
@@ -37,6 +38,8 @@ export interface SaveCoordinatorClock {
 export interface SaveCoordinatorDependencies {
     store: PersistentDataStore
     captureRoot(): RootDatabase
+    capturePluginStorage?(): Database['pluginCustomStorage'] | null
+    publishPluginStorageWorkingSet?(storage: Database['pluginCustomStorage']): void
     capturePresets?(): botPreset[] | null
     captureSelectedCharacter(): CompleteCharacter | null
     captureCharacter(id: string): CompleteCharacter | null
@@ -59,6 +62,8 @@ export interface SaveCoordinatorDependencies {
 interface CapturedState {
     root: RootDatabase
     rootCanonical: string
+    pluginStorage: Database['pluginCustomStorage'] | null
+    pluginStorageCanonical: string | null
     presets: botPreset[] | null
     presetsCanonical: string | null
     character: CompleteCharacter | null
@@ -107,6 +112,40 @@ export function canonicalJson(value: unknown): string {
 
 function canonicalClone<T>(value: T): T {
     return JSON.parse(canonicalJson(value)) as T
+}
+
+function pluginStorageJson(storage: Database['pluginCustomStorage']): string {
+    const normalized: Database['pluginCustomStorage'] = {}
+    for (const key of Object.keys(storage)) {
+        const value = storage[key]
+        if (value !== undefined) normalized[key] = canonicalize(value)
+    }
+    return JSON.stringify(normalized)
+}
+
+function pluginStorageClone(
+    storage: Database['pluginCustomStorage'],
+): Database['pluginCustomStorage'] {
+    return JSON.parse(pluginStorageJson(storage)) as Database['pluginCustomStorage']
+}
+
+function canonicalDatabaseClone(database: Database): Database {
+    const includesPluginStorage = Object.prototype.hasOwnProperty.call(
+        database,
+        'pluginCustomStorage',
+    )
+    const orderedPluginStorage = includesPluginStorage
+        ? pluginStorageClone(database.pluginCustomStorage ?? {})
+        : null
+    const cloned = canonicalClone(database)
+    if (orderedPluginStorage !== null) cloned.pluginCustomStorage = orderedPluginStorage
+    return cloned
+}
+
+function isPluginStorageArrayIndex(key: string): boolean {
+    if (!/^(0|[1-9]\d*)$/.test(key)) return false
+    const value = Number(key)
+    return Number.isSafeInteger(value) && value >= 0 && value < 4_294_967_295
 }
 
 interface ReplacementRebaseResult {
@@ -404,9 +443,101 @@ function splitDatabase(database: Database): {
     root: RootDatabase
     characters: CompleteCharacter[]
     presets: botPreset[]
+    pluginStorage: Database['pluginCustomStorage']
 } {
-    const { characters, botPresets, ...root } = database
-    return { root, characters, presets: botPresets ?? [] }
+    const { characters, botPresets, pluginCustomStorage, ...root } = database
+    return {
+        root,
+        characters,
+        presets: botPresets ?? [],
+        pluginStorage: pluginCustomStorage ?? {},
+    }
+}
+
+function diffPluginStorage(
+    baseline: string | null,
+    current: Database['pluginCustomStorage'],
+): PluginStorageMutation[] {
+    const previous = baseline
+        ? JSON.parse(baseline) as Database['pluginCustomStorage']
+        : {}
+    const currentKeys = Object.keys(current)
+    if (currentKeys.length === 0 && Object.keys(previous).length > 0) {
+        return [{ type: 'clear' }]
+    }
+    const mutations: PluginStorageMutation[] = []
+    const previousKeys = Object.keys(previous)
+    for (const key of previousKeys) {
+        if (!Object.hasOwn(current, key)) mutations.push({ type: 'delete', key })
+    }
+    const previousStringKeys = previousKeys.filter((key) =>
+        !isPluginStorageArrayIndex(key) && Object.hasOwn(current, key),
+    )
+    const currentStringKeys = currentKeys.filter((key) => !isPluginStorageArrayIndex(key))
+    let previousPosition = 0
+    let stablePrefixLength = 0
+    for (const key of currentStringKeys) {
+        if (!Object.hasOwn(previous, key)) break
+        const position = previousStringKeys.indexOf(key, previousPosition)
+        if (position < 0) break
+        previousPosition = position + 1
+        stablePrefixLength++
+    }
+    const movedKeys = new Set(
+        currentStringKeys
+            .slice(stablePrefixLength)
+            .filter((key) => Object.hasOwn(previous, key)),
+    )
+    for (const key of previousKeys) {
+        if (movedKeys.has(key)) mutations.push({ type: 'delete', key })
+    }
+    for (const key of currentKeys) {
+        if (
+            movedKeys.has(key) ||
+            !Object.hasOwn(previous, key) ||
+            !canonicalValuesEqual(previous[key], current[key])
+        ) {
+            mutations.push({ type: 'set', key, value: current[key] })
+        }
+    }
+    return mutations
+}
+
+function applyPluginStorageMutations(
+    storage: Database['pluginCustomStorage'],
+    mutations: readonly PluginStorageMutation[],
+): Database['pluginCustomStorage'] {
+    const next = pluginStorageClone(storage)
+    for (const mutation of mutations) {
+        if (mutation.type === 'clear') {
+            for (const key of Object.keys(next)) delete next[key]
+        } else if (mutation.type === 'delete') {
+            delete next[mutation.key]
+        } else {
+            next[mutation.key] = canonicalClone(mutation.value)
+        }
+    }
+    return next
+}
+
+function rebaseConcurrentPluginStorage(
+    base: Database['pluginCustomStorage'],
+    live: Database['pluginCustomStorage'],
+    candidate: Database['pluginCustomStorage'],
+): Database['pluginCustomStorage'] {
+    const rebased = rebaseConcurrentLiveDelta(base, live, candidate)
+    const ordered = applyPluginStorageMutations(
+        candidate,
+        diffPluginStorage(pluginStorageJson(base), live),
+    )
+    const result: Database['pluginCustomStorage'] = {}
+    for (const key of Object.keys(ordered)) {
+        if (Object.hasOwn(rebased, key)) result[key] = rebased[key]
+    }
+    for (const key of Object.keys(rebased)) {
+        if (!Object.hasOwn(result, key)) result[key] = rebased[key]
+    }
+    return result
 }
 
 export interface PersistentReplacementOptions {
@@ -483,6 +614,7 @@ export class SaveCoordinator {
     private readonly clock: SaveCoordinatorClock
     private currentRevision: DataRevision | null = null
     private rootBaseline: string | null = null
+    private pluginStorageBaseline: string | null = null
     private presetsBaseline: string | null = null
     private characterBaseline: string | null = null
     private characterBaselineId: string | null = null
@@ -526,6 +658,7 @@ export class SaveCoordinator {
         const captured = database ? this.captureDatabase(database) : this.capture()
         this.currentRevision = revision
         this.rootBaseline = captured.rootCanonical
+        this.pluginStorageBaseline = captured.pluginStorageCanonical
         this.presetsBaseline = captured.presetsCanonical
         this.setCharacterBaseline(captured)
         this.dirtyGeneration = 0
@@ -565,6 +698,7 @@ export class SaveCoordinator {
         ) return false
         const captured = this.captureDatabase(database)
         this.rootBaseline = captured.rootCanonical
+        this.pluginStorageBaseline = captured.pluginStorageCanonical
         this.presetsBaseline = captured.presetsCanonical
         this.setCharacterBaseline(captured)
         return true
@@ -622,7 +756,7 @@ export class SaveCoordinator {
                 new Error('Cannot replace persistent data from an incomplete persistent working set'),
             )
         }
-        const candidate = canonicalClone(database)
+        const candidate = canonicalDatabaseClone(database)
         const before = this.capture()
         const capturedGeneration = this.dirtyGeneration
         const supersededAdditionToken = (
@@ -677,7 +811,7 @@ export class SaveCoordinator {
                         'Cannot replace persistent data from an incomplete persistent working set',
                     )
                 }
-                candidate = canonicalClone(prepared)
+                candidate = canonicalDatabaseClone(prepared)
             } catch (error) {
                 throw error
             }
@@ -783,6 +917,49 @@ export class SaveCoordinator {
             }
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
+        })
+    }
+
+    mutatePersistentPluginStorage(
+        reason: string,
+        mutations: readonly PluginStorageMutation[],
+    ): Promise<void> {
+        this.assertInitialized()
+        this.cancelDebounce()
+        return this.enqueue(async () => {
+            await this.flushIterations(reason, true)
+            if (mutations.length === 0) return
+            const revision = this.revision
+            const baseline = this.pluginStorageBaseline === null
+                ? null
+                : JSON.parse(this.pluginStorageBaseline) as Database['pluginCustomStorage']
+            const committedStorage = applyPluginStorageMutations(baseline ?? {}, mutations)
+            const liveBeforeCommit = this.capture().pluginStorage
+            const committed = await this.dependencies.store.commit({
+                expectedRevision: revision,
+                pluginStorage: canonicalClone(mutations) as PluginStorageMutation[],
+            })
+            this.currentRevision = committed.revision
+            this.dirtyGeneration++
+            if (baseline !== null) {
+                this.pluginStorageBaseline = pluginStorageJson(committedStorage)
+                const liveAfterCommit = this.capture().pluginStorage
+                const publishedStorage =
+                    liveBeforeCommit !== null && liveAfterCommit !== null
+                        ? rebaseConcurrentPluginStorage(
+                            liveBeforeCommit,
+                            liveAfterCommit,
+                            committedStorage,
+                        )
+                        : committedStorage
+                this.dependencies.publishPluginStorageWorkingSet?.(
+                    publishedStorage,
+                )
+            }
+            this.dependencies.onLocalRevision?.(committed.revision)
+            this.pendingByteCount = 0
+            this.lastBackgroundErrorMessage = null
+            await this.finishExplicitCommit(committed.revision)
         })
     }
 
@@ -1152,7 +1329,7 @@ export class SaveCoordinator {
                 throw new Error('Working set changed during persistent database materialization')
             }
             return {
-                database: canonicalClone(database),
+                database: canonicalDatabaseClone(database),
                 revision,
                 mutationGeneration: generation,
             }
@@ -1250,6 +1427,15 @@ export class SaveCoordinator {
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
             if (
+                captured.pluginStorage !== null &&
+                captured.pluginStorageCanonical !== this.pluginStorageBaseline
+            ) {
+                commit.pluginStorage = diffPluginStorage(
+                    this.pluginStorageBaseline,
+                    captured.pluginStorage,
+                )
+            }
+            if (
                 captured.presetsCanonical !== null &&
                 captured.presetsCanonical !== this.presetsBaseline
             ) {
@@ -1284,6 +1470,7 @@ export class SaveCoordinator {
 
             if (
                 commit.root ||
+                commit.pluginStorage ||
                 commit.replacePresets ||
                 commit.replaceCharacter ||
                 commit.addCharacter ||
@@ -1292,6 +1479,9 @@ export class SaveCoordinator {
                 const committed = await this.dependencies.store.commit(commit)
                 this.currentRevision = committed.revision
                 if (commit.root) this.rootBaseline = captured.rootCanonical
+                if (commit.pluginStorage) {
+                    this.pluginStorageBaseline = captured.pluginStorageCanonical
+                }
                 if (commit.replacePresets) this.presetsBaseline = captured.presetsCanonical
                 if (commit.replaceCharacter && !replacementIsAddition) {
                     if (detached && captured.character) {
@@ -1335,6 +1525,8 @@ export class SaveCoordinator {
             if (
                 generation === this.dirtyGeneration &&
                 current.rootCanonical === this.rootBaseline &&
+                (current.pluginStorageCanonical === null ||
+                    current.pluginStorageCanonical === this.pluginStorageBaseline) &&
                 (current.presetsCanonical === null ||
                     current.presetsCanonical === this.presetsBaseline) &&
                 current.characterCanonical === this.characterBaseline &&
@@ -1403,6 +1595,7 @@ export class SaveCoordinator {
         this.currentRevision = replaced.revision
         const candidateCapture = this.captureDatabase(candidate)
         this.rootBaseline = candidateCapture.rootCanonical
+        this.pluginStorageBaseline = candidateCapture.pluginStorageCanonical
         this.presetsBaseline = candidateCapture.presetsCanonical
         this.setCharacterBaseline(candidateCapture)
 
@@ -1425,6 +1618,11 @@ export class SaveCoordinator {
             this.currentRevision = compensated.revision
             if (compensation.root) {
                 this.rootBaseline = canonicalJson(compensation.root)
+            }
+            if (compensation.pluginStorage) {
+                this.pluginStorageBaseline = pluginStorageJson(
+                    published.pluginCustomStorage ?? {},
+                )
             }
             if (compensation.replacePresets) {
                 this.presetsBaseline = canonicalJson(compensation.replacePresets)
@@ -1629,6 +1827,8 @@ export class SaveCoordinator {
         const currentAddition = this.capturePendingAddition()
         const isClean = targetSettled &&
             current.rootCanonical === this.rootBaseline &&
+            (current.pluginStorageCanonical === null ||
+                current.pluginStorageCanonical === this.pluginStorageBaseline) &&
             (current.presetsCanonical === null ||
                 current.presetsCanonical === this.presetsBaseline) &&
             current.characterCanonical === this.characterBaseline &&
@@ -1783,13 +1983,21 @@ export class SaveCoordinator {
         const capturedRoot = this.dependencies.captureRoot() as RootDatabase & {
             characters?: Database['characters']
             botPresets?: botPreset[]
+            pluginCustomStorage?: Database['pluginCustomStorage']
         }
         const {
             characters: _characters,
             botPresets: legacyPresets,
+            pluginCustomStorage: legacyPluginStorage,
             ...rootValue
         } = capturedRoot
         const rootCanonical = canonicalJson(rootValue)
+        const pluginStorageValue = this.dependencies.capturePluginStorage
+            ? this.dependencies.capturePluginStorage()
+            : legacyPluginStorage ?? null
+        const pluginStorageCanonical = pluginStorageValue === null
+            ? null
+            : pluginStorageJson(pluginStorageValue)
         const presetsValue = this.dependencies.capturePresets
             ? this.dependencies.capturePresets()
             : legacyPresets ?? []
@@ -1805,6 +2013,10 @@ export class SaveCoordinator {
         return {
             root: JSON.parse(rootCanonical) as RootDatabase,
             rootCanonical,
+            pluginStorage: pluginStorageCanonical === null
+                ? null
+                : JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage'],
+            pluginStorageCanonical,
             presets: presetsCanonical === null
                 ? null
                 : JSON.parse(presetsCanonical) as botPreset[],
@@ -1818,13 +2030,20 @@ export class SaveCoordinator {
     }
 
     private captureDatabase(database: Database): CapturedState {
-        const cloned = canonicalClone(database)
-        const { root, characters, presets } = splitDatabase(cloned)
+        const cloned = canonicalDatabaseClone(database)
+        const { root, characters, presets, pluginStorage } = splitDatabase(cloned)
+        const pluginStorageUnavailable =
+            !Object.prototype.hasOwnProperty.call(cloned, 'pluginCustomStorage') &&
+            this.dependencies.isIncompleteWorkingSet?.(cloned) === true
         const selectedId = this.dependencies.captureSelectedCharacter()?.chaId
         const character = selectedId ? characters.find((candidate) => candidate.chaId === selectedId) ?? null : null
         return {
             root,
             rootCanonical: JSON.stringify(root),
+            pluginStorage: pluginStorageUnavailable ? null : pluginStorage,
+            pluginStorageCanonical: pluginStorageUnavailable
+                ? null
+                : JSON.stringify(pluginStorage),
             presets,
             presetsCanonical: JSON.stringify(presets),
             character,
@@ -2034,7 +2253,7 @@ export class SaveCoordinator {
         live: CapturedState,
         preserveConflicts: boolean,
     ): ReplacementRebaseResult {
-        const publishedParts = splitDatabase(canonicalClone(candidate))
+        const publishedParts = splitDatabase(canonicalDatabaseClone(candidate))
         const compensation: Omit<WorkingSetCommit, 'expectedRevision'> = {}
         let publishedRoot: RootDatabase
         try {
@@ -2068,6 +2287,27 @@ export class SaveCoordinator {
             }
         }
 
+        let publishedPluginStorage = publishedParts.pluginStorage
+        if (
+            live.pluginStorage !== null &&
+            before.pluginStorage !== null &&
+            live.pluginStorageCanonical !== before.pluginStorageCanonical
+        ) {
+            try {
+                publishedPluginStorage = rebaseConcurrentPluginStorage(
+                    before.pluginStorage,
+                    live.pluginStorage,
+                    publishedParts.pluginStorage,
+                )
+            } catch (error) {
+                if (!preserveConflicts) throw error
+                publishedPluginStorage = pluginStorageClone(live.pluginStorage)
+                compensation.pluginStorage = diffPluginStorage(
+                    pluginStorageJson(publishedParts.pluginStorage),
+                    publishedPluginStorage,
+                )
+            }
+        }
         if (
             before.character &&
             live.character?.chaId === before.character.chaId &&
@@ -2092,9 +2332,16 @@ export class SaveCoordinator {
             }
         }
 
+        const includesPluginStorage = Object.prototype.hasOwnProperty.call(
+            candidate,
+            'pluginCustomStorage',
+        ) || live.pluginStorage !== null
         return {
             database: {
                 ...publishedRoot,
+                ...(includesPluginStorage
+                    ? { pluginCustomStorage: publishedPluginStorage }
+                    : {}),
                 characters: publishedParts.characters,
                 botPresets: publishedPresets,
             } as Database,

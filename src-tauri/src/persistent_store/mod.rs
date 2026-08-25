@@ -10,6 +10,7 @@ pub(crate) use commands::PersistentStoreState;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 pub(super) type StoreResult<T> = Result<T, StoreError>;
@@ -143,6 +144,44 @@ pub(crate) struct PresetCatalog {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct PluginStorageSummary {
+    pub(crate) key: String,
+    pub(crate) byte_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PluginStorageCatalog {
+    pub(crate) revision: i64,
+    pub(crate) items: Vec<PluginStorageSummary>,
+}
+
+fn plugin_storage_array_index(key: &str) -> Option<u32> {
+    let value = key.parse::<u32>().ok()?;
+    (value < u32::MAX && value.to_string() == key).then_some(value)
+}
+
+pub(super) fn compare_plugin_storage_keys(
+    left_key: &str,
+    left_ordinal: i64,
+    right_key: &str,
+    right_ordinal: i64,
+) -> Ordering {
+    match (
+        plugin_storage_array_index(left_key),
+        plugin_storage_array_index(right_key),
+    ) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left_ordinal
+            .cmp(&right_ordinal)
+            .then_with(|| left_key.cmp(right_key)),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct CharacterPage {
     pub(crate) revision: i64,
     pub(crate) items: Vec<CharacterSummary>,
@@ -235,6 +274,18 @@ pub(crate) enum ConversationMutation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(
+    tag = "type",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum PluginStorageMutation {
+    Set { key: String, value: Value },
+    Delete { key: String },
+    Clear,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkingSetCommit {
     pub(crate) expected_revision: i64,
@@ -252,6 +303,8 @@ pub(crate) struct WorkingSetCommit {
     pub(crate) conversations: Option<Vec<ConversationMutation>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) delete_character_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) plugin_storage: Option<Vec<PluginStorageMutation>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -392,6 +445,21 @@ impl PersistentStore {
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<ConversationWindow>>> {
         query::read_conversation_window(&self.connection, query, lease)
+    }
+
+    pub(crate) fn query_plugin_storage(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<PluginStorageCatalog> {
+        query::query_plugin_storage(&self.connection, lease)
+    }
+
+    pub(crate) fn read_plugin_storage(
+        &self,
+        key: &str,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<Versioned<Value>>> {
+        query::read_plugin_storage(&self.connection, key, lease)
     }
 
     pub(crate) fn materialize(&self, revision: Option<i64>) -> StoreResult<Value> {

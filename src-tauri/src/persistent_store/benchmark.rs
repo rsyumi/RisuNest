@@ -533,6 +533,7 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
                     conversation: None,
                 }]),
                 delete_character_id: None,
+                plugin_storage: None,
             })
             .expect("append benchmark message")
             .revision,

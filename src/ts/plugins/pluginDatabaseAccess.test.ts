@@ -5,6 +5,7 @@ import type {
     ConversationPage,
     ConversationWindow,
     PersistentDataStore,
+    PluginStorageMutation,
 } from '../storage/persistentDataStore'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { createCatalogCharacterStub } from '../storage/workingSetCatalog'
@@ -117,6 +118,14 @@ function createHarness() {
             expectedMutationGeneration?: number
         },
     ) => undefined)
+    const readPluginStorageSnapshot = vi.fn(async () => ({
+        '2': 0,
+        memory: { retained: true },
+    }))
+    const mutatePluginStorage = vi.fn(async (
+        _mutations: readonly PluginStorageMutation[],
+    ) => undefined)
+    const invalidatePluginStorage = vi.fn()
     const access = createPluginDatabaseAccess({
         store,
         flushPendingData,
@@ -127,6 +136,9 @@ function createHarness() {
         applyCompatibilityDatabase,
         materializeDatabaseSnapshot,
         replacePersistentDatabase,
+        readPluginStorageSnapshot,
+        mutatePluginStorage,
+        invalidatePluginStorage,
         prepareAuthoritativeDatabaseUpdate,
         snapshot: <T>(value: T) => snapshot(value) as T,
     })
@@ -139,7 +151,10 @@ function createHarness() {
         flushPendingData,
         materializedDatabases,
         materializeDatabaseSnapshot,
+        mutatePluginStorage,
         prepareAuthoritativeDatabaseUpdate,
+        readPluginStorageSnapshot,
+        invalidatePluginStorage,
         replacePersistentDatabase,
         setCompatibilityProfile(profile: 'scalable-v3' | 'maximum-compatibility') {
             compatibilityProfile = profile
@@ -168,6 +183,9 @@ describe('plugin database access', () => {
             getNavigationGeneration: () => 0,
             applyCompatibilityDatabaseLite: harness.applyCompatibilityDatabaseLite,
             applyCompatibilityDatabase: harness.applyCompatibilityDatabase,
+            readPluginStorageSnapshot: harness.readPluginStorageSnapshot,
+            mutatePluginStorage: harness.mutatePluginStorage,
+            invalidatePluginStorage: harness.invalidatePluginStorage,
             materializeDatabaseSnapshot: harness.materializeDatabaseSnapshot,
             replacePersistentDatabase: harness.replacePersistentDatabase,
             prepareAuthoritativeDatabaseUpdate: harness.prepareAuthoritativeDatabaseUpdate,
@@ -356,6 +374,28 @@ describe('plugin database access', () => {
         expect(harness.store.open).not.toHaveBeenCalled()
         expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
         expect(harness.flushPendingData).not.toHaveBeenCalled()
+    })
+
+    it('reads requested scalable plugin storage through the per-key authority', async () => {
+        const harness = createHarness()
+        Object.defineProperty(harness.compatibilityDatabase, 'pluginCustomStorage', {
+            get() {
+                throw new Error('scalable plugin storage touched the compatibility root')
+            },
+        })
+
+        await expect(harness.access.getDatabaseSnapshot(
+            ['pluginCustomStorage'],
+            ['pluginCustomStorage', 'username'],
+        )).resolves.toEqual({
+            pluginCustomStorage: {
+                '2': 0,
+                memory: { retained: true },
+            },
+        })
+        expect(harness.readPluginStorageSnapshot).toHaveBeenCalledOnce()
+        expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
     })
 
     it('materializes characters only for the explicit full compatibility snapshot', async () => {
@@ -567,6 +607,41 @@ describe('plugin database access', () => {
             'plugin-database-set',
             expect.objectContaining({ expectedRevision: 9 }),
         )
+        expect(harness.invalidatePluginStorage).toHaveBeenCalledOnce()
+    })
+
+    it('routes scalable lite plugin storage replacement through atomic per-key mutations', async () => {
+        const harness = createHarness()
+
+        await harness.access.setDatabaseLite({
+            pluginCustomStorage: {
+                '2': 0,
+                memory: { replaced: true },
+            },
+        }, ['pluginCustomStorage'])
+
+        expect(harness.mutatePluginStorage).toHaveBeenCalledWith([
+            { type: 'clear' },
+            { type: 'set', key: '2', value: 0 },
+            { type: 'set', key: 'memory', value: { replaced: true } },
+        ])
+        expect(harness.applyCompatibilityDatabaseLite).not.toHaveBeenCalled()
+        expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
+    })
+
+    it('routes a scalable async plugin-only update without materializing the database', async () => {
+        const harness = createHarness()
+
+        await harness.access.setDatabase({
+            pluginCustomStorage: { memory: 'authoritative' },
+        }, ['pluginCustomStorage'])
+
+        expect(harness.mutatePluginStorage).toHaveBeenCalledWith([
+            { type: 'clear' },
+            { type: 'set', key: 'memory', value: 'authoritative' },
+        ])
+        expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(harness.replacePersistentDatabase).not.toHaveBeenCalled()
     })
 
     it('keeps maximum-compatibility character setters on the live full database paths', async () => {
@@ -806,14 +881,17 @@ describe('plugin database access', () => {
         await first.access.setDatabase(firstUpdate, ['pluginCustomStorage'])
         await second.access.setDatabase(secondUpdate, ['pluginCustomStorage'])
 
-        const firstCandidate = first.replacePersistentDatabase.mock.calls[0][0]
-        const secondCandidate = second.replacePersistentDatabase.mock.calls[0][0]
-        expect(firstCandidate.pluginCustomStorage).toEqual({
-            explicitOnly: 'value',
-            extraOnly: 2,
-            shared: 'extra',
-        })
-        expect(secondCandidate.pluginCustomStorage).toEqual(firstCandidate.pluginCustomStorage)
+        expect(first.mutatePluginStorage).toHaveBeenCalledWith([
+            { type: 'clear' },
+            { type: 'set', key: 'shared', value: 'extra' },
+            { type: 'set', key: 'explicitOnly', value: 'value' },
+            { type: 'set', key: 'extraOnly', value: 2 },
+        ])
+        expect(second.mutatePluginStorage.mock.calls[0][0]).toEqual(
+            first.mutatePluginStorage.mock.calls[0][0],
+        )
+        expect(first.replacePersistentDatabase).not.toHaveBeenCalled()
+        expect(second.replacePersistentDatabase).not.toHaveBeenCalled()
     })
 
     it.each([

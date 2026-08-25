@@ -758,6 +758,9 @@ describe('plugin compatibility profiles', () => {
             getNavigationGeneration: () => 0,
             applyCompatibilityDatabaseLite: vi.fn(),
             applyCompatibilityDatabase: applyMaximumUpdate,
+            readPluginStorageSnapshot: vi.fn(async () => ({})),
+            mutatePluginStorage: vi.fn(async () => undefined),
+            invalidatePluginStorage: vi.fn(),
             materializeDatabaseSnapshot: async () => {
                 await persistenceComplete.promise
                 return {

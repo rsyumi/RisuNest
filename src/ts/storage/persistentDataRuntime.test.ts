@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from './database.svelte'
 import {
+    capturePersistentPluginStorage,
     capturePersistentPresets,
     capturePersistentRoot,
     captureResidentPersistentCharacter,
@@ -66,6 +67,26 @@ describe('persistent preset capture', () => {
         ] as Database['botPresets']
 
         expect(capturePersistentPresets({ botPresets } as Database)).toBe(botPresets)
+    })
+})
+
+describe('persistent plugin storage capture', () => {
+    it('does not capture the empty compatibility object from a scalable working set', () => {
+        const database = makeDatabase('Scalable')
+        database.botPresets = createCatalogPresetWorkingSet(
+            { revision: 3, items: [] },
+            null,
+        )
+        database.pluginCustomStorage = {}
+
+        expect(capturePersistentPluginStorage(database)).toBeNull()
+    })
+
+    it('captures all values from a maximum-compatibility working set', () => {
+        const database = makeDatabase('Maximum')
+        database.pluginCustomStorage = { memory: { entries: [1, 2, 3] } }
+
+        expect(capturePersistentPluginStorage(database)).toBe(database.pluginCustomStorage)
     })
 })
 

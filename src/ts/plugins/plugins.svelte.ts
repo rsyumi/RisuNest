@@ -25,10 +25,18 @@ import {
 import {
     getPersistentNavigationGeneration,
     materializeMaximumCompatibilityWorkingSet,
+    mutatePersistentPluginStorage,
     releaseInactiveWorkingSet,
     replacePersistentDatabase,
 } from "../storage/persistentDataRuntime.svelte";
+import { getPersistentDataStore } from "../storage/persistentDataStoreFactory";
 import { workingSetResidency } from "../storage/workingSetResidency";
+import {
+    createPluginStorageStore,
+    observePluginStorageValue,
+    readCompatibilityPluginStorageValue,
+    registerPluginStorageLifecycle,
+} from "./pluginStorageStore";
 import {
     applyPluginDatabaseUpdate,
     validatePluginDatabaseUpdate,
@@ -479,6 +487,12 @@ function scheduleWorkingSetReleaseRetry(retry: () => void): () => void {
     }
 }
 
+export const pluginStorageStore = createPluginStorageStore({
+    store: getPersistentDataStore,
+    mutate: (mutations) => mutatePersistentPluginStorage('plugin-v3-storage', mutations),
+})
+registerPluginStorageLifecycle(pluginStorageStore)
+
 export const pluginCompatibility = createPluginCompatibilityController({
     persistBeforeEviction: createFullCompatibilityPersistence(
         () => getDatabase({ snapshot: true }),
@@ -486,8 +500,16 @@ export const pluginCompatibility = createPluginCompatibilityController({
             publishOfficial: true,
         }),
     ),
-    enterMaximumCompatibility: materializeMaximumCompatibilityWorkingSet,
-    setEvictionAllowed: (allowed) => workingSetResidency.setEvictionAllowed(allowed),
+    enterMaximumCompatibility: async () => {
+        await materializeMaximumCompatibilityWorkingSet()
+        pluginStorageStore.preloadCompatibilityValues(
+            getDatabase({ snapshot: true }).pluginCustomStorage ?? {},
+        )
+    },
+    setEvictionAllowed: (allowed) => {
+        workingSetResidency.setEvictionAllowed(allowed)
+        pluginStorageStore.setEvictionAllowed(allowed)
+    },
     canReleaseWorkingSet,
     scheduleReleaseRetry: scheduleWorkingSetReleaseRetry,
     onReleaseRetryError: (error) => console.error(error),
@@ -513,6 +535,12 @@ export async function loadPlugins() {
     const pluginV2 = enabledPlugins.filter((a: RisuPlugin) => a.version === 2 || a.version === '2.1')
     const pluginV3 = enabledPlugins.filter((a: RisuPlugin) => a.version === '3.0')
     const nextProfile = selectPluginCompatibilityProfile(plugins)
+    if (
+        nextProfile === 'maximum-compatibility' &&
+        pluginCompatibility.profile === 'maximum-compatibility'
+    ) {
+        pluginStorageStore.preloadCompatibilityValues(db.pluginCustomStorage ?? {})
+    }
 
     await applyPluginLoad({ nextProfile, pluginV2, pluginV3 })
 }
@@ -591,6 +619,12 @@ export function applyPreparedPluginDatabaseUpdate(
 ): void {
     const db = getDatabase()
     applyPluginDatabaseUpdate(db, database, allowedDbKeys)
+    if (
+        pluginCompatibility.profile === 'maximum-compatibility' &&
+        Object.prototype.hasOwnProperty.call(database, 'pluginCustomStorage')
+    ) {
+        pluginStorageStore.synchronizeCompatibilityStorage(db.pluginCustomStorage ?? {})
+    }
     if (lite) DBState.db = db
     else setDatabase(db)
 }
@@ -778,23 +812,49 @@ export const getV2PluginAPIs = () => {
             return new Proxy(db, {
                 get(target, prop) {
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
-                        return (target as any)[prop];
+                        const value = (target as any)[prop]
+                        if (prop !== 'pluginCustomStorage') return value
+                        return observePluginStorageValue(value, () => {
+                            pluginStorageStore.synchronizeCompatibilityStorage(
+                                target.pluginCustomStorage ?? {},
+                            )
+                        })
                     }
                     else if(target.pluginCustomStorage){
                         console.log('Getting custom db property', prop.toString());
-                        return target.pluginCustomStorage[prop.toString()];
+                        const key = prop.toString()
+                        return observePluginStorageValue(
+                            target.pluginCustomStorage[key],
+                            () => pluginStorageStore.synchronizeCompatibilityMutation({
+                                type: 'set',
+                                key,
+                                value: target.pluginCustomStorage[key],
+                            }),
+                        )
                     }
                     return undefined;
                 },
                 set(target, prop, value) {
                     if (typeof prop === 'string' && allowedDbKeys.includes(prop)) {
                         (target as any)[prop] = value;
+                        if (prop === 'pluginCustomStorage') {
+                            pluginStorageStore.synchronizeCompatibilityStorage(
+                                value && typeof value === 'object' && !Array.isArray(value)
+                                    ? value
+                                    : {},
+                            )
+                        }
                         return true;
                     }
                     else{
                         console.log('Setting custom db property', prop.toString(), value);
                         target.pluginCustomStorage ??= {}
                         target.pluginCustomStorage[prop.toString()] = value;
+                        pluginStorageStore.synchronizeCompatibilityMutation({
+                            type: 'set',
+                            key: prop.toString(),
+                            value,
+                        })
                         return true;
                     }
                 },
@@ -818,21 +878,24 @@ export const getV2PluginAPIs = () => {
             getItem: (key: string) => {
                 const db = getDatabase({ snapshot: true });
                 db.pluginCustomStorage ??= {}
-                return db.pluginCustomStorage[key] || null;
+                return readCompatibilityPluginStorageValue(db.pluginCustomStorage, key);
             },
             setItem: (key: string, value: string) => {
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 db.pluginCustomStorage[key] = value;
+                pluginStorageStore.synchronizeCompatibilityMutation({ type: 'set', key, value })
             },
             removeItem: (key: string) => {
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
                 delete db.pluginCustomStorage[key];
+                pluginStorageStore.synchronizeCompatibilityMutation({ type: 'delete', key })
             },
             clear: () => {
                 const db = getDatabase();
                 db.pluginCustomStorage = {};
+                pluginStorageStore.synchronizeCompatibilityMutation({ type: 'clear' })
             },
             key: (index: number) => {
                 const db = getDatabase();

@@ -125,13 +125,31 @@ async function presetValues(lease: PersistentRevisionLease): Promise<Database['b
     return presets
 }
 
+async function pluginStorageValues(
+    lease: PersistentRevisionLease,
+): Promise<Database['pluginCustomStorage']> {
+    const storage: Database['pluginCustomStorage'] = {}
+    const catalog = await lease.queryPluginStorage()
+    for (const summary of catalog.items) {
+        const value = await lease.readPluginStorage(summary.key)
+        if (!value) throw new Error(`Missing plugin storage value for ${summary.key}`)
+        storage[summary.key] = value.value
+    }
+    return storage
+}
+
 export async function* streamRisuSaveFromLease(
     lease: PersistentRevisionLease,
     options?: RisuSaveStreamOptions,
 ): AsyncGenerator<Uint8Array> {
     const storedRoot = (await lease.readRoot()).value
     const storedPresets = await presetValues(lease)
-    const rootWithPresets = { ...storedRoot, botPresets: storedPresets } as Database
+    const storedPluginStorage = await pluginStorageValues(lease)
+    const rootWithPresets = {
+        ...storedRoot,
+        botPresets: storedPresets,
+        pluginCustomStorage: storedPluginStorage,
+    } as Database
     const root = options?.replaceResources
         ? replaceDatabaseRootResources(rootWithPresets, options.replaceResources)
         : rootWithPresets
@@ -222,11 +240,12 @@ async function materializeDatabaseFromLease(
 ): Promise<Database> {
     const root = (await lease.readRoot()).value
     const botPresets = await presetValues(lease)
+    const pluginCustomStorage = await pluginStorageValues(lease)
     const characters: Database['characters'] = []
     for await (const character of characterValues(lease)) {
         characters.push(character)
     }
-    return { ...root, characters, botPresets } as Database
+    return { ...root, characters, botPresets, pluginCustomStorage } as Database
 }
 
 async function collectChunks(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {

@@ -167,7 +167,13 @@ pub(super) fn acquire_revision(
         "INSERT INTO root (generation, value) SELECT ?1, value FROM root WHERE generation = ?2",
         params![generation, source],
     )?;
-    for table in ["bot_presets", "characters", "conversations", "messages"] {
+    for table in [
+        "bot_presets",
+        "characters",
+        "conversations",
+        "messages",
+        "plugin_storage",
+    ] {
         let sql = format!(
             "INSERT INTO {table} SELECT ?1, {} FROM {table} WHERE generation = ?2",
             columns_without_generation(table)
@@ -281,6 +287,7 @@ fn columns_without_generation(table: &str) -> &'static str {
         "characters" => "character_id, configured_index, recent_at, trashed, name, image, conversation_count, type, creator_notes, trash_time, detail",
         "conversations" => "character_id, conversation_id, configured_index, recent_at, name, message_count, detail",
         "messages" => "character_id, conversation_id, message_index, message_id, value",
+        "plugin_storage" => "storage_key, byte_size, ordinal, value",
         _ => unreachable!(),
     }
 }
@@ -291,6 +298,7 @@ fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) 
         "conversations",
         "characters",
         "bot_presets",
+        "plugin_storage",
         "root",
     ] {
         transaction.execute(
@@ -374,7 +382,7 @@ fn validate_restore_database(path: &Path) -> StoreResult<()> {
         return Err(validation("snapshot integrity check failed"));
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if !matches!(version, 1 | 2) {
+    if !matches!(version, 1 | 2 | 3 | 4) {
         return Err(validation("snapshot schema version is not supported"));
     }
     Ok(())

@@ -11,6 +11,181 @@ export interface PersistentDataStoreHarness {
 
 export function persistentDataStoreContract(createHarness: () => Promise<PersistentDataStoreHarness>): void {
     describe('PersistentDataStore contract', () => {
+        it('stores plugin values outside root and materializes the legacy object losslessly', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.pluginCustomStorage = { fixture: { value: 'stored' } }
+            const imported = await store.replaceFromDatabase(database)
+
+            expect((await store.readRoot()).value).not.toHaveProperty('pluginCustomStorage')
+            expect(await store.queryPluginStorage()).toEqual({
+                revision: imported.revision,
+                items: [
+                    {
+                        key: 'fixture',
+                        byteSize: new TextEncoder().encode(
+                            JSON.stringify(database.pluginCustomStorage.fixture),
+                        ).byteLength,
+                    },
+                ],
+            })
+            expect((await store.readPluginStorage('fixture'))?.value).toEqual(
+                database.pluginCustomStorage.fixture,
+            )
+            expect(await store.readPluginStorage('missing')).toBeNull()
+            expect((await store.materializeDatabase()).pluginCustomStorage).toEqual(
+                database.pluginCustomStorage,
+            )
+        })
+
+        it('atomically mutates plugin keys with root under revision CAS', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.pluginCustomStorage = { alpha: 'old', beta: { keep: false } }
+            const imported = await store.replaceFromDatabase(database)
+            const root = (await store.readRoot()).value
+
+            const committed = await store.commit({
+                expectedRevision: imported.revision,
+                root: { ...root, username: 'Plugin commit' },
+                pluginStorage: [
+                    { type: 'set', key: 'alpha', value: 'new' },
+                    { type: 'delete', key: 'beta' },
+                    { type: 'set', key: 'gamma', value: [1, 2, 3] },
+                ],
+            })
+
+            expect((await store.readRoot()).value.username).toBe('Plugin commit')
+            expect((await store.queryPluginStorage()).items.map((item) => item.key)).toEqual([
+                'alpha',
+                'gamma',
+            ])
+            expect((await store.materializeDatabase()).pluginCustomStorage).toEqual({
+                alpha: 'new',
+                gamma: [1, 2, 3],
+            })
+
+            await expect(store.commit({
+                expectedRevision: imported.revision,
+                root: { ...root, username: 'Stale plugin commit' },
+                pluginStorage: [{ type: 'clear' }],
+            })).rejects.toBeInstanceOf(RevisionConflictError)
+            expect((await store.readRoot()).revision).toBe(committed.revision)
+            expect((await store.readRoot()).value.username).toBe('Plugin commit')
+            expect((await store.materializeDatabase()).pluginCustomStorage).toEqual({
+                alpha: 'new',
+                gamma: [1, 2, 3],
+            })
+
+            await store.commit({
+                expectedRevision: committed.revision,
+                pluginStorage: [{ type: 'clear' }],
+            })
+            expect((await store.queryPluginStorage()).items).toEqual([])
+        })
+
+        it('isolates plugin reads through a revision lease and rejects them after release', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.pluginCustomStorage = { memory: { revision: 1 } }
+            const imported = await store.replaceFromDatabase(database)
+            const lease = await store.acquireRevision(imported.revision)
+
+            await store.commit({
+                expectedRevision: imported.revision,
+                pluginStorage: [{ type: 'set', key: 'memory', value: { revision: 2 } }],
+            })
+
+            expect((await lease.queryPluginStorage()).items.map((item) => item.key)).toEqual([
+                'memory',
+            ])
+            expect((await lease.readPluginStorage('memory'))?.value).toEqual({ revision: 1 })
+            expect((await store.readPluginStorage('memory'))?.value).toEqual({ revision: 2 })
+            await lease.release()
+            await expect(lease.readPluginStorage('memory')).rejects.toBeInstanceOf(
+                SnapshotReleasedError,
+            )
+        })
+
+        it('preserves legacy Object.keys plugin ordering across mutation and reopen', async () => {
+            const { store, reopen } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            const storage: Record<string, unknown> = {}
+            storage.zeta = 'first string'
+            storage['10'] = 'ten'
+            storage['2'] = 'two'
+            storage['01'] = 'non-index'
+            storage['4294967294'] = 'largest index'
+            storage['4294967295'] = 'non-index boundary'
+            storage['\uffffx'] = 'high unicode'
+            database.pluginCustomStorage = storage
+            const imported = await store.replaceFromDatabase(database)
+            const originalOrder = Object.keys(storage)
+
+            expect((await store.queryPluginStorage()).items.map((item) => item.key)).toEqual(
+                originalOrder,
+            )
+            expect(Object.keys((await store.materializeDatabase()).pluginCustomStorage)).toEqual(
+                originalOrder,
+            )
+            expect((await store.readPluginStorage('\uffffx'))?.value).toBe('high unicode')
+
+            const updated = await store.commit({
+                expectedRevision: imported.revision,
+                pluginStorage: [
+                    { type: 'set', key: 'zeta', value: 'updated in place' },
+                    { type: 'delete', key: 'zeta' },
+                    { type: 'set', key: 'zeta', value: 'reinserted last' },
+                ],
+            })
+            const expectedAfterReinsert = originalOrder.filter((key) => key !== 'zeta')
+            expectedAfterReinsert.push('zeta')
+            const reopened = await reopen()
+
+            expect((await reopened.queryPluginStorage()).items.map((item) => item.key)).toEqual(
+                expectedAfterReinsert,
+            )
+            expect(Object.keys(
+                (await reopened.materializeDatabase(updated.revision)).pluginCustomStorage,
+            )).toEqual(expectedAfterReinsert)
+
+            const cleared = await reopened.commit({
+                expectedRevision: updated.revision,
+                pluginStorage: [
+                    { type: 'clear' },
+                    { type: 'set', key: 'zeta', value: 'fresh string' },
+                    { type: 'set', key: '2', value: 2 },
+                    { type: 'set', key: '1', value: 1 },
+                ],
+            })
+            expect((await reopened.queryPluginStorage()).items.map((item) => item.key)).toEqual([
+                '1',
+                '2',
+                'zeta',
+            ])
+            expect(Object.keys(
+                (await reopened.materializeDatabase(cleared.revision)).pluginCustomStorage,
+            )).toEqual(['1', '2', 'zeta'])
+        })
+
+        it('always materializes empty plugin storage and ignores incidental root fields', async () => {
+            const { store } = await createHarness()
+            expect((await store.materializeDatabase()).pluginCustomStorage).toEqual({})
+            const database = structuredClone(fixtureDatabase)
+            database.pluginCustomStorage = { retained: 0 }
+            const imported = await store.replaceFromDatabase(database)
+            const root = (await store.readRoot()).value
+            await store.commit({
+                expectedRevision: imported.revision,
+                root: {
+                    ...root,
+                    pluginCustomStorage: { incidental: 'must not replace records' },
+                } as typeof root,
+            })
+
+            expect((await store.materializeDatabase()).pluginCustomStorage).toEqual({ retained: 0 })
+        })
+
         it('stores presets outside root and preserves configured ordering and exact values', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

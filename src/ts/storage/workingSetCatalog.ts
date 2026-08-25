@@ -198,6 +198,7 @@ export function projectCatalogWorkingSet(
         .map(createCatalogCharacterStub)
     return {
         ...root,
+        pluginCustomStorage: {},
         botPresets: presets,
         characters,
     } as Database
@@ -211,7 +212,7 @@ export function projectCompleteScalableWorkingSet(
     selectedConversationId?: string | null,
 ): Database {
     const complete = structuredClone(database)
-    const { characters, botPresets, ...root } = complete
+    const { characters, botPresets, pluginCustomStorage: _pluginCustomStorage, ...root } = complete
     const summaries: CharacterSummary[] = characters.map((character, configuredIndex) => ({
         id: character.chaId,
         name: character.name,

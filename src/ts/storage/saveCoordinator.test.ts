@@ -6,6 +6,7 @@ import {
 import type { Chat, Database, character, groupChat } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
+import { createPluginStorageStore } from '../plugins/pluginStorageStore'
 
 function makeDatabase(): Database {
     return {
@@ -39,8 +40,15 @@ function makeStore(commit = vi.fn()) {
     } as unknown as PersistentDataStore
 }
 
-function captureRoot(database: Database): Omit<Database, 'characters' | 'botPresets'> {
-    const { characters: _characters, botPresets: _botPresets, ...root } = database
+function captureRoot(
+    database: Database,
+): Omit<Database, 'characters' | 'botPresets' | 'pluginCustomStorage'> {
+    const {
+        characters: _characters,
+        botPresets: _botPresets,
+        pluginCustomStorage: _pluginCustomStorage,
+        ...root
+    } = database
     return root
 }
 
@@ -67,6 +75,265 @@ describe('SaveCoordinator', () => {
         added.name = 'Added'
         return { database, added }
     }
+
+    it('commits captured plugin storage mutations atomically without putting values in root', async () => {
+        const database = makeDatabase()
+        database.pluginCustomStorage = { alpha: 'old', removed: true }
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(4)
+        database.pluginCustomStorage.alpha = 'new'
+        database.pluginCustomStorage.beta = { nested: true }
+        delete database.pluginCustomStorage.removed
+        database.username = 'Root changed too'
+        coordinator.markPersistentDataDirty(1)
+
+        await coordinator.flushPendingData('plugin-storage')
+
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 4,
+            root: { username: 'Root changed too' },
+            pluginStorage: [
+                { type: 'delete', key: 'removed' },
+                { type: 'set', key: 'alpha', value: 'new' },
+                { type: 'set', key: 'beta', value: { nested: true } },
+            ],
+        })
+        expect(commit.mock.calls[0][0].root).not.toHaveProperty('pluginCustomStorage')
+    })
+
+    it('does not clear plugin storage when the scalable working set omits it', async () => {
+        const database = makeDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => null,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(4)
+        database.username = 'Scalable edit'
+        coordinator.markPersistentDataDirty(1)
+
+        await coordinator.flushPendingData('scalable-plugin-storage')
+
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 4,
+            root: { username: 'Scalable edit' },
+        })
+    })
+
+    it('serializes explicit plugin mutations through revision CAS', async () => {
+        const database = makeDatabase()
+        const committed = deferred<{ revision: number }>()
+        const commit = vi.fn(() => committed.promise)
+        const onLocalRevision = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => null,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onLocalRevision,
+        })
+        coordinator.initialize(7)
+
+        const mutation = coordinator.mutatePersistentPluginStorage('v3-plugin-storage', [
+            { type: 'set', key: 'alpha', value: { large: true } },
+        ])
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            pluginStorage: [
+                { type: 'set', key: 'alpha', value: { large: true } },
+            ],
+        })
+        expect(coordinator.revision).toBe(7)
+
+        committed.resolve({ revision: 8 })
+        await mutation
+
+        expect(coordinator.revision).toBe(8)
+        expect(onLocalRevision).toHaveBeenCalledWith(8)
+    })
+
+    it('does not hydrate plugin values into an incomplete scalable working set', async () => {
+        const database = makeDatabase()
+        const publishPluginStorageWorkingSet = vi.fn()
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => null,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            isIncompleteWorkingSet: () => true,
+            publishPluginStorageWorkingSet,
+        })
+        coordinator.initialize(7, database)
+
+        await coordinator.mutatePersistentPluginStorage('scalable-v3', [
+            { type: 'set', key: 'large', value: 'external-only' },
+        ])
+
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            pluginStorage: [{ type: 'set', key: 'large', value: 'external-only' }],
+        })
+        expect(publishPluginStorageWorkingSet).not.toHaveBeenCalled()
+        expect(database).not.toHaveProperty('pluginCustomStorage')
+    })
+
+    it('publishes explicit V3 mutations into a hydrated compatibility working set', async () => {
+        const database = makeDatabase()
+        database.pluginCustomStorage = { existing: true }
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishPluginStorageWorkingSet: (storage) => {
+                database.pluginCustomStorage = storage
+            },
+        })
+        coordinator.initialize(2, database)
+
+        await coordinator.mutatePersistentPluginStorage('maximum-compatibility', [
+            { type: 'set', key: 'added', value: 42 },
+        ])
+
+        expect(database.pluginCustomStorage).toEqual({ existing: true, added: 42 })
+        await coordinator.flushPendingData('already-baselined')
+        expect(commit).toHaveBeenCalledOnce()
+    })
+
+    it('rebases a later same-key V2 mutation over an in-flight V3 commit', async () => {
+        const database = makeDatabase()
+        database.pluginCustomStorage = { shared: 'base' }
+        const firstCommit = deferred<{ revision: number }>()
+        const commit = vi.fn()
+            .mockImplementationOnce(() => firstCommit.promise)
+            .mockImplementationOnce(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishPluginStorageWorkingSet: (storage) => {
+                database.pluginCustomStorage = storage
+            },
+        })
+        coordinator.initialize(3, database)
+
+        const v3Mutation = coordinator.mutatePersistentPluginStorage('v3-race', [
+            { type: 'set', key: 'shared', value: 'v3-first' },
+        ])
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+        database.pluginCustomStorage.shared = 'v2-later'
+        coordinator.markPersistentDataDirty(1)
+        firstCommit.resolve({ revision: 4 })
+        await v3Mutation
+
+        expect(database.pluginCustomStorage.shared).toBe('v2-later')
+        await coordinator.flushPendingData('persist-v2-winner')
+        expect(commit).toHaveBeenLastCalledWith({
+            expectedRevision: 4,
+            pluginStorage: [{ type: 'set', key: 'shared', value: 'v2-later' }],
+        })
+    })
+
+    it('keeps V3 reads coherent with a later same-key V2 mutation after commit publication', async () => {
+        const database = makeDatabase()
+        database.pluginCustomStorage = { shared: 'base' }
+        const durableStorage: Record<string, unknown> = { shared: 'base' }
+        let revision = 3
+        const firstCommit = deferred<{ revision: number }>()
+        const commit = vi.fn(async (input) => {
+            const result = commit.mock.calls.length === 1
+                ? await firstCommit.promise
+                : { revision: input.expectedRevision + 1 }
+            for (const mutation of input.pluginStorage ?? []) {
+                if (mutation.type === 'clear') {
+                    for (const key of Object.keys(durableStorage)) delete durableStorage[key]
+                } else if (mutation.type === 'delete') {
+                    delete durableStorage[mutation.key]
+                } else {
+                    durableStorage[mutation.key] = structuredClone(mutation.value)
+                }
+            }
+            revision = result.revision
+            return result
+        })
+        const store = {
+            ...makeStore(commit),
+            open: vi.fn(async () => undefined),
+            queryPluginStorage: vi.fn(async () => ({
+                revision,
+                items: Object.keys(durableStorage).map((key) => ({ key, byteSize: 1 })),
+            })),
+            readPluginStorage: vi.fn(async (key: string) =>
+                Object.prototype.hasOwnProperty.call(durableStorage, key)
+                    ? { revision, value: structuredClone(durableStorage[key]) }
+                    : null),
+        } as unknown as PersistentDataStore
+        let v3Storage: ReturnType<typeof createPluginStorageStore>
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishPluginStorageWorkingSet: (storage) => {
+                database.pluginCustomStorage = storage
+                v3Storage?.synchronizeCompatibilityStorage(storage)
+            },
+        })
+        coordinator.initialize(3, database)
+        v3Storage = createPluginStorageStore({
+            store,
+            mutate: (mutations) => coordinator.mutatePersistentPluginStorage(
+                'overlapping-v3-v2',
+                mutations,
+            ),
+        }, 100)
+
+        const v3Mutation = v3Storage.setItem('shared', 'v3-first')
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+        database.pluginCustomStorage.shared = 'v2-later'
+        v3Storage.synchronizeCompatibilityMutation({
+            type: 'set',
+            key: 'shared',
+            value: 'v2-later',
+        })
+        coordinator.markPersistentDataDirty(1)
+        firstCommit.resolve({ revision: 4 })
+        await v3Mutation
+        await coordinator.flushPendingData('persist-v2-winner')
+
+        expect(durableStorage.shared).toBe('v2-later')
+        expect(database.pluginCustomStorage.shared).toBe('v2-later')
+        await expect(v3Storage.getItem('shared')).resolves.toBe('v2-later')
+    })
 
     it('commits the complete preset array atomically with a changed root', async () => {
         const database = makeDatabase()
@@ -3654,6 +3921,55 @@ describe('SaveCoordinator', () => {
             { id: 'chat-b', name: 'Authoritative second chat' },
             { id: 'chat-a', note: 'Later live first-chat note' },
         ])
+    })
+
+    it('rebases a concurrent compatibility plugin edit and persists it after replacement', async () => {
+        const database = makeDatabase()
+        database.pluginCustomStorage = {
+            retained: 'before',
+            live: 'before',
+        }
+        const candidate = structuredClone(database)
+        candidate.pluginCustomStorage.retained = 'replacement'
+        const replacementWrite = deferred<{ revision: number }>()
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const store = {
+            replaceFromDatabase: vi.fn(() => replacementWrite.promise),
+            commit,
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: (replacement) => Object.assign(database, replacement),
+        })
+        coordinator.initialize(5, database)
+
+        const replacing = coordinator.replacePersistentDatabase(candidate, 'plugin-rebase', {
+            authoritative: true,
+        })
+        await vi.waitFor(() => expect(store.replaceFromDatabase).toHaveBeenCalledOnce())
+        database.pluginCustomStorage.live = 'later'
+        coordinator.markPersistentDataDirty(1)
+        replacementWrite.resolve({ revision: 6 })
+
+        await replacing
+
+        expect(database.pluginCustomStorage).toEqual({
+            retained: 'replacement',
+            live: 'later',
+        })
+        expect(commit).not.toHaveBeenCalled()
+
+        await coordinator.flushPendingData('plugin-rebase-save')
+
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 6,
+            pluginStorage: [{ type: 'set', key: 'live', value: 'later' }],
+        })
     })
 
     it('keeps preset entities intact across an authoritative reorder and concurrent rename', async () => {

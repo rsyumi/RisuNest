@@ -2,7 +2,7 @@ use super::{StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 4;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -19,8 +19,10 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => create_v2(connection),
+        0 => create_v4(connection),
         1 => migrate_v1(connection),
+        2 => migrate_v2(connection),
+        3 => migrate_v3(connection),
         SCHEMA_VERSION => Ok(()),
         _ => Err(StoreError::Store {
             message: format!("unsupported persistent schema version {version}"),
@@ -28,7 +30,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     }
 }
 
-fn create_v2(connection: &mut Connection) -> StoreResult<()> {
+fn create_v4(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
         "
         BEGIN IMMEDIATE;
@@ -36,6 +38,14 @@ fn create_v2(connection: &mut Connection) -> StoreResult<()> {
         CREATE TABLE app_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE snapshot_leases (generation TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
         CREATE TABLE root (generation TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE plugin_storage (
+            generation TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            byte_size INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (generation, storage_key)
+        );
         CREATE TABLE bot_presets (
             generation TEXT NOT NULL,
             preset_id TEXT NOT NULL,
@@ -89,7 +99,7 @@ fn create_v2(connection: &mut Connection) -> StoreResult<()> {
         );
         CREATE INDEX messages_by_id
             ON messages (generation, character_id, conversation_id, message_id);
-        PRAGMA user_version = 2;
+        PRAGMA user_version = 4;
         COMMIT;
         ",
     )?;
@@ -110,6 +120,14 @@ fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
             PRIMARY KEY (generation, preset_id)
         );
         CREATE INDEX bot_presets_configured ON bot_presets (generation, configured_index);
+        CREATE TABLE plugin_storage (
+            generation TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            byte_size INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (generation, storage_key)
+        );
         ALTER TABLE characters ADD COLUMN type TEXT NOT NULL DEFAULT '';
         ALTER TABLE characters ADD COLUMN creator_notes TEXT;
         ALTER TABLE characters ADD COLUMN trash_time INTEGER;
@@ -122,17 +140,52 @@ fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     Ok(())
 }
 
+fn migrate_v2(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "
+        CREATE TABLE plugin_storage (
+            generation TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            byte_size INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (generation, storage_key)
+        );
+        ",
+    )?;
+    migrate_plugin_storage(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "
+        ALTER TABLE plugin_storage ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0;
+        UPDATE plugin_storage AS target
+        SET ordinal = (
+            SELECT COUNT(*) - 1
+            FROM plugin_storage AS predecessor
+            WHERE predecessor.generation = target.generation
+              AND predecessor.storage_key <= target.storage_key
+        );
+        ",
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn migrate_roots(transaction: &Transaction<'_>) -> StoreResult<()> {
-    let rows = {
-        let mut statement = transaction.prepare("SELECT generation, value FROM root")?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows
-    };
-    for (generation, serialized) in rows {
+    for generation in root_generations(transaction)? {
+        let serialized: String = transaction.query_row(
+            "SELECT value FROM root WHERE generation = ?1",
+            [&generation],
+            |row| row.get(0),
+        )?;
         let mut value: Value = serde_json::from_str(&serialized)?;
         let object = value.as_object_mut().ok_or_else(|| StoreError::Store {
             message: "persistent root must be an object".to_owned(),
@@ -149,12 +202,71 @@ fn migrate_roots(transaction: &Transaction<'_>) -> StoreResult<()> {
             }
         };
         object.remove("characters");
+        migrate_plugin_storage_value(transaction, &generation, object)?;
         for (configured_index, preset) in presets.iter().enumerate() {
             insert_preset(transaction, &generation, configured_index as i64, preset)?;
         }
         transaction.execute(
             "UPDATE root SET value = ?2 WHERE generation = ?1",
             params![generation, serde_json::to_string(&value)?],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_plugin_storage(transaction: &Transaction<'_>) -> StoreResult<()> {
+    for generation in root_generations(transaction)? {
+        let serialized: String = transaction.query_row(
+            "SELECT value FROM root WHERE generation = ?1",
+            [&generation],
+            |row| row.get(0),
+        )?;
+        let mut value: Value = serde_json::from_str(&serialized)?;
+        let object = value.as_object_mut().ok_or_else(|| StoreError::Store {
+            message: "persistent root must be an object".to_owned(),
+        })?;
+        migrate_plugin_storage_value(transaction, &generation, object)?;
+        transaction.execute(
+            "UPDATE root SET value = ?2 WHERE generation = ?1",
+            params![generation, serde_json::to_string(&value)?],
+        )?;
+    }
+    Ok(())
+}
+
+fn root_generations(transaction: &Transaction<'_>) -> StoreResult<Vec<String>> {
+    let mut statement = transaction.prepare("SELECT generation FROM root")?;
+    let generations = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(generations)
+}
+
+fn migrate_plugin_storage_value(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    root: &mut serde_json::Map<String, Value>,
+) -> StoreResult<()> {
+    let Some(storage) = root.remove("pluginCustomStorage") else {
+        return Ok(());
+    };
+    let storage = storage.as_object().ok_or_else(|| StoreError::Validation {
+        message: format!(
+            "persistent root for generation {generation} has non-object pluginCustomStorage"
+        ),
+    })?;
+    for (ordinal, (key, value)) in storage.iter().enumerate() {
+        let serialized = serde_json::to_string(value)?;
+        transaction.execute(
+            "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                generation,
+                key,
+                serialized.len() as i64,
+                ordinal as i64,
+                serialized
+            ],
         )?;
     }
     Ok(())

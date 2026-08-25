@@ -19,6 +19,8 @@ function makeStore() {
         queryConversations: vi.fn(),
         readConversation: vi.fn(),
         readConversationWindow: vi.fn(),
+        queryPluginStorage: vi.fn(),
+        readPluginStorage: vi.fn(),
     } as unknown as PersistentDataStore
 }
 
@@ -32,7 +34,10 @@ describe('createMutationGatedPersistentDataStore', () => {
                 return operation()
             }),
         } as StorageMutationGate
-        const commit = { expectedRevision: 3 } as WorkingSetCommit
+        const commit = {
+            expectedRevision: 3,
+            pluginStorage: [{ type: 'set', key: 'plugin', value: true }],
+        } as WorkingSetCommit
         const database = { username: 'Fixture', characters: [] } as unknown as Database
         const commitResult = { revision: 4 }
         const replacementResult = { revision: 5 }
@@ -69,6 +74,8 @@ describe('createMutationGatedPersistentDataStore', () => {
         await gated.readRoot()
         await gated.queryPresets()
         await gated.readPreset('0')
+        await gated.queryPluginStorage()
+        await gated.readPluginStorage('plugin')
 
         expect(gate.runWrite).not.toHaveBeenCalled()
     })

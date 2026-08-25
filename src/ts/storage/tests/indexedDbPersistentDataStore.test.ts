@@ -87,6 +87,7 @@ async function createVersion1Database(
     transaction.objectStore('meta').put({ key: 'activeGeneration', value: generation })
     transaction.objectStore('meta').put({ key: 'currentRevision', value: 7 })
     const { characters, ...root } = databaseValue
+    root.pluginCustomStorage = { 'active-memory': { turns: [1, 2, 3] } }
     transaction.objectStore('root').put({
         key: generation,
         generation,
@@ -98,6 +99,7 @@ async function createVersion1Database(
         value: {
             username: 'Legacy generation',
             botPresets: [{ name: 'Legacy preset', image: 'legacy.png' }],
+            pluginCustomStorage: { 'old-memory': 'preserved' },
         },
     })
     for (let configuredIndex = 0; configuredIndex < characters.length; configuredIndex++) {
@@ -159,6 +161,59 @@ async function createVersion1Database(
     database.close()
 }
 
+async function createVersion5PluginDatabase(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    const generation = 'revision-5'
+    const openRequest = indexedDB.open(databaseName, 5)
+    openRequest.onupgradeneeded = () => {
+        for (const storeName of [
+            'meta',
+            'root',
+            'presets',
+            'catalog',
+            'characters',
+            'conversations',
+            'messagePages',
+            'pluginStorage',
+        ]) {
+            openRequest.result.createObjectStore(storeName, { keyPath: 'key' })
+        }
+        const pluginStorage = openRequest.transaction!.objectStore('pluginStorage')
+        pluginStorage.createIndex('byGenerationKey', ['generation', 'storageKey'])
+        pluginStorage.createIndex('byGeneration', 'generation')
+    }
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        openRequest.onsuccess = () => resolve(openRequest.result)
+        openRequest.onerror = () => reject(openRequest.error)
+    })
+    const transaction = database.transaction(['meta', 'root', 'pluginStorage'], 'readwrite')
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 5 })
+    transaction.objectStore('meta').put({ key: 'activeGeneration', value: generation })
+    transaction.objectStore('meta').put({ key: 'currentRevision', value: 5 })
+    transaction.objectStore('root').put({
+        key: generation,
+        generation,
+        value: { username: 'Version 5' },
+    })
+    for (const [ordinal, [storageKey, value]] of [
+        ['zeta', 'first'],
+        ['alpha', 'second'],
+    ].entries()) {
+        transaction.objectStore('pluginStorage').put({
+            key: `${generation}:plugin-storage:${storageKey}`,
+            generation,
+            storageKey,
+            byteSize: JSON.stringify(value).length,
+            ordinal,
+            value,
+        })
+    }
+    await completeTransaction(transaction)
+    database.close()
+}
+
 persistentDataStoreContract(async () => {
     const indexedDB = new IDBFactory()
     const databaseName = `persistent-store-contract-${databaseSequence++}`
@@ -176,6 +231,84 @@ persistentDataStoreContract(async () => {
 })
 
 describe('IndexedDbPersistentDataStore I/O shape', () => {
+    function rejectPluginPayloadIndexScans() {
+        const original = IDBIndex.prototype.getAll
+        return vi.spyOn(IDBIndex.prototype, 'getAll').mockImplementation(function (
+            this: IDBIndex,
+            query?: IDBValidKey | IDBKeyRange | null,
+            count?: number,
+        ) {
+            if (this.objectStore.name === 'pluginStorage') {
+                throw new Error('plugin payload index scan')
+            }
+            return count === undefined
+                ? original.call(this, query)
+                : original.call(this, query, count)
+        })
+    }
+
+    it('boots the plugin catalog without scanning large plugin payload rows', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `plugin-metadata-catalog-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const database = structuredClone(fixtureDatabase)
+        database.pluginCustomStorage = {
+            alpha: 'a'.repeat(2 * 1024 * 1024),
+            beta: 'b'.repeat(2 * 1024 * 1024),
+        }
+        const imported = await store.replaceFromDatabase(database)
+        const payloadScan = rejectPluginPayloadIndexScans()
+
+        try {
+            await expect(store.queryPluginStorage()).resolves.toEqual({
+                revision: imported.revision,
+                items: [
+                    { key: 'alpha', byteSize: 2 * 1024 * 1024 + 2 },
+                    { key: 'beta', byteSize: 2 * 1024 * 1024 + 2 },
+                ],
+            })
+        } finally {
+            payloadScan.mockRestore()
+        }
+    })
+
+    it('allocates a new plugin ordinal without scanning existing payload rows', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `plugin-metadata-ordinal-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const database = structuredClone(fixtureDatabase)
+        database.pluginCustomStorage = {
+            first: 'a'.repeat(2 * 1024 * 1024),
+            second: 'b'.repeat(2 * 1024 * 1024),
+        }
+        const imported = await store.replaceFromDatabase(database)
+        const payloadScan = rejectPluginPayloadIndexScans()
+
+        try {
+            await expect(store.commit({
+                expectedRevision: imported.revision,
+                pluginStorage: [{ type: 'set', key: 'third', value: 3 }],
+            })).resolves.toEqual({ revision: imported.revision + 1 })
+            await expect(store.queryPluginStorage()).resolves.toMatchObject({
+                items: [
+                    { key: 'first' },
+                    { key: 'second' },
+                    { key: 'third' },
+                ],
+            })
+        } finally {
+            payloadScan.mockRestore()
+        }
+    })
+
     it('shares a single in-flight open across concurrent callers', async () => {
         const indexedDB = new IDBFactory()
         const openSpy = vi.spyOn(indexedDB, 'open')
@@ -360,6 +493,10 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             revision: 7,
             value: { username: 'Fixture User' },
         })
+        expect((await store.readRoot()).value).not.toHaveProperty('pluginCustomStorage')
+        expect((await store.readPluginStorage('active-memory'))?.value).toEqual({
+            turns: [1, 2, 3],
+        })
         expect(await store.queryPresets()).toEqual({
             revision: 7,
             items: [
@@ -376,6 +513,18 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             key: 'revision-legacy',
             generation: 'revision-legacy',
             value: { username: 'Legacy generation' },
+        })
+        expect(
+            await readRawRecord(
+                indexedDB,
+                databaseName,
+                'pluginStorage',
+                'revision-legacy:plugin-storage:old-memory',
+            ),
+        ).toMatchObject({
+            generation: 'revision-legacy',
+            storageKey: 'old-memory',
+            value: 'preserved',
         })
         expect(
             await readRawRecord(
@@ -457,6 +606,67 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         ).toEqual(['char-b', 'char-a'])
     })
 
+    it('migrates version 1 plugin insertion ordinals and array-index ordering', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'version-1-plugin-order-upgrade'
+        await createVersion1Database(indexedDB, databaseName)
+        const record = await readRawRecord(
+            indexedDB,
+            databaseName,
+            'root',
+            'revision-7',
+        ) as { key: string; generation: string; value: Record<string, unknown> }
+        const storage: Record<string, unknown> = {}
+        storage.zeta = 'first string'
+        storage['10'] = 'ten'
+        storage['2'] = 'two'
+        storage['01'] = 'non-index'
+        storage['\uffffx'] = 'unicode'
+        record.value.pluginCustomStorage = storage
+        await writeRawRecords(indexedDB, databaseName, 'root', [record])
+
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+
+        expect((await store.queryPluginStorage()).items.map((item) => item.key)).toEqual(
+            Object.keys(storage),
+        )
+        expect(Object.keys((await store.materializeDatabase()).pluginCustomStorage)).toEqual(
+            Object.keys(storage),
+        )
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'pluginStorage',
+            'revision-7:plugin-storage:zeta',
+        )).toMatchObject({ ordinal: 2 })
+    })
+
+    it('backfills metadata from version 5 plugin value rows atomically', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-5-plugin-metadata-${databaseSequence++}`
+        await createVersion5PluginDatabase(indexedDB, databaseName)
+
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+
+        expect((await store.queryPluginStorage()).items.map((item) => item.key)).toEqual([
+            'zeta',
+            'alpha',
+        ])
+        expect(await store.readPluginStorage('zeta')).toMatchObject({ value: 'first' })
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'pluginStorageMetadata',
+            'revision-5:plugin-storage:zeta',
+        )).toMatchObject({
+            generation: 'revision-5',
+            storageKey: 'zeta',
+            ordinal: 0,
+        })
+    })
+
     it('rolls back a version 1 upgrade when botPresets exists but is not an array', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = 'version-1-invalid-presets-upgrade'
@@ -492,6 +702,41 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         )) as Record<string, unknown>
         expect((activeRecord.value as Record<string, unknown>).botPresets).toEqual(
             fixtureDatabase.botPresets,
+        )
+    })
+
+    it('rolls back a version 1 upgrade when plugin storage is not a plain record', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'version-1-invalid-plugin-storage-upgrade'
+        const invalidPluginStorage = ['unsupported']
+        await createVersion1Database(indexedDB, databaseName)
+        await writeRawRecords(indexedDB, databaseName, 'root', [
+            {
+                key: 'revision-legacy',
+                generation: 'revision-legacy',
+                value: {
+                    username: 'Legacy generation',
+                    botPresets: [{ name: 'Legacy preset' }],
+                    pluginCustomStorage: invalidPluginStorage,
+                },
+            },
+        ])
+
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await expect(store.open()).rejects.toBeTruthy()
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(1)
+        expect(database.objectStoreNames.contains('pluginStorage')).toBe(false)
+        database.close()
+        const record = (await readRawRecord(
+            indexedDB,
+            databaseName,
+            'root',
+            'revision-legacy',
+        )) as Record<string, unknown>
+        expect((record.value as Record<string, unknown>).pluginCustomStorage).toEqual(
+            invalidPluginStorage,
         )
     })
 

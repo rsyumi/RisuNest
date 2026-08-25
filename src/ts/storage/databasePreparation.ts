@@ -245,6 +245,11 @@ export async function preparePersistentRootForWorkingSet(
     await checkNewFormat(candidate, { now: options.now })
     candidate.characterOrder = characterOrder
 
-    const { characters: _characters, botPresets: _botPresets, ...root } = candidate
+    const {
+        characters: _characters,
+        botPresets: _botPresets,
+        pluginCustomStorage: _pluginCustomStorage,
+        ...root
+    } = candidate
     return root
 }

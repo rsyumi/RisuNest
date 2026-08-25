@@ -14,6 +14,8 @@ import type {
     PersistentDataStore,
     PersistentRevisionLease,
     PersistentRoot,
+    PluginStorageCatalog,
+    PluginStorageMutation,
     PresetCatalog,
     PresetSummary,
     Versioned,
@@ -21,12 +23,12 @@ import type {
 } from './persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
 
-const DATABASE_VERSION = 4
+const DATABASE_VERSION = 6
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
-const STORE_NAMES = ['meta', 'root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const
-const DATA_STORE_NAMES = ['root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const
+const STORE_NAMES = ['meta', 'root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const
+const DATA_STORE_NAMES = ['root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const
 const activeSnapshotGenerations = new Set<string>()
 
 interface StoredRecord<T> {
@@ -49,6 +51,46 @@ interface StoredConversation {
 interface StoredPreset {
     summary: PresetSummary
     preset: botPreset
+}
+
+interface StoredPluginStorage extends StoredRecord<unknown> {
+    storageKey: string
+    byteSize: number
+    ordinal: number
+}
+
+interface StoredPluginStorageMetadata {
+    key: string
+    generation: string
+    storageKey: string
+    byteSize: number
+    ordinal: number
+}
+
+const textEncoder = new TextEncoder()
+
+function serializedByteSize(value: unknown): number {
+    return textEncoder.encode(JSON.stringify(value) ?? 'null').byteLength
+}
+
+function arrayIndexKey(key: string): number | null {
+    if (!/^(0|[1-9]\d*)$/.test(key)) return null
+    const value = Number(key)
+    return Number.isSafeInteger(value) && value >= 0 && value < 4_294_967_295
+        ? value
+        : null
+}
+
+function comparePluginStorageRecords(
+    left: Pick<StoredPluginStorageMetadata, 'storageKey' | 'ordinal'>,
+    right: Pick<StoredPluginStorageMetadata, 'storageKey' | 'ordinal'>,
+): number {
+    const leftIndex = arrayIndexKey(left.storageKey)
+    const rightIndex = arrayIndexKey(right.storageKey)
+    if (leftIndex !== null && rightIndex !== null) return leftIndex - rightIndex
+    if (leftIndex !== null) return -1
+    if (rightIndex !== null) return 1
+    return left.ordinal - right.ordinal || left.storageKey.localeCompare(right.storageKey)
 }
 
 export type PersistentGenerationCleanupErrorHandler = (
@@ -195,12 +237,29 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 ['generation', 'characterId'],
             )
             this.createIndex(transaction.objectStore('messagePages'), 'byGeneration', 'generation')
+            this.createIndex(
+                transaction.objectStore('pluginStorage'),
+                'byGenerationKey',
+                ['generation', 'storageKey'],
+            )
+            this.createIndex(transaction.objectStore('pluginStorage'), 'byGeneration', 'generation')
+            this.createIndex(
+                transaction.objectStore('pluginStorageMetadata'),
+                'byGenerationOrdinal',
+                ['generation', 'ordinal'],
+            )
+            this.createIndex(
+                transaction.objectStore('pluginStorageMetadata'),
+                'byGeneration',
+                'generation',
+            )
             this.backfillCharacterSummaries(transaction)
             this.backfillOrderKeys<StoredConversation>(
                 transaction.objectStore('conversations'),
                 (record) => record.value.summary,
             )
-            this.migratePresetRows(transaction)
+            this.migrateRootRows(transaction)
+            this.backfillPluginStorageMetadata(transaction)
         }
         this.database = await requestResult(request)
         this.database.onversionchange = () => {
@@ -288,6 +347,21 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.readConversationWindowFromTransaction(transaction, revision, generation, input)
     }
 
+    async queryPluginStorage(): Promise<PluginStorageCatalog> {
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'pluginStorageMetadata'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        return this.queryPluginStorageFromTransaction(transaction, revision, generation)
+    }
+
+    async readPluginStorage(key: string): Promise<Versioned<unknown> | null> {
+        const transaction = this.requireDatabase().transaction(['meta', 'pluginStorage'], 'readonly')
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readPluginStorageFromTransaction(transaction, revision, generation, key)
+    }
+
     async commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         const database = this.requireDatabase()
         const transaction = database.transaction([...STORE_NAMES], 'readwrite')
@@ -320,6 +394,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             for (const mutation of input.conversations ?? []) {
                 await this.applyConversationMutation(transaction, generation, mutation)
             }
+            for (const mutation of input.pluginStorage ?? []) {
+                await this.applyPluginStorageMutation(transaction, generation, mutation)
+            }
             this.setActive(transaction, revision, generation)
             await transactionDone(transaction)
             return { revision }
@@ -346,7 +423,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const generation = this.generationFor(revision)
             await this.stageDatabase(transaction, databaseValue, generation)
             transaction.objectStore('root').delete(active.generation)
-            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const) {
+            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const) {
                 await this.deleteIndexRange(
                     transaction.objectStore(storeName).index('byGeneration'),
                     this.keyRangeFactory.only(active.generation),
@@ -366,7 +443,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     async materializeDatabase(revision?: DataRevision): Promise<Database> {
         const database = this.requireDatabase()
         const transaction = database.transaction(
-            ['meta', 'root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages'],
+            ['meta', 'root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage'],
             'readonly',
         )
         const active = await this.readActive(transaction)
@@ -401,6 +478,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             transaction.objectStore('presets'),
             generation,
         )
+        const pluginStorageRecords = await this.generationRecords<unknown>(
+            transaction.objectStore('pluginStorage'),
+            generation,
+        ) as StoredPluginStorage[]
         const characters = [] as Database['characters']
         for (const summary of catalog) {
             const detail = characterRecords.find(
@@ -432,7 +513,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             .map((record) => record.value)
             .sort((left, right) => left.summary.configuredIndex - right.summary.configuredIndex)
             .map((record) => record.preset)
-        const result = { ...root.value, characters, botPresets } as Database
+        const pluginCustomStorage = Object.fromEntries(
+            pluginStorageRecords
+                .sort(comparePluginStorageRecords)
+                .map((record) => [record.storageKey, record.value]),
+        )
+        const result = {
+            ...root.value,
+            characters,
+            botPresets,
+            pluginCustomStorage,
+        } as Database
         await transactionDone(transaction)
         return result
     }
@@ -457,7 +548,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 value: generation,
                 createdAt: Date.now(),
             })
-            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const) {
+            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const) {
                 await this.copyGeneration(
                     transaction.objectStore(storeName),
                     active.generation,
@@ -552,6 +643,23 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     input,
                 )
             },
+            queryPluginStorage: async () => {
+                assertActive()
+                return this.queryPluginStorageFromTransaction(
+                    this.requireDatabase().transaction('pluginStorageMetadata', 'readonly'),
+                    revision,
+                    generation,
+                )
+            },
+            readPluginStorage: async (key) => {
+                assertActive()
+                return this.readPluginStorageFromTransaction(
+                    this.requireDatabase().transaction('pluginStorage', 'readonly'),
+                    revision,
+                    generation,
+                    key,
+                )
+            },
             release: async () => {
                 if (releasePromise) return releasePromise
                 releasePromise = this.releaseSnapshotLease(generation).then(
@@ -578,6 +686,36 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )) as StoredRecord<PersistentRoot> | undefined
         await transactionDone(transaction)
         return record
+    }
+
+    private async queryPluginStorageFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+    ): Promise<PluginStorageCatalog> {
+        const records = (await requestResult(
+            transaction.objectStore('pluginStorageMetadata').index('byGeneration').getAll(generation),
+        )) as StoredPluginStorageMetadata[]
+        await transactionDone(transaction)
+        return {
+            revision,
+            items: records
+                .sort(comparePluginStorageRecords)
+                .map(({ storageKey: key, byteSize }) => ({ key, byteSize })),
+        }
+    }
+
+    private async readPluginStorageFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+        key: string,
+    ): Promise<Versioned<unknown> | null> {
+        const record = (await requestResult(
+            transaction.objectStore('pluginStorage').get(this.pluginStorageKey(generation, key)),
+        )) as StoredPluginStorage | undefined
+        await transactionDone(transaction)
+        return record ? { revision, value: record.value } : null
     }
 
     private async queryPresetsFromTransaction(
@@ -806,9 +944,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     ): Promise<void> {
         const ids = new Set<string>()
         const conversationIds = new Set<string>()
-        const { characters, botPresets, ...root } = databaseValue
+        const { characters, botPresets, pluginCustomStorage, ...root } = databaseValue
         this.putRoot(transaction, generation, root)
         this.writePresetRows(transaction, generation, botPresets ?? [])
+        this.writePluginStorageRows(transaction, generation, pluginCustomStorage ?? {})
         for (let index = 0; index < characters.length; index++) {
             const character = characters[index]
             if (!character.chaId || ids.has(character.chaId)) {
@@ -847,7 +986,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         generation: string,
     ): Promise<void> {
         transaction.objectStore('root').delete(generation)
-        for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const) {
+        for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const) {
             await this.deleteIndexRange(
                 transaction.objectStore(storeName).index('byGeneration'),
                 this.keyRangeFactory.only(generation),
@@ -1500,8 +1639,103 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         generation: string,
         root: PersistentRoot,
     ): void {
-        const { characters: _characters, botPresets: _botPresets, ...value } = root as Database
+        const {
+            characters: _characters,
+            botPresets: _botPresets,
+            pluginCustomStorage: _pluginCustomStorage,
+            ...value
+        } = root as Database
         transaction.objectStore('root').put({ key: generation, generation, value })
+    }
+
+    private writePluginStorageRows(
+        transaction: IDBTransaction,
+        generation: string,
+        values: Record<string, unknown>,
+    ): void {
+        const valueStore = transaction.objectStore('pluginStorage')
+        const metadataStore = transaction.objectStore('pluginStorageMetadata')
+        for (const [ordinal, storageKey] of Object.keys(values).entries()) {
+            const value = values[storageKey]
+            const metadata = {
+                key: this.pluginStorageKey(generation, storageKey),
+                generation,
+                storageKey,
+                byteSize: serializedByteSize(value),
+                ordinal,
+            } satisfies StoredPluginStorageMetadata
+            valueStore.put({
+                ...metadata,
+                value,
+            } satisfies StoredPluginStorage)
+            metadataStore.put(metadata)
+        }
+    }
+
+    private async applyPluginStorageMutation(
+        transaction: IDBTransaction,
+        generation: string,
+        mutation: PluginStorageMutation,
+    ): Promise<void> {
+        const valueStore = transaction.objectStore('pluginStorage')
+        const metadataStore = transaction.objectStore('pluginStorageMetadata')
+        if (mutation.type === 'clear') {
+            await Promise.all([
+                this.deleteIndexRange(
+                    valueStore.index('byGeneration'),
+                    this.keyRangeFactory.only(generation),
+                ),
+                this.deleteIndexRange(
+                    metadataStore.index('byGeneration'),
+                    this.keyRangeFactory.only(generation),
+                ),
+            ])
+            return
+        }
+        if (mutation.type === 'delete') {
+            const key = this.pluginStorageKey(generation, mutation.key)
+            valueStore.delete(key)
+            metadataStore.delete(key)
+            return
+        }
+        const existing = (await requestResult(
+            metadataStore.get(this.pluginStorageKey(generation, mutation.key)),
+        )) as StoredPluginStorageMetadata | undefined
+        const ordinal = existing?.ordinal ?? await this.nextPluginStorageOrdinal(
+            metadataStore,
+            generation,
+        )
+        const metadata = {
+            key: this.pluginStorageKey(generation, mutation.key),
+            generation,
+            storageKey: mutation.key,
+            byteSize: serializedByteSize(mutation.value),
+            ordinal,
+        } satisfies StoredPluginStorageMetadata
+        valueStore.put({
+            ...metadata,
+            value: mutation.value,
+        } satisfies StoredPluginStorage)
+        metadataStore.put(metadata)
+    }
+
+    private async nextPluginStorageOrdinal(
+        metadataStore: IDBObjectStore,
+        generation: string,
+    ): Promise<number> {
+        const cursor = await requestResult(
+            metadataStore.index('byGenerationOrdinal').openKeyCursor(
+                this.keyRangeFactory.bound(
+                    [generation, 0],
+                    [generation, MAX_INDEX_VALUE],
+                ),
+                'prev',
+            ),
+        )
+        const ordinal = cursor
+            ? (cursor.key as [string, number])[1]
+            : -1
+        return ordinal + 1
     }
 
     private async putPresets(
@@ -1600,7 +1834,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    private migratePresetRows(transaction: IDBTransaction): void {
+    private migrateRootRows(transaction: IDBTransaction): void {
         const root = transaction.objectStore('root')
         const presets = transaction.objectStore('presets')
         const request = root.openCursor()
@@ -1632,8 +1866,45 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     },
                 })
             }
-            const { characters: _characters, botPresets: _botPresets, ...value } = record.value
+            const legacy = record.value.pluginCustomStorage
+            if (
+                legacy !== undefined &&
+                (!legacy || typeof legacy !== 'object' || Array.isArray(legacy))
+            ) {
+                transaction.abort()
+                return
+            }
+            this.writePluginStorageRows(
+                transaction,
+                record.generation,
+                (legacy ?? {}) as Record<string, unknown>,
+            )
+            const {
+                characters: _characters,
+                botPresets: _botPresets,
+                pluginCustomStorage: _pluginCustomStorage,
+                ...value
+            } = record.value
             cursor.update({ ...record, value })
+            cursor.continue()
+        }
+    }
+
+    private backfillPluginStorageMetadata(transaction: IDBTransaction): void {
+        const valueStore = transaction.objectStore('pluginStorage')
+        const metadataStore = transaction.objectStore('pluginStorageMetadata')
+        const request = valueStore.openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) return
+            const record = cursor.value as StoredPluginStorage
+            metadataStore.put({
+                key: record.key,
+                generation: record.generation,
+                storageKey: record.storageKey,
+                byteSize: record.byteSize ?? serializedByteSize(record.value),
+                ordinal: record.ordinal ?? 0,
+            } satisfies StoredPluginStorageMetadata)
             cursor.continue()
         }
     }
@@ -1661,5 +1932,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         pageIndex: number,
     ): string {
         return `${generation}:message-page:${characterId}:${conversationId}:${pageIndex}`
+    }
+
+    private pluginStorageKey(generation: string, key: string): string {
+        return `${generation}:plugin-storage:${key}`
     }
 }

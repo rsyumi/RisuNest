@@ -1,6 +1,7 @@
 use super::{
     CharacterQuery, CheckpointMode, ConversationMutation, ConversationPage, ConversationQuery,
-    ConversationWindowQuery, PersistentStore, QueryOrder, StoreError, WorkingSetCommit,
+    ConversationWindowQuery, PersistentStore, PluginStorageMutation, QueryOrder, StoreError,
+    WorkingSetCommit,
 };
 use serde_json::{json, Value};
 use std::{
@@ -15,11 +16,18 @@ fn fixture() -> Value {
         .expect("parse persistent store fixture")
 }
 
-fn root(database: &Value) -> Value {
+fn staged_root(database: &Value) -> Value {
     let mut root = database.clone();
     let root = root.as_object_mut().expect("fixture database object");
     root.remove("characters");
     root.remove("botPresets");
+    Value::Object(root.clone())
+}
+
+fn root(database: &Value) -> Value {
+    let mut root = staged_root(database);
+    let root = root.as_object_mut().expect("fixture staged root object");
+    root.remove("pluginCustomStorage");
     Value::Object(root.clone())
 }
 
@@ -28,7 +36,7 @@ fn open_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     let database = fixture();
     let staging = store.replace_begin().expect("begin staged replacement");
-    let root = root(&database);
+    let root = staged_root(&database);
     let characters = database["characters"]
         .as_array()
         .expect("fixture characters");
@@ -95,6 +103,7 @@ fn preset_catalog_reads_and_materializes_in_configured_order() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("replace presets");
     assert_eq!(
@@ -118,6 +127,267 @@ fn preset_catalog_reads_and_materializes_in_configured_order() {
     ));
 }
 
+#[test]
+fn plugin_storage_is_revisioned_per_key_and_lease_isolated() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let mut database = fixture();
+    database["pluginCustomStorage"] = json!({
+        "alpha": "old",
+        "beta": { "enabled": true }
+    });
+    let staging = store.replace_begin().expect("begin staged replacement");
+    store
+        .replace_put_root(&staging.staging_id, &staged_root(&database))
+        .expect("stage plugin storage");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            database["botPresets"].as_array().expect("fixture presets"),
+        )
+        .expect("stage presets");
+    store
+        .replace_add_characters(
+            &staging.staging_id,
+            database["characters"]
+                .as_array()
+                .expect("fixture characters"),
+        )
+        .expect("stage characters");
+    let imported = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("commit plugin storage");
+
+    assert!(store
+        .read_root(None)
+        .expect("read stripped root")
+        .value
+        .get("pluginCustomStorage")
+        .is_none());
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .query_plugin_storage(None)
+                .expect("query plugin storage")
+        )
+        .expect("serialize plugin catalog"),
+        json!({
+            "revision": 1,
+            "items": [
+                { "key": "alpha", "byteSize": 5 },
+                { "key": "beta", "byteSize": 16 }
+            ]
+        })
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("beta", None)
+            .expect("read plugin key")
+            .expect("plugin key exists")
+            .value,
+        json!({ "enabled": true })
+    );
+    let lease = store
+        .acquire_revision(imported.revision)
+        .expect("acquire plugin lease");
+
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: imported.revision,
+            root: Some(json!({ "username": "Plugin commit" })),
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![
+                PluginStorageMutation::Set {
+                    key: "alpha".to_owned(),
+                    value: json!("new"),
+                },
+                PluginStorageMutation::Delete {
+                    key: "beta".to_owned(),
+                },
+            ]),
+        })
+        .expect("mutate plugin storage");
+
+    assert_eq!(
+        store
+            .read_plugin_storage("alpha", Some(&lease.lease))
+            .expect("read leased plugin key")
+            .expect("leased plugin key exists")
+            .value,
+        json!("old")
+    );
+    assert_eq!(
+        store.materialize(None).expect("materialize plugin storage")["pluginCustomStorage"],
+        json!({ "alpha": "new" })
+    );
+    store
+        .release_revision(&lease.lease)
+        .expect("release plugin lease");
+    assert!(matches!(
+        store.read_plugin_storage("alpha", Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+}
+
+#[test]
+fn plugin_storage_preserves_legacy_object_key_order_across_reopen() {
+    let directory = tempfile::tempdir().expect("create plugin order directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin ordered replacement");
+    let mut storage = serde_json::Map::new();
+    storage.insert("zeta".to_owned(), json!("first string"));
+    storage.insert("10".to_owned(), json!("ten"));
+    storage.insert("2".to_owned(), json!(0));
+    storage.insert("01".to_owned(), json!("non-index"));
+    storage.insert("4294967294".to_owned(), json!(true));
+    storage.insert("4294967295".to_owned(), json!(false));
+    storage.insert("\u{ffff}x".to_owned(), json!("unicode"));
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "pluginCustomStorage": Value::Object(storage) }),
+        )
+        .expect("stage ordered plugin storage");
+    let imported = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("commit ordered plugin storage");
+    let original_order = vec![
+        "2",
+        "10",
+        "4294967294",
+        "zeta",
+        "01",
+        "4294967295",
+        "\u{ffff}x",
+    ];
+    assert_eq!(
+        store
+            .query_plugin_storage(None)
+            .expect("query ordered storage")
+            .items
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect::<Vec<_>>(),
+        original_order
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("\u{ffff}x", None)
+            .expect("read unicode key")
+            .expect("unicode key exists")
+            .value,
+        json!("unicode")
+    );
+
+    let updated = store
+        .commit(&WorkingSetCommit {
+            expected_revision: imported.revision,
+            root: None,
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![
+                PluginStorageMutation::Set {
+                    key: "zeta".to_owned(),
+                    value: json!("updated"),
+                },
+                PluginStorageMutation::Delete {
+                    key: "zeta".to_owned(),
+                },
+                PluginStorageMutation::Set {
+                    key: "zeta".to_owned(),
+                    value: json!("reinserted"),
+                },
+            ]),
+        })
+        .expect("reinsert string key");
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen ordered storage");
+    let expected = vec![
+        "2",
+        "10",
+        "4294967294",
+        "01",
+        "4294967295",
+        "\u{ffff}x",
+        "zeta",
+    ];
+    assert_eq!(
+        reopened
+            .query_plugin_storage(None)
+            .expect("query reopened ordered storage")
+            .items
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        reopened
+            .materialize(Some(updated.revision))
+            .expect("materialize ordered storage")["pluginCustomStorage"]
+            .as_object()
+            .expect("plugin storage object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn ordinary_root_commits_do_not_replace_plugin_records_and_empty_materializes() {
+    let directory = tempfile::tempdir().expect("create root semantics directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    assert_eq!(
+        store.materialize(None).expect("materialize empty store")["pluginCustomStorage"],
+        json!({})
+    );
+    let staging = store.replace_begin().expect("begin plugin replacement");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "pluginCustomStorage": { "retained": 0 } }),
+        )
+        .expect("stage plugin replacement");
+    let imported = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("commit plugin replacement");
+
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: imported.revision,
+            root: Some(json!({
+                "username": "ordinary root",
+                "pluginCustomStorage": { "incidental": "ignored" }
+            })),
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+        })
+        .expect("commit ordinary root");
+
+    assert_eq!(
+        store
+            .materialize(None)
+            .expect("materialize retained storage")["pluginCustomStorage"],
+        json!({ "retained": 0 })
+    );
+}
+
 fn message(id: &str) -> Value {
     json!({ "role": "user", "data": id, "chatId": id, "time": 1_800_000_000_000i64 })
 }
@@ -133,6 +403,7 @@ fn commit(store: &mut PersistentStore, revision: i64, mutation: ConversationMuta
             add_character: None,
             conversations: Some(vec![mutation]),
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("commit conversation mutation")
         .revision
@@ -256,6 +527,7 @@ fn character_search_uses_rust_unicode_lowercase_matching() {
             })),
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("add character with Unicode name");
 
@@ -516,6 +788,7 @@ fn cas_conflict_preserves_current_revision() {
         add_character: None,
         conversations: None,
         delete_character_id: None,
+        plugin_storage: None,
     });
 
     assert!(matches!(
@@ -562,6 +835,7 @@ fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("replace selected character")
         .revision;
@@ -635,6 +909,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
             add_character: None,
             conversations: None,
             delete_character_id: Some("char-a".to_owned()),
+            plugin_storage: None,
         })
         .expect("delete middle configured character");
     assert!(store
@@ -658,6 +933,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("add replacement after configured gap");
 
@@ -700,6 +976,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         }),
         Err(StoreError::Validation { .. })
     ));
@@ -724,6 +1001,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         }),
         Err(StoreError::RevisionConflict { .. })
     ));
@@ -819,6 +1097,7 @@ fn revision_leases_are_isolated_then_released() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("commit changed root");
 
@@ -898,6 +1177,7 @@ fn character_detail_update_preserves_index_and_conversations() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("commit character detail update");
 
@@ -1051,6 +1331,7 @@ fn summary_recent_at_falls_back_to_message_time_then_zero() {
             add_character: Some(json!({ "chaId": "char-zero", "name": "Zero", "chats": [] })),
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("add character without lastInteraction");
 
@@ -1346,7 +1627,10 @@ fn create_v1_database(path: &Path) {
                     "botPresets": [
                         { "name": "V1 first", "image": "v1.png" },
                         { "name": "V1 second" }
-                    ]
+                    ],
+                    "pluginCustomStorage": {
+                        "active-memory": { "turns": [1, 2, 3] }
+                    }
                 })
                 .to_string()
             ],
@@ -1357,8 +1641,12 @@ fn create_v1_database(path: &Path) {
             "INSERT INTO root VALUES (?1, ?2)",
             rusqlite::params![
                 "revision-old",
-                json!({ "username": "V1 old", "botPresets": [{ "name": "Old preset" }] })
-                    .to_string()
+                json!({
+                    "username": "V1 old",
+                    "botPresets": [{ "name": "Old preset" }],
+                    "pluginCustomStorage": { "old-memory": "preserved" }
+                })
+                .to_string()
             ],
         )
         .expect("insert v1 old root");
@@ -1385,8 +1673,210 @@ fn create_v1_database(path: &Path) {
         .expect("insert v1 character");
 }
 
+fn create_v2_database(path: &Path) {
+    create_v1_database(path);
+    let connection = rusqlite::Connection::open(path).expect("open v1 database for v2 setup");
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE bot_presets (
+                generation TEXT NOT NULL,
+                preset_id TEXT NOT NULL,
+                configured_index INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                image TEXT,
+                value TEXT NOT NULL,
+                PRIMARY KEY (generation, preset_id)
+            );
+            CREATE INDEX bot_presets_configured ON bot_presets (generation, configured_index);
+            ALTER TABLE characters ADD COLUMN type TEXT NOT NULL DEFAULT '';
+            ALTER TABLE characters ADD COLUMN creator_notes TEXT;
+            ALTER TABLE characters ADD COLUMN trash_time INTEGER;
+            PRAGMA user_version = 2;
+            ",
+        )
+        .expect("create v2 schema additions");
+    connection
+        .execute(
+            "UPDATE root SET value = ?2 WHERE generation = ?1",
+            rusqlite::params![
+                "revision-7",
+                json!({
+                    "username": "V2 active",
+                    "pluginCustomStorage": { "v2-memory": { "lossless": true } }
+                })
+                .to_string()
+            ],
+        )
+        .expect("write v2 plugin root");
+}
+
+fn create_v3_database(path: &Path) {
+    create_v2_database(path);
+    let connection = rusqlite::Connection::open(path).expect("open v2 database for v3 setup");
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE plugin_storage (
+                generation TEXT NOT NULL,
+                storage_key TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (generation, storage_key)
+            );
+            ",
+        )
+        .expect("create v3 plugin table");
+    let roots = {
+        let mut statement = connection
+            .prepare("SELECT generation, value FROM root")
+            .expect("prepare v3 roots");
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query v3 roots")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect v3 roots")
+    };
+    for (generation, serialized) in roots {
+        let mut value: Value = serde_json::from_str(&serialized).expect("parse v3 root");
+        let object = value.as_object_mut().expect("v3 root object");
+        if let Some(storage) = object.remove("pluginCustomStorage") {
+            for (key, value) in storage.as_object().expect("v3 plugin object") {
+                let serialized = serde_json::to_string(value).expect("serialize v3 plugin value");
+                connection
+                    .execute(
+                        "INSERT INTO plugin_storage (generation, storage_key, byte_size, value)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![generation, key, serialized.len() as i64, serialized],
+                    )
+                    .expect("insert v3 plugin value");
+            }
+        }
+        connection
+            .execute(
+                "UPDATE root SET value = ?2 WHERE generation = ?1",
+                rusqlite::params![generation, value.to_string()],
+            )
+            .expect("strip v3 root");
+    }
+    connection
+        .execute(
+            "INSERT INTO plugin_storage (generation, storage_key, byte_size, value)
+             VALUES ('revision-7', 'zeta', 1, '0'),
+                    ('revision-7', '10', 1, '0'),
+                    ('revision-7', '2', 1, '0')",
+            [],
+        )
+        .expect("insert v3 ordering values");
+    connection
+        .pragma_update(None, "user_version", 3)
+        .expect("set v3 schema version");
+}
+
 #[test]
-fn schema_v2_migrates_presets_and_character_summaries_for_every_v1_generation() {
+fn schema_v4_migrates_existing_v2_plugin_storage() {
+    let directory = tempfile::tempdir().expect("create v2 migration directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_v2_database(&database_path);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate v2 store");
+
+    assert!(store
+        .read_root(None)
+        .expect("read v2 migrated root")
+        .value
+        .get("pluginCustomStorage")
+        .is_none());
+    assert_eq!(
+        store
+            .read_plugin_storage("v2-memory", None)
+            .expect("read v2 migrated plugin key")
+            .expect("v2 migrated plugin key exists")
+            .value,
+        json!({ "lossless": true })
+    );
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read v2 migrated version");
+    assert_eq!(version, 4);
+}
+
+#[test]
+fn schema_v4_adds_durable_plugin_ordinals_to_v3() {
+    let directory = tempfile::tempdir().expect("create v3 migration directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_v3_database(&database_path);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate v3 store");
+
+    assert_eq!(
+        store
+            .query_plugin_storage(None)
+            .expect("query migrated v3 storage")
+            .items
+            .iter()
+            .map(|item| item.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2", "10", "v2-memory", "zeta"]
+    );
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read migrated v3 version");
+    assert_eq!(version, 4);
+}
+
+#[test]
+fn schema_v4_migrates_large_retained_roots_one_generation_at_a_time() {
+    let directory = tempfile::tempdir().expect("create retained root migration directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_v2_database(&database_path);
+    let connection = rusqlite::Connection::open(&database_path).expect("open retained roots");
+    let payload = "x".repeat(512 * 1024);
+    for index in 0..12 {
+        connection
+            .execute(
+                "INSERT INTO root (generation, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("retained-{index}"),
+                    json!({
+                        "username": format!("Retained {index}"),
+                        "pluginCustomStorage": { format!("memory-{index}"): payload }
+                    })
+                    .to_string()
+                ],
+            )
+            .expect("insert retained root");
+    }
+    drop(connection);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate retained roots");
+    let migrated_count: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM plugin_storage WHERE generation LIKE 'retained-%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count retained plugin rows");
+    let retained_root_fields: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM root
+             WHERE generation LIKE 'retained-%' AND value LIKE '%pluginCustomStorage%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count retained root plugin fields");
+    assert_eq!(migrated_count, 12);
+    assert_eq!(retained_root_fields, 0);
+}
+
+#[test]
+fn schema_v4_migrates_records_for_every_v1_generation() {
     let directory = tempfile::tempdir().expect("create migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -1406,6 +1896,20 @@ fn schema_v2_migrates_presets_and_character_summaries_for_every_v1_generation() 
         .value
         .get("botPresets")
         .is_none());
+    assert!(store
+        .read_root(None)
+        .expect("read migrated root")
+        .value
+        .get("pluginCustomStorage")
+        .is_none());
+    assert_eq!(
+        store
+            .read_plugin_storage("active-memory", None)
+            .expect("read migrated plugin storage")
+            .expect("migrated plugin key exists")
+            .value,
+        json!({ "turns": [1, 2, 3] })
+    );
     let old_root: String = store
         .connection
         .query_row(
@@ -1427,6 +1931,19 @@ fn schema_v2_migrates_presets_and_character_summaries_for_every_v1_generation() 
         )
         .expect("count old presets");
     assert_eq!(old_presets, 1);
+    let old_plugin_storage: String = store
+        .connection
+        .query_row(
+            "SELECT value FROM plugin_storage
+             WHERE generation = 'revision-old' AND storage_key = 'old-memory'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read old plugin storage");
+    assert_eq!(
+        serde_json::from_str::<Value>(&old_plugin_storage).expect("parse old plugin storage"),
+        json!("preserved")
+    );
     let summary = &store
         .query_characters(
             &CharacterQuery {
@@ -1447,11 +1964,11 @@ fn schema_v2_migrates_presets_and_character_summaries_for_every_v1_generation() 
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 4);
 }
 
 #[test]
-fn schema_v2_rolls_back_when_v1_bot_presets_is_not_an_array() {
+fn schema_v4_rolls_back_when_v1_bot_presets_is_not_an_array() {
     let directory = tempfile::tempdir().expect("create migration rollback directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -1513,7 +2030,56 @@ fn schema_v2_rolls_back_when_v1_bot_presets_is_not_an_array() {
 }
 
 #[test]
-fn pending_v1_snapshot_restores_then_migrates_to_v2() {
+fn schema_v4_rolls_back_when_v1_plugin_storage_is_not_an_object() {
+    let directory = tempfile::tempdir().expect("create plugin migration rollback directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_v1_database(&database_path);
+    let invalid_root = json!({
+        "username": "Invalid plugin root",
+        "botPresets": [{ "name": "Still valid" }],
+        "pluginCustomStorage": ["unsupported"]
+    });
+    let connection = rusqlite::Connection::open(&database_path).expect("open v1 database");
+    connection
+        .execute(
+            "UPDATE root SET value = ?2 WHERE generation = ?1",
+            rusqlite::params!["revision-old", invalid_root.to_string()],
+        )
+        .expect("write invalid plugin storage");
+    drop(connection);
+
+    assert!(PersistentStore::open(directory.path()).is_err());
+
+    let connection =
+        rusqlite::Connection::open(&database_path).expect("reopen rolled back plugin migration");
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read rolled back version");
+    let preserved: String = connection
+        .query_row(
+            "SELECT value FROM root WHERE generation = 'revision-old'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read preserved plugin root");
+    let plugin_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'plugin_storage'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check rolled back plugin table");
+    assert_eq!(version, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&preserved).expect("parse preserved plugin root"),
+        invalid_root
+    );
+    assert_eq!(plugin_table_count, 0);
+}
+
+#[test]
+fn pending_v1_snapshot_restores_then_migrates_to_v4() {
     let directory = tempfile::tempdir().expect("create restore directory");
     let store = PersistentStore::open(directory.path()).expect("open current v2 store");
     let candidate = directory
@@ -1540,7 +2106,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v2() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -1557,6 +2123,7 @@ fn invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("seed live database");
 
@@ -1620,6 +2187,7 @@ fn semantically_invalid_pending_v1_snapshot_preserves_live_database_and_restore_
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("seed semantic live database");
 
@@ -1680,7 +2248,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 2);
+    assert_eq!(integer_pragma("user_version"), 4);
 }
 
 #[test]
@@ -1703,6 +2271,7 @@ fn snapshots_create_list_and_restore_on_reopen() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("change database after snapshot");
     store
@@ -1871,6 +2440,7 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            plugin_storage: None,
         })
         .expect("change current data");
     store
@@ -1932,6 +2502,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
                 add_character: None,
                 conversations: None,
                 delete_character_id: None,
+                plugin_storage: None,
             })
             .expect("change current data");
         let expected = store.materialize(None).expect("materialize current data");
@@ -1945,7 +2516,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 3;")
+                .execute_batch("PRAGMA user_version = 5;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");

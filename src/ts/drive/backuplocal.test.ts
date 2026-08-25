@@ -188,6 +188,7 @@ describe('local backup persistent snapshot', () => {
         expect(backedUp.characters[0].chats[0].message).toEqual(
             persisted.characters[0].chats[0].message,
         )
+        expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
         expect(state.snapshotSeenByColdStorage?.characters[0].chats[0].message).toEqual(
             persisted.characters[0].chats[0].message,
         )
@@ -233,6 +234,7 @@ describe('local backup persistent snapshot', () => {
         expect(backedUp.characters[0].chats[0].message).toEqual(
             persisted.characters[0].chats[0].message,
         )
+        expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith(
             'partial-local-backup',
         )

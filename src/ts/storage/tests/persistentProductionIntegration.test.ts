@@ -11,6 +11,7 @@ import {
 } from '../persistentDataRuntime'
 import { createCatalogPresetWorkingSet } from '../workingSetCatalog'
 import { decodeRisuSave } from '../risuSave'
+import { streamRisuSaveFromStore } from '../risuSaveStoreAdapter'
 import {
     createPersistentSaveObserverInstallation,
     installPersistentSaveNotifications,
@@ -100,7 +101,108 @@ function makeStore(name: string) {
     return new IndexedDbPersistentDataStore(name, indexedDB, IDBKeyRange)
 }
 
+async function concatenate(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+    const values: Uint8Array[] = []
+    let length = 0
+    for await (const chunk of chunks) {
+        values.push(chunk)
+        length += chunk.length
+    }
+    const result = new Uint8Array(length)
+    let offset = 0
+    for (const value of values) {
+        result.set(value, offset)
+        offset += value.length
+    }
+    return result
+}
+
 describe('persistent production runtime', () => {
+    it('preserves V2 plugin insertion order through nested edits, restart, and export', async () => {
+        const databaseName = `runtime-plugin-order-${crypto.randomUUID()}`
+        const database = makeDatabase()
+        database.pluginCustomStorage = {
+            zeta: { nested: { count: 1 } },
+            alpha: { nested: { count: 1 } },
+        }
+        const store = makeStore(databaseName)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+
+        adapter.current().pluginCustomStorage.alpha.nested.count = 2
+        adapter.current().pluginCustomStorage.beta = { nested: true }
+        delete adapter.current().pluginCustomStorage.zeta
+        adapter.current().pluginCustomStorage.zeta = { nested: { count: 1 } }
+        runtime.markPersistentDataDirty(1)
+        await runtime.flushPendingData('v2-plugin-order')
+
+        const expectedKeys = ['alpha', 'beta', 'zeta']
+        const reopened = makeStore(databaseName)
+        await reopened.open()
+        const persisted = await reopened.materializeDatabase(runtime.revision)
+        expect(Object.keys(persisted.pluginCustomStorage)).toEqual(expectedKeys)
+        expect(persisted.pluginCustomStorage.alpha).toEqual({ nested: { count: 2 } })
+        const exported = await decodeRisuSave(await concatenate(
+            streamRisuSaveFromStore(reopened, runtime.revision),
+        ))
+        expect(Object.keys(exported.pluginCustomStorage)).toEqual(expectedKeys)
+    })
+
+    it('preserves replacement plugin order through publication, restart, snapshot, and export', async () => {
+        const databaseName = `runtime-plugin-replacement-order-${crypto.randomUUID()}`
+        const database = makeDatabase()
+        const store = makeStore(databaseName)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+
+        const replacement = structuredClone(database)
+        const storage: Record<string, unknown> = {}
+        storage.zeta = { value: 'first string' }
+        storage.alpha = { value: 'second string' }
+        storage.renewed = { value: 'before reinsert' }
+        storage['10'] = 'ten'
+        storage['2'] = 0
+        storage['01'] = 'non-index'
+        storage['4294967294'] = true
+        storage['4294967295'] = false
+        delete storage.renewed
+        storage.renewed = { value: 'after reinsert' }
+        replacement.pluginCustomStorage = storage
+        const expectedKeys = Object.keys(storage)
+
+        await runtime.replacePersistentDatabase(replacement, 'plugin-replacement-order')
+
+        expect(Object.keys(adapter.current().pluginCustomStorage)).toEqual(expectedKeys)
+        const snapshot = await runtime.materializePersistentDatabaseSnapshot(
+            'plugin-replacement-order-snapshot',
+        )
+        expect(Object.keys(snapshot.pluginCustomStorage)).toEqual(expectedKeys)
+        const reopened = makeStore(databaseName)
+        await reopened.open()
+        const persisted = await reopened.materializeDatabase(runtime.revision)
+        expect(Object.keys(persisted.pluginCustomStorage)).toEqual(expectedKeys)
+        expect(persisted.pluginCustomStorage).toEqual(storage)
+        const exported = await decodeRisuSave(await concatenate(
+            streamRisuSaveFromStore(reopened, runtime.revision),
+        ))
+        expect(Object.keys(exported.pluginCustomStorage)).toEqual(expectedKeys)
+        expect(exported.pluginCustomStorage).toEqual(storage)
+    })
+
     it('captures root and the selected character without traversing inactive characters', () => {
         const database = makeDatabase()
         const inactive = structuredClone(database.characters[0])

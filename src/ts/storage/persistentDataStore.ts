@@ -9,7 +9,22 @@ export interface Versioned<T> {
 
 export type CharacterDetail = Omit<character, 'chats'> | Omit<groupChat, 'chats'>
 
-export type PersistentRoot = Omit<Database, 'characters' | 'botPresets'>
+export type PersistentRoot = Omit<Database, 'characters' | 'botPresets' | 'pluginCustomStorage'>
+
+export interface PluginStorageSummary {
+    key: string
+    byteSize: number
+}
+
+export interface PluginStorageCatalog {
+    revision: DataRevision
+    items: PluginStorageSummary[]
+}
+
+export type PluginStorageMutation =
+    | { type: 'set'; key: string; value: unknown }
+    | { type: 'delete'; key: string }
+    | { type: 'clear' }
 
 export interface CharacterSummary {
     id: string
@@ -119,6 +134,7 @@ export interface WorkingSetCommit {
     addCharacter?: character | groupChat
     conversations?: ConversationMutation[]
     deleteCharacterId?: string
+    pluginStorage?: PluginStorageMutation[]
 }
 
 export class RevisionConflictError extends Error {
@@ -152,6 +168,8 @@ export interface PersistentRevisionLease {
     readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
+    queryPluginStorage(): Promise<PluginStorageCatalog>
+    readPluginStorage(key: string): Promise<Versioned<unknown> | null>
     release(): Promise<void>
 }
 
@@ -167,6 +185,8 @@ export interface PersistentDataStore {
     readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null>
+    queryPluginStorage(): Promise<PluginStorageCatalog>
+    readPluginStorage(key: string): Promise<Versioned<unknown> | null>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
     replaceFromDatabase(
         database: Database,

@@ -50,6 +50,8 @@ describe('SqlitePersistentDataStore', () => {
         await store.queryConversations(conversationQuery)
         await store.readConversation('char-a', 'conv-long')
         await store.readConversationWindow(windowQuery)
+        await store.queryPluginStorage()
+        await store.readPluginStorage('memory')
         await store.commit(commit)
         await store.materializeDatabase(9)
 
@@ -66,6 +68,8 @@ describe('SqlitePersistentDataStore', () => {
                 { characterId: 'char-a', conversationId: 'conv-long' },
             ],
             ['pds_read_conversation_window', { query: windowQuery }],
+            ['pds_query_plugin_storage', {}],
+            ['pds_read_plugin_storage', { key: 'memory' }],
             ['pds_commit', { commit }],
             ['pds_materialize', { revision: 9 }],
         ])
@@ -209,6 +213,8 @@ describe('SqlitePersistentDataStore', () => {
             conversationId: 'conv-long',
             limit: 10,
         })
+        await lease.queryPluginStorage()
+        await lease.readPluginStorage('memory')
         await lease.release()
         await lease.release()
 
@@ -240,10 +246,12 @@ describe('SqlitePersistentDataStore', () => {
                     lease: 'lease-7',
                 },
             ],
+            ['pds_query_plugin_storage', { lease: 'lease-7' }],
+            ['pds_read_plugin_storage', { key: 'memory', lease: 'lease-7' }],
             ['pds_release_revision', { lease: 'lease-7' }],
         ])
         await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
-        expect(mocks.invoke).toHaveBeenCalledTimes(10)
+        expect(mocks.invoke).toHaveBeenCalledTimes(12)
     })
 
     it('keeps a lease active and retries native cleanup after release fails', async () => {

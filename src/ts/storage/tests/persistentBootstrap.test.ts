@@ -44,6 +44,8 @@ function createStore(input?: {
         queryConversations: vi.fn(),
         readConversation: vi.fn(),
         readConversationWindow: vi.fn(),
+        queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
+        readPluginStorage: vi.fn(async () => null),
         commit: vi.fn(),
         acquireRevision: vi.fn(),
     }
@@ -112,6 +114,9 @@ describe('bootstrapPersistentDatabase', () => {
         const persistent = structuredClone(fixtureDatabase)
         persistent.plugins = [plugin('2.1', false)]
         persistent.botPresetsId = 1
+        persistent.pluginCustomStorage = {
+            'plugin-memory': { entries: [1, 2, 3] },
+        }
         await store.open()
         await store.replaceFromDatabase(persistent)
         const materializeDatabase = vi.spyOn(store, 'materializeDatabase')
@@ -170,6 +175,10 @@ describe('bootstrapPersistentDatabase', () => {
             [],
         ])
         expect(result.database.characters.map(getCatalogConversationCount)).toEqual([1, 2, 1])
+        expect(result.database.pluginCustomStorage).toEqual({})
+        expect((await store.readPluginStorage('plugin-memory'))?.value).toEqual(
+            persistent.pluginCustomStorage['plugin-memory'],
+        )
     })
 
     it('canonicalizes an out-of-range scalable preset selection before hydration', async () => {
