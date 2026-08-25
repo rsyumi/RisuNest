@@ -228,15 +228,27 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         expect(target.querySelector('img')).toBeNull()
     })
 
-    test('retries after a failed preview lookup', async () => {
+    test('resolves concurrent callers to null after a shared failure, then retries', async () => {
+        let rejectAsset!: (reason: Error) => void
         inlayMocks.getInlayAssetBlob
-            .mockRejectedValueOnce(new Error('preview failed'))
+            .mockReturnValueOnce(new Promise((_, reject) => {
+                rejectAsset = reject
+            }))
             .mockResolvedValueOnce(asset)
         const target = document.createElement('div')
         document.body.appendChild(target)
         mounted = mount(PlaygroundInlayExplorer, { target })
 
         await vi.waitFor(() => expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledOnce())
+        target.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click()
+        await tick()
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledOnce()
+
+        rejectAsset(new Error('preview failed'))
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        await tick()
+        expect(target.querySelector('img')).toBeNull()
+
         target.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click()
 
         await vi.waitFor(() => expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2))

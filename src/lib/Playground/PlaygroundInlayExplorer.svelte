@@ -35,7 +35,8 @@
     const existing = pendingPreviews.get(id)
     if (existing) return existing
     const generation = previewGenerations.get(id) ?? 0
-    const pending = (async () => {
+    let pending: Promise<string | null>
+    pending = (async () => {
       const source = await getInlayRenderSource(id, isTauri, getNativeInlayThumbnailSize(asset, isTauri), asset)
       if (!source) return null
       if (destroyed || (previewGenerations.get(id) ?? 0) !== generation) {
@@ -45,16 +46,14 @@
       previewSources.set(id, source)
       return source.url
     })()
+      .catch(() => null)
+      .finally(() => {
+        if (pendingPreviews.get(id) === pending) {
+          pendingPreviews.delete(id)
+        }
+      })
     pendingPreviews.set(id, pending)
-    try {
-      return await pending
-    } catch {
-      return null
-    } finally {
-      if (pendingPreviews.get(id) === pending) {
-        pendingPreviews.delete(id)
-      }
-    }
+    return pending
   }
 
   const removePreview = (id: string) => {
