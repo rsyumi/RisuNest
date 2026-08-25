@@ -18,6 +18,7 @@ import { tokenize } from "../tokenizer";
 import { fetchNative, readImage } from "../globalApi.svelte";
 import { loadLoreBookV3Prompt } from './lorebook.svelte';
 import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
+import { isTauriMobile } from '../platform';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
@@ -65,6 +66,9 @@ export async function runScripted(code:string, arg:{
     type?: 'lua'|'py'
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
+    if (type === 'py' && isTauriMobile) {
+        throw new Error('Python scripting is unavailable on Tauri mobile')
+    }
     const char = arg.char ?? getCurrentCharacter()
     const data = arg.data ?? ''
     const setVar = arg.setVar ?? setChatVar

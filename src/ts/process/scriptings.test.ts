@@ -18,6 +18,7 @@ vi.mock('../alert', () => ({
 }))
 
 vi.mock('../globalApi.svelte', () => ({ fetchNative: vi.fn(), readImage: vi.fn() }))
+vi.mock('../platform', () => ({ isTauriMobile: true }))
 vi.mock('../tokenizer', () => ({ tokenize: vi.fn() }))
 vi.mock('../util', () => ({
   asBuffer: vi.fn(),
@@ -58,6 +59,20 @@ beforeAll(async () => {
   vi.stubGlobal('fetch', vi.fn(async () => new Response(jsonLua, { status: 200 })))
   const scriptings = await import('./scriptings')
   runScripted = scriptings.runScripted
+})
+
+test('rejects Python scripting on Tauri mobile before creating a Worker', async () => {
+  const worker = vi.fn()
+  vi.stubGlobal('Worker', worker)
+
+  await expect(runScripted('print("blocked")', {
+    char: {} as never,
+    chat: { message: [] } as never,
+    mode: 'tauri-mobile-python-gate',
+    type: 'py',
+  })).rejects.toThrow(/Python scripting is unavailable on Tauri mobile/)
+
+  expect(worker).not.toHaveBeenCalled()
 })
 
 test('does not stop generation when setStateChanged is a no-op', async () => {
