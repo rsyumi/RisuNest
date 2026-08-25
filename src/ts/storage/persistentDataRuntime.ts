@@ -4,6 +4,7 @@ import type {
     CharacterDetail,
     DataRevision,
     PersistentDataStore,
+    PersistentRevisionLease,
     PersistentRoot,
     PluginStorageMutation,
 } from './persistentDataStore'
@@ -34,8 +35,11 @@ import {
     hasIncompletePersistentWorkingSet,
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
+    materializePinnedCompatibilityDatabase,
     patchWorkingSetCharacterDetail,
+    projectScalableWorkingSetAtRevision,
 } from './workingSetCatalog'
+import { releasePersistentRevisionLease } from './persistentRecordIterator'
 
 type CompleteCharacter = character | groupChat
 type RootDatabase = PersistentRoot
@@ -329,7 +333,7 @@ export interface MaximumCompatibilityWorkingSetDependencies {
     getRevision(): DataRevision
     getMutationGeneration(): number
     getNavigationGeneration(): number
-    materializeDatabase(revision: DataRevision): Promise<Database>
+    acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>
     installCompleteDatabase(database: Database): void
     restoreSelection(characterId: string | null, conversationId: string | null): void
     adoptMaterializedDatabase(
@@ -341,6 +345,29 @@ export interface MaximumCompatibilityWorkingSetDependencies {
 
 const MAXIMUM_COMPATIBILITY_MATERIALIZATION_ATTEMPTS = 3
 
+async function readMaximumCompatibilityRevision(
+    dependencies: MaximumCompatibilityWorkingSetDependencies,
+    revision: DataRevision,
+): Promise<Database> {
+    const lease = await dependencies.acquireRevision(revision)
+    let primaryError: unknown
+    try {
+        if (lease.revision !== revision) {
+            throw new Error(`Revision lease returned ${lease.revision}, expected ${revision}`)
+        }
+        return await materializePinnedCompatibilityDatabase(lease)
+    } catch (error) {
+        primaryError = error
+        throw error
+    } finally {
+        try {
+            await releasePersistentRevisionLease(lease)
+        } catch (error) {
+            if (primaryError === undefined) throw error
+        }
+    }
+}
+
 export async function installMaximumCompatibilityWorkingSet(
     dependencies: MaximumCompatibilityWorkingSetDependencies,
 ): Promise<void> {
@@ -351,7 +378,7 @@ export async function installMaximumCompatibilityWorkingSet(
         const navigationGeneration = dependencies.getNavigationGeneration()
         const selectedCharacterId = dependencies.getSelectedCharacterId() ?? null
         const selectedConversationId = dependencies.getSelectedConversationId() ?? null
-        const database = await dependencies.materializeDatabase(revision)
+        const database = await readMaximumCompatibilityRevision(dependencies, revision)
         if (
             revision !== dependencies.getRevision() ||
             mutationGeneration !== dependencies.getMutationGeneration() ||
@@ -539,7 +566,7 @@ export function createPersistentDataRuntime(
                 getRevision: () => coordinator.revision,
                 getMutationGeneration: () => coordinator.mutationGeneration,
                 getNavigationGeneration: () => workingSet.navigationGenerationToken,
-                materializeDatabase: (revision) => dependencies.store.materializeDatabase(revision),
+                acquireRevision: (revision) => dependencies.store.acquireRevision(revision),
                 installCompleteDatabase: (database) =>
                     (dependencies.state.installCompleteDatabase
                         ?? dependencies.state.replaceDatabase)(database),
@@ -549,19 +576,28 @@ export function createPersistentDataRuntime(
                     coordinator.adoptMaterializedDatabase(revision, mutationGeneration, database),
             }),
         async releaseInactiveWorkingSet(canRelease, isCurrent) {
-            const snapshot = await coordinator.materializePersistentDatabaseSnapshotWithRevision(
+            const token = await coordinator.capturePersistentMutationToken(
                 'plugin-scalable-working-set',
             )
             const selectedCharacterId = dependencies.state.getSelectedCharacterId() ?? null
             const selectedConversationId =
                 dependencies.state.getSelectedConversationId?.() ?? null
             const navigationGeneration = workingSet.navigationGenerationToken
+            const database = await projectScalableWorkingSetAtRevision(
+                dependencies.store,
+                token.revision,
+                {
+                    selectedCharacterId,
+                    selectedConversationId,
+                    activeCharacterIds: workingSet.activeCharacterIds,
+                },
+            )
             const releaseAllowed = canRelease ? await canRelease() : true
             if (
                 !releaseAllowed ||
                 isCurrent?.() === false ||
-                snapshot.revision !== coordinator.revision ||
-                snapshot.mutationGeneration !== coordinator.mutationGeneration ||
+                token.revision !== coordinator.revision ||
+                token.mutationGeneration !== coordinator.mutationGeneration ||
                 navigationGeneration !== workingSet.navigationGenerationToken ||
                 selectedCharacterId !==
                     (dependencies.state.getSelectedCharacterId() ?? null) ||
@@ -569,11 +605,11 @@ export function createPersistentDataRuntime(
                     (dependencies.state.getSelectedConversationId?.() ?? null)
             ) return false
             const activeCharacterIds = workingSet.reconcileActiveCharacterIds(
-                snapshot.database,
+                database,
                 selectedCharacterId,
             )
             dependencies.state.replaceDatabase(
-                snapshot.database,
+                database,
                 activeCharacterIds,
                 true,
             )
@@ -582,8 +618,8 @@ export function createPersistentDataRuntime(
             if (
                 resident &&
                 !coordinator.adoptHydratedCharacter(
-                    snapshot.revision,
-                    snapshot.mutationGeneration,
+                    token.revision,
+                    token.mutationGeneration,
                     resident,
                 )
             ) return false

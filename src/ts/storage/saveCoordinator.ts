@@ -11,6 +11,7 @@ import type {
 import { RevisionConflictError } from './persistentDataStore'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import { isConversationSummaryStub } from './conversationResidency'
+import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 
 const SAVE_DEBOUNCE_MS = 500
 const PENDING_BYTE_LIMIT = 1_048_576
@@ -100,7 +101,9 @@ function canonicalize(value: unknown): unknown {
         const result: Record<string, unknown> = {}
         for (const key of Object.keys(value).sort()) {
             const entry = (value as Record<string, unknown>)[key]
-            if (entry !== undefined) result[key] = canonicalize(entry)
+            if (entry !== undefined) {
+                defineOwnEnumerableProperty(result, key, canonicalize(entry))
+            }
         }
         return result
     }
@@ -119,7 +122,9 @@ function pluginStorageJson(storage: Database['pluginCustomStorage']): string {
     const normalized: Database['pluginCustomStorage'] = {}
     for (const key of Object.keys(storage)) {
         const value = storage[key]
-        if (value !== undefined) normalized[key] = canonicalize(value)
+        if (value !== undefined) {
+            defineOwnEnumerableProperty(normalized, key, canonicalize(value))
+        }
     }
     return JSON.stringify(normalized)
 }
@@ -515,7 +520,11 @@ function applyPluginStorageMutations(
         } else if (mutation.type === 'delete') {
             delete next[mutation.key]
         } else {
-            next[mutation.key] = canonicalClone(mutation.value)
+            defineOwnEnumerableProperty(
+                next,
+                mutation.key,
+                canonicalClone(mutation.value),
+            )
         }
     }
     return next
@@ -533,10 +542,14 @@ function rebaseConcurrentPluginStorage(
     )
     const result: Database['pluginCustomStorage'] = {}
     for (const key of Object.keys(ordered)) {
-        if (Object.hasOwn(rebased, key)) result[key] = rebased[key]
+        if (Object.hasOwn(rebased, key)) {
+            defineOwnEnumerableProperty(result, key, rebased[key])
+        }
     }
     for (const key of Object.keys(rebased)) {
-        if (!Object.hasOwn(result, key)) result[key] = rebased[key]
+        if (!Object.hasOwn(result, key)) {
+            defineOwnEnumerableProperty(result, key, rebased[key])
+        }
     }
     return result
 }

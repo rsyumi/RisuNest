@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
     SaveCoordinator as ProductionSaveCoordinator,
+    canonicalJson,
     type SaveCoordinatorDependencies,
 } from './saveCoordinator'
 import type { Chat, Database, character, groupChat } from './database.svelte'
@@ -23,6 +24,27 @@ function makeDatabase(): Database {
         ],
     } as unknown as Database
 }
+
+describe('canonical JSON property safety', () => {
+    it('preserves JSON-origin own proto keys at every nested level', () => {
+        const source = JSON.parse(
+            '{"zeta":0,"__proto__":{"nested":{"__proto__":false}},"alpha":""}',
+        )
+
+        const canonical = JSON.parse(canonicalJson(source)) as Record<string, unknown>
+        const protoValue = canonical.__proto__ as Record<string, unknown>
+        const nested = protoValue.nested as Record<string, unknown>
+
+        expect(Object.keys(canonical)).toEqual(['__proto__', 'alpha', 'zeta'])
+        expect(Object.hasOwn(canonical, '__proto__')).toBe(true)
+        expect(Object.getPrototypeOf(canonical)).toBe(Object.prototype)
+        expect(Object.hasOwn(nested, '__proto__')).toBe(true)
+        expect(nested.__proto__).toBe(false)
+        expect(Object.getPrototypeOf(nested)).toBe(Object.prototype)
+        expect(canonical.alpha).toBe('')
+        expect(canonical.zeta).toBe(0)
+    })
+})
 
 function deferred<T>() {
     let resolve!: (value: T) => void
@@ -241,6 +263,7 @@ describe('SaveCoordinator', () => {
     it('publishes explicit V3 mutations into a hydrated compatibility working set', async () => {
         const database = makeDatabase()
         database.pluginCustomStorage = { existing: true }
+        const storagePrototype = Object.getPrototypeOf(database.pluginCustomStorage)
         const commit = vi.fn(async ({ expectedRevision }) => ({
             revision: expectedRevision + 1,
         }))
@@ -258,9 +281,17 @@ describe('SaveCoordinator', () => {
 
         await coordinator.mutatePersistentPluginStorage('maximum-compatibility', [
             { type: 'set', key: 'added', value: 42 },
+            { type: 'set', key: '__proto__', value: 0 },
         ])
 
-        expect(database.pluginCustomStorage).toEqual({ existing: true, added: 42 })
+        expect(Object.keys(database.pluginCustomStorage)).toEqual([
+            'existing',
+            'added',
+            '__proto__',
+        ])
+        expect(Object.hasOwn(database.pluginCustomStorage, '__proto__')).toBe(true)
+        expect(database.pluginCustomStorage.__proto__).toBe(0)
+        expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(storagePrototype)
         await coordinator.flushPendingData('already-baselined')
         expect(commit).toHaveBeenCalledOnce()
     })
@@ -4335,10 +4366,10 @@ describe('SaveCoordinator', () => {
 
     it('rebases a concurrent compatibility plugin edit and persists it after replacement', async () => {
         const database = makeDatabase()
-        database.pluginCustomStorage = {
-            retained: 'before',
-            live: 'before',
-        }
+        database.pluginCustomStorage = JSON.parse(
+            '{"retained":"before","__proto__":"before"}',
+        )
+        const storagePrototype = Object.getPrototypeOf(database.pluginCustomStorage)
         const candidate = structuredClone(database)
         candidate.pluginCustomStorage.retained = 'replacement'
         const replacementWrite = deferred<{ revision: number }>()
@@ -4362,23 +4393,24 @@ describe('SaveCoordinator', () => {
             authoritative: true,
         })
         await vi.waitFor(() => expect(store.replaceFromDatabase).toHaveBeenCalledOnce())
-        database.pluginCustomStorage.live = 'later'
+        database.pluginCustomStorage.__proto__ = 'later'
         coordinator.markPersistentDataDirty(1)
         replacementWrite.resolve({ revision: 6 })
 
         await replacing
 
-        expect(database.pluginCustomStorage).toEqual({
-            retained: 'replacement',
-            live: 'later',
-        })
+        expect(Object.keys(database.pluginCustomStorage)).toEqual(['retained', '__proto__'])
+        expect(database.pluginCustomStorage.retained).toBe('replacement')
+        expect(Object.hasOwn(database.pluginCustomStorage, '__proto__')).toBe(true)
+        expect(database.pluginCustomStorage.__proto__).toBe('later')
+        expect(Object.getPrototypeOf(database.pluginCustomStorage)).toBe(storagePrototype)
         expect(commit).not.toHaveBeenCalled()
 
         await coordinator.flushPendingData('plugin-rebase-save')
 
         expect(commit).toHaveBeenCalledWith({
             expectedRevision: 6,
-            pluginStorage: [{ type: 'set', key: 'live', value: 'later' }],
+            pluginStorage: [{ type: 'set', key: '__proto__', value: 'later' }],
         })
     })
 

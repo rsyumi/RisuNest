@@ -52,7 +52,7 @@ export { createPersistentDataRuntime } from './persistentDataRuntime'
 
 type CompleteCharacter = character | groupChat
 
-function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
+export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapter {
     return {
         captureRoot() {
             return capturePersistentRoot(getDatabase())
@@ -279,7 +279,7 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
     if (!productionRuntime) {
         productionRuntime = createPersistentDataRuntime({
             store: getPersistentDataStore(),
-            state: productionStateAdapter(),
+            state: createProductionStateAdapter(),
             getOfficialPublisher: () => productionConfiguration.officialPublisher,
             onLocalRevision: (revision) => productionConfiguration.onLocalRevision?.(revision),
             onFlushPromise: (promise) => productionConfiguration.onFlushPromise?.(promise),

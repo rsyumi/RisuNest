@@ -61,6 +61,7 @@ import {
     createCatalogPresetWorkingSet,
     hasIncompletePersistentWorkingSet,
     isCatalogCharacterStub,
+    isCatalogPresetWorkingSet,
     projectCatalogWorkingSet,
     projectCompleteScalableWorkingSet,
 } from "./storage/workingSetCatalog";
@@ -170,13 +171,15 @@ export async function loadData() {
                     pluginCompatibility,
                     forceScalableProjection,
                 )) return database
-                const projected = projectCompleteScalableWorkingSet(
-                    database,
-                    selectedCharacterId,
-                    runtime.revision,
-                    activeCharacterIds,
-                    selectedConversationId,
-                )
+                const projected = isCatalogPresetWorkingSet(database.botPresets)
+                    ? database
+                    : projectCompleteScalableWorkingSet(
+                        database,
+                        selectedCharacterId,
+                        runtime.revision,
+                        activeCharacterIds,
+                        selectedConversationId,
+                    )
                 for (const character of projected.characters) {
                     if (isCatalogCharacterStub(character)) {
                         workingSetResidency.markCharacterReleased(character.chaId)

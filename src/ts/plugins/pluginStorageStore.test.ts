@@ -334,6 +334,36 @@ describe('plugin storage V3 residency', () => {
         expect(store.acquireRevision).toHaveBeenCalledWith(4)
     })
 
+    it('preserves an own proto key and catalog order in a pinned snapshot', async () => {
+        const { storage, store } = harness({}, 100)
+        vi.mocked(store.acquireRevision).mockResolvedValueOnce({
+            revision: 4,
+            queryPluginStorage: async () => ({
+                revision: 4,
+                items: [
+                    { key: 'zeta', byteSize: 1 },
+                    { key: '0', byteSize: 1 },
+                    { key: '__proto__', byteSize: 1 },
+                    { key: 'alpha', byteSize: 1 },
+                ],
+            }),
+            readPluginStorage: async (key: string) => ({
+                revision: 4,
+                value: key === '__proto__' ? false : key === '0' ? 0 : '',
+            }),
+            release: vi.fn(async () => undefined),
+        } as any)
+
+        const snapshot = await storage.snapshot()
+
+        expect(Object.keys(snapshot)).toEqual(['0', 'zeta', '__proto__', 'alpha'])
+        expect(Object.hasOwn(snapshot, '__proto__')).toBe(true)
+        expect(snapshot.__proto__).toBe(false)
+        expect(Object.getPrototypeOf(snapshot)).toBe(Object.prototype)
+        expect(snapshot['0']).toBe(0)
+        expect(snapshot.alpha).toBe('')
+    })
+
     it('retries a pinned compatibility snapshot when the selected revision races a commit', async () => {
         const { storage, store } = harness({
             zero: { byteSize: 1, value: 0 },

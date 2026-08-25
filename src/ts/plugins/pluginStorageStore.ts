@@ -4,6 +4,7 @@ import {
     type PluginStorageMutation,
     type PluginStorageSummary,
 } from '../storage/persistentDataStore'
+import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
 
 export const PLUGIN_STORAGE_CACHE_BYTE_BUDGET = 64 * 1024 * 1024
 
@@ -305,7 +306,13 @@ export function createPluginStorageStore(
                 const storage: Record<string, unknown> = {}
                 for (const item of pinnedCatalog.items) {
                     const record = await lease.readPluginStorage(item.key)
-                    if (record) storage[item.key] = structuredClone(record.value)
+                    if (record) {
+                        defineOwnEnumerableProperty(
+                            storage,
+                            item.key,
+                            structuredClone(record.value),
+                        )
+                    }
                 }
                 return storage
             } finally {

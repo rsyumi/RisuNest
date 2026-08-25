@@ -37,12 +37,27 @@ import {
     readCompatibilityPluginStorageValue,
     registerPluginStorageLifecycle,
 } from "./pluginStorageStore";
+import { defineOwnEnumerableProperty } from "../storage/ownEnumerableProperty";
 import {
     applyPluginDatabaseUpdate,
     validatePluginDatabaseUpdate,
 } from "./pluginDatabaseAccess";
 
 export const customProviderStore = writable([] as string[])
+
+function writeCompatibilityPluginStorageValue(
+    storage: Record<string, unknown>,
+    key: string,
+    value: unknown,
+): Record<string, unknown> {
+    if (Object.hasOwn(storage, key) || !(key in storage)) {
+        defineOwnEnumerableProperty(storage, key, value)
+        return storage
+    }
+    const replacement = Object.fromEntries(Object.entries(storage))
+    defineOwnEnumerableProperty(replacement, key, value)
+    return replacement
+}
 
 interface ProviderPlugin {
     name: string
@@ -502,9 +517,6 @@ export const pluginCompatibility = createPluginCompatibilityController({
     ),
     enterMaximumCompatibility: async () => {
         await materializeMaximumCompatibilityWorkingSet()
-        pluginStorageStore.preloadCompatibilityValues(
-            getDatabase({ snapshot: true }).pluginCustomStorage ?? {},
-        )
     },
     setEvictionAllowed: (allowed) => {
         workingSetResidency.setEvictionAllowed(allowed)
@@ -849,7 +861,14 @@ export const getV2PluginAPIs = () => {
                     else{
                         console.log('Setting custom db property', prop.toString(), value);
                         target.pluginCustomStorage ??= {}
-                        target.pluginCustomStorage[prop.toString()] = value;
+                        const replacement = writeCompatibilityPluginStorageValue(
+                            target.pluginCustomStorage,
+                            prop.toString(),
+                            value,
+                        )
+                        if (replacement !== target.pluginCustomStorage) {
+                            target.pluginCustomStorage = replacement;
+                        }
                         pluginStorageStore.synchronizeCompatibilityMutation({
                             type: 'set',
                             key: prop.toString(),
@@ -883,7 +902,14 @@ export const getV2PluginAPIs = () => {
             setItem: (key: string, value: string) => {
                 const db = getDatabase();
                 db.pluginCustomStorage ??= {}
-                db.pluginCustomStorage[key] = value;
+                const replacement = writeCompatibilityPluginStorageValue(
+                    db.pluginCustomStorage,
+                    key,
+                    value,
+                )
+                if (replacement !== db.pluginCustomStorage) {
+                    db.pluginCustomStorage = replacement;
+                }
                 pluginStorageStore.synchronizeCompatibilityMutation({ type: 'set', key, value })
             },
             removeItem: (key: string) => {

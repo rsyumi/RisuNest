@@ -9,7 +9,7 @@ import {
     publishPersistentCharacterMutationToWorkingSet,
     restoreStableWorkingSetSelection,
 } from './persistentDataRuntime'
-import type { PersistentDataStore } from './persistentDataStore'
+import type { PersistentDataStore, PersistentRevisionLease } from './persistentDataStore'
 import {
     createCatalogCharacterStub,
     createCatalogPresetWorkingSet,
@@ -38,6 +38,87 @@ function makeDatabase(username: string): Database {
             chats: [],
         }],
     } as unknown as Database
+}
+
+function makeDatabaseLease(database: Database, revision: number): PersistentRevisionLease {
+    const {
+        characters,
+        botPresets = [],
+        pluginCustomStorage = {},
+        ...root
+    } = database
+    return {
+        revision,
+        readRoot: vi.fn(async () => ({ revision, value: structuredClone(root) })),
+        queryPresets: vi.fn(async () => ({
+            revision,
+            items: botPresets.map((preset, configuredIndex) => ({
+                id: String(configuredIndex),
+                configuredIndex,
+                name: preset.name ?? '',
+                image: preset.image,
+            })),
+        })),
+        readPreset: vi.fn(async (id) => {
+            const preset = botPresets[Number(id)]
+            return preset ? { revision, value: structuredClone(preset) } : null
+        }),
+        queryCharacters: vi.fn(async ({ trash }) => ({
+            revision,
+            items: characters.flatMap((character, configuredIndex) =>
+                (character.trashTime !== undefined) === trash ? [{
+                    id: character.chaId,
+                    name: character.name,
+                    image: character.image,
+                    configuredIndex,
+                    recentAt: character.lastInteraction ?? 0,
+                    trashed: trash,
+                    conversationCount: character.chats.length,
+                    type: character.type,
+                    creatorNotes: character.creatorNotes,
+                    trashTime: character.trashTime,
+                }] : []),
+        })),
+        readCharacter: vi.fn(async (id) => {
+            const character = characters.find((candidate) => candidate.chaId === id)
+            if (!character) return null
+            const { chats: _chats, ...detail } = character
+            return { revision, value: structuredClone(detail) }
+        }),
+        queryConversations: vi.fn(async ({ characterId }) => {
+            const character = characters.find((candidate) => candidate.chaId === characterId)
+            return {
+                revision,
+                items: (character?.chats ?? []).map((chat, configuredIndex) => ({
+                    id: chat.id!,
+                    characterId,
+                    name: chat.name ?? '',
+                    folderId: chat.folderId,
+                    bindedPersona: chat.bindedPersona,
+                    configuredIndex,
+                    recentAt: chat.lastDate ?? 0,
+                    messageCount: chat.message.length,
+                })),
+            }
+        }),
+        readConversation: vi.fn(async (characterId, conversationId) => {
+            const conversation = characters.find((candidate) =>
+                candidate.chaId === characterId)?.chats.find((candidate) =>
+                candidate.id === conversationId)
+            return conversation
+                ? { revision, value: structuredClone(conversation) }
+                : null
+        }),
+        readConversationWindow: vi.fn(async () => null),
+        queryPluginStorage: vi.fn(async () => ({
+            revision,
+            items: Object.keys(pluginCustomStorage).map((key) => ({ key, byteSize: 0 })),
+        })),
+        readPluginStorage: vi.fn(async (key) => Object.hasOwn(pluginCustomStorage, key)
+            ? { revision, value: structuredClone(pluginCustomStorage[key]) }
+            : null),
+        release: vi.fn(async () => undefined),
+    }
 }
 
 describe('persistent preset capture', () => {
@@ -541,10 +622,14 @@ describe('prepared persistent replacement', () => {
         } as unknown as Database
         let database = structuredClone(complete)
         let projectedActiveIds: string[] = []
+        const lease = makeDatabaseLease(complete, 4)
         const store = {
             open: vi.fn(async () => undefined),
             readRoot: vi.fn(async () => ({ revision: 4, value: capturePersistentRoot(complete) })),
-            materializeDatabase: vi.fn(async () => structuredClone(complete)),
+            acquireRevision: vi.fn(async () => lease),
+            materializeDatabase: vi.fn(async () => {
+                throw new Error('legacy materializer must not be called')
+            }),
         } as unknown as PersistentDataStore
         const restoreSelection = vi.fn()
         const runtime = createPersistentDataRuntime({
@@ -560,7 +645,7 @@ describe('prepared persistent replacement', () => {
                 replaceDatabase: (replacement, activeCharacterIds, forceScalableProjection) => {
                     expect(forceScalableProjection).toBe(true)
                     projectedActiveIds = [...(activeCharacterIds ?? [])]
-                    database = projectCompleteScalableWorkingSet(replacement, 'char-b', 4)
+                    database = replacement
                 },
                 restoreSelection,
                 publishCharacter: vi.fn(),
@@ -572,7 +657,8 @@ describe('prepared persistent replacement', () => {
 
         await runtime.releaseInactiveWorkingSet()
 
-        expect(store.materializeDatabase).toHaveBeenCalledWith(4)
+        expect(store.materializeDatabase).not.toHaveBeenCalled()
+        expect(store.acquireRevision).toHaveBeenCalledWith(4)
         expect(database.username).toBe('Authoritative')
         expect(isCatalogCharacterStub(database.characters[0])).toBe(true)
         expect(database.characters[0]).not.toHaveProperty('personality')
@@ -588,14 +674,19 @@ describe('prepared persistent replacement', () => {
     it('does not publish a scalable snapshot when the final release guard becomes false', async () => {
         const database = makeDatabase('Initial')
         const snapshot = makeDatabase('Snapshot')
-        const materialization = deferred<Database>()
+        const materialization = deferred<Awaited<
+            ReturnType<PersistentRevisionLease['queryCharacters']>
+        >>()
+        const lease = makeDatabaseLease(snapshot, 4)
+        const originalQuery = lease.queryCharacters.bind(lease)
+        lease.queryCharacters = vi.fn(() => materialization.promise)
         const store = {
             open: vi.fn(async () => undefined),
             readRoot: vi.fn(async () => ({
                 revision: 4,
                 value: capturePersistentRoot(database),
             })),
-            materializeDatabase: vi.fn(() => materialization.promise),
+            acquireRevision: vi.fn(async () => lease),
         } as unknown as PersistentDataStore
         const replaceDatabase = vi.fn()
         const runtime = createPersistentDataRuntime({
@@ -616,8 +707,12 @@ describe('prepared persistent replacement', () => {
         await runtime.initializeActiveWorkingSet(database)
 
         const release = runtime.releaseInactiveWorkingSet(() => false)
-        await vi.waitFor(() => expect(store.materializeDatabase).toHaveBeenCalledOnce())
-        materialization.resolve(snapshot)
+        await vi.waitFor(() => expect(lease.queryCharacters).toHaveBeenCalledOnce())
+        materialization.resolve(await originalQuery({
+            order: 'configured',
+            trash: false,
+            limit: 128,
+        }))
 
         await expect(release).resolves.toBe(false)
         expect(replaceDatabase).not.toHaveBeenCalled()
@@ -628,6 +723,7 @@ describe('prepared persistent replacement', () => {
         const releasePermission = deferred<boolean>()
         let transitionCurrent = true
         const replaceDatabase = vi.fn()
+        const snapshot = makeDatabase('Snapshot')
         const runtime = createPersistentDataRuntime({
             store: {
                 open: vi.fn(async () => undefined),
@@ -635,7 +731,7 @@ describe('prepared persistent replacement', () => {
                     revision: 4,
                     value: capturePersistentRoot(database),
                 })),
-                materializeDatabase: vi.fn(async () => makeDatabase('Snapshot')),
+                acquireRevision: vi.fn(async () => makeDatabaseLease(snapshot, 4)),
             } as unknown as PersistentDataStore,
             state: {
                 captureRoot: () => capturePersistentRoot(database),
@@ -770,5 +866,186 @@ describe('prepared persistent replacement', () => {
         expect(database.characters[2].personality).toBe('gamma body')
         expect(database.characters[3].type).toBe('group')
         expect(isCatalogCharacterStub(database.characters[4])).toBe(true)
+    })
+
+    it('rebases a dirty UI edit before synchronous bounded replacement publication', async () => {
+        const complete = {
+            username: 'Initial',
+            customBackground: '',
+            botPresetsId: 0,
+            botPresets: [{ name: 'Active', mainPrompt: 'body' }],
+            pluginCustomStorage: { cached: true },
+            characters: [{
+                type: 'character',
+                chaId: 'member-a',
+                name: 'Member',
+                personality: 'member detail',
+                chats: [],
+            }, {
+                type: 'group',
+                chaId: 'group-a',
+                name: 'Group',
+                characters: ['member-a'],
+                characterTalks: [1],
+                characterActive: [true],
+                chats: [],
+            }, {
+                type: 'character',
+                chaId: 'inactive',
+                name: 'Inactive',
+                personality: 'release me',
+                chats: [],
+            }],
+        } as unknown as Database
+        let database = structuredClone(complete)
+        const replacementWrite = deferred<{ revision: number }>()
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const acquireRevision = vi.fn(async () => {
+            throw new Error('replacement publication must not acquire a revision')
+        })
+        const materializeDatabase = vi.fn(async () => {
+            throw new Error('replacement publication must not materialize the database')
+        })
+        const store = {
+            open: vi.fn(async () => undefined),
+            readRoot: vi.fn(async () => ({
+                revision: 7,
+                value: capturePersistentRoot(complete),
+            })),
+            replaceFromDatabase: vi.fn(() => replacementWrite.promise),
+            commit,
+            acquireRevision,
+            materializeDatabase,
+        } as unknown as PersistentDataStore
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: {
+                captureRoot: () => capturePersistentRoot(database),
+                capturePluginStorage: () => database.pluginCustomStorage,
+                capturePresets: () => database.botPresets,
+                captureSelectedCharacter: () => database.characters.find(
+                    (character) => character.chaId === 'group-a',
+                ) ?? null,
+                captureCharacter: (id) => database.characters.find(
+                    (character) => character.chaId === id,
+                ) ?? null,
+                getSelectedCharacterId: () => 'group-a',
+                replaceDatabase: (replacement, activeCharacterIds) => {
+                    database = projectCompleteScalableWorkingSet(
+                        replacement,
+                        'group-a',
+                        8,
+                        activeCharacterIds,
+                    )
+                },
+                publishCharacter: vi.fn(),
+                publishConversation: vi.fn(),
+            },
+            prepareDatabase: async (value) => value,
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const replacement = structuredClone(complete)
+        replacement.username = 'Replacement'
+
+        const replacing = runtime.replacePersistentDatabase(replacement, 'delayed-replacement')
+        await vi.waitFor(() => expect(store.replaceFromDatabase).toHaveBeenCalledOnce())
+        database.customBackground = 'live edit during replacement'
+        runtime.markPersistentDataDirty(1)
+        replacementWrite.resolve({ revision: 8 })
+        await replacing
+
+        expect(database.username).toBe('Replacement')
+        expect(database.customBackground).toBe('live edit during replacement')
+        expect(database.pluginCustomStorage).toEqual({})
+        expect(database.characters[0].personality).toBe('member detail')
+        expect(isCatalogCharacterStub(database.characters[2])).toBe(true)
+        expect(acquireRevision).not.toHaveBeenCalled()
+        expect(materializeDatabase).not.toHaveBeenCalled()
+
+        await runtime.flushPendingData('persist-rebased-live-edit')
+        expect(commit).toHaveBeenCalledWith(expect.objectContaining({
+            expectedRevision: 8,
+            root: expect.objectContaining({
+                customBackground: 'live edit during replacement',
+            }),
+        }))
+    })
+
+    it('cannot split committed replacement publication on revision read or release failure', async () => {
+        const complete = {
+            username: 'Initial',
+            botPresetsId: 0,
+            botPresets: [{ name: 'Active', mainPrompt: 'body' }],
+            pluginCustomStorage: { cached: true },
+            characters: [{
+                type: 'character',
+                chaId: 'char-a',
+                name: 'Selected',
+                personality: 'selected detail',
+                chats: [],
+            }, {
+                type: 'character',
+                chaId: 'inactive',
+                name: 'Inactive',
+                personality: 'release me',
+                chats: [],
+            }],
+        } as unknown as Database
+        let database = structuredClone(complete)
+        const acquireRevision = vi.fn(async () => {
+            throw new Error('revision reads are unavailable')
+        })
+        const materializeDatabase = vi.fn(async () => {
+            throw new Error('full materialization is unavailable')
+        })
+        const store = {
+            open: vi.fn(async () => undefined),
+            readRoot: vi.fn(async () => ({
+                revision: 7,
+                value: capturePersistentRoot(complete),
+            })),
+            replaceFromDatabase: vi.fn(async () => ({ revision: 8 })),
+            acquireRevision,
+            materializeDatabase,
+        } as unknown as PersistentDataStore
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: {
+                captureRoot: () => capturePersistentRoot(database),
+                capturePluginStorage: () => database.pluginCustomStorage,
+                capturePresets: () => database.botPresets,
+                captureSelectedCharacter: () => database.characters[0],
+                captureCharacter: (id) => database.characters.find(
+                    (character) => character.chaId === id,
+                ) ?? null,
+                getSelectedCharacterId: () => 'char-a',
+                replaceDatabase: (replacement, activeCharacterIds) => {
+                    database = projectCompleteScalableWorkingSet(
+                        replacement,
+                        'char-a',
+                        8,
+                        activeCharacterIds,
+                    )
+                },
+                publishCharacter: vi.fn(),
+                publishConversation: vi.fn(),
+            },
+            prepareDatabase: async (value) => value,
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const replacement = structuredClone(complete)
+        replacement.username = 'Committed replacement'
+
+        await runtime.replacePersistentDatabase(replacement, 'nonthrowing-publication')
+
+        expect(runtime.revision).toBe(8)
+        expect(database.username).toBe('Committed replacement')
+        expect(database.pluginCustomStorage).toEqual({})
+        expect(database.characters[0].personality).toBe('selected detail')
+        expect(isCatalogCharacterStub(database.characters[1])).toBe(true)
+        expect(acquireRevision).not.toHaveBeenCalled()
+        expect(materializeDatabase).not.toHaveBeenCalled()
     })
 })

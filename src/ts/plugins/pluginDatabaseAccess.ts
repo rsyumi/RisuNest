@@ -17,6 +17,7 @@ import {
     iteratePinnedCharacters,
     iteratePinnedConversations,
 } from '../storage/persistentRecordIterator'
+import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
 import type { PluginCompatibilityProfile } from './pluginCompatibility'
 
 export const PLUGIN_SUMMARY_QUERY_DEFAULT_LIMIT = 50
@@ -445,7 +446,11 @@ export function createPluginDatabaseAccess(
                                     value.revision,
                                     `Plugin storage value ${summary.key}`,
                                 )
-                                storage[summary.key] = dependencies.snapshot(value.value)
+                                defineOwnEnumerableProperty(
+                                    storage,
+                                    summary.key,
+                                    dependencies.snapshot(value.value),
+                                )
                             }
                             result[key] = storage
                             continue

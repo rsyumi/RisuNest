@@ -1,0 +1,170 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+vi.mock('../parser/parser.svelte', () => ({
+    assetRegex: /$^/,
+    hasher: vi.fn(async () => 'hash'),
+    parseMarkdownSafe: (value: string) => value,
+    ParseMarkdown: vi.fn(async (value: string) => value),
+    risuChatParser: (value: string) => value,
+}))
+import { selectedCharID } from '../stores.svelte'
+import {
+    createPluginStorageStore,
+    registerPluginStorageLifecycle,
+} from '../plugins/pluginStorageStore'
+import { getV2PluginAPIs } from '../plugins/plugins.svelte'
+import type { Database } from './database.svelte'
+import type { PersistentDataStore } from './persistentDataStore'
+import { getDatabase, setDatabaseLite } from './database.svelte'
+import {
+    configurePersistentDataRuntime,
+    createProductionStateAdapter,
+} from './persistentDataRuntime.svelte'
+import {
+    isCatalogCharacterStub,
+    projectCompleteScalableWorkingSet,
+} from './workingSetCatalog'
+import { workingSetResidency } from './workingSetResidency'
+
+afterEach(() => {
+    configurePersistentDataRuntime({ projectWorkingSet: undefined })
+    workingSetResidency.clear()
+})
+
+describe('production persistent working-set publication', () => {
+    it('clears old residency before the synchronous projector records the replacement', () => {
+        const initial = {
+            botPresetsId: 0,
+            botPresets: [{ name: 'Active' }],
+            characters: [{
+                type: 'group',
+                chaId: 'group-a',
+                name: 'Group',
+                characters: ['member-a'],
+                characterTalks: [1],
+                characterActive: [true],
+                chats: [],
+            }],
+        } as unknown as Database
+        const replacement = {
+            ...initial,
+            characters: [{
+                type: 'character',
+                chaId: 'member-a',
+                name: 'Member',
+                personality: 'resident detail',
+                chats: [],
+            }, initial.characters[0], {
+                type: 'character',
+                chaId: 'inactive',
+                name: 'Inactive',
+                personality: 'must be released',
+                chats: [],
+            }],
+        } as unknown as Database
+        setDatabaseLite(initial)
+        selectedCharID.set(0)
+        workingSetResidency.markCharacterReleased('stale')
+        let oldResidencyClearedBeforeProjection = false
+        configurePersistentDataRuntime({
+            projectWorkingSet(database, selectedCharacterId, selectedConversationId, activeIds) {
+                oldResidencyClearedBeforeProjection =
+                    !workingSetResidency.isCharacterReleased('stale')
+                const projected = projectCompleteScalableWorkingSet(
+                    database,
+                    selectedCharacterId,
+                    2,
+                    activeIds,
+                    selectedConversationId,
+                )
+                for (const character of projected.characters) {
+                    if (isCatalogCharacterStub(character)) {
+                        workingSetResidency.markCharacterReleased(character.chaId)
+                    }
+                }
+                return projected
+            },
+        })
+
+        createProductionStateAdapter().replaceDatabase(
+            replacement,
+            new Set(['group-a', 'member-a']),
+            true,
+        )
+
+        expect(oldResidencyClearedBeforeProjection).toBe(true)
+        expect(workingSetResidency.isCharacterReleased('inactive')).toBe(true)
+        expect(getDatabase().characters[0].personality).toBe('resident detail')
+        expect(isCatalogCharacterStub(getDatabase().characters[2])).toBe(true)
+    })
+
+    it('preloads nested maximum plugin values from the installed plain database', async () => {
+        const storage = createPluginStorageStore({
+            store: {} as PersistentDataStore,
+            mutate: async () => undefined,
+        })
+        const unregister = registerPluginStorageLifecycle(storage)
+        const nestedValue = {
+            list: [{ enabled: true }],
+            settings: { mode: 'maximum' },
+        }
+        const complete = {
+            botPresets: [],
+            pluginCustomStorage: { nested: nestedValue },
+            characters: [],
+        } as unknown as Database
+        try {
+            createProductionStateAdapter().installCompleteDatabase!(complete)
+
+            await expect(storage.keys()).resolves.toEqual(['nested'])
+            await expect(storage.getItem('nested')).resolves.toEqual(nestedValue)
+            expect(await storage.getItem('nested')).not.toBe(nestedValue)
+        } finally {
+            unregister()
+        }
+    })
+
+    it.each(['proxy', 'pluginStorage'] as const)(
+        'creates a safe own proto key through the V2 %s writer',
+        (writer) => {
+            setDatabaseLite({
+                botPresets: [],
+                characters: [],
+                plugins: [],
+                pluginCustomStorage: JSON.parse('{"2":0,"zeta":false}'),
+            } as unknown as Database)
+            const expectedPrototype = Object.getPrototypeOf(
+                getDatabase().pluginCustomStorage,
+            )
+            const value = ''
+            const api = getV2PluginAPIs()
+            const initialStorage = getDatabase().pluginCustomStorage
+
+            if (writer === 'proxy') {
+                ;(api.getDatabase() as Record<string, unknown>).ordinary = 0
+            } else api.pluginStorage.setItem('ordinary', '')
+            expect(getDatabase().pluginCustomStorage).toBe(initialStorage)
+
+            if (writer === 'proxy') {
+                ;(api.getDatabase() as Record<string, unknown>).__proto__ = value
+            }
+            else api.pluginStorage.setItem('__proto__', value)
+
+            const storage = getDatabase().pluginCustomStorage
+            expect(Object.keys(storage)).toEqual(['2', 'zeta', 'ordinary', '__proto__'])
+            expect(Object.hasOwn(storage, '__proto__')).toBe(true)
+            expect(storage.__proto__).toEqual(value)
+            expect(Object.getPrototypeOf(storage)).toBe(expectedPrototype)
+            expect(storage['2']).toBe(0)
+            expect(storage.zeta).toBe(false)
+            expect(storage.ordinary).toBe(writer === 'proxy' ? 0 : '')
+
+            if (writer === 'proxy') {
+                ;(api.getDatabase() as Record<string, unknown>).__proto__ = 'updated'
+            } else api.pluginStorage.setItem('__proto__', 'updated')
+            expect(getDatabase().pluginCustomStorage).toBe(storage)
+            expect(Object.keys(storage)).toEqual(['2', 'zeta', 'ordinary', '__proto__'])
+            expect(storage.__proto__).toBe('updated')
+        },
+    )
+})

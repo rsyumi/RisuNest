@@ -149,14 +149,11 @@ describe('RisuSave persistent store adapter', () => {
 
     it('exports plugin storage in legacy Object.keys order from the pinned catalog', async () => {
         const database = structuredClone(risuSaveFixtureDatabase)
-        const storage: Record<string, unknown> = {}
-        storage.zeta = 'first string'
-        storage['10'] = 'ten'
-        storage['2'] = 0
-        storage['01'] = 'non-index'
-        storage['4294967294'] = true
-        storage['4294967295'] = false
-        storage['\uffffx'] = 'unicode'
+        const storage = JSON.parse(
+            '{"zeta":"first string","10":"ten","2":0,"01":"non-index",' +
+            '"4294967294":true,"4294967295":false,"__proto__":{"safe":true},' +
+            '"\\uffffx":"unicode"}',
+        ) as Record<string, unknown>
         database.pluginCustomStorage = storage
         const store = new IndexedDbPersistentDataStore(
             'risu-save-plugin-order',
@@ -171,6 +168,9 @@ describe('RisuSave persistent store adapter', () => {
         )
 
         expect(Object.keys(decoded.pluginCustomStorage)).toEqual(Object.keys(storage))
+        expect(Object.hasOwn(decoded.pluginCustomStorage, '__proto__')).toBe(true)
+        expect(decoded.pluginCustomStorage.__proto__).toEqual({ safe: true })
+        expect(Object.getPrototypeOf(decoded.pluginCustomStorage)).toBe(Object.prototype)
         expect(decoded.pluginCustomStorage['2']).toBe(0)
         expect(decoded.pluginCustomStorage['\uffffx']).toBe('unicode')
     })

@@ -634,6 +634,36 @@ describe('plugin database access', () => {
         expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
     })
 
+    it('preserves a JSON-origin own proto key in the paged plugin snapshot', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push({
+            characters: [],
+            pluginCustomStorage: JSON.parse(
+                '{"0":0,"zeta":false,"__proto__":{"safe":true},"alpha":""}',
+            ),
+        } as unknown as Database)
+
+        const result = await harness.access.getDatabaseSnapshot(
+            ['characters', 'pluginCustomStorage'],
+            ['characters', 'pluginCustomStorage'],
+        )
+        const storage = result.pluginCustomStorage as Record<string, unknown>
+
+        expect(result.characters).toEqual([])
+        expect(Object.keys(storage)).toEqual([
+            '0',
+            'zeta',
+            '__proto__',
+            'alpha',
+        ])
+        expect(Object.hasOwn(storage, '__proto__')).toBe(true)
+        expect(storage.__proto__).toEqual({ safe: true })
+        expect(Object.getPrototypeOf(storage)).toBe(Object.prototype)
+        expect(storage['0']).toBe(0)
+        expect(storage.zeta).toBe(false)
+        expect(storage.alpha).toBe('')
+    })
+
     it('releases the pinned reader when an explicit scalable snapshot fails', async () => {
         const harness = createHarness()
         harness.pinnedDatabases.push({

@@ -4,6 +4,7 @@ import type {
     CharacterSummary,
     ConversationSummary,
     DataRevision,
+    PersistentRevisionLease,
     PersistentRevisionReader,
 } from './persistentDataStore'
 
@@ -26,6 +27,20 @@ export function assertPinnedRevision(
 ): void {
     if (actual !== expected) {
         throw new Error(`${description} returned revision ${actual}, expected ${expected}`)
+    }
+}
+
+export async function releasePersistentRevisionLease(
+    lease: PersistentRevisionLease,
+): Promise<void> {
+    try {
+        await lease.release()
+    } catch (firstError) {
+        try {
+            await lease.release()
+        } catch {
+            throw firstError
+        }
     }
 }
 

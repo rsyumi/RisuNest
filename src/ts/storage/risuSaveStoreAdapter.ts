@@ -8,7 +8,6 @@ import {
 import type {
     DataRevision,
     PersistentDataStore,
-    PersistentRevisionLease,
     PersistentRevisionReader,
 } from './persistentDataStore'
 import {
@@ -17,7 +16,9 @@ import {
     countPinnedCharacters,
     iteratePinnedCharacters,
     iteratePinnedConversations,
+    releasePersistentRevisionLease,
 } from './persistentRecordIterator'
+import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import {
     replaceCharacterResources,
     replaceDatabaseRootResources,
@@ -46,18 +47,6 @@ async function* characterValues(reader: PersistentRevisionReader): AsyncGenerato
     }
 }
 
-async function releaseRevisionLease(lease: PersistentRevisionLease): Promise<void> {
-    try {
-        await lease.release()
-    } catch (firstError) {
-        try {
-            await lease.release()
-        } catch {
-            throw firstError
-        }
-    }
-}
-
 export async function* streamRisuSaveFromStore(
     store: PersistentDataStore,
     revision: DataRevision,
@@ -72,7 +61,7 @@ export async function* streamRisuSaveFromStore(
         throw error
     } finally {
         try {
-            await releaseRevisionLease(lease)
+            await releasePersistentRevisionLease(lease)
         } catch (error) {
             if (!exportFailed) throw error
         }
@@ -111,7 +100,7 @@ async function pluginStorageValues(
             value.revision,
             `Plugin storage value ${summary.key}`,
         )
-        storage[summary.key] = value.value
+        defineOwnEnumerableProperty(storage, summary.key, value.value)
     }
     return storage
 }
@@ -291,7 +280,7 @@ export async function withPinnedRisuSaveExport<T>(
         throw error
     } finally {
         try {
-            await releaseRevisionLease(lease)
+            await releasePersistentRevisionLease(lease)
         } catch (error) {
             if (!exportFailed) throw error
         }

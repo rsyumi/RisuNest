@@ -1514,6 +1514,91 @@ describe('ActiveWorkingSet', () => {
 })
 
 describe('maximum compatibility working set installation', () => {
+    function makeCompleteDatabaseLease(
+        database: Database,
+        revision: number,
+    ): PersistentRevisionLease {
+        const {
+            characters,
+            botPresets = [],
+            pluginCustomStorage = {},
+            ...root
+        } = database
+        return {
+            revision,
+            readRoot: vi.fn(async () => ({ revision, value: structuredClone(root) })),
+            queryPresets: vi.fn(async () => ({
+                revision,
+                items: botPresets.map((preset, configuredIndex) => ({
+                    id: String(configuredIndex),
+                    configuredIndex,
+                    name: preset.name ?? '',
+                    image: preset.image,
+                })),
+            })),
+            readPreset: vi.fn(async (id) => {
+                const preset = botPresets[Number(id)]
+                return preset ? { revision, value: structuredClone(preset) } : null
+            }),
+            queryCharacters: vi.fn(async ({ trash }) => ({
+                revision,
+                items: characters.flatMap((character, configuredIndex) =>
+                    (character.trashTime !== undefined) === trash ? [{
+                        id: character.chaId,
+                        name: character.name,
+                        image: character.image,
+                        configuredIndex,
+                        recentAt: character.lastInteraction ?? 0,
+                        trashed: trash,
+                        conversationCount: character.chats.length,
+                        type: character.type,
+                        creatorNotes: character.creatorNotes,
+                        trashTime: character.trashTime,
+                    }] : []),
+            })),
+            readCharacter: vi.fn(async (id) => {
+                const character = characters.find((candidate) => candidate.chaId === id)
+                if (!character) return null
+                const { chats: _chats, ...detail } = character
+                return { revision, value: structuredClone(detail) }
+            }),
+            queryConversations: vi.fn(async ({ characterId }) => {
+                const character = characters.find((candidate) =>
+                    candidate.chaId === characterId)
+                return {
+                    revision,
+                    items: (character?.chats ?? []).map((chat, configuredIndex) => ({
+                        id: chat.id!,
+                        characterId,
+                        name: chat.name ?? '',
+                        folderId: chat.folderId,
+                        bindedPersona: chat.bindedPersona,
+                        configuredIndex,
+                        recentAt: chat.lastDate ?? 0,
+                        messageCount: chat.message.length,
+                    })),
+                }
+            }),
+            readConversation: vi.fn(async (characterId, conversationId) => {
+                const conversation = characters.find((candidate) =>
+                    candidate.chaId === characterId)?.chats.find((candidate) =>
+                    candidate.id === conversationId)
+                return conversation
+                    ? { revision, value: structuredClone(conversation) }
+                    : null
+            }),
+            readConversationWindow: vi.fn(async () => null),
+            queryPluginStorage: vi.fn(async () => ({
+                revision,
+                items: Object.keys(pluginCustomStorage).map((key) => ({ key, byteSize: 0 })),
+            })),
+            readPluginStorage: vi.fn(async (key) => Object.hasOwn(pluginCustomStorage, key)
+                ? { revision, value: structuredClone(pluginCustomStorage[key]) }
+                : null),
+            release: vi.fn(async () => undefined),
+        }
+    }
+
     it('captures stable selection IDs after flushing before materialization', async () => {
         const database = {
             username: 'Complete',
@@ -1534,19 +1619,19 @@ describe('maximum compatibility working set installation', () => {
             getRevision: () => 7,
             getMutationGeneration: () => 0,
             getNavigationGeneration: () => 0,
-            materializeDatabase: async (revision) => {
+            acquireRevision: async (revision) => {
                 events.push(`materialize:${revision}`)
-                return database
+                return makeCompleteDatabaseLease(database, revision)
             },
             installCompleteDatabase: (candidate) => {
-                expect(candidate).toBe(database)
+                expect(candidate).toMatchObject(database)
                 events.push('install')
             },
             restoreSelection: (characterId, conversationId) => {
                 events.push(`restore:${characterId}:${conversationId}`)
             },
             adoptMaterializedDatabase: (revision, _mutationGeneration, candidate) => {
-                expect(candidate).toBe(database)
+                expect(candidate).toMatchObject(database)
                 events.push(`baseline:${revision}`)
                 return true
             },
@@ -1571,7 +1656,13 @@ describe('maximum compatibility working set installation', () => {
             getSelectedConversationId: () => 'chat-a',
             flushPendingData: vi.fn(async () => undefined),
             getRevision: () => 3,
-            materializeDatabase: vi.fn(async () => { throw error }),
+            acquireRevision: vi.fn(async () => {
+                const lease = makeCompleteDatabaseLease({
+                    characters: [],
+                } as unknown as Database, 3)
+                lease.readRoot = vi.fn(async () => { throw error })
+                return lease
+            }),
             installCompleteDatabase,
             restoreSelection,
             getMutationGeneration: () => 0,
@@ -1592,7 +1683,7 @@ describe('maximum compatibility working set installation', () => {
             username: 'Fresh',
             characters: [makeCharacter('char-b', [makeChat('chat-b')])],
         } as unknown as Database
-        const firstMaterialization = deferred<Database>()
+        const firstMaterialization = deferred<PersistentRevisionLease>()
         let revision = 7
         let mutationGeneration = 0
         let navigationGeneration = 0
@@ -1601,8 +1692,10 @@ describe('maximum compatibility working set installation', () => {
         let flushCount = 0
         const installCompleteDatabase = vi.fn()
         const restoreSelection = vi.fn()
-        const materializeDatabase = vi.fn((candidateRevision: number) =>
-            candidateRevision === 7 ? firstMaterialization.promise : Promise.resolve(fresh),
+        const acquireRevision = vi.fn((candidateRevision: number) =>
+            candidateRevision === 7
+                ? firstMaterialization.promise
+                : Promise.resolve(makeCompleteDatabaseLease(fresh, candidateRevision)),
         )
 
         const installation = installMaximumCompatibilityWorkingSet({
@@ -1615,27 +1708,27 @@ describe('maximum compatibility working set installation', () => {
             getRevision: () => revision,
             getMutationGeneration: () => mutationGeneration,
             getNavigationGeneration: () => navigationGeneration,
-            materializeDatabase,
+            acquireRevision,
             installCompleteDatabase,
             restoreSelection,
             adoptMaterializedDatabase: (candidateRevision, candidateGeneration) =>
                 candidateRevision === revision && candidateGeneration === mutationGeneration,
         })
-        await vi.waitFor(() => expect(materializeDatabase).toHaveBeenCalledWith(7))
+        await vi.waitFor(() => expect(acquireRevision).toHaveBeenCalledWith(7))
 
         mutationGeneration++
         navigationGeneration++
         selectedCharacterId = 'char-b'
         selectedConversationId = 'chat-b'
-        firstMaterialization.resolve(stale)
+        firstMaterialization.resolve(makeCompleteDatabaseLease(stale, 7))
         await installation
 
-        expect(materializeDatabase.mock.calls.map(([candidateRevision]) => candidateRevision)).toEqual([
+        expect(acquireRevision.mock.calls.map(([candidateRevision]) => candidateRevision)).toEqual([
             7,
             8,
         ])
         expect(installCompleteDatabase).toHaveBeenCalledOnce()
-        expect(installCompleteDatabase).toHaveBeenCalledWith(fresh)
+        expect(installCompleteDatabase.mock.calls[0][0]).toMatchObject(fresh)
         expect(restoreSelection).toHaveBeenCalledWith('char-b', 'chat-b')
     })
 
@@ -1647,9 +1740,9 @@ describe('maximum compatibility working set installation', () => {
         let navigationGeneration = 0
         const installCompleteDatabase = vi.fn()
         const restoreSelection = vi.fn()
-        const materializeDatabase = vi.fn(async () => {
+        const acquireRevision = vi.fn(async () => {
             navigationGeneration++
-            return database
+            return makeCompleteDatabaseLease(database, 7)
         })
 
         await expect(installMaximumCompatibilityWorkingSet({
@@ -1659,13 +1752,13 @@ describe('maximum compatibility working set installation', () => {
             getRevision: () => 7,
             getMutationGeneration: () => 0,
             getNavigationGeneration: () => navigationGeneration,
-            materializeDatabase,
+            acquireRevision,
             installCompleteDatabase,
             restoreSelection,
             adoptMaterializedDatabase: vi.fn(() => true),
         })).rejects.toThrow('Working set changed during maximum compatibility materialization')
 
-        expect(materializeDatabase).toHaveBeenCalledTimes(3)
+        expect(acquireRevision).toHaveBeenCalledTimes(3)
         expect(installCompleteDatabase).not.toHaveBeenCalled()
         expect(restoreSelection).not.toHaveBeenCalled()
     })
