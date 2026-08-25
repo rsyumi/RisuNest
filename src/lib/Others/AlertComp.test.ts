@@ -40,6 +40,7 @@ vi.mock('src/ts/gui/colorscheme', async () => {
 })
 vi.mock('../../ts/sourcemap', () => ({ translateStackTrace: vi.fn() }))
 vi.mock('src/ts/platform', () => ({
+    isTauri: false,
     getDetailedOSLabel: async () => 'Test OS',
     getFallbackOSLabel: () => 'Test OS',
     getRisuEnvironmentLabel: () => 'Test',
@@ -75,6 +76,9 @@ vi.mock('../UI/GUI/SelectInput.svelte', async () => ({
     default: (await import('./AlertCompDependencyStub.test.svelte')).default,
 }))
 vi.mock('../UI/GUI/OptionInput.svelte', async () => ({
+    default: (await import('./AlertCompDependencyStub.test.svelte')).default,
+}))
+vi.mock('../UI/DeferredMarkdown.svelte', async () => ({
     default: (await import('./AlertCompDependencyStub.test.svelte')).default,
 }))
 vi.mock('../UI/GUI/TextAreaInput.svelte', async () => ({
