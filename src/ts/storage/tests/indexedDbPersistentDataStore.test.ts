@@ -65,6 +65,7 @@ async function countPersistentDataRecords(
         'characters',
         'conversations',
         'messagePages',
+        'pluginStorage',
     ]
     const database = await openDatabase(indexedDB, databaseName)
     const transaction = database.transaction(storeNames, 'readonly')
@@ -1047,18 +1048,28 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const databaseName = 'staged-generation-cleanup'
         const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
         await store.open()
-        await store.replaceFromDatabase(fixtureDatabase)
-        const replacement = structuredClone(fixtureDatabase)
+        const database = structuredClone(fixtureDatabase)
+        database.pluginCustomStorage = { retained: 0 }
+        await store.replaceFromDatabase(database)
+        const replacement = structuredClone(database)
         replacement.username = 'Replacement User'
         await store.replaceFromDatabase(replacement)
 
         const openRequest = indexedDB.open(databaseName)
-        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const rawDatabase = await new Promise<IDBDatabase>((resolve, reject) => {
             openRequest.onsuccess = () => resolve(openRequest.result)
             openRequest.onerror = () => reject(openRequest.error)
         })
-        const storeNames = ['root', 'catalog', 'characters', 'conversations', 'messagePages']
-        const transaction = database.transaction(storeNames, 'readonly')
+        const storeNames = [
+            'root',
+            'presets',
+            'catalog',
+            'characters',
+            'conversations',
+            'messagePages',
+            'pluginStorage',
+        ]
+        const transaction = rawDatabase.transaction(storeNames, 'readonly')
         const generations = new Map<string, Set<string>>()
         await Promise.all(
             storeNames.map(async (storeName) => {
@@ -1109,6 +1120,10 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             }),
         ).toHaveProperty('revision', imported.revision)
         expect((await lease.readConversation('char-a', 'conv-short'))?.value.message).toHaveLength(2)
+        await expect(lease.queryPluginStorage()).resolves.toMatchObject({
+            revision: imported.revision,
+            items: [],
+        })
 
         await lease.release()
         await lease.release()
@@ -1130,6 +1145,126 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 limit: 1,
             }),
         ).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.queryPluginStorage()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.readPluginStorage('missing')).rejects.toBeInstanceOf(
+            SnapshotReleasedError,
+        )
+    })
+
+    it('rejects every old lease view after another realm removes its durable lease', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `externally-expired-revision-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        let imported = await store.replaceFromDatabase(fixtureDatabase)
+        imported = await store.commit({
+            expectedRevision: imported.revision,
+            pluginStorage: [{ type: 'set', key: 'pinned-zero', value: 0 }],
+        })
+        const lease = await store.acquireRevision(imported.revision)
+
+        const database = await openDatabase(indexedDB, databaseName)
+        const transaction = database.transaction('meta', 'readwrite')
+        const meta = transaction.objectStore('meta')
+        const leaseKeys = await new Promise<IDBValidKey[]>((resolve, reject) => {
+            const request = meta.getAllKeys(
+                IDBKeyRange.bound('snapshotLease:', 'snapshotLease:\uffff'),
+            )
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })
+        expect(leaseKeys).toHaveLength(1)
+        meta.delete(leaseKeys[0])
+        await completeTransaction(transaction)
+        database.close()
+
+        const root = (await store.readRoot()).value
+        const committed = await store.commit({
+            expectedRevision: imported.revision,
+            root: { ...root, username: 'Committed after external lease expiry' },
+            pluginStorage: [{ type: 'set', key: 'pinned-zero', value: 1 }],
+        })
+        expect((await store.readRoot()).value.username).toBe(
+            'Committed after external lease expiry',
+        )
+
+        await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.queryPresets()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.readPreset('0')).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(
+            lease.queryCharacters({ order: 'configured', trash: false, limit: 1 }),
+        ).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.readCharacter('char-a')).rejects.toBeInstanceOf(
+            SnapshotReleasedError,
+        )
+        await expect(
+            lease.queryConversations({ characterId: 'char-a', order: 'configured', limit: 1 }),
+        ).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.readConversation('char-a', 'conv-short')).rejects.toBeInstanceOf(
+            SnapshotReleasedError,
+        )
+        await expect(
+            lease.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-short',
+                limit: 1,
+            }),
+        ).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.queryPluginStorage()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        await expect(lease.readPluginStorage('pinned-zero')).rejects.toBeInstanceOf(
+            SnapshotReleasedError,
+        )
+
+        expect((await store.readRoot()).value).toMatchObject({
+            username: 'Committed after external lease expiry',
+        })
+        expect((await store.readRoot()).revision).toBe(committed.revision)
+        await expect(store.readPluginStorage('pinned-zero')).resolves.toMatchObject({
+            revision: committed.revision,
+            value: 1,
+        })
+    })
+
+    it('rolls back an injected generation copy failure without invalidating the lease', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `revision-copy-rollback-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        const lease = await store.acquireRevision(imported.revision)
+        const countsBefore = await countPersistentDataRecords(indexedDB, databaseName)
+        const copyError = new Error('injected generation copy failure')
+        const copyGeneration = vi.spyOn(
+            store as unknown as {
+                copyGeneration(
+                    source: IDBObjectStore,
+                    sourceGeneration: string,
+                    targetGeneration: string,
+                ): Promise<void>
+            },
+            'copyGeneration',
+        )
+        copyGeneration.mockRejectedValueOnce(copyError)
+
+        const root = (await store.readRoot()).value
+        await expect(
+            store.commit({
+                expectedRevision: imported.revision,
+                root: { ...root, username: 'Must roll back' },
+            }),
+        ).rejects.toBe(copyError)
+        copyGeneration.mockRestore()
+
+        expect(await countPersistentDataRecords(indexedDB, databaseName)).toEqual(countsBefore)
+        await expect(store.readRoot()).resolves.toMatchObject({
+            revision: imported.revision,
+            value: { username: fixtureDatabase.username },
+        })
+        await expect(lease.readRoot()).resolves.toMatchObject({
+            revision: imported.revision,
+            value: { username: fixtureDatabase.username },
+        })
+        await lease.release()
     })
 
     it('keeps a lease active and retries cleanup after release fails', async () => {

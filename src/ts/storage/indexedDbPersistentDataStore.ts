@@ -599,8 +599,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             revision,
             readRoot: async () => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'root'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 const record = await this.readRootRecordFromTransaction(
-                    this.requireDatabase().transaction('root', 'readonly'),
+                    transaction,
                     generation,
                 )
                 if (!record) throw new Error('Persistent snapshot root is missing')
@@ -608,16 +613,26 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             queryPresets: async () => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'presets'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.queryPresetsFromTransaction(
-                    this.requireDatabase().transaction('presets', 'readonly'),
+                    transaction,
                     revision,
                     generation,
                 )
             },
             readPreset: async (id) => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'presets'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.readPresetFromTransaction(
-                    this.requireDatabase().transaction('presets', 'readonly'),
+                    transaction,
                     revision,
                     generation,
                     id,
@@ -625,8 +640,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             queryCharacters: async (input) => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'catalog'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.queryCharactersFromTransaction(
-                    this.requireDatabase().transaction('catalog', 'readonly'),
+                    transaction,
                     revision,
                     generation,
                     input,
@@ -634,8 +654,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             readCharacter: async (id) => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'characters'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.readCharacterFromTransaction(
-                    this.requireDatabase().transaction('characters', 'readonly'),
+                    transaction,
                     revision,
                     generation,
                     id,
@@ -643,8 +668,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             queryConversations: async (input) => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'conversations'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.queryConversationsFromTransaction(
-                    this.requireDatabase().transaction('conversations', 'readonly'),
+                    transaction,
                     revision,
                     generation,
                     input,
@@ -652,8 +682,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             readConversation: async (characterId, conversationId) => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'conversations', 'messagePages'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.readConversationFromTransaction(
-                    this.requireDatabase().transaction(['conversations', 'messagePages'], 'readonly'),
+                    transaction,
                     revision,
                     generation,
                     characterId,
@@ -662,8 +697,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             readConversationWindow: async (input) => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'conversations', 'messagePages'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.readConversationWindowFromTransaction(
-                    this.requireDatabase().transaction(['conversations', 'messagePages'], 'readonly'),
+                    transaction,
                     revision,
                     generation,
                     input,
@@ -671,16 +711,26 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             queryPluginStorage: async () => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'pluginStorageMetadata'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.queryPluginStorageFromTransaction(
-                    this.requireDatabase().transaction('pluginStorageMetadata', 'readonly'),
+                    transaction,
                     revision,
                     generation,
                 )
             },
             readPluginStorage: async (key) => {
                 assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'pluginStorage'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
                 return this.readPluginStorageFromTransaction(
-                    this.requireDatabase().transaction('pluginStorage', 'readonly'),
+                    transaction,
                     revision,
                     generation,
                     key,
@@ -700,6 +750,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 )
                 return releasePromise
             },
+        }
+    }
+
+    private async validateSnapshotLease(
+        transaction: IDBTransaction,
+        lease: string,
+        generation: string,
+        revision: DataRevision,
+    ): Promise<void> {
+        const record = (await requestResult(
+            transaction.objectStore('meta').get(this.snapshotLeaseKey(lease)),
+        )) as SnapshotLeaseRecord | undefined
+        const target = record ? this.snapshotLeaseTarget(record) : undefined
+        if (!target || target.generation !== generation || target.revision !== revision) {
+            await transactionDone(transaction)
+            throw new SnapshotReleasedError()
         }
     }
 

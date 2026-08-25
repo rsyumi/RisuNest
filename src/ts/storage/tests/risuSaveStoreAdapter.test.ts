@@ -3,7 +3,12 @@ import localforage from 'localforage'
 import { describe, expect, it, vi } from 'vitest'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import { nativePersistentRevisionLease } from '../nativePersistentExport'
-import { RevisionConflictError, type PersistentRevisionLease } from '../persistentDataStore'
+import {
+    RevisionConflictError,
+    SnapshotReleasedError,
+    type PersistentDataStore,
+    type PersistentRevisionLease,
+} from '../persistentDataStore'
 import { decodeRisuSave, encodeRisuSaveBlock, RisuSaveType } from '../risuSave'
 import {
     importRisuSaveToStore,
@@ -55,6 +60,24 @@ async function snapshotLeases(indexedDB: IDBFactory, databaseName: string): Prom
     })
     database.close()
     return records.map(String)
+}
+
+async function deleteSnapshotLeases(indexedDB: IDBFactory, databaseName: string): Promise<void> {
+    const keys = await snapshotLeases(indexedDB, databaseName)
+    const request = indexedDB.open(databaseName)
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+    })
+    const transaction = database.transaction('meta', 'readwrite')
+    const meta = transaction.objectStore('meta')
+    for (const key of keys) meta.delete(key)
+    await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve()
+        transaction.onabort = () => reject(transaction.error)
+        transaction.onerror = () => reject(transaction.error)
+    })
+    database.close()
 }
 
 describe('RisuSave persistent store adapter', () => {
@@ -170,6 +193,46 @@ describe('RisuSave persistent store adapter', () => {
         expect(release).not.toHaveBeenCalled()
         expect(materialize).not.toHaveBeenCalled()
         await lease.release()
+    })
+
+    it('rejects materialization and export through an externally expired lease', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'risu-save-externally-expired-lease'
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(risuSaveFixtureDatabase))
+        const lease = await store.acquireRevision(imported.revision)
+        await deleteSnapshotLeases(indexedDB, databaseName)
+        const root = (await store.readRoot()).value
+        await store.commit({
+            expectedRevision: imported.revision,
+            root: { ...root, username: 'Committed after external lease expiry' },
+        })
+
+        const expiredLeaseStore = {
+            acquireRevision: async () => lease,
+        } as unknown as PersistentDataStore
+        await withFlushedRisuSaveExport(
+            {
+                store: expiredLeaseStore,
+                capturePersistentMutationToken: async () => ({
+                    revision: imported.revision,
+                    mutationGeneration: 0,
+                }),
+            },
+            'external lease expiry regression',
+            async (pinned) => {
+                await expect(pinned.materializeDatabase()).rejects.toBeInstanceOf(
+                    SnapshotReleasedError,
+                )
+                await expect(pinned.collectBytes()).rejects.toBeInstanceOf(
+                    SnapshotReleasedError,
+                )
+            },
+        )
+        expect((await store.readRoot()).value.username).toBe(
+            'Committed after external lease expiry',
+        )
     })
 
     it('projects root and character resources while streaming from a lease', async () => {
