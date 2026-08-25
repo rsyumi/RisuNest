@@ -3,6 +3,7 @@ import { open as openFile } from '@tauri-apps/plugin-fs'
 
 import { isTauri } from '../platform'
 import type { DataRevision, PersistentRevisionLease } from './persistentDataStore'
+import { retryPersistentRevisionRelease } from './persistentRecordIterator'
 
 export const nativePersistentRevisionLease: unique symbol = Symbol(
     'nativePersistentRevisionLease',
@@ -232,7 +233,9 @@ export async function exportNativePersistentRisuSave(
 
     let releaseError: unknown
     try {
-        await dependencies.invoke('pds_release_revision', { lease })
+        await retryPersistentRevisionRelease(async () => {
+            await dependencies.invoke('pds_release_revision', { lease })
+        })
     } catch (error) {
         releaseError = error
     }

@@ -259,12 +259,13 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             .mockRejectedValueOnce(new Error('release unavailable'))
             .mockImplementation(releaseLease)
 
-        await expect(publication.publish()).rejects.toThrow('release unavailable')
+        await expect(publication.publish()).resolves.toBeUndefined()
         const databaseWrites = () => harness.writeItem.mock.calls
             .filter(([key]) => key === databaseKey).length
         expect(databaseWrites()).toBe(1)
 
         await expect(publication.publish()).resolves.toBeUndefined()
+        await expect(publication.dispose()).resolves.toBeUndefined()
 
         expect(release).toHaveBeenCalledTimes(2)
         expect(databaseWrites()).toBe(1)
@@ -281,7 +282,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             .mockRejectedValueOnce(new Error('release unavailable'))
             .mockImplementation(releaseLease)
 
-        await expect(publication.dispose()).rejects.toThrow('release unavailable')
+        await expect(publication.dispose()).resolves.toBeUndefined()
         await expect(publication.dispose()).resolves.toBeUndefined()
 
         expect(release).toHaveBeenCalledTimes(2)
@@ -619,7 +620,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             'cold offline',
         )
 
-        expect(release).toHaveBeenCalledOnce()
+        expect(release).toHaveBeenCalledTimes(2)
         expect(harness.writeItem).not.toHaveBeenCalled()
     })
 
@@ -637,7 +638,13 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
 
     it('propagates publication abort without changing local authority or marking success', async () => {
         const harness = await makeHarness()
+        const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
         const publication = await harness.adapter.pin(harness.imported.revision)
+        const lease = await acquireRevision.mock.results[0].value
+        const releaseLease = lease.release.bind(lease)
+        const release = vi.spyOn(lease, 'release')
+            .mockRejectedValueOnce(new Error('release unavailable'))
+            .mockImplementation(releaseLease)
         const abort = new DOMException('cancelled', 'AbortError')
         harness.writeItem.mockRejectedValueOnce(abort)
 
@@ -645,7 +652,8 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
 
         expect((await harness.store.readRoot()).revision).toBe(harness.imported.revision)
         expect(harness.markPublished).not.toHaveBeenCalled()
-        await publication.dispose()
+        await expect(publication.dispose()).resolves.toBeUndefined()
+        expect(release).toHaveBeenCalledTimes(2)
     })
 
     it('associates a successful push with its active revision for cache hits', async () => {

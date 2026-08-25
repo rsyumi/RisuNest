@@ -334,6 +334,47 @@ describe('plugin storage V3 residency', () => {
         expect(store.acquireRevision).toHaveBeenCalledWith(4)
     })
 
+    it('retries a transient pinned snapshot release without duplicating successful cleanup', async () => {
+        const { storage, store } = harness({ zero: { byteSize: 1, value: 0 } }, 1)
+        const release = vi.fn()
+            .mockRejectedValueOnce(new Error('release unavailable'))
+            .mockResolvedValueOnce(undefined)
+        vi.mocked(store.acquireRevision).mockResolvedValueOnce({
+            revision: 4,
+            queryPluginStorage: async () => ({
+                revision: 4,
+                items: [{ key: 'zero', byteSize: 1 }],
+            }),
+            readPluginStorage: async () => ({ revision: 4, value: 0 }),
+            release,
+        } as any)
+
+        await expect(storage.snapshot()).resolves.toEqual({ zero: 0 })
+        expect(release).toHaveBeenCalledTimes(2)
+    })
+
+    it('preserves a compatibility preload failure when both release attempts fail', async () => {
+        const { storage, store } = harness({ broken: { byteSize: 1, value: 1 } }, 1)
+        const primaryError = new Error('plugin value unavailable')
+        const release = vi.fn(async () => {
+            throw new Error('release unavailable')
+        })
+        vi.mocked(store.acquireRevision).mockResolvedValueOnce({
+            revision: 4,
+            queryPluginStorage: async () => ({
+                revision: 4,
+                items: [{ key: 'broken', byteSize: 1 }],
+            }),
+            readPluginStorage: async () => {
+                throw primaryError
+            },
+            release,
+        } as any)
+
+        await expect(storage.preloadCompatibility()).rejects.toBe(primaryError)
+        expect(release).toHaveBeenCalledTimes(2)
+    })
+
     it('preserves an own proto key and catalog order in a pinned snapshot', async () => {
         const { storage, store } = harness({}, 100)
         vi.mocked(store.acquireRevision).mockResolvedValueOnce({

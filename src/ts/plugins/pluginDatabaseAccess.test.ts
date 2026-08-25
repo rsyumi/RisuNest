@@ -528,6 +528,29 @@ describe('plugin database access', () => {
         expect(harness.releasedLeases[0]).toHaveBeenCalledTimes(1)
     })
 
+    it('retries a transient explicit snapshot release within the same request', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push({
+            characters: [],
+            username: 'Pinned user',
+        } as unknown as Database)
+        const acquireRevision = vi.mocked(harness.store.acquireRevision)
+        const acquirePinnedReader = acquireRevision.getMockImplementation()!
+        acquireRevision.mockImplementationOnce(async (revision) => {
+            const reader = await acquirePinnedReader(revision)
+            harness.releasedLeases[0]
+                .mockRejectedValueOnce(new Error('release unavailable'))
+                .mockResolvedValueOnce(undefined)
+            return reader
+        })
+
+        await expect(harness.access.getDatabaseSnapshot(
+            ['characters', 'username'],
+            ['characters', 'username'],
+        )).resolves.toEqual({ characters: [], username: 'Pinned user' })
+        expect(harness.releasedLeases[0]).toHaveBeenCalledTimes(2)
+    })
+
     it('retries a scalable character snapshot when current revision acquisition races a commit', async () => {
         const harness = createHarness()
         const stale = {
@@ -664,7 +687,7 @@ describe('plugin database access', () => {
         expect(storage.alpha).toBe('')
     })
 
-    it('releases the pinned reader when an explicit scalable snapshot fails', async () => {
+    it('preserves an explicit snapshot failure when both release attempts fail', async () => {
         const harness = createHarness()
         harness.pinnedDatabases.push({
             characters: [{
@@ -679,6 +702,7 @@ describe('plugin database access', () => {
         acquireRevision.mockImplementationOnce(async (revision) => {
             const reader = await acquirePinnedReader(revision)
             reader.readConversation = vi.fn(async () => null)
+            harness.releasedLeases[0].mockRejectedValue(new Error('release unavailable'))
             return reader
         })
 
@@ -686,7 +710,7 @@ describe('plugin database access', () => {
             ['characters'],
             ['characters'],
         )).rejects.toThrow('Missing conversation missing')
-        expect(harness.releasedLeases[0]).toHaveBeenCalledTimes(1)
+        expect(harness.releasedLeases[0]).toHaveBeenCalledTimes(2)
     })
 
     it('omits unapproved selected keys and snapshots live non-character values', async () => {

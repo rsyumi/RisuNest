@@ -5,11 +5,13 @@ import type {
     CharacterQuery,
     ConversationPage,
     ConversationQuery,
+    PersistentRevisionLease,
     PersistentRevisionReader,
 } from './persistentDataStore'
 import {
     iteratePinnedCharacters,
     iteratePinnedConversations,
+    withPersistentRevisionLease,
 } from './persistentRecordIterator'
 
 function characterPage(
@@ -29,6 +31,58 @@ function conversationPage(
 }
 
 describe('persistent record iterators', () => {
+    it('releases a successful lease scope once without a duplicate cleanup call', async () => {
+        const release = vi.fn(async () => undefined)
+        const lease = { release } as unknown as PersistentRevisionLease
+
+        await expect(withPersistentRevisionLease(lease, async () => 'result')).resolves.toBe(
+            'result',
+        )
+
+        expect(release).toHaveBeenCalledOnce()
+    })
+
+    it('retries lease cleanup once after a transient release failure', async () => {
+        const release = vi.fn()
+            .mockRejectedValueOnce(new Error('release unavailable'))
+            .mockResolvedValueOnce(undefined)
+        const lease = { release } as unknown as PersistentRevisionLease
+
+        await expect(withPersistentRevisionLease(lease, async () => 'result')).resolves.toBe(
+            'result',
+        )
+
+        expect(release).toHaveBeenCalledTimes(2)
+    })
+
+    it('preserves the primary operation error when both lease release attempts fail', async () => {
+        const primaryError = new Error('read failed')
+        const release = vi.fn(async () => {
+            throw new Error('release failed')
+        })
+        const lease = { release } as unknown as PersistentRevisionLease
+
+        await expect(withPersistentRevisionLease(lease, async () => {
+            throw primaryError
+        })).rejects.toBe(primaryError)
+
+        expect(release).toHaveBeenCalledTimes(2)
+    })
+
+    it('reports the first release error when a successful operation cannot clean up', async () => {
+        const firstReleaseError = new Error('first release failed')
+        const release = vi.fn()
+            .mockRejectedValueOnce(firstReleaseError)
+            .mockRejectedValueOnce(new Error('retry failed'))
+        const lease = { release } as unknown as PersistentRevisionLease
+
+        await expect(withPersistentRevisionLease(lease, async () => 'result')).rejects.toBe(
+            firstReleaseError,
+        )
+
+        expect(release).toHaveBeenCalledTimes(2)
+    })
+
     it('merges active and trash pages in configured order without collecting either catalog', async () => {
         const activePages = [
             characterPage(7, [{

@@ -30,16 +30,41 @@ export function assertPinnedRevision(
     }
 }
 
-export async function releasePersistentRevisionLease(
-    lease: PersistentRevisionLease,
+export async function retryPersistentRevisionRelease(
+    release: () => Promise<void>,
 ): Promise<void> {
     try {
-        await lease.release()
+        await release()
     } catch (firstError) {
         try {
-            await lease.release()
+            await release()
         } catch {
             throw firstError
+        }
+    }
+}
+
+export function releasePersistentRevisionLease(
+    lease: PersistentRevisionLease,
+): Promise<void> {
+    return retryPersistentRevisionRelease(() => lease.release())
+}
+
+export async function withPersistentRevisionLease<T>(
+    lease: PersistentRevisionLease,
+    operation: (reader: PersistentRevisionLease) => Promise<T>,
+): Promise<T> {
+    let operationFailed = false
+    try {
+        return await operation(lease)
+    } catch (error) {
+        operationFailed = true
+        throw error
+    } finally {
+        try {
+            await releasePersistentRevisionLease(lease)
+        } catch (error) {
+            if (!operationFailed) throw error
         }
     }
 }

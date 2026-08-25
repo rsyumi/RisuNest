@@ -1341,7 +1341,7 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(3)
     })
 
-    it.each(['stale-lease', 'read-failure', 'release-failure'] as const)(
+    it.each(['stale-lease', 'read-failure'] as const)(
         'releases a failed permanent-delete lease and does not commit for %s',
         async (failure) => {
             const database = makeDatabase()
@@ -1349,9 +1349,6 @@ describe('SaveCoordinator', () => {
             if (failure === 'stale-lease') lease.revision = 0
             if (failure === 'read-failure') {
                 lease.readRoot.mockRejectedValueOnce(new Error('read failed'))
-            }
-            if (failure === 'release-failure') {
-                lease.release.mockRejectedValueOnce(new Error('release failed'))
             }
             const commit = vi.fn()
             const coordinator = new SaveCoordinator({
@@ -1376,6 +1373,65 @@ describe('SaveCoordinator', () => {
             expect(coordinator.revision).toBe(1)
         },
     )
+
+    it('retries a transient permanent-delete lease release before committing', async () => {
+        const database = makeDatabase()
+        const lease = makeGroupDeletionLease(database)
+        lease.release
+            .mockRejectedValueOnce(new Error('release unavailable'))
+            .mockResolvedValueOnce(undefined)
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: {
+                acquireRevision: vi.fn(async () => lease),
+                commit,
+            } as unknown as PersistentDataStore,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => null,
+            captureCharacter: () => null,
+            replaceDatabase: vi.fn(),
+            publishCharacterMutation: (state) => publishGroupDeletion(database, state),
+        })
+        coordinator.initialize(1)
+
+        await expect(coordinator.deletePersistentCharacterWithGroupReferences(
+            'char-a',
+            'transient-release-delete',
+        )).resolves.toBe(true)
+
+        expect(lease.release).toHaveBeenCalledTimes(2)
+        expect(commit).toHaveBeenCalledOnce()
+    })
+
+    it('preserves a permanent-delete read failure when both release attempts fail', async () => {
+        const database = makeDatabase()
+        const lease = makeGroupDeletionLease(database)
+        const primaryError = new Error('read failed')
+        lease.readRoot.mockRejectedValueOnce(primaryError)
+        lease.release.mockRejectedValue(new Error('release unavailable'))
+        const commit = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: {
+                acquireRevision: vi.fn(async () => lease),
+                commit,
+            } as unknown as PersistentDataStore,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => null,
+            captureCharacter: () => null,
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(1)
+
+        await expect(coordinator.deletePersistentCharacterWithGroupReferences(
+            'char-a',
+            'failed-read-and-release-delete',
+        )).rejects.toBe(primaryError)
+
+        expect(lease.release).toHaveBeenCalledTimes(2)
+        expect(commit).not.toHaveBeenCalled()
+    })
 
     it.each(['detail', 'replace', 'upsert'] as const)(
         'rejects an async %s mutation when its resident character changes before commit',

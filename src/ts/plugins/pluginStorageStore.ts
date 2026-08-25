@@ -5,6 +5,7 @@ import {
     type PluginStorageSummary,
 } from '../storage/persistentDataStore'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
+import { withPersistentRevisionLease } from '../storage/persistentRecordIterator'
 
 export const PLUGIN_STORAGE_CACHE_BYTE_BUDGET = 64 * 1024 * 1024
 
@@ -301,11 +302,11 @@ export function createPluginStorageStore(
         },
         async snapshot() {
             const lease = await acquirePinnedPluginStorageLease()
-            try {
-                const pinnedCatalog = await lease.queryPluginStorage()
+            return withPersistentRevisionLease(lease, async (reader) => {
+                const pinnedCatalog = await reader.queryPluginStorage()
                 const storage: Record<string, unknown> = {}
                 for (const item of pinnedCatalog.items) {
-                    const record = await lease.readPluginStorage(item.key)
+                    const record = await reader.readPluginStorage(item.key)
                     if (record) {
                         defineOwnEnumerableProperty(
                             storage,
@@ -315,9 +316,7 @@ export function createPluginStorageStore(
                     }
                 }
                 return storage
-            } finally {
-                await lease.release()
-            }
+            })
         },
         mutate,
         invalidate,
@@ -329,19 +328,17 @@ export function createPluginStorageStore(
             keyGenerations.clear()
             evictionAllowed = false
             const lease = await acquirePinnedPluginStorageLease()
-            try {
-                const pinnedCatalog = await lease.queryPluginStorage()
+            await withPersistentRevisionLease(lease, async (reader) => {
+                const pinnedCatalog = await reader.queryPluginStorage()
                 index.clear()
                 cache.clear()
                 cacheBytes = 0
                 for (const item of pinnedCatalog.items) {
                     index.set(item.key, item)
-                    const record = await lease.readPluginStorage(item.key)
+                    const record = await reader.readPluginStorage(item.key)
                     if (record) putCached(item.key, record.value, item.byteSize)
                 }
-            } finally {
-                await lease.release()
-            }
+            })
         },
         preloadCompatibilityValues(storage) {
             evictionAllowed = false

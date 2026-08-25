@@ -12,6 +12,7 @@ import { RevisionConflictError } from './persistentDataStore'
 import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import { isConversationSummaryStub } from './conversationResidency'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
+import { withPersistentRevisionLease } from './persistentRecordIterator'
 
 const SAVE_DEBOUNCE_MS = 500
 const PENDING_BYTE_LIMIT = 1_048_576
@@ -1073,12 +1074,11 @@ export class SaveCoordinator {
                 string,
                 ReturnType<SaveCoordinator['captureResidentCharacter']>
             >()
-            let failed = false
-            try {
-                this.assertReadRevision(revision, lease.revision)
-                rootValue = await lease.readRoot()
+            const found = await withPersistentRevisionLease(lease, async (reader) => {
+                this.assertReadRevision(revision, reader.revision)
+                rootValue = await reader.readRoot()
                 this.assertReadRevision(revision, rootValue.revision)
-                const targetValue = await lease.readCharacter(characterId)
+                const targetValue = await reader.readCharacter(characterId)
                 if (!targetValue) return false
                 this.assertReadRevision(revision, targetValue.revision)
                 if (targetValue.value.chaId !== characterId) {
@@ -1088,7 +1088,7 @@ export class SaveCoordinator {
                 for (const trash of [false, true]) {
                     let cursor: string | undefined
                     do {
-                        const page = await lease.queryCharacters({
+                        const page = await reader.queryCharacters({
                             order: 'configured',
                             trash,
                             limit: CHARACTER_MUTATION_PAGE_SIZE,
@@ -1097,7 +1097,7 @@ export class SaveCoordinator {
                         this.assertReadRevision(revision, page.revision)
                         for (const summary of page.items) {
                             if (summary.id === characterId || summary.type !== 'group') continue
-                            const value = await lease.readCharacter(summary.id)
+                            const value = await reader.readCharacter(summary.id)
                             if (!value) throw new Error(`Character ${summary.id} was not found`)
                             this.assertReadRevision(revision, value.revision)
                             if (value.value.chaId !== summary.id || value.value.type !== 'group') {
@@ -1114,16 +1114,9 @@ export class SaveCoordinator {
                         cursor = page.nextCursor
                     } while (cursor)
                 }
-            } catch (error) {
-                failed = true
-                throw error
-            } finally {
-                try {
-                    await lease.release()
-                } catch (error) {
-                    if (!failed) throw error
-                }
-            }
+                return true
+            })
+            if (!found) return false
             if (!rootValue) return false
             if (this.dirtyGeneration !== mutationGeneration) {
                 throw new Error(`Persistent data changed during character deletion: ${characterId}`)

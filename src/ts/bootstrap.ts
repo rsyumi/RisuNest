@@ -81,6 +81,7 @@ import {
 } from "./storage/sync/officialAccountSnapshot";
 import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
 import { formatNameList, summarizePinnedSyncConflict } from "./storage/sync/syncConflictSummary";
+import { withPersistentRevisionLease } from "./storage/persistentRecordIterator";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
@@ -267,13 +268,10 @@ export async function loadData() {
             conflict: {
                 resolve: async ({ remote, syncedAt }) => {
                     const lease = await runtime.store.acquireRevision(runtime.revision)
-                    const summary = await (async () => {
-                        try {
-                            return await summarizePinnedSyncConflict(lease, remote)
-                        } finally {
-                            await lease.release()
-                        }
-                    })()
+                    const summary = await withPersistentRevisionLease(
+                        lease,
+                        (reader) => summarizePinnedSyncConflict(reader, remote),
+                    )
                     const details = [language.syncConflictDetected]
                     if (syncedAt !== null) {
                         details.push(language.syncConflictLastSynced

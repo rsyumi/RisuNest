@@ -105,6 +105,59 @@ describe('native persistent RisuSave export', () => {
         expect(events.at(-1)).toBe('pds_release_revision:{"lease":"snapshot-5-test"}')
     })
 
+    it('retries a transient native lease release within the successful export', async () => {
+        const { events, runtime, dependencies } = harness()
+        const invoke = dependencies.invoke.getMockImplementation()!
+        let releaseAttempts = 0
+        dependencies.invoke.mockImplementation(async (command, args) => {
+            if (command !== 'pds_release_revision') return invoke(command, args)
+            events.push(`${command}:${JSON.stringify(args ?? {})}`)
+            releaseAttempts += 1
+            if (releaseAttempts === 1) throw new Error('release unavailable')
+            return undefined
+        })
+
+        await expect(exportNativePersistentRisuSave(
+            runtime,
+            'content://documents/export.risudat',
+            {},
+            dependencies,
+        )).resolves.toEqual({ revision: 5, bytes: 7 })
+
+        expect(releaseAttempts).toBe(2)
+        expect(events.slice(-2)).toEqual([
+            'pds_release_revision:{"lease":"snapshot-5-test"}',
+            'pds_release_revision:{"lease":"snapshot-5-test"}',
+        ])
+    })
+
+    it('preserves a copy failure when both native lease release attempts fail', async () => {
+        const { destination, events, runtime, dependencies } = harness()
+        const primaryError = new Error('destination write failed')
+        destination.write.mockRejectedValueOnce(primaryError)
+        const invoke = dependencies.invoke.getMockImplementation()!
+        let releaseAttempts = 0
+        dependencies.invoke.mockImplementation(async (command, args) => {
+            if (command !== 'pds_release_revision') return invoke(command, args)
+            events.push(`${command}:${JSON.stringify(args ?? {})}`)
+            releaseAttempts += 1
+            throw new Error('release unavailable')
+        })
+
+        await expect(exportNativePersistentRisuSave(
+            runtime,
+            'content://documents/export.risudat',
+            {},
+            dependencies,
+        )).rejects.toBe(primaryError)
+
+        expect(releaseAttempts).toBe(2)
+        expect(events.slice(-2)).toEqual([
+            'pds_release_revision:{"lease":"snapshot-5-test"}',
+            'pds_release_revision:{"lease":"snapshot-5-test"}',
+        ])
+    })
+
     it('rejects non-Tauri callers before flushing', async () => {
         const { runtime, dependencies } = harness()
         dependencies.isTauri = () => false

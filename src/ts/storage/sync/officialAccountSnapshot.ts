@@ -23,6 +23,7 @@ import {
     assertPinnedRevision,
     iteratePinnedCharacters,
     iteratePinnedConversations,
+    releasePersistentRevisionLease,
 } from '../persistentRecordIterator'
 import { decodeRisuSave } from '../risuSave'
 import {
@@ -342,7 +343,7 @@ class OfficialPinnedPublication implements PinnedPublication {
 
     private async release(): Promise<void> {
         if (this.released) return
-        await this.lease.release()
+        await releasePersistentRevisionLease(this.lease)
         this.released = true
     }
 }
@@ -457,7 +458,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
             )
         } catch (error) {
             try {
-                await lease.release()
+                await releasePersistentRevisionLease(lease)
             } catch {}
             throw error
         }

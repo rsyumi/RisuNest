@@ -16,6 +16,7 @@ import {
     assertPinnedRevision,
     iteratePinnedCharacters,
     iteratePinnedConversations,
+    withPersistentRevisionLease,
 } from '../storage/persistentRecordIterator'
 import { defineOwnEnumerableProperty } from '../storage/ownEnumerableProperty'
 import type { PluginCompatibilityProfile } from './pluginCompatibility'
@@ -382,7 +383,7 @@ export function createPluginDatabaseAccess(
                 await dependencies.flushPendingData('plugin-full-database-snapshot')
                 await openStore()
                 const reader = await acquireCurrentRevisionReader()
-                try {
+                return withPersistentRevisionLease(reader, async (reader) => {
                     const pinnedRoot = await reader.readRoot()
                     assertPinnedRevision(reader.revision, pinnedRoot.revision, 'Root')
                     const result: Record<string, unknown> = {}
@@ -460,9 +461,7 @@ export function createPluginDatabaseAccess(
                         )
                     }
                     return result
-                } finally {
-                    await reader.release()
-                }
+                })
             }
 
             const sourceDatabase = dependencies.snapshot(dependencies.getCompatibilityDatabase())
