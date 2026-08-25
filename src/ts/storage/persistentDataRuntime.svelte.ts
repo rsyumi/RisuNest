@@ -34,6 +34,7 @@ import type { PersistentReplacementOptions } from './saveCoordinator'
 import { workingSetResidency } from './workingSetResidency'
 import {
     createCatalogPresetWorkingSet,
+    hydrateWorkingSetCharacterDetail,
     isCatalogPresetWorkingSet,
 } from './workingSetCatalog'
 
@@ -149,6 +150,7 @@ function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
             const index = database.characters.findIndex((candidate) => candidate.chaId === character.chaId)
             if (index < 0) return
             workingSetResidency.markCharacterHydrated(character.chaId)
+            workingSetResidency.reconcileConversationResidency(character)
             database.characters[index] = character
             selectedCharID.set(index)
         },
@@ -164,29 +166,46 @@ function productionStateAdapter(): PersistentDataRuntimeStateAdapter {
             )
             if (primaryIndex < 0 || relatedIndices.some((index) => index < 0)) return
             for (let index = 0; index < related.length; index++) {
-                const character = related[index]
-                database.characters[relatedIndices[index]] = character
+                const detail = related[index]
+                const character = hydrateWorkingSetCharacterDetail(
+                    database,
+                    relatedIndices[index],
+                    detail,
+                )
                 workingSetResidency.markCharacterHydrated(character.chaId)
             }
             workingSetResidency.markCharacterHydrated(primary.chaId)
+            workingSetResidency.reconcileConversationResidency(primary)
             database.characters[primaryIndex] = primary
             selectedCharID.set(primaryIndex)
         },
-        publishConversation(characterId, conversation: Chat) {
+        publishConversation(characterId, conversation: Chat, nextCharacter?: CompleteCharacter) {
             const database = getDatabase()
             const characterIndex = database.characters.findIndex(
                 (candidate) => candidate.chaId === characterId,
             )
             if (characterIndex < 0) return
-            const character = database.characters[characterIndex]
+            const character = nextCharacter ?? database.characters[characterIndex]
             const conversationIndex = character.chats.findIndex(
                 (candidate) => candidate.id === conversation.id,
             )
             if (conversationIndex < 0) return
-            character.chats[conversationIndex] = conversation
+            if (!nextCharacter) character.chats[conversationIndex] = conversation
             character.chatPage = conversationIndex
+            database.characters[characterIndex] = character
+            workingSetResidency.reconcileConversationResidency(character)
             selectedCharID.set(characterIndex)
             ReloadGUIPointer.set(Math.random())
+        },
+        shouldHydrateFullCharacter() {
+            return !workingSetResidency.allowsEviction
+        },
+        canReleaseConversation(character, conversationId, nextConversationId) {
+            return workingSetResidency.canReleaseConversation(
+                character,
+                conversationId,
+                nextConversationId,
+            )
         },
         canActivateWorkingSet() {
             return !get(doingChat)

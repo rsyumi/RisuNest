@@ -6,6 +6,7 @@ import {
     getCatalogCharacterMetadata,
     getCatalogConversationCount,
     getCatalogPresetMetadata,
+    hydrateWorkingSetCharacterDetail,
     isCatalogCharacterStub,
     isCatalogPresetWorkingSet,
     patchWorkingSetCharacterDetail,
@@ -112,6 +113,31 @@ describe('working-set catalog', () => {
         expect(getCatalogConversationCount(stub)).toBe(37)
     })
 
+    it('creates unmarked group-generation detail while preserving catalog origin metadata', () => {
+        const stub = createCatalogCharacterStub(summary)
+        const database = { characters: [stub] }
+
+        const hydrated = hydrateWorkingSetCharacterDetail(database, 0, {
+            type: 'character',
+            chaId: 'char-a',
+            name: 'Alpha',
+            firstMessage: 'Generation greeting',
+            personality: 'Generation personality',
+        } as any)
+
+        expect(hydrated).toMatchObject({
+            firstMessage: 'Generation greeting',
+            personality: 'Generation personality',
+            chats: [],
+        })
+        expect(hydrated).not.toBe(stub)
+        expect(database.characters[0]).toBe(hydrated)
+        expect(isCatalogCharacterStub(hydrated)).toBe(false)
+        expect(getCatalogConversationCount(hydrated)).toBe(37)
+        expect(isCatalogCharacterStub(stub)).toBe(true)
+        expect(stub).not.toHaveProperty('personality')
+    })
+
     it('keeps preset indexes stable while hydrating only the selected preset body', () => {
         const active = {
             name: 'Active',
@@ -159,7 +185,23 @@ describe('working-set catalog', () => {
                     name: 'Alpha',
                     creatorNotes: 'Alpha note',
                     lastInteraction: 17,
-                    chats: [{ id: 'chat-a', message: [{ role: 'user', data: 'resident' }] }],
+                    chatPage: 1,
+                    chats: [
+                        {
+                            id: 'chat-a1',
+                            name: 'Older',
+                            note: '',
+                            localLore: [],
+                            message: [{ role: 'user', data: 'released' }],
+                        },
+                        {
+                            id: 'chat-a2',
+                            name: 'Selected',
+                            note: '',
+                            localLore: [],
+                            message: [{ role: 'user', data: 'resident' }],
+                        },
+                    ],
                 },
                 {
                     chaId: 'char-b',
@@ -172,7 +214,13 @@ describe('working-set catalog', () => {
         } as unknown as Database
         const snapshot = structuredClone(complete)
 
-        const projected = projectCompleteScalableWorkingSet(complete, 'char-a', 12)
+        const projected = projectCompleteScalableWorkingSet(
+            complete,
+            'char-a',
+            12,
+            undefined,
+            'chat-a2',
+        )
 
         expect(projected).not.toBe(complete)
         expect(projected.botPresets[0]).toEqual({ name: 'Inactive', image: 'inactive.png' })
@@ -182,7 +230,13 @@ describe('working-set catalog', () => {
             activeConfiguredIndex: 1,
             catalogRevision: 12,
         })
-        expect(projected.characters[0]).toEqual(complete.characters[0])
+        expect(projected.characters[0]).toEqual({
+            ...complete.characters[0],
+            chats: [
+                { ...complete.characters[0].chats[0], lastDate: 0, message: [] },
+                complete.characters[0].chats[1],
+            ],
+        })
         expect(projected.characters[0]).not.toBe(complete.characters[0])
         expect(isCatalogCharacterStub(projected.characters[0])).toBe(false)
         expect(isCatalogCharacterStub(projected.characters[1])).toBe(true)
@@ -200,7 +254,11 @@ describe('working-set catalog', () => {
                     type: 'character',
                     name: 'Alpha',
                     personality: 'alpha body',
-                    chats: [],
+                    chats: [{
+                        id: 'member-a-chat',
+                        name: 'Alpha chat',
+                        message: [{ role: 'assistant', data: 'must be released' }],
+                    }],
                 },
                 {
                     chaId: 'member-b',
@@ -237,6 +295,12 @@ describe('working-set catalog', () => {
 
         expect(projected.characters.slice(0, 3).every(isCatalogCharacterStub)).toBe(false)
         expect(projected.characters[0].personality).toBe('alpha body')
+        expect(projected.characters[0].chats).toHaveLength(1)
+        expect(projected.characters[0].chats[0]).toMatchObject({
+            id: 'member-a-chat',
+            name: 'Alpha chat',
+            message: [],
+        })
         expect(projected.characters[1].personality).toBe('beta body')
         expect(projected.characters[2].type).toBe('group')
         expect(isCatalogCharacterStub(projected.characters[3])).toBe(true)

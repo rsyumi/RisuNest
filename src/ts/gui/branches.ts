@@ -1,4 +1,5 @@
-import { getCurrentCharacter } from "../storage/database.svelte";
+import type { character, groupChat } from '../storage/database.svelte'
+import { readPersistentCompleteCharacter } from '../storage/persistentDataRuntime.svelte'
 
 type ChatBranch = {
     children: Map<string, ChatBranch>,
@@ -42,12 +43,13 @@ type RenderedBranch = {
     connectX:number,
     connectY:number,
     content: string,
+    preview: string,
     multiChild: boolean,
     chatId: number,
 }
 
-function renderBranch(branch: ChatBranch, x: number, y: number, connectX = -1, connectY = -1): RenderedBranch[]{
-    const rendered: RenderedBranch[] = []
+function renderBranch(branch: ChatBranch, x: number, y: number, connectX = -1, connectY = -1): Omit<RenderedBranch, 'preview'>[]{
+    const rendered: Omit<RenderedBranch, 'preview'>[] = []
     for(const [key, child] of branch.children){
         rendered.push({
             x,
@@ -66,8 +68,9 @@ function renderBranch(branch: ChatBranch, x: number, y: number, connectX = -1, c
     
 }
 
-export function getChatBranches(){
-    const character = getCurrentCharacter()
+export async function getChatBranches(characterId: string): Promise<RenderedBranch[]> {
+    const character = await readPersistentCompleteCharacter(characterId, 'chat-branches')
+    if (!character) return []
 
     const mainBranch: ChatBranch = {
         children: new Map(),
@@ -77,9 +80,11 @@ export function getChatBranches(){
 
     let i = 0;
     for(const chat of character.chats){
-        const fm = chat.fmIndex === -1 ? character.firstMessage : character.alternateGreetings?.[chat.fmIndex ?? 0]
+        const fm = chat.fmIndex === -1
+            ? character.firstMessage
+            : character.alternateGreetings?.[chat.fmIndex ?? 0]
         // const chatList = [fm].concat(chat.message.map((v) => v.data))
-        const chatList:string[] = [simpleHasher(fm)]
+        const chatList:string[] = [simpleHasher(fm ?? '')]
         for(const message of chat.message){
             chatList.push(simpleHasher(message.data))
         }
@@ -89,7 +94,19 @@ export function getChatBranches(){
 
     getMaxChildren(mainBranch)
 
-    return renderBranch(mainBranch, 0, 0)
+    return renderBranch(mainBranch, 0, 0).map((branch) => ({
+        ...branch,
+        preview: branch.y === 0
+            ? getFirstMessage(character, branch.chatId)
+            : character.chats[branch.chatId].message[branch.y - 1]?.data ?? '',
+    }))
+}
+
+function getFirstMessage(character: character | groupChat, chatId: number): string {
+    const chat = character.chats[chatId]
+    return chat.fmIndex === -1
+        ? character.firstMessage ?? ''
+        : character.alternateGreetings?.[chat.fmIndex ?? 0] ?? ''
 }
 
 function simpleHasher(str: string){

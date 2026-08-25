@@ -6,7 +6,7 @@ import { checkNullish, findCharacterbyId, getUserName, selectMultipleFile, selec
 import { v4 as uuidv4, v4 } from 'uuid';
 import { getImageType } from "./media";
 import { DBState, MobileGUIStack, OpenRealmStore, selectedCharID } from "./stores.svelte";
-import { AppendableBuffer, changeChatTo, checkCharOrder, downloadFile, getFileSrc } from "./globalApi.svelte";
+import { AppendableBuffer, changeChatTo, checkCharOrder, createChatCopyName, downloadFile, getFileSrc } from "./globalApi.svelte";
 import { updateInlayScreen } from "./process/inlayScreen";
 import { parseMarkdownSafe } from "./parser/parser.svelte";
 import { translateHTML } from "./translator/translator";
@@ -22,12 +22,16 @@ import {
     materializePersistentDatabaseSnapshotWithRevision,
     markPersistentDataDirty,
     mutatePersistentCharacterDetail,
+    readPersistentCompleteCharacter,
+    readPersistentConversation,
     reconcilePersistentActiveCharacterIds,
     replacePersistentDatabase,
 } from "./storage/persistentDataRuntime.svelte";
 import type { groupChat } from "./storage/database.svelte";
 import { removeCharacterIdFromOrder } from './storage/characterOrderMutation'
 import { restoreColdPersistentCharacter } from './process/coldCharacterRestore'
+import { safeStructuredClone } from './polyfill'
+import { isConversationSummaryStub } from './storage/conversationResidency'
 
 export async function commitDetachedCharacter(
     character: character | groupChat,
@@ -225,8 +229,11 @@ export async function exportChat(page:number){
         const anonymous = (mode === '2' || mode === '3') ? ((await alertSelect([language.includePersonaName, language.hidePersonaName])) === '1') : false
         const selectedID = get(selectedCharID)
         const db = DBState.db
-        const chat = db.characters[selectedID].chats[page]
         const char = db.characters[selectedID]
+        const chatId = char.chats[page]?.id
+        if (!chatId) throw new Error('Chat was not found')
+        const chat = await readPersistentConversation(char.chaId, chatId, 'export-chat')
+        if (!chat) throw new Error('Chat was not found')
         const date = new Date().toJSON();
         const htmlChatParse = async (v:string) => {
             v = parseMarkdownSafe(v)
@@ -540,7 +547,11 @@ export async function exportAllChats() {
     try {
         const selectedID = get(selectedCharID)
         const db = getDatabase()
-        const char = db.characters[selectedID]
+        const selected = db.characters[selectedID]
+        const char = selected
+            ? await readPersistentCompleteCharacter(selected.chaId, 'export-all-chats')
+            : null
+        if (!char) throw new Error('Character was not found')
         const date = new Date().toISOString().replace(/[:.]/g, "-")
         const allChats = char.chats
         const allFolders = char.chatFolders
@@ -667,6 +678,7 @@ export function characterFormatUpdate(indexOrCharacter:number|character, arg:{
     }
     for(let i = 0; i < cha.chats.length; i++){
         const chat = cha.chats[i]
+        if(isConversationSummaryStub(chat)) continue
         chat.fmIndex ??= cha.firstMsgIndex ?? -1
         if(!chat.id){
             chat.id = uuidv4()
@@ -1104,6 +1116,19 @@ export async function addNewChat(character: character | groupChat): Promise<bool
     chats.unshift(newChat)
     character.chats = chats
     return await changeChatTo(newChat.id)
+}
+
+export async function duplicateChat(characterId: string, chatId: string): Promise<boolean> {
+    if (!(await changeChatTo(chatId))) return false
+    const character = getDatabase().characters.find((candidate) => candidate.chaId === characterId)
+    const source = character?.chats.find((conversation) => conversation.id === chatId)
+    if (!character || !source) return false
+    const duplicate = safeStructuredClone(source)
+    duplicate.name = createChatCopyName(duplicate.name, 'Copy')
+    duplicate.id = v4()
+    character.chats.unshift(duplicate)
+    character.chats = character.chats
+    return await changeChatTo(duplicate.id)
 }
 
 export async function removeChat(character: character | groupChat, chatId: string): Promise<boolean> {

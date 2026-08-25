@@ -675,7 +675,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         await transactionDone(transaction)
         return {
             revision,
-            items: result.items.map((item) => item.summary),
+            items: result.items.map((item) => ({
+                ...item.summary,
+                folderId: item.detail.folderId,
+                bindedPersona: item.detail.bindedPersona,
+            })),
             nextCursor: result.nextCursor,
         }
     }

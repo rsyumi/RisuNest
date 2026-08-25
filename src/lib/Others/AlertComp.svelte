@@ -24,7 +24,6 @@
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme";
     import Help from "./Help.svelte";
     import { getChatBranches } from "src/ts/gui/branches";
-    import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { translateStackTrace } from "../../ts/sourcemap";
     import { getDetailedOSLabel, getFallbackOSLabel, getRisuEnvironmentLabel } from "src/ts/platform";
     import versionData from "../../../version.json";
@@ -71,6 +70,8 @@
         y:number,
         content:string,
     } = $state(null)
+    let chatBranches = $state<Awaited<ReturnType<typeof getChatBranches>>>([])
+    let branchLoadGeneration = 0
     let expandedLogs: Set<number> = $state(new Set())
     let allExpanded = $state(false)
     let copiedKey: string | null = $state(null)
@@ -143,6 +144,20 @@
             allExpanded = false
         }
     });
+
+    $effect(() => {
+        const characterId = $alertStore.type === 'branches' ? $alertStore.msg : ''
+        const generation = ++branchLoadGeneration
+        chatBranches = []
+        if (!characterId) return
+        void getChatBranches(characterId).then((branches) => {
+            if (
+                generation === branchLoadGeneration &&
+                $alertStore.type === 'branches' &&
+                $alertStore.msg === characterId
+            ) chatBranches = branches
+        }).catch(() => undefined)
+    })
 
     $effect(() => {
         if ($alertStore.type === 'error' && $alertStore.stackTrace && !translatedStackTrace && !stackTraceTranslationFailed && !isTranslating) {
@@ -850,7 +865,7 @@
             </button>
         </div>
 
-        {#each getChatBranches() as obj}
+        {#each chatBranches as obj}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
             <div
@@ -859,21 +874,19 @@
                 style="top: {obj.y * 80 + 24}px; left: {obj.x * 80 + 24}px"
                 onmouseenter={() => {
                     if(branchHover === null){
-                        const char = getCurrentCharacter()
                         branchHover = {
                             x: obj.x,
                             y: obj.y,
-                            content: char.chats[obj.chatId].message[obj.y - 1].data
+                            content: obj.preview
                         }
                     }
                 }}
                 onclick={() => {
                     if(branchHover === null){
-                        const char = getCurrentCharacter()
                         branchHover = {
                             x: obj.x,
                             y: obj.y,
-                            content: char.chats[obj.chatId].message[obj.y - 1].data
+                            content: obj.preview
                         }
                     }
                 }}

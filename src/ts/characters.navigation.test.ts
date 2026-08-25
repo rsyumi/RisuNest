@@ -17,13 +17,17 @@ const mocks = vi.hoisted(() => ({
     materializePersistentDatabaseSnapshotWithRevision: vi.fn(),
     replacePersistentDatabase: vi.fn(),
     readPersistentCharacterDetail: vi.fn(),
+    readPersistentCompleteCharacter: vi.fn(),
+    readPersistentConversation: vi.fn(),
     replacePersistentCompleteCharacter: vi.fn(),
     reconcilePersistentActiveCharacterIds: vi.fn(),
     getColdStorageItem: vi.fn(),
     alertConfirm: vi.fn(async () => true),
+    alertSelect: vi.fn(async () => '0'),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
     alertError: vi.fn(),
     changeChatTo: vi.fn(async (_idOrIndex?: string | number) => true),
+    downloadFile: vi.fn(),
     findCharacterbyId: vi.fn(),
 }))
 
@@ -47,7 +51,7 @@ vi.mock('./alert', async () => {
         alertConfirm: mocks.alertConfirm,
         alertError: mocks.alertError,
         alertNormal: vi.fn(),
-        alertSelect: vi.fn(),
+        alertSelect: mocks.alertSelect,
         alertStore: writable({ type: 'none', msg: '' }),
         alertWait: vi.fn(),
     }
@@ -75,7 +79,8 @@ vi.mock('./globalApi.svelte', () => ({
     AppendableBuffer: class {},
     changeChatTo: mocks.changeChatTo,
     checkCharOrder: vi.fn(),
-    downloadFile: vi.fn(),
+    createChatCopyName: (name: string, type: string) => `${name} (${type})`,
+    downloadFile: mocks.downloadFile,
     getFileSrc: vi.fn(),
 }))
 vi.mock('./process/inlayScreen', () => ({ updateInlayScreen: (value: unknown) => value }))
@@ -100,6 +105,8 @@ vi.mock('./storage/persistentDataRuntime.svelte', () => ({
         mocks.materializePersistentDatabaseSnapshotWithRevision,
     replacePersistentDatabase: mocks.replacePersistentDatabase,
     readPersistentCharacterDetail: mocks.readPersistentCharacterDetail,
+    readPersistentCompleteCharacter: mocks.readPersistentCompleteCharacter,
+    readPersistentConversation: mocks.readPersistentConversation,
     replacePersistentCompleteCharacter: mocks.replacePersistentCompleteCharacter,
     reconcilePersistentActiveCharacterIds: mocks.reconcilePersistentActiveCharacterIds,
 }))
@@ -112,11 +119,15 @@ import {
     createBlankChar,
     createNewCharacter,
     createNewGroup,
+    duplicateChat,
+    exportAllChats,
+    exportChat,
     removeChar,
     removeChat,
 } from './characters'
 import { MobileGUIStack, OpenRealmStore, selectedCharID } from './stores.svelte'
 import { doingChat } from './process/index.svelte'
+import { createConversationSummaryStub } from './storage/conversationResidency'
 
 function deferred<T>() {
     let resolve!: (value: T) => void
@@ -137,6 +148,7 @@ describe('runtime chat identity', () => {
         mocks.activateCharacter.mockResolvedValue(true)
         mocks.deactivateActiveWorkingSet.mockResolvedValue(true)
         mocks.alertConfirm.mockResolvedValue(true)
+        mocks.alertSelect.mockResolvedValue('0')
         mocks.alertAddCharacter.mockResolvedValue('createfromScratch')
         mocks.commitCharacterAddition.mockImplementation(async (request) => request.install())
         mocks.mutatePersistentCharacterDetail.mockImplementation(async (id, _reason, mutate) => {
@@ -817,6 +829,94 @@ describe('chat list operations', () => {
         expect(character.chats[0].name).toBe('New Chat 4')
         expect(character.chats[0].id).toBeTruthy()
         expect(mocks.changeChatTo).toHaveBeenCalledWith(character.chats[0].id)
+    })
+
+    it('does not apply semantic format migrations to conversation summary stubs', () => {
+        const character = buildCharacter()
+        character.firstMsgIndex = 2
+        character.chats[0] = createConversationSummaryStub({
+            id: 'chat-a',
+            characterId: character.chaId,
+            name: 'Chat A',
+            configuredIndex: 0,
+            recentAt: 0,
+            messageCount: 3,
+        })
+
+        characterFormatUpdate(character)
+
+        expect(character.chats[0]).not.toHaveProperty('fmIndex')
+    })
+
+    it('hydrates a nonselected chat before duplicating its body', async () => {
+        const character = buildCharacter()
+        character.chats[0].message = []
+        mocks.database.characters.push(character)
+        mocks.changeChatTo.mockImplementation(async (id: string) => {
+            if (id === 'chat-a') {
+                character.chats[0] = {
+                    ...character.chats[0],
+                    message: [{ role: 'user', data: 'authoritative body' }],
+                }
+                character.chatPage = 0
+            }
+            return true
+        })
+
+        const duplicated = await duplicateChat(character.chaId, 'chat-a')
+
+        expect(duplicated).toBe(true)
+        expect(mocks.changeChatTo).toHaveBeenNthCalledWith(1, 'chat-a')
+        expect(character.chats[0]).toMatchObject({
+            id: expect.stringMatching(/^generated-/),
+            name: 'Chat A (Copy)',
+            message: [{ role: 'user', data: 'authoritative body' }],
+        })
+        expect(mocks.changeChatTo).toHaveBeenNthCalledWith(2, character.chats[0].id)
+    })
+
+    it('reads a nonselected chat authoritatively before export', async () => {
+        const character = buildCharacter()
+        character.chats[0].message = []
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.readPersistentConversation.mockResolvedValue({
+            ...character.chats[0],
+            message: [{ role: 'user', data: 'authoritative body' }],
+        })
+
+        await exportChat(0)
+
+        expect(mocks.readPersistentConversation).toHaveBeenCalledWith(
+            character.chaId,
+            'chat-a',
+            'export-chat',
+        )
+        const exported = JSON.parse(Buffer.from(mocks.downloadFile.mock.calls[0][1]).toString())
+        expect(exported.data.message).toEqual([
+            { role: 'user', data: 'authoritative body' },
+        ])
+    })
+
+    it('reads the complete character authoritatively before exporting all chats', async () => {
+        const resident = buildCharacter()
+        resident.chats[0].message = []
+        const complete = structuredClone(resident)
+        complete.chats[0].message = [{ role: 'user', data: 'authoritative body' }]
+        mocks.database.characters.push(resident)
+        selectedCharID.set(0)
+        mocks.readPersistentCompleteCharacter.mockResolvedValue(complete)
+
+        await exportAllChats()
+
+        expect(mocks.readPersistentCompleteCharacter).toHaveBeenCalledWith(
+            resident.chaId,
+            'export-all-chats',
+        )
+        const exported = JSON.parse(Buffer.from(mocks.downloadFile.mock.calls[0][1]).toString())
+        expect(exported.data[0].message).toEqual([
+            { role: 'user', data: 'authoritative body' },
+        ])
     })
 
     it('seeds group chats with member first messages', async () => {

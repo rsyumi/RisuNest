@@ -1,4 +1,5 @@
 import type { Database, character, groupChat } from './database.svelte'
+import { createConversationSummaryStubFromChat } from './conversationResidency'
 import type {
     CharacterSummary,
     CharacterDetail,
@@ -16,7 +17,7 @@ const catalogPresetMetadata = Symbol('catalogPresetMetadata')
 export interface CatalogCharacterMetadata {
     configuredIndex: number
     conversationCount: number
-    residency: 'catalog'
+    residency: 'catalog' | 'detail'
 }
 
 type CatalogCharacter = CompleteCharacter & {
@@ -109,6 +110,32 @@ export function patchWorkingSetCharacterDetail(
     Object.assign(targetRecord, detailRecord)
 }
 
+export function hydrateWorkingSetCharacterDetail(
+    database: Pick<Database, 'characters'>,
+    index: number,
+    detail: CharacterDetail,
+): CompleteCharacter {
+    const target = database.characters[index]
+    const hydrated = {
+        ...detail,
+        chats: target.chats,
+    } as CompleteCharacter
+    const metadata = getCatalogCharacterMetadata(target)
+    if (metadata) {
+        Object.defineProperty(hydrated, catalogCharacterMetadata, {
+            configurable: false,
+            enumerable: false,
+            value: {
+                ...metadata,
+                residency: 'detail',
+            } satisfies CatalogCharacterMetadata,
+            writable: false,
+        })
+    }
+    database.characters[index] = hydrated
+    return hydrated
+}
+
 export function createCatalogPresetWorkingSet(
     catalog: PresetCatalog,
     active: ActiveCatalogPreset | null,
@@ -148,12 +175,16 @@ export function isCatalogPresetWorkingSet(presets: Database['botPresets']): bool
 
 export function hasIncompletePersistentWorkingSet(
     database: Pick<Database, 'characters' | 'botPresets'>,
-    residency?: Pick<WorkingSetResidencyRegistry, 'isCharacterReleased'>,
+    residency?: Pick<
+        WorkingSetResidencyRegistry,
+        'isCharacterReleased' | 'hasReleasedConversations'
+    >,
 ): boolean {
     if (isCatalogPresetWorkingSet(database.botPresets)) return true
     return database.characters.some((character) => (
         isCatalogCharacterStub(character) ||
-        residency?.isCharacterReleased(character.chaId) === true
+        residency?.isCharacterReleased(character.chaId) === true ||
+        residency?.hasReleasedConversations(character.chaId) === true
     ))
 }
 
@@ -177,6 +208,7 @@ export function projectCompleteScalableWorkingSet(
     selectedCharacterId: string | null,
     revision: number,
     activeCharacterIds?: ReadonlySet<string>,
+    selectedConversationId?: string | null,
 ): Database {
     const complete = structuredClone(database)
     const { characters, botPresets, ...root } = complete
@@ -219,7 +251,22 @@ export function projectCompleteScalableWorkingSet(
     if (selectedCharacterId) residentIds.add(selectedCharacterId)
     for (let index = 0; index < characters.length; index++) {
         if (residentIds.has(characters[index].chaId)) {
-            projected.characters[index] = characters[index]
+            const character = characters[index]
+            const pinnedConversationId = character.chaId === selectedCharacterId
+                ? selectedConversationId ?? character.chats[character.chatPage ?? 0]?.id
+                : undefined
+            projected.characters[index] = {
+                ...character,
+                chats: character.chats.map((conversation, conversationIndex) =>
+                    conversation.id === pinnedConversationId
+                        ? conversation
+                        : createConversationSummaryStubFromChat(
+                            character.chaId,
+                            conversation,
+                            conversationIndex,
+                        ),
+                ),
+            } as typeof character
         }
     }
     return projected

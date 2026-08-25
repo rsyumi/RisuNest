@@ -162,7 +162,7 @@ export async function loadData() {
             projectWorkingSet(
                 database,
                 selectedCharacterId,
-                _selectedConversationId,
+                selectedConversationId,
                 activeCharacterIds,
                 forceScalableProjection,
             ) {
@@ -175,10 +175,13 @@ export async function loadData() {
                     selectedCharacterId,
                     runtime.revision,
                     activeCharacterIds,
+                    selectedConversationId,
                 )
                 for (const character of projected.characters) {
                     if (isCatalogCharacterStub(character)) {
                         workingSetResidency.markCharacterReleased(character.chaId)
+                    } else {
+                        workingSetResidency.reconcileConversationResidency(character)
                     }
                 }
                 return projected

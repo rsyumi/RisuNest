@@ -169,7 +169,7 @@ pub(super) fn query_conversations(
     let (limit, offset) = page_input(query.limit, query.cursor.as_deref())?;
     let order = order_sql(query.order);
     let mut statement = connection.prepare(&format!(
-        "SELECT conversation_id, character_id, name, configured_index, recent_at, message_count
+        "SELECT conversation_id, character_id, name, configured_index, recent_at, message_count, detail
          FROM conversations WHERE generation = ?1 AND character_id = ?2
          ORDER BY {order} LIMIT ?3 OFFSET ?4"
     ))?;
@@ -181,10 +181,19 @@ pub(super) fn query_conversations(
     ])?;
     let mut items = Vec::new();
     while let Some(row) = rows.next()? {
+        let detail: Value = serde_json::from_str(&row.get::<_, String>(6)?)?;
         items.push(ConversationSummary {
             id: row.get(0)?,
             character_id: row.get(1)?,
             name: row.get(2)?,
+            folder_id: detail
+                .get("folderId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            binded_persona: detail
+                .get("bindedPersona")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             configured_index: row.get(3)?,
             recent_at: row.get(4)?,
             message_count: row.get(5)?,

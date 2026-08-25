@@ -9,6 +9,7 @@ import type {
 } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
 import { appendCharacterIdToOrder } from './characterOrderMutation'
+import { isConversationSummaryStub } from './conversationResidency'
 
 const SAVE_DEBOUNCE_MS = 500
 const PENDING_BYTE_LIMIT = 1_048_576
@@ -62,6 +63,7 @@ interface CapturedState {
     presetsCanonical: string | null
     character: CompleteCharacter | null
     characterCanonical: string | null
+    conversationStubIds: ReadonlySet<string>
 }
 
 export interface CharacterAdditionRequest {
@@ -1261,7 +1263,9 @@ export class SaveCoordinator {
             ) {
                 const conversations = this.diffSelectedConversations(captured)
                 if (conversations) commit.conversations = conversations
-                else commit.replaceCharacter = captured.character
+                else commit.replaceCharacter = captured.conversationStubIds.size > 0
+                    ? await this.reconstructCapturedCharacter(captured)
+                    : captured.character
             }
 
             let replacementIsAddition = false
@@ -1748,6 +1752,7 @@ export class SaveCoordinator {
             if (seenIds.has(conversationId)) return null
             seenIds.add(conversationId)
             if (JSON.stringify(capturedChat) === JSON.stringify(baselineChat)) continue
+            if (captured.conversationStubIds.has(conversationId)) return null
             if (!Array.isArray(capturedChat.message) || !Array.isArray(baselineChat.message)) {
                 return null
             }
@@ -1790,6 +1795,12 @@ export class SaveCoordinator {
             : legacyPresets ?? []
         const presetsCanonical = presetsValue === null ? null : canonicalJson(presetsValue)
         const characterValue = this.dependencies.captureSelectedCharacter()
+        const conversationStubIds = new Set(
+            characterValue?.chats
+                .filter(isConversationSummaryStub)
+                .map((conversation) => conversation.id)
+                .filter((id): id is string => Boolean(id)) ?? [],
+        )
         const characterCanonical = characterValue ? canonicalJson(characterValue) : null
         return {
             root: JSON.parse(rootCanonical) as RootDatabase,
@@ -1802,6 +1813,7 @@ export class SaveCoordinator {
                 ? (JSON.parse(characterCanonical) as CompleteCharacter)
                 : null,
             characterCanonical,
+            conversationStubIds,
         }
     }
 
@@ -1817,7 +1829,43 @@ export class SaveCoordinator {
             presetsCanonical: JSON.stringify(presets),
             character,
             characterCanonical: character ? JSON.stringify(character) : null,
+            conversationStubIds: new Set(),
         }
+    }
+
+    private async reconstructCapturedCharacter(captured: CapturedState): Promise<CompleteCharacter> {
+        const character = captured.character!
+        const { chats: _chats, ...detail } = character
+        const authoritative = await this.readCompleteCharacter(
+            character.chaId,
+            this.revision,
+            detail,
+        )
+        const authoritativeById = new Map(
+            authoritative.chats.map((conversation) => [conversation.id, conversation]),
+        )
+        return {
+            ...character,
+            chats: character.chats.map((conversation) => {
+                if (!conversation.id || !captured.conversationStubIds.has(conversation.id)) {
+                    return conversation
+                }
+                const full = authoritativeById.get(conversation.id)
+                if (!full) {
+                    throw new Error(
+                        `Conversation ${conversation.id} was not found during resident reconstruction`,
+                    )
+                }
+                return {
+                    ...full,
+                    id: conversation.id,
+                    name: conversation.name,
+                    folderId: conversation.folderId,
+                    bindedPersona: conversation.bindedPersona,
+                    lastDate: conversation.lastDate,
+                }
+            }),
+        } as CompleteCharacter
     }
 
     private capturePendingAddition(): {

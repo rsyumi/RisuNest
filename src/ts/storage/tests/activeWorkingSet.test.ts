@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from 'vitest'
 import { ActiveWorkingSet } from '../activeWorkingSet.svelte'
 import type { Chat, Database, character, groupChat } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
-import { installMaximumCompatibilityWorkingSet } from '../persistentDataRuntime'
+import {
+    capturePersistentRoot,
+    createPersistentDataRuntime,
+    installMaximumCompatibilityWorkingSet,
+} from '../persistentDataRuntime'
 import { isCatalogCharacterStub } from '../workingSetCatalog'
 import { WorkingSetResidencyRegistry } from '../workingSetResidency'
 import type {
@@ -71,6 +75,8 @@ function makeLease(input: {
                     id: chat.id!,
                     characterId: input.characterId,
                     name: chat.name,
+                    folderId: chat.folderId,
+                    bindedPersona: chat.bindedPersona,
                     configuredIndex: index + offset,
                     recentAt: 0,
                     messageCount: chat.message.length,
@@ -89,7 +95,10 @@ function makeLease(input: {
     }
 }
 
-function makeHarness(lease: PersistentRevisionLease) {
+function makeHarness(
+    lease: PersistentRevisionLease,
+    options: { hydrateFullCharacter?: boolean } = {},
+) {
     const database = {
         username: 'Fixture',
         characters: [makeCharacter('previous', [makeChat('previous-chat')])],
@@ -135,15 +144,28 @@ function makeHarness(lease: PersistentRevisionLease) {
         store,
         coordinator: coordinator as never,
         getSelectedCharacterId: () => selectedCharacterId,
+        getResidentCharacter: (id) =>
+            database.characters.find((character) => character.chaId === id) ?? null,
         publishCharacter,
         publishCharacterSet,
-        publishConversation: (characterId, conversation) => {
+        publishConversation: (characterId, conversation, nextCharacter) => {
+            if (nextCharacter) {
+                const index = database.characters.findIndex(
+                    (character) => character.chaId === characterId,
+                )
+                if (index >= 0) database.characters[index] = nextCharacter
+            }
             publishedConversations.push({ characterId, conversation })
         },
         canActivateWorkingSet: () => workingSetActivationAllowed,
         canDeactivateWorkingSet: () => workingSetReleaseAllowed,
         canDeactivateCharacter: () => releaseAllowed,
         releaseInactiveCharacter,
+        shouldHydrateFullCharacter: () => options.hydrateFullCharacter === true,
+        canReleaseConversation: (character, conversationId) =>
+            releaseAllowed && !character.chats.find(
+                (conversation) => conversation.id === conversationId,
+            )?.isStreaming,
     })
     return {
         workingSet,
@@ -171,6 +193,47 @@ function makeHarness(lease: PersistentRevisionLease) {
 }
 
 describe('ActiveWorkingSet', () => {
+    it('hydrates only the selected conversation body in the scalable working set', async () => {
+        const chatA = {
+            ...makeChat('chat-a'),
+            folderId: 'folder-a',
+            bindedPersona: 'persona-a',
+            message: [{ role: 'user', data: 'inactive body' }],
+        } as Chat
+        const chatB = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'user', data: 'selected body' }],
+        } as Chat
+        const lease = makeLease({
+            characterId: 'char-a',
+            chats: [chatA, chatB],
+            readCharacter: vi.fn(async () => ({
+                revision: 1,
+                value: { ...makeCharacterDetail('char-a'), chatPage: 1 },
+            })),
+        })
+        const harness = makeHarness(lease)
+
+        expect(await harness.workingSet.activateCharacter('char-a')).toBe(true)
+
+        expect(lease.readConversation).toHaveBeenCalledOnce()
+        expect(lease.readConversation).toHaveBeenCalledWith('char-a', 'chat-b')
+        expect(harness.publishedCharacters[0]).toMatchObject({
+            chaId: 'char-a',
+            chatPage: 1,
+            chats: [
+                {
+                    id: 'chat-a',
+                    name: 'chat-a',
+                    folderId: 'folder-a',
+                    bindedPersona: 'persona-a',
+                    message: [],
+                },
+                { id: 'chat-b', name: 'chat-b', message: chatB.message },
+            ],
+        })
+    })
+
     it('reconciles selected group dependencies from an authoritative snapshot', () => {
         const harness = makeHarness(makeLease({ characterId: 'group-a' }))
         const database = {
@@ -280,17 +343,27 @@ describe('ActiveWorkingSet', () => {
         expect([...harness.workingSet.activeCharacterIds]).toEqual([])
     })
 
-    it('reconstructs a complete character from detail, configured summaries, and full chats', async () => {
-        const chats = [makeChat('chat-a'), makeChat('chat-b')]
+    it('hydrates every conversation body for a maximum-compatibility pin', async () => {
+        const chats = [
+            {
+                ...makeChat('chat-a'),
+                message: [{ role: 'user', data: 'full A' }],
+            } as Chat,
+            {
+                ...makeChat('chat-b'),
+                message: [{ role: 'char', data: 'full B' }],
+            } as Chat,
+        ]
         const lease = makeLease({ characterId: 'char-a', chats })
-        const harness = makeHarness(lease)
+        const harness = makeHarness(lease, { hydrateFullCharacter: true })
 
         expect(await harness.workingSet.activateCharacter('char-a')).toBe(true)
 
         expect(harness.publishedCharacters[0]).toMatchObject({
             chaId: 'char-a',
-            chats: [{ id: 'chat-a' }, { id: 'chat-b' }],
+            chats,
         })
+        expect(lease.readConversation).toHaveBeenCalledTimes(2)
         expect(lease.queryConversations).toHaveBeenCalledTimes(2)
         expect(harness.store.acquireRevision).not.toHaveBeenCalled()
         expect(harness.coordinator.adoptHydratedCharacter).toHaveBeenCalledWith(
@@ -394,7 +467,7 @@ describe('ActiveWorkingSet', () => {
         expect(database.characters[2]).toHaveProperty('personality', 'body-c')
     })
 
-    it('publishes a group only after every unique member is completely hydrated', async () => {
+    it('publishes a group after every unique member detail is hydrated without member chat reads', async () => {
         const memberTwo = deferred<{
             revision: number
             value: Omit<character, 'chats'>
@@ -424,12 +497,17 @@ describe('ActiveWorkingSet', () => {
         memberTwo.resolve({ revision: 1, value: makeCharacterDetail('member-b') })
         expect(await activation).toBe(true)
 
-        expect(harness.publishCharacterSet).toHaveBeenCalledWith(
-            expect.objectContaining({ chaId: 'group-a' }),
-            [
-                expect.objectContaining({ chaId: 'member-a', chats: [] }),
-                expect.objectContaining({ chaId: 'member-b', chats: [] }),
-            ],
+        const [publishedGroup, publishedMembers] = harness.publishCharacterSet.mock.calls[0]
+        expect(publishedGroup).toEqual(expect.objectContaining({ chaId: 'group-a' }))
+        expect(publishedMembers).toEqual([
+            expect.objectContaining({ chaId: 'member-a', name: 'MEMBER-A' }),
+            expect.objectContaining({ chaId: 'member-b', name: 'MEMBER-B' }),
+        ])
+        expect(publishedMembers[0]).not.toHaveProperty('chats')
+        expect(publishedMembers[1]).not.toHaveProperty('chats')
+        expect(harness.store.queryConversations).toHaveBeenCalledTimes(1)
+        expect(harness.store.queryConversations).toHaveBeenCalledWith(
+            expect.objectContaining({ characterId: 'group-a' }),
         )
         expect(harness.coordinator.adoptHydratedCharacter).toHaveBeenCalledOnce()
         expect([...harness.workingSet.activeCharacterIds]).toEqual([
@@ -587,7 +665,7 @@ describe('ActiveWorkingSet', () => {
                 return entry.promise
             }),
         })
-        const harness = makeHarness(lease)
+        const harness = makeHarness(lease, { hydrateFullCharacter: true })
         vi.mocked(lease.queryConversations).mockResolvedValue({
             revision: 1,
             items: chats.map((chat, index) => ({
@@ -793,7 +871,7 @@ describe('ActiveWorkingSet', () => {
         expect(harness.releaseInactiveCharacter).not.toHaveBeenCalled()
     })
 
-    it('uses the selected character captured before conversation navigation awaits', async () => {
+    it('rejects conversation navigation when the selected character changes during flush', async () => {
         const chat = makeChat('chat-a')
         const lease = makeLease({ characterId: 'char-a', chats: [chat] })
         const harness = makeHarness(lease)
@@ -805,12 +883,327 @@ describe('ActiveWorkingSet', () => {
         harness.setSelectedCharacterId('char-b')
         harness.database.characters.reverse()
         pendingFlush.resolve()
-        expect(await activation).toBe(true)
+        expect(await activation).toBe(false)
 
-        expect(lease.readConversation).toHaveBeenCalledWith('char-a', 'chat-a')
-        expect(harness.publishedConversations).toEqual([{ characterId: 'char-a', conversation: chat }])
+        expect(lease.readConversation).not.toHaveBeenCalled()
+        expect(harness.publishedConversations).toEqual([])
         expect(harness.coordinator.adoptHydratedCharacter).not.toHaveBeenCalled()
         expect(harness.store.acquireRevision).not.toHaveBeenCalled()
+    })
+
+    it('coalesces duplicate stable-ID conversation hydration into one flight', async () => {
+        const conversationRead = deferred<{ revision: number; value: Chat } | null>()
+        const lease = makeLease({
+            characterId: 'char-a',
+            readConversation: vi.fn(() => conversationRead.promise),
+        })
+        const harness = makeHarness(lease)
+        harness.setSelectedCharacterId('char-a')
+
+        const first = harness.workingSet.activateConversation('chat-a')
+        const second = harness.workingSet.activateConversation('chat-a')
+        await vi.waitFor(() => expect(lease.readConversation).toHaveBeenCalled())
+        conversationRead.resolve({ revision: 1, value: makeChat('chat-a') })
+
+        await expect(Promise.all([first, second])).resolves.toEqual([true, true])
+        expect(lease.readConversation).toHaveBeenCalledOnce()
+        expect(harness.publishedConversations).toHaveLength(1)
+    })
+
+    it('starts a fresh conversation flight when a later navigation returns to the same ID', async () => {
+        const firstB = deferred<{ revision: number; value: Chat } | null>()
+        const chatC = deferred<{ revision: number; value: Chat } | null>()
+        const latestB = deferred<{ revision: number; value: Chat } | null>()
+        const bReads = [firstB, latestB]
+        const readConversation = vi.fn((_characterId: string, conversationId: string) => {
+            if (conversationId === 'chat-c') return chatC.promise
+            return bReads.shift()!.promise
+        })
+        const lease = makeLease({ characterId: 'char-a', readConversation })
+        const harness = makeHarness(lease)
+        harness.setSelectedCharacterId('char-a')
+
+        const staleBActivation = harness.workingSet.activateConversation('chat-b')
+        await vi.waitFor(() => expect(readConversation).toHaveBeenCalledTimes(1))
+        const staleCActivation = harness.workingSet.activateConversation('chat-c')
+        await vi.waitFor(() => expect(readConversation).toHaveBeenCalledTimes(2))
+        const latestBActivation = harness.workingSet.activateConversation('chat-b')
+
+        await vi.waitFor(() => expect(readConversation).toHaveBeenCalledTimes(3))
+        firstB.resolve({ revision: 1, value: {
+            ...makeChat('chat-b'),
+            message: [{ role: 'char', data: 'stale B' }],
+        } as Chat })
+        chatC.resolve({ revision: 1, value: makeChat('chat-c') })
+        latestB.resolve({ revision: 1, value: {
+            ...makeChat('chat-b'),
+            message: [{ role: 'char', data: 'latest B' }],
+        } as Chat })
+
+        await expect(Promise.all([
+            staleBActivation,
+            staleCActivation,
+            latestBActivation,
+        ])).resolves.toEqual([false, false, true])
+        expect(harness.publishedConversations).toEqual([{
+            characterId: 'char-a',
+            conversation: expect.objectContaining({
+                id: 'chat-b',
+                message: [{ role: 'char', data: 'latest B' }],
+            }),
+        }])
+    })
+
+    it('flushes the previous body before publishing its summary stub', async () => {
+        const chatA = {
+            ...makeChat('chat-a'),
+            message: [{ role: 'user', data: 'dirty body' }],
+        } as Chat
+        const chatB = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'char', data: 'authoritative body' }],
+        } as Chat
+        let resident = makeCharacter('char-a', [chatA, makeChat('chat-b')])
+        resident.chatPage = 0
+        const flush = deferred<void>()
+        const events: string[] = []
+        const lease = makeLease({ characterId: 'char-a', chats: [chatA, chatB] })
+        const coordinator = {
+            revision: 1,
+            mutationGeneration: 4,
+            initialize: vi.fn(),
+            flushPendingData: vi.fn(async () => {
+                events.push('flush:start')
+                await flush.promise
+                events.push('flush:done')
+            }),
+            replacePersistentDatabase: vi.fn(async () => undefined),
+            adoptHydratedCharacter: vi.fn(() => {
+                events.push('baseline')
+                return true
+            }),
+        }
+        const workingSet = new ActiveWorkingSet({
+            store: {
+                readConversation: vi.fn(async () => {
+                    events.push('read')
+                    return { revision: 1, value: structuredClone(chatB) }
+                }),
+            } as unknown as PersistentDataStore,
+            coordinator,
+            getSelectedCharacterId: () => 'char-a',
+            getResidentCharacter: () => resident,
+            canReleaseConversation: () => true,
+            publishCharacter: vi.fn(),
+            publishCharacterSet: vi.fn(),
+            publishConversation: (_characterId, _conversation, nextCharacter) => {
+                events.push('publish')
+                resident = nextCharacter as character
+            },
+        })
+
+        const activation = workingSet.activateConversation('chat-b')
+        await vi.waitFor(() => expect(coordinator.flushPendingData).toHaveBeenCalledOnce())
+        expect(resident.chats[0].message).toEqual(chatA.message)
+        flush.resolve()
+
+        await expect(activation).resolves.toBe(true)
+        expect(events).toEqual(['flush:start', 'flush:done', 'read', 'baseline', 'publish'])
+        expect(resident.chatPage).toBe(1)
+        expect(resident.chats).toMatchObject([
+            { id: 'chat-a', message: [] },
+            { id: 'chat-b', message: chatB.message },
+        ])
+    })
+
+    it('keeps the previous body resident when its pending save fails', async () => {
+        const previous = {
+            ...makeChat('chat-a'),
+            message: [{ role: 'user', data: 'unsaved' }],
+        } as Chat
+        const resident = makeCharacter('char-a', [previous, makeChat('chat-b')])
+        resident.chatPage = 0
+        const readConversation = vi.fn()
+        const publishConversation = vi.fn()
+        const workingSet = new ActiveWorkingSet({
+            store: { readConversation } as unknown as PersistentDataStore,
+            coordinator: {
+                revision: 1,
+                mutationGeneration: 1,
+                initialize: vi.fn(),
+                flushPendingData: vi.fn(async () => { throw new Error('commit failed') }),
+                replacePersistentDatabase: vi.fn(async () => undefined),
+                adoptHydratedCharacter: vi.fn(() => true),
+            },
+            getSelectedCharacterId: () => 'char-a',
+            getResidentCharacter: () => resident,
+            canReleaseConversation: () => true,
+            publishCharacter: vi.fn(),
+            publishCharacterSet: vi.fn(),
+            publishConversation,
+        })
+
+        await expect(workingSet.activateConversation('chat-b')).rejects.toThrow('commit failed')
+        expect(readConversation).not.toHaveBeenCalled()
+        expect(publishConversation).not.toHaveBeenCalled()
+        expect(resident.chats[0]).toBe(previous)
+    })
+
+    it('keeps a streaming previous body pinned while selecting the hydrated target', async () => {
+        const streaming = {
+            ...makeChat('chat-a'),
+            isStreaming: true,
+            message: [{ role: 'char', data: 'partial stream' }],
+        } as Chat
+        const target = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'user', data: 'target' }],
+        } as Chat
+        let resident = makeCharacter('char-a', [streaming, makeChat('chat-b')])
+        resident.chatPage = 0
+        const workingSet = new ActiveWorkingSet({
+            store: {
+                readConversation: vi.fn(async () => ({ revision: 1, value: target })),
+            } as unknown as PersistentDataStore,
+            coordinator: {
+                revision: 1,
+                mutationGeneration: 0,
+                initialize: vi.fn(),
+                flushPendingData: vi.fn(async () => undefined),
+                replacePersistentDatabase: vi.fn(async () => undefined),
+                adoptHydratedCharacter: vi.fn(() => true),
+            },
+            getSelectedCharacterId: () => 'char-a',
+            getResidentCharacter: () => resident,
+            canReleaseConversation: (character, conversationId) =>
+                !character.chats.find((conversation) => conversation.id === conversationId)
+                    ?.isStreaming,
+            publishCharacter: vi.fn(),
+            publishCharacterSet: vi.fn(),
+            publishConversation: (_characterId, _conversation, nextCharacter) => {
+                resident = nextCharacter as character
+            },
+        })
+
+        await expect(workingSet.activateConversation('chat-b')).resolves.toBe(true)
+        expect(resident.chats[0]).toBe(streaming)
+        expect(resident.chats[0].message).toEqual([
+            { role: 'char', data: 'partial stream' },
+        ])
+        expect(resident.chats[1]).toBe(target)
+    })
+
+    it('keeps the committed previous body authoritative after a later selected save', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            'conversation-residency-commit-before-release',
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const chatA = {
+            ...makeChat('chat-a'),
+            message: [{ role: 'user', data: 'first' }],
+        } as Chat
+        const chatB = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'char', data: 'second' }],
+        } as Chat
+        const chatC = {
+            ...makeChat('chat-c'),
+            fmIndex: 2,
+            scriptstate: { source: 'authoritative' },
+            note: 'authoritative note',
+            localLore: [{ key: 'lore', content: 'authoritative lore' }],
+            message: [{ role: 'user', data: 'must survive structural save' }],
+        } as unknown as Chat
+        let database = {
+            username: 'Fixture',
+            botPresets: [],
+            characters: [makeCharacter('char-a', [chatA, chatB, chatC])],
+        } as unknown as Database
+        database.characters[0].chatPage = 0
+        const imported = await store.replaceFromDatabase(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: {
+                captureRoot: () => capturePersistentRoot(database),
+                capturePresets: () => database.botPresets,
+                captureSelectedCharacter: () => database.characters[0],
+                captureCharacter: (id) =>
+                    database.characters.find((character) => character.chaId === id) ?? null,
+                getSelectedCharacterId: () => 'char-a',
+                getSelectedConversationId: () =>
+                    database.characters[0].chats[database.characters[0].chatPage].id,
+                replaceDatabase: (value) => { database = value },
+                publishCharacter: (value) => { database.characters[0] = value },
+                publishConversation: (_characterId, conversation, nextCharacter) => {
+                    if (nextCharacter) {
+                        database.characters[0] = nextCharacter
+                        return
+                    }
+                    const character = database.characters[0]
+                    const index = character.chats.findIndex((chat) => chat.id === conversation.id)
+                    character.chats[index] = conversation
+                    character.chatPage = index
+                },
+                shouldHydrateFullCharacter: () => false,
+                canReleaseConversation: () => true,
+            },
+            prepareDatabase: async (value) => value,
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        expect(runtime.revision).toBe(imported.revision)
+        expect(await runtime.activateCharacter('char-a')).toBe(true)
+
+        database.characters[0].chats[0].message.push({ role: 'char', data: 'saved before release' })
+        runtime.markPersistentDataDirty(64)
+        expect(await runtime.activateConversation('chat-b')).toBe(true)
+        expect(database.characters[0].chats[0].message).toEqual([])
+        expect((await store.readConversation('char-a', 'chat-a'))?.value.message).toEqual([
+            { role: 'user', data: 'first' },
+            { role: 'char', data: 'saved before release' },
+        ])
+
+        database.characters[0].chats[1].message.push({ role: 'user', data: 'later save' })
+        runtime.markPersistentDataDirty(32)
+        await runtime.flushPendingData('conversation-residency-test')
+
+        expect((await store.readConversation('char-a', 'chat-a'))?.value.message).toEqual([
+            { role: 'user', data: 'first' },
+            { role: 'char', data: 'saved before release' },
+        ])
+        expect((await store.readConversation('char-a', 'chat-b'))?.value.message).toEqual([
+            { role: 'char', data: 'second' },
+            { role: 'user', data: 'later save' },
+        ])
+
+        database.characters[0].chats[2].name = 'Renamed summary'
+        database.characters[0].chats[2].fmIndex = -1
+        database.characters[0].chats[2].scriptstate = { source: 'synthetic' }
+        runtime.markPersistentDataDirty(16)
+        await runtime.flushPendingData('conversation-summary-metadata-test')
+        expect(await store.readConversation('char-a', 'chat-c')).toMatchObject({
+            value: {
+                name: 'Renamed summary',
+                fmIndex: 2,
+                scriptstate: { source: 'authoritative' },
+                note: 'authoritative note',
+                localLore: [{ key: 'lore', content: 'authoritative lore' }],
+                message: [{ role: 'user', data: 'must survive structural save' }],
+            },
+        })
+
+        database.characters[0].chats.splice(0, 1)
+        database.characters[0].chatPage = 0
+        runtime.markPersistentDataDirty(16)
+        await runtime.flushPendingData('conversation-structure-test')
+
+        expect((await store.readConversation('char-a', 'chat-c'))?.value).toMatchObject({
+            fmIndex: 2,
+            scriptstate: { source: 'authoritative' },
+            message: [{ role: 'user', data: 'must survive structural save' }],
+        })
     })
 
     it('discards hydration when the coordinator revision changes', async () => {
@@ -850,6 +1243,13 @@ describe('ActiveWorkingSet', () => {
         })
         const harness = makeHarness(lease)
         harness.setSelectedCharacterId('char-a')
+        const previous = {
+            ...makeChat('chat-old'),
+            message: [{ role: 'user', data: 'must remain resident' }],
+        } as Chat
+        const resident = makeCharacter('char-a', [previous, makeChat('chat-a')])
+        resident.chatPage = 0
+        harness.database.characters = [resident]
 
         const activation = harness.workingSet.activateConversation('chat-a')
         await vi.waitFor(() => expect(harness.store.readConversation).toHaveBeenCalledOnce())
@@ -858,6 +1258,36 @@ describe('ActiveWorkingSet', () => {
 
         expect(await activation).toBe(false)
         expect(harness.publishedConversations).toEqual([])
+        expect(harness.database.characters[0].chats[0]).toBe(previous)
+        expect(harness.database.characters[0].chats[0].message).toEqual([
+            { role: 'user', data: 'must remain resident' },
+        ])
+    })
+
+    it('keeps the previous body resident when the selected character changes during hydration', async () => {
+        const conversationRead = deferred<{ revision: number; value: Chat } | null>()
+        const lease = makeLease({
+            characterId: 'char-a',
+            readConversation: vi.fn(() => conversationRead.promise),
+        })
+        const harness = makeHarness(lease)
+        harness.setSelectedCharacterId('char-a')
+        const previous = {
+            ...makeChat('chat-old'),
+            message: [{ role: 'user', data: 'must remain resident' }],
+        } as Chat
+        const resident = makeCharacter('char-a', [previous, makeChat('chat-a')])
+        resident.chatPage = 0
+        harness.database.characters = [resident]
+
+        const activation = harness.workingSet.activateConversation('chat-a')
+        await vi.waitFor(() => expect(lease.readConversation).toHaveBeenCalledOnce())
+        harness.setSelectedCharacterId('char-b')
+        conversationRead.resolve({ revision: 1, value: makeChat('chat-a') })
+
+        expect(await activation).toBe(false)
+        expect(harness.publishedConversations).toEqual([])
+        expect(harness.database.characters[0].chats[0]).toBe(previous)
     })
 
     it('does not adopt a hydrated body after the resident working set changes', async () => {
@@ -998,7 +1428,7 @@ describe('ActiveWorkingSet', () => {
             coordinator,
             getSelectedCharacterId: () => 'char-a',
             publishCharacter: (value) => published.push(value),
-            publishCharacterSet: (primary, related) => published.push(...related, primary),
+            publishCharacterSet: vi.fn(),
             publishConversation: vi.fn(),
         })
 
@@ -1011,7 +1441,13 @@ describe('ActiveWorkingSet', () => {
             clearSpy.mockRestore()
         }
 
-        expect(published[0]).toEqual(fixtureDatabase.characters[1])
+        expect(published[0]).toEqual({
+            ...fixtureDatabase.characters[1],
+            chats: [
+                fixtureDatabase.characters[1].chats[0],
+                { ...fixtureDatabase.characters[1].chats[1], message: [] },
+            ],
+        })
         expect(acquireRevision).not.toHaveBeenCalled()
         expect(writes).toEqual({ put: 0, add: 0, delete: 0, clear: 0 })
     })

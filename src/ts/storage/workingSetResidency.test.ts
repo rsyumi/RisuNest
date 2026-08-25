@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import type { Chat, Database, character } from './database.svelte'
 import { captureResidentPersistentCharacter } from './persistentDataRuntime'
-import { WorkingSetResidencyRegistry } from './workingSetResidency'
+import {
+    isConversationSummaryStub,
+    WorkingSetResidencyRegistry,
+} from './workingSetResidency'
 import {
     createCatalogCharacterStub,
     createCatalogPresetWorkingSet,
     getCatalogCharacterMetadata,
     hasIncompletePersistentWorkingSet,
+    hydrateWorkingSetCharacterDetail,
     isCatalogCharacterStub,
 } from './workingSetCatalog'
 
@@ -31,6 +35,22 @@ function characterWithChats(chats: Chat[]): character {
 }
 
 describe('WorkingSetResidencyRegistry', () => {
+    it('pins the selected conversation while releasing a nonselected body to its summary', () => {
+        const registry = new WorkingSetResidencyRegistry()
+        const selected = chat('selected')
+        const inactive = chat('inactive')
+        const value = characterWithChats([selected, inactive])
+        registry.pinSelectedConversation('char-a', 'selected')
+
+        expect(registry.releaseConversationToSummary(value, 'selected')).toBe(false)
+        expect(registry.releaseConversationToSummary(value, 'inactive')).toBe(true)
+
+        expect(value.chats[0]).toBe(selected)
+        expect(value.chats[0].message).toEqual([{ role: 'user', data: 'selected' }])
+        expect(isConversationSummaryStub(value.chats[1])).toBe(true)
+        expect(value.chats[1]).toMatchObject({ id: 'inactive', name: 'inactive', message: [] })
+    })
+
     it('keeps only the latest character detail resident across repeated visits', () => {
         const registry = new WorkingSetResidencyRegistry()
         const database = {
@@ -79,6 +99,55 @@ describe('WorkingSetResidencyRegistry', () => {
         expect(database.characters[0]).not.toHaveProperty('personality')
         expect(getCatalogCharacterMetadata(database.characters[0])?.conversationCount).toBe(0)
         expect(registry.isCharacterReleased('char-empty')).toBe(true)
+    })
+
+    it('releases group-member detail and reloads fresh detail on revisit', () => {
+        const registry = new WorkingSetResidencyRegistry()
+        const catalog = createCatalogCharacterStub({
+            id: 'member-a',
+            name: 'Member',
+            configuredIndex: 3,
+            recentAt: 0,
+            trashed: false,
+            conversationCount: 12,
+            type: 'character',
+        })
+        const database = { characters: [catalog] } as unknown as Database
+        const firstVisit = hydrateWorkingSetCharacterDetail(database, 0, {
+            type: 'character',
+            chaId: 'member-a',
+            name: 'Member',
+            personality: 'first personality',
+            globalLore: [{ key: 'first lore', content: 'first' }],
+        } as any) as character
+        registry.markCharacterHydrated('member-a')
+
+        expect(registry.releaseCharacterToCatalog(database, 'member-a')).toBe(true)
+        expect(isCatalogCharacterStub(database.characters[0])).toBe(true)
+        expect(database.characters[0]).not.toHaveProperty('personality')
+        expect(database.characters[0]).not.toHaveProperty('globalLore')
+        expect(getCatalogCharacterMetadata(database.characters[0])).toMatchObject({
+            configuredIndex: 3,
+            conversationCount: 12,
+        })
+
+        const secondVisit = hydrateWorkingSetCharacterDetail(database, 0, {
+            type: 'character',
+            chaId: 'member-a',
+            name: 'Member reloaded',
+            personality: 'second personality',
+            globalLore: [{ key: 'second lore', content: 'second' }],
+        } as any) as character
+        registry.markCharacterHydrated('member-a')
+
+        expect(secondVisit).not.toBe(firstVisit)
+        expect(isCatalogCharacterStub(secondVisit)).toBe(false)
+        expect(registry.isCharacterReleased('member-a')).toBe(false)
+        expect(secondVisit).toMatchObject({
+            name: 'Member reloaded',
+            personality: 'second personality',
+            globalLore: [{ key: 'second lore', content: 'second' }],
+        })
     })
 
     it('keeps a streaming character fully resident', () => {
@@ -171,6 +240,19 @@ describe('WorkingSetResidencyRegistry', () => {
         const database = { characters: [stub] } as never
 
         expect(captureResidentPersistentCharacter(database, 'char-a', registry)).toBeNull()
+    })
+
+    it('rejects a conversation-summary working set as a complete replacement source', () => {
+        const registry = new WorkingSetResidencyRegistry()
+        const complete = characterWithChats([chat('selected'), chat('inactive')])
+        const database = {
+            characters: [complete],
+            botPresets: [],
+        } as unknown as Database
+        registry.pinSelectedConversation('char-a', 'selected')
+        expect(registry.releaseConversationToSummary(complete, 'inactive')).toBe(true)
+
+        expect(hasIncompletePersistentWorkingSet(database, registry)).toBe(true)
     })
 
     it('detects every structural form of an incomplete persistent working set', () => {

@@ -55,7 +55,7 @@ vi.mock('./coldCharacterRestore', () => ({
     restoreColdPersistentCharacter: mocks.restoreColdPersistentCharacter,
 }))
 
-import { addGroupChar, rmCharFromGroup } from './group'
+import { addGroupChar, groupOrder, rmCharFromGroup } from './group'
 
 function makeGroup() {
     return {
@@ -79,8 +79,8 @@ describe('group working-set residency', () => {
         const group = makeGroup()
         mocks.database.characters = [
             group,
-            { type: 'character', chaId: 'member-a', firstMessage: 'A', chats: [] },
-            { type: 'character', chaId: 'member-b', chats: [] },
+            { type: 'character', chaId: 'member-a', name: 'Alpha', firstMessage: 'A', chats: [] },
+            { type: 'character', chaId: 'member-b', name: 'Beta', chats: [] },
         ]
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.alertSelectChar.mockResolvedValue('member-b')
@@ -108,6 +108,17 @@ describe('group working-set residency', () => {
             { role: 'char', data: 'Hydrated B', saying: 'member-b' },
         ])
         expect(mocks.markPersistentDataDirty).toHaveBeenCalled()
+    })
+
+    it('orders group generation from detail-only members without conversation histories', () => {
+        const order = groupOrder([
+            { id: 'member-a', talkness: 1, index: 0 },
+            { id: 'member-b', talkness: 1, index: 1 },
+        ], 'alpha')
+
+        expect(order[0].id).toBe('member-a')
+        expect(mocks.database.characters[1].chats).toEqual([])
+        expect(mocks.database.characters[2].chats).toEqual([])
     })
 
     it('does not mutate membership when generation starts during cold restore', async () => {

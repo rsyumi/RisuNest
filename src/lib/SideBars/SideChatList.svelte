@@ -12,14 +12,14 @@
     import Button from "../UI/GUI/Button.svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
 
-    import { addNewChat, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
+    import { addNewChat, duplicateChat, exportChat, importChat, exportAllChats, removeChat } from "src/ts/characters";
     import { alertChatOptions, alertConfirm, alertError, alertNormal, alertSelect, alertStore } from "src/ts/alert";
     import { sleep, sortableOptions } from "src/ts/util";
     import { createMultiuserRoom } from "src/ts/sync/multiuser";
     import { bookmarkListOpen } from "src/ts/stores.svelte";
     import { language } from "src/lang";
     import Toggles from "./Toggles.svelte";
-    import { changeChatTo, createChatCopyName } from "src/ts/globalApi.svelte";
+    import { changeChatTo } from "src/ts/globalApi.svelte";
 
     interface Props {
         chara: character|groupChat;
@@ -246,12 +246,7 @@
                                 const option = await alertChatOptions()
                                 switch(option){
                                     case 0:{
-                                        const newChat = $state.snapshot(chara.chats[chara.chats.indexOf(chat)])
-                                        newChat.name = createChatCopyName(newChat.name, 'Copy')
-                                        newChat.id = v4()
-                                        chara.chats.unshift(newChat)
-                                        chara.chats = chara.chats
-                                        await changeChatTo(newChat.id)
+                                        await duplicateChat(chara.chaId, chat.id)
                                         break
                                     }
                                     case 1:{
@@ -351,12 +346,7 @@
                         const option = await alertChatOptions()
                         switch(option){
                             case 0:{
-                                const newChat = $state.snapshot(chara.chats[i])
-                                newChat.name = createChatCopyName(newChat.name, 'Copy')
-                                newChat.id = v4()
-                                chara.chats.unshift(newChat)
-                                chara.chats = chara.chats
-                                await changeChatTo(newChat.id)
+                                await duplicateChat(chara.chaId, chat.id)
                                 break
                             }
                             case 1:{
@@ -452,7 +442,7 @@
             <button class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer" onclick={() => {
                 alertStore.set({
                   type: "branches",
-                  msg: ""
+                  msg: chara.chaId
                 })
             }}>
                 <SplitIcon size={18}/>

@@ -166,6 +166,10 @@ pub(crate) struct ConversationSummary {
     pub(crate) id: String,
     pub(crate) character_id: String,
     pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) folder_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binded_persona: Option<String>,
     pub(crate) configured_index: i64,
     pub(crate) recent_at: i64,
     pub(crate) message_count: i64,

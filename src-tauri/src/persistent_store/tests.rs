@@ -329,6 +329,63 @@ fn conversation_catalog_honors_configured_recent_and_cursor() {
 }
 
 #[test]
+fn conversation_catalog_includes_chat_list_metadata() {
+    let (_directory, mut store, _) = open_fixture();
+    let mut detail = store
+        .read_conversation("char-a", "conv-short", None)
+        .expect("read conversation")
+        .expect("conversation exists")
+        .value;
+    let detail = detail.as_object_mut().expect("conversation object");
+    detail.remove("message");
+    detail.insert("folderId".to_owned(), json!("folder-a"));
+    detail.insert("bindedPersona".to_owned(), json!("persona-a"));
+    commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-short".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: Vec::new(),
+            conversation: Some(Value::Object(detail.clone())),
+        },
+    );
+
+    let page = store
+        .query_conversations(
+            &ConversationQuery {
+                character_id: "char-a".to_owned(),
+                order: QueryOrder::Configured,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("query conversations");
+    let summary = page
+        .items
+        .iter()
+        .find(|item| item.id == "conv-short")
+        .expect("conversation summary");
+
+    assert_eq!(
+        serde_json::to_value(summary).expect("serialize summary"),
+        json!({
+            "id": "conv-short",
+            "characterId": "char-a",
+            "name": "Short chat",
+            "folderId": "folder-a",
+            "bindedPersona": "persona-a",
+            "configuredIndex": 1,
+            "recentAt": 250,
+            "messageCount": 2
+        })
+    );
+}
+
+#[test]
 fn conversation_windows_cover_latest_and_anchor_boundaries() {
     let (_directory, store, _) = open_fixture();
     let window = |anchor: Option<&str>, before, after| ConversationWindowQuery {

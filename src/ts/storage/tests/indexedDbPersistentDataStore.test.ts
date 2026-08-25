@@ -210,6 +210,32 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         ).rejects.toThrow(RangeError)
     })
 
+    it('keeps synchronous chat-list metadata in conversation summaries', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `conversation-summary-list-metadata-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const database = structuredClone(fixtureDatabase)
+        database.characters[1].chats[0].folderId = 'folder-a'
+        database.characters[1].chats[0].bindedPersona = 'persona-a'
+        await store.replaceFromDatabase(database)
+
+        const page = await store.queryConversations({
+            characterId: 'char-a',
+            order: 'configured',
+            limit: 10,
+        })
+
+        expect(page.items[0]).toMatchObject({
+            id: 'conv-long',
+            folderId: 'folder-a',
+            bindedPersona: 'persona-a',
+        })
+    })
+
     it('atomically adds one complete character with root and selected edits across reopen', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `atomic-character-addition-${databaseSequence++}`

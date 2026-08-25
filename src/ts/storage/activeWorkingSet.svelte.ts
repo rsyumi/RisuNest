@@ -1,5 +1,14 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
-import type { DataRevision, PersistentDataStore } from './persistentDataStore'
+import type {
+    CharacterDetail,
+    ConversationSummary,
+    DataRevision,
+    PersistentDataStore,
+} from './persistentDataStore'
+import {
+    createConversationSummaryStub,
+    createConversationSummaryStubFromChat,
+} from './conversationResidency'
 
 type CompleteCharacter = character | groupChat
 
@@ -30,18 +39,33 @@ export interface ActiveWorkingSetDependencies {
     store: PersistentDataStore
     coordinator: WorkingSetCoordinator
     getSelectedCharacterId(): string | null | undefined
+    getResidentCharacter?(id: string): CompleteCharacter | null
     publishCharacter(character: CompleteCharacter): void
-    publishCharacterSet(primary: CompleteCharacter, related: CompleteCharacter[]): void
-    publishConversation(characterId: string, conversation: Chat): void
+    publishCharacterSet(primary: CompleteCharacter, related: CharacterDetail[]): void
+    publishConversation(
+        characterId: string,
+        conversation: Chat,
+        nextCharacter?: CompleteCharacter,
+    ): void
     canActivateWorkingSet?(): boolean
     canDeactivateWorkingSet?(): boolean
     canDeactivateCharacter?(id: string): boolean
     releaseInactiveCharacter?(id: string): void
+    shouldHydrateFullCharacter?(): boolean
+    canReleaseConversation?(
+        character: CompleteCharacter,
+        conversationId: string,
+        nextConversationId: string,
+    ): boolean
 }
 
 export class ActiveWorkingSet {
     private navigationGeneration = 0
     private activeIds = new Set<string>()
+    private readonly conversationFlights = new Map<
+        string,
+        { generation: number; promise: Promise<boolean> }
+    >()
 
     constructor(private readonly dependencies: ActiveWorkingSetDependencies) {}
 
@@ -151,7 +175,7 @@ export class ActiveWorkingSet {
         let relatedIds = characterValue.type === 'group'
             ? [...new Set(characterValue.characters)].filter((memberId) => memberId !== id)
             : []
-        const relatedValues: Array<CompleteCharacter | null | undefined> = []
+        const relatedValues: Array<CharacterDetail | null | undefined> = []
         for (
             let start = 0;
             start < relatedIds.length;
@@ -163,7 +187,7 @@ export class ActiveWorkingSet {
             )
             const hydratedChunk = await Promise.all(chunk.map(async (memberId) => {
                 try {
-                    return await this.hydrateCharacter(
+                    return await this.hydrateCharacterDetail(
                         memberId,
                         revision,
                         mutationGeneration,
@@ -208,7 +232,7 @@ export class ActiveWorkingSet {
         }
         if (this.dependencies.canActivateWorkingSet?.() === false) return false
         const completeRelated = relatedValues.filter(
-            (value): value is CompleteCharacter => value !== null && value !== undefined,
+            (value): value is CharacterDetail => value !== null && value !== undefined,
         )
         if (completeRelated.length > 0) {
             this.dependencies.publishCharacterSet(characterValue, completeRelated)
@@ -225,26 +249,81 @@ export class ActiveWorkingSet {
         return true
     }
 
-    async activateConversation(id: string): Promise<boolean> {
-        if (this.dependencies.canActivateWorkingSet?.() === false) return false
-        const generation = ++this.navigationGeneration
+    activateConversation(id: string): Promise<boolean> {
+        if (this.dependencies.canActivateWorkingSet?.() === false) return Promise.resolve(false)
         const characterId = this.dependencies.getSelectedCharacterId()
-        if (!characterId) throw new Error('No character is selected')
+        if (!characterId) return Promise.reject(new Error('No character is selected'))
+        const key = `${characterId}\u0000${id}`
+        const existing = this.conversationFlights.get(key)
+        if (existing?.generation === this.navigationGeneration) return existing.promise
+        const generation = ++this.navigationGeneration
+        const pending = this.activateConversationOnce(characterId, id, generation).finally(() => {
+            if (this.conversationFlights.get(key)?.promise === pending) {
+                this.conversationFlights.delete(key)
+            }
+        })
+        this.conversationFlights.set(key, { generation, promise: pending })
+        return pending
+    }
+
+    private async activateConversationOnce(
+        characterId: string,
+        id: string,
+        generation: number,
+    ): Promise<boolean> {
         await this.dependencies.coordinator.flushPendingData('activate-conversation')
         if (
             generation !== this.navigationGeneration ||
+            characterId !== this.dependencies.getSelectedCharacterId() ||
             this.dependencies.canActivateWorkingSet?.() === false
         ) return false
         const revision = this.dependencies.coordinator.revision
         const mutationGeneration = this.dependencies.coordinator.mutationGeneration
         const conversation = await this.dependencies.store.readConversation(characterId, id)
-        if (!this.isCurrent(generation, revision, mutationGeneration)) return false
+        if (
+            characterId !== this.dependencies.getSelectedCharacterId() ||
+            !this.isCurrent(generation, revision, mutationGeneration)
+        ) return false
         if (!conversation) throw new Error(`Conversation ${id} was not found for ${characterId}`)
         if (conversation.revision !== revision) return false
         if (conversation.value.id !== id) {
             throw new Error(`Conversation ${id} returned mismatched ID ${conversation.value.id ?? ''}`)
         }
-        this.dependencies.publishConversation(characterId, conversation.value)
+        const resident = this.dependencies.getResidentCharacter?.(characterId)
+        const conversationIndex = resident?.chats.findIndex((candidate) => candidate.id === id) ?? -1
+        let nextCharacter: CompleteCharacter | undefined
+        if (resident && conversationIndex >= 0) {
+            const chats = [...resident.chats]
+            const previousIndex = resident.chatPage ?? 0
+            const previous = chats[previousIndex]
+            if (
+                previous &&
+                previousIndex !== conversationIndex &&
+                this.dependencies.canReleaseConversation?.(
+                    resident,
+                    previous.id ?? '',
+                    id,
+                ) === true
+            ) {
+                chats[previousIndex] = createConversationSummaryStubFromChat(
+                    characterId,
+                    previous,
+                    previousIndex,
+                )
+            }
+            chats[conversationIndex] = conversation.value
+            nextCharacter = {
+                ...resident,
+                chats,
+                chatPage: conversationIndex,
+            } as CompleteCharacter
+            if (!this.dependencies.coordinator.adoptHydratedCharacter(
+                revision,
+                mutationGeneration,
+                nextCharacter,
+            )) return false
+        }
+        this.dependencies.publishConversation(characterId, conversation.value, nextCharacter)
         return true
     }
 
@@ -254,15 +333,19 @@ export class ActiveWorkingSet {
         mutationGeneration: number,
         generation: number,
     ): Promise<CompleteCharacter | null> {
-        const detail = await this.dependencies.store.readCharacter(id)
-        if (!this.isCurrent(generation, revision, mutationGeneration)) return null
-        if (!detail) throw new MissingCharacterError(`Character ${id} was not found`)
-        if (detail.revision !== revision) return null
-        if (detail.value.chaId !== id) {
-            throw new Error(`Character ${id} returned mismatched ID ${detail.value.chaId}`)
-        }
+        const detail = await this.hydrateCharacterDetail(
+            id,
+            revision,
+            mutationGeneration,
+            generation,
+        )
+        if (!detail) return null
 
+        const summaries: ConversationSummary[] = []
+        const summaryPositions = new Map<string, number>()
         const chats: Chat[] = []
+        const hydrateAll = this.dependencies.shouldHydrateFullCharacter?.() === true
+        let selectedId: string | undefined
         let cursor: string | undefined
         do {
             const page = await this.dependencies.store.queryConversations({
@@ -280,12 +363,27 @@ export class ActiveWorkingSet {
                     throw new Error(`Conversation ${summary.id} returned mismatched character ID`)
                 }
             }
+            for (const summary of page.items) {
+                summaryPositions.set(summary.id, summaries.length)
+                summaries.push(summary)
+                chats.push(createConversationSummaryStub(summary))
+            }
+            const selectedSummary = page.items.find(
+                (summary) => summary.configuredIndex === (detail.chatPage ?? 0),
+            )
+            if (selectedSummary) selectedId = selectedSummary.id
+            const summariesToHydrate = hydrateAll
+                ? page.items
+                : selectedSummary ? [selectedSummary] : []
             for (
                 let start = 0;
-                start < page.items.length;
+                start < summariesToHydrate.length;
                 start += CONVERSATION_HYDRATION_CONCURRENCY
             ) {
-                const chunk = page.items.slice(start, start + CONVERSATION_HYDRATION_CONCURRENCY)
+                const chunk = summariesToHydrate.slice(
+                    start,
+                    start + CONVERSATION_HYDRATION_CONCURRENCY,
+                )
                 const conversations = await Promise.all(
                     chunk.map((summary) => this.dependencies.store.readConversation(id, summary.id)),
                 )
@@ -300,13 +398,51 @@ export class ActiveWorkingSet {
                     if (conversation.value.id !== summary.id) {
                         throw new Error(`Conversation ${summary.id} returned mismatched ID`)
                     }
-                    chats.push(conversation.value)
+                    chats[summaryPositions.get(summary.id)!] = conversation.value
                 }
             }
             cursor = page.nextCursor
         } while (cursor !== undefined)
 
-        return { ...detail.value, chats } as CompleteCharacter
+        if (!hydrateAll && !selectedId && summaries.length > 0) {
+            const summary = summaries[0]
+            const conversation = await this.dependencies.store.readConversation(id, summary.id)
+            if (!this.isCurrent(generation, revision, mutationGeneration)) return null
+            if (!conversation) {
+                throw new Error(`Conversation ${summary.id} was not found for ${id}`)
+            }
+            if (conversation.revision !== revision) return null
+            if (conversation.value.id !== summary.id) {
+                throw new Error(`Conversation ${summary.id} returned mismatched ID`)
+            }
+            selectedId = summary.id
+            chats[0] = conversation.value
+        }
+
+        const chatPage = selectedId
+            ? chats.findIndex((conversation) => conversation.id === selectedId)
+            : 0
+        return {
+            ...detail,
+            chats,
+            chatPage: chatPage < 0 ? 0 : chatPage,
+        } as CompleteCharacter
+    }
+
+    private async hydrateCharacterDetail(
+        id: string,
+        revision: DataRevision,
+        mutationGeneration: number,
+        generation: number,
+    ): Promise<CharacterDetail | null> {
+        const detail = await this.dependencies.store.readCharacter(id)
+        if (!this.isCurrent(generation, revision, mutationGeneration)) return null
+        if (!detail) throw new MissingCharacterError(`Character ${id} was not found`)
+        if (detail.revision !== revision) return null
+        if (detail.value.chaId !== id) {
+            throw new Error(`Character ${id} returned mismatched ID ${detail.value.chaId}`)
+        }
+        return detail.value
     }
 
     private isCurrent(

@@ -40,6 +40,8 @@ export interface ConversationSummary {
     id: string
     characterId: string
     name: string
+    folderId?: string
+    bindedPersona?: string
     configuredIndex: number
     recentAt: number
     messageCount: number

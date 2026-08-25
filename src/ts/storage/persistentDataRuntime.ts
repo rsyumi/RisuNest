@@ -186,8 +186,18 @@ export interface PersistentDataRuntimeStateAdapter {
     installCompleteDatabase?(database: Database): void
     restoreSelection?(characterId: string | null, conversationId: string | null): void
     publishCharacter(character: CompleteCharacter): void
-    publishCharacterSet?(primary: CompleteCharacter, related: CompleteCharacter[]): void
-    publishConversation(characterId: string, conversation: Chat): void
+    publishCharacterSet?(primary: CompleteCharacter, related: CharacterDetail[]): void
+    publishConversation(
+        characterId: string,
+        conversation: Chat,
+        nextCharacter?: CompleteCharacter,
+    ): void
+    shouldHydrateFullCharacter?(): boolean
+    canReleaseConversation?(
+        character: CompleteCharacter,
+        conversationId: string,
+        nextConversationId: string,
+    ): boolean
     canActivateWorkingSet?(): boolean
     canDeactivateWorkingSet?(): boolean
     canDeactivateCharacter?(id: string): boolean
@@ -381,9 +391,16 @@ export function createPersistentDataRuntime(
         store: dependencies.store,
         coordinator,
         getSelectedCharacterId: dependencies.state.getSelectedCharacterId,
+        getResidentCharacter: dependencies.state.captureCharacter,
         publishCharacter: dependencies.state.publishCharacter,
         publishCharacterSet: dependencies.state.publishCharacterSet ?? ((primary, related) => {
-            for (const character of related) dependencies.state.publishCharacter(character)
+            for (const detail of related) {
+                const resident = dependencies.state.captureCharacter(detail.chaId)
+                if (resident) dependencies.state.publishCharacter({
+                    ...detail,
+                    chats: resident.chats,
+                } as CompleteCharacter)
+            }
             dependencies.state.publishCharacter(primary)
         }),
         publishConversation: dependencies.state.publishConversation,
@@ -391,6 +408,8 @@ export function createPersistentDataRuntime(
         canDeactivateWorkingSet: dependencies.state.canDeactivateWorkingSet,
         canDeactivateCharacter: dependencies.state.canDeactivateCharacter,
         releaseInactiveCharacter: dependencies.state.releaseInactiveCharacter,
+        shouldHydrateFullCharacter: dependencies.state.shouldHydrateFullCharacter,
+        canReleaseConversation: dependencies.state.canReleaseConversation,
     })
     const activateCharacter = (
         id: string,
@@ -520,6 +539,15 @@ export function createPersistentDataRuntime(
                 true,
             )
             dependencies.state.restoreSelection?.(selectedCharacterId, selectedConversationId)
+            const resident = dependencies.state.captureSelectedCharacter()
+            if (
+                resident &&
+                !coordinator.adoptHydratedCharacter(
+                    snapshot.revision,
+                    snapshot.mutationGeneration,
+                    resident,
+                )
+            ) return false
             return true
         },
         publishCurrentOfficialRevision: () => coordinator.publishCurrentOfficialRevision(),
