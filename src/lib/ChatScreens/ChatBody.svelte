@@ -8,6 +8,8 @@
     import { getModuleAssets } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc } from "src/ts/globalApi.svelte";
+    import { DeferredInlayMarkerRegistry, mountDeferredInlaySources } from "src/ts/process/files/inlayRenderSource";
+    import { onDestroy, tick } from 'svelte'
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -44,6 +46,17 @@
     let lastParsed = ''
     let lastCharArg:string|simpleCharacterArgument = null
     let lastChatId = -10
+    let renderRoot = $state<HTMLElement | undefined>(undefined)
+    let releaseObjectUrls = () => {}
+    let destroyed = false
+
+    interface ChatBodyParseJob {
+        promise: Promise<string>
+        deferredInlays: DeferredInlayMarkerRegistry
+        disposed: boolean
+    }
+
+    let activeParseJob: ChatBodyParseJob|null = null
 
     function getCbsCondition(){
         try{
@@ -63,7 +76,10 @@
 
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
 
-    const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, tries?:number) => {
+    const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
+        const parseForRender = (value:string, mode:'normal'|'back'|'pretranslate'|'notrim') => (
+            ParseMarkdown(value, charArg, mode, chatID, getCbsCondition(), { deferredInlays: job.deferredInlays })
+        )
         // track 'translated' and 'retranslate' state
         translated;
         retranslate;
@@ -100,7 +116,7 @@
                     // State change of `translated` triggers markParsing again,
                     // causing redundant translation attempts
                     if (lastTranslated !== translateText) {
-                        return;
+                        return ''
                     }
                 } catch (error) {
                     console.error(error)
@@ -118,13 +134,13 @@
                     translating = true
                     data = await translateHTML(data, false, charArg, chatID, retranslate)
                     translating = false
-                    const marked = await ParseMarkdown(data, charArg, mode, chatID, getCbsCondition())
+                    const marked = await parseForRender(data, mode)
                     lastParsedQueue = marked
                     lastCharArg = charArg
                     transResult = marked
                 }
                 else if(!DBState.db.legacyTranslation){
-                    const marked = await ParseMarkdown(data, charArg, 'pretranslate', chatID, getCbsCondition())
+                    const marked = await parseForRender(data, 'pretranslate')
                     translating = true
                     const translated = await postTranslationParse(await translateHTML(marked, false, charArg, chatID, retranslate))
                     translating = false
@@ -133,7 +149,7 @@
                     transResult = translated
                 }
                 else{
-                    const marked = await ParseMarkdown(data, charArg, mode, chatID, getCbsCondition())
+                    const marked = await parseForRender(data, mode)
                     translating = true
                     const translated = await translateHTML(marked, false, charArg, chatID, retranslate)
                     translating = false
@@ -149,7 +165,7 @@
                 return transResult
             }
             else{
-                const marked = await ParseMarkdown(data, charArg, mode, chatID, getCbsCondition())
+                const marked = await parseForRender(data, mode)
                 lastParsedQueue = marked
                 lastCharArg = charArg
                 return marked
@@ -161,7 +177,10 @@
                 alertError(`Error while parsing chat message: ${translated}, ${error.message}, ${error.stack}`)
                 return data
             }
-            return await markParsing(data, charArg, chatID, (tries ?? 0) + 1)
+            if(job.disposed) return data
+            job.deferredInlays.clear()
+            job.deferredInlays = new DeferredInlayMarkerRegistry()
+            return await markParsing(data, charArg, chatID, job, (tries ?? 0) + 1)
         }
         finally{
             //since trimMarkdown is fast, we don't need to cache it
@@ -246,24 +265,77 @@
         }
     }
 
-    let markParsingResult = $derived.by(() => markParsing(msgDisplay, character, idx))
+    function startParsing():ChatBodyParseJob {
+        const job:ChatBodyParseJob = {
+            promise: Promise.resolve(''),
+            deferredInlays: new DeferredInlayMarkerRegistry(),
+            disposed: false,
+        }
+        job.promise = markParsing(msgDisplay, character, idx, job)
+        return job
+    }
+
+    function disposeParseJob(job:ChatBodyParseJob|null) {
+        if (!job || job.disposed) return
+        job.disposed = true
+        job.deferredInlays.clear()
+    }
+
+    let markParsingResult = $derived.by(() => shouldRenderRawStreaming ? null : startParsing())
+
+    async function syncObjectUrls(job: ChatBodyParseJob) {
+        try {
+            await job.promise
+            if (destroyed || job.disposed || job !== markParsingResult) {
+                disposeParseJob(job)
+                return
+            }
+            await tick()
+            if (destroyed || job.disposed || job !== markParsingResult) {
+                disposeParseJob(job)
+                return
+            }
+            releaseObjectUrls()
+            if (renderRoot) releaseObjectUrls = mountDeferredInlaySources(renderRoot, job.deferredInlays)
+            else disposeParseJob(job)
+        }
+        catch {
+            // markParsing handles its own failures
+        }
+    }
+
+    onDestroy(() => {
+        destroyed = true
+        releaseObjectUrls()
+        disposeParseJob(activeParseJob)
+    })
 
     $effect(() => {
+        const result = markParsingResult
+        if (activeParseJob !== result) {
+            disposeParseJob(activeParseJob)
+            activeParseJob = result
+        }
         if(shouldRenderRawStreaming){
+            releaseObjectUrls()
+            releaseObjectUrls = () => {}
             return
         }
-        markParsingResult
+        if (!result) return
         checkImg()
-        markParsingResult.then(checkImg)
+        result.promise.then(checkImg)
+        void syncObjectUrls(result)
     })
 </script>
 
 {#if shouldRenderRawStreaming}
     <span class="whitespace-pre-wrap">{rawStreamingText}</span>
 {:else}
-    {#await markParsingResult}
-        {@html addMetadataToElement(trimMarkdown(lastParsed), modelShortName)}
-    {:then md}
-        {@html addMetadataToElement(trimMarkdown(md), modelShortName)}
-    {/await}
+    <span style="display:contents" bind:this={renderRoot}>
+        {#await markParsingResult?.promise}
+            {@html addMetadataToElement(trimMarkdown(lastParsed), modelShortName)}
+        {:then parsed}
+            {@html addMetadataToElement(trimMarkdown(parsed ?? ''), modelShortName)}
+        {/await}
+    </span>
 {/if}

@@ -25,6 +25,8 @@
     import PopupButton from "../UI/PopupButton.svelte";
     import PartialEditController from './PartialEditController.svelte';
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
+    import { DeferredInlayMarkerRegistry, withResolvedDeferredInlaySources } from "src/ts/process/files/inlayRenderSource"
+    import { copyImageSourceToDataUrl } from "src/ts/process/files/chatCopyInlays"
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -516,10 +518,19 @@
                 alertWait(language.loading)
                 const root = document.querySelector(':root') as HTMLElement;
 
+                const deferredInlays = new DeferredInlayMarkerRegistry()
                 const parser = new DOMParser()
                 const doc = parser.parseFromString(
-                    await ParseMarkdown(copyText, getCurrentCharacter(), 'normal', idx, getCbsCondition())
+                    await ParseMarkdown(
+                        copyText,
+                        getCurrentCharacter(),
+                        'normal',
+                        idx,
+                        getCbsCondition(),
+                        { deferredInlays },
+                    )
                 , 'text/html')
+                await withResolvedDeferredInlaySources(doc, deferredInlays, async () => {
                 
                 doc.querySelectorAll('mark').forEach((el) => {
                     const d = el.getAttribute('risu-mark')
@@ -564,37 +575,35 @@
                         margin-right: auto;
                     `)
                     
-                    if(url && (url.startsWith('http://asset.localhost') || url.startsWith('https://asset.localhost') || url.startsWith('https://sv.risuai') || url.startsWith('data:') || url.startsWith('http') || url.startsWith('/'))){
+                    if(url && (url.startsWith('blob:') || url.startsWith('http://asset.localhost') || url.startsWith('https://asset.localhost') || url.startsWith('https://sv.risuai') || url.startsWith('data:') || url.startsWith('http') || url.startsWith('/'))){
                         try {
                             let fetchUrl = url
                             if(url.startsWith('/')) {
                                 fetchUrl = window.location.origin + url
                             }
                             
-                            const data = await fetch(fetchUrl)
-                            if (data.ok) {
-                                const canvas = document.createElement('canvas')
-                                const ctx = canvas.getContext('2d')
-                                const imgElement = new Image()
-                                imgElement.crossOrigin = 'anonymous'
-                                imgElement.src = await data.blob().then((b) => new Promise((resolve, reject) => {
-                                    const reader = new FileReader()
-                                    reader.onload = () => resolve(reader.result as string)
-                                    reader.onerror = reject
-                                    reader.readAsDataURL(b)
-                                }))
-                                await new Promise((resolve) => {
-                                    imgElement.onload = resolve
-                                })
-                                canvas.width = imgElement.width
-                                canvas.height = imgElement.height
-                                ctx.drawImage(imgElement, 0, 0)
-                                const dataURL = canvas.toDataURL('image/jpeg', 0.6)
-                                img.setAttribute('src', dataURL)
-                            }
+                            const dataUrl = await copyImageSourceToDataUrl(fetchUrl, 0.6)
+                            if(dataUrl) img.setAttribute('src', dataUrl)
                         } catch (error) {
                             console.error('Image error:', error)
                         }
+                    }
+                }
+
+                for(const source of doc.querySelectorAll('source[src^="blob:"]')){
+                    try {
+                        const response = await fetch(source.getAttribute('src'))
+                        if(response.ok){
+                            const dataUrl = await response.blob().then((blob) => new Promise<string>((resolve, reject) => {
+                                const reader = new FileReader()
+                                reader.onload = () => resolve(reader.result as string)
+                                reader.onerror = reject
+                                reader.readAsDataURL(blob)
+                            }))
+                            source.setAttribute('src', dataUrl)
+                        }
+                    } catch (error) {
+                        console.error('Media error:', error)
                     }
                 }
 
@@ -719,6 +728,7 @@
                         'text/html': new Blob([html], {type: 'text/html'})
                     })
                 ])
+                })
                 alertNormal(language.copied)
                 return
             }

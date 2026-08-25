@@ -203,6 +203,25 @@ describe('getFileSrc tauri asset route', () => {
         state.blobStore = createFakeBlobStore({ 'assets/ghost.png': { data: new Uint8Array([1]), mime: 'image/png' } })
         expect(await getFileSrc('assets/ghost.png')).toBe('asset:///data/assets/ghost.png')
     })
+
+    test('bounds native URL entries without revoking protocol URLs', async () => {
+        state.isTauri = true
+        const entries = Object.fromEntries(
+            Array.from({ length: 257 }, (_, index) => [`assets/native-${index}.png`, {
+                data: new Uint8Array([index]), mime: 'image/png',
+            }]),
+        )
+        state.blobStore = createFakeBlobStore(entries)
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+
+        for (let index = 0; index < 257; index++) {
+            await getFileSrc(`assets/native-${index}.png`)
+        }
+        await getFileSrc('assets/native-0.png')
+
+        expect(state.blobStore.resolveUrl).toHaveBeenCalledTimes(258)
+        expect(revokeObjectURL).not.toHaveBeenCalled()
+    })
 })
 
 describe('getFileSrc browser asset route', () => {

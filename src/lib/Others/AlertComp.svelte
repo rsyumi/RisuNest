@@ -3,7 +3,7 @@
     
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from '../../ts/characters';
-    import { ParseMarkdown } from '../../ts/parser/parser.svelte';
+    import DeferredMarkdown from '../UI/DeferredMarkdown.svelte';
     import BarIcon from '../SideBars/BarIcon.svelte';
     import { ChevronRightIcon, User } from '@lucide/svelte';
     import { hubURL, isCharacterHasAssets } from 'src/ts/characterCards';
@@ -220,9 +220,7 @@
             {#if $alertStore.type === 'markdown'}
                 <div class="overflow-y-auto">
                     <span class="text-gray-300 chattext prose chattext2" class:prose-invert={$ColorSchemeTypeStore}>
-                        {#await ParseMarkdown($alertStore.msg) then msg}
-                            {@html msg}                        
-                        {/await}
+                        <DeferredMarkdown data={$alertStore.msg} />
                     </span>
                 </div>
             {:else if $alertStore.type === 'tos'}

@@ -10,6 +10,7 @@ import {
     migrateLegacyInlayAsset,
     readLegacyInlayPayload,
     postInlayAsset,
+    reencodeImage,
     removeInlayAsset,
     saveInlayedSignature,
     setInlayAsset,
@@ -382,6 +383,42 @@ describe('removeInlayAsset', () => {
 })
 
 describe('postInlayAsset', () => {
+    test('revokes an image URL when the source setter throws', async () => {
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:source-throw')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+        vi.stubGlobal('Image', class {
+            onload: (() => void) | null = null
+            onerror: (() => void) | null = null
+            set src(_value: string) { throw new Error('source assignment failed') }
+        })
+
+        await expect(postInlayAsset({
+            name: 'broken.png',
+            data: new Uint8Array([1]),
+        })).rejects.toThrow('source assignment failed')
+
+        expect(revokeObjectURL).toHaveBeenCalledTimes(1)
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:source-throw')
+    })
+
+    test('revokes an image URL when image loading fails', async () => {
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:load-error')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+        vi.stubGlobal('Image', class {
+            onload: (() => void) | null = null
+            onerror: (() => void) | null = null
+            set src(_value: string) { queueMicrotask(() => this.onerror?.()) }
+        })
+
+        await expect(postInlayAsset({
+            name: 'broken.png',
+            data: new Uint8Array([1]),
+        })).rejects.toThrow('Failed to load image')
+
+        expect(revokeObjectURL).toHaveBeenCalledTimes(1)
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:load-error')
+    })
+
     test('stores audio asset and returns id', async () => {
         const data = new Uint8Array([0xff, 0xfb, 0x90, 0x00])
         const result = await postInlayAsset({
@@ -462,6 +499,40 @@ describe('postInlayAsset', () => {
                 expect(stored!.ext).toBe(ext)
             }),
         )
+    })
+})
+
+describe('reencodeImage temporary object URLs', () => {
+    test('revokes the temporary URL after a successful conversion', async () => {
+        const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:success')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+        vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,AA==')
+        vi.stubGlobal('Image', class {
+            width = 1
+            height = 1
+            src = ''
+            async decode() {}
+        })
+
+        await reencodeImage(new Uint8Array([1]))
+
+        expect(createObjectURL).toHaveBeenCalledTimes(1)
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:success')
+        expect(revokeObjectURL).toHaveBeenCalledTimes(1)
+    })
+
+    test('revokes the temporary URL when conversion fails', async () => {
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:failure')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+        vi.stubGlobal('Image', class {
+            src = ''
+            async decode() { throw new Error('decode failed') }
+        })
+
+        await expect(reencodeImage(new Uint8Array([1]))).rejects.toThrow('decode failed')
+
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:failure')
+        expect(revokeObjectURL).toHaveBeenCalledTimes(1)
     })
 })
 

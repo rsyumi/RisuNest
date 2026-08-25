@@ -11,8 +11,8 @@ import css, { type CssAtRuleAST } from '@adobe/css-tools'
 import { selectedCharID } from '../stores.svelte';
 import { calcString } from '../process/infunctions';
 import { findCharacterbyId, getPersonaPrompt, getUserIcon, getUserName, pickHashRand, replaceAsync} from '../util';
-import { getInlayAssetBlob } from '../process/files/inlays';
-import { getInlayRenderSources, renderInlaySourceMarkup, type InlayRenderSource } from '../process/files/inlayRenderSource';
+import { getInlayAssetMetadata } from '../process/files/inlays';
+import { DeferredInlayMarkerRegistry, getInlayRenderSources, renderDeferredInlaySourceMarkup, renderInlaySourceMarkup, type InlayRenderSource } from '../process/files/inlayRenderSource';
 import { getModuleAssets, getModuleLorebooks, getModules } from '../process/modules';
 import hljs from 'highlight.js/lib/core'
 import 'highlight.js/styles/atom-one-dark.min.css'
@@ -429,16 +429,8 @@ function getEmoSrc(emoArr: string[][], emoPaths: AssetPaths) {
     }
 }
 
-const fileSrcCache = new Map<string, string>()
-
 async function getFileSrcCached(path:string){
-    let cached = fileSrcCache.get(path)
-    if(cached){
-        return cached
-    }
-    const src = await getFileSrc(path)
-    fileSrcCache.set(path, src)
-    return src
+    return await getFileSrc(path)
 }
 
 type AssetPaths = {[key:string]:{
@@ -662,9 +654,8 @@ function trimmer(str:string){
     return str.trim().replace(/[_ -.]/g, '')
 }
 
-const blobUrlCache = new Map<string, string>()
-
-async function parseInlayAssets(data:string){
+async function parseInlayAssets(data:string, deferredInlays?:DeferredInlayMarkerRegistry){
+    const markerRegistry = deferredInlays ?? new DeferredInlayMarkerRegistry()
     const inlayMatch = data.match(/{{(inlay|inlayed|inlayeddata)::(.+?)}}/g)
     if(inlayMatch){
         const nativeSources = isTauri
@@ -681,22 +672,15 @@ async function parseInlayAssets(data:string){
                 source = nativeSources?.get(id) ?? null
             }
             else{
-                const asset = await getInlayAssetBlob(id)
-                let url = blobUrlCache.get(id)
-                if(!url && asset?.data){
-                    url = URL.createObjectURL(asset.data)
-                    blobUrlCache.set(id, url)
-                }
-                if(asset && url){
+                const asset = await getInlayAssetMetadata(id)
+                if(asset){
                     source = {
-                        url,
-                        mime: asset.data.type,
-                        type: asset.type,
+                        url: '', mime: asset.mime, type: asset.inlayType,
                         name: asset.name,
-                        size: asset.data.size,
+                        size: asset.size,
                         width: asset.width,
                         height: asset.height,
-                        objectUrl: true,
+                        objectUrl: false,
                     }
                 }
             }
@@ -707,13 +691,13 @@ async function parseInlayAssets(data:string){
                         data = data.replace(inlay, '')
                         break
                     }
-                    data = data.replace(inlay, `${prefix}${renderInlaySourceMarkup(source)}${postfix}`)
+                    data = data.replace(inlay, `${prefix}${isTauri ? renderInlaySourceMarkup(source) : renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
                     break
                 case 'video':
-                    data = data.replace(inlay, `${prefix}${renderInlaySourceMarkup(source)}${postfix}`)
+                    data = data.replace(inlay, `${prefix}${isTauri ? renderInlaySourceMarkup(source) : renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
                     break
                 case 'audio':
-                    data = data.replace(inlay, `${prefix}${renderInlaySourceMarkup(source)}${postfix}`)
+                    data = data.replace(inlay, `${prefix}${isTauri ? renderInlaySourceMarkup(source) : renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
                     break
             }
             
@@ -730,6 +714,10 @@ export interface simpleCharacterArgument{
     virtualscript?: string
     emotionImages?: [string, string][]
     triggerscript?: triggerscript[]
+}
+
+export interface ParseMarkdownRenderContext {
+    deferredInlays?: DeferredInlayMarkerRegistry
 }
 
 function parseThoughtsAndTools(data:string){
@@ -760,7 +748,8 @@ export async function ParseMarkdown(
     charArg:(character|simpleCharacterArgument | groupChat | string) = null,
     mode:'normal'|'back'|'pretranslate'|'notrim' = 'normal',
     chatID=-1,
-    cbsConditions:CbsConditions = {}
+    cbsConditions:CbsConditions = {},
+    renderContext:ParseMarkdownRenderContext = {},
 ) {
     let firstParsed = ''
     const additionalAssetMode = (mode === 'back') ? 'back' : 'normal'
@@ -783,7 +772,7 @@ export async function ParseMarkdown(
         })
     }
 
-    data = await parseInlayAssets(data ?? '')
+    data = await parseInlayAssets(data ?? '', renderContext.deferredInlays)
 
     data = parseThoughtsAndTools(data)
 

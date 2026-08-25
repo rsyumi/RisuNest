@@ -11,7 +11,7 @@
     import { language } from "src/lang";
     import { getUserName, replacePlaceholders } from "../../ts/util";
     import { onDestroy } from 'svelte';
-    import { ParseMarkdown } from "src/ts/parser/parser.svelte";
+    import DeferredMarkdown from "src/lib/UI/DeferredMarkdown.svelte";
     import {defaultAutoSuggestPrompt} from "../../ts/storage/defaultPrompts.js";
 
     interface Props {
@@ -199,9 +199,7 @@
                     messageInput(suggest)
                     send()
                 }}>
-                {#await ParseMarkdown((DBState.db.translator !== '' && toggleTranslate && suggestMessagesTranslated && suggestMessagesTranslated.length > 0) ? suggestMessagesTranslated[i]??suggest : suggest) then md}
-                    {@html md}
-                {/await}
+                <DeferredMarkdown data={(DBState.db.translator !== '' && toggleTranslate && suggestMessagesTranslated && suggestMessagesTranslated.length > 0) ? suggestMessagesTranslated[i]??suggest : suggest} />
                 </button>
                 <button class="bg-textcolor2 hover:bg-darkbutton text-textcolor font-bold py-2 px-4 rounded-sm ml-1" onclick={() => {
                     messageInput(suggest)

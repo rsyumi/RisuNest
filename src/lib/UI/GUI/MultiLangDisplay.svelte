@@ -1,6 +1,6 @@
 <script lang="ts">
     import { ColorSchemeTypeStore } from "src/ts/gui/colorscheme";
-    import { ParseMarkdown } from "src/ts/parser/parser.svelte";
+    import DeferredMarkdown from "../DeferredMarkdown.svelte";
     import { parseMultilangString, toLangName } from "src/ts/util";
     import { DBState } from "src/ts/stores.svelte";
 
@@ -60,9 +60,7 @@
     </div>
     {#if markdown}
         <div class="ml-2 max-w-full wrap-break-word text chat chattext prose" class:prose-invert={$ColorSchemeTypeStore}>
-            {#await ParseMarkdown(valueObject[selectedLang]) then md} 
-                {@html md}
-            {/await}
+            <DeferredMarkdown data={valueObject[selectedLang]} />
         </div>
     {:else}
         <div class="ml-2 max-w-full wrap-break-word text chat chattext prose" class:prose-invert={$ColorSchemeTypeStore}>

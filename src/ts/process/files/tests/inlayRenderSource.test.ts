@@ -10,9 +10,13 @@ const inlayMocks = vi.hoisted(() => ({
 vi.mock('../inlays', () => inlayMocks)
 
 import {
+    DeferredInlayMarkerRegistry,
     getInlayRenderSource,
     getInlayRenderSources,
     getNativeInlayThumbnailSize,
+    mountDeferredInlaySources,
+    resolveDeferredInlaySources,
+    renderDeferredInlaySourceMarkup,
     renderInlaySourceMarkup,
 } from '../inlayRenderSource'
 
@@ -121,6 +125,174 @@ describe('getInlayRenderSource', () => {
             size: 42,
             objectUrl: false,
         })).toBe('<video controls><source src="http://example.test/a?x=&quot;&lt;&gt;&amp;&#39;value" type="video/webm&quot; onload=&quot;bad&lt;&gt;&amp;&#39;"></video>')
+    })
+
+    test('escapes deferred marker IDs', () => {
+        const registry = new DeferredInlayMarkerRegistry()
+        expect(renderDeferredInlaySourceMarkup('a"<', {
+            url: '', mime: 'image/png', type: 'image', name: 'a', size: 1, objectUrl: false,
+        }, registry)).toContain('data-risu-inlay-id="a&quot;&lt;"')
+    })
+
+    test('ignores forged raw markers and mismatched element kinds', async () => {
+        const registry = new DeferredInlayMarkerRegistry()
+        const generated = renderDeferredInlaySourceMarkup('image-id', { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)
+        const slot = generated.match(/data-risu-inlay-slot="([^"]+)/)?.[1]
+        const root = document.createElement('div')
+        root.innerHTML = `<img data-risu-inlay-id="forged" data-risu-inlay-token="guessed"><video><source data-risu-inlay-slot="${slot}"></video>`
+        const cleanup = mountDeferredInlaySources(root, registry)
+        await Promise.resolve(); await Promise.resolve()
+        expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
+        cleanup()
+    })
+
+    test('does not retain dropped generated markers', () => {
+        const registry = new DeferredInlayMarkerRegistry()
+        for (let index = 0; index < 1000; index++) {
+            expect(renderDeferredInlaySourceMarkup(`drop-${index}`, { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)).toContain('data-risu-inlay-slot')
+        }
+        registry.clear()
+    })
+
+    test('loads each mounted ID once and releases URLs once', async () => {
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({ data: new Blob(['x'.repeat(33 * 1024 * 1024)]), type: 'image', name: 'x' })
+        const create = vi.fn((_: Blob) => `blob:${create.mock.calls.length}`)
+        const revoke = vi.fn()
+        vi.stubGlobal('URL', { ...URL, createObjectURL: create, revokeObjectURL: revoke })
+        const root = document.createElement('div')
+        const registry = new DeferredInlayMarkerRegistry()
+        root.innerHTML = Array.from({ length: 129 }, () => renderDeferredInlaySourceMarkup('same', { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)).join('')
+        document.body.append(root)
+        const cleanup = mountDeferredInlaySources(root, registry)
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(1)
+        expect(root.querySelectorAll('[src="blob:1"]')).toHaveLength(129)
+        cleanup(); cleanup()
+        expect(revoke).toHaveBeenCalledTimes(1)
+        root.remove()
+    })
+
+    test.each(['audio', 'video'] as const)('reloads deferred %s after assigning its source', async (type) => {
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({ data: new Blob(['x']), type, name: `x.${type}` })
+        const root = document.createElement('div')
+        const registry = new DeferredInlayMarkerRegistry()
+        root.innerHTML = renderDeferredInlaySourceMarkup('media', { url: '', mime: `${type}/x`, type, name: 'x', size: 1, objectUrl: false }, registry)
+        const media = root.querySelector(type) as HTMLMediaElement
+        media.load = vi.fn()
+        document.body.append(root)
+
+        mountDeferredInlaySources(root, registry)
+        await Promise.resolve(); await Promise.resolve()
+
+        expect(media.load).toHaveBeenCalledTimes(1)
+        root.remove()
+    })
+
+    test('releases pending elements without creating a URL after cleanup', async () => {
+        let resolve: (value: any) => void
+        inlayMocks.getInlayAssetBlob.mockReturnValue(new Promise((done) => { resolve = done }))
+        const revoke = vi.fn()
+        vi.stubGlobal('URL', { ...URL, createObjectURL: vi.fn(() => 'blob:late'), revokeObjectURL: revoke })
+        const root = document.createElement('div')
+        const registry = new DeferredInlayMarkerRegistry()
+        root.innerHTML = renderDeferredInlaySourceMarkup('late', { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)
+        const element = root.querySelector('img')!
+        const setAttribute = vi.spyOn(element, 'setAttribute')
+        mountDeferredInlaySources(root, registry)()
+        setAttribute.mockClear()
+        root.remove()
+        resolve!({ data: new Blob(['x']), type: 'image', name: 'x' })
+        await Promise.resolve(); await Promise.resolve()
+        expect(root.querySelector('img')?.getAttribute('src')).toBeNull()
+        expect(URL.createObjectURL).not.toHaveBeenCalled()
+        expect(revoke).not.toHaveBeenCalled()
+        expect(setAttribute).not.toHaveBeenCalled()
+    })
+
+    test('awaits deferred source attachment for detached document serialization', async () => {
+        let resolve: (value: any) => void
+        inlayMocks.getInlayAssetBlob.mockReturnValue(new Promise((done) => { resolve = done }))
+        const registry = new DeferredInlayMarkerRegistry()
+        const doc = document.implementation.createHTMLDocument()
+        doc.body.innerHTML = renderDeferredInlaySourceMarkup('copy', { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)
+        const resolving = resolveDeferredInlaySources(doc, registry)
+        let settled = false
+        void resolving.then(() => { settled = true })
+        await Promise.resolve()
+        expect(settled).toBe(false)
+
+        resolve!({ data: new Blob(['x']), type: 'image', name: 'x' })
+        const cleanup = await resolving
+
+        expect(doc.querySelector('img')?.getAttribute('src')).toBe('blob:web-preview')
+        cleanup()
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:web-preview')
+    })
+
+    test('does not let a copied slot authorize another ID', async () => {
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({ data: new Blob(['x']), type: 'image', name: 'x' })
+        const registry = new DeferredInlayMarkerRegistry()
+        const generated = renderDeferredInlaySourceMarkup('original', { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)
+        const slot = generated.match(/data-risu-inlay-slot="([^"]+)/)?.[1]
+        const root = document.createElement('div')
+        root.innerHTML = `${generated}<img data-risu-inlay-id="other" data-risu-inlay-slot="${slot}">`
+        document.body.append(root)
+
+        mountDeferredInlaySources(root, registry)
+        await Promise.resolve(); await Promise.resolve()
+
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(1)
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledWith('original')
+        expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalledWith('other')
+        expect(root.querySelector('[data-risu-inlay-id="other"]')?.getAttribute('src')).toBeNull()
+        root.remove()
+    })
+
+    test('does not let a sealed token authorize a newly forged ID', async () => {
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({ data: new Blob(['x']), type: 'image', name: 'x' })
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = renderDeferredInlaySourceMarkup('original', { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)
+        document.body.append(root)
+        const cleanup = mountDeferredInlaySources(root, registry)
+        await Promise.resolve(); await Promise.resolve()
+        const observedToken = root.querySelector('img')?.dataset.risuInlayToken
+        expect(observedToken).toBeTruthy()
+        inlayMocks.getInlayAssetBlob.mockClear()
+
+        root.insertAdjacentHTML('beforeend', `<img data-risu-inlay-id="other" data-risu-inlay-token="${observedToken}">`)
+        mountDeferredInlaySources(root, registry)
+        await Promise.resolve(); await Promise.resolve()
+
+        expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
+        expect(root.querySelector('[data-risu-inlay-id="other"]')?.getAttribute('src')).toBeNull()
+        cleanup()
+        root.remove()
+    })
+
+    test('revokes a URL when its only marker disconnects during URL creation', async () => {
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({ data: new Blob(['x']), type: 'image', name: 'x' })
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = renderDeferredInlaySourceMarkup('race', { url: '', mime: 'image/png', type: 'image', name: 'x', size: 1, objectUrl: false }, registry)
+        document.body.append(root)
+        const revoke = vi.fn()
+        vi.stubGlobal('URL', {
+            ...URL,
+            createObjectURL: vi.fn(() => {
+                root.querySelector('img')?.remove()
+                return 'blob:detached'
+            }),
+            revokeObjectURL: revoke,
+        })
+
+        mountDeferredInlaySources(root, registry)
+        await Promise.resolve(); await Promise.resolve()
+
+        expect(revoke).toHaveBeenCalledTimes(1)
+        expect(revoke).toHaveBeenCalledWith('blob:detached')
+        root.remove()
     })
 
     test('preserves the web Blob fallback when legacy metadata is not listed yet', async () => {

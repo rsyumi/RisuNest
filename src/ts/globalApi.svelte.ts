@@ -146,6 +146,7 @@ function createBrowserAssetDataUrlCache() {
     return new ByteBudgetLru<string, string>(
         getRuntimePerformanceBudgets().browserAssetDataUrlCacheBytes,
         (_loc, dataUrl) => dataUrl.length,
+        256,
     )
 }
 
@@ -154,7 +155,11 @@ subscribeRuntimePerformanceProfile(() => {
     browserAssetDataUrlCache = createBrowserAssetDataUrlCache()
 })
 const pendingBrowserAssetReads = new Map<string, Promise<string | null>>()
-const tauriAssetUrlCache = new Map<string, string>()
+const tauriAssetUrlCache = new ByteBudgetLru<string, string>(
+    Number.POSITIVE_INFINITY,
+    () => 0,
+    256,
+)
 
 function buildAssetDataUrl(mime: string | undefined, data: Uint8Array): string {
     return `data:${mime || 'application/octet-stream'};base64,${Buffer.from(data).toString('base64')}`
@@ -181,7 +186,7 @@ async function readBrowserAssetDataUrl(loc: string): Promise<string | null> {
         })()
         pendingBrowserAssetReads.set(loc, pending)
         const cleanup = () => {
-            pendingBrowserAssetReads.delete(loc)
+            if (pendingBrowserAssetReads.get(loc) === pending) pendingBrowserAssetReads.delete(loc)
         }
         void pending.then(cleanup, cleanup)
     }

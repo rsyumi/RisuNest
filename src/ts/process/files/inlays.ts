@@ -44,12 +44,16 @@ export async function postInlayAsset(img:{
     const imgObj = new Image()
 
     if(inlayImageExts.includes(extention)){
-        imgObj.src = URL.createObjectURL(new Blob([asBuffer(img.data)], {type: `image/${extention}`}))
-
-        return await writeInlayImage(imgObj, {
-            name: img.name,
-            ext: extention
-        })
+        const url = URL.createObjectURL(new Blob([asBuffer(img.data)], {type: `image/${extention}`}))
+        try {
+            return await writeInlayImage(imgObj, {
+                name: img.name,
+                ext: extention
+            }, url)
+        }
+        finally {
+            URL.revokeObjectURL(url)
+        }
     }
 
     if(inlayAudioExts.includes(extention)){
@@ -83,13 +87,13 @@ export async function postInlayAsset(img:{
     return null
 }
 
-export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string, ext?:string, id?:string} = {}) {
+export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string, ext?:string, id?:string} = {}, sourceUrl?: string) {
 
     let drawHeight = 0
     let drawWidth = 0
     const canvas = document.createElement('canvas')
     const ctx = canvas.getContext('2d')
-    await new Promise((resolve) => {
+    await new Promise<void>((resolve, reject) => {
         imgObj.onload = () => {
             drawHeight = imgObj.height
             drawWidth = imgObj.width
@@ -109,6 +113,8 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
             ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
             resolve(null)
         }
+        imgObj.onerror = () => reject(new Error('Failed to load image'))
+        if (sourceUrl) imgObj.src = sourceUrl
     })
     const imageBlob = await new Promise<Blob>((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
 
@@ -378,15 +384,21 @@ export async function reencodeImage(img:Uint8Array){
     }
     const canvas = document.createElement('canvas')
     const imgObj = new Image()
-    imgObj.src = URL.createObjectURL(new Blob([asBuffer(img)], {type: `image/png`}))
-    await imgObj.decode()
-    let drawHeight = imgObj.height
-    let drawWidth = imgObj.width
-    canvas.width = drawWidth
-    canvas.height = drawHeight
-    const ctx = canvas.getContext('2d')
-    ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
-    const b64 = canvas.toDataURL('image/png').split(',')[1]
-    const b = Buffer.from(b64, 'base64')
-    return b
+    const url = URL.createObjectURL(new Blob([asBuffer(img)], {type: `image/png`}))
+    try {
+        imgObj.src = url
+        await imgObj.decode()
+        let drawHeight = imgObj.height
+        let drawWidth = imgObj.width
+        canvas.width = drawWidth
+        canvas.height = drawHeight
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
+        const b64 = canvas.toDataURL('image/png').split(',')[1]
+        const b = Buffer.from(b64, 'base64')
+        return b
+    }
+    finally {
+        URL.revokeObjectURL(url)
+    }
 }
