@@ -7,6 +7,7 @@ import type { Chat, Database, character, groupChat } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
 import { createPluginStorageStore } from '../plugins/pluginStorageStore'
+import { createConversationSummaryStubFromChat } from './conversationResidency'
 
 function makeDatabase(): Database {
     return {
@@ -1203,6 +1204,111 @@ describe('SaveCoordinator', () => {
             expect(coordinator.pendingBytes).toBe(0)
         },
     )
+
+    it('reconstructs selected group conversation stubs before pending-delete compensation', async () => {
+        const selectedConversation = {
+            id: 'selected-chat',
+            name: 'Selected chat',
+            message: [{ role: 'user', data: 'selected body', chatId: 'selected-message' }],
+        } as groupChat['chats'][number]
+        const omittedConversation = {
+            id: 'omitted-chat',
+            name: 'Omitted chat',
+            note: 'Authoritative note',
+            localLore: [{ key: 'authoritative lore', content: 'keep' }],
+            message: [{ role: 'char', data: 'omitted body', chatId: 'omitted-message' }],
+        } as groupChat['chats'][number]
+        const omittedStub = createConversationSummaryStubFromChat(
+            'group-a',
+            omittedConversation,
+            1,
+        )
+        const group = {
+            type: 'group',
+            chaId: 'group-a',
+            name: 'Group',
+            additionalText: 'Initial',
+            characters: ['char-a', 'char-b'],
+            characterTalks: [0.25, 0.75],
+            characterActive: [false, true],
+            chats: [selectedConversation, omittedStub],
+            chatPage: 0,
+        } as groupChat
+        const target = makeDatabase().characters[0]
+        const database = {
+            ...makeDatabase(),
+            characterOrder: ['group-a', 'char-a'],
+            characters: [group, target],
+        } as Database
+        const lease = makeGroupDeletionLease(database)
+        const atomicCommit = deferred<{ revision: number }>()
+        const commit = vi.fn()
+            .mockImplementationOnce(() => atomicCommit.promise)
+            .mockImplementationOnce(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            }))
+        const queryConversations = vi.fn(async () => ({
+            revision: 2,
+            items: [selectedConversation, omittedConversation].map((conversation, configuredIndex) => ({
+                id: conversation.id!,
+                characterId: 'group-a',
+                name: conversation.name,
+                configuredIndex,
+                recentAt: 0,
+                messageCount: conversation.message.length,
+            })),
+        }))
+        const readConversation = vi.fn(async (_characterId: string, conversationId: string) => ({
+            revision: 2,
+            value: structuredClone(
+                conversationId === selectedConversation.id
+                    ? selectedConversation
+                    : omittedConversation,
+            ),
+        }))
+        const coordinator = new SaveCoordinator({
+            store: {
+                acquireRevision: vi.fn(async () => lease),
+                commit,
+                queryConversations,
+                readConversation,
+            } as unknown as PersistentDataStore,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => group,
+            captureCharacter: (id) =>
+                database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: vi.fn(),
+            publishCharacterMutation: (state) => publishGroupDeletion(database, state),
+        })
+        coordinator.initialize(1)
+
+        const deletion = coordinator.deletePersistentCharacterWithGroupReferences(
+            'char-a',
+            'pending-stubbed-group-edit',
+        )
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+        group.additionalText = 'Live group edit'
+        coordinator.markPersistentDataDirty(1)
+        atomicCommit.resolve({ revision: 2 })
+
+        await expect(deletion).resolves.toBe(true)
+        await coordinator.flushPendingData('after-stubbed-group-compensation')
+
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].replaceCharacter.chats).toEqual([
+            selectedConversation,
+            {
+                ...omittedConversation,
+                name: omittedStub.name,
+                folderId: omittedStub.folderId,
+                bindedPersona: omittedStub.bindedPersona,
+                lastDate: omittedStub.lastDate,
+            },
+        ])
+        expect(queryConversations).toHaveBeenCalledOnce()
+        expect(readConversation).toHaveBeenCalledTimes(2)
+        expect(coordinator.revision).toBe(3)
+    })
 
     it.each(['stale-lease', 'read-failure', 'release-failure'] as const)(
         'releases a failed permanent-delete lease and does not commit for %s',

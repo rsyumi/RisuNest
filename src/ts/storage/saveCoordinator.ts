@@ -1874,13 +1874,21 @@ export class SaveCoordinator {
     private captureResidentCharacter(characterId: string): {
         character: CompleteCharacter
         canonical: string
+        conversationStubIds: ReadonlySet<string>
     } | null {
         const character = this.dependencies.captureCharacter(characterId)
         if (!character) return null
+        const conversationStubIds = new Set(
+            character.chats
+                .filter(isConversationSummaryStub)
+                .map((conversation) => conversation.id)
+                .filter((id): id is string => Boolean(id)),
+        )
         const canonical = canonicalJson(character)
         return {
             character: JSON.parse(canonical) as CompleteCharacter,
             canonical,
+            conversationStubIds,
         }
     }
 
@@ -2008,7 +2016,7 @@ export class SaveCoordinator {
             try {
                 committed = await this.dependencies.store.commit({
                     expectedRevision: this.revision,
-                    replaceCharacter: resident.character,
+                    replaceCharacter: await this.reconstructResidentCharacter(resident),
                 })
             } catch (error) {
                 this.armDebounce()
@@ -2232,7 +2240,26 @@ export class SaveCoordinator {
     }
 
     private async reconstructCapturedCharacter(captured: CapturedState): Promise<CompleteCharacter> {
-        const character = captured.character!
+        return this.reconstructCharacterWithStubBodies(
+            captured.character!,
+            captured.conversationStubIds,
+        )
+    }
+
+    private async reconstructResidentCharacter(
+        resident: NonNullable<ReturnType<SaveCoordinator['captureResidentCharacter']>>,
+    ): Promise<CompleteCharacter> {
+        if (resident.conversationStubIds.size === 0) return resident.character
+        return this.reconstructCharacterWithStubBodies(
+            resident.character,
+            resident.conversationStubIds,
+        )
+    }
+
+    private async reconstructCharacterWithStubBodies(
+        character: CompleteCharacter,
+        conversationStubIds: ReadonlySet<string>,
+    ): Promise<CompleteCharacter> {
         const { chats: _chats, ...detail } = character
         const authoritative = await this.readCompleteCharacter(
             character.chaId,
@@ -2245,7 +2272,7 @@ export class SaveCoordinator {
         return {
             ...character,
             chats: character.chats.map((conversation) => {
-                if (!conversation.id || !captured.conversationStubIds.has(conversation.id)) {
+                if (!conversation.id || !conversationStubIds.has(conversation.id)) {
                     return conversation
                 }
                 const full = authoritativeById.get(conversation.id)
