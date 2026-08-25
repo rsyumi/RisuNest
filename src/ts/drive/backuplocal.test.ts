@@ -441,6 +441,7 @@ describe('local backup persistent snapshot', () => {
         await expect(writePinnedLocalBackupDatabase(writer as any, {
             revision: 3,
             mutationGeneration: 0,
+            reader: { revision: 3 } as never,
             countCharacters: vi.fn(),
             materializeDatabase: vi.fn(),
             stream: vi.fn(),
@@ -472,6 +473,7 @@ describe('local backup persistent snapshot', () => {
         await expect(writePinnedLocalBackupDatabase(writer as any, {
             revision: 3,
             mutationGeneration: 0,
+            reader: { revision: 3 } as never,
             countCharacters: vi.fn(),
             materializeDatabase: vi.fn(),
             stream: vi.fn(),
