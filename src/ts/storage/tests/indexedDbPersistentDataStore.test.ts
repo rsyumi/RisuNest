@@ -66,6 +66,7 @@ async function countPersistentDataRecords(
         'conversations',
         'messagePages',
         'pluginStorage',
+        'pluginStorageMetadata',
     ]
     const database = await openDatabase(indexedDB, databaseName)
     const transaction = database.transaction(storeNames, 'readonly')
@@ -240,6 +241,61 @@ async function createVersion5PluginDatabase(
             value,
         })
     }
+    await completeTransaction(transaction)
+    database.close()
+}
+
+async function createVersion6PluginSnapshotDatabase(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    await createVersion5PluginDatabase(indexedDB, databaseName)
+    const openRequest = indexedDB.open(databaseName, 6)
+    openRequest.onupgradeneeded = () => {
+        const metadata = openRequest.result.createObjectStore('pluginStorageMetadata', {
+            keyPath: 'key',
+        })
+        metadata.createIndex('byGenerationOrdinal', ['generation', 'ordinal'])
+        metadata.createIndex('byGeneration', 'generation')
+        const values = openRequest.transaction!.objectStore('pluginStorage')
+        const cursorRequest = values.openCursor()
+        cursorRequest.onsuccess = () => {
+            const cursor = cursorRequest.result
+            if (!cursor) return
+            const { value: _value, ...record } = cursor.value as Record<string, unknown>
+            metadata.put(record)
+            cursor.continue()
+        }
+    }
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        openRequest.onsuccess = () => resolve(openRequest.result)
+        openRequest.onerror = () => reject(openRequest.error)
+    })
+    const snapshotGeneration = 'snapshot-5-migrated'
+    const transaction = database.transaction(
+        ['meta', 'root', 'pluginStorage', 'pluginStorageMetadata'],
+        'readwrite',
+    )
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 6 })
+    transaction.objectStore('meta').put({
+        key: `snapshotLease:${snapshotGeneration}`,
+        value: snapshotGeneration,
+        createdAt: Date.now(),
+    })
+    transaction.objectStore('root').put({
+        key: snapshotGeneration,
+        generation: snapshotGeneration,
+        value: { username: 'Version 6 snapshot' },
+    })
+    const metadata = {
+        key: `${snapshotGeneration}:plugin-storage:legacy`,
+        generation: snapshotGeneration,
+        storageKey: 'legacy',
+        byteSize: JSON.stringify(0).length,
+        ordinal: 0,
+    }
+    transaction.objectStore('pluginStorage').put({ ...metadata, value: 0 })
+    transaction.objectStore('pluginStorageMetadata').put(metadata)
     await completeTransaction(transaction)
     database.close()
 }
@@ -715,6 +771,88 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         })
     })
 
+    it('rolls back a version 5 metadata upgrade when backfill fails', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-5-plugin-metadata-rollback-${databaseSequence++}`
+        await createVersion5PluginDatabase(indexedDB, databaseName)
+        const backfillError = new Error('injected metadata backfill failure')
+        const originalOpenCursor = IDBObjectStore.prototype.openCursor
+        const cursorSpy = vi
+            .spyOn(IDBObjectStore.prototype, 'openCursor')
+            .mockImplementation(function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore['openCursor']>
+            ) {
+                if (this.name === 'pluginStorage') throw backfillError
+                return originalOpenCursor.apply(this, args)
+            })
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        try {
+            await expect(store.open()).rejects.toBeTruthy()
+        } finally {
+            cursorSpy.mockRestore()
+        }
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(5)
+        expect(database.objectStoreNames.contains('pluginStorageMetadata')).toBe(false)
+        database.close()
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'pluginStorage',
+            'revision-5:plugin-storage:zeta',
+        )).toMatchObject({ value: 'first', ordinal: 0 })
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+        await expect(reopened.readPluginStorage('zeta')).resolves.toMatchObject({
+            revision: 5,
+            value: 'first',
+        })
+    })
+
+    it('opens a version 6 metadata split and preserves legacy snapshot rows', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-6-plugin-snapshot-${databaseSequence++}`
+        await createVersion6PluginSnapshotDatabase(indexedDB, databaseName)
+
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+
+        await expect(store.queryPluginStorage()).resolves.toMatchObject({
+            revision: 5,
+            items: [{ key: 'zeta' }, { key: 'alpha' }],
+        })
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'pluginStorage',
+            'snapshot-5-migrated:plugin-storage:legacy',
+        )).toMatchObject({ value: 0 })
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'pluginStorageMetadata',
+            'snapshot-5-migrated:plugin-storage:legacy',
+        )).toMatchObject({ generation: 'snapshot-5-migrated', ordinal: 0 })
+
+        await (store as unknown as { releaseSnapshotLease(lease: string): Promise<void> })
+            .releaseSnapshotLease('snapshot-5-migrated')
+
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'pluginStorageMetadata',
+            'snapshot-5-migrated:plugin-storage:legacy',
+        )).toBeUndefined()
+        await expect(store.readPluginStorage('zeta')).resolves.toMatchObject({
+            revision: 5,
+            value: 'first',
+        })
+    })
+
     it('rolls back a version 1 upgrade when botPresets exists but is not an array', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = 'version-1-invalid-presets-upgrade'
@@ -1072,6 +1210,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             'conversations',
             'messagePages',
             'pluginStorage',
+            'pluginStorageMetadata',
         ]
         const transaction = rawDatabase.transaction(storeNames, 'readonly')
         const generations = new Map<string, Set<string>>()
