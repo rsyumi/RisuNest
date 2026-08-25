@@ -99,6 +99,7 @@ fn preset_catalog_reads_and_materializes_in_configured_order() {
             root: Some(json!({ "username": "Preset commit", "botPresets": ["strip"] })),
             replace_presets: Some(vec![json!({ "name": "Replacement" })]),
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -197,6 +198,7 @@ fn plugin_storage_is_revisioned_per_key_and_lease_isolated() {
             root: Some(json!({ "username": "Plugin commit" })),
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -399,6 +401,7 @@ fn commit(store: &mut PersistentStore, revision: i64, mutation: ConversationMuta
             root: None,
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: Some(vec![mutation]),
@@ -518,6 +521,7 @@ fn character_search_uses_rust_unicode_lowercase_matching() {
             root: None,
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: Some(json!({
                 "type": "character",
@@ -784,6 +788,7 @@ fn cas_conflict_preserves_current_revision() {
         root: Some(json!({ "username": "stale" })),
         replace_presets: None,
         character: None,
+        character_details: None,
         replace_character: None,
         add_character: None,
         conversations: None,
@@ -831,6 +836,7 @@ fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
             root: Some(changed_root),
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: Some(replacement),
             add_character: None,
             conversations: None,
@@ -905,6 +911,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
             root: None,
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -929,6 +936,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
             root: None,
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: Some(replacement),
             add_character: None,
             conversations: None,
@@ -972,6 +980,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
             root: Some(json!({ "username": "must roll back" })),
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: Some(invalid.clone()),
             add_character: None,
             conversations: None,
@@ -997,6 +1006,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
             root: None,
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: Some(invalid),
             add_character: None,
             conversations: None,
@@ -1093,6 +1103,7 @@ fn revision_leases_are_isolated_then_released() {
             root: Some(json!({ "apiType": "fixture-provider", "username": "Changed" })),
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -1173,6 +1184,7 @@ fn character_detail_update_preserves_index_and_conversations() {
             root: None,
             replace_presets: None,
             character: Some(detail.clone()),
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -1221,6 +1233,147 @@ fn character_detail_update_preserves_index_and_conversations() {
             .len(),
         2
     );
+}
+
+#[test]
+fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut group = database["characters"][0].clone();
+    group.as_object_mut().expect("group object").remove("chats");
+    group["type"] = json!("group");
+    group["characters"] = json!(["char-a", "char-c"]);
+    group["characterTalks"] = json!([0.25, 0.75]);
+    group["characterActive"] = json!([false, true]);
+
+    let prepared = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: None,
+            replace_presets: None,
+            character: Some(group.clone()),
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "zero".to_owned(),
+                value: json!(0),
+            }]),
+        })
+        .expect("prepare group and plugin value");
+    let lease = store
+        .acquire_revision(prepared.revision)
+        .expect("acquire batch mutation lease");
+    let mut updated_group = group.clone();
+    updated_group["characters"] = json!(["char-c"]);
+    updated_group["characterTalks"] = json!([0.75]);
+    updated_group["characterActive"] = json!([true]);
+    let mut invalid_detail = updated_group.clone();
+    invalid_detail["chaId"] = json!("char-c");
+    invalid_detail
+        .as_object_mut()
+        .expect("invalid detail object")
+        .remove("name");
+
+    let failed = store.commit(&WorkingSetCommit {
+        expected_revision: prepared.revision,
+        root: Some(json!({ "username": "Must roll back" })),
+        replace_presets: None,
+        character: None,
+        character_details: Some(vec![updated_group.clone(), invalid_detail]),
+        replace_character: None,
+        add_character: None,
+        conversations: None,
+        delete_character_id: Some("char-a".to_owned()),
+        plugin_storage: None,
+    });
+
+    assert!(failed.is_err());
+    assert_eq!(
+        store.revision().expect("revision after rollback"),
+        prepared.revision
+    );
+    assert!(store
+        .read_character("char-a", None)
+        .expect("read rolled back target")
+        .is_some());
+    assert_eq!(
+        store
+            .read_character("char-b", None)
+            .expect("read rolled back group")
+            .expect("group exists")
+            .value["characters"],
+        json!(["char-a", "char-c"])
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("zero", None)
+            .expect("read plugin zero")
+            .expect("plugin zero exists")
+            .value,
+        json!(0)
+    );
+
+    let committed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: prepared.revision,
+            root: Some(json!({ "username": "Committed" })),
+            replace_presets: None,
+            character: None,
+            character_details: Some(vec![updated_group]),
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: Some("char-a".to_owned()),
+            plugin_storage: None,
+        })
+        .expect("commit batch delete");
+
+    assert_eq!(committed.revision, prepared.revision + 1);
+    assert!(store
+        .read_character("char-a", None)
+        .expect("read deleted target")
+        .is_none());
+    assert_eq!(
+        store
+            .read_character("char-b", None)
+            .expect("read committed group")
+            .expect("group exists")
+            .value["characters"],
+        json!(["char-c"])
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("zero", None)
+            .expect("read preserved plugin zero")
+            .expect("plugin zero exists")
+            .value,
+        json!(0)
+    );
+    assert!(store
+        .read_character("char-a", Some(&lease.lease))
+        .expect("read leased target")
+        .is_some());
+    assert_eq!(
+        store
+            .read_character("char-b", Some(&lease.lease))
+            .expect("read leased group")
+            .expect("leased group exists")
+            .value["characters"],
+        json!(["char-a", "char-c"])
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("zero", Some(&lease.lease))
+            .expect("read leased plugin zero")
+            .expect("leased plugin zero exists")
+            .value,
+        json!(0)
+    );
+    store
+        .release_revision(&lease.lease)
+        .expect("release batch mutation lease");
 }
 
 #[test]
@@ -1327,6 +1480,7 @@ fn summary_recent_at_falls_back_to_message_time_then_zero() {
             root: None,
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: Some(json!({ "chaId": "char-zero", "name": "Zero", "chats": [] })),
             conversations: None,
@@ -2119,6 +2273,7 @@ fn invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
             root: Some(json!({ "username": "Preserved live database" })),
             replace_presets: Some(vec![json!({ "name": "Live preset" })]),
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -2183,6 +2338,7 @@ fn semantically_invalid_pending_v1_snapshot_preserves_live_database_and_restore_
             root: Some(json!({ "username": "Preserved semantic live database" })),
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -2267,6 +2423,7 @@ fn snapshots_create_list_and_restore_on_reopen() {
             root: Some(json!({ "username": "Changed after snapshot" })),
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -2436,6 +2593,7 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
             root: Some(json!({ "username": "Current before restore" })),
             replace_presets: None,
             character: None,
+            character_details: None,
             replace_character: None,
             add_character: None,
             conversations: None,
@@ -2498,6 +2656,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
                 root: Some(json!({ "username": "Current protected data" })),
                 replace_presets: None,
                 character: None,
+                character_details: None,
                 replace_character: None,
                 add_character: None,
                 conversations: None,

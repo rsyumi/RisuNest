@@ -376,6 +376,14 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (input.addCharacter) {
                 this.validateCharacterInput(input.addCharacter, 'Character addition')
             }
+            if (input.characterDetails) {
+                await this.validateCharacterDetails(
+                    transaction,
+                    active.generation,
+                    input.characterDetails,
+                    input.deleteCharacterId,
+                )
+            }
 
             const revision = active.revision + 1
             const generation = active.generation
@@ -385,6 +393,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 await this.deleteCharacter(transaction, generation, input.deleteCharacterId)
             }
             if (input.character) await this.putCharacter(transaction, generation, input.character)
+            for (const detail of input.characterDetails ?? []) {
+                await this.putCharacter(transaction, generation, detail)
+            }
             if (input.replaceCharacter) {
                 await this.replaceCharacter(transaction, generation, input.replaceCharacter)
             }
@@ -1208,6 +1219,30 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 throw new Error(`${context} requires unique, nonempty chat IDs`)
             }
             conversationIds.add(conversation.id)
+        }
+    }
+
+    private async validateCharacterDetails(
+        transaction: IDBTransaction,
+        generation: string,
+        details: readonly CharacterDetail[],
+        deleteCharacterId?: string,
+    ): Promise<void> {
+        const ids = new Set<string>()
+        for (const detail of details) {
+            if (!detail.chaId) {
+                throw new Error('Batch character detail mutation requires nonempty character IDs')
+            }
+            if (detail.chaId === deleteCharacterId || ids.has(detail.chaId)) {
+                throw new Error('Batch character detail mutation requires unique retained character IDs')
+            }
+            ids.add(detail.chaId)
+            const existing = await requestResult(
+                transaction.objectStore('catalog').get(
+                    this.characterKey(generation, detail.chaId),
+                ),
+            )
+            if (!existing) throw new Error(`Character ${detail.chaId} does not exist`)
         }
     }
 

@@ -118,6 +118,14 @@ export function publishPersistentCharacterMutationToWorkingSet(
     selectCharacterIndex: (index: number) => void,
 ): void {
     Object.assign(database, state.root)
+    for (const detail of state.relatedCharacters ?? []) {
+        const relatedIndex = database.characters.findIndex(
+            (candidate) => candidate.chaId === detail.chaId,
+        )
+        if (relatedIndex >= 0) {
+            patchWorkingSetCharacterDetail(database.characters[relatedIndex], detail)
+        }
+    }
     const index = database.characters.findIndex(
         (candidate) => candidate.chaId === state.characterId,
     )
@@ -265,6 +273,10 @@ export interface PersistentDataRuntime {
         characterId: string,
         reason: string,
         mutate: PersistentCharacterDetailMutation,
+    ): Promise<boolean>
+    deletePersistentCharacterWithGroupReferences(
+        characterId: string,
+        reason: string,
     ): Promise<boolean>
     replacePersistentCompleteCharacter(
         characterId: string,
@@ -491,6 +503,8 @@ export function createPersistentDataRuntime(
             coordinator.mutatePersistentPresets(reason, mutate),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
             coordinator.mutatePersistentCharacterDetail(characterId, reason, mutate),
+        deletePersistentCharacterWithGroupReferences: (characterId, reason) =>
+            coordinator.deletePersistentCharacterWithGroupReferences(characterId, reason),
         replacePersistentCompleteCharacter: (characterId, reason, mutate) =>
             coordinator.replacePersistentCompleteCharacter(characterId, reason, mutate),
         upsertPersistentCompleteCharacter: (characterId, reason, createOrMutate, options) =>

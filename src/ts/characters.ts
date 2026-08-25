@@ -17,15 +17,14 @@ import {
     activateCharacter,
     commitCharacterAddition,
     deactivateActiveWorkingSet,
+    deletePersistentCharacterWithGroupReferences,
     getPersistentNavigationGeneration,
     invalidatePersistentNavigation,
-    materializePersistentDatabaseSnapshotWithRevision,
     markPersistentDataDirty,
     mutatePersistentCharacterDetail,
     readPersistentCompleteCharacter,
     readPersistentConversation,
     reconcilePersistentActiveCharacterIds,
-    replacePersistentDatabase,
 } from "./storage/persistentDataRuntime.svelte";
 import type { groupChat } from "./storage/database.svelte";
 import { removeCharacterIdFromOrder } from './storage/characterOrderMutation'
@@ -922,18 +921,6 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
         selectedCharID.set(-1)
         reconcilePersistentActiveCharacterIds(DBState.db, null)
     }
-    const pruneGroupMember = (group: groupChat) => {
-        const retainedIndices = group.characters
-            .map((id, index) => ({ id, index }))
-            .filter(({ id }) => id !== targetId)
-        group.characters = retainedIndices.map(({ id }) => id)
-        group.characterTalks = retainedIndices.map(
-            ({ index }) => group.characterTalks?.[index] ?? 1 / 6 * 4,
-        )
-        group.characterActive = retainedIndices.map(
-            ({ index }) => group.characterActive?.[index] ?? true,
-        )
-    }
     let changed = false
     try {
         if (type === 'normal') {
@@ -946,26 +933,10 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
                 },
             )
         } else {
-            const snapshot = await materializePersistentDatabaseSnapshotWithRevision(
-                'materialize-character-removal',
+            changed = await deletePersistentCharacterWithGroupReferences(
+                targetId,
+                'character-removal',
             )
-            const targetIndex = snapshot.database.characters.findIndex(
-                (character) => character.chaId === targetId,
-            )
-            if (targetIndex >= 0) {
-                snapshot.database.characters.splice(targetIndex, 1)
-                removeCharacterIdFromOrder(snapshot.database, targetId)
-                for (const character of snapshot.database.characters) {
-                    if (character.type === 'group') pruneGroupMember(character)
-                }
-                await replacePersistentDatabase(snapshot.database, 'character-removal', {
-                    authoritative: true,
-                    expectedRevision: snapshot.revision,
-                    expectedMutationGeneration: snapshot.mutationGeneration,
-                    publishOfficial: true,
-                })
-                changed = true
-            }
         }
     } catch (error) {
         const locallyCommitted = type !== 'normal' && !DBState.db.characters.some(

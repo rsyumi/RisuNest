@@ -39,7 +39,12 @@ describe('SqlitePersistentDataStore', () => {
             before: 4,
             after: 5,
         }
-        const commit = { expectedRevision: 8, deleteCharacterId: 'char-c' }
+        const { chats: _chats, ...characterDetail } = fixtureDatabase.characters[0]
+        const commit = {
+            expectedRevision: 8,
+            deleteCharacterId: 'char-c',
+            characterDetails: [characterDetail],
+        }
 
         await store.open()
         await store.readRoot()

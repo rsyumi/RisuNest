@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { Database } from '../database.svelte'
+import type { Database, groupChat } from '../database.svelte'
 import type { PersistentDataStore } from '../persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
@@ -388,6 +388,87 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect((await store.readCharacter('char-a'))?.revision).toBe(imported.revision)
         })
 
+        it('atomically deletes a character with batch group details and preserves plugin records', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            const makeGroup = (id: string, members: string[], trashTime?: number) => ({
+                type: 'group',
+                chaId: id,
+                name: id,
+                characters: members,
+                characterTalks: members.map((_member, index) => index + 0.25),
+                characterActive: members.map((_member, index) => index % 2 === 0),
+                chats: [],
+                ...(trashTime === undefined ? {} : { trashTime }),
+            }) as Database['characters'][number]
+            database.characters.push(
+                makeGroup('group-active', ['char-b', 'char-a']),
+                makeGroup('group-trash', ['char-a', 'char-c'], 500),
+                makeGroup('group-unreferenced', ['char-b']),
+            )
+            database.pluginCustomStorage = { zero: 0 }
+            database.characterOrder = database.characters.map((character) => character.chaId)
+            const imported = await store.replaceFromDatabase(database)
+            const lease = await store.acquireRevision(imported.revision)
+            const root = (await store.readRoot()).value
+            const active = (await store.readCharacter('group-active'))!.value as groupChat
+            const trash = (await store.readCharacter('group-trash'))!.value as groupChat
+            active.characters = ['char-b']
+            active.characterTalks = [0.25]
+            active.characterActive = [true]
+            trash.characters = ['char-c']
+            trash.characterTalks = [1.25]
+            trash.characterActive = [false]
+
+            const committed = await store.commit({
+                expectedRevision: imported.revision,
+                root: {
+                    ...root,
+                    characterOrder: root.characterOrder.filter((id) => id !== 'char-a'),
+                },
+                deleteCharacterId: 'char-a',
+                characterDetails: [active, trash],
+            })
+
+            expect(committed.revision).toBe(imported.revision + 1)
+            expect(await store.readCharacter('char-a')).toBeNull()
+            expect(await store.readCharacter('group-active')).toMatchObject({
+                revision: committed.revision,
+                value: {
+                    characters: ['char-b'],
+                    characterTalks: [0.25],
+                    characterActive: [true],
+                },
+            })
+            expect(await store.readCharacter('group-trash')).toMatchObject({
+                revision: committed.revision,
+                value: {
+                    characters: ['char-c'],
+                    characterTalks: [1.25],
+                    characterActive: [false],
+                },
+            })
+            expect((await store.readCharacter('group-unreferenced'))?.value).toMatchObject({
+                characters: ['char-b'],
+            })
+            expect((await store.readPluginStorage('zero'))?.value).toBe(0)
+            expect((await lease.readCharacter('char-a'))?.value.name).toBe('Alpha')
+            expect((await lease.readCharacter('group-active'))?.value).toMatchObject({
+                characters: ['char-b', 'char-a'],
+                characterTalks: [0.25, 1.25],
+                characterActive: [true, false],
+            })
+            expect((await lease.readPluginStorage('zero'))?.value).toBe(0)
+            await lease.release()
+
+            await expect(store.commit({
+                expectedRevision: imported.revision,
+                characterDetails: [active],
+            })).rejects.toBeInstanceOf(RevisionConflictError)
+            expect((await store.readRoot()).revision).toBe(committed.revision)
+            expect((await store.readPluginStorage('zero'))?.value).toBe(0)
+        })
+
         it('commits a replacement range and increments the revision once', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(fixtureDatabase)
@@ -603,6 +684,48 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
 
             expect(await store.readRoot()).toEqual(rootBefore)
             expect((await store.readCharacter('char-a'))?.value.name).toBe('Alpha')
+        })
+
+        it('rolls back root, deletion, and every batch detail when one detail cannot be stored', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.pluginCustomStorage = { zero: 0 }
+            const group = {
+                type: 'group',
+                chaId: 'group-a',
+                name: 'Group',
+                characters: ['char-a', 'char-b'],
+                characterTalks: [0.25, 0.75],
+                characterActive: [true, false],
+                chats: [],
+            } as Database['characters'][number]
+            database.characters.push(group)
+            const imported = await store.replaceFromDatabase(database)
+            const rootBefore = await store.readRoot()
+            const groupBefore = (await store.readCharacter('group-a'))!.value
+            const updatedGroup = structuredClone(groupBefore) as groupChat
+            updatedGroup.characters = ['char-b']
+            updatedGroup.characterTalks = [0.75]
+            updatedGroup.characterActive = [false]
+
+            await expect(store.commit({
+                expectedRevision: imported.revision,
+                root: { ...rootBefore.value, username: 'Must roll back' },
+                deleteCharacterId: 'char-a',
+                characterDetails: [
+                    updatedGroup,
+                    {
+                        ...structuredClone(groupBefore),
+                        chaId: 'char-b',
+                        invalidFixtureValue: () => undefined,
+                    } as unknown as typeof groupBefore,
+                ],
+            })).rejects.toThrow()
+
+            expect(await store.readRoot()).toEqual(rootBefore)
+            expect((await store.readCharacter('char-a'))?.value.name).toBe('Alpha')
+            expect((await store.readCharacter('group-a'))?.value).toEqual(groupBefore)
+            expect((await store.readPluginStorage('zero'))?.value).toBe(0)
         })
 
         it('does not activate an invalid staged replacement', async () => {

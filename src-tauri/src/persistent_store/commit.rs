@@ -26,6 +26,14 @@ pub(super) fn commit(
     }
 
     let generation = active_generation(&transaction)?;
+    if let Some(details) = &input.character_details {
+        validate_character_details(
+            &transaction,
+            &generation,
+            details,
+            input.delete_character_id.as_deref(),
+        )?;
+    }
     if let Some(root) = &input.root {
         put_root(&transaction, &generation, root)?;
     }
@@ -37,6 +45,9 @@ pub(super) fn commit(
     }
     if let Some(character) = &input.character {
         put_character_detail(&transaction, &generation, character)?;
+    }
+    for detail in input.character_details.as_deref().unwrap_or_default() {
+        put_character_detail(&transaction, &generation, detail)?;
     }
     if let Some(character) = &input.replace_character {
         replace_character(&transaction, &generation, character)?;
@@ -344,6 +355,29 @@ fn validate_character(character: &Value, context: &str) -> StoreResult<()> {
         if id.is_empty() || !conversation_ids.insert(id) {
             return Err(validation(format!(
                 "{context} requires unique, nonempty chat IDs"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_character_details(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    details: &[Value],
+    delete_character_id: Option<&str>,
+) -> StoreResult<()> {
+    let mut character_ids = std::collections::HashSet::new();
+    for detail in details {
+        let character_id = required_string(detail, "chaId", "Batch character detail mutation")?;
+        if Some(character_id) == delete_character_id || !character_ids.insert(character_id) {
+            return Err(validation(
+                "Batch character detail mutation requires unique retained character IDs",
+            ));
+        }
+        if !character_exists(transaction, generation, character_id)? {
+            return Err(validation(format!(
+                "Character {character_id} does not exist"
             )));
         }
     }

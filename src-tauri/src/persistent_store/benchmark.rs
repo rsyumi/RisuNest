@@ -522,6 +522,7 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
                 root: None,
                 replace_presets: None,
                 character: None,
+                character_details: None,
                 replace_character: None,
                 add_character: None,
                 conversations: Some(vec![ConversationMutation::ReplaceRange {

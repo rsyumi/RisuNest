@@ -36,6 +36,7 @@ describe('createMutationGatedPersistentDataStore', () => {
         } as StorageMutationGate
         const commit = {
             expectedRevision: 3,
+            characterDetails: [{ type: 'group', chaId: 'group-a', name: 'Group' }],
             pluginStorage: [{ type: 'set', key: 'plugin', value: true }],
         } as WorkingSetCommit
         const database = { username: 'Fixture', characters: [] } as unknown as Database

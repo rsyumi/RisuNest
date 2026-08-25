@@ -91,7 +91,7 @@ describe('persistent plugin storage capture', () => {
 })
 
 describe('persistent character mutation publication', () => {
-    it('prunes a deleted selected-group member and forgets its released stable ID', () => {
+    it('publishes every committed group detail with a deletion and forgets its released stable ID', () => {
         const residency = new WorkingSetResidencyRegistry()
         const group = {
             type: 'group',
@@ -110,7 +110,15 @@ describe('persistent character mutation publication', () => {
         } as any
         const database = {
             ...makeDatabase('Delete'),
-            characters: [group, removed, {
+            characters: [group, {
+                type: 'group',
+                chaId: 'group-b',
+                name: 'Other group',
+                characters: ['char-a'],
+                characterTalks: [0.5],
+                characterActive: [true],
+                chats: [],
+            }, removed, {
                 type: 'character',
                 chaId: 'char-b',
                 name: 'Remaining',
@@ -127,6 +135,21 @@ describe('persistent character mutation publication', () => {
                 characterId: 'char-a',
                 kind: 'delete',
                 character: null,
+                relatedCharacters: [{
+                    type: 'group',
+                    chaId: 'group-a',
+                    name: 'Group',
+                    characters: ['char-b'],
+                    characterTalks: [0.75],
+                    characterActive: [true],
+                } as any, {
+                    type: 'group',
+                    chaId: 'group-b',
+                    name: 'Other group',
+                    characters: [],
+                    characterTalks: [],
+                    characterActive: [],
+                } as any],
             },
             residency,
             0,
@@ -136,6 +159,7 @@ describe('persistent character mutation publication', () => {
         expect(group.characters).toEqual(['char-b'])
         expect(group.characterTalks).toEqual([0.75])
         expect(group.characterActive).toEqual([true])
+        expect((database.characters[1] as any).characters).toEqual([])
         expect(residency.isCharacterReleased('char-a')).toBe(false)
 
         const readded = { ...removed, name: 'Re-added' }

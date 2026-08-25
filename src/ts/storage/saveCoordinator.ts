@@ -9,7 +9,7 @@ import type {
     WorkingSetCommit,
 } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
-import { appendCharacterIdToOrder } from './characterOrderMutation'
+import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characterOrderMutation'
 import { isConversationSummaryStub } from './conversationResidency'
 
 const SAVE_DEBOUNCE_MS = 500
@@ -17,6 +17,7 @@ const PENDING_BYTE_LIMIT = 1_048_576
 /** Official publishes upload the full database snapshot, so they are spaced like upstream's save loop. */
 const OFFICIAL_PUBLISH_MIN_INTERVAL_MS = 3_000
 const CONCURRENT_CHARACTER_COMPENSATION_ATTEMPTS = 3
+const CHARACTER_MUTATION_PAGE_SIZE = 100
 
 type CompleteCharacter = character | groupChat
 type RootDatabase = PersistentRoot
@@ -571,6 +572,7 @@ export interface PersistentCharacterMutationResult {
     characterId: string
     kind: 'detail' | 'replace' | 'add' | 'delete'
     character: CharacterDetail | CompleteCharacter | null
+    relatedCharacters?: CharacterDetail[]
 }
 
 export interface PersistentMutationToken {
@@ -1034,6 +1036,118 @@ export class SaveCoordinator {
                 characterId,
                 kind: deleting ? 'delete' : 'detail',
                 character: deleting ? null : canonicalClone(state.character),
+            }, committedRoot)
+            await this.finishExplicitCommit(committed.revision)
+            return true
+        })
+    }
+
+    deletePersistentCharacterWithGroupReferences(
+        characterId: string,
+        reason: string,
+    ): Promise<boolean> {
+        this.assertInitialized()
+        this.cancelDebounce()
+        return this.enqueue(async () => {
+            await this.flushIterations(reason, true)
+            const residentBefore = this.captureResidentCharacter(characterId)
+            const revision = this.revision
+            const mutationGeneration = this.dirtyGeneration
+            const lease = await this.dependencies.store.acquireRevision(revision)
+            this.assertReadRevision(revision, lease.revision)
+            let rootValue: { revision: DataRevision; value: RootDatabase } | undefined
+            const relatedCharacters: CharacterDetail[] = []
+            let failed = false
+            try {
+                rootValue = await lease.readRoot()
+                this.assertReadRevision(revision, rootValue.revision)
+                const targetValue = await lease.readCharacter(characterId)
+                if (!targetValue) return false
+                this.assertReadRevision(revision, targetValue.revision)
+                if (targetValue.value.chaId !== characterId) {
+                    throw new Error(`Character ${characterId} returned mismatched detail`)
+                }
+
+                for (const trash of [false, true]) {
+                    let cursor: string | undefined
+                    do {
+                        const page = await lease.queryCharacters({
+                            order: 'configured',
+                            trash,
+                            limit: CHARACTER_MUTATION_PAGE_SIZE,
+                            cursor,
+                        })
+                        this.assertReadRevision(revision, page.revision)
+                        for (const summary of page.items) {
+                            if (summary.id === characterId || summary.type !== 'group') continue
+                            const value = await lease.readCharacter(summary.id)
+                            if (!value) throw new Error(`Character ${summary.id} was not found`)
+                            this.assertReadRevision(revision, value.revision)
+                            if (value.value.chaId !== summary.id || value.value.type !== 'group') {
+                                throw new Error(`Character ${summary.id} returned mismatched detail`)
+                            }
+                            const group = canonicalClone(value.value) as Omit<groupChat, 'chats'>
+                            const retainedIndices = group.characters
+                                .map((id, index) => ({ id, index }))
+                                .filter(({ id }) => id !== characterId)
+                            if (retainedIndices.length === group.characters.length) continue
+                            group.characters = retainedIndices.map(({ id }) => id)
+                            group.characterTalks = retainedIndices.map(
+                                ({ index }) => group.characterTalks?.[index] ?? 1 / 6 * 4,
+                            )
+                            group.characterActive = retainedIndices.map(
+                                ({ index }) => group.characterActive?.[index] ?? true,
+                            )
+                            relatedCharacters.push(group)
+                        }
+                        cursor = page.nextCursor
+                    } while (cursor)
+                }
+            } catch (error) {
+                failed = true
+                throw error
+            } finally {
+                try {
+                    await lease.release()
+                } catch (error) {
+                    if (!failed) throw error
+                }
+            }
+            if (!rootValue) return false
+            if (this.dirtyGeneration !== mutationGeneration) {
+                throw new Error(`Persistent data changed during character deletion: ${characterId}`)
+            }
+            this.assertResidentCharacterUnchanged(characterId, residentBefore)
+
+            const mutatedRoot = canonicalClone(rootValue.value)
+            removeCharacterIdFromOrder(mutatedRoot, characterId)
+            const liveBeforeCommit = this.capture()
+            const committedRoot = rebaseRootMutation(
+                rootValue.value,
+                mutatedRoot,
+                liveBeforeCommit.root,
+            )
+            const commit: WorkingSetCommit = {
+                expectedRevision: revision,
+                deleteCharacterId: characterId,
+                characterDetails: canonicalClone(relatedCharacters),
+            }
+            if (canonicalJson(committedRoot) !== canonicalJson(rootValue.value)) {
+                commit.root = committedRoot
+            }
+            const committed = await this.dependencies.store.commit(commit)
+            const liveAfterCommit = this.capture()
+            this.finishCharacterMutation({
+                revision: committed.revision,
+                root: rebaseRootMutation(
+                    liveBeforeCommit.root,
+                    liveAfterCommit.root,
+                    committedRoot,
+                ),
+                characterId,
+                kind: 'delete',
+                character: null,
+                relatedCharacters: canonicalClone(relatedCharacters),
             }, committedRoot)
             await this.finishExplicitCommit(committed.revision)
             return true

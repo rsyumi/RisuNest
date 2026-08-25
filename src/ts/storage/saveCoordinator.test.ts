@@ -873,67 +873,167 @@ describe('SaveCoordinator', () => {
         expect(coordinator.revision).toBe(9)
     })
 
-    it('keeps selected-group cleanup dirty after deleting another character', async () => {
-        const group = {
+    it('pages group details and commits permanent deletion with every changed group once', async () => {
+        const groupA = {
             type: 'group',
             chaId: 'group-a',
             name: 'Group',
-            characters: ['char-a'],
-            characterTalks: [0.5],
-            characterActive: [true],
+            characters: ['char-a', 'char-b'],
+            characterTalks: [0.25, 0.75],
+            characterActive: [false, true],
             chats: [],
+        } as groupChat
+        const groupB = {
+            ...structuredClone(groupA),
+            chaId: 'group-b',
+            characters: ['char-b', 'char-a'],
+            characterTalks: [0.4, 0.6],
+            characterActive: [true, false],
+        } as groupChat
+        const groupTrash = {
+            ...structuredClone(groupA),
+            chaId: 'group-trash',
+            characters: ['char-a'],
+            characterTalks: [0.9],
+            characterActive: [true],
+            trashTime: 100,
+        } as groupChat
+        const unreferenced = {
+            ...structuredClone(groupA),
+            chaId: 'group-unreferenced',
+            characters: ['char-b'],
+            characterTalks: [0.7],
+            characterActive: [true],
         } as groupChat
         const target = makeDatabase().characters[0]
         const database = {
             ...makeDatabase(),
-            characters: [group, target],
+            characterOrder: ['group-a', 'char-a', 'group-b', 'group-trash'],
+            characters: [groupA, groupB, groupTrash, unreferenced, target],
         } as Database
         const commit = vi.fn(async ({ expectedRevision }) => ({
             revision: expectedRevision + 1,
         }))
+        const readCharacter = vi.fn(async (id: string) => ({
+            revision: 1,
+            value: structuredClone(database.characters.find((character) => character.chaId === id)),
+        }))
+        const lease = {
+            revision: 1,
+            readRoot: vi.fn(async () => ({ revision: 1, value: captureRoot(database) })),
+            queryCharacters: vi.fn(async ({ trash, cursor }: { trash: boolean; cursor?: string }) => {
+                if (trash) return {
+                    revision: 1,
+                    items: [{ id: 'group-trash', type: 'group' }],
+                }
+                if (!cursor) return {
+                    revision: 1,
+                    items: [
+                        { id: 'group-a', type: 'group' },
+                        { id: 'group-unreferenced', type: 'group' },
+                    ],
+                    nextCursor: 'next-page',
+                }
+                return {
+                    revision: 1,
+                    items: [
+                        { id: 'group-b', type: 'group' },
+                        { id: 'char-a', type: 'character' },
+                    ],
+                }
+            }),
+            readCharacter,
+            release: vi.fn(async () => undefined),
+        }
         const store = {
             commit,
-            readRoot: vi.fn(async () => ({ revision: 1, value: captureRoot(database) })),
-            readCharacter: vi.fn(async () => ({
-                revision: 1,
-                value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
-            })),
+            acquireRevision: vi.fn(async () => lease),
         } as unknown as PersistentDataStore
+        const publishCharacterMutation = vi.fn((state) => {
+            Object.assign(database, state.root)
+            database.characters = database.characters.filter(
+                (character) => character.chaId !== state.characterId,
+            )
+            for (const detail of state.relatedCharacters ?? []) {
+                const live = database.characters.find(
+                    (character) => character.chaId === detail.chaId,
+                )
+                if (live) Object.assign(live, detail)
+            }
+        })
         const coordinator = new SaveCoordinator({
             store,
             captureRoot: () => captureRoot(database),
-            captureSelectedCharacter: () => database.characters[0],
+            captureSelectedCharacter: () => null,
+            captureCharacter: () => null,
             replaceDatabase: vi.fn(),
-            publishCharacterMutation: (state) => {
-                if (state.kind !== 'delete') return
-                group.characters = []
-                group.characterTalks = []
-                group.characterActive = []
-                database.characters.splice(1, 1)
-            },
+            publishCharacterMutation,
         })
         coordinator.initialize(1)
 
-        await expect(coordinator.mutatePersistentCharacterDetail(
+        await expect(coordinator.deletePersistentCharacterWithGroupReferences(
             'char-a',
-            'delete-group-member',
-            () => ({ delete: true }),
+            'permanent-delete',
         )).resolves.toBe(true)
-        await coordinator.flushPendingData('persist-group-cleanup')
 
-        expect(commit).toHaveBeenNthCalledWith(1, {
+        expect(store.acquireRevision).toHaveBeenCalledWith(1)
+        expect(lease.queryCharacters).toHaveBeenCalledTimes(3)
+        expect(readCharacter.mock.calls.map(([id]) => id)).toEqual([
+            'char-a',
+            'group-a',
+            'group-unreferenced',
+            'group-b',
+            'group-trash',
+        ])
+        expect(lease.release).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledWith({
             expectedRevision: 1,
-            deleteCharacterId: 'char-a',
-        })
-        expect(commit).toHaveBeenNthCalledWith(2, expect.objectContaining({
-            expectedRevision: 2,
-            replaceCharacter: expect.objectContaining({
-                chaId: 'group-a',
-                characters: [],
-                characterTalks: [],
-                characterActive: [],
+            root: expect.objectContaining({
+                characterOrder: ['group-a', 'group-b', 'group-trash'],
             }),
+            deleteCharacterId: 'char-a',
+            characterDetails: [
+                expect.objectContaining({
+                    chaId: 'group-a',
+                    characters: ['char-b'],
+                    characterTalks: [0.75],
+                    characterActive: [true],
+                }),
+                expect.objectContaining({
+                    chaId: 'group-b',
+                    characters: ['char-b'],
+                    characterTalks: [0.4],
+                    characterActive: [true],
+                }),
+                expect.objectContaining({
+                    chaId: 'group-trash',
+                    characters: [],
+                    characterTalks: [],
+                    characterActive: [],
+                }),
+            ],
+        })
+        expect(publishCharacterMutation).toHaveBeenCalledWith(expect.objectContaining({
+            revision: 2,
+            characterId: 'char-a',
+            kind: 'delete',
+            relatedCharacters: expect.arrayContaining([
+                expect.objectContaining({ chaId: 'group-a' }),
+                expect.objectContaining({ chaId: 'group-b' }),
+                expect.objectContaining({ chaId: 'group-trash' }),
+            ]),
         }))
+        expect(database.characters.map((character) => character.chaId)).toEqual([
+            'group-a',
+            'group-b',
+            'group-trash',
+            'group-unreferenced',
+        ])
+        expect(groupA.characters).toEqual(['char-b'])
+        expect(groupB.characters).toEqual(['char-b'])
+        expect(groupTrash.characters).toEqual([])
+        expect(unreferenced.characters).toEqual(['char-b'])
     })
 
     it.each(['detail', 'replace', 'upsert'] as const)(

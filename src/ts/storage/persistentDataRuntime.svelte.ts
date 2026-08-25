@@ -341,6 +341,13 @@ export const mutatePersistentCharacterDetail = (
     reason,
     mutate,
 )
+export const deletePersistentCharacterWithGroupReferences = (
+    characterId: string,
+    reason: string,
+): Promise<boolean> => getPersistentDataRuntime().deletePersistentCharacterWithGroupReferences(
+    characterId,
+    reason,
+)
 export const replacePersistentCompleteCharacter = (
     characterId: string,
     reason: string,

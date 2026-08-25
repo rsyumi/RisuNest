@@ -296,6 +296,8 @@ pub(crate) struct WorkingSetCommit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) character: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) character_details: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) replace_character: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) add_character: Option<Value>,

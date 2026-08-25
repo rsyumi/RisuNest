@@ -130,6 +130,7 @@ export interface WorkingSetCommit {
     root?: PersistentRoot
     replacePresets?: botPreset[]
     character?: CharacterDetail
+    characterDetails?: CharacterDetail[]
     replaceCharacter?: character | groupChat
     addCharacter?: character | groupChat
     conversations?: ConversationMutation[]
