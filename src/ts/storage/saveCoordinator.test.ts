@@ -2038,6 +2038,7 @@ describe('SaveCoordinator', () => {
     it.each([
         {
             label: 'tail edit',
+            prepare: (_chat: Chat) => undefined,
             mutate: (chat: Chat) => {
                 chat.message[1] = { role: 'char', data: 'edited reply' }
             },
@@ -2049,6 +2050,7 @@ describe('SaveCoordinator', () => {
         },
         {
             label: 'middle insert',
+            prepare: (_chat: Chat) => undefined,
             mutate: (chat: Chat) => {
                 chat.message.splice(1, 0, { role: 'user', data: 'inserted' })
             },
@@ -2060,17 +2062,21 @@ describe('SaveCoordinator', () => {
         },
         {
             label: 'middle delete',
+            prepare: (chat: Chat) => {
+                chat.message.push({ role: 'user', data: 'shared suffix' })
+            },
             mutate: (chat: Chat) => {
-                chat.message.splice(0, 1)
+                chat.message.splice(1, 1)
             },
             expected: {
-                start: 0,
+                start: 1,
                 deleteCount: 1,
                 messages: [],
             },
         },
         {
             label: 'complete replacement',
+            prepare: (_chat: Chat) => undefined,
             mutate: (chat: Chat) => {
                 chat.message.splice(
                     0,
@@ -2090,6 +2096,7 @@ describe('SaveCoordinator', () => {
         },
         {
             label: 'metadata-only mutation',
+            prepare: (_chat: Chat) => undefined,
             mutate: (chat: Chat) => {
                 chat.name = 'Renamed conversation'
             },
@@ -2099,8 +2106,9 @@ describe('SaveCoordinator', () => {
                 messages: [],
             },
         },
-    ])('commits the minimal conversation replace range for $label', async ({ mutate, expected }) => {
+    ])('commits the minimal conversation replace range for $label', async ({ prepare, mutate, expected }) => {
         const database = makeChattyDatabase()
+        prepare(database.characters[0].chats[1])
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
         const coordinator = new SaveCoordinator({
             store: makeStore(commit),
