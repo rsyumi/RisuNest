@@ -25,7 +25,7 @@
     import { PreUnreroll, Prereroll } from 'src/ts/process/prereroll';
     import { processMultiCommand } from 'src/ts/process/command';
     import { postChatFile } from 'src/ts/process/files/multisend';
-    import { getInlayAsset } from 'src/ts/process/files/inlays';
+    import InlayFilePreview from './InlayFilePreview.svelte';
     import { ConnectionOpenStore } from 'src/ts/sync/multiuser';
     import { coldStorageHeader, preLoadChat } from 'src/ts/process/coldstorage.svelte';
     import Chats from './Chats.svelte';
@@ -732,33 +732,16 @@
 
             {#if fileInput.length > 0}
                 <div class="flex items-center ml-4 flex-wrap p-2 m-2 border-darkborderc border rounded-md">
-                    {#each fileInput as file, i}
-                        {#await getInlayAsset(file) then inlayAsset}
-                            <div class="relative">
-                                {#if inlayAsset.type === 'image'}
-                                    <img src={inlayAsset.data} alt="Inlay" class="max-w-48 max-h-48 border border-darkborderc">
-                                {:else if inlayAsset.type === 'video'}
-                                    <video controls class="max-w-48 max-h-48 border border-darkborderc">
-                                        <source src={inlayAsset.data} type="video/mp4" />
-                                        <track kind="captions" />
-                                        Your browser does not support the video tag.
-                                    </video>
-                                {:else if inlayAsset.type === 'audio'}
-                                    <audio controls class="max-w-48 max-h-24 border border-darkborderc">
-                                        <source src={inlayAsset.data} type="audio/mpeg" />
-                                        Your browser does not support the audio tag.
-                                    </audio>
-                                {:else}
-                                    <div class="max-w-24 max-h-24">{file}</div>
-                                {/if}
-                                <button class="absolute -right-1 -top-1 p-1 bg-darkbg text-textcolor rounded-md transition-colors hover:text-draculared focus:text-draculared" onclick={() => {
-                                    fileInput.splice(i, 1)
-                                    updateInputSizeAll()
-                                }}>
-                                    <XIcon size={18} />
-                                </button>
-                            </div>
-                        {/await}
+                    {#each fileInput as file, i (file)}
+                        <div class="relative">
+                            <InlayFilePreview id={file} />
+                            <button class="absolute -right-1 -top-1 p-1 bg-darkbg text-textcolor rounded-md transition-colors hover:text-draculared focus:text-draculared" onclick={() => {
+                                fileInput.splice(i, 1)
+                                updateInputSizeAll()
+                            }}>
+                                <XIcon size={18} />
+                            </button>
+                        </div>
                     {/each}
                 </div>
 

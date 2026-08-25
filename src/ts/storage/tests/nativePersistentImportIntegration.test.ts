@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import type { Database } from '../database.svelte'
+import type { PersistentRoot } from '../persistentDataStore'
 
 type StagedDatabase = {
-    root: Omit<Database, 'characters'> | null
+    root: PersistentRoot | null
+    presets: Database['botPresets']
     characters: Database['characters']
 }
 
@@ -23,17 +25,22 @@ class NativeStoreBoundary {
             case 'pds_open':
                 return { revision: this.revision }
             case 'pds_read_root': {
-                const { characters: _characters, ...root } = this.database
+                const { characters: _characters, botPresets: _botPresets, ...root } = this.database
                 return { revision: this.revision, value: structuredClone(root) }
             }
             case 'pds_replace_begin': {
                 const stagingId = `staging-${++this.stagingSequence}`
-                this.staging.set(stagingId, { root: null, characters: [] })
+                this.staging.set(stagingId, { root: null, presets: [], characters: [] })
                 return { stagingId }
             }
             case 'pds_replace_put_root': {
                 const staging = this.requireStaging(args.stagingId)
-                staging.root = structuredClone(args.root as Omit<Database, 'characters'>)
+                staging.root = structuredClone(args.root as PersistentRoot)
+                return undefined
+            }
+            case 'pds_replace_put_presets': {
+                const staging = this.requireStaging(args.stagingId)
+                staging.presets = structuredClone(args.presets as Database['botPresets'])
                 return undefined
             }
             case 'pds_replace_add_characters': {
@@ -53,7 +60,11 @@ class NativeStoreBoundary {
                     throw { code: 'revision-conflict', expected: expectedRevision, actual: this.revision }
                 }
                 if (!staging.root) throw new Error('staged root is required')
-                this.database = { ...structuredClone(staging.root), characters: structuredClone(staging.characters) }
+                this.database = {
+                    ...structuredClone(staging.root),
+                    botPresets: structuredClone(staging.presets),
+                    characters: structuredClone(staging.characters),
+                } as Database
                 this.staging.delete(stagingId)
                 this.revision++
                 return { revision: this.revision }
@@ -95,9 +106,10 @@ function createStateAdapter(initial: Database): PersistentDataRuntimeStateAdapte
     return {
         current: () => database,
         captureRoot: () => {
-            const { characters: _characters, ...root } = database
+            const { characters: _characters, botPresets: _botPresets, ...root } = database
             return structuredClone(root)
         },
+        capturePresets: () => structuredClone(database.botPresets ?? []),
         captureSelectedCharacter: () => structuredClone(database.characters[0] ?? null),
         captureCharacter: (id) => {
             const character = database.characters.find((item) => item.chaId === id)
@@ -130,7 +142,7 @@ describe('native persistent local backup integration', () => {
     })
 
     test('bootstraps a fresh Tauri store, imports a local backup, and preserves it on failure', async () => {
-        const preparedDefault = { characters: [] } as unknown as Database
+        const preparedDefault = { characters: [], botPresets: [] } as unknown as Database
         const prepareDatabase = async (database: Database) => database.characters
             ? structuredClone(database)
             : structuredClone(preparedDefault)

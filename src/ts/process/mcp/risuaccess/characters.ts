@@ -1,14 +1,52 @@
 import { language } from 'src/lang'
 import { alertConfirm } from 'src/ts/alert'
-import { type character, type groupChat, type loreBook } from 'src/ts/storage/database.svelte'
+import { type character, type loreBook } from 'src/ts/storage/database.svelte'
+import { mutatePersistentCharacterDetail } from 'src/ts/storage/persistentDataRuntime.svelte'
 import { DBState } from 'src/ts/stores.svelte'
 import { pickHashRand } from 'src/ts/util'
 import { type MCPTool, MCPToolHandler, type RPCToolCallContent } from '../mcplib'
 import { getCharacter } from './utils'
 
+const characterNotFound = (id: string): RPCToolCallContent[] => [{
+  type: 'text',
+  text: `Error: Character with ID ${id} not found.`,
+}]
+
+const groupChatError = (): RPCToolCallContent[] => [{
+  type: 'text',
+  text: 'Error: The id pointed to a group chat, not a character.',
+}]
+
+class CharacterMutationAbort extends Error {
+  constructor(readonly response: RPCToolCallContent[]) {
+    super('Character mutation aborted')
+  }
+}
+
 export class CharacterHandler extends MCPToolHandler {
   private promptAccess(tool: string, action: string) {
     return alertConfirm(language.mcpAccessPrompt.replace('{{tool}}', tool).replace('{{action}}', action))
+  }
+
+  private async commitCharacterMutation(
+    requestedId: string,
+    characterId: string,
+    reason: string,
+    mutate: (character: Omit<character, 'chats'>) => RPCToolCallContent[],
+  ): Promise<RPCToolCallContent[]> {
+    let response: RPCToolCallContent[] | undefined
+    try {
+      const found = await mutatePersistentCharacterDetail(characterId, reason, ({ character }) => {
+        if (character.type === 'group') throw new CharacterMutationAbort(groupChatError())
+        response = mutate(character)
+      })
+      if (!found) return characterNotFound(requestedId)
+      if (!response) throw new Error(`Character ${characterId} mutation produced no response`)
+      return response
+    } catch (error) {
+      if (error instanceof CharacterMutationAbort) return error.response
+      throw error
+    }
   }
 
   getTools(): MCPTool[] {
@@ -381,7 +419,7 @@ export class CharacterHandler extends MCPToolHandler {
   }
 
   async getCharacterInfo(id: string, fields: string[]): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -434,7 +472,7 @@ export class CharacterHandler extends MCPToolHandler {
   }
 
   async getCharacterLorebooks(id: string, count: number = 100, offset: number = 0): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -474,7 +512,7 @@ export class CharacterHandler extends MCPToolHandler {
   }
 
   async getCharacterLorebook(id: string, entryNames: string[]): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -522,7 +560,7 @@ export class CharacterHandler extends MCPToolHandler {
   }
 
   async setCharacterInfo(id: string, data: any): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -558,12 +596,8 @@ export class CharacterHandler extends MCPToolHandler {
       backgroundEmbedding: 'backgroundHTML',
     } as const
 
-    for (const [field, value] of Object.entries(data)) {
-      if (fieldRemap[field as keyof typeof fieldRemap]) {
-        const realField = fieldRemap[field as keyof typeof fieldRemap]
-        // @ts-ignore
-        char[realField] = value
-      } else {
+    for (const field of Object.keys(data)) {
+      if (!fieldRemap[field as keyof typeof fieldRemap]) {
         return [
           {
             type: 'text',
@@ -573,12 +607,19 @@ export class CharacterHandler extends MCPToolHandler {
       }
     }
 
-    return [
-      {
-        type: 'text',
-        text: `Successfully updated character ${char.name || char.chaId}`,
-      },
-    ]
+    return this.commitCharacterMutation(id, char.chaId, 'risu-set-character-info', (persisted) => {
+      const persistedRecord = persisted as unknown as Record<string, unknown>
+      for (const [field, value] of Object.entries(data)) {
+        const realField = fieldRemap[field as keyof typeof fieldRemap]
+        persistedRecord[realField] = value
+      }
+      return [
+        {
+          type: 'text',
+          text: `Successfully updated character ${persisted.name || persisted.chaId}`,
+        },
+      ]
+    })
   }
 
   async setCharacterLorebook(
@@ -589,7 +630,7 @@ export class CharacterHandler extends MCPToolHandler {
     newName?: string,
     alwaysActive?: boolean
   ): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -621,58 +662,50 @@ export class CharacterHandler extends MCPToolHandler {
       ]
     }
 
-    const entryIndex = char.globalLore.findIndex((entry) => {
-      const displayName = entry.comment || 'Unnamed ' + pickHashRand(5515, entry.content)
-      return displayName === name
-    })
-    if (entryIndex === -1) {
-      const newEntry: loreBook = {
-        key: alwaysActive ? '' : keys?.join(',') || '',
-        content: content || '',
-        comment: newName || name,
-        alwaysActive: alwaysActive || false,
-        secondkey: '',
-        selective: false,
-        insertorder: 100,
-        mode: 'normal',
+    return this.commitCharacterMutation(id, char.chaId, 'risu-set-character-lorebook', (persisted) => {
+      const entryIndex = persisted.globalLore.findIndex((entry) => {
+        const displayName = entry.comment || 'Unnamed ' + pickHashRand(5515, entry.content)
+        return displayName === name
+      })
+      if (entryIndex === -1) {
+        const newEntry: loreBook = {
+          key: alwaysActive ? '' : keys?.join(',') || '',
+          content: content || '',
+          comment: newName || name,
+          alwaysActive: alwaysActive || false,
+          secondkey: '',
+          selective: false,
+          insertorder: 100,
+          mode: 'normal',
+        }
+        persisted.globalLore.push(newEntry)
+        return [
+          {
+            type: 'text',
+            text: `Successfully added lorebook entry "${newName || name}" to character ${persisted.name || persisted.chaId}`,
+          },
+        ]
       }
-      char.globalLore.push(newEntry)
+
+      const entry = persisted.globalLore[entryIndex]
+      if (content !== undefined) entry.content = content
+      if (keys !== undefined) entry.key = alwaysActive ? '' : keys.join(',')
+      if (newName !== undefined) entry.comment = newName
+      if (alwaysActive !== undefined) {
+        entry.alwaysActive = alwaysActive
+        if (alwaysActive) entry.key = ''
+      }
       return [
         {
           type: 'text',
-          text: `Successfully added lorebook entry "${newName || name}" to character ${char.name || char.chaId}`,
+          text: `Successfully updated lorebook entry "${name}" for character ${persisted.name || persisted.chaId}`,
         },
       ]
-    }
-
-    const entry = char.globalLore[entryIndex]
-
-    if (content !== undefined) {
-      entry.content = content
-    }
-    if (keys !== undefined) {
-      entry.key = alwaysActive ? '' : keys.join(',')
-    }
-    if (newName !== undefined) {
-      entry.comment = newName
-    }
-    if (alwaysActive !== undefined) {
-      entry.alwaysActive = alwaysActive
-      if (alwaysActive) {
-        entry.key = ''
-      }
-    }
-
-    return [
-      {
-        type: 'text',
-        text: `Successfully updated lorebook entry "${name}" for character ${char.name || char.chaId}`,
-      },
-    ]
+    })
   }
 
   async deleteCharacterLorebook(id: string, name: string): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -704,31 +737,31 @@ export class CharacterHandler extends MCPToolHandler {
       ]
     }
 
-    const entryIndex = char.globalLore.findIndex((entry) => {
-      const displayName = entry.comment || 'Unnamed ' + pickHashRand(5515, entry.content)
-      return displayName === name
-    })
-    if (entryIndex === -1) {
+    return this.commitCharacterMutation(id, char.chaId, 'risu-delete-character-lorebook', (persisted) => {
+      const entryIndex = persisted.globalLore.findIndex((entry) => {
+        const displayName = entry.comment || 'Unnamed ' + pickHashRand(5515, entry.content)
+        return displayName === name
+      })
+      if (entryIndex === -1) {
+        throw new CharacterMutationAbort([
+          {
+            type: 'text',
+            text: `Error: Lorebook entry with name "${name}" not found.`,
+          },
+        ])
+      }
+      persisted.globalLore.splice(entryIndex, 1)
       return [
         {
           type: 'text',
-          text: `Error: Lorebook entry with name "${name}" not found.`,
+          text: `Successfully deleted lorebook entry "${name}" from character ${persisted.name || persisted.chaId}`,
         },
       ]
-    }
-
-    char.globalLore.splice(entryIndex, 1)
-
-    return [
-      {
-        type: 'text',
-        text: `Successfully deleted lorebook entry "${name}" from character ${char.name || char.chaId}`,
-      },
-    ]
+    })
   }
 
   async getCharacterRegexScripts(id: string): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -775,7 +808,7 @@ export class CharacterHandler extends MCPToolHandler {
     flag?: string,
     ableFlag?: boolean
   ): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -807,52 +840,47 @@ export class CharacterHandler extends MCPToolHandler {
       ]
     }
 
-    if (!char.customscript) {
-      char.customscript = []
-    }
-
-    const scriptIndex = char.customscript.findIndex((script) => {
-      const displayName = script.comment || 'Unnamed ' + pickHashRand(5515, script.in + script.out)
-      return displayName === name
-    })
-    if (scriptIndex === -1) {
-      const newScript = {
-        comment: newName || name,
-        in: regexIn || '',
-        out: regexOut || '',
-        type: type || 'editdisplay',
-        flag: flag || '',
-        ableFlag: ableFlag !== undefined ? ableFlag : true,
+    return this.commitCharacterMutation(id, char.chaId, 'risu-set-character-regex-scripts', (persisted) => {
+      if (!persisted.customscript) persisted.customscript = []
+      const scriptIndex = persisted.customscript.findIndex((script) => {
+        const displayName = script.comment || 'Unnamed ' + pickHashRand(5515, script.in + script.out)
+        return displayName === name
+      })
+      if (scriptIndex === -1) {
+        persisted.customscript.push({
+          comment: newName || name,
+          in: regexIn || '',
+          out: regexOut || '',
+          type: type || 'editdisplay',
+          flag: flag || '',
+          ableFlag: ableFlag !== undefined ? ableFlag : true,
+        })
+        return [
+          {
+            type: 'text',
+            text: `Successfully added regex script "${newName || name}" to character ${persisted.name || persisted.chaId}`,
+          },
+        ]
       }
 
-      char.customscript.push(newScript)
+      const script = persisted.customscript[scriptIndex]
+      if (newName !== undefined) script.comment = newName
+      if (regexIn !== undefined) script.in = regexIn
+      if (regexOut !== undefined) script.out = regexOut
+      if (type !== undefined) script.type = type
+      if (flag !== undefined) script.flag = flag
+      if (ableFlag !== undefined) script.ableFlag = ableFlag
       return [
         {
           type: 'text',
-          text: `Successfully added regex script "${newName || name}" to character ${char.name || char.chaId}`,
+          text: `Successfully updated regex script "${name}" for character ${persisted.name || persisted.chaId}`,
         },
       ]
-    }
-
-    const script = char.customscript[scriptIndex]
-
-    if (newName !== undefined) script.comment = newName
-    if (regexIn !== undefined) script.in = regexIn
-    if (regexOut !== undefined) script.out = regexOut
-    if (type !== undefined) script.type = type
-    if (flag !== undefined) script.flag = flag
-    if (ableFlag !== undefined) script.ableFlag = ableFlag
-
-    return [
-      {
-        type: 'text',
-        text: `Successfully updated regex script "${name}" for character ${char.name || char.chaId}`,
-      },
-    ]
+    })
   }
 
   async deleteCharacterRegexScripts(id: string, name: string): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -884,35 +912,32 @@ export class CharacterHandler extends MCPToolHandler {
       ]
     }
 
-    if (!char.customscript) {
-      char.customscript = []
-    }
-
-    const scriptIndex = char.customscript.findIndex((script) => {
-      const displayName = script.comment || 'Unnamed ' + pickHashRand(5515, script.in + script.out)
-      return displayName === name
-    })
-    if (scriptIndex === -1) {
+    return this.commitCharacterMutation(id, char.chaId, 'risu-delete-character-regex-scripts', (persisted) => {
+      if (!persisted.customscript) persisted.customscript = []
+      const scriptIndex = persisted.customscript.findIndex((script) => {
+        const displayName = script.comment || 'Unnamed ' + pickHashRand(5515, script.in + script.out)
+        return displayName === name
+      })
+      if (scriptIndex === -1) {
+        throw new CharacterMutationAbort([
+          {
+            type: 'text',
+            text: `Error: Regex script with name "${name}" not found.`,
+          },
+        ])
+      }
+      persisted.customscript.splice(scriptIndex, 1)
       return [
         {
           type: 'text',
-          text: `Error: Regex script with name "${name}" not found.`,
+          text: `Successfully deleted regex script "${name}" from character ${persisted.name || persisted.chaId}`,
         },
       ]
-    }
-
-    char.customscript.splice(scriptIndex, 1)
-
-    return [
-      {
-        type: 'text',
-        text: `Successfully deleted regex script "${name}" from character ${char.name || char.chaId}`,
-      },
-    ]
+    })
   }
 
   async getCharacterAdditionalAssets(id: string): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -945,7 +970,7 @@ export class CharacterHandler extends MCPToolHandler {
   }
 
   async deleteCharacterAdditionalAssets(id: string, assetName: string): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -977,35 +1002,32 @@ export class CharacterHandler extends MCPToolHandler {
       ]
     }
 
-    if (!char.additionalAssets) {
-      char.additionalAssets = []
-    }
-
-    const assetIndex = char.additionalAssets.findIndex((asset) => {
-      const displayName = asset[0] || 'Unnamed ' + pickHashRand(5515, asset[1] + asset[2])
-      return displayName === assetName
-    })
-    if (assetIndex === -1) {
+    return this.commitCharacterMutation(id, char.chaId, 'risu-delete-character-additional-assets', (persisted) => {
+      if (!persisted.additionalAssets) persisted.additionalAssets = []
+      const assetIndex = persisted.additionalAssets.findIndex((asset) => {
+        const displayName = asset[0] || 'Unnamed ' + pickHashRand(5515, asset[1] + asset[2])
+        return displayName === assetName
+      })
+      if (assetIndex === -1) {
+        throw new CharacterMutationAbort([
+          {
+            type: 'text',
+            text: `Error: Additional asset with name "${assetName}" not found.`,
+          },
+        ])
+      }
+      persisted.additionalAssets.splice(assetIndex, 1)
       return [
         {
           type: 'text',
-          text: `Error: Additional asset with name "${assetName}" not found.`,
+          text: `Successfully deleted additional asset "${assetName}" from character ${persisted.name || persisted.chaId}`,
         },
       ]
-    }
-
-    char.additionalAssets.splice(assetIndex, 1)
-
-    return [
-      {
-        type: 'text',
-        text: `Successfully deleted additional asset "${assetName}" from character ${char.name || char.chaId}`,
-      },
-    ]
+    })
   }
 
   async getCharacterLuaScript(id: string): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -1042,7 +1064,7 @@ export class CharacterHandler extends MCPToolHandler {
   }
 
   async setCharacterLuaScript(id: string, code: string): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
+    const char = await getCharacter(id)
     if (!char) {
       return [
         {
@@ -1069,23 +1091,24 @@ export class CharacterHandler extends MCPToolHandler {
       ]
     }
 
-    const firstTrigger = char.triggerscript?.[0]
-    if (firstTrigger?.effect?.[0]?.type === 'triggerlua') {
+    return this.commitCharacterMutation(id, char.chaId, 'risu-set-character-lua-script', (persisted) => {
+      const firstTrigger = persisted.triggerscript?.[0]
+      if (firstTrigger?.effect?.[0]?.type !== 'triggerlua') {
+        throw new CharacterMutationAbort([
+          {
+            type: 'text',
+            text: 'Error: User must first change the first trigger type to Lua manually.',
+          },
+        ])
+      }
       firstTrigger.effect[0].code = code
       return [
         {
           type: 'text',
-          text: `Successfully updated Lua script for character ${char.name || char.chaId}`,
+          text: `Successfully updated Lua script for character ${persisted.name || persisted.chaId}`,
         },
       ]
-    }
-
-    return [
-      {
-        type: 'text',
-        text: 'Error: User must first change the first trigger type to Lua manually.',
-      },
-    ]
+    })
   }
 
   async listCharacters(count: number = 100, offset: number = 0): Promise<RPCToolCallContent[]> {

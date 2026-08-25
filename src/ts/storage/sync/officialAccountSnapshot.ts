@@ -295,6 +295,7 @@ class OfficialPinnedPublication implements PinnedPublication {
     private released = false
     private disposed = false
     private published = false
+    private publicationCommitted = false
 
     constructor(
         private readonly revision: DataRevision,
@@ -316,6 +317,11 @@ class OfficialPinnedPublication implements PinnedPublication {
     async publish(): Promise<void> {
         if (this.disposed) throw new Error('Official publication has been disposed')
         if (this.published) return
+        if (this.publicationCommitted) {
+            await this.release()
+            this.published = true
+            return
+        }
 
         for (const asset of this.assets) {
             if (this.replacements.has(asset.key)) continue
@@ -347,41 +353,54 @@ class OfficialPinnedPublication implements PinnedPublication {
         requireWriteSuccess(result, databaseKey)
         await this.dependencies.markPublished(this.revision)
         this.onPublished(this.revision, this.databaseFingerprint)
-        this.published = true
+        this.publicationCommitted = true
         await this.release()
+        this.published = true
     }
 
     async dispose(): Promise<void> {
         if (this.disposed) return
-        this.disposed = true
         await this.release()
+        this.disposed = true
     }
 
     private async release(): Promise<void> {
         if (this.released) return
-        this.released = true
         await this.lease.release()
+        this.released = true
     }
 }
 
 export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher {
     readonly capability = officialAccountSnapshotCapability
+    private associatedAccountId: string | null = null
     private associatedProjection: OfficialAssociationRecord | null = null
     /** Keys already known to be unavailable everywhere; skipping them keeps publishes from re-probing. */
     private readonly unavailableRemoteAssets = new Set<string>()
 
     constructor(private readonly dependencies: OfficialAccountSnapshotDependencies) {}
 
+    resetAccountAssociation(accountId: string | null): void {
+        this.associatedAccountId = accountId
+        this.associatedProjection = accountId
+            ? this.dependencies.association?.load(accountId) ?? null
+            : null
+        this.unavailableRemoteAssets.clear()
+    }
+
     private resolveAssociation(accountId: string | undefined): OfficialAssociationRecord | null {
-        if (this.associatedProjection) return this.associatedProjection
-        if (!accountId) return null
-        return this.dependencies.association?.load(accountId) ?? null
+        const resolvedAccountId = accountId ?? null
+        if (resolvedAccountId !== this.associatedAccountId) {
+            this.resetAccountAssociation(resolvedAccountId)
+        }
+        return this.associatedProjection
     }
 
     private rememberAssociation(
         accountId: string | undefined,
         record: OfficialAssociationRecord,
     ): void {
+        this.associatedAccountId = accountId ?? null
         this.associatedProjection = record
         if (accountId) this.dependencies.association?.save(accountId, record)
     }
@@ -461,7 +480,9 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 },
             )
         } catch (error) {
-            await lease.release()
+            try {
+                await lease.release()
+            } catch {}
             throw error
         }
     }

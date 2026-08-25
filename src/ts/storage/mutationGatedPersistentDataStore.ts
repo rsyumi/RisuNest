@@ -22,6 +22,8 @@ export function createMutationGatedPersistentDataStore(
     return {
         open: () => store.open(),
         readRoot: () => store.readRoot(),
+        queryPresets: () => store.queryPresets(),
+        readPreset: (id: string) => store.readPreset(id),
         queryCharacters: (input: CharacterQuery): Promise<CharacterPage> =>
             store.queryCharacters(input),
         readCharacter: (id: string): Promise<Versioned<CharacterDetail> | null> =>

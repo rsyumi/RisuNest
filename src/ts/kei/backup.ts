@@ -1,29 +1,41 @@
 import { keiServerURL } from "./kei"
 import { getDatabase } from "../storage/database.svelte"
+import { materializePersistentDatabaseSnapshot } from "../storage/persistentDataRuntime.svelte"
 
 let lastKeiSave = 0
 
-export function saveDbKei() {
+export async function saveDbKei(): Promise<void> {
     try {
-        const db = getDatabase()
-        if (!db?.account?.kei) {
+        const liveAccount = getDatabase()?.account
+        if (!liveAccount?.kei) {
             return
         }
         if (Date.now() - lastKeiSave < 60000 * 5) {
             return
         }
         lastKeiSave = Date.now()
-        fetch(keiServerURL() + '/autobackup/save', {
+        const liveAccountId = liveAccount.id
+        const liveToken = liveAccount.token
+        const database = await materializePersistentDatabaseSnapshot('kei-auto-backup')
+        const snapshotAccount = database.account
+        if (
+            !snapshotAccount?.kei ||
+            snapshotAccount.id !== liveAccountId ||
+            snapshotAccount.token !== liveToken
+        ) {
+            throw new Error('Kei account changed during backup materialization')
+        }
+        await fetch(keiServerURL() + '/autobackup/save', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                token: db.account.token,
-                database: db
+                token: snapshotAccount.token,
+                database,
             })
-        }).catch((error) => {
-            console.error('Kei auto backup failed:', error)
         })
-    } catch (error) {}
+    } catch (error) {
+        console.error('Kei auto backup failed:', error)
+    }
 }

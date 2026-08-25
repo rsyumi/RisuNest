@@ -17,10 +17,10 @@ fn fixture() -> Value {
 
 fn root(database: &Value) -> Value {
     let mut root = database.clone();
-    root.as_object_mut()
-        .expect("fixture database object")
-        .remove("characters");
-    root
+    let root = root.as_object_mut().expect("fixture database object");
+    root.remove("characters");
+    root.remove("botPresets");
+    Value::Object(root.clone())
 }
 
 fn open_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
@@ -36,6 +36,12 @@ fn open_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
         .replace_put_root(&staging.staging_id, &root)
         .expect("stage fixture root");
     store
+        .replace_put_presets(
+            &staging.staging_id,
+            database["botPresets"].as_array().expect("fixture presets"),
+        )
+        .expect("stage fixture presets");
+    store
         .replace_add_characters(&staging.staging_id, characters)
         .expect("stage fixture characters");
     assert_eq!(
@@ -48,6 +54,70 @@ fn open_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
     (directory, store, database)
 }
 
+#[test]
+fn preset_catalog_reads_and_materializes_in_configured_order() {
+    let (_directory, mut store, database) = open_fixture();
+
+    assert!(store
+        .read_root(None)
+        .expect("read root")
+        .value
+        .get("botPresets")
+        .is_none());
+    assert_eq!(
+        serde_json::to_value(store.query_presets(None).expect("query presets"))
+            .expect("serialize preset catalog"),
+        json!({
+            "revision": 1,
+            "items": [
+                { "id": "0", "name": "Preset Beta", "image": "preset-beta.png", "configuredIndex": 0 },
+                { "id": "1", "name": "Preset Alpha", "configuredIndex": 1 }
+            ]
+        })
+    );
+    assert_eq!(
+        store
+            .read_preset("1", None)
+            .expect("read preset")
+            .expect("preset exists")
+            .value,
+        database["botPresets"][1]
+    );
+
+    let lease = store.acquire_revision(1).expect("acquire preset lease");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Preset commit", "botPresets": ["strip"] })),
+            replace_presets: Some(vec![json!({ "name": "Replacement" })]),
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+        })
+        .expect("replace presets");
+    assert_eq!(
+        store.materialize(None).expect("materialize replacement")["botPresets"],
+        json!([{ "name": "Replacement" }])
+    );
+    assert_eq!(
+        store
+            .query_presets(Some(&lease.lease))
+            .expect("query leased presets")
+            .items[0]
+            .name,
+        "Preset Beta"
+    );
+    store
+        .release_revision(&lease.lease)
+        .expect("release preset lease");
+    assert!(matches!(
+        store.query_presets(Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+}
+
 fn message(id: &str) -> Value {
     json!({ "role": "user", "data": id, "chatId": id, "time": 1_800_000_000_000i64 })
 }
@@ -57,6 +127,7 @@ fn commit(store: &mut PersistentStore, revision: i64, mutation: ConversationMuta
         .commit(&WorkingSetCommit {
             expected_revision: revision,
             root: None,
+            replace_presets: None,
             character: None,
             replace_character: None,
             add_character: None,
@@ -174,6 +245,7 @@ fn character_search_uses_rust_unicode_lowercase_matching() {
         .commit(&WorkingSetCommit {
             expected_revision: 0,
             root: None,
+            replace_presets: None,
             character: None,
             replace_character: None,
             add_character: Some(json!({
@@ -381,6 +453,7 @@ fn cas_conflict_preserves_current_revision() {
     let result = store.commit(&WorkingSetCommit {
         expected_revision: 0,
         root: Some(json!({ "username": "stale" })),
+        replace_presets: None,
         character: None,
         replace_character: None,
         add_character: None,
@@ -426,6 +499,7 @@ fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
         .commit(&WorkingSetCommit {
             expected_revision: 1,
             root: Some(changed_root),
+            replace_presets: None,
             character: None,
             replace_character: Some(replacement),
             add_character: None,
@@ -498,6 +572,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
         .commit(&WorkingSetCommit {
             expected_revision: 1,
             root: None,
+            replace_presets: None,
             character: None,
             replace_character: None,
             add_character: None,
@@ -520,6 +595,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
         .commit(&WorkingSetCommit {
             expected_revision: deleted.revision,
             root: None,
+            replace_presets: None,
             character: None,
             replace_character: Some(replacement),
             add_character: None,
@@ -561,6 +637,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
         store.commit(&WorkingSetCommit {
             expected_revision: 1,
             root: Some(json!({ "username": "must roll back" })),
+            replace_presets: None,
             character: None,
             replace_character: Some(invalid.clone()),
             add_character: None,
@@ -584,6 +661,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
         store.commit(&WorkingSetCommit {
             expected_revision: 0,
             root: None,
+            replace_presets: None,
             character: None,
             replace_character: Some(invalid),
             add_character: None,
@@ -604,6 +682,12 @@ fn reopen_recovers_committed_data_and_sweeps_abandoned_staging() {
         store
             .replace_put_root(&committed.staging_id, &root(&database))
             .expect("stage committed root");
+        store
+            .replace_put_presets(
+                &committed.staging_id,
+                database["botPresets"].as_array().expect("fixture presets"),
+            )
+            .expect("stage committed presets");
         store
             .replace_add_characters(
                 &committed.staging_id,
@@ -672,6 +756,7 @@ fn revision_leases_are_isolated_then_released() {
         .commit(&WorkingSetCommit {
             expected_revision: 1,
             root: Some(json!({ "apiType": "fixture-provider", "username": "Changed" })),
+            replace_presets: None,
             character: None,
             replace_character: None,
             add_character: None,
@@ -750,6 +835,7 @@ fn character_detail_update_preserves_index_and_conversations() {
         .commit(&WorkingSetCommit {
             expected_revision: 1,
             root: None,
+            replace_presets: None,
             character: Some(detail.clone()),
             replace_character: None,
             add_character: None,
@@ -902,6 +988,7 @@ fn summary_recent_at_falls_back_to_message_time_then_zero() {
         .commit(&WorkingSetCommit {
             expected_revision: revision,
             root: None,
+            replace_presets: None,
             character: None,
             replace_character: None,
             add_character: Some(json!({ "chaId": "char-zero", "name": "Zero", "chats": [] })),
@@ -1124,6 +1211,396 @@ fn app_kv_round_trips_json() {
 }
 
 #[test]
+fn app_kv_remove_deletes_only_the_selected_key() {
+    let (_directory, store, _) = open_fixture();
+    store
+        .set_app_kv("credential", &json!({ "token": "legacy" }))
+        .expect("write credential");
+    store
+        .set_app_kv("ledger", &json!({ "version": 1 }))
+        .expect("write ledger");
+
+    store
+        .remove_app_kv("credential")
+        .expect("remove credential");
+
+    assert_eq!(
+        store.get_app_kv("credential").expect("read credential"),
+        None
+    );
+    assert_eq!(
+        store.get_app_kv("ledger").expect("read ledger"),
+        Some(json!({ "version": 1 }))
+    );
+}
+
+fn create_v1_database(path: &Path) {
+    fs::create_dir_all(path.parent().expect("v1 database parent")).expect("create v1 parent");
+    let connection = rusqlite::Connection::open(path).expect("create v1 database");
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE app_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE snapshot_leases (generation TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
+            CREATE TABLE root (generation TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE characters (
+                generation TEXT NOT NULL, character_id TEXT NOT NULL,
+                configured_index INTEGER NOT NULL, recent_at INTEGER NOT NULL,
+                trashed INTEGER NOT NULL, name TEXT NOT NULL, image TEXT,
+                conversation_count INTEGER NOT NULL, detail TEXT NOT NULL,
+                PRIMARY KEY (generation, character_id)
+            );
+            CREATE INDEX characters_configured ON characters (generation, configured_index);
+            CREATE INDEX characters_recent ON characters (generation, recent_at DESC, configured_index);
+            CREATE TABLE conversations (
+                generation TEXT NOT NULL, character_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL, configured_index INTEGER NOT NULL,
+                recent_at INTEGER NOT NULL, name TEXT NOT NULL,
+                message_count INTEGER NOT NULL, detail TEXT NOT NULL,
+                PRIMARY KEY (generation, character_id, conversation_id)
+            );
+            CREATE INDEX conversations_configured
+                ON conversations (generation, character_id, configured_index);
+            CREATE INDEX conversations_recent
+                ON conversations (generation, character_id, recent_at DESC, configured_index);
+            CREATE TABLE messages (
+                generation TEXT NOT NULL, character_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL, message_index INTEGER NOT NULL,
+                message_id TEXT, value TEXT NOT NULL,
+                PRIMARY KEY (generation, character_id, conversation_id, message_index)
+            );
+            CREATE INDEX messages_by_id
+                ON messages (generation, character_id, conversation_id, message_id);
+            INSERT INTO meta VALUES ('currentRevision', '7');
+            INSERT INTO meta VALUES ('activeGeneration', '\"revision-7\"');
+            PRAGMA user_version = 1;
+            ",
+        )
+        .expect("create v1 schema");
+    connection
+        .execute(
+            "INSERT INTO root VALUES (?1, ?2)",
+            rusqlite::params![
+                "revision-7",
+                json!({
+                    "username": "V1 active",
+                    "characters": ["strip"],
+                    "botPresets": [
+                        { "name": "V1 first", "image": "v1.png" },
+                        { "name": "V1 second" }
+                    ]
+                })
+                .to_string()
+            ],
+        )
+        .expect("insert v1 active root");
+    connection
+        .execute(
+            "INSERT INTO root VALUES (?1, ?2)",
+            rusqlite::params![
+                "revision-old",
+                json!({ "username": "V1 old", "botPresets": [{ "name": "Old preset" }] })
+                    .to_string()
+            ],
+        )
+        .expect("insert v1 old root");
+    let detail = json!({
+        "type": "character",
+        "chaId": "v1-character",
+        "name": "V1 character",
+        "creatorNotes": "migrated notes",
+        "trashTime": 123
+    });
+    connection
+        .execute(
+            "INSERT INTO characters
+             (generation, character_id, configured_index, recent_at, trashed, name, image,
+              conversation_count, detail)
+             VALUES (?1, ?2, 0, 0, 1, ?3, NULL, 0, ?4)",
+            rusqlite::params![
+                "revision-7",
+                "v1-character",
+                "V1 character",
+                detail.to_string()
+            ],
+        )
+        .expect("insert v1 character");
+}
+
+#[test]
+fn schema_v2_migrates_presets_and_character_summaries_for_every_v1_generation() {
+    let directory = tempfile::tempdir().expect("create migration directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_v1_database(&database_path);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate v1 store");
+    assert_eq!(
+        store
+            .query_presets(None)
+            .expect("query migrated presets")
+            .items
+            .len(),
+        2
+    );
+    assert!(store
+        .read_root(None)
+        .expect("read migrated root")
+        .value
+        .get("botPresets")
+        .is_none());
+    let old_root: String = store
+        .connection
+        .query_row(
+            "SELECT value FROM root WHERE generation = 'revision-old'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read migrated old root");
+    assert_eq!(
+        serde_json::from_str::<Value>(&old_root).expect("parse old root"),
+        json!({ "username": "V1 old" })
+    );
+    let old_presets: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM bot_presets WHERE generation = 'revision-old'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count old presets");
+    assert_eq!(old_presets, 1);
+    let summary = &store
+        .query_characters(
+            &CharacterQuery {
+                search: None,
+                order: QueryOrder::Configured,
+                trash: true,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("query migrated character")
+        .items[0];
+    assert_eq!(summary.r#type, "character");
+    assert_eq!(summary.creator_notes.as_deref(), Some("migrated notes"));
+    assert_eq!(summary.trash_time, Some(123));
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read migrated version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn schema_v2_rolls_back_when_v1_bot_presets_is_not_an_array() {
+    let directory = tempfile::tempdir().expect("create migration rollback directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_v1_database(&database_path);
+    let invalid_root = json!({
+        "username": "Invalid v1 root",
+        "botPresets": { "legacy": "unsupported" }
+    });
+    let connection = rusqlite::Connection::open(&database_path).expect("open v1 database");
+    let original_active: String = connection
+        .query_row(
+            "SELECT value FROM root WHERE generation = 'revision-7'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read original active v1 root");
+    connection
+        .execute(
+            "UPDATE root SET value = ?2 WHERE generation = ?1",
+            rusqlite::params!["revision-old", invalid_root.to_string()],
+        )
+        .expect("write invalid v1 root");
+    drop(connection);
+
+    assert!(PersistentStore::open(directory.path()).is_err());
+
+    let connection =
+        rusqlite::Connection::open(&database_path).expect("reopen rolled back v1 database");
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read rolled back schema version");
+    let preserved: String = connection
+        .query_row(
+            "SELECT value FROM root WHERE generation = 'revision-old'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read preserved v1 root");
+    let preserved_active: String = connection
+        .query_row(
+            "SELECT value FROM root WHERE generation = 'revision-7'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read preserved active v1 root");
+    let preset_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'bot_presets'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check rolled back preset table");
+    assert_eq!(version, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&preserved).expect("parse preserved root"),
+        invalid_root
+    );
+    assert_eq!(preserved_active, original_active);
+    assert_eq!(preset_table_count, 0);
+}
+
+#[test]
+fn pending_v1_snapshot_restores_then_migrates_to_v2() {
+    let directory = tempfile::tempdir().expect("create restore directory");
+    let store = PersistentStore::open(directory.path()).expect("open current v2 store");
+    let candidate = directory
+        .path()
+        .join("persistent/snapshots/persistent-v1.db");
+    create_v1_database(&candidate);
+    store
+        .snapshot_restore_request(&candidate)
+        .expect("request v1 snapshot restore");
+    drop(store);
+
+    let restored =
+        PersistentStore::open(directory.path()).expect("restore and migrate v1 snapshot");
+    assert_eq!(restored.revision().expect("read restored revision"), 7);
+    assert_eq!(
+        restored
+            .query_presets(None)
+            .expect("query restored presets")
+            .items[0]
+            .name,
+        "V1 first"
+    );
+    let version: i64 = restored
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read restored version");
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
+    let directory = tempfile::tempdir().expect("create invalid restore directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open current v2 store");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 0,
+            root: Some(json!({ "username": "Preserved live database" })),
+            replace_presets: Some(vec![json!({ "name": "Live preset" })]),
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+        })
+        .expect("seed live database");
+
+    let candidate = directory
+        .path()
+        .join("persistent/snapshots/persistent-invalid-v1.db");
+    create_v1_database(&candidate);
+    let connection = rusqlite::Connection::open(&candidate).expect("open invalid v1 candidate");
+    connection
+        .execute(
+            "UPDATE root SET value = ?2 WHERE generation = ?1",
+            rusqlite::params![
+                "revision-7",
+                json!({ "username": "Invalid candidate", "botPresets": { "legacy": true } })
+                    .to_string()
+            ],
+        )
+        .expect("corrupt candidate preset shape");
+    drop(connection);
+    store
+        .snapshot_restore_request(&candidate)
+        .expect("request invalid v1 restore");
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path())
+        .expect("invalid candidate must not replace live database");
+    assert_eq!(reopened.revision().expect("read preserved revision"), 1);
+    assert_eq!(
+        reopened
+            .read_root(None)
+            .expect("read preserved live root")
+            .value["username"],
+        "Preserved live database"
+    );
+    assert_eq!(
+        reopened
+            .query_presets(None)
+            .expect("query preserved live presets")
+            .items[0]
+            .name,
+        "Live preset"
+    );
+    assert!(directory
+        .path()
+        .join("persistent/snapshots/pending-restore.json")
+        .is_file());
+    assert!(candidate.is_file());
+}
+
+#[test]
+fn semantically_invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
+    let directory = tempfile::tempdir().expect("create semantic restore directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open current v2 store");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 0,
+            root: Some(json!({ "username": "Preserved semantic live database" })),
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+        })
+        .expect("seed semantic live database");
+
+    let candidate = directory
+        .path()
+        .join("persistent/snapshots/persistent-semantic-invalid-v1.db");
+    create_v1_database(&candidate);
+    let connection = rusqlite::Connection::open(&candidate).expect("open semantic v1 candidate");
+    connection
+        .execute(
+            "UPDATE meta SET value = '\"missing-generation\"' WHERE key = 'activeGeneration'",
+            [],
+        )
+        .expect("make active generation semantically invalid");
+    drop(connection);
+    store
+        .snapshot_restore_request(&candidate)
+        .expect("request semantic invalid v1 restore");
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path())
+        .expect("semantic invalid candidate must not replace live database");
+    assert_eq!(reopened.revision().expect("read preserved revision"), 1);
+    assert_eq!(
+        reopened
+            .read_root(None)
+            .expect("read preserved semantic live root")
+            .value["username"],
+        "Preserved semantic live database"
+    );
+    assert!(directory
+        .path()
+        .join("persistent/snapshots/pending-restore.json")
+        .is_file());
+    assert!(candidate.is_file());
+}
+
+#[test]
 fn schema_configures_the_documented_sqlite_profile() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let store = PersistentStore::open(directory.path()).expect("open persistent store");
@@ -1146,7 +1623,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 1);
+    assert_eq!(integer_pragma("user_version"), 2);
 }
 
 #[test]
@@ -1163,6 +1640,7 @@ fn snapshots_create_list_and_restore_on_reopen() {
         .commit(&WorkingSetCommit {
             expected_revision: 1,
             root: Some(json!({ "username": "Changed after snapshot" })),
+            replace_presets: None,
             character: None,
             replace_character: None,
             add_character: None,
@@ -1330,6 +1808,7 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
         .commit(&WorkingSetCommit {
             expected_revision: 1,
             root: Some(json!({ "username": "Current before restore" })),
+            replace_presets: None,
             character: None,
             replace_character: None,
             add_character: None,
@@ -1383,13 +1862,14 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
 }
 
 #[test]
-fn invalid_restore_candidates_preserve_current_data_and_clear_marker() {
+fn invalid_restore_candidates_preserve_current_data_and_marker() {
     for wrong_version in [false, true] {
         let (directory, mut store, database) = open_fixture();
         store
             .commit(&WorkingSetCommit {
                 expected_revision: 1,
                 root: Some(json!({ "username": "Current protected data" })),
+                replace_presets: None,
                 character: None,
                 replace_character: None,
                 add_character: None,
@@ -1408,7 +1888,7 @@ fn invalid_restore_candidates_preserve_current_data_and_clear_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 2;")
+                .execute_batch("PRAGMA user_version = 3;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
@@ -1426,7 +1906,7 @@ fn invalid_restore_candidates_preserve_current_data_and_clear_marker() {
                 .expect("read preserved current data"),
             expected
         );
-        assert!(!snapshots_dir(&directory)
+        assert!(snapshots_dir(&directory)
             .join("pending-restore.json")
             .exists());
     }

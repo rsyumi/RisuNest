@@ -252,6 +252,9 @@ changes made through the live Proxy are durable before compatibility data can be
 
 `getDatabase()` remains supported as the explicit compatibility snapshot. Requesting
 `characters`, including its default `'all'`, can temporarily materialize the complete library.
+Every requested key comes from the same detached snapshot. Scalable mode uses one authoritative
+committed revision. Maximum compatibility snapshots the current live database, including API v2.1
+edits that have not yet been persisted.
 The bounded query methods flush pending compatibility changes before exposing committed data
 and return cloned values rather than mutable live references. Existing index-based APIs remain
 compatible, but stable IDs and opaque cursors are the scalable path. A denied permission returns

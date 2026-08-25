@@ -1,4 +1,10 @@
 import type { Database } from './database.svelte'
+import {
+    hasNativePersistentRevisionLease,
+    type NativePersistentExportFile,
+    type NativePersistentExportOptions,
+    withPinnedNativePersistentRisuSaveFile,
+} from './nativePersistentExport'
 import type {
     CharacterSummary,
     DataRevision,
@@ -70,21 +76,53 @@ async function* characterValues(lease: PersistentRevisionLease): AsyncGenerator<
     }
 }
 
+async function releaseRevisionLease(lease: PersistentRevisionLease): Promise<void> {
+    try {
+        await lease.release()
+    } catch (firstError) {
+        try {
+            await lease.release()
+        } catch {
+            throw firstError
+        }
+    }
+}
+
 export async function* streamRisuSaveFromStore(
     store: PersistentDataStore,
     revision: DataRevision,
     options?: RisuSaveStreamOptions,
 ): AsyncGenerator<Uint8Array> {
     const lease = await store.acquireRevision(revision)
+    let exportFailed = false
     try {
         yield* streamRisuSaveFromLease(lease, options)
+    } catch (error) {
+        exportFailed = true
+        throw error
     } finally {
-        await lease.release()
+        try {
+            await releaseRevisionLease(lease)
+        } catch (error) {
+            if (!exportFailed) throw error
+        }
     }
 }
 
 export interface RisuSaveStreamOptions {
     replaceResources?: Readonly<Record<string, string>>
+    omitAccount?: boolean
+}
+
+async function presetValues(lease: PersistentRevisionLease): Promise<Database['botPresets']> {
+    const presets: Database['botPresets'] = []
+    const catalog = await lease.queryPresets()
+    for (const summary of catalog.items) {
+        const preset = await lease.readPreset(summary.id)
+        if (!preset) throw new Error(`Missing preset ${summary.id}`)
+        presets.push(preset.value)
+    }
+    return presets
 }
 
 export async function* streamRisuSaveFromLease(
@@ -92,9 +130,11 @@ export async function* streamRisuSaveFromLease(
     options?: RisuSaveStreamOptions,
 ): AsyncGenerator<Uint8Array> {
     const storedRoot = (await lease.readRoot()).value
+    const storedPresets = await presetValues(lease)
+    const rootWithPresets = { ...storedRoot, botPresets: storedPresets } as Database
     const root = options?.replaceResources
-        ? replaceDatabaseRootResources(storedRoot, options.replaceResources)
-        : storedRoot
+        ? replaceDatabaseRootResources(rootWithPresets, options.replaceResources)
+        : rootWithPresets
     const directory: string[] = [
         'preset',
         'modules',
@@ -113,10 +153,13 @@ export async function* streamRisuSaveFromLease(
         pluginCustomStorage,
         ...rootData
     } = root
+    const exportedRoot = options?.omitAccount
+        ? Object.fromEntries(Object.entries(rootData).filter(([key]) => key !== 'account'))
+        : rootData
     yield magicRisuSaveHeader.slice()
     yield await encodeRisuSaveBlock({
         compression: true,
-        data: JSON.stringify({ ...rootData, __directory: directory }),
+        data: JSON.stringify({ ...exportedRoot, __directory: directory }),
         type: RisuSaveType.ROOT,
         name: 'root',
     })
@@ -151,4 +194,95 @@ export async function* streamRisuSaveFromLease(
         type: RisuSaveType.CONFIG,
         name: 'config',
     })
+}
+
+export interface RisuSaveExportRuntime {
+    readonly store: PersistentDataStore
+    capturePersistentMutationToken(reason: string): Promise<{
+        revision: DataRevision
+        mutationGeneration: number
+    }>
+}
+
+export interface PinnedRisuSaveExport {
+    readonly revision: DataRevision
+    readonly mutationGeneration: number
+    countCharacters(): Promise<number>
+    materializeDatabase(): Promise<Database>
+    stream(options?: RisuSaveStreamOptions): AsyncGenerator<Uint8Array>
+    collectBytes(options?: RisuSaveStreamOptions): Promise<Uint8Array>
+    withNativeFile?<T>(
+        options: NativePersistentExportOptions,
+        callback: (file: NativePersistentExportFile) => Promise<T>,
+    ): Promise<T>
+}
+
+async function materializeDatabaseFromLease(
+    lease: PersistentRevisionLease,
+): Promise<Database> {
+    const root = (await lease.readRoot()).value
+    const botPresets = await presetValues(lease)
+    const characters: Database['characters'] = []
+    for await (const character of characterValues(lease)) {
+        characters.push(character)
+    }
+    return { ...root, characters, botPresets } as Database
+}
+
+async function collectChunks(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
+    const values: Uint8Array[] = []
+    let length = 0
+    for await (const chunk of chunks) {
+        values.push(chunk)
+        length += chunk.byteLength
+    }
+    const result = new Uint8Array(length)
+    let offset = 0
+    for (const value of values) {
+        result.set(value, offset)
+        offset += value.byteLength
+    }
+    return result
+}
+
+export async function withFlushedRisuSaveExport<T>(
+    runtime: RisuSaveExportRuntime,
+    reason: string,
+    callback: (pinned: PinnedRisuSaveExport) => Promise<T>,
+): Promise<T> {
+    const token = await runtime.capturePersistentMutationToken(reason)
+    const lease = await runtime.store.acquireRevision(token.revision)
+    const pinned: PinnedRisuSaveExport = {
+        revision: token.revision,
+        mutationGeneration: token.mutationGeneration,
+        countCharacters: async () => (await characterSummaries(lease)).length,
+        materializeDatabase: () => materializeDatabaseFromLease(lease),
+        stream: (options) => streamRisuSaveFromLease(lease, options),
+        collectBytes: (options) => collectChunks(streamRisuSaveFromLease(lease, options)),
+        ...(hasNativePersistentRevisionLease(lease)
+            ? {
+                  withNativeFile: <T>(
+                      options: NativePersistentExportOptions,
+                      nativeCallback: (file: NativePersistentExportFile) => Promise<T>,
+                  ) => withPinnedNativePersistentRisuSaveFile(
+                      lease,
+                      options,
+                      nativeCallback,
+                  ),
+              }
+            : {}),
+    }
+    let exportFailed = false
+    try {
+        return await callback(pinned)
+    } catch (error) {
+        exportFailed = true
+        throw error
+    } finally {
+        try {
+            await releaseRevisionLease(lease)
+        } catch (error) {
+            if (!exportFailed) throw error
+        }
+    }
 }

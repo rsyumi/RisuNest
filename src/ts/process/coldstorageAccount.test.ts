@@ -3,12 +3,13 @@ import { decompressSync } from 'fflate'
 
 const mocks = vi.hoisted(() => ({
     fetchProtectedResource: vi.fn(),
+    database: { characters: [] as any[] },
 }))
 
 vi.mock('../sionyw', () => ({ fetchProtectedResource: mocks.fetchProtectedResource }))
 vi.mock('../globalApi.svelte', () => ({ forageStorage: { isAccount: true } }))
 vi.mock('src/ts/platform', () => ({ isNodeServer: false, isTauri: false }))
-vi.mock('../stores.svelte', () => ({ DBState: { db: { characters: [] } } }))
+vi.mock('../stores.svelte', () => ({ DBState: { db: mocks.database } }))
 vi.mock('../alert', () => ({
     alertClear: vi.fn(),
     alertConfirm: vi.fn(),
@@ -21,9 +22,38 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({ replacePersistentDat
 
 beforeEach(() => {
     mocks.fetchProtectedResource.mockReset()
+    mocks.database.characters = []
 })
 
 describe('official account cold storage transport', () => {
+    it('skips public cleanup for an incomplete catalog working set', async () => {
+        const { createCatalogCharacterStub } = await import('../storage/workingSetCatalog')
+        mocks.database.characters = [createCatalogCharacterStub({
+            id: 'char-a',
+            name: 'Alpha',
+            configuredIndex: 0,
+            recentAt: 0,
+            trashed: false,
+            conversationCount: 1,
+            type: 'character',
+        })]
+        const list = vi.fn(async () => ['unused'])
+        const remove = vi.fn(async () => undefined)
+        const { cleanColdStorage, configureLocalColdStorageRuntime } = await import(
+            './coldstorage.svelte'
+        )
+        configureLocalColdStorageRuntime({
+            list,
+            remove,
+        } as any)
+
+        await cleanColdStorage()
+
+        expect(mocks.fetchProtectedResource).not.toHaveBeenCalled()
+        expect(list).not.toHaveBeenCalled()
+        expect(remove).not.toHaveBeenCalled()
+    })
+
     it('keeps an account-mode startup cold payload in the local authoritative store', async () => {
         const files = new Map<string, Uint8Array>()
         const directory = {

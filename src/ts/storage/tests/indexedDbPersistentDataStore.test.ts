@@ -87,7 +87,19 @@ async function createVersion1Database(
     transaction.objectStore('meta').put({ key: 'activeGeneration', value: generation })
     transaction.objectStore('meta').put({ key: 'currentRevision', value: 7 })
     const { characters, ...root } = databaseValue
-    transaction.objectStore('root').put({ key: generation, generation, value: root })
+    transaction.objectStore('root').put({
+        key: generation,
+        generation,
+        value: root,
+    })
+    transaction.objectStore('root').put({
+        key: 'revision-legacy',
+        generation: 'revision-legacy',
+        value: {
+            username: 'Legacy generation',
+            botPresets: [{ name: 'Legacy preset', image: 'legacy.png' }],
+        },
+    })
     for (let configuredIndex = 0; configuredIndex < characters.length; configuredIndex++) {
         const character = characters[configuredIndex]
         const { chats, ...detail } = character
@@ -322,11 +334,50 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             revision: 7,
             value: { username: 'Fixture User' },
         })
+        expect(await store.queryPresets()).toEqual({
+            revision: 7,
+            items: [
+                {
+                    id: '0',
+                    name: 'Preset Beta',
+                    image: 'preset-beta.png',
+                    configuredIndex: 0,
+                },
+                { id: '1', name: 'Preset Alpha', image: undefined, configuredIndex: 1 },
+            ],
+        })
+        expect(await readRawRecord(indexedDB, databaseName, 'root', 'revision-legacy')).toEqual({
+            key: 'revision-legacy',
+            generation: 'revision-legacy',
+            value: { username: 'Legacy generation' },
+        })
+        expect(
+            await readRawRecord(
+                indexedDB,
+                databaseName,
+                'presets',
+                'revision-legacy:preset:0',
+            ),
+        ).toMatchObject({
+            generation: 'revision-legacy',
+            value: {
+                summary: { name: 'Legacy preset', image: 'legacy.png', configuredIndex: 0 },
+                preset: { name: 'Legacy preset', image: 'legacy.png' },
+            },
+        })
         expect(
             (await store.queryCharacters({ order: 'configured', trash: false, limit: 10 })).items.map(
                 (item) => item.id,
             ),
         ).toEqual(['char-b', 'char-a'])
+        expect(
+            (await store.queryCharacters({ order: 'configured', trash: true, limit: 10 })).items[0],
+        ).toMatchObject({
+            id: 'char-c',
+            type: 'character',
+            creatorNotes: '',
+            trashTime: 350,
+        })
         expect(
             (await store.queryCharacters({ order: 'recent', trash: false, limit: 10 })).items.map(
                 (item) => item.id,
@@ -378,6 +429,44 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 (item) => item.id,
             ),
         ).toEqual(['char-b', 'char-a'])
+    })
+
+    it('rolls back a version 1 upgrade when botPresets exists but is not an array', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'version-1-invalid-presets-upgrade'
+        const invalidPresets = { legacy: 'unsupported' }
+        await createVersion1Database(indexedDB, databaseName)
+        await writeRawRecords(indexedDB, databaseName, 'root', [
+            {
+                key: 'revision-legacy',
+                generation: 'revision-legacy',
+                value: { username: 'Legacy generation', botPresets: invalidPresets },
+            },
+        ])
+
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await expect(store.open()).rejects.toBeTruthy()
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(1)
+        expect(database.objectStoreNames.contains('presets')).toBe(false)
+        database.close()
+        const record = (await readRawRecord(
+            indexedDB,
+            databaseName,
+            'root',
+            'revision-legacy',
+        )) as Record<string, unknown>
+        expect((record.value as Record<string, unknown>).botPresets).toEqual(invalidPresets)
+        const activeRecord = (await readRawRecord(
+            indexedDB,
+            databaseName,
+            'root',
+            'revision-7',
+        )) as Record<string, unknown>
+        expect((activeRecord.value as Record<string, unknown>).botPresets).toEqual(
+            fixtureDatabase.botPresets,
+        )
     })
 
     it('scopes catalog, conversation, and latest-window reads to IndexedDB ranges', async () => {
@@ -727,6 +816,29 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 limit: 1,
             }),
         ).rejects.toBeInstanceOf(SnapshotReleasedError)
+    })
+
+    it('keeps a lease active and retries cleanup after release fails', async () => {
+        const indexedDB = new IDBFactory()
+        const store = new IndexedDbPersistentDataStore(
+            `revision-release-retry-${databaseSequence++}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        const releaseError = new Error('release failed')
+        const releaseSnapshotLease = vi.spyOn(
+            store as unknown as { releaseSnapshotLease(generation: string): Promise<void> },
+            'releaseSnapshotLease',
+        ).mockRejectedValueOnce(releaseError).mockResolvedValueOnce(undefined)
+        const lease = await store.acquireRevision(imported.revision)
+
+        await expect(lease.release()).rejects.toBe(releaseError)
+        await expect(lease.readRoot()).resolves.toMatchObject({ revision: imported.revision })
+        await expect(lease.release()).resolves.toBeUndefined()
+        await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        expect(releaseSnapshotLease).toHaveBeenCalledTimes(2)
     })
 
     it('sweeps inactive temporary snapshot generations on open', async () => {

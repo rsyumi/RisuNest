@@ -1,4 +1,4 @@
-import { allowedDbKeys, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
+import { allowedDbKeys, applyPreparedPluginDatabaseUpdate, customProviderStore, getV2PluginAPIs, handlePluginInstallViaPlugin, pluginCompatibility, pluginV2, type PluginV2ProviderArgument, type PluginV2ProviderOptions, type RisuPlugin } from "../plugins.svelte";
 import { SandboxHost } from "./factory";
 import { getDatabase } from "src/ts/storage/database.svelte";
 import { SafeLocalPluginStorage, tagWhitelist } from "../pluginSafeClass";
@@ -34,7 +34,12 @@ import {
     type AfterTTSResult,
     type TTSHookFn,
 } from "src/ts/process/ttsHooks";
-import { flushPendingData } from "src/ts/storage/persistentDataRuntime.svelte";
+import {
+    flushPendingData,
+    getPersistentNavigationGeneration,
+    materializePersistentDatabaseSnapshotWithRevision,
+    replacePersistentDatabase,
+} from "src/ts/storage/persistentDataRuntime.svelte";
 import {
     createProductionPluginDatabaseAccess,
     type PluginDatabaseAccess,
@@ -70,6 +75,21 @@ function getPluginDatabaseAccess(): PluginDatabaseAccess {
     return (pluginDatabaseAccess ??= createProductionPluginDatabaseAccess({
         flushPendingData,
         getCompatibilityDatabase: () => DBState.db,
+        getCompatibilityProfile: () => pluginCompatibility.profile,
+        getNavigationGeneration: getPersistentNavigationGeneration,
+        applyCompatibilityDatabaseLite: (database) =>
+            applyPreparedPluginDatabaseUpdate(database, true),
+        applyCompatibilityDatabase: async (database) =>
+            applyPreparedPluginDatabaseUpdate(database, false),
+        materializeDatabaseSnapshot: materializePersistentDatabaseSnapshotWithRevision,
+        replacePersistentDatabase,
+        prepareAuthoritativeDatabaseUpdate: async (database) => {
+            if (!Object.prototype.hasOwnProperty.call(database, 'plugins')) return database
+            return {
+                ...database,
+                plugins: await handlePluginInstallViaPlugin(database.plugins as RisuPlugin[]),
+            }
+        },
         snapshot: <T>(value: T) => $state.snapshot(value) as T,
     }))
 }
@@ -749,8 +769,10 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuChatListener(mode, func as any));
         },
         removeRisuChatListener: oldApis.removeRisuChatListener,
-        setDatabaseLite: oldApis.setDatabaseLite,
-        setDatabase: oldApis.setDatabase,
+        setDatabaseLite: (database: Record<string, unknown>) =>
+            getPluginDatabaseAccess().setDatabaseLite(database, allowedDbKeys),
+        setDatabase: (database: Record<string, unknown>) =>
+            getPluginDatabaseAccess().setDatabase(database, allowedDbKeys),
         loadPlugins: oldApis.loadPlugins,
         readImage: oldApis.readImage,
         readInlay: async (id: string) => {

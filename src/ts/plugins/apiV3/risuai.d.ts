@@ -1530,6 +1530,9 @@ interface RisuaiPluginAPI {
      *
      * Requesting characters, including the default 'all', materializes a complete
      * compatibility snapshot and can temporarily use memory proportional to the library.
+     * All requested keys come from one detached snapshot. Scalable mode reads the
+     * authoritative committed revision, while maximum compatibility snapshots the current
+     * live database so API v2.1 edits are included.
      * Prefer the bounded ID-based query methods for normal reads.
      * 
      * @example

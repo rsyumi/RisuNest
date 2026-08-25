@@ -1,11 +1,13 @@
-import { BaseDirectory, writeFile } from "@tauri-apps/plugin-fs";
+import { BaseDirectory, readFile, writeFile } from "@tauri-apps/plugin-fs";
 import localforage from "localforage";
 import { alertError, alertNormal, alertStore, alertWait, alertMd, alertConfirm } from "../alert";
-import { getUncleanables, LocalWriter, forageStorage } from "../globalApi.svelte";
+import { LocalWriter, forageStorage } from "../globalApi.svelte";
 import { resolveBlobStore } from "../storage/platformBlobStore";
-import type { InlayBlobMetadata } from "../storage/blobStore";
+import type { BlobStore } from "../storage/blobStore";
 import {
     collectBackupAssetKeys,
+    collectPinnedBackupAssetReferences,
+    collectReferencedBackupInlays,
     decodeBackupInlayEntry,
     encodeBackupInlayEntry,
     getBackupInlayName,
@@ -16,15 +18,27 @@ import {
 } from "./backupAssets";
 import { classifyPocketRisuEntry, PocketRisuInlayImporter } from "./pocketRisuBackup";
 import { isTauri, isTauriDesktop } from "src/ts/platform"
-import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
-import { getDatabase } from "../storage/database.svelte";
+import { decodeRisuSave } from "../storage/risuSave";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { decryptBuffer, encryptBuffer, sleep } from "../util";
 import { hubURL } from "../characterCards";
 import { language } from "src/lang";
 import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupKey, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
-import { publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
+import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installLocalBackup } from "../storage/databaseRestore";
+import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
+
+export function readPinnedLocalBackupDatabase(
+    pinned: PinnedRisuSaveExport,
+): Promise<Uint8Array> {
+    if (pinned.withNativeFile) {
+        return pinned.withNativeFile(
+            { omitAccount: true },
+            (file) => readFile(file.path),
+        )
+    }
+    return pinned.collectBytes({ omitAccount: true })
+}
 
 function getBasename(data:string){
     const baseNameRegex = /\\/g
@@ -37,7 +51,15 @@ export async function SaveLocalBackup(){
     if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     alertWait("Saving local backup...")
-    const db = getDatabase()
+    return withFlushedRisuSaveExport(
+        getPersistentDataRuntime(),
+        'local-backup',
+        (pinned) => saveLocalBackupSnapshot(blobStore, pinned),
+    )
+}
+
+async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuSaveExport) {
+    const db = await pinned.materializeDatabase()
     const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
     const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
     if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
@@ -95,7 +117,10 @@ export async function SaveLocalBackup(){
 
     const backupAssetKeys = await collectBackupAssetKeys(
         blobStore,
-        await getUncleanables(db, 'pure'),
+        collectPinnedBackupAssetReferences(
+            db,
+            coldStoragePayloads.payloads.map((payload) => payload.value),
+        ),
     )
     for(let i=0;i<backupAssetKeys.length;i++){
         const key = backupAssetKeys[i]
@@ -128,9 +153,10 @@ export async function SaveLocalBackup(){
         }
     }
 
-    const inlays = (await blobStore.list({ kind: 'inlay' }))
-        .filter((metadata): metadata is InlayBlobMetadata =>
-            metadata.kind === 'inlay' && !isLegacyBackupAssetKey(metadata.key))
+    const inlays = await collectReferencedBackupInlays(blobStore, [
+        db,
+        ...coldStoragePayloads.payloads.map((payload) => payload.value),
+    ])
     for(let i=0;i<inlays.length;i++){
         const metadata = inlays[i]
         alertWait(`Saving local Backup inlays... (${i + 1} / ${inlays.length})`)
@@ -152,8 +178,7 @@ export async function SaveLocalBackup(){
         await writer.writeBackup(payload.backupName, payload.encoded)
     }
 
-    const dbWithoutAccount = { ...db, account: undefined }
-    let dbData = encodeRisuSaveLegacy(dbWithoutAccount, 'compression')
+    let dbData = await readPinnedLocalBackupDatabase(pinned)
 
     if(forageStorage.isAccount && location.origin.endsWith('risuai.xyz')){
         const time = Date.now()
@@ -212,7 +237,15 @@ export async function SavePartialLocalBackup(){
     }
     
     alertWait("Saving partial local backup...")
-    const db = getDatabase()
+    return withFlushedRisuSaveExport(
+        getPersistentDataRuntime(),
+        'partial-local-backup',
+        (pinned) => savePartialLocalBackupSnapshot(blobStore, pinned),
+    )
+}
+
+async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuSaveExport) {
+    const db = await pinned.materializeDatabase()
     const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
     const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
     if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
@@ -320,8 +353,7 @@ export async function SavePartialLocalBackup(){
         await writer.writeBackup(payload.backupName, payload.encoded)
     }
 
-    const dbWithoutAccount = { ...db, account: undefined }
-    const dbData = encodeRisuSaveLegacy(dbWithoutAccount, 'compression')
+    const dbData = await readPinnedLocalBackupDatabase(pinned)
 
     alertWait(`Saving partial local backup... (Saving database)`) 
 

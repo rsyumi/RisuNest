@@ -1,10 +1,10 @@
-import { getDatabase } from "./database.svelte";
 import { downloadFile } from "../globalApi.svelte";
 import { alertNormal } from "../alert";
 import { language } from "src/lang";
+import { materializePersistentDatabaseSnapshot } from "./persistentDataRuntime.svelte";
 
 export async function exportAsDataset(){
-    const db = getDatabase()
+    const db = await materializePersistentDatabaseSnapshot('dataset-export')
 
     let dataset = []
     for(const char of db.characters){

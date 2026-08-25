@@ -33,6 +33,10 @@ import { hypaMemoryV3 } from "./memory/hypav3";
 import { getModuleAssets, getModuleToggles } from "./modules";
 import { readImage } from "../globalApi.svelte";
 import { pluginV2 } from "../plugins/plugins.svelte";
+import { activatePresetChainForRequest } from "./presetChain";
+import { doingChat } from './generationState'
+
+export { doingChat } from './generationState'
 
 export interface OpenAIChat{
     role: 'system'|'user'|'assistant'|'function'
@@ -89,7 +93,6 @@ export interface requestTokenPart{
     tokens:number
 }
 
-export const doingChat = writable(false)
 export const chatProcessStage = writable(0)
 export const abortChat = writable(false)
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
@@ -216,24 +219,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             return false
         }
     }
-    doingChat.set(true)
-
-    if(chatProcessIndex === -1 && DBState.db.presetChain){
-        const names = DBState.db.presetChain.split(',').map((v) => v.trim())
-        const randomSelect = Math.floor(Math.random() * names.length)
-        const ele = names[randomSelect]
-
-        const findId = DBState.db.botPresets.findIndex((v) => {
-            return v.name === ele
-        })
-
-        if(findId === -1){
-            alertToast(`Cannot find preset: ${ele}`)
-        }
-        else{
-            changeToPreset(findId, true)
-        }
-    }
+    await activatePresetChainForRequest(
+        chatProcessIndex === -1 ? DBState.db : { botPresets: [] },
+        changeToPreset,
+        Math.random,
+        (name) => alertToast(`Cannot find preset: ${name}`),
+        (busy) => doingChat.set(busy),
+    )
 
     if(connectionOpen){
         chatProcessStage.set(4)

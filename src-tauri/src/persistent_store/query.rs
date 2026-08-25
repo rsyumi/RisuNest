@@ -1,7 +1,8 @@
 use super::{
     active_generation, current_revision, read_target, CharacterPage, CharacterQuery,
     CharacterSummary, ConversationPage, ConversationQuery, ConversationSummary, ConversationWindow,
-    ConversationWindowQuery, QueryOrder, StoreError, StoreResult, Versioned,
+    ConversationWindowQuery, PresetCatalog, PresetSummary, QueryOrder, StoreError, StoreResult,
+    Versioned,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
@@ -26,6 +27,54 @@ pub(super) fn read_root(
     })
 }
 
+pub(super) fn query_presets(
+    connection: &Connection,
+    lease: Option<&str>,
+) -> StoreResult<PresetCatalog> {
+    let target = read_target(connection, lease)?;
+    let mut statement = connection.prepare(
+        "SELECT preset_id, name, image, configured_index FROM bot_presets
+         WHERE generation = ?1 ORDER BY configured_index ASC",
+    )?;
+    let items = statement
+        .query_map([&target.generation], |row| {
+            Ok(PresetSummary {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                image: row.get(2)?,
+                configured_index: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PresetCatalog {
+        revision: target.revision,
+        items,
+    })
+}
+
+pub(super) fn read_preset(
+    connection: &Connection,
+    id: &str,
+    lease: Option<&str>,
+) -> StoreResult<Option<Versioned<Value>>> {
+    let target = read_target(connection, lease)?;
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM bot_presets WHERE generation = ?1 AND preset_id = ?2",
+            params![target.generation, id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            Ok(Versioned {
+                revision: target.revision,
+                value: serde_json::from_str(&value)?,
+            })
+        })
+        .transpose()
+}
+
 pub(super) fn query_characters(
     connection: &Connection,
     query: &CharacterQuery,
@@ -41,7 +90,8 @@ pub(super) fn query_characters(
         .filter(|value| !value.is_empty())
         .map(str::to_lowercase);
     let mut statement = connection.prepare(&format!(
-        "SELECT character_id, name, image, configured_index, recent_at, trashed, conversation_count
+        "SELECT character_id, name, image, configured_index, recent_at, trashed, conversation_count,
+                type, creator_notes, trash_time
          FROM characters
          WHERE generation = ?1 AND trashed = ?2
          ORDER BY {order}"
@@ -59,6 +109,9 @@ pub(super) fn query_characters(
             recent_at: row.get(4)?,
             trashed: row.get::<_, i64>(5)? != 0,
             conversation_count: row.get(6)?,
+            r#type: row.get(7)?,
+            creator_notes: row.get(8)?,
+            trash_time: row.get(9)?,
         };
         if search
             .as_ref()
@@ -303,6 +356,17 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
         characters.push(Value::Object(character));
     }
     database.insert("characters".to_owned(), Value::Array(characters));
+    let presets = {
+        let mut statement = transaction.prepare(
+            "SELECT value FROM bot_presets WHERE generation = ?1 ORDER BY configured_index ASC",
+        )?;
+        let presets = statement
+            .query_map([&generation], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect::<StoreResult<Vec<_>>>()?;
+        presets
+    };
+    database.insert("botPresets".to_owned(), Value::Array(presets));
     transaction.commit()?;
     Ok(Value::Object(database))
 }

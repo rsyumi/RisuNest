@@ -1,9 +1,11 @@
 import { alertError, alertInput, alertNormal, alertSelect, alertStore } from "../alert";
 import { getDatabase, type Database } from "../storage/database.svelte";
-import { forageStorage, getUncleanables, getUncleanablesSync, openURL } from "../globalApi.svelte";
+import { forageStorage, getUncleanablesSync, openURL } from "../globalApi.svelte";
 import { resolveBlobStore } from "../storage/platformBlobStore";
+import type { BlobStore } from "../storage/blobStore";
 import {
     collectBackupAssetKeys,
+    collectPinnedBackupAssetReferences,
     readBackupAsset,
     writeBackupAsset,
 } from "./backupAssets";
@@ -12,10 +14,11 @@ import { language } from "../../lang";
 import { relaunch } from '@tauri-apps/plugin-process';
 import { sleep } from "../util";
 import { hubURL } from "../characterCards";
-import { decodeRisuSave, encodeRisuSaveLegacy } from "../storage/risuSave";
+import { decodeRisuSave } from "../storage/risuSave";
 import { collectColdStorageBackupPayloads, confirmIncompleteColdStorageOperation, getColdStorageBackupName, getColdStorageItem, isColdStorageBackupData, listColdDataKeys, setLocalColdStorageItem } from "../process/coldstorage.svelte";
-import { publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
+import { getPersistentDataRuntime, publishCurrentOfficialRevision, replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
 import { installDriveRestore } from "../storage/databaseRestore";
+import { type PinnedRisuSaveExport, withFlushedRisuSaveExport } from "../storage/risuSaveStoreAdapter";
 
 export async function checkDriver(type:'save'|'load'|'loadtauri'|'savetauri'|'reftoken'){
     const CLIENT_ID = '580075990041-l26k2d3c0nemmqiu3d3aag01npfrkn76.apps.googleusercontent.com';
@@ -122,21 +125,37 @@ async function backupDrive(ACCESS_TOKEN:string) {
         msg: "Uploading Backup..."
     })
 
+    return withFlushedRisuSaveExport(
+        getPersistentDataRuntime(),
+        'drive-backup',
+        (pinned) => backupDriveSnapshot(ACCESS_TOKEN, blobStore, pinned),
+    )
+}
+
+async function backupDriveSnapshot(
+    ACCESS_TOKEN: string,
+    blobStore: BlobStore,
+    pinned: PinnedRisuSaveExport,
+) {
+    const db = await pinned.materializeDatabase()
     const files:DriveFile[] = await getFilesInFolder(ACCESS_TOKEN)
 
     const fileNames = files.map((d) => {
         return d.name
     })
 
-    const coldStoragePayloads = await collectColdStorageBackupPayloads(getDatabase())
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
     const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
-    if(!await confirmIncompleteColdStorageOperation(getDatabase(), unavailableColdStorageKeys, 'backup')){
+    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
         return
     }
 
     const assetKeys = await collectBackupAssetKeys(
         blobStore,
-        await getUncleanables(getDatabase(), 'pure'),
+        collectPinnedBackupAssetReferences(
+            db,
+            coldStoragePayloads.payloads.map((payload) => payload.value),
+        ),
     )
     for(let i=0;i<assetKeys.length;i++){
         alertStore.set({
@@ -163,7 +182,7 @@ async function backupDrive(ACCESS_TOKEN:string) {
         await createFileInFolder(ACCESS_TOKEN, payload.backupName, payload.encoded)
     }
 
-    const dbData = encodeRisuSaveLegacy(getDatabase(), 'compression')
+    const dbData = await pinned.collectBytes()
 
     alertStore.set({
         type: "wait",

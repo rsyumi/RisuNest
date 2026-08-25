@@ -52,6 +52,7 @@
     import QuickSettingsGui from "../Others/QuickSettingsGUI.svelte";
     import PluginDefinedIcon from "../Others/PluginDefinedIcon.svelte";
     import { RISU_SIDEBAR_DRAG_TYPE } from "src/ts/dragTypes";
+  import { clearCharacterSelection } from "../workingSetNavigation";
   let sideBarMode = $state(0);
   let editMode = $state(false);
   let menuMode = $state(0);
@@ -411,9 +412,9 @@
     $PlaygroundStore === 0 &&
     !$settingsOpen
   )}
-  onclick={() => {
+  onclick={async () => {
     reseter();
-    selectedCharID.set(-1)
+    if (!await clearCharacterSelection()) return
     PlaygroundStore.set(0)
     OpenRealmStore.set(false)
   }}
@@ -457,9 +458,9 @@
     $selectedCharID < 0 &&
     $PlaygroundStore !== 0
   )}
-  onclick={() => {
+  onclick={async () => {
     reseter();
-    selectedCharID.set(-1)
+    if (!await clearCharacterSelection()) return
     PlaygroundStore.set(1)
   }}
 >
@@ -499,21 +500,21 @@
       >
       <div class="mt-2"></div>
       <BarIcon
-        onClick={() => {
+        onClick={async () => {
           reseter();
-          selectedCharID.set(-1)
+          if (!await clearCharacterSelection()) return
           PlaygroundStore.set(0)
           OpenRealmStore.set(false)
         }}><HomeIcon /></BarIcon>
       <div class="mt-2"></div>
       <BarIcon
-        onClick={() => {
+        onClick={async () => {
           reseter()
           if($selectedCharID === -1 && $PlaygroundStore !== 0){
             PlaygroundStore.set(0)
             return
           }
-          selectedCharID.set(-1)
+          if (!await clearCharacterSelection()) return
           PlaygroundStore.set(1)
         }}
       ><ShellIcon /></BarIcon>
@@ -843,21 +844,21 @@
       >
       <div class="mt-2"></div>
       <BarIcon
-        onClick={() => {
+        onClick={async () => {
           reseter();
-          selectedCharID.set(-1)
+          if (!await clearCharacterSelection()) return
           PlaygroundStore.set(0)
           OpenRealmStore.set(false)
         }}><HomeIcon /></BarIcon>
       <div class="mt-2"></div>
       <BarIcon
-        onClick={() => {
+        onClick={async () => {
           reseter()
           if($selectedCharID === -1 && $PlaygroundStore !== 0){
             PlaygroundStore.set(0)
             return
           }
-          selectedCharID.set(-1)
+          if (!await clearCharacterSelection()) return
           PlaygroundStore.set(1)
         }}
       ><ShellIcon /></BarIcon>

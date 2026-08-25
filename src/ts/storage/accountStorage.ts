@@ -7,11 +7,18 @@ import { v4 } from "uuid"
 import { language } from "src/lang"
 import { fetchProtectedResource } from "../sionyw"
 import { completeAccountUnmigration } from "./databaseRestore"
-import { replacePersistentDatabase } from "./persistentDataRuntime.svelte"
+import {
+    materializePersistentDatabaseSnapshotWithRevision,
+    replacePersistentDatabase,
+} from "./persistentDataRuntime.svelte"
+import { isTauri } from "../platform"
 
 export const AccountWarning = writable('')
 let risuSession = ''
-const cachedForage = localforage.createInstance({name: "risuaiAccountCached"})
+
+export function resetAccountStorageSession(): void {
+    risuSession = ''
+}
 
 let seenWarnings:string[] = []
 const accountDatabaseKey = 'database/database.bin'
@@ -35,6 +42,22 @@ export interface AccountWriteOptions {
     signal?: AbortSignal
 }
 
+export interface AccountStorageCache {
+    getItem(key: string): Promise<unknown | null>
+    setItem(key: string, value: unknown): Promise<unknown>
+}
+
+export interface AccountCredentialRouting {
+    getToken(): string | null | undefined
+    reauthenticate(loginResult: string): Promise<void>
+}
+
+export interface AccountStorageOptions {
+    databaseCache?: AccountStorageCache
+    assetCache?: AccountStorageCache
+    credentialRouting?: AccountCredentialRouting
+}
+
 function withSignal(options: RequestInit, signal?: AbortSignal): RequestInit {
     return signal ? { ...options, signal } : options
 }
@@ -53,17 +76,32 @@ function waitForever(): Promise<never> {
     return new Promise(() => {})
 }
 
-async function cacheDatabaseWrite(key:string, value:Uint8Array, saveDate:string):Promise<void> {
+async function cacheDatabaseWrite(
+    cache: AccountStorageCache,
+    key:string,
+    value:Uint8Array,
+    saveDate:string,
+):Promise<void> {
     if(key !== accountDatabaseKey){
         return
     }
-    await cachedForage.setItem(key, value)
-    await cachedForage.setItem(key + '__date', saveDate)
+    await cache.setItem(key, value)
+    await cache.setItem(key + '__date', saveDate)
 }
 
 export class AccountStorage{
     auth:string
     usingSync:boolean
+    private readonly databaseCache: AccountStorageCache
+    private readonly assetCache: AccountStorageCache
+    private readonly credentialRouting?: AccountCredentialRouting
+
+    constructor(options: AccountStorageOptions = {}) {
+        this.databaseCache = options.databaseCache
+            ?? localforage.createInstance({ name: 'risuaiAccountCached' })
+        this.assetCache = options.assetCache ?? localforage
+        this.credentialRouting = options.credentialRouting
+    }
 
     async setItem(key:string, value:Uint8Array) {
         const result = await this.writeItem(key, value)
@@ -115,7 +153,7 @@ export class AccountStorage{
 
             if(da.status === 304){
                 await discardResponseBody(da)
-                await cacheDatabaseWrite(key, value, saveDate)
+                await cacheDatabaseWrite(this.databaseCache, key, value, saveDate)
                 return { kind: 'not-modified', replacementKey: key }
             }
             if(da.status === 403){
@@ -123,8 +161,7 @@ export class AccountStorage{
                 if(da.headers.get('x-risu-status') === 'warn'){
                     return { kind: 'auth-warning' }
                 }
-                localStorage.setItem("fallbackRisuToken",await alertLogin())
-                this.checkAuth()
+                await this.reauthenticate()
                 continue
             }
             if(da.status < 200 || da.status >= 300){
@@ -149,9 +186,9 @@ export class AccountStorage{
 
             const replacementKey = await getDaText()
             if(key.startsWith('assets/')){
-                await localforage.setItem(key, new Uint8Array(value).buffer)
+                await this.assetCache.setItem(key, new Uint8Array(value).buffer)
             }
-            await cacheDatabaseWrite(key, value, saveDate)
+            await cacheDatabaseWrite(this.databaseCache, key, value, saveDate)
             return { kind: 'written', replacementKey }
         }
 
@@ -172,13 +209,17 @@ export class AccountStorage{
     ):Promise<AccountReadResult> {
         this.checkAuth()
         if(key.startsWith('assets/')){
-            const cached:ArrayBuffer|null = await localforage.getItem(key)
-            if(cached){
-                return { kind: 'value', bytes: new Uint8Array(cached) }
+            const cached = await this.assetCache.getItem(key)
+            if(cached instanceof ArrayBuffer || ArrayBuffer.isView(cached)){
+                return { kind: 'value', bytes: new Uint8Array(
+                    cached instanceof ArrayBuffer
+                        ? cached
+                        : cached.buffer.slice(cached.byteOffset, cached.byteOffset + cached.byteLength),
+                ) }
             }
         }
         let da:Response|undefined
-        const saveDate = await cachedForage.getItem(key + '__date') as number|string|undefined
+        const saveDate = await this.databaseCache.getItem(key + '__date') as number|string|undefined
         while((!da) || da.status === 403){
             da = await fetchProtectedResource('/api/account/read/' + Buffer.from(key ,'utf-8').toString('hex') +
                 (key === accountDatabaseKey ? ('|' + v4()) : ''), withSignal({
@@ -190,14 +231,13 @@ export class AccountStorage{
             }, options.signal))
             if(da.status === 403){
                 await discardResponseBody(da)
-                localStorage.setItem("fallbackRisuToken",await alertLogin())
-                this.checkAuth()
+                await this.reauthenticate()
             }
         }
         if(da.status === 303){
             const data = await da.json()
             if(data.match){
-                const cached = await cachedForage.getItem(key) as ArrayBuffer|Uint8Array|null
+                const cached = await this.databaseCache.getItem(key) as ArrayBuffer|Uint8Array|null
                 if(!cached){
                     throw new Error(`Cached account bytes are missing for ${key}`)
                 }
@@ -216,7 +256,7 @@ export class AccountStorage{
         }
         if(key.startsWith('assets/')){
             const ab = await da.arrayBuffer()
-            await localforage.setItem(key, ab)
+            await this.assetCache.setItem(key, ab)
             return { kind: 'value', bytes: new Uint8Array(ab) }
         }
         if(!options.progress){
@@ -249,6 +289,10 @@ export class AccountStorage{
     }
 
     private checkAuth(){
+        if (this.credentialRouting) {
+            this.auth = this.credentialRouting.getToken() ?? ''
+            return
+        }
         const db = getDatabase()
         this.auth = db?.account?.token
         if(!this.auth){
@@ -260,13 +304,30 @@ export class AccountStorage{
         }
     }
 
+    private async reauthenticate(): Promise<void> {
+        const loginResult = await alertLogin()
+        if (this.credentialRouting) {
+            await this.credentialRouting.reauthenticate(loginResult)
+        } else {
+            localStorage.setItem("fallbackRisuToken", loginResult)
+        }
+        this.checkAuth()
+    }
+
 
     listItem = this.keys
 }
 
 export async function unMigrationAccount() {
-    const db = getDatabase()
-    const MigrationStorage = localforage.createInstance({name: "risuai"})
+    if (isTauri) {
+        throw new Error('Account unmigration is only available on the web')
+    }
+    const snapshot = await materializePersistentDatabaseSnapshotWithRevision(
+        'account-unmigration',
+    )
+    const db = snapshot.database
+    const expectedRevision = snapshot.revision
+    const expectedMutationGeneration = snapshot.mutationGeneration
     const { materializeAccountUnmigrationResources } = await import("./databaseRestore")
     const { resolveBlobStore } = await import("./platformBlobStore")
     const { selectLegacyBackupAssetKeys } = await import("../drive/backupAssets")
@@ -328,7 +389,11 @@ export async function unMigrationAccount() {
                 }
             },
         }),
-        replaceDatabase: replacePersistentDatabase,
+        replaceDatabase: (database, reason) => replacePersistentDatabase(database, reason, {
+            authoritative: true,
+            expectedRevision,
+            expectedMutationGeneration,
+        }),
         finalize: () => {
             alertStore.set({ type: "none", msg: "" })
             localStorage.setItem('dosync', 'avoid')

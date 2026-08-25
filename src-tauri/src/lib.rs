@@ -1,3 +1,4 @@
+mod native_media;
 mod persistent_store;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -446,6 +447,16 @@ pub fn run() {
     }
 
     builder
+        .register_asynchronous_uri_scheme_protocol("risuasset", |context, request, responder| {
+            let root = context.app_handle().path().app_data_dir();
+            tauri::async_runtime::spawn_blocking(move || {
+                let response = match root {
+                    Ok(root) => native_media::respond(&root, request),
+                    Err(_) => native_media::not_found(),
+                };
+                responder.respond(response);
+            });
+        })
         .manage(persistent_store::PersistentStoreState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -471,8 +482,11 @@ pub fn run() {
             #[cfg(desktop)]
             install_py_dependencies,
             oauth_login,
+            native_media::native_media_remove_thumbnails,
             persistent_store::commands::pds_open,
             persistent_store::commands::pds_read_root,
+            persistent_store::commands::pds_query_presets,
+            persistent_store::commands::pds_read_preset,
             persistent_store::commands::pds_query_characters,
             persistent_store::commands::pds_read_character,
             persistent_store::commands::pds_query_conversations,
@@ -481,18 +495,22 @@ pub fn run() {
             persistent_store::commands::pds_commit,
             persistent_store::commands::pds_replace_begin,
             persistent_store::commands::pds_replace_put_root,
+            persistent_store::commands::pds_replace_put_presets,
             persistent_store::commands::pds_replace_add_characters,
             persistent_store::commands::pds_replace_commit,
             persistent_store::commands::pds_replace_abort,
             persistent_store::commands::pds_materialize,
             persistent_store::commands::pds_acquire_revision,
             persistent_store::commands::pds_release_revision,
+            persistent_store::commands::pds_export_risu_save,
+            persistent_store::commands::pds_export_risu_save_cleanup,
             persistent_store::commands::pds_checkpoint,
             persistent_store::commands::pds_snapshot_create,
             persistent_store::commands::pds_snapshot_list,
             persistent_store::commands::pds_snapshot_restore_request,
             persistent_store::commands::pds_get_app_kv,
             persistent_store::commands::pds_set_app_kv,
+            persistent_store::commands::pds_remove_app_kv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

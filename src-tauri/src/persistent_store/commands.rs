@@ -1,8 +1,9 @@
+use super::export::ExportedRisuSave;
 use super::{
     CharacterPage, CharacterQuery, CheckpointMode, ConversationPage, ConversationQuery,
-    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore, RevisionResult,
-    SnapshotCreated, SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned,
-    WorkingSetCommit,
+    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore, PresetCatalog,
+    RevisionResult, SnapshotCreated, SnapshotInfo, StagingResult, StoreError, StoreResult,
+    Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -81,6 +82,23 @@ pub(crate) fn pds_read_root(
     lease: Option<String>,
 ) -> Result<Versioned<Value>, StoreError> {
     with_store(state, |store| store.read_root(lease.as_deref()))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_query_presets(
+    state: State<'_, PersistentStoreState>,
+    lease: Option<String>,
+) -> Result<PresetCatalog, StoreError> {
+    with_store(state, |store| store.query_presets(lease.as_deref()))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_preset(
+    state: State<'_, PersistentStoreState>,
+    id: String,
+    lease: Option<String>,
+) -> Result<Option<Versioned<Value>>, StoreError> {
+    with_store(state, |store| store.read_preset(&id, lease.as_deref()))
 }
 
 #[tauri::command(async)]
@@ -173,6 +191,17 @@ pub(crate) fn pds_replace_add_characters(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_replace_put_presets(
+    state: State<'_, PersistentStoreState>,
+    staging_id: String,
+    presets: Vec<Value>,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store.replace_put_presets(&staging_id, &presets)
+    })
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_replace_commit(
     state: State<'_, PersistentStoreState>,
     staging_id: String,
@@ -213,6 +242,25 @@ pub(crate) fn pds_release_revision(
     lease: String,
 ) -> Result<(), StoreError> {
     with_store_mut(state, |store| store.release_revision(&lease))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_export_risu_save(
+    state: State<'_, PersistentStoreState>,
+    lease: String,
+    omit_account: bool,
+) -> Result<ExportedRisuSave, StoreError> {
+    with_store(state, |store| store.export_risu_save(&lease, omit_account))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_export_risu_save_cleanup(
+    state: State<'_, PersistentStoreState>,
+    path: String,
+) -> Result<(), StoreError> {
+    with_store(state, |store| {
+        store.cleanup_risu_save_export(Path::new(&path))
+    })
 }
 
 #[tauri::command(async)]
@@ -263,4 +311,12 @@ pub(crate) fn pds_set_app_kv(
     value: Value,
 ) -> Result<(), StoreError> {
     with_store(state, |store| store.set_app_kv(&key, &value))
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_remove_app_kv(
+    state: State<'_, PersistentStoreState>,
+    key: String,
+) -> Result<(), StoreError> {
+    with_store(state, |store| store.remove_app_kv(&key))
 }

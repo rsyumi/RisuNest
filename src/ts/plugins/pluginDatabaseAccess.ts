@@ -1,11 +1,15 @@
 import type { Database } from '../storage/database.svelte'
+import type { PersistentReplacementOptions } from '../storage/saveCoordinator'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
+import { isCatalogCharacterStub } from '../storage/workingSetCatalog'
 import type {
     CharacterPage,
     ConversationPage,
     ConversationWindow,
+    DataRevision,
     PersistentDataStore,
 } from '../storage/persistentDataStore'
+import type { PluginCompatibilityProfile } from './pluginCompatibility'
 
 export const PLUGIN_SUMMARY_QUERY_DEFAULT_LIMIT = 50
 export const PLUGIN_SUMMARY_QUERY_MAX_LIMIT = 100
@@ -40,6 +44,23 @@ export interface PluginDatabaseAccessDependencies {
     store: PersistentDataStore
     flushPendingData(reason: string): Promise<void>
     getCompatibilityDatabase(): Database
+    getCompatibilityProfile(): PluginCompatibilityProfile
+    getNavigationGeneration(): number
+    applyCompatibilityDatabaseLite(database: Record<string, unknown>): void
+    applyCompatibilityDatabase(database: Record<string, unknown>): Promise<void>
+    materializeDatabaseSnapshot(reason: string): Promise<{
+        database: Database
+        revision: DataRevision
+        mutationGeneration: number
+    }>
+    replacePersistentDatabase(
+        database: Database,
+        reason: string,
+        options: PersistentReplacementOptions,
+    ): Promise<void>
+    prepareAuthoritativeDatabaseUpdate?(
+        database: Record<string, unknown>,
+    ): Promise<Record<string, unknown>>
     snapshot<T>(value: T): T
 }
 
@@ -53,7 +74,18 @@ export interface PluginDatabaseAccess {
         includeOnly: string[] | 'all',
         allowedKeys: readonly string[],
     ): Promise<Record<string, unknown>>
+    setDatabaseLite(database: Record<string, unknown>, allowedKeys: readonly string[]): void
+    setDatabase(
+        database: Record<string, unknown>,
+        allowedKeys: readonly string[],
+    ): Promise<void>
 }
+
+const SCALABLE_CHARACTER_SET_ERROR =
+    'Synchronous plugin character updates are unavailable in scalable-v3. Use async setDatabase() or maximum-compatibility.'
+const STALE_DATABASE_SET_ERROR =
+    'Plugin database update became stale because compatibility or navigation state changed.'
+const DANGEROUS_DATABASE_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
 function positiveLimit(value: number | undefined, defaultValue: number, maximum: number): number {
     const limit = value ?? defaultValue
@@ -75,6 +107,103 @@ function nonnegativeWindow(value: number | undefined, name: string): number {
         throw new RangeError(`${name} must be a nonnegative safe integer`)
     }
     return size
+}
+
+function hasCharacterUpdate(database: Record<string, unknown>): boolean {
+    return Object.prototype.hasOwnProperty.call(database, 'characters')
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    if (value === null || typeof value !== 'object') return false
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+}
+
+function validateSafeKeys(database: Record<string, unknown>): void {
+    for (const key of Object.keys(database)) {
+        if (DANGEROUS_DATABASE_KEYS.has(key)) {
+            throw new TypeError(`Unsafe plugin database key: ${key}`)
+        }
+    }
+}
+
+export function validatePluginDatabaseUpdate(
+    database: unknown,
+): asserts database is Record<string, unknown> {
+    if (!isPlainRecord(database)) {
+        throw new TypeError('Plugin database update must be a plain record')
+    }
+    validateSafeKeys(database)
+    if (Object.prototype.hasOwnProperty.call(database, 'pluginCustomStorage')) {
+        if (!isPlainRecord(database.pluginCustomStorage)) {
+            throw new TypeError('pluginCustomStorage must be a plain record')
+        }
+        validateSafeKeys(database.pluginCustomStorage)
+    }
+}
+
+function validateCompleteCharacters(value: unknown): asserts value is Database['characters'] {
+    if (!Array.isArray(value)) {
+        throw new TypeError('Plugin database characters must be an array')
+    }
+    const characterIds = new Set<string>()
+    for (const character of value) {
+        if (!character || typeof character !== 'object') {
+            throw new TypeError('Plugin database characters must contain complete characters')
+        }
+        const record = character as Record<string, unknown>
+        if (typeof record.chaId !== 'string' || record.chaId.length === 0) {
+            throw new TypeError('Plugin database characters must have nonempty character IDs')
+        }
+        if (isCatalogCharacterStub(character as Database['characters'][number])) {
+            throw new TypeError('Plugin database characters cannot contain catalog working-set stubs')
+        }
+        if (characterIds.has(record.chaId)) {
+            throw new TypeError(`Plugin database contains duplicate character ID ${record.chaId}`)
+        }
+        characterIds.add(record.chaId)
+        if (!Array.isArray(record.chats)) {
+            throw new TypeError(`Plugin database character ${record.chaId} is not fully hydrated`)
+        }
+        for (const conversation of record.chats) {
+            if (
+                !conversation ||
+                typeof conversation !== 'object' ||
+                !Array.isArray((conversation as Record<string, unknown>).message)
+            ) {
+                throw new TypeError(`Plugin database character ${record.chaId} is not fully hydrated`)
+            }
+        }
+    }
+}
+
+export function applyPluginDatabaseUpdate(
+    candidate: Database,
+    update: Record<string, unknown>,
+    allowedKeys: readonly string[],
+): void {
+    validatePluginDatabaseUpdate(update)
+    const mutableCandidate = candidate as unknown as Record<string, unknown>
+    const allowedKeySet = new Set(allowedKeys)
+    const hasExplicitCustomStorage = Object.prototype.hasOwnProperty.call(
+        update,
+        'pluginCustomStorage',
+    ) && allowedKeySet.has('pluginCustomStorage')
+    const existingCustomStorage = candidate.pluginCustomStorage ?? {}
+    if (!isPlainRecord(existingCustomStorage)) {
+        throw new TypeError('Existing pluginCustomStorage must be a plain record')
+    }
+    const customStorage = hasExplicitCustomStorage
+        ? { ...(update.pluginCustomStorage as Record<string, unknown>) }
+        : { ...existingCustomStorage }
+
+    for (const key of Object.keys(update).filter((key) => allowedKeySet.has(key)).sort()) {
+        if (key !== 'pluginCustomStorage') mutableCandidate[key] = update[key]
+    }
+    for (const key of Object.keys(update).filter((key) => !allowedKeySet.has(key)).sort()) {
+        customStorage[key] = update[key]
+    }
+    candidate.pluginCustomStorage = customStorage
 }
 
 export function createPluginDatabaseAccess(
@@ -169,23 +298,93 @@ export function createPluginDatabaseAccess(
                     ? [...allowedKeys]
                     : allowedKeys.filter((key) => includeOnly.includes(key))
             const needsCharacters = requestedKeys.includes('characters')
-            let materializedDatabase: Database | undefined
-            if (needsCharacters) {
+            if (!needsCharacters) {
+                const compatibilityDatabase = dependencies.getCompatibilityDatabase()
+                return Object.fromEntries(requestedKeys.map((key) => [
+                    key,
+                    dependencies.snapshot(
+                        (compatibilityDatabase as unknown as Record<string, unknown>)[key],
+                    ),
+                ]))
+            }
+            const compatibilityProfile = dependencies.getCompatibilityProfile()
+            let sourceDatabase: Database
+            if (compatibilityProfile === 'scalable-v3') {
                 await dependencies.flushPendingData('plugin-full-database-snapshot')
                 await openStore()
-                materializedDatabase = await dependencies.store.materializeDatabase()
+                sourceDatabase = dependencies.snapshot(
+                    await dependencies.store.materializeDatabase(),
+                )
+            } else {
+                sourceDatabase = dependencies.snapshot(dependencies.getCompatibilityDatabase())
             }
 
-            const compatibilityDatabase = dependencies.getCompatibilityDatabase()
             const result: Record<string, unknown> = {}
             for (const key of requestedKeys) {
-                const value =
-                    key === 'characters'
-                        ? materializedDatabase!.characters
-                        : (compatibilityDatabase as unknown as Record<string, unknown>)[key]
+                const value = (sourceDatabase as unknown as Record<string, unknown>)[key]
                 result[key] = dependencies.snapshot(value)
             }
             return result
+        },
+
+        setDatabaseLite(database, _allowedKeys) {
+            validatePluginDatabaseUpdate(database)
+            if (
+                dependencies.getCompatibilityProfile() === 'scalable-v3' &&
+                hasCharacterUpdate(database)
+            ) {
+                throw new Error(SCALABLE_CHARACTER_SET_ERROR)
+            }
+            const prepared = dependencies.snapshot(database)
+            dependencies.applyCompatibilityDatabaseLite(prepared)
+        },
+
+        async setDatabase(database, allowedKeys) {
+            validatePluginDatabaseUpdate(database)
+            const initialProfile = dependencies.getCompatibilityProfile()
+            const initialNavigationGeneration = dependencies.getNavigationGeneration()
+            if (initialProfile === 'scalable-v3' && hasCharacterUpdate(database)) {
+                validateCompleteCharacters(database.characters)
+            }
+            const detachedUpdate = dependencies.snapshot(database)
+            const preparedUpdate = dependencies.prepareAuthoritativeDatabaseUpdate
+                ? await dependencies.prepareAuthoritativeDatabaseUpdate(detachedUpdate)
+                : detachedUpdate
+            validatePluginDatabaseUpdate(preparedUpdate)
+            if (
+                dependencies.getCompatibilityProfile() !== initialProfile ||
+                dependencies.getNavigationGeneration() !== initialNavigationGeneration
+            ) {
+                throw new Error(STALE_DATABASE_SET_ERROR)
+            }
+            if (initialProfile === 'maximum-compatibility') {
+                await dependencies.applyCompatibilityDatabase(dependencies.snapshot(preparedUpdate))
+                return
+            }
+            if (hasCharacterUpdate(preparedUpdate)) {
+                validateCompleteCharacters(preparedUpdate.characters)
+            }
+            const materialized = await dependencies.materializeDatabaseSnapshot(
+                'plugin-database-set',
+            )
+            if (
+                dependencies.getCompatibilityProfile() !== initialProfile ||
+                dependencies.getNavigationGeneration() !== initialNavigationGeneration
+            ) {
+                throw new Error(STALE_DATABASE_SET_ERROR)
+            }
+            const candidate = dependencies.snapshot(materialized.database)
+            applyPluginDatabaseUpdate(
+                candidate,
+                dependencies.snapshot(preparedUpdate),
+                allowedKeys,
+            )
+            await dependencies.replacePersistentDatabase(candidate, 'plugin-database-set', {
+                authoritative: true,
+                publishOfficial: true,
+                expectedRevision: materialized.revision,
+                expectedMutationGeneration: materialized.mutationGeneration,
+            })
         },
     }
 }

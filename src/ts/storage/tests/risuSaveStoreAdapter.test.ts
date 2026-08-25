@@ -2,12 +2,14 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import localforage from 'localforage'
 import { describe, expect, it, vi } from 'vitest'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
-import { RevisionConflictError } from '../persistentDataStore'
+import { nativePersistentRevisionLease } from '../nativePersistentExport'
+import { RevisionConflictError, type PersistentRevisionLease } from '../persistentDataStore'
 import { decodeRisuSave, encodeRisuSaveBlock, RisuSaveType } from '../risuSave'
 import {
     importRisuSaveToStore,
     streamRisuSaveFromLease,
     streamRisuSaveFromStore,
+    withFlushedRisuSaveExport,
 } from '../risuSaveStoreAdapter'
 import { risuSaveFixtureDatabase, risuSaveFixtures } from './risuSaveFixtures'
 
@@ -258,6 +260,160 @@ describe('RisuSave persistent store adapter', () => {
         await iterator.return?.(undefined)
 
         expect(await snapshotGenerations(indexedDB, databaseName)).toEqual([])
+    })
+
+    it('exports a flushed pinned revision instead of released live message arrays', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'risu-save-flushed-pinned-export'
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(risuSaveFixtureDatabase))
+        let revision = imported.revision
+        const liveDatabase = structuredClone(risuSaveFixtureDatabase)
+        liveDatabase.characters[0].chats[0].message = []
+        const capturePersistentMutationToken = vi.fn(async () => {
+            const root = await store.readRoot()
+            revision = (await store.commit({
+                expectedRevision: revision,
+                root: { ...root.value, username: 'Flushed User' },
+            })).revision
+            return { revision, mutationGeneration: 7 }
+        })
+
+        const exported = await withFlushedRisuSaveExport({
+            store,
+            capturePersistentMutationToken,
+        }, 'local-backup', async (pinned) => {
+            expect(pinned.mutationGeneration).toBe(7)
+            const snapshot = await pinned.materializeDatabase()
+            expect(snapshot.characters[0].chats[0].message).toEqual(
+                risuSaveFixtureDatabase.characters[0].chats[0].message,
+            )
+            expect(snapshot.characters[0].chats[0].message).not.toEqual(
+                liveDatabase.characters[0].chats[0].message,
+            )
+            return pinned.collectBytes()
+        })
+
+        expect(capturePersistentMutationToken).toHaveBeenCalledWith('local-backup')
+        expect((await decodeRisuSave(exported)).username).toBe('Flushed User')
+        expect((await decodeRisuSave(exported)).characters[0].chats[0].message).toEqual(
+            risuSaveFixtureDatabase.characters[0].chats[0].message,
+        )
+        expect(await snapshotGenerations(indexedDB, databaseName)).toEqual([])
+    })
+
+    it('releases a flushed export lease when the backup fails', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = 'risu-save-failed-pinned-export'
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(risuSaveFixtureDatabase))
+        const error = new Error('backup failed')
+
+        await expect(withFlushedRisuSaveExport({
+            store,
+            capturePersistentMutationToken: vi.fn(async () => ({
+                revision: imported.revision,
+                mutationGeneration: 0,
+            })),
+        }, 'drive-backup', async (pinned) => {
+            await pinned.materializeDatabase()
+            throw error
+        })).rejects.toBe(error)
+
+        expect(await snapshotGenerations(indexedDB, databaseName)).toEqual([])
+    })
+
+    it('preserves the export failure when lease cleanup also fails', async () => {
+        const exportError = new Error('export failed')
+        const releaseError = new Error('lease cleanup failed')
+        const release = vi.fn()
+            .mockRejectedValueOnce(releaseError)
+            .mockResolvedValueOnce(undefined)
+        const lease = { release } as unknown as PersistentRevisionLease
+        const store = { acquireRevision: vi.fn(async () => lease) }
+
+        await expect(withFlushedRisuSaveExport({
+            store: store as never,
+            capturePersistentMutationToken: vi.fn(async () => ({
+                revision: 4,
+                mutationGeneration: 9,
+            })),
+        }, 'local-backup', async () => {
+            throw exportError
+        })).rejects.toBe(exportError)
+
+        expect(release).toHaveBeenCalledTimes(2)
+    })
+
+    it('preserves a streaming export failure when lease cleanup also fails', async () => {
+        const exportError = new Error('stream failed')
+        const release = vi.fn()
+            .mockRejectedValueOnce(new Error('lease cleanup failed'))
+            .mockResolvedValueOnce(undefined)
+        const lease = {
+            readRoot: vi.fn(async () => {
+                throw exportError
+            }),
+            release,
+        } as unknown as PersistentRevisionLease
+        const store = { acquireRevision: vi.fn(async () => lease) }
+
+        await expect(concatenate(streamRisuSaveFromStore(
+            store as never,
+            4,
+        ))).rejects.toBe(exportError)
+        expect(release).toHaveBeenCalledTimes(2)
+    })
+
+    it('counts characters from the pinned catalog without materializing the database', async () => {
+        const store = new IndexedDbPersistentDataStore(
+            'risu-save-pinned-character-count',
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(risuSaveFixtureDatabase))
+        const materialize = vi.spyOn(store, 'materializeDatabase').mockRejectedValue(
+            new Error('character count must use the pinned catalog'),
+        )
+
+        const count = await withFlushedRisuSaveExport({
+            store,
+            capturePersistentMutationToken: vi.fn(async () => ({
+                revision: imported.revision,
+                mutationGeneration: 0,
+            })),
+        }, 'sync-conflict-backup', (pinned) => pinned.countCharacters())
+
+        expect(count).toBe(risuSaveFixtureDatabase.characters.length)
+        expect(materialize).not.toHaveBeenCalled()
+    })
+
+    it('exposes the native file boundary only for a native-capable pinned lease', async () => {
+        const release = vi.fn(async () => undefined)
+        const lease = {
+            revision: 12,
+            [nativePersistentRevisionLease]: 'native-lease-12',
+            release,
+        } as unknown as PersistentRevisionLease
+        const store = {
+            acquireRevision: vi.fn(async () => lease),
+        }
+
+        await withFlushedRisuSaveExport({
+            store: store as never,
+            capturePersistentMutationToken: vi.fn(async () => ({
+                revision: 12,
+                mutationGeneration: 0,
+            })),
+        }, 'local-backup', async (pinned) => {
+            expect(pinned.withNativeFile).toBeTypeOf('function')
+        })
+
+        expect(store.acquireRevision).toHaveBeenCalledWith(12)
+        expect(release).toHaveBeenCalledOnce()
     })
 
     it('rejects a stale revision before yielding any bytes', async () => {

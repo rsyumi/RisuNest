@@ -4,13 +4,16 @@
 
   import { language } from 'src/lang'
   import { alertConfirm } from 'src/ts/alert'
-  import { getInlayAssetBlob, listInlayAssets, removeInlayAsset, type InlayAsset } from 'src/ts/process/files/inlays'
+  import { listInlayAssetMetadata, removeInlayAsset } from 'src/ts/process/files/inlays'
+  import { getInlayRenderSource, getNativeInlayThumbnailSize } from 'src/ts/process/files/inlayRenderSource'
+  import { isTauri } from 'src/ts/platform'
+  import type { InlayBlobMetadata } from 'src/ts/storage/blobStore'
   import Button from '../UI/GUI/Button.svelte'
   import CheckInput from '../UI/GUI/CheckInput.svelte'
 
   const PAGE_SIZE = 36
 
-  let allAssets = $state<[string, InlayAsset][]>([])
+  let allAssets = $state<InlayBlobMetadata[]>([])
   let displayCount = $state(PAGE_SIZE)
   let loading = $state(true)
   let loadMoreSentinel: HTMLDivElement | null = $state(null)
@@ -22,13 +25,13 @@
   const hasMore = $derived(displayCount < allAssets.length)
   const hasSelection = $derived(selection.size > 0)
 
-  const getPreviewURL = async (id: string) => {
+  const getPreviewURL = async (asset: InlayBlobMetadata) => {
+    const id = asset.key
     if (previewURLs.has(id)) return previewURLs.get(id)!
-    const result = await getInlayAssetBlob(id)
-    if (result) {
-      const url = URL.createObjectURL(result.data)
-      previewURLs.set(id, url)
-      return url
+    const source = await getInlayRenderSource(id, isTauri, getNativeInlayThumbnailSize(asset, isTauri), asset)
+    if (source) {
+      previewURLs.set(id, source.url)
+      return source.url
     }
     return null
   }
@@ -42,7 +45,7 @@
   }
 
   const selectAll = () => {
-    displayedAssets.forEach(([id]) => selection.add(id))
+    displayedAssets.forEach((asset) => selection.add(asset.key))
   }
 
   const deselectAll = () => {
@@ -55,11 +58,11 @@
     }
     await removeInlayAsset(id)
     if (previewURLs.has(id)) {
-      URL.revokeObjectURL(previewURLs.get(id)!)
+        if (!isTauri) URL.revokeObjectURL(previewURLs.get(id)!)
       previewURLs.delete(id)
     }
     selection.delete(id)
-    allAssets = allAssets.filter(([assetId]) => assetId !== id)
+    allAssets = allAssets.filter((asset) => asset.key !== id)
   }
 
   const deleteSelected = async () => {
@@ -70,11 +73,11 @@
     for (const id of selection) {
       await removeInlayAsset(id)
       if (previewURLs.has(id)) {
-        URL.revokeObjectURL(previewURLs.get(id)!)
+      if (!isTauri) URL.revokeObjectURL(previewURLs.get(id)!)
         previewURLs.delete(id)
       }
     }
-    allAssets = allAssets.filter(([assetId]) => !selection.has(assetId))
+    allAssets = allAssets.filter((asset) => !selection.has(asset.key))
     selection.clear()
   }
 
@@ -82,13 +85,6 @@
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-  }
-
-  const getAssetSize = (asset: InlayAsset) => {
-    if (asset.data instanceof Blob) {
-      return formatSize(asset.data.size)
-    }
-    return formatSize(asset.data.length * 0.75) // base64 estimate
   }
 
   let observer: IntersectionObserver | null = null
@@ -132,13 +128,13 @@
   })
 
   onDestroy(() => {
-    previewURLs.forEach((url) => URL.revokeObjectURL(url))
+    if (!isTauri) previewURLs.forEach((url) => URL.revokeObjectURL(url))
     observer?.disconnect()
   })
 
   const loadAssets = async () => {
     loading = true
-    allAssets = await listInlayAssets()
+    allAssets = await listInlayAssetMetadata({ migrateLegacy: !isTauri })
     loading = false
   }
   loadAssets()
@@ -169,34 +165,36 @@
   </div>
 {:else}
   <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-    {#each displayedAssets as [id, asset] (id)}
-      {#key selection.has(id)}
+    {#each displayedAssets as asset (asset.key)}
+      {#key selection.has(asset.key)}
         <div class="border border-darkborderc rounded-lg p-4 bg-darkbg">
           <div class="flex items-center gap-2 mb-3">
-            <CheckInput check={selection.has(id)} hiddenName margin={false} onChange={() => toggleSelect(id)} />
+            <CheckInput check={selection.has(asset.key)} hiddenName margin={false} onChange={() => toggleSelect(asset.key)} />
             <span class="px-2 py-1 text-xs rounded bg-darkbutton text-textcolor2">
-              {asset.type}
+              {asset.inlayType}
             </span>
           </div>
           <div class="mb-3">
-            {#if asset.type === 'image'}
-              {#await getPreviewURL(id) then url}
+            {#if asset.inlayType === 'image'}
+              {#await getPreviewURL(asset) then url}
                 {#if url}
                   <img alt={asset.name} class="w-full h-40 object-contain rounded bg-black/20" src={url} />
                 {/if}
               {/await}
-            {:else if asset.type === 'video'}
-              {#await getPreviewURL(id) then url}
+            {:else if asset.inlayType === 'video'}
+              {#await getPreviewURL(asset) then url}
                 {#if url}
-                  <video class="w-full h-40 object-contain rounded bg-black/20" controls src={url}>
+                  <video class="w-full h-40 object-contain rounded bg-black/20" controls>
+                    <source src={url} type={asset.mime} />
                     <track kind="captions" />
                   </video>
                 {/if}
               {/await}
-            {:else if asset.type === 'audio'}
-              {#await getPreviewURL(id) then url}
+            {:else if asset.inlayType === 'audio'}
+              {#await getPreviewURL(asset) then url}
                 {#if url}
-                  <audio class="w-full" controls src={url}>
+                  <audio class="w-full" controls>
+                    <source src={url} type={asset.mime} />
                     <track kind="captions" />
                   </audio>
                 {/if}
@@ -207,8 +205,8 @@
           <div class="flex justify-between items-start mb-2">
             <div class="flex-1 min-w-0">
               <p class="text-textcolor font-medium truncate" title={asset.name}>{asset.name}</p>
-              {#if asset.name !== id}
-                <p class="text-textcolor2 text-xs truncate" title={id}>{id}</p>
+              {#if asset.name !== asset.key}
+                <p class="text-textcolor2 text-xs truncate" title={asset.key}>{asset.key}</p>
               {/if}
             </div>
           </div>
@@ -217,10 +215,10 @@
             {#if asset.width && asset.height}
               <span>{asset.width}x{asset.height} • </span>
             {/if}
-            <span>{getAssetSize(asset)}</span>
+            <span>{formatSize(asset.size)}</span>
           </div>
 
-          <Button onclick={() => deleteAsset(id, asset.name)} styled="danger" size="sm">Delete</Button>
+          <Button onclick={() => deleteAsset(asset.key, asset.name)} styled="danger" size="sm">Delete</Button>
         </div>
       {/key}
     {/each}

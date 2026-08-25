@@ -1,13 +1,26 @@
 import { v4 } from 'uuid';
 import { alertError, alertInput, alertNormal, alertStore, alertWait } from '../alert';
 import { get, writable } from 'svelte/store';
-import { setDatabase, type character, saveImage, type Chat, getCurrentChat, setCurrentChat, getDatabase, type Database } from '../storage/database.svelte';
-import { assignIds } from '../storage/databasePreparation';
+import {
+    setDatabase,
+    type character,
+    saveImage,
+    type Chat,
+    getCurrentChat,
+    setCurrentChat,
+    getDatabase,
+    type groupChat,
+} from '../storage/database.svelte';
 import { selectedCharID } from '../stores.svelte';
 import { sleep } from '../util';
 import type { DataConnection, Peer } from 'peerjs';
 import { readImage } from '../globalApi.svelte';
 import { doingChat } from '../process/index.svelte';
+import {
+    activateCharacter,
+    invalidatePersistentNavigation,
+    upsertPersistentCompleteCharacter,
+} from '../storage/persistentDataRuntime.svelte';
 
 async function importPeerJS(){
     return await import('peerjs');
@@ -49,19 +62,23 @@ interface RequestChat{
 
 type ReciveData = ReciveFirst|RequestFirst|ReciveAsset|RequestSync|ReciveSync|RequestChatSafe|ResponseChatSafe|RequestChat
 
-export function installReceivedCharacter(db:Database, incoming:character):number{
-    incoming.chaId = '§temp'
-    incoming.chatPage = 0
-    incoming.chats = (incoming.chats ?? []).filter((chat) => !!chat)
-    const existingIndex = db.characters.findIndex((candidate) => candidate.chaId === '§temp')
-    if(existingIndex === -1){
-        db.characters.push(incoming)
+type CompleteCharacter = character | groupChat
+
+const MULTIUSER_TEMP_CHARACTER_ID = '§temp'
+
+export function normalizeIncomingCharacter(incoming:character):character{
+    const detached = safeStructuredClone(incoming)
+    detached.chaId = MULTIUSER_TEMP_CHARACTER_ID
+    detached.chatPage = 0
+    detached.chats = (detached.chats ?? []).filter((chat) => !!chat)
+    const assignedIds = new Set<string>()
+    for (const chat of detached.chats) {
+        let id = v4()
+        while (!id || assignedIds.has(id)) id = v4()
+        chat.id = id
+        assignedIds.add(id)
     }
-    else{
-        db.characters[existingIndex] = incoming
-    }
-    assignIds(db)
-    return db.characters.findIndex((candidate) => candidate.chaId === '§temp')
+    return detached
 }
 
 export function normalizeIncomingChat(chat:Chat, fallbackId?:string):Chat{
@@ -69,6 +86,109 @@ export function normalizeIncomingChat(chat:Chat, fallbackId?:string):Chat{
         chat.id = fallbackId || v4()
     }
     return chat
+}
+
+export function normalizeIncomingChatForCurrent(incoming: Chat, current?: Chat): Chat {
+    const normalized = safeStructuredClone(incoming)
+    normalized.id = current?.id || v4()
+    return normalized
+}
+
+export interface MultiuserReceiveControllerDependencies {
+    upsertCompleteCharacter(
+        characterId: string,
+        reason: string,
+        createOrMutate: (
+            existing: CompleteCharacter | null,
+        ) => CompleteCharacter | Promise<CompleteCharacter>,
+        options?: { includeInCharacterOrder?: boolean },
+    ): Promise<boolean>
+    activateCharacter(characterId: string): Promise<boolean>
+    invalidateNavigation(): void
+    deselect(): void
+    onChatCommitted(chat: Chat): void
+}
+
+export interface MultiuserReceiveController {
+    receiveCharacter(character: character): Promise<void>
+    receiveChat(chat: Chat): Promise<void>
+    close(): void
+}
+
+export function createMultiuserReceiveController(
+    dependencies: MultiuserReceiveControllerDependencies,
+): MultiuserReceiveController {
+    let closed = false
+    let ready = false
+    let operationTail = Promise.resolve()
+
+    const enqueue = (operation: () => Promise<void>): Promise<void> => {
+        const result = operationTail.then(async () => {
+            if (closed) return
+            await operation()
+        })
+        operationTail = result.then(
+            () => undefined,
+            () => undefined,
+        )
+        return result
+    }
+
+    return {
+        receiveCharacter(incoming) {
+            const detached = normalizeIncomingCharacter(incoming)
+            return enqueue(async () => {
+                ready = false
+                const committed = await dependencies.upsertCompleteCharacter(
+                    MULTIUSER_TEMP_CHARACTER_ID,
+                    'multiuser-receive-character',
+                    () => safeStructuredClone(detached),
+                    { includeInCharacterOrder: false },
+                )
+                if (!committed) throw new Error('Failed to persist the multiuser character')
+                if (closed) return
+                const activated = await dependencies.activateCharacter(MULTIUSER_TEMP_CHARACTER_ID)
+                if (closed) return
+                if (!activated) throw new Error('Failed to activate the multiuser character')
+                ready = true
+            })
+        },
+        receiveChat(incoming) {
+            const detached = safeStructuredClone(incoming)
+            return enqueue(async () => {
+                if (!ready) throw new Error('The multiuser character is not ready')
+                let committedChat: Chat | null = null
+                const committed = await dependencies.upsertCompleteCharacter(
+                    MULTIUSER_TEMP_CHARACTER_ID,
+                    'multiuser-receive-chat',
+                    (existing) => {
+                        if (!existing) {
+                            throw new Error('The multiuser character is not available')
+                        }
+                        const replacement = safeStructuredClone(existing)
+                        const chatIndex = replacement.chatPage ?? 0
+                        const normalized = normalizeIncomingChatForCurrent(
+                            detached,
+                            replacement.chats[chatIndex],
+                        )
+                        replacement.chats[chatIndex] = normalized
+                        committedChat = safeStructuredClone(normalized)
+                        return replacement
+                    },
+                    { includeInCharacterOrder: false },
+                )
+                if (!committed) throw new Error('Failed to persist the multiuser chat')
+                if (!closed && committedChat) dependencies.onChatCommitted(committedChat)
+            })
+        },
+        close() {
+            if (closed) return
+            closed = true
+            ready = false
+            dependencies.invalidateNavigation()
+            dependencies.deselect()
+        },
+    }
 }
 
 let conn:DataConnection
@@ -167,9 +287,13 @@ export async function createMultiuserRoom(){
                 const db = getDatabase()
                 const selectedCharId = get(selectedCharID)
                 const char = db.characters[selectedCharId]
-                char.chats[char.chatPage] = normalizeIncomingChat(data.data, char.chats[char.chatPage]?.id)
+                const normalized = normalizeIncomingChatForCurrent(
+                    data.data,
+                    char.chats[char.chatPage],
+                )
+                char.chats[char.chatPage] = normalized
                 db.characters[selectedCharId] = char
-                latestSyncChat = data.data
+                latestSyncChat = normalized
                 setDatabase(db)
 
                 for(const connection of connections){
@@ -178,7 +302,7 @@ export async function createMultiuserRoom(){
                     }
                     const rs:ReciveSync = {
                         type: 'receive-chat',
-                        data: data.data
+                        data: normalized
                     }
                     connection.send(rs)
                 }
@@ -299,6 +423,15 @@ export async function joinMultiuserRoom(){
         let open = false
         conn = peer.connect(roomId);
         RoomIdStore.set(roomId)
+        const receiveController = createMultiuserReceiveController({
+            upsertCompleteCharacter: upsertPersistentCompleteCharacter,
+            activateCharacter,
+            invalidateNavigation: invalidatePersistentNavigation,
+            deselect: () => selectedCharID.set(-1),
+            onChatCommitted: (chat) => {
+                latestSyncChat = chat
+            },
+        })
 
         conn.on('open', function() {
             alertWait("Waiting for host to accept connection")
@@ -311,14 +444,7 @@ export async function joinMultiuserRoom(){
         conn.on('data', function(data:ReciveData) {
             switch(data.type){
                 case 'receive-char':{
-                    //create temp character
-                    const db = getDatabase()
-                    const selectedcharIndex = get(selectedCharID)
-                    const tempInd = installReceivedCharacter(db, data.data)
-                    if(selectedcharIndex !== tempInd){
-                        selectedCharID.set(tempInd)
-                    }
-                    setDatabase(db)
+                    void receiveController.receiveCharacter(data.data).catch(alertError)
                     break
                 }
                 case 'receive-asset':{
@@ -326,15 +452,7 @@ export async function joinMultiuserRoom(){
                     break
                 }
                 case 'receive-chat':{
-                    const db = getDatabase({
-                        snapshot: true
-                    })
-                    const selectedCharId = get(selectedCharID)
-                    const char = safeStructuredClone(db.characters[selectedCharId])
-                    char.chats[char.chatPage] = normalizeIncomingChat(data.data, char.chats[char.chatPage]?.id)
-                    db.characters[selectedCharId] = char
-                    latestSyncChat = data.data
-                    setDatabase(db)
+                    void receiveController.receiveChat(data.data).catch(alertError)
                     break
                 }
                 case 'request-chat-safe':{
@@ -356,10 +474,10 @@ export async function joinMultiuserRoom(){
         });
 
         conn.on('close', function() {
+            receiveController.close()
             alertError("Connection closed")
             connectionOpen = false
             ConnectionOpenStore.set(false)
-            selectedCharID.set(-1)
         })
     
         let waitTime = 0

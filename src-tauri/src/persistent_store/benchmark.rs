@@ -520,6 +520,7 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
             .commit(&WorkingSetCommit {
                 expected_revision: 2,
                 root: None,
+                replace_presets: None,
                 character: None,
                 replace_character: None,
                 add_character: None,

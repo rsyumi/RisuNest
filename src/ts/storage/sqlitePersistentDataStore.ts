@@ -1,6 +1,10 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import type { Chat, Database } from './database.svelte'
+import type { Chat, Database, botPreset } from './database.svelte'
+import {
+    nativePersistentRevisionLease,
+    type NativePersistentRevisionLease,
+} from './nativePersistentExport'
 import {
     RevisionConflictError,
     SnapshotReleasedError,
@@ -14,6 +18,8 @@ import {
     type DataRevision,
     type PersistentDataStore,
     type PersistentRevisionLease,
+    type PersistentRoot,
+    type PresetCatalog,
     type Versioned,
     type WorkingSetCommit,
 } from './persistentDataStore'
@@ -93,8 +99,16 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         await invokeStore<{ revision: DataRevision }>('pds_open')
     }
 
-    readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
+    readRoot(): Promise<Versioned<PersistentRoot>> {
         return invokeStore('pds_read_root', {})
+    }
+
+    queryPresets(): Promise<PresetCatalog> {
+        return invokeStore('pds_query_presets', {})
+    }
+
+    readPreset(id: string): Promise<Versioned<botPreset> | null> {
+        return invokeStore('pds_read_preset', { id })
     }
 
     queryCharacters(input: CharacterQuery): Promise<CharacterPage> {
@@ -132,8 +146,12 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     ): Promise<{ revision: DataRevision }> {
         const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
         try {
-            const { characters, ...root } = database
+            const { characters, botPresets, ...root } = database
             await invokeStore<void>('pds_replace_put_root', { stagingId, root })
+            await invokeStore<void>('pds_replace_put_presets', {
+                stagingId,
+                presets: botPresets ?? [],
+            })
             for (const batch of characterBatches(characters)) {
                 await invokeStore<void>('pds_replace_add_characters', {
                     stagingId,
@@ -168,11 +186,20 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             if (released) throw new SnapshotReleasedError()
         }
 
-        return {
+        const revisionLease: NativePersistentRevisionLease = {
             revision,
+            [nativePersistentRevisionLease]: lease,
             readRoot: async () => {
                 assertActive()
                 return invokeStore('pds_read_root', { lease })
+            },
+            queryPresets: async () => {
+                assertActive()
+                return invokeStore('pds_query_presets', { lease })
+            },
+            readPreset: async (id) => {
+                assertActive()
+                return invokeStore('pds_read_preset', { id, lease })
             },
             queryCharacters: async (input) => {
                 assertActive()
@@ -200,10 +227,18 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             },
             release: () => {
                 if (releasePromise) return releasePromise
-                released = true
-                releasePromise = invokeStore<void>('pds_release_revision', { lease })
+                releasePromise = invokeStore<void>('pds_release_revision', { lease }).then(
+                    () => {
+                        released = true
+                    },
+                    (error) => {
+                        releasePromise = undefined
+                        throw error
+                    },
+                )
                 return releasePromise
             },
         }
+        return revisionLease
     }
 }

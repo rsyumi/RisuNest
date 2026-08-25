@@ -1,7 +1,7 @@
 <script lang="ts">
     import { changeChar, getCharImage, removeChar } from "../../ts/characters";
-    import { getDatabase, type Database } from "../../ts/storage/database.svelte";
-    import { replacePersistentDatabase } from "../../ts/storage/persistentDataRuntime.svelte";
+    import type { Database } from "../../ts/storage/database.svelte";
+    import { mutatePersistentCharacterDetail } from "../../ts/storage/persistentDataRuntime.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import BarIcon from "../SideBars/BarIcon.svelte";
     import { ArrowLeft, User, Users, SquareMousePointer, TrashIcon, Undo2Icon } from "@lucide/svelte";
@@ -10,7 +10,7 @@
     import Button from "../UI/GUI/Button.svelte";
     import { language } from "src/lang";
     import { parseMultilangString } from "src/ts/util";
-    import { checkCharOrder } from "src/ts/globalApi.svelte";
+    import { appendCharacterIdToOrder } from "src/ts/storage/characterOrderMutation";
     import MobileCharacters from "../Mobile/MobileCharacters.svelte";
     interface Props {
         endGrid?: any;
@@ -139,13 +139,14 @@
                         <span class="text-textcolor2">{parseMultilangString(char.desc)['en'] || parseMultilangString(char.desc)['xx'] || 'No description'}</span>
                         <div class="flex gap-2 justify-end">
                             <button class="hover:text-textcolor text-textcolor2" onclick={async () => {
-                                const candidate = getDatabase({ snapshot: true })
-                                const restoreIdx = candidate.characters.findIndex((c) => c.chaId === char.chaId)
-                                if (restoreIdx !== -1) {
-                                    candidate.characters[restoreIdx].trashTime = undefined
-                                    checkCharOrder(candidate)
-                                    await replacePersistentDatabase(candidate, 'character-restore')
-                                }
+                                await mutatePersistentCharacterDetail(
+                                    char.chaId,
+                                    'character-restore',
+                                    ({ root, character }) => {
+                                        delete character.trashTime
+                                        appendCharacterIdToOrder(root, char.chaId)
+                                    },
+                                )
                             }}>
                                 <Undo2Icon />
                             </button>

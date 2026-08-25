@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { NativeOfficialAccountFlow } from './sync/nativeOfficialAccountFlow'
 
 const mocks = vi.hoisted(() => {
     const cache = new Map<string, unknown>()
@@ -36,6 +37,10 @@ const mocks = vi.hoisted(() => {
         getColdStorageItem: vi.fn(),
         getAccountColdStorageItem: vi.fn(),
         setLocalColdStorageItem: vi.fn(),
+        materializePersistentDatabaseSnapshotWithRevision: vi.fn(),
+        replacePersistentDatabase: vi.fn(),
+        runtime: { revision: 11 },
+        isTauri: false,
     }
 })
 
@@ -63,7 +68,17 @@ vi.mock('./databaseRestore', async (importOriginal) => ({
     ...await importOriginal<typeof import('./databaseRestore')>(),
     completeAccountUnmigration: mocks.completeAccountUnmigration,
 }))
-vi.mock('./persistentDataRuntime.svelte', () => ({ replacePersistentDatabase: vi.fn() }))
+vi.mock('./persistentDataRuntime.svelte', () => ({
+    getPersistentDataRuntime: () => mocks.runtime,
+    replacePersistentDatabase: mocks.replacePersistentDatabase,
+    materializePersistentDatabaseSnapshotWithRevision:
+        mocks.materializePersistentDatabaseSnapshotWithRevision,
+}))
+vi.mock('../platform', () => ({
+    get isTauri() {
+        return mocks.isTauri
+    },
+}))
 vi.mock('./platformBlobStore', () => ({
     resolveBlobStore: async () => ({
         read: async (key: string) => mocks.blobAssets.get(key) ?? null,
@@ -127,7 +142,15 @@ beforeEach(() => {
     mocks.getColdStorageItem.mockReset().mockResolvedValue(null)
     mocks.getAccountColdStorageItem.mockReset().mockResolvedValue(null)
     mocks.setLocalColdStorageItem.mockReset().mockResolvedValue(true)
-    mocks.localforage.createInstance.mockReturnValue(mocks.cachedForage)
+    mocks.materializePersistentDatabaseSnapshotWithRevision.mockReset().mockResolvedValue({
+        database: mocks.database,
+        revision: 11,
+        mutationGeneration: 17,
+    })
+    mocks.replacePersistentDatabase.mockReset().mockResolvedValue(undefined)
+    mocks.runtime.revision = 12
+    mocks.isTauri = false
+    mocks.localforage.createInstance.mockReset().mockReturnValue(mocks.cachedForage)
     localStorage.clear()
     vi.spyOn(Date, 'now').mockReturnValue(1_725_000_000_123)
 })
@@ -297,6 +320,366 @@ describe('AccountStorage structured wire contract', () => {
         expect(warnBody.cancel).toHaveBeenCalledOnce()
     })
 
+    it('routes native reauthentication without reading or writing the legacy fallback token', async () => {
+        localStorage.setItem('fallbackRisuToken', JSON.stringify({ token: 'legacy-token' }))
+        const getItem = vi.spyOn(Storage.prototype, 'getItem')
+        const setItem = vi.spyOn(Storage.prototype, 'setItem')
+        const credentialRouting = {
+            getToken: vi.fn(() => 'native-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({
+            id: 'account-1',
+            token: 'refreshed-token',
+            data: { dpop_private_key: 'must-not-persist' },
+        }))
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(null, 403))
+            .mockResolvedValueOnce(response(new Uint8Array([9, 1])))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage({
+            databaseCache: mocks.cachedForage,
+            assetCache: mocks.localforage,
+            credentialRouting,
+        })
+
+        await expect(storage.readItem('native-resource')).resolves.toEqual({
+            kind: 'value',
+            bytes: new Uint8Array([9, 1]),
+        })
+
+        expect(credentialRouting.getToken).toHaveBeenCalledTimes(2)
+        expect(credentialRouting.reauthenticate).toHaveBeenCalledWith(JSON.stringify({
+            id: 'account-1',
+            token: 'refreshed-token',
+            data: { dpop_private_key: 'must-not-persist' },
+        }))
+        expect(getItem).not.toHaveBeenCalledWith('fallbackRisuToken')
+        expect(setItem).not.toHaveBeenCalledWith('fallbackRisuToken', expect.anything())
+        expect(localStorage.getItem('fallbackRisuToken')).toBe(JSON.stringify({
+            token: 'legacy-token',
+        }))
+    })
+
+    it('completes restore after AccountStorage reauthenticates a 403 inside the flow queue', async () => {
+        const values = new Map<string, unknown>()
+        const setRouting = vi.fn()
+        let flow!: NativeOfficialAccountFlow
+        let reauthenticateSnapshotRequest!: (loginResult: string) => Promise<void>
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({
+            id: 'account-1',
+            token: 'refreshed-token',
+            data: { dpop_private_key: 'must-not-persist' },
+        }))
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(null, 403))
+            .mockResolvedValueOnce(response(null, 204))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage({
+            databaseCache: mocks.cachedForage,
+            assetCache: mocks.localforage,
+            credentialRouting: {
+                getToken: () => flow.getToken(),
+                reauthenticate: (loginResult) => reauthenticateSnapshotRequest(loginResult),
+            },
+        })
+        const { createNativeOfficialAccountFlowService, nativeOfficialAccountKeys } =
+            await import('./sync/nativeOfficialAccountFlow')
+        const service = createNativeOfficialAccountFlowService({
+            appKv: {
+                get: vi.fn(async (key) => values.get(key) ?? null),
+                set: vi.fn(async (key, value) => void values.set(key, value)),
+                remove: vi.fn(async (key) => void values.delete(key)),
+            },
+            adapter: {
+                pull: vi.fn(async () => {
+                    await storage.readItem('database/database.bin')
+                    return { kind: 'missing' as const }
+                }),
+                pin: vi.fn(),
+                resetAccountAssociation: vi.fn(),
+            },
+            initialCredential: { id: 'account-1', token: 'legacy-token', data: {} },
+            flushPendingData: vi.fn(async () => undefined),
+            getRevision: () => 1,
+            restart: vi.fn(async () => undefined),
+            setRouting,
+            clearLegacyFallback: vi.fn(),
+            flushMetadata: vi.fn(async () => undefined),
+            resetMetadata: vi.fn(),
+            resetAccountSession: vi.fn(),
+        })
+        flow = service.flow
+        reauthenticateSnapshotRequest = (loginResult) =>
+            service.snapshotRequestReauthentication.reauthenticate(loginResult).then(() => undefined)
+
+        await expect(flow.restore()).resolves.toEqual({ kind: 'missing' })
+
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(2)
+        expect(flow.getToken()).toBe('refreshed-token')
+        expect(values.get(nativeOfficialAccountKeys.credential)).toEqual({
+            id: 'account-1',
+            token: 'refreshed-token',
+            data: {},
+        })
+        expect(setRouting).toHaveBeenCalledOnce()
+    }, 1_000)
+
+    it('aborts snapshot retry when a 403 returns credentials for another account', async () => {
+        let flow!: NativeOfficialAccountFlow
+        let reauthenticateSnapshotRequest!: (loginResult: string) => Promise<void>
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({
+            id: 'account-2',
+            token: 'other-token',
+            data: {},
+        }))
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response(null, 403))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage({
+            databaseCache: mocks.cachedForage,
+            assetCache: mocks.localforage,
+            credentialRouting: {
+                getToken: () => flow.getToken(),
+                reauthenticate: (loginResult) => reauthenticateSnapshotRequest(loginResult),
+            },
+        })
+        const { createNativeOfficialAccountFlowService } =
+            await import('./sync/nativeOfficialAccountFlow')
+        const appKv = {
+            get: vi.fn(async () => null),
+            set: vi.fn(async () => undefined),
+            remove: vi.fn(async () => undefined),
+        }
+        const setRouting = vi.fn()
+        const service = createNativeOfficialAccountFlowService({
+            appKv,
+            adapter: {
+                pull: vi.fn(async () => {
+                    await storage.readItem('database/database.bin')
+                    return { kind: 'missing' as const }
+                }),
+                pin: vi.fn(),
+                resetAccountAssociation: vi.fn(),
+            },
+            initialCredential: { id: 'account-1', token: 'legacy-token', data: {} },
+            flushPendingData: vi.fn(async () => undefined),
+            getRevision: () => 1,
+            restart: vi.fn(async () => undefined),
+            setRouting,
+            clearLegacyFallback: vi.fn(),
+            flushMetadata: vi.fn(async () => undefined),
+            resetMetadata: vi.fn(),
+            resetAccountSession: vi.fn(),
+        })
+        flow = service.flow
+        reauthenticateSnapshotRequest = (loginResult) =>
+            service.snapshotRequestReauthentication.reauthenticate(loginResult).then(() => undefined)
+
+        await expect(flow.restore()).rejects.toThrow(
+            'Native official account changed during snapshot reauthentication',
+        )
+
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledOnce()
+        expect(flow.getToken()).toBe('legacy-token')
+        expect(appKv.set).not.toHaveBeenCalled()
+        expect(setRouting).not.toHaveBeenCalled()
+    })
+
+    it('does not publish an account A pin after a 403 authenticates account B', async () => {
+        let flow!: NativeOfficialAccountFlow
+        let reauthenticateSnapshotRequest!: (loginResult: string) => Promise<void>
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({
+            id: 'account-b',
+            token: 'other-token',
+            data: {},
+        }))
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 'session-a' }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response(null, 403))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage({
+            databaseCache: mocks.cachedForage,
+            assetCache: mocks.localforage,
+            credentialRouting: {
+                getToken: () => flow.getToken(),
+                reauthenticate: (loginResult) => reauthenticateSnapshotRequest(loginResult),
+            },
+        })
+        const { createNativeOfficialAccountFlowService } =
+            await import('./sync/nativeOfficialAccountFlow')
+        const appKv = {
+            get: vi.fn(async () => null),
+            set: vi.fn(async () => undefined),
+            remove: vi.fn(async () => undefined),
+        }
+        const setRouting = vi.fn()
+        const publication = {
+            publish: vi.fn(async () => {
+                await storage.writeItem('database/database.bin', Uint8Array.of(1))
+            }),
+            dispose: vi.fn(async () => undefined),
+        }
+        const service = createNativeOfficialAccountFlowService({
+            appKv,
+            adapter: {
+                pull: vi.fn(),
+                pin: vi.fn(async () => publication),
+                resetAccountAssociation: vi.fn(),
+            },
+            initialCredential: { id: 'account-a', token: 'legacy-token', data: {} },
+            flushPendingData: vi.fn(async () => undefined),
+            getRevision: () => 1,
+            restart: vi.fn(async () => undefined),
+            setRouting,
+            clearLegacyFallback: vi.fn(),
+            flushMetadata: vi.fn(async () => undefined),
+            resetMetadata: vi.fn(),
+            resetAccountSession: vi.fn(),
+        })
+        flow = service.flow
+        reauthenticateSnapshotRequest = (loginResult) =>
+            service.snapshotRequestReauthentication.reauthenticate(loginResult).then(() => undefined)
+
+        await expect(flow.publish()).rejects.toThrow(
+            'Native official account changed during snapshot reauthentication',
+        )
+
+        expect(publication.publish).toHaveBeenCalledOnce()
+        expect(publication.dispose).toHaveBeenCalledOnce()
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(2)
+        expect(flow.getToken()).toBe('legacy-token')
+        expect(appKv.set).not.toHaveBeenCalled()
+        expect(setRouting).not.toHaveBeenCalled()
+    })
+
+    it('does not let an external asset 403 resurrect credentials after queued logout', async () => {
+        let flow!: NativeOfficialAccountFlow
+        mocks.alertLogin.mockResolvedValueOnce(JSON.stringify({
+            id: 'account-1',
+            token: 'refreshed-token',
+            data: {},
+        }))
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response(null, 403))
+        const { AccountStorage } = await loadStorage()
+        const liveStorage = new AccountStorage({
+            databaseCache: mocks.cachedForage,
+            assetCache: mocks.localforage,
+            credentialRouting: {
+                getToken: () => flow.getToken(),
+                reauthenticate: (loginResult) =>
+                    flow.reauthenticate(loginResult).then(() => undefined),
+            },
+        })
+        const { createNativeOfficialAccountFlowService, nativeOfficialAccountKeys } =
+            await import('./sync/nativeOfficialAccountFlow')
+        const values = new Map<string, unknown>([[
+            nativeOfficialAccountKeys.credential,
+            { id: 'account-1', token: 'legacy-token', data: {} },
+        ]])
+        let resolvePull: (result: { kind: 'missing' }) => void = () => undefined
+        const pull = vi.fn(async () => new Promise<{ kind: 'missing' }>((resolve) => {
+            resolvePull = resolve
+        }))
+        const setRouting = vi.fn()
+        const service = createNativeOfficialAccountFlowService({
+            appKv: {
+                get: vi.fn(async (key) => values.get(key) ?? null),
+                set: vi.fn(async (key, value) => void values.set(key, value)),
+                remove: vi.fn(async (key) => void values.delete(key)),
+            },
+            adapter: {
+                pull,
+                pin: vi.fn(),
+                resetAccountAssociation: vi.fn(),
+            },
+            initialCredential: { id: 'account-1', token: 'legacy-token', data: {} },
+            flushPendingData: vi.fn(async () => undefined),
+            getRevision: () => 1,
+            restart: vi.fn(async () => undefined),
+            setRouting,
+            clearLegacyFallback: vi.fn(),
+            flushMetadata: vi.fn(async () => undefined),
+            resetMetadata: vi.fn(),
+            resetAccountSession: vi.fn(),
+        })
+        flow = service.flow
+
+        const restore = flow.restore()
+        await vi.waitFor(() => expect(pull).toHaveBeenCalledOnce())
+        const logout = flow.logout()
+        const liveRead = liveStorage.readItem('assets/live.png')
+        await vi.waitFor(() => expect(mocks.alertLogin).toHaveBeenCalledOnce())
+        resolvePull({ kind: 'missing' })
+
+        await expect(restore).resolves.toEqual({ kind: 'missing' })
+        await expect(logout).resolves.toBeUndefined()
+        await expect(liveRead).rejects.toThrow(
+            'Native official account session changed during reauthentication',
+        )
+        expect(flow.getToken()).toBeNull()
+        expect(values.has(nativeOfficialAccountKeys.credential)).toBe(false)
+        expect(setRouting).toHaveBeenCalledTimes(1)
+        expect(setRouting).toHaveBeenCalledWith(null)
+    }, 1_000)
+
+    it('does not reuse account A session headers after logout and account B login', async () => {
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 'session-a' }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response('assets/a.png'))
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 'session-b' }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response('assets/b.png'))
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const { createNativeOfficialAccountFlow } = await import('./sync/nativeOfficialAccountFlow')
+        const flow = createNativeOfficialAccountFlow({
+            appKv: {
+                get: vi.fn(async () => null),
+                set: vi.fn(async () => undefined),
+                remove: vi.fn(async () => undefined),
+            },
+            adapter: {
+                pull: vi.fn(),
+                pin: vi.fn(),
+                resetAccountAssociation: vi.fn(),
+            },
+            initialCredential: { id: 'account-a', token: 'token-a', data: {} },
+            flushPendingData: vi.fn(async () => undefined),
+            getRevision: () => 1,
+            restart: vi.fn(async () => undefined),
+            setRouting: vi.fn(),
+            clearLegacyFallback: vi.fn(),
+            flushMetadata: vi.fn(async () => undefined),
+            resetMetadata: vi.fn(),
+            resetAccountSession: resetAccountStorageSession,
+        })
+        const storage = new AccountStorage({
+            databaseCache: mocks.cachedForage,
+            assetCache: mocks.localforage,
+            credentialRouting: {
+                getToken: () => flow.getToken(),
+                reauthenticate: (loginResult) =>
+                    flow.reauthenticate(loginResult).then(() => undefined),
+            },
+        })
+
+        await storage.writeItem('assets/a.png', Uint8Array.of(1))
+        await flow.logout()
+        await flow.login({ id: 'account-b', token: 'token-b', data: {} })
+        await storage.writeItem('assets/b.png', Uint8Array.of(2))
+
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(4)
+        expect(mocks.fetchProtectedResource.mock.calls[1][1].headers['x-risu-session'])
+            .toBe('session-a')
+        expect(mocks.fetchProtectedResource.mock.calls[3][1].headers['x-risu-session'])
+            .toBe('session-b')
+    })
+
     it('does not mutate the database cache for warning or failed writes', async () => {
         mocks.fetchProtectedResource
             .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 80 }), 200, {
@@ -460,6 +843,32 @@ describe('AccountStorage structured wire contract', () => {
         )
     })
 
+    it('uses injected native caches without creating or accessing LocalForage', async () => {
+        mocks.localforage.createInstance.mockClear()
+        const databaseCache = {
+            getItem: vi.fn(async () => null),
+            setItem: vi.fn(async () => undefined),
+        }
+        const assetCache = {
+            getItem: vi.fn(async () => null),
+            setItem: vi.fn(async () => undefined),
+        }
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response(new Uint8Array([4, 2])))
+        const { AccountStorage } = await loadStorage()
+        const storage = new AccountStorage({ databaseCache, assetCache })
+
+        await expect(storage.readItem('assets/native.png')).resolves.toEqual({
+            kind: 'value',
+            bytes: new Uint8Array([4, 2]),
+        })
+
+        expect(assetCache.getItem).toHaveBeenCalledWith('assets/native.png')
+        expect(assetCache.setItem).toHaveBeenCalledOnce()
+        expect(mocks.localforage.createInstance).not.toHaveBeenCalled()
+        expect(mocks.localforage.getItem).not.toHaveBeenCalled()
+        expect(mocks.localforage.setItem).not.toHaveBeenCalled()
+    })
+
     it('cancels an ignored read 403 body before retrying', async () => {
         const forbidden = cancellableResponse(403)
         mocks.fetchProtectedResource
@@ -492,9 +901,23 @@ describe('AccountStorage structured wire contract', () => {
         }
         mocks.database.characters = [{
             type: 'character',
+            chaId: 'catalog-only',
+            chats: [],
+        }]
+        const authoritativeDatabase = {
+            account: mocks.database.account,
+            characters: [{
+            type: 'character',
             chaId: 'cold-character',
             coldstorage: 'cold-character-key',
-        }]
+            chats: [],
+        }],
+        }
+        mocks.materializePersistentDatabaseSnapshotWithRevision.mockResolvedValue({
+            database: authoritativeDatabase,
+            revision: 11,
+            mutationGeneration: 17,
+        })
         mocks.getColdStorageItem.mockResolvedValue(localCold)
         mocks.getAccountColdStorageItem.mockResolvedValue(officialCold)
         mocks.getUncleanablesSync.mockImplementation((_database, _mode, options) => (
@@ -506,17 +929,49 @@ describe('AccountStorage structured wire contract', () => {
         const events: string[] = []
         mocks.completeAccountUnmigration.mockImplementation(async (_database, dependencies) => {
             await dependencies.prepareResources()
+            await dependencies.replaceDatabase(
+                { ..._database, account: null },
+                'account-unmigration',
+            )
             events.push('disable-account')
         })
         const { unMigrationAccount } = await loadStorage()
 
         await unMigrationAccount()
 
+        expect(mocks.materializePersistentDatabaseSnapshotWithRevision).toHaveBeenCalledWith(
+            'account-unmigration',
+        )
+        expect(mocks.completeAccountUnmigration).toHaveBeenCalledWith(
+            authoritativeDatabase,
+            expect.any(Object),
+        )
+        expect(mocks.replacePersistentDatabase).toHaveBeenCalledWith(
+            expect.objectContaining({ account: null }),
+            'account-unmigration',
+            {
+                authoritative: true,
+                expectedRevision: 11,
+                expectedMutationGeneration: 17,
+            },
+        )
         expect(mocks.getAccountColdStorageItem).not.toHaveBeenCalled()
         expect(mocks.blobAssets.get('assets/local-cold-only.png')).toEqual(
             new Uint8Array([7, 6, 5]),
         )
         expect(mocks.blobAssets.has('assets/official-only.png')).toBe(false)
         expect(events).toEqual(['disable-account'])
+    })
+
+    it('rejects legacy account unmigration on native before reading any legacy storage', async () => {
+        mocks.isTauri = true
+        const { unMigrationAccount } = await loadStorage()
+
+        await expect(unMigrationAccount()).rejects.toThrow(
+            'Account unmigration is only available on the web',
+        )
+
+        expect(mocks.materializePersistentDatabaseSnapshotWithRevision).not.toHaveBeenCalled()
+        expect(mocks.localforage.createInstance).not.toHaveBeenCalled()
     })
 })

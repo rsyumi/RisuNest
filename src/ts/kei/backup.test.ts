@@ -2,12 +2,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Database } from '../storage/database.svelte'
 
 let database: Partial<Database>
+let persistentDatabase: Partial<Database>
+const materializePersistentDatabaseSnapshot = vi.fn()
 
 vi.mock('../storage/database.svelte', () => ({
     getDatabase: () => database,
 }))
 vi.mock('./kei', () => ({
     keiServerURL: () => 'https://kei.example',
+}))
+vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    materializePersistentDatabaseSnapshot,
 }))
 
 const fetchMock = vi.fn(async () => new Response(''))
@@ -27,6 +32,15 @@ describe('saveDbKei', () => {
         database = {
             account: { id: 'acc', token: 'secret-token', data: {}, kei: true },
         } as Partial<Database>
+        persistentDatabase = {
+            account: { id: 'acc', token: 'secret-token', data: {}, kei: true },
+            characters: [{
+                type: 'character',
+                chaId: 'complete-character',
+                chats: [{ id: 'complete-chat', message: [{ role: 'user', data: 'complete' }] }],
+            }],
+        } as Partial<Database>
+        materializePersistentDatabaseSnapshot.mockReset().mockResolvedValue(persistentDatabase)
     })
 
     afterEach(() => {
@@ -36,8 +50,9 @@ describe('saveDbKei', () => {
     it('posts the full database as JSON to the kei autobackup route', async () => {
         const saveDbKei = await loadSaveDbKei()
 
-        saveDbKei()
+        await saveDbKei()
 
+        expect(materializePersistentDatabaseSnapshot).toHaveBeenCalledWith('kei-auto-backup')
         expect(fetchMock).toHaveBeenCalledTimes(1)
         const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
         expect(url).toBe('https://kei.example/autobackup/save')
@@ -45,7 +60,7 @@ describe('saveDbKei', () => {
         expect(init.headers).toEqual({ 'Content-Type': 'application/json' })
         expect(JSON.parse(init.body as string)).toEqual({
             token: 'secret-token',
-            database,
+            database: persistentDatabase,
         })
     })
 
@@ -53,23 +68,24 @@ describe('saveDbKei', () => {
         const saveDbKei = await loadSaveDbKei()
 
         database = {}
-        saveDbKei()
+        await saveDbKei()
         database = { account: { id: 'acc', token: 'secret-token', data: {} } } as Partial<Database>
-        saveDbKei()
+        await saveDbKei()
 
         expect(fetchMock).not.toHaveBeenCalled()
+        expect(materializePersistentDatabaseSnapshot).not.toHaveBeenCalled()
     })
 
     it('sends at most one backup per five minutes', async () => {
         const saveDbKei = await loadSaveDbKei()
 
-        saveDbKei()
+        await saveDbKei()
         vi.advanceTimersByTime(5 * 60000 - 1)
-        saveDbKei()
+        await saveDbKei()
         expect(fetchMock).toHaveBeenCalledTimes(1)
 
         vi.advanceTimersByTime(1)
-        saveDbKei()
+        await saveDbKei()
         expect(fetchMock).toHaveBeenCalledTimes(2)
     })
 
@@ -78,8 +94,28 @@ describe('saveDbKei', () => {
         const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         fetchMock.mockRejectedValueOnce(new Error('offline'))
 
-        expect(() => saveDbKei()).not.toThrow()
+        await expect(saveDbKei()).resolves.toBeUndefined()
         await vi.waitFor(() => expect(consoleError).toHaveBeenCalled())
+        consoleError.mockRestore()
+    })
+
+    it('does not publish when the live account and materialized snapshot disagree', async () => {
+        const saveDbKei = await loadSaveDbKei()
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        persistentDatabase.account = {
+            id: 'different-account',
+            token: 'different-token',
+            data: {},
+            kei: true,
+        }
+
+        await saveDbKei()
+
+        expect(fetchMock).not.toHaveBeenCalled()
+        expect(consoleError).toHaveBeenCalledWith(
+            'Kei auto backup failed:',
+            expect.objectContaining({ message: 'Kei account changed during backup materialization' }),
+        )
         consoleError.mockRestore()
     })
 })

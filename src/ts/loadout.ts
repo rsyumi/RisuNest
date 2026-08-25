@@ -43,7 +43,7 @@ export function makeLoadout(options:{
 
 type LoadoutApplyOption = 'modules' | 'globalVariables' | 'preset' | 'persona'
 
-export function applyLoadout(loadout: Loadout, apply:LoadoutApplyOption[] = [
+export async function applyLoadout(loadout: Loadout, apply:LoadoutApplyOption[] = [
     'modules',
     'globalVariables',
     'preset',
@@ -60,7 +60,7 @@ export function applyLoadout(loadout: Loadout, apply:LoadoutApplyOption[] = [
     if(apply.includes('preset')) {
         let presetIndex = DBState.db.botPresets?.findIndex(p => p.name === loadout.presetName)
         if(presetIndex !== -1){
-            changeToPreset(presetIndex)
+            await changeToPreset(presetIndex)
         }
     }
     if(apply.includes('modules')) {

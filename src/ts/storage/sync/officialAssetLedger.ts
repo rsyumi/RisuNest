@@ -8,6 +8,7 @@ export interface OfficialAssetLedger {
     coldDigest(key: string): string | null
     recordCold(key: string, digest: string): void
     clear(): void
+    reset(): void
 }
 
 interface LedgerRecord {
@@ -77,6 +78,9 @@ export function createOfficialAssetLedger(
             record = emptyRecord()
             storage.removeItem(storageKey)
         },
+        reset() {
+            record = emptyRecord()
+        },
     }
 }
 
@@ -87,6 +91,7 @@ export function createUnrecordedOfficialAssetLedger(): OfficialAssetLedger {
         coldDigest: () => null,
         recordCold: () => undefined,
         clear: () => undefined,
+        reset: () => undefined,
     }
 }
 
@@ -118,5 +123,9 @@ export function createAccountScopedOfficialAssetLedger(
         coldDigest: (key) => resolve().coldDigest(key),
         recordCold: (key, digest) => resolve().recordCold(key, digest),
         clear: () => resolve().clear(),
+        reset() {
+            boundId = null
+            bound = unrecorded
+        },
     }
 }

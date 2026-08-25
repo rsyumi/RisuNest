@@ -12,12 +12,26 @@ import { SafeDocument, SafeIdbFactory, SafeLocalStorage } from "./pluginSafeClas
 import { loadV3Plugins } from "./apiV3/v3.svelte";
 import { pluginCodeTranspiler } from "./apiV3/transpiler";
 import {
+    createAwaitablePluginLoaderSource,
     createFullCompatibilityPersistence,
     createPluginCompatibilityController,
     createPluginLoadOrchestrator,
+    createPluginLoadReentrancyGuard,
+    runAwaitablePluginLoader,
+    runPluginUnloadCallbacks,
     selectPluginCompatibilityProfile,
 } from "./pluginCompatibility";
-import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte";
+import {
+    getPersistentNavigationGeneration,
+    materializeMaximumCompatibilityWorkingSet,
+    releaseInactiveWorkingSet,
+    replacePersistentDatabase,
+} from "../storage/persistentDataRuntime.svelte";
+import { workingSetResidency } from "../storage/workingSetResidency";
+import {
+    applyPluginDatabaseUpdate,
+    validatePluginDatabaseUpdate,
+} from "./pluginDatabaseAccess";
 
 export const customProviderStore = writable([] as string[])
 
@@ -436,18 +450,63 @@ export async function importPlugin(code:string|null = null, argu:{
 
 let pluginTranslator = false
 
-export const pluginCompatibility = createPluginCompatibilityController(
-    createFullCompatibilityPersistence(
+async function canReleaseWorkingSet(): Promise<boolean> {
+    const { doingChat } = await import('../process/index.svelte')
+    return !get(doingChat)
+}
+
+function scheduleWorkingSetReleaseRetry(retry: () => void): () => void {
+    let cancelled = false
+    let unsubscribe = () => undefined
+    void import('../process/index.svelte').then(({ doingChat }) => {
+        if (cancelled) return
+        if (!get(doingChat)) {
+            retry()
+            return
+        }
+        unsubscribe = doingChat.subscribe((generationActive) => {
+            if (generationActive || cancelled) return
+            queueMicrotask(() => {
+                unsubscribe()
+                unsubscribe = () => undefined
+                if (!cancelled) retry()
+            })
+        })
+    }).catch((error) => {
+        console.error(error)
+        if (!cancelled) retry()
+    })
+    return () => {
+        cancelled = true
+        unsubscribe()
+        unsubscribe = () => undefined
+    }
+}
+
+export const pluginCompatibility = createPluginCompatibilityController({
+    persistBeforeEviction: createFullCompatibilityPersistence(
         () => getDatabase({ snapshot: true }),
-        replacePersistentDatabase,
+        (database, reason) => replacePersistentDatabase(database, reason, {
+            publishOfficial: true,
+        }),
     ),
-)
+    enterMaximumCompatibility: materializeMaximumCompatibilityWorkingSet,
+    setEvictionAllowed: (allowed) => workingSetResidency.setEvictionAllowed(allowed),
+    canReleaseWorkingSet,
+    scheduleReleaseRetry: scheduleWorkingSetReleaseRetry,
+    onReleaseRetryError: (error) => console.error(error),
+    releaseAfterScalable: (isCurrent) => releaseInactiveWorkingSet(
+        canReleaseWorkingSet,
+        isCurrent,
+    ),
+})
 
 const applyPluginLoad = createPluginLoadOrchestrator<RisuPlugin>({
     controller: pluginCompatibility,
     loadV2: loadV2Plugin,
     loadV3: loadV3Plugins,
 })
+const pluginLoadReentrancy = createPluginLoadReentrancyGuard((error) => console.error(error))
 
 export async function loadPlugins() {
     console.log('Loading plugins...')
@@ -460,6 +519,10 @@ export async function loadPlugins() {
     const nextProfile = selectPluginCompatibilityProfile(plugins)
 
     await applyPluginLoad({ nextProfile, pluginV2, pluginV3 })
+}
+
+function loadPluginsFromV2(): Promise<void> {
+    return pluginLoadReentrancy.settle(loadPlugins())
 }
 
 export type PluginV2ProviderArgument = {
@@ -525,6 +588,16 @@ export const allowedDbKeys = [
     'selectedPersona',
     'characterOrder'
 ]
+
+export function applyPreparedPluginDatabaseUpdate(
+    database: Record<string, unknown>,
+    lite: boolean,
+): void {
+    const db = getDatabase()
+    applyPluginDatabaseUpdate(db, database, allowedDbKeys)
+    if (lite) DBState.db = db
+    else setDatabase(db)
+}
 
 export const getV2PluginAPIs = () => {
     return {
@@ -783,35 +856,28 @@ export const getV2PluginAPIs = () => {
             }
         },
         setDatabaseLite: (newDb: any) => {
-            const db = getDatabase();
-            db.pluginCustomStorage ??= {}
-            for (const key of Object.keys(newDb)) {
-                if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
-                }
-                else{
-                    db.pluginCustomStorage[key] = newDb[key];
-                }
-            }
-            DBState.db = db;
+            validatePluginDatabaseUpdate(newDb)
+            applyPreparedPluginDatabaseUpdate(safeStructuredClone(newDb), true)
         },
         setDatabase: async (newDb: any) => {
-            const db = getDatabase();
-            db.pluginCustomStorage ??= {}
-            for (const key of Object.keys(newDb)) {
-                if (key === 'plugins') {
-                    console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
-                    newDb[key] = await handlePluginInstallViaPlugin(newDb.plugins)
-                }
-                
-                if (allowedDbKeys.includes(key)) {
-                    (db as any)[key] = newDb[key];
-                }
-                else{
-                    db.pluginCustomStorage[key] = newDb[key];
-                }
+            validatePluginDatabaseUpdate(newDb)
+            const initialProfile = pluginCompatibility.profile
+            const initialNavigationGeneration = getPersistentNavigationGeneration()
+            const prepared = safeStructuredClone(newDb) as Record<string, unknown>
+            if (Object.prototype.hasOwnProperty.call(prepared, 'plugins')) {
+                console.warn('[WARN] Plugin attempted to access plugin directly. this would be blocked in future versions. Instead, use the provided APIs to manage plugins. Attempting to handle plugin installation via plugin for new plugins in the provided database object.')
+                prepared.plugins = await handlePluginInstallViaPlugin(prepared.plugins as RisuPlugin[])
             }
-            setDatabase(db);
+            validatePluginDatabaseUpdate(prepared)
+            if (
+                pluginCompatibility.profile !== initialProfile ||
+                getPersistentNavigationGeneration() !== initialNavigationGeneration
+            ) {
+                throw new Error(
+                    'Plugin database update became stale because compatibility or navigation state changed.',
+                )
+            }
+            applyPreparedPluginDatabaseUpdate(prepared, false)
         },
         SafeFunction: new Proxy(Function, {
             construct(target, args) {
@@ -828,7 +894,7 @@ export const getV2PluginAPIs = () => {
             }
 
         }),
-        loadPlugins: loadPlugins,
+        loadPlugins: loadPluginsFromV2,
         readImage: (path:string) => {
             if(path.startsWith('assets/')){
                 //trim assets/ prefix temporarily
@@ -853,10 +919,11 @@ export async function loadV2Plugin(
 ) {
 
     if (pluginV2.loaded) {
-        for (const unload of pluginV2.unload) {
-            await unload()
-            if (!isCurrent()) return
-        }
+        if (!await runPluginUnloadCallbacks(
+            pluginV2.unload,
+            isCurrent,
+            pluginLoadReentrancy,
+        )) return
 
         if (!isCurrent()) return
         pluginV2.providers.clear()
@@ -889,7 +956,7 @@ export async function loadV2Plugin(
 
             const policy = policyFactory.createPolicy('plugin-policy', {
                 createScript: (_input) => {
-                    return `(async () => {
+                    return createAwaitablePluginLoaderSource(`
                         const risuFetch = globalThis.__pluginApis__.risuFetch
                         const nativeFetch = globalThis.__pluginApis__.nativeFetch
                         const getArg = globalThis.__pluginApis__.getArg
@@ -920,7 +987,7 @@ export async function loadV2Plugin(
                         ` : ''}
 
                         ${data}
-                    })();`
+                    `)
                 }
             });
 
@@ -935,10 +1002,14 @@ export async function loadV2Plugin(
             console.log('Loading V2.1 Plugin', plugin.name, data)
 
             try {
-                new Function(createRealScript(data))()
+                await pluginLoadReentrancy.runEvaluation(() =>
+                    runAwaitablePluginLoader(createRealScript(data)),
+                )
             } catch (error) {
                 console.error(error)
             }
+
+            if (!isCurrent()) return
 
             console.log('Loaded V2.1 Plugin', plugin.name)
         }

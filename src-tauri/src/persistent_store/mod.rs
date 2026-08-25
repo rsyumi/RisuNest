@@ -1,5 +1,6 @@
 pub(crate) mod commands;
 mod commit;
+mod export;
 mod query;
 mod schema;
 mod snapshot;
@@ -116,6 +117,28 @@ pub(crate) struct CharacterSummary {
     pub(crate) recent_at: i64,
     pub(crate) trashed: bool,
     pub(crate) conversation_count: i64,
+    pub(crate) r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) creator_notes: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trash_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PresetSummary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) image: Option<String>,
+    pub(crate) configured_index: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PresetCatalog {
+    pub(crate) revision: i64,
+    pub(crate) items: Vec<PresetSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -214,6 +237,8 @@ pub(crate) struct WorkingSetCommit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) root: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) replace_presets: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) character: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) replace_character: Option<Value>,
@@ -279,7 +304,7 @@ impl PersistentStore {
 
         let database_path = persistent_dir.join("persistent.db");
         let mut connection = Connection::open(&database_path)?;
-        schema::initialize(&connection)?;
+        schema::initialize(&mut connection)?;
 
         let transaction = connection.transaction()?;
         transaction.execute(
@@ -295,6 +320,7 @@ impl PersistentStore {
             params!["revision-0", "{}"],
         )?;
         transaction.commit()?;
+        export::sweep_abandoned(&mut connection, &snapshots_dir)?;
         snapshot::sweep_temporary_generations(&mut connection)?;
 
         Ok(Self {
@@ -309,6 +335,18 @@ impl PersistentStore {
 
     pub(crate) fn read_root(&self, lease: Option<&str>) -> StoreResult<Versioned<Value>> {
         query::read_root(&self.connection, lease)
+    }
+
+    pub(crate) fn query_presets(&self, lease: Option<&str>) -> StoreResult<PresetCatalog> {
+        query::query_presets(&self.connection, lease)
+    }
+
+    pub(crate) fn read_preset(
+        &self,
+        id: &str,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<Versioned<Value>>> {
+        query::read_preset(&self.connection, id, lease)
     }
 
     pub(crate) fn query_characters(
@@ -368,6 +406,14 @@ impl PersistentStore {
         commit::replace_put_root(&mut self.connection, staging_id, root)
     }
 
+    pub(crate) fn replace_put_presets(
+        &mut self,
+        staging_id: &str,
+        presets: &[Value],
+    ) -> StoreResult<()> {
+        commit::replace_put_presets(&mut self.connection, staging_id, presets)
+    }
+
     pub(crate) fn replace_add_characters(
         &mut self,
         staging_id: &str,
@@ -399,6 +445,18 @@ impl PersistentStore {
 
     pub(crate) fn release_revision(&mut self, lease: &str) -> StoreResult<()> {
         snapshot::release_revision(&mut self.connection, lease)
+    }
+
+    pub(crate) fn export_risu_save(
+        &self,
+        lease: &str,
+        omit_account: bool,
+    ) -> StoreResult<export::ExportedRisuSave> {
+        export::create(&self.connection, &self.snapshots_dir, lease, omit_account)
+    }
+
+    pub(crate) fn cleanup_risu_save_export(&self, path: &Path) -> StoreResult<()> {
+        export::cleanup(&self.snapshots_dir, path)
     }
 
     pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> StoreResult<()> {
@@ -434,6 +492,12 @@ impl PersistentStore {
             "INSERT INTO app_kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, serde_json::to_string(value)?],
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn remove_app_kv(&self, key: &str) -> StoreResult<()> {
+        self.connection
+            .execute("DELETE FROM app_kv WHERE key = ?1", [key])?;
         Ok(())
     }
 }

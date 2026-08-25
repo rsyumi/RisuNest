@@ -6,6 +6,7 @@ import {
     type Database,
 } from './database.svelte'
 import { canonicalJson } from './saveCoordinator'
+import type { PersistentRoot } from './persistentDataStore'
 
 export interface DatabasePreparationOptions {
     createId?: () => string
@@ -226,4 +227,24 @@ export async function prepareDatabaseForPersistence(
     assignIds(database, options.createId)
     checkCharOrder(database)
     return database
+}
+
+export async function preparePersistentRootForWorkingSet(
+    input: PersistentRoot,
+    options: Pick<DatabasePreparationOptions, 'now'> = {},
+): Promise<PersistentRoot> {
+    const detachedRoot = JSON.parse(canonicalJson(input)) as PersistentRoot
+    const characterOrder = detachedRoot.characterOrder ?? []
+    const candidate = {
+        ...detachedRoot,
+        botPresets: [],
+        characters: [],
+    } as Database
+
+    normalizeDatabaseDefaults(candidate)
+    await checkNewFormat(candidate, { now: options.now })
+    candidate.characterOrder = characterOrder
+
+    const { characters: _characters, botPresets: _botPresets, ...root } = candidate
+    return root
 }

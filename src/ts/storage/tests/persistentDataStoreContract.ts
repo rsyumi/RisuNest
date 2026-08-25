@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import type { Database } from '../database.svelte'
 import type { PersistentDataStore } from '../persistentDataStore'
-import { RevisionConflictError } from '../persistentDataStore'
+import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
 
 export interface PersistentDataStoreHarness {
@@ -10,6 +11,69 @@ export interface PersistentDataStoreHarness {
 
 export function persistentDataStoreContract(createHarness: () => Promise<PersistentDataStoreHarness>): void {
     describe('PersistentDataStore contract', () => {
+        it('stores presets outside root and preserves configured ordering and exact values', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+
+            expect((await store.readRoot()).value).not.toHaveProperty('botPresets')
+            expect(await store.queryPresets()).toEqual({
+                revision: imported.revision,
+                items: [
+                    { id: '0', name: 'Preset Beta', image: 'preset-beta.png', configuredIndex: 0 },
+                    { id: '1', name: 'Preset Alpha', configuredIndex: 1 },
+                ],
+            })
+            expect((await store.readPreset('1'))?.value).toEqual(fixtureDatabase.botPresets[1])
+            expect(await store.readPreset('missing')).toBeNull()
+            expect((await store.materializeDatabase()).botPresets).toEqual(fixtureDatabase.botPresets)
+        })
+
+        it('atomically replaces presets with root and leaves both unchanged after stale CAS', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const root = (await store.readRoot()).value
+            const replacement = [
+                { ...fixtureDatabase.botPresets[1], name: 'Replacement' },
+            ] as Database['botPresets']
+
+            const committed = await store.commit({
+                expectedRevision: imported.revision,
+                root: { ...root, username: 'Preset commit' },
+                replacePresets: replacement,
+            })
+            expect((await store.readRoot()).value.username).toBe('Preset commit')
+            expect((await store.materializeDatabase()).botPresets).toEqual(replacement)
+
+            await expect(
+                store.commit({
+                    expectedRevision: imported.revision,
+                    root: { ...root, username: 'Stale root' },
+                    replacePresets: fixtureDatabase.botPresets,
+                }),
+            ).rejects.toBeInstanceOf(RevisionConflictError)
+            expect((await store.readRoot()).revision).toBe(committed.revision)
+            expect((await store.readRoot()).value.username).toBe('Preset commit')
+            expect((await store.materializeDatabase()).botPresets).toEqual(replacement)
+        })
+
+        it('isolates preset reads through a revision lease and rejects them after release', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const lease = await store.acquireRevision(imported.revision)
+            await store.commit({
+                expectedRevision: imported.revision,
+                replacePresets: [{ ...fixtureDatabase.botPresets[0], name: 'New active preset' }],
+            })
+
+            expect((await lease.queryPresets()).items.map((item) => item.name)).toEqual([
+                'Preset Beta',
+                'Preset Alpha',
+            ])
+            expect((await lease.readPreset('0'))?.value.name).toBe('Preset Beta')
+            await lease.release()
+            await expect(lease.queryPresets()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        })
+
         it('queries the character catalog without hydrating conversations', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(fixtureDatabase)
@@ -28,6 +92,12 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     (item) => item.id,
                 ),
             ).toEqual(['char-a', 'char-b'])
+            expect(
+                (await store.queryCharacters({ order: 'configured', trash: false, limit: 2 })).items[0],
+            ).toMatchObject({ type: 'character', creatorNotes: '' })
+            expect(
+                (await store.queryCharacters({ order: 'configured', trash: true, limit: 10 })).items[0],
+            ).toMatchObject({ type: 'character', creatorNotes: '', trashTime: 350 })
             expect(
                 (
                     await store.queryCharacters({

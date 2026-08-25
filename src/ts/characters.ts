@@ -13,9 +13,21 @@ import { translateHTML } from "./translator/translator";
 import { doingChat } from "./process/index.svelte";
 import { importCharacter } from "./characterCards";
 import { PngChunk } from "./pngChunk";
-import { getColdStorageItem } from "./process/coldstorage.svelte";
-import { activateCharacter, commitCharacterAddition, markPersistentDataDirty, replacePersistentDatabase } from "./storage/persistentDataRuntime.svelte";
+import {
+    activateCharacter,
+    commitCharacterAddition,
+    deactivateActiveWorkingSet,
+    getPersistentNavigationGeneration,
+    invalidatePersistentNavigation,
+    materializePersistentDatabaseSnapshotWithRevision,
+    markPersistentDataDirty,
+    mutatePersistentCharacterDetail,
+    reconcilePersistentActiveCharacterIds,
+    replacePersistentDatabase,
+} from "./storage/persistentDataRuntime.svelte";
 import type { groupChat } from "./storage/database.svelte";
+import { removeCharacterIdFromOrder } from './storage/characterOrderMutation'
+import { restoreColdPersistentCharacter } from './process/coldCharacterRestore'
 
 export async function commitDetachedCharacter(
     character: character | groupChat,
@@ -844,18 +856,134 @@ export async function removeChar(identifier:string|number,name:string, type:'nor
             return
         }
     }
-    const candidate = getDatabase({ snapshot: true })
-    const index = candidate.characters.findIndex((character) => character.chaId === targetId)
-    if (index === -1) return
-    if(type === 'normal'){
-        candidate.characters[index].trashTime = Date.now()
+    const selected = liveDatabase.characters[get(selectedCharID)]
+    const targetTrashTime = liveDatabase.characters.find(
+        (character) => character.chaId === targetId,
+    )?.trashTime
+    const selectedCharacterId = selected?.chaId ?? null
+    if (!await deactivateActiveWorkingSet()) return
+    const deactivatedGeneration = getPersistentNavigationGeneration()
+    const restoreSelectionAfterFailedMutation = async () => {
+        const currentSelectedId = DBState.db.characters[get(selectedCharID)]?.chaId ?? null
+        if (
+            !selectedCharacterId ||
+            currentSelectedId !== selectedCharacterId ||
+            getPersistentNavigationGeneration() !== deactivatedGeneration
+        ) return
+        const beforeActivationGeneration = getPersistentNavigationGeneration()
+        let restored = false
+        try {
+            restored = await activateCharacter(selectedCharacterId)
+        } catch {
+            restored = false
+        }
+        if (restored) return
+        const afterActivationGeneration = getPersistentNavigationGeneration()
+        const selectedAfterFailure = DBState.db.characters[get(selectedCharID)]?.chaId ?? null
+        if (
+            selectedAfterFailure === selectedCharacterId &&
+            (
+                afterActivationGeneration === beforeActivationGeneration ||
+                afterActivationGeneration === beforeActivationGeneration + 1
+            )
+        ) {
+            selectedCharID.set(-1)
+            reconcilePersistentActiveCharacterIds(DBState.db, null)
+        }
     }
-    else{
-        candidate.characters.splice(index, 1)
+    const clearSelectionAfterCommittedReplacement = async () => {
+        const currentSelectedId = DBState.db.characters[get(selectedCharID)]?.chaId ?? null
+        if (
+            getPersistentNavigationGeneration() !== deactivatedGeneration ||
+            (currentSelectedId !== selectedCharacterId && currentSelectedId !== null)
+        ) return
+        if (!await deactivateActiveWorkingSet()) return
+        selectedCharID.set(-1)
+        reconcilePersistentActiveCharacterIds(DBState.db, null)
     }
-    checkCharOrder(candidate)
-    await replacePersistentDatabase(candidate, 'character-removal')
-    selectedCharID.set(-1)
+    const clearSelectionAfterCommittedDetail = () => {
+        const currentSelectedId = DBState.db.characters[get(selectedCharID)]?.chaId ?? null
+        if (
+            getPersistentNavigationGeneration() !== deactivatedGeneration ||
+            (currentSelectedId !== selectedCharacterId && currentSelectedId !== null)
+        ) return
+        selectedCharID.set(-1)
+        reconcilePersistentActiveCharacterIds(DBState.db, null)
+    }
+    const pruneGroupMember = (group: groupChat) => {
+        const retainedIndices = group.characters
+            .map((id, index) => ({ id, index }))
+            .filter(({ id }) => id !== targetId)
+        group.characters = retainedIndices.map(({ id }) => id)
+        group.characterTalks = retainedIndices.map(
+            ({ index }) => group.characterTalks?.[index] ?? 1 / 6 * 4,
+        )
+        group.characterActive = retainedIndices.map(
+            ({ index }) => group.characterActive?.[index] ?? true,
+        )
+    }
+    let changed = false
+    try {
+        if (type === 'normal') {
+            changed = await mutatePersistentCharacterDetail(
+                targetId,
+                'character-removal',
+                ({ root, character }) => {
+                    removeCharacterIdFromOrder(root, targetId)
+                    character.trashTime = Date.now()
+                },
+            )
+        } else {
+            const snapshot = await materializePersistentDatabaseSnapshotWithRevision(
+                'materialize-character-removal',
+            )
+            const targetIndex = snapshot.database.characters.findIndex(
+                (character) => character.chaId === targetId,
+            )
+            if (targetIndex >= 0) {
+                snapshot.database.characters.splice(targetIndex, 1)
+                removeCharacterIdFromOrder(snapshot.database, targetId)
+                for (const character of snapshot.database.characters) {
+                    if (character.type === 'group') pruneGroupMember(character)
+                }
+                await replacePersistentDatabase(snapshot.database, 'character-removal', {
+                    authoritative: true,
+                    expectedRevision: snapshot.revision,
+                    expectedMutationGeneration: snapshot.mutationGeneration,
+                    publishOfficial: true,
+                })
+                changed = true
+            }
+        }
+    } catch (error) {
+        const locallyCommitted = type !== 'normal' && !DBState.db.characters.some(
+            (character) => character.chaId === targetId,
+        )
+        const locallyTrashed = type === 'normal' && DBState.db.characters.some(
+            (character) => (
+                character.chaId === targetId &&
+                character.trashTime !== undefined &&
+                character.trashTime !== targetTrashTime
+            ),
+        )
+        if (locallyCommitted) {
+            await clearSelectionAfterCommittedReplacement().catch(() => false)
+        } else if (locallyTrashed) {
+            clearSelectionAfterCommittedDetail()
+        } else {
+            await restoreSelectionAfterFailedMutation().catch(() => false)
+        }
+        throw error
+    }
+    if (!changed) {
+        await restoreSelectionAfterFailedMutation()
+        return
+    }
+    if (type !== 'normal') {
+        await clearSelectionAfterCommittedReplacement()
+    } else {
+        clearSelectionAfterCommittedDetail()
+    }
 }
 
 export async function addCharacter(arg:{
@@ -867,6 +995,7 @@ export async function addCharacter(arg:{
     try {
         const r = await alertAddCharacter()
         if(r === 'importFromRealm'){
+            if (!await deactivateActiveWorkingSet()) return
             selectedCharID.set(-1)
             OpenRealmStore.set(true)
             finalStack = 0
@@ -909,24 +1038,36 @@ export async function changeChar(index: number, arg:{
     }
     const chaId = DBState.db.characters?.[index]?.chaId
     if(!chaId) return false
+    invalidatePersistentNavigation()
+    const restoreNavigationGeneration = getPersistentNavigationGeneration()
+    const isRestoreCurrent = () =>
+        getPersistentNavigationGeneration() === restoreNavigationGeneration
     reseter();
     try {
-        const coldStorageKey = DBState.db.characters.find((character) => character.chaId === chaId)?.coldstorage
-        const activationOptions = coldStorageKey ? {
-            async prepare() {
-                const coldData = await getColdStorageItem(coldStorageKey)
-                if(!coldData?.character || coldData.character.chaId !== chaId){
-                    throw new Error(language.errors.coldStorageRestoreFailed)
-                }
-                const candidate = getDatabase({ snapshot: true })
-                const candidateIndex = candidate.characters.findIndex((character) => character.chaId === chaId)
-                if(candidateIndex === -1) return null
-                candidate.characters[candidateIndex] = coldData.character
-                return { database: candidate, reason: 'cold-character-restore' }
-            },
-        } : undefined
-        const activated = await activateCharacter(chaId, activationOptions)
-            || await activateCharacter(chaId, activationOptions)
+        const restoreColdCharacter = async (characterId: string) => {
+            return restoreColdPersistentCharacter(
+                characterId,
+                {
+                    errorMessage: language.errors.coldStorageRestoreFailed,
+                    isCurrent: isRestoreCurrent,
+                },
+            )
+        }
+        const detail = await restoreColdCharacter(chaId)
+        if (!isRestoreCurrent()) return false
+        if (detail?.type === 'group') {
+            for (const memberId of new Set(detail.characters as string[])) {
+                if (memberId !== chaId) await restoreColdCharacter(memberId)
+                if (!isRestoreCurrent()) return false
+            }
+        }
+        if (!isRestoreCurrent()) return false
+        const expectedNavigationGeneration = restoreNavigationGeneration + 1
+        let activated = await activateCharacter(chaId, undefined)
+        if (!activated) {
+            if (getPersistentNavigationGeneration() !== expectedNavigationGeneration) return false
+            activated = await activateCharacter(chaId, undefined)
+        }
         if(!activated) return false
         const selectedIndex = DBState.db.characters.findIndex((character) => character.chaId === chaId)
         if(selectedIndex === -1) return false

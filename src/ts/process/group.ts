@@ -3,10 +3,55 @@ import { findCharacterbyId } from "../util";
 import { alertConfirm, alertError, alertSelectChar } from "../alert";
 import { language } from "src/lang";
 import { get } from "svelte/store";
-import { getDatabase, setDatabase } from "../storage/database.svelte";
 import { DBState, selectedCharID } from "../stores.svelte";
+import {
+    activateCharacter,
+    flushPendingData,
+    getPersistentNavigationGeneration,
+    markPersistentDataDirty,
+    reconcilePersistentActiveCharacterIds,
+} from "../storage/persistentDataRuntime.svelte";
+import { restoreColdPersistentCharacter } from './coldCharacterRestore'
+import { doingChat } from './generationState'
 
-export async function addGroupChar(){
+function markGroupDirty(group: unknown) {
+    markPersistentDataDirty(new TextEncoder().encode(JSON.stringify(group)).byteLength)
+}
+
+function isSelectedGroup(groupId: string): boolean {
+    const selected = DBState.db.characters[get(selectedCharID)]
+    return selected?.type === 'group' && selected.chaId === groupId
+}
+
+async function activateSelectedGroup(groupId: string): Promise<'activated' | 'failed' | 'superseded'> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        if (!isSelectedGroup(groupId)) return 'superseded'
+        const expectedGeneration = getPersistentNavigationGeneration() + 1
+        let activated = false
+        try {
+            activated = await activateCharacter(groupId)
+        } catch {
+            activated = false
+        }
+        if (activated) return 'activated'
+        const actualGeneration = getPersistentNavigationGeneration()
+        if (
+            !isSelectedGroup(groupId) ||
+            (
+                actualGeneration !== expectedGeneration &&
+                actualGeneration !== expectedGeneration - 1
+            )
+        ) return 'superseded'
+    }
+    return 'failed'
+}
+
+async function settleGroupRollback(groupId: string): Promise<void> {
+    await flushPendingData('group-membership-rollback')
+    reconcilePersistentActiveCharacterIds(DBState.db, groupId)
+}
+
+export async function addGroupChar(): Promise<boolean> {
     let selectedId = get(selectedCharID)
     let group = DBState.db.characters[selectedId]
     if(group.type === 'group'){
@@ -14,33 +59,102 @@ export async function addGroupChar(){
         if(res){
             if(group.characters.includes(res)){
                 alertError(language.errors.alreadyCharInGroup)
+                return false
             }
             else{
-                if(await alertConfirm(language.askLoadFirstMsg)){
-                    group.chats[group.chatPage].message.push({
-                        role:'char',
-                        data: findCharacterbyId(res).firstMessage,
-                        saying: res,
-                    })
-                }
-
+                const loadFirstMessage = await alertConfirm(language.askLoadFirstMsg)
+                const groupId = group.chaId
+                const navigationGeneration = getPersistentNavigationGeneration()
+                const member = await restoreColdPersistentCharacter(res, {
+                    errorMessage: language.errors.coldStorageRestoreFailed,
+                    isCurrent: () => (
+                        getPersistentNavigationGeneration() === navigationGeneration &&
+                        isSelectedGroup(groupId)
+                    ),
+                })
+                if (!member || !isSelectedGroup(groupId)) return false
+                if (get(doingChat)) return false
+                selectedId = get(selectedCharID)
+                group = DBState.db.characters[selectedId]
+                if (group?.type !== 'group' || group.chaId !== groupId) return false
+                if (group.characters.includes(res)) return false
                 group.characters.push(res)
                 group.characterTalks.push(1 / 6 * 4)
                 group.characterActive.push(true)
+                let addedMessageIndex = -1
+                let addedMessageChatId: string | undefined
+                if(loadFirstMessage){
+                    const message = {
+                        role:'char',
+                        data: member?.firstMessage ?? '',
+                        saying: res,
+                    } as const
+                    const chat = group.chats[group.chatPage]
+                    addedMessageIndex = chat.message.length
+                    addedMessageChatId = chat.id
+                    chat.message.push(message)
+                }
+                markGroupDirty(group)
+                const activation = await activateSelectedGroup(groupId)
+                if (activation === 'activated') return true
+                if (activation === 'superseded') return false
+                group = DBState.db.characters.find((character) => character.chaId === groupId)
+                if (!group || group.type !== 'group') return false
+                const memberIndex = group.characters.indexOf(res)
+                if (memberIndex >= 0) {
+                    group.characters.splice(memberIndex, 1)
+                    group.characterTalks.splice(memberIndex, 1)
+                    group.characterActive.splice(memberIndex, 1)
+                }
+                if (loadFirstMessage) {
+                    const chat = group.chats.find((candidate) => candidate.id === addedMessageChatId)
+                        ?? group.chats[group.chatPage]
+                    const message = chat?.message[addedMessageIndex]
+                    if (
+                        message?.saying === res &&
+                        message.data === (member.firstMessage ?? '')
+                    ) chat.message.splice(addedMessageIndex, 1)
+                }
+                markGroupDirty(group)
+                await settleGroupRollback(groupId)
+                return false
             }
         }
     }
+    return false
 }
 
 
-export function rmCharFromGroup(index:number){
+export async function rmCharFromGroup(index:number): Promise<boolean> {
     let selectedId = get(selectedCharID)
     let group = DBState.db.characters[selectedId]
     if(group.type === 'group'){
+        if (get(doingChat)) return false
+        if (index < 0 || index >= group.characters.length) return false
+        const groupId = group.chaId
+        const removedCharacter = group.characters[index]
+        const removedTalkness = group.characterTalks[index]
+        const removedActive = group.characterActive[index]
         group.characters.splice(index, 1)
         group.characterTalks.splice(index, 1)
         group.characterActive.splice(index, 1)
+        markGroupDirty(group)
+        const activation = await activateSelectedGroup(groupId)
+        if (activation === 'activated') return true
+        if (activation === 'superseded') return false
+        group = DBState.db.characters.find((character) => character.chaId === groupId)
+        if (!group || group.type !== 'group') return false
+        if (!group.characters.includes(removedCharacter)) {
+            const restoredIndex = Math.min(index, group.characters.length)
+            group.characters.splice(restoredIndex, 0, removedCharacter)
+            group.characterTalks.splice(restoredIndex, 0, removedTalkness)
+            group.characterActive.splice(restoredIndex, 0, removedActive)
+        }
+        markGroupDirty(group)
+        await settleGroupRollback(groupId)
+        return false
     }
+    return false
 }
 
 export type GroupOrder = {

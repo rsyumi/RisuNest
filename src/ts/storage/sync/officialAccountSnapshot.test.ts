@@ -249,6 +249,45 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(harness.markPublished).toHaveBeenCalledWith(harness.imported.revision)
     })
 
+    it('retries lease cleanup after a transient release failure without republishing', async () => {
+        const harness = await makeHarness()
+        const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        const lease = await acquireRevision.mock.results[0].value
+        const releaseLease = lease.release.bind(lease)
+        const release = vi.spyOn(lease, 'release')
+            .mockRejectedValueOnce(new Error('release unavailable'))
+            .mockImplementation(releaseLease)
+
+        await expect(publication.publish()).rejects.toThrow('release unavailable')
+        const databaseWrites = () => harness.writeItem.mock.calls
+            .filter(([key]) => key === databaseKey).length
+        expect(databaseWrites()).toBe(1)
+
+        await expect(publication.publish()).resolves.toBeUndefined()
+
+        expect(release).toHaveBeenCalledTimes(2)
+        expect(databaseWrites()).toBe(1)
+        expect(harness.markPublished).toHaveBeenCalledTimes(1)
+    })
+
+    it('retries dispose after a transient release failure', async () => {
+        const harness = await makeHarness()
+        const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        const lease = await acquireRevision.mock.results[0].value
+        const releaseLease = lease.release.bind(lease)
+        const release = vi.spyOn(lease, 'release')
+            .mockRejectedValueOnce(new Error('release unavailable'))
+            .mockImplementation(releaseLease)
+
+        await expect(publication.dispose()).rejects.toThrow('release unavailable')
+        await expect(publication.dispose()).resolves.toBeUndefined()
+
+        expect(release).toHaveBeenCalledTimes(2)
+        await expect(publication.publish()).rejects.toThrow('disposed')
+    })
+
     it('publishes sorted assets, then sorted cold payloads, then the projected database', async () => {
         const harness = await makeHarness()
         const publication = await harness.adapter.pin(harness.imported.revision)
@@ -552,6 +591,27 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(harness.writeItem).not.toHaveBeenCalled()
     })
 
+    it('preserves the pin error when lease cleanup also fails', async () => {
+        const harness = await makeHarness({ localCold: new Map() })
+        harness.cold.readRemote.mockRejectedValue(new Error('cold offline'))
+        const acquireLease = harness.store.acquireRevision.bind(harness.store)
+        const release = vi.fn(async () => {
+            throw new Error('release unavailable')
+        })
+        vi.spyOn(harness.store, 'acquireRevision').mockImplementation(async (revision) => {
+            const lease = await acquireLease(revision)
+            lease.release = release
+            return lease
+        })
+
+        await expect(harness.adapter.pin(harness.imported.revision)).rejects.toThrow(
+            'cold offline',
+        )
+
+        expect(release).toHaveBeenCalledOnce()
+        expect(harness.writeItem).not.toHaveBeenCalled()
+    })
+
     it('keeps auth warnings as failed publications and dispose is idempotent', async () => {
         const harness = await makeHarness()
         const publication = await harness.adapter.pin(harness.imported.revision)
@@ -801,6 +861,20 @@ describe('OfficialAccountSnapshotAdapter pull', () => {
 
 describe('OfficialAccountSnapshotAdapter persisted association', () => {
     const accountId = 'assoc-account'
+
+    it('reloads the keyed durable association when the active account changes', async () => {
+        const association: OfficialAssociationMarkers = {
+            load: vi.fn(() => null),
+            save: vi.fn(),
+        }
+        const harness = await makeHarness({ accountId, association })
+
+        harness.adapter.resetAccountAssociation(accountId)
+        harness.adapter.resetAccountAssociation('other-account')
+
+        expect(association.load).toHaveBeenNthCalledWith(1, accountId)
+        expect(association.load).toHaveBeenNthCalledWith(2, 'other-account')
+    })
 
     async function publishHarness(options: HarnessOptions = {}) {
         const association = options.association

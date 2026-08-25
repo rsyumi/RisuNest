@@ -20,29 +20,61 @@
         restartNativeApp,
         restoreNativePersistentSnapshot,
     } from "src/ts/storage/nativePersistentMaintenance";
+    import { getNativeOfficialAccountFlow } from "src/ts/storage/sync/nativeOfficialAccountFlow";
+    import {
+        createHubPopupController,
+        isExpectedHubMessage,
+        resolveExpectedOfficialAccountMessageUrl,
+    } from "src/ts/storage/officialAccountMessage";
+    import { onDestroy } from "svelte";
     let openIframe = $state(false)
     let openIframeURL = $state('')
-    let popup:Window = null
+    const drivePopup = createHubPopupController()
+    let accountIframe = $state<HTMLIFrameElement>()
+    let nativeAccountBusy = $state(false)
+
+    async function runNativeAccountOperation<T>(operation: () => Promise<T>): Promise<T | undefined> {
+        if (nativeAccountBusy) return undefined
+        nativeAccountBusy = true
+        try {
+            return await operation()
+        } finally {
+            nativeAccountBusy = false
+        }
+    }
+
+    onDestroy(() => drivePopup.close())
 </script>
 
 <svelte:window onmessage={async (e) => {
-    if(e.origin.startsWith("https://nightly.sv.risuai.xyz") || e.origin.startsWith("https://sv.risuai.xyz") || e.origin.startsWith("http://127.0.0.1") || e.origin === window.location.origin){
-        if(e.data.msg?.type === 'drive'){
-            await loadRisuAccountData()
-            DBState.db.account.data.refresh_token = e.data.msg.data.refresh_token
-            DBState.db.account.data.access_token = e.data.msg.data.access_token
-            DBState.db.account.data.expires_in = (e.data.msg.data.expires_in * 700) + Date.now()
-            await saveRisuAccountData()
-            popup.close()
+    const message = e.data?.msg
+    const expectedUrl = resolveExpectedOfficialAccountMessageUrl(
+        message?.type,
+        hubURL,
+        openIframeURL,
+    )
+    const expectedSource = message?.type === 'drive'
+        ? drivePopup.source
+        : accountIframe?.contentWindow
+    if(!isExpectedHubMessage(e, expectedUrl, expectedSource)) return
+    if(message?.type === 'drive'){
+        if(!isTauri) await loadRisuAccountData()
+        DBState.db.account.data.refresh_token = message.data.refresh_token
+        DBState.db.account.data.access_token = message.data.access_token
+        DBState.db.account.data.expires_in = (message.data.expires_in * 700) + Date.now()
+        if(!isTauri) await saveRisuAccountData()
+        drivePopup.close()
+    }
+    else if(message?.data.vaild){
+        openIframe = false
+        const credential = {
+            id: message.id,
+            token: message.token,
+            data: message.data
         }
-        else if(e.data.msg?.data.vaild){
-            openIframe = false
-            DBState.db.account = {
-                id: e.data.msg.id,
-                token: e.data.msg.token,
-                data: e.data.msg.data
-            }
-        }
+        DBState.db.account = isTauri
+            ? await getNativeOfficialAccountFlow().login(credential)
+            : credential
     }
 }}></svelte:window>
 
@@ -180,11 +212,14 @@
 <div class="bg-darkbg p-3 rounded-md mb-2 flex flex-col items-start mt-2">
     <div class="w-full">
         <h1 class="text-3xl font-black min-w-0">Risu Account{#if DBState.db.account}
-            <button class="bg-selected p-1 text-sm font-light rounded-md hover:bg-blue-500 transition-colors float-right" onclick={async () => {
-                if(DBState.db.account.useSync || forageStorage.isAccount){
+            <button disabled={isTauri && nativeAccountBusy} class="bg-selected p-1 text-sm font-light rounded-md hover:bg-blue-500 transition-colors float-right" onclick={async () => {
+                if(isTauri){
+                    if(nativeAccountBusy) return
+                    await runNativeAccountOperation(() => getNativeOfficialAccountFlow().logout())
+                }
+                else if(DBState.db.account.useSync || forageStorage.isAccount){
                     unMigrationAccount()
                 }
-                
                 DBState.db.account = undefined
             }}>{language.logout}</button>
                 {#if import.meta.env.DEV}
@@ -200,7 +235,54 @@
     </div>
     {#if DBState.db.account}
         <span class="mb-4 text-textcolor2">ID: {DBState.db.account.id}</span>
+        {#if isTauri}
+            <Button
+                disabled={nativeAccountBusy}
+                onclick={async () => {
+                    await runNativeAccountOperation(async () => {
+                        if(!await alertConfirm('Replace local data with the official account backup?')) return
+                        if(!await alertConfirm('Official snapshots do not include separate inlay payloads. Referenced image, audio, video, and signature inlays may not be restored. The app will restart after restoring the official account backup. Continue?')) return
+                        try {
+                            const result = await getNativeOfficialAccountFlow().restore()
+                            if(result.kind === 'missing') {
+                                alertNormal('No official account backup was found. Local data was not changed.')
+                            }
+                        } catch (error) {
+                            alertError(error instanceof Error ? error : String(error))
+                        }
+                    })
+                }} className="mt-2">
+                Restore official account backup
+            </Button>
+            <Button
+                disabled={nativeAccountBusy}
+                onclick={async () => {
+                    await runNativeAccountOperation(async () => {
+                        if(!await alertConfirm('Overwrite the official account backup with current local data?')) return
+                        try {
+                            await getNativeOfficialAccountFlow().publish()
+                            alertNormal('Official account backup published.')
+                        } catch (error) {
+                            alertError(error instanceof Error ? error : String(error))
+                        }
+                    })
+                }} className="mt-2">
+                Publish official account backup
+            </Button>
+        {/if}
         {#if !isTauri}
+            <h1 class="text-xl font-bold mt-2">{language.googleDriveConnection}</h1>
+            {#if !DBState.db.account.data.refresh_token}
+                <span class="text-sm font-light mb-2 text-textcolor2">{language.googleDriveInfo}</span>
+                <button class="bg-selected p-2 rounded-md hover:bg-blue-500 transition-colors" onclick={async () => {
+                    const authorizationUrl = await checkDriver('reftoken')
+                    if(typeof authorizationUrl === 'string') drivePopup.open(authorizationUrl)
+                }}>
+                    Connect to Google Drive
+                </button>
+            {:else}
+                <span class="text-sm font-light mb-2 text-textcolor2">{language.googleDriveConnected}</span>
+            {/if}
             <div class="flex items-center mt-2">
                 {#if DBState.db.account.useSync || forageStorage.isAccount}
                     <Check check={true} name={language.SaveDataInAccount} onChange={(v) => {
@@ -231,7 +313,7 @@
 </div>
 {#if openIframe}
     <div class="fixed top-0 left-0 bg-black/50 w-full h-full flex justify-center items-center">
-        <iframe src={openIframeURL} title="login" class="w-full h-full">
+        <iframe bind:this={accountIframe} src={openIframeURL} title="login" class="w-full h-full">
         </iframe>
     </div>
 {/if}

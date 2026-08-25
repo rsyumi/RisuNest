@@ -1,12 +1,14 @@
 import { language } from 'src/lang'
 import { alertConfirm, alertError, alertNormal, alertSelect } from '../../alert'
-import { getDatabase, type Database } from '../database.svelte'
+import type { Database } from '../database.svelte'
 import { installLocalBackup } from '../databaseRestore'
 import {
+    getPersistentDataRuntime,
     publishCurrentOfficialRevision,
     replacePersistentDatabase,
 } from '../persistentDataRuntime.svelte'
-import { decodeRisuSave, encodeRisuSaveLegacy } from '../risuSave'
+import { decodeRisuSave } from '../risuSave'
+import { withFlushedRisuSaveExport } from '../risuSaveStoreAdapter'
 import {
     getSyncConflictBackupStore,
     type SyncConflictBackupEntry,
@@ -16,10 +18,11 @@ function entryLabel(entry: SyncConflictBackupEntry): string {
     const side = entry.side === 'local'
         ? language.syncBackupSideLocal
         : language.syncBackupSideRemote
-    return language.syncBackupEntry
+    const label = language.syncBackupEntry
         .replace('{date}', new Date(entry.createdAt).toLocaleString())
         .replace('{side}', side)
         .replace('{count}', `${entry.characterCount}`)
+    return `${label} / ${language.syncBackupDatabaseOnly}`
 }
 
 export async function openSyncConflictBackups(): Promise<void> {
@@ -43,14 +46,27 @@ export async function openSyncConflictBackups(): Promise<void> {
         alertError('Invalid sync conflict backup')
         return
     }
-    const current = getDatabase()
+    const current = await withFlushedRisuSaveExport(
+        getPersistentDataRuntime(),
+        'sync-conflict-restore-safety-backup',
+        async (pinned) => ({
+            revision: pinned.revision,
+            mutationGeneration: pinned.mutationGeneration,
+            bytes: await pinned.collectBytes(),
+            characterCount: await pinned.countCharacters(),
+        }),
+    )
     await store.save({
         side: 'local',
-        bytes: encodeRisuSaveLegacy(current, 'compression'),
-        characterCount: current.characters?.length ?? 0,
+        bytes: current.bytes,
+        characterCount: current.characterCount,
     })
     await installLocalBackup(decoded, {
-        replaceDatabase: replacePersistentDatabase,
+        replaceDatabase: (database, reason) => replacePersistentDatabase(database, reason, {
+            authoritative: true,
+            expectedRevision: current.revision,
+            expectedMutationGeneration: current.mutationGeneration,
+        }),
         publishAcceptedRevision: publishCurrentOfficialRevision,
         relaunch: () => location.reload(),
     })

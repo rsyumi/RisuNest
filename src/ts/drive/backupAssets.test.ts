@@ -3,6 +3,8 @@ import type { BlobStore } from '../storage/blobStore'
 import { configureOfficialAccountAssetReader } from '../storage/accountAssetAccess'
 import {
     collectBackupAssetKeys,
+    collectPinnedBackupAssetReferences,
+    collectReferencedBackupInlays,
     decodeBackupInlayEntry,
     encodeBackupInlayEntry,
     getBackupInlayName,
@@ -106,9 +108,57 @@ describe('backup inlay entries', () => {
             expect(decodeBackupInlayEntry(name, forged)).toBeNull()
         }
     })
+
+    test('keeps only inlays referenced by the pinned logical snapshot', async () => {
+        const referenced = { chats: [{ data: '{{inlayed::pinned-id}}' }] }
+        const list = vi.fn(async () => [
+            { ...metadata, key: 'pinned-id' },
+            { ...metadata, key: 'created-after-pin' },
+        ])
+        const store = { list } as unknown as BlobStore
+
+        await expect(collectReferencedBackupInlays(store, referenced)).resolves.toEqual([
+            { ...metadata, key: 'pinned-id' },
+        ])
+    })
 })
 
 describe('account backup asset I/O', () => {
+    test('derives asset references from one database and cold-payload snapshot', () => {
+        const database = {
+            customBackground: 'assets/root.png',
+            characters: [{
+                chaId: 'cold-char', type: 'character', image: 'assets/stub.png', chats: [],
+            }],
+        }
+        const coldPayloads = [{
+            character: {
+                chaId: 'cold-char', type: 'character', image: 'assets/cold.png', chats: [],
+                additionalAssets: [['prop', 'assets/cold-prop.png', 'png']],
+            },
+        }]
+
+        expect(collectPinnedBackupAssetReferences(
+            database as never,
+            coldPayloads,
+        )).toEqual([
+            'assets/cold-prop.png',
+            'assets/cold.png',
+            'assets/root.png',
+        ])
+    })
+
+    test('does not add unreferenced live BlobStore payloads to a pinned backup', async () => {
+        const list = vi.fn(async () => [
+            { key: 'assets/local.png', kind: 'asset' },
+            { key: 'sync-conflict-backups/backup-id.risudat', kind: 'asset' },
+        ])
+        const store = { list } as unknown as BlobStore
+
+        await expect(collectBackupAssetKeys(store, [])).resolves.toEqual([])
+        expect(list).not.toHaveBeenCalled()
+    })
+
     test('combines active-root assets with remote-only database references', async () => {
         const localBytes = new Uint8Array([1])
         const read = vi.fn(async (key: string) => key === 'assets/local.png' ? localBytes : null)
@@ -130,6 +180,22 @@ describe('account backup asset I/O', () => {
         )
         expect(readRemote).toHaveBeenCalledOnce()
         expect(readRemote).toHaveBeenCalledWith('assets/remote.png')
+    })
+
+    test('keeps pinned references stable when a live orphan appears after pinning', async () => {
+        const list = vi.fn(async () => [
+            { key: 'assets/pinned.png', kind: 'asset' },
+            { key: 'assets/created-after-pin.png', kind: 'asset' },
+        ])
+        const store = { list } as unknown as BlobStore
+
+        const keys = await collectBackupAssetKeys(store, [
+            'assets/pinned.png',
+            'assets/remote-only.png',
+        ])
+
+        expect(keys).toEqual(['assets/pinned.png', 'assets/remote-only.png'])
+        expect(list).not.toHaveBeenCalled()
     })
 
     test('restores through BlobStore metadata on a Tauri-shaped backend', async () => {

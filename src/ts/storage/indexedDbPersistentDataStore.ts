@@ -1,4 +1,4 @@
-import type { Chat, Database, Message } from './database.svelte'
+import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
     CharacterDetail,
     CharacterPage,
@@ -13,17 +13,20 @@ import type {
     DataRevision,
     PersistentDataStore,
     PersistentRevisionLease,
+    PersistentRoot,
+    PresetCatalog,
+    PresetSummary,
     Versioned,
     WorkingSetCommit,
 } from './persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
 
-const DATABASE_VERSION = 3
+const DATABASE_VERSION = 4
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
-const STORE_NAMES = ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
-const DATA_STORE_NAMES = ['root', 'catalog', 'characters', 'conversations', 'messagePages'] as const
+const STORE_NAMES = ['meta', 'root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const
+const DATA_STORE_NAMES = ['root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const
 const activeSnapshotGenerations = new Set<string>()
 
 interface StoredRecord<T> {
@@ -41,6 +44,11 @@ interface StoredMessagePage extends StoredRecord<Message[]> {
 interface StoredConversation {
     summary: ConversationSummary
     detail: Omit<Chat, 'message'>
+}
+
+interface StoredPreset {
+    summary: PresetSummary
+    preset: botPreset
 }
 
 export type PersistentGenerationCleanupErrorHandler = (
@@ -148,6 +156,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             const transaction = request.transaction!
             this.createIndex(
+                transaction.objectStore('presets'),
+                'byGenerationConfigured',
+                ['generation', 'configuredIndex'],
+            )
+            this.createIndex(transaction.objectStore('presets'), 'byGeneration', 'generation')
+            this.createIndex(
                 transaction.objectStore('catalog'),
                 'byGenerationConfigured',
                 ['generation', 'configuredIndex'],
@@ -181,14 +195,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 ['generation', 'characterId'],
             )
             this.createIndex(transaction.objectStore('messagePages'), 'byGeneration', 'generation')
-            this.backfillOrderKeys<CharacterSummary>(
-                transaction.objectStore('catalog'),
-                (record) => record.value,
-            )
+            this.backfillCharacterSummaries(transaction)
             this.backfillOrderKeys<StoredConversation>(
                 transaction.objectStore('conversations'),
                 (record) => record.value.summary,
             )
+            this.migratePresetRows(transaction)
         }
         this.database = await requestResult(request)
         this.database.onversionchange = () => {
@@ -210,11 +222,23 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         await this.sweepTemporaryGenerations()
     }
 
-    async readRoot(): Promise<Versioned<Omit<Database, 'characters'>>> {
+    async readRoot(): Promise<Versioned<PersistentRoot>> {
         const transaction = this.requireDatabase().transaction(['meta', 'root'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
         const record = await this.readRootRecordFromTransaction(transaction, generation)
-        return { revision, value: record?.value ?? ({} as Omit<Database, 'characters'>) }
+        return { revision, value: record?.value ?? ({} as PersistentRoot) }
+    }
+
+    async queryPresets(): Promise<PresetCatalog> {
+        const transaction = this.requireDatabase().transaction(['meta', 'presets'], 'readonly')
+        const { revision, generation } = await this.readActive(transaction)
+        return this.queryPresetsFromTransaction(transaction, revision, generation)
+    }
+
+    async readPreset(id: string): Promise<Versioned<botPreset> | null> {
+        const transaction = this.requireDatabase().transaction(['meta', 'presets'], 'readonly')
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readPresetFromTransaction(transaction, revision, generation, id)
     }
 
     async queryCharacters(input: CharacterQuery): Promise<CharacterPage> {
@@ -282,6 +306,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const revision = active.revision + 1
             const generation = active.generation
             if (input.root) this.putRoot(transaction, generation, input.root)
+            if (input.replacePresets) await this.putPresets(transaction, generation, input.replacePresets)
             if (input.deleteCharacterId) {
                 await this.deleteCharacter(transaction, generation, input.deleteCharacterId)
             }
@@ -321,7 +346,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const generation = this.generationFor(revision)
             await this.stageDatabase(transaction, databaseValue, generation)
             transaction.objectStore('root').delete(active.generation)
-            for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages']) {
+            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const) {
                 await this.deleteIndexRange(
                     transaction.objectStore(storeName).index('byGeneration'),
                     this.keyRangeFactory.only(active.generation),
@@ -341,7 +366,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     async materializeDatabase(revision?: DataRevision): Promise<Database> {
         const database = this.requireDatabase()
         const transaction = database.transaction(
-            ['meta', 'root', 'catalog', 'characters', 'conversations', 'messagePages'],
+            ['meta', 'root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages'],
             'readonly',
         )
         const active = await this.readActive(transaction)
@@ -353,7 +378,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const generation = active.generation
         const root = (await requestResult(
             transaction.objectStore('root').get(generation),
-        )) as StoredRecord<Omit<Database, 'characters'>> | undefined
+        )) as StoredRecord<PersistentRoot> | undefined
         if (!root) throw new RevisionConflictError(targetRevision, active.revision)
 
         const catalog = (
@@ -370,6 +395,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )
         const conversationRecords = await this.generationRecords<StoredConversation>(
             transaction.objectStore('conversations'),
+            generation,
+        )
+        const presetRecords = await this.generationRecords<StoredPreset>(
+            transaction.objectStore('presets'),
             generation,
         )
         const characters = [] as Database['characters']
@@ -399,7 +428,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             characters.push({ ...detail.value, chats } as Database['characters'][number])
         }
-        const result = { ...root.value, characters } as Database
+        const botPresets = presetRecords
+            .map((record) => record.value)
+            .sort((left, right) => left.summary.configuredIndex - right.summary.configuredIndex)
+            .map((record) => record.preset)
+        const result = { ...root.value, characters, botPresets } as Database
         await transactionDone(transaction)
         return result
     }
@@ -416,7 +449,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             const root = (await requestResult(
                 transaction.objectStore('root').get(active.generation),
-            )) as StoredRecord<Omit<Database, 'characters'>> | undefined
+            )) as StoredRecord<PersistentRoot> | undefined
             if (!root) throw new RevisionConflictError(revision, active.revision)
             transaction.objectStore('root').put({ ...root, key: generation, generation })
             transaction.objectStore('meta').put({
@@ -424,7 +457,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 value: generation,
                 createdAt: Date.now(),
             })
-            for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
+            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const) {
                 await this.copyGeneration(
                     transaction.objectStore(storeName),
                     active.generation,
@@ -455,6 +488,23 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 )
                 if (!record) throw new Error('Persistent snapshot root is missing')
                 return { revision, value: record.value }
+            },
+            queryPresets: async () => {
+                assertActive()
+                return this.queryPresetsFromTransaction(
+                    this.requireDatabase().transaction('presets', 'readonly'),
+                    revision,
+                    generation,
+                )
+            },
+            readPreset: async (id) => {
+                assertActive()
+                return this.readPresetFromTransaction(
+                    this.requireDatabase().transaction('presets', 'readonly'),
+                    revision,
+                    generation,
+                    id,
+                )
             },
             queryCharacters: async (input) => {
                 assertActive()
@@ -504,10 +554,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             release: async () => {
                 if (releasePromise) return releasePromise
-                released = true
-                releasePromise = this.releaseSnapshotLease(generation).finally(() => {
-                    activeSnapshotGenerations.delete(generation)
-                })
+                releasePromise = this.releaseSnapshotLease(generation).then(
+                    () => {
+                        released = true
+                        activeSnapshotGenerations.delete(generation)
+                    },
+                    (error) => {
+                        releasePromise = undefined
+                        throw error
+                    },
+                )
                 return releasePromise
             },
         }
@@ -516,12 +572,42 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     private async readRootRecordFromTransaction(
         transaction: IDBTransaction,
         generation: string,
-    ): Promise<StoredRecord<Omit<Database, 'characters'>> | undefined> {
+    ): Promise<StoredRecord<PersistentRoot> | undefined> {
         const record = (await requestResult(
             transaction.objectStore('root').get(generation),
-        )) as StoredRecord<Omit<Database, 'characters'>> | undefined
+        )) as StoredRecord<PersistentRoot> | undefined
         await transactionDone(transaction)
         return record
+    }
+
+    private async queryPresetsFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+    ): Promise<PresetCatalog> {
+        const records = (await requestResult(
+            transaction.objectStore('presets').index('byGenerationConfigured').getAll(
+                this.keyRangeFactory.bound(
+                    [generation, 0],
+                    [generation, MAX_INDEX_VALUE],
+                ),
+            ),
+        )) as StoredRecord<StoredPreset>[]
+        await transactionDone(transaction)
+        return { revision, items: records.map((record) => record.value.summary) }
+    }
+
+    private async readPresetFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+        id: string,
+    ): Promise<Versioned<botPreset> | null> {
+        const record = (await requestResult(
+            transaction.objectStore('presets').get(this.presetKey(generation, id)),
+        )) as StoredRecord<StoredPreset> | undefined
+        await transactionDone(transaction)
+        return record ? { revision, value: record.value.preset } : null
     }
 
     private async queryCharactersFromTransaction(
@@ -716,8 +802,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     ): Promise<void> {
         const ids = new Set<string>()
         const conversationIds = new Set<string>()
-        const { characters, ...root } = databaseValue
+        const { characters, botPresets, ...root } = databaseValue
         this.putRoot(transaction, generation, root)
+        this.writePresetRows(transaction, generation, botPresets ?? [])
         for (let index = 0; index < characters.length; index++) {
             const character = characters[index]
             if (!character.chaId || ids.has(character.chaId)) {
@@ -756,7 +843,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         generation: string,
     ): Promise<void> {
         transaction.objectStore('root').delete(generation)
-        for (const storeName of ['catalog', 'characters', 'conversations', 'messagePages'] as const) {
+        for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages'] as const) {
             await this.deleteIndexRange(
                 transaction.objectStore(storeName).index('byGeneration'),
                 this.keyRangeFactory.only(generation),
@@ -1068,6 +1155,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             recentAt: detail.lastInteraction ?? 0,
             trashed: detail.trashTime !== undefined,
             conversationCount,
+            type: detail.type,
+            creatorNotes: detail.creatorNotes,
+            trashTime: detail.trashTime,
         }
         transaction.objectStore('catalog').put({
             key: this.characterKey(generation, detail.chaId),
@@ -1404,9 +1494,45 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     private putRoot(
         transaction: IDBTransaction,
         generation: string,
-        root: Omit<Database, 'characters'>,
+        root: PersistentRoot,
     ): void {
-        transaction.objectStore('root').put({ key: generation, generation, value: root })
+        const { characters: _characters, botPresets: _botPresets, ...value } = root as Database
+        transaction.objectStore('root').put({ key: generation, generation, value })
+    }
+
+    private async putPresets(
+        transaction: IDBTransaction,
+        generation: string,
+        presets: botPreset[],
+    ): Promise<void> {
+        await this.deleteIndexRange(
+            transaction.objectStore('presets').index('byGeneration'),
+            this.keyRangeFactory.only(generation),
+        )
+        this.writePresetRows(transaction, generation, presets)
+    }
+
+    private writePresetRows(
+        transaction: IDBTransaction,
+        generation: string,
+        presets: botPreset[],
+    ): void {
+        for (let configuredIndex = 0; configuredIndex < presets.length; configuredIndex++) {
+            const id = String(configuredIndex)
+            const preset = presets[configuredIndex]
+            const summary: PresetSummary = {
+                id,
+                name: preset.name ?? '',
+                image: preset.image,
+                configuredIndex,
+            }
+            transaction.objectStore('presets').put({
+                key: this.presetKey(generation, id),
+                generation,
+                configuredIndex,
+                value: { summary, preset },
+            })
+        }
     }
 
     private async generationRecords<T>(
@@ -1445,12 +1571,79 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
+    private backfillCharacterSummaries(transaction: IDBTransaction): void {
+        const catalog = transaction.objectStore('catalog')
+        const characters = transaction.objectStore('characters')
+        const request = catalog.openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) return
+            const record = cursor.value as StoredRecord<CharacterSummary> & {
+                configuredIndex?: number
+                recentSortValue?: number
+            }
+            const detailRequest = characters.get(record.key)
+            detailRequest.onsuccess = () => {
+                const detail = (detailRequest.result as StoredRecord<CharacterDetail> | undefined)?.value
+                record.configuredIndex = record.value.configuredIndex
+                record.recentSortValue = -record.value.recentAt
+                record.value.type = detail?.type ?? 'character'
+                record.value.creatorNotes = detail?.creatorNotes
+                record.value.trashTime = detail?.trashTime
+                cursor.update(record)
+                cursor.continue()
+            }
+        }
+    }
+
+    private migratePresetRows(transaction: IDBTransaction): void {
+        const root = transaction.objectStore('root')
+        const presets = transaction.objectStore('presets')
+        const request = root.openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) return
+            const record = cursor.value as StoredRecord<Record<string, unknown>>
+            const hasLegacyPresets = Object.prototype.hasOwnProperty.call(
+                record.value,
+                'botPresets',
+            )
+            if (hasLegacyPresets && !Array.isArray(record.value.botPresets)) {
+                transaction.abort()
+                return
+            }
+            const legacyPresets = hasLegacyPresets
+                ? record.value.botPresets as botPreset[]
+                : []
+            for (let configuredIndex = 0; configuredIndex < legacyPresets.length; configuredIndex++) {
+                const id = String(configuredIndex)
+                const preset = legacyPresets[configuredIndex]
+                presets.put({
+                    key: this.presetKey(record.generation, id),
+                    generation: record.generation,
+                    configuredIndex,
+                    value: {
+                        summary: { id, name: preset.name ?? '', image: preset.image, configuredIndex },
+                        preset,
+                    },
+                })
+            }
+            const { characters: _characters, botPresets: _botPresets, ...value } = record.value
+            cursor.update({ ...record, value })
+            cursor.continue()
+        }
+    }
+
     private generationFor(revision: DataRevision): string {
         return `revision-${revision}`
     }
 
     private characterKey(generation: string, characterId: string): string {
         return `${generation}:character:${characterId}`
+    }
+
+    private presetKey(generation: string, id: string): string {
+        return `${generation}:preset:${id}`
     }
 
     private conversationKey(generation: string, characterId: string, conversationId: string): string {

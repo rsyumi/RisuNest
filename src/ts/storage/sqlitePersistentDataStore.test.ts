@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
 
 import { SqlitePersistentDataStore } from './sqlitePersistentDataStore'
+import { nativePersistentRevisionLease } from './nativePersistentExport'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
 import { fixtureDatabase } from './tests/persistentDataFixtures'
 
@@ -42,6 +43,8 @@ describe('SqlitePersistentDataStore', () => {
 
         await store.open()
         await store.readRoot()
+        await store.queryPresets()
+        await store.readPreset('1')
         await store.queryCharacters(characterQuery)
         await store.readCharacter('char-a')
         await store.queryConversations(conversationQuery)
@@ -53,6 +56,8 @@ describe('SqlitePersistentDataStore', () => {
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_open'],
             ['pds_read_root', {}],
+            ['pds_query_presets', {}],
+            ['pds_read_preset', { id: '1' }],
             ['pds_query_characters', { query: characterQuery }],
             ['pds_read_character', { id: 'char-a' }],
             ['pds_query_conversations', { query: conversationQuery }],
@@ -104,6 +109,7 @@ describe('SqlitePersistentDataStore', () => {
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce({ revision: 4 })
         const database = structuredClone(fixtureDatabase)
         database.characters = Array.from({ length: 17 }, (_, index) => ({
@@ -111,7 +117,7 @@ describe('SqlitePersistentDataStore', () => {
             chaId: `character-${index}`,
             name: `Character ${index}`,
         }))
-        const { characters, ...root } = database
+        const { characters, botPresets, ...root } = database
         const store = new SqlitePersistentDataStore()
 
         await expect(store.replaceFromDatabase(database, 3)).resolves.toEqual({ revision: 4 })
@@ -119,6 +125,7 @@ describe('SqlitePersistentDataStore', () => {
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_replace_begin'],
             ['pds_replace_put_root', { stagingId: 'staging-1', root }],
+            ['pds_replace_put_presets', { stagingId: 'staging-1', presets: botPresets }],
             [
                 'pds_replace_add_characters',
                 { stagingId: 'staging-1', characters: characters.slice(0, 16) },
@@ -136,15 +143,17 @@ describe('SqlitePersistentDataStore', () => {
         mocks.invoke
             .mockResolvedValueOnce({ stagingId: 'staging-2' })
             .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce(undefined)
             .mockRejectedValueOnce(primaryError)
             .mockRejectedValueOnce(new Error('abort failed'))
         const store = new SqlitePersistentDataStore()
-        const { characters, ...root } = fixtureDatabase
+        const { characters, botPresets, ...root } = fixtureDatabase
 
         await expect(store.replaceFromDatabase(fixtureDatabase)).rejects.toBe(primaryError)
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_replace_begin'],
             ['pds_replace_put_root', { stagingId: 'staging-2', root }],
+            ['pds_replace_put_presets', { stagingId: 'staging-2', presets: botPresets }],
             [
                 'pds_replace_add_characters',
                 { stagingId: 'staging-2', characters },
@@ -156,6 +165,7 @@ describe('SqlitePersistentDataStore', () => {
     it('splits staged character batches at approximately four MiB', async () => {
         mocks.invoke
             .mockResolvedValueOnce({ stagingId: 'staging-large' })
+            .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
@@ -185,7 +195,11 @@ describe('SqlitePersistentDataStore', () => {
         const store = new SqlitePersistentDataStore()
         const lease = await store.acquireRevision(7)
 
+        expect(lease[nativePersistentRevisionLease]).toBe('lease-7')
+
         await lease.readRoot()
+        await lease.queryPresets()
+        await lease.readPreset('0')
         await lease.queryCharacters({ order: 'configured', trash: false, limit: 10 })
         await lease.readCharacter('char-a')
         await lease.queryConversations({ characterId: 'char-a', order: 'recent', limit: 10 })
@@ -201,6 +215,8 @@ describe('SqlitePersistentDataStore', () => {
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_acquire_revision', { revision: 7 }],
             ['pds_read_root', { lease: 'lease-7' }],
+            ['pds_query_presets', { lease: 'lease-7' }],
+            ['pds_read_preset', { id: '0', lease: 'lease-7' }],
             [
                 'pds_query_characters',
                 { query: { order: 'configured', trash: false, limit: 10 }, lease: 'lease-7' },
@@ -227,6 +243,29 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_release_revision', { lease: 'lease-7' }],
         ])
         await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
-        expect(mocks.invoke).toHaveBeenCalledTimes(8)
+        expect(mocks.invoke).toHaveBeenCalledTimes(10)
+    })
+
+    it('keeps a lease active and retries native cleanup after release fails', async () => {
+        const releaseError = new Error('native release failed')
+        let releaseCalls = 0
+        mocks.invoke.mockImplementation(async (command: string) => {
+            if (command === 'pds_acquire_revision') return { lease: 'lease-retry' }
+            if (command === 'pds_release_revision') {
+                releaseCalls += 1
+                if (releaseCalls === 1) throw releaseError
+                return undefined
+            }
+            if (command === 'pds_read_root') return { revision: 7, value: {} }
+            throw new Error(`Unexpected command ${command}`)
+        })
+        const store = new SqlitePersistentDataStore()
+        const lease = await store.acquireRevision(7)
+
+        await expect(lease.release()).rejects.toBe(releaseError)
+        await expect(lease.readRoot()).resolves.toMatchObject({ revision: 7 })
+        await expect(lease.release()).resolves.toBeUndefined()
+        await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        expect(releaseCalls).toBe(2)
     })
 })

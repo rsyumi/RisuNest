@@ -1,5 +1,59 @@
-import { describe, expect, it } from 'vitest'
-import { SyncConflictBackupStore, type SyncConflictBackupKv } from './syncConflictBackup'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const platformMocks = vi.hoisted(() => {
+    const appValues = new Map<string, unknown>()
+    const blobValues = new Map<string, Uint8Array>()
+    return {
+        isTauri: false,
+        appValues,
+        blobValues,
+        localforage: {
+            createInstance: vi.fn(() => {
+                throw new Error('LocalForage must not be opened for native conflict backups')
+            }),
+        },
+        appKv: {
+            get: vi.fn(async (key: string) => appValues.get(key) ?? null),
+            set: vi.fn(async (key: string, value: unknown) => {
+                appValues.set(key, value)
+            }),
+            remove: vi.fn(async (key: string) => {
+                appValues.delete(key)
+            }),
+        },
+        blobStore: {
+            put: vi.fn(async (key: string, bytes: Uint8Array) => {
+                blobValues.set(key, bytes.slice())
+                return {
+                    key,
+                    kind: 'asset' as const,
+                    size: bytes.byteLength,
+                    mime: 'application/octet-stream',
+                    name: key,
+                    ext: 'risudat',
+                }
+            }),
+            read: vi.fn(async (key: string) => blobValues.get(key)?.slice() ?? null),
+            remove: vi.fn(async (key: string) => {
+                blobValues.delete(key)
+            }),
+        },
+    }
+})
+
+vi.mock('localforage', () => ({ default: platformMocks.localforage }))
+vi.mock('../../platform', () => ({
+    get isTauri() { return platformMocks.isTauri },
+}))
+vi.mock('../nativeAppKv', () => ({ createNativeAppKv: () => platformMocks.appKv }))
+vi.mock('../platformBlobStore', () => ({ getBlobStore: () => platformMocks.blobStore }))
+
+import {
+    getSyncConflictBackupStore,
+    SyncConflictBackupStore,
+    type SyncConflictBackupKv,
+    type SyncConflictBackupPayloadStore,
+} from './syncConflictBackup'
 
 function memoryKv(): SyncConflictBackupKv & { values: Map<string, unknown> } {
     const values = new Map<string, unknown>()
@@ -21,7 +75,30 @@ function sequenceClock(start = 1_000): () => number {
     return () => current++
 }
 
+function memoryPayloadStore(): SyncConflictBackupPayloadStore & {
+    values: Map<string, Uint8Array>
+} {
+    const values = new Map<string, Uint8Array>()
+    return {
+        values,
+        write: async (id, bytes) => {
+            values.set(id, bytes.slice())
+        },
+        read: async (id) => values.get(id)?.slice() ?? null,
+        remove: async (id) => {
+            values.delete(id)
+        },
+    }
+}
+
 describe('SyncConflictBackupStore', () => {
+    beforeEach(() => {
+        platformMocks.isTauri = false
+        platformMocks.appValues.clear()
+        platformMocks.blobValues.clear()
+        vi.clearAllMocks()
+    })
+
     it('saves entries and lists them newest first', async () => {
         const store = new SyncConflictBackupStore(memoryKv(), sequenceClock())
 
@@ -30,8 +107,12 @@ describe('SyncConflictBackupStore', () => {
 
         const entries = await store.list()
         expect(entries).toHaveLength(2)
-        expect(entries[0]).toMatchObject({ side: 'local', characterCount: 5, byteLength: 1 })
-        expect(entries[1]).toMatchObject({ side: 'remote', characterCount: 3, byteLength: 2 })
+        expect(entries[0]).toMatchObject({
+            side: 'local', characterCount: 5, byteLength: 1, scope: 'database-only',
+        })
+        expect(entries[1]).toMatchObject({
+            side: 'remote', characterCount: 3, byteLength: 2, scope: 'database-only',
+        })
         expect(entries[0].createdAt).toBeGreaterThan(entries[1].createdAt)
     })
 
@@ -82,6 +163,106 @@ describe('SyncConflictBackupStore', () => {
         expect(await store.read(entry.id)).toBeNull()
     })
 
+    it('keeps a visible entry readable when removing it cannot update the index', async () => {
+        const kv = memoryKv()
+        const payloads = memoryPayloadStore()
+        const store = new SyncConflictBackupStore(kv, sequenceClock(), payloads)
+        const entry = await store.save({
+            side: 'local', bytes: Uint8Array.of(1), characterCount: 1,
+        })
+        vi.spyOn(kv, 'setItem').mockRejectedValueOnce(new Error('index unavailable'))
+
+        await expect(store.remove(entry.id)).rejects.toThrow('index unavailable')
+
+        expect((await store.list()).map((value) => value.id)).toEqual([entry.id])
+        expect(await store.read(entry.id)).toEqual(Uint8Array.of(1))
+    })
+
+    it('removes the index entry even when payload cleanup fails', async () => {
+        const kv = memoryKv()
+        const payloads = memoryPayloadStore()
+        const store = new SyncConflictBackupStore(kv, sequenceClock(), payloads)
+        const entry = await store.save({
+            side: 'local', bytes: Uint8Array.of(1), characterCount: 1,
+        })
+        vi.spyOn(payloads, 'remove').mockRejectedValueOnce(new Error('blob unavailable'))
+
+        await expect(store.remove(entry.id)).resolves.toBeUndefined()
+
+        expect(await store.list()).toEqual([])
+        expect(payloads.values.get(entry.id)).toEqual(Uint8Array.of(1))
+    })
+
+    it('keeps the previous index when saving a new entry cannot update it', async () => {
+        const kv = memoryKv()
+        const payloads = memoryPayloadStore()
+        const store = new SyncConflictBackupStore(kv, sequenceClock(), payloads)
+        const kept = await store.save({
+            side: 'remote', bytes: Uint8Array.of(1), characterCount: 1,
+        })
+        vi.spyOn(kv, 'setItem').mockRejectedValueOnce(new Error('index unavailable'))
+
+        await expect(store.save({
+            side: 'local', bytes: Uint8Array.of(2), characterCount: 2,
+        })).rejects.toThrow('index unavailable')
+
+        expect((await store.list()).map((value) => value.id)).toEqual([kept.id])
+        expect(payloads.values.size).toBe(1)
+        expect(payloads.values.get(kept.id)).toEqual(Uint8Array.of(1))
+    })
+
+    it('preserves the index error when failed-save payload cleanup also fails', async () => {
+        const kv = memoryKv()
+        const payloads = memoryPayloadStore()
+        const store = new SyncConflictBackupStore(kv, sequenceClock(), payloads)
+        const kept = await store.save({
+            side: 'remote', bytes: Uint8Array.of(1), characterCount: 1,
+        })
+        vi.spyOn(kv, 'setItem').mockRejectedValueOnce(new Error('index unavailable'))
+        const remove = vi.spyOn(payloads, 'remove')
+            .mockRejectedValueOnce(new Error('blob unavailable'))
+
+        await expect(store.save({
+            side: 'local', bytes: Uint8Array.of(2), characterCount: 2,
+        })).rejects.toThrow('index unavailable')
+
+        expect(remove).toHaveBeenCalledOnce()
+        expect((await store.list()).map((value) => value.id)).toEqual([kept.id])
+    })
+
+    it('keeps a newly indexed backup when pruning an old payload fails', async () => {
+        const kv = memoryKv()
+        const payloads = memoryPayloadStore()
+        const store = new SyncConflictBackupStore(kv, sequenceClock(), payloads)
+        for (let index = 0; index < 5; index++) {
+            await store.save({
+                side: 'remote', bytes: Uint8Array.of(index), characterCount: index,
+            })
+        }
+        vi.spyOn(payloads, 'remove').mockRejectedValueOnce(new Error('blob unavailable'))
+
+        await expect(store.save({
+            side: 'local', bytes: Uint8Array.of(9), characterCount: 9,
+        })).resolves.toMatchObject({ side: 'local', characterCount: 9 })
+
+        expect(await store.list()).toHaveLength(5)
+    })
+
+    it('serializes concurrent saves so both entries remain indexed', async () => {
+        const store = new SyncConflictBackupStore(
+            memoryKv(),
+            sequenceClock(),
+            memoryPayloadStore(),
+        )
+
+        await Promise.all([
+            store.save({ side: 'local', bytes: Uint8Array.of(1), characterCount: 1 }),
+            store.save({ side: 'remote', bytes: Uint8Array.of(2), characterCount: 2 }),
+        ])
+
+        expect(await store.list()).toHaveLength(2)
+    })
+
     it('treats a corrupted index as empty', async () => {
         const kv = memoryKv()
         kv.values.set('index', { not: 'an array' })
@@ -91,5 +272,39 @@ describe('SyncConflictBackupStore', () => {
 
         kv.values.set('index', [{ id: 'x' }, null, 'garbage'])
         expect(await store.list()).toEqual([])
+    })
+
+    it('keeps payload bytes outside the metadata key-value store', async () => {
+        const kv = memoryKv()
+        const payloads = memoryPayloadStore()
+        const store = new SyncConflictBackupStore(kv, sequenceClock(), payloads)
+
+        const entry = await store.save({
+            side: 'local',
+            bytes: Uint8Array.of(9, 8, 7),
+            characterCount: 4,
+        })
+
+        expect(kv.values.has(`payload:${entry.id}`)).toBe(false)
+        expect(payloads.values.get(entry.id)).toEqual(Uint8Array.of(9, 8, 7))
+        expect(await store.read(entry.id)).toEqual(Uint8Array.of(9, 8, 7))
+    })
+
+    it('uses native app metadata and BlobStore payloads on Tauri', async () => {
+        platformMocks.isTauri = true
+        const store = getSyncConflictBackupStore()
+
+        const entry = await store.save({
+            side: 'remote',
+            bytes: Uint8Array.of(6, 5, 4),
+            characterCount: 2,
+        })
+
+        expect(platformMocks.appValues.get('sync-conflict-backups.index.v1')).toEqual([
+            expect.objectContaining({ id: entry.id, scope: 'database-only' }),
+        ])
+        expect(platformMocks.blobValues.get(`sync-conflict-backups/${entry.id}.risudat`))
+            .toEqual(Uint8Array.of(6, 5, 4))
+        expect(await store.read(entry.id)).toEqual(Uint8Array.of(6, 5, 4))
     })
 })

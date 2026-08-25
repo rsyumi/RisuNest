@@ -3,6 +3,7 @@
     import Button from "../UI/GUI/Button.svelte";
     import { selectMultipleFile } from "src/ts/util";
     import { detectPromptJSONType, promptConvertion } from "src/ts/process/prompt";
+    import { alertError } from "src/ts/alert";
 
     let files: { name: string, content: string, type:string }[] = $state([])
 
@@ -44,6 +45,10 @@
     {/each}
     <Button onclick={addFile}>Add</Button>
 </div>
-<Button className="mt-6" onclick={() => {
-    promptConvertion(files)
+<Button className="mt-6" onclick={async () => {
+    try {
+        await promptConvertion(files)
+    } catch (error) {
+        alertError(error instanceof Error ? error.message : String(error))
+    }
 }}>Run</Button>

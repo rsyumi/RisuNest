@@ -1,6 +1,8 @@
 import { safeStructuredClone } from '../polyfill'
 import type { Database } from './database.svelte'
 import { coldStorageHeader } from '../process/coldstorageData'
+import { hasIncompletePersistentWorkingSet } from './workingSetCatalog'
+import { workingSetResidency } from './workingSetResidency'
 
 type ColdStorageCompactionDependencies = {
     now: number
@@ -70,6 +72,9 @@ export async function compactColdStorageDatabase(
     database: Database,
     dependencies: ColdStorageCompactionDependencies,
 ): Promise<boolean> {
+    if (hasIncompletePersistentWorkingSet(database, workingSetResidency)) {
+        return false
+    }
     if (!database.coldstorage) {
         return false
     }

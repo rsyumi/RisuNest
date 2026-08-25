@@ -34,6 +34,7 @@
     import ChatFormatSettings from "./ChatFormatSettings.svelte";
     import PromptSettings from "./PromptSettings.svelte";
     import { openPresetList } from "src/ts/stores.svelte";
+    import { updateActivePresetImage } from "src/ts/storage/database.svelte";
     import { selectSingleFile } from "src/ts/util";
     import { getModelInfo, LLMFlags, LLMFormat, LLMProvider } from "src/ts/model/modellist";
     import RegexList from "src/lib/SideBars/Scripts/RegexList.svelte";
@@ -815,7 +816,7 @@
             canvas.height = 48
             ctx.drawImage(img, 0, 0, 48, 48)
             const data = canvas.toDataURL('image/jpeg', 0.7)
-            DBState.db.botPresets[DBState.db.botPresetsId].image = data //Since its small (max 2304 pixels), its okay to store it directly
+            await updateActivePresetImage(data)
         }}>
             <UploadIcon />
         </button>

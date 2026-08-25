@@ -29,6 +29,9 @@ pub(super) fn commit(
     if let Some(root) = &input.root {
         put_root(&transaction, &generation, root)?;
     }
+    if let Some(presets) = &input.replace_presets {
+        replace_presets(&transaction, &generation, presets)?;
+    }
     if let Some(character_id) = &input.delete_character_id {
         delete_character(&transaction, &generation, character_id)?;
     }
@@ -103,6 +106,18 @@ pub(super) fn replace_add_characters(
     Ok(())
 }
 
+pub(super) fn replace_put_presets(
+    connection: &mut Connection,
+    staging_id: &str,
+    presets: &[Value],
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    replace_presets(&transaction, staging_id, presets)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 pub(super) fn replace_commit(
     connection: &mut Connection,
     staging_id: &str,
@@ -159,10 +174,42 @@ pub(super) fn replace_abort(connection: &mut Connection, staging_id: &str) -> St
 }
 
 fn put_root(transaction: &Transaction<'_>, generation: &str, root: &Value) -> StoreResult<()> {
+    let mut root = object(root, "Persistent root")?.clone();
+    root.remove("characters");
+    root.remove("botPresets");
     transaction.execute(
         "INSERT INTO root (generation, value) VALUES (?1, ?2) ON CONFLICT(generation) DO UPDATE SET value = excluded.value",
-        params![generation, serde_json::to_string(root)?],
+        params![generation, serde_json::to_string(&root)?],
     )?;
+    Ok(())
+}
+
+fn replace_presets(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    presets: &[Value],
+) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM bot_presets WHERE generation = ?1",
+        [generation],
+    )?;
+    let mut statement = transaction.prepare_cached(
+        "INSERT INTO bot_presets (generation, preset_id, configured_index, name, image, value)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for (configured_index, preset) in presets.iter().enumerate() {
+        statement.execute(params![
+            generation,
+            configured_index.to_string(),
+            configured_index as i64,
+            preset
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            preset.get("image").and_then(Value::as_str),
+            serde_json::to_string(preset)?,
+        ])?;
+    }
     Ok(())
 }
 
@@ -319,11 +366,17 @@ fn put_character_records(
         .and_then(Value::as_i64)
         .unwrap_or_default();
     let trashed = object.contains_key("trashTime");
+    let character_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("character");
+    let creator_notes = object.get("creatorNotes").and_then(Value::as_str);
+    let trash_time = object.get("trashTime").and_then(Value::as_i64);
     transaction.execute(
         "INSERT INTO characters (
             generation, character_id, configured_index, recent_at, trashed, name, image,
-            conversation_count, detail
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            conversation_count, type, creator_notes, trash_time, detail
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(generation, character_id) DO UPDATE SET
             configured_index = excluded.configured_index,
             recent_at = excluded.recent_at,
@@ -331,6 +384,9 @@ fn put_character_records(
             name = excluded.name,
             image = excluded.image,
             conversation_count = excluded.conversation_count,
+            type = excluded.type,
+            creator_notes = excluded.creator_notes,
+            trash_time = excluded.trash_time,
             detail = excluded.detail",
         params![
             generation,
@@ -341,6 +397,9 @@ fn put_character_records(
             name,
             image,
             conversation_count,
+            character_type,
+            creator_notes,
+            trash_time,
             serde_json::to_string(detail)?,
         ],
     )?;
@@ -667,6 +726,10 @@ fn delete_generation(transaction: &Transaction<'_>, generation: &str) -> StoreRe
         [generation],
     )?;
     transaction.execute("DELETE FROM characters WHERE generation = ?1", [generation])?;
+    transaction.execute(
+        "DELETE FROM bot_presets WHERE generation = ?1",
+        [generation],
+    )?;
     transaction.execute("DELETE FROM root WHERE generation = ?1", [generation])?;
     transaction.execute(
         "DELETE FROM snapshot_leases WHERE generation = ?1",
@@ -682,6 +745,10 @@ fn move_generation(transaction: &Transaction<'_>, source: &str, target: &str) ->
     )?;
     transaction.execute(
         "UPDATE characters SET generation = ?2 WHERE generation = ?1",
+        params![source, target],
+    )?;
+    transaction.execute(
+        "UPDATE bot_presets SET generation = ?2 WHERE generation = ?1",
         params![source, target],
     )?;
     transaction.execute(

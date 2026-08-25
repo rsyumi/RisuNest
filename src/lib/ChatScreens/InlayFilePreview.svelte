@@ -1,0 +1,48 @@
+<script lang="ts">
+    import { getInlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
+    import type { InlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
+    import { isTauri } from 'src/ts/platform'
+
+    interface Props {
+        id: string
+    }
+
+    let { id }: Props = $props()
+    let source: InlayRenderSource | null = $state(null)
+
+    $effect(() => {
+        const assetId = id
+        let disposed = false
+        let objectUrl: string | null = null
+        source = null
+        void getInlayRenderSource(assetId, isTauri).then((nextSource) => {
+            if (disposed) {
+                if (nextSource?.objectUrl) URL.revokeObjectURL(nextSource.url)
+                return
+            }
+            source = nextSource
+            objectUrl = nextSource?.objectUrl ? nextSource.url : null
+        })
+        return () => {
+            disposed = true
+            if (objectUrl) URL.revokeObjectURL(objectUrl)
+        }
+    })
+</script>
+
+{#if source?.type === 'image'}
+    <img src={source.url} alt="Inlay" class="max-w-48 max-h-48 border border-darkborderc">
+{:else if source?.type === 'video'}
+    <video controls class="max-w-48 max-h-48 border border-darkborderc">
+        <source src={source.url} type={source.mime} />
+        <track kind="captions" />
+        Your browser does not support the video tag.
+    </video>
+{:else if source?.type === 'audio'}
+    <audio controls class="max-w-48 max-h-24 border border-darkborderc">
+        <source src={source.url} type={source.mime} />
+        Your browser does not support the audio tag.
+    </audio>
+{:else if source}
+    <div class="max-w-24 max-h-24">{id}</div>
+{/if}

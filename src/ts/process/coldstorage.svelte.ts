@@ -10,6 +10,8 @@ import { coldStorageHeader, getColdStorageAffectedCharacters, getColdStorageBack
 import { compactColdStorageDatabase } from "../storage/coldStorageCompaction"
 import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte"
 import type { LocalColdStorageRuntime } from "../storage/localColdStorageRuntime"
+import { hasIncompletePersistentWorkingSet } from '../storage/workingSetCatalog'
+import { workingSetResidency } from '../storage/workingSetResidency'
 
 export {
     coldStorageHeader,
@@ -176,6 +178,7 @@ export async function listColdStorageItems():Promise<{items:string[]}> {
 }
 
 export async function cleanColdStorage(){
+    if (hasIncompletePersistentWorkingSet(DBState.db, workingSetResidency)) return
     const actualUsedKeys = await listColdDataKeys()
     const allKeys = (await listColdStorageItems()).items
     const unusedKeys = allKeys.filter(k => !actualUsedKeys.includes(k))

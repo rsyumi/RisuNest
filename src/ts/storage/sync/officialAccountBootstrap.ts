@@ -3,11 +3,11 @@ import type { Database } from '../database.svelte'
 import {
     RevisionConflictError,
     type DataRevision,
-    type PersistentDataStore,
 } from '../persistentDataStore'
 import type { OfficialRevisionPublisher, PinnedPublication } from '../saveCoordinator'
 import type { OfficialPullResult } from './officialAccountSnapshot'
 import type { OfficialAccountAssetReader } from '../accountAssetAccess'
+import type { PluginCompatibilityProfile } from '../../plugins/pluginCompatibility'
 
 interface OfficialBootstrapAdapter extends OfficialRevisionPublisher {
     pull(signal?: AbortSignal): Promise<OfficialPullResult>
@@ -23,8 +23,13 @@ export interface OfficialAccountBootstrapDependencies {
     local: {
         database: Database
         revision: DataRevision
+        profile: PluginCompatibilityProfile
     }
-    store: Pick<PersistentDataStore, 'materializeDatabase'>
+    resolveWorkingSet(revision: DataRevision): Promise<{
+        database: Database
+        revision: DataRevision
+        profile: PluginCompatibilityProfile
+    }>
     adapter: OfficialBootstrapAdapter
     readRemoteDatabase(): Promise<AccountReadResult>
     markers: AccountMarkers
@@ -34,6 +39,7 @@ export interface OfficialAccountBootstrapDependencies {
     configureAssetReader(reader: OfficialAccountAssetReader | null): void
     chooseExistingRemote(): Promise<'pull' | 'push'>
     confirmInitialPush(): Promise<boolean>
+    initializeProfile(profile: PluginCompatibilityProfile): void
     installDatabase(database: Database): void
     initializeWorkingSet(database: Database): Promise<void>
     onRemoteError(error: unknown): void
@@ -52,12 +58,24 @@ async function publishPinnedRevision(
     revision: DataRevision,
 ): Promise<void> {
     let publication: PinnedPublication | null = null
+    let failed = false
+    let originalError: unknown
     try {
         publication = await publisher.pin(revision)
         await publication.publish()
-    } finally {
-        await publication?.dispose()
+    } catch (error) {
+        failed = true
+        originalError = error
     }
+    try {
+        await publication?.dispose()
+    } catch (error) {
+        if (!failed) {
+            failed = true
+            originalError = error
+        }
+    }
+    if (failed) throw originalError
 }
 
 export async function publishOfficialRevisionIfChanged(
@@ -139,10 +157,14 @@ export async function initializeOfficialAccountBootstrap(
         }
     }
 
-    const database = revision === dependencies.local.revision
-        ? dependencies.local.database
-        : await dependencies.store.materializeDatabase(revision)
-    dependencies.installDatabase(database)
-    await dependencies.initializeWorkingSet(database)
-    return { database, revision, officialEnabled }
+    const resolved = revision === dependencies.local.revision
+        ? dependencies.local
+        : await dependencies.resolveWorkingSet(revision)
+    if (resolved.revision !== revision) {
+        throw new RevisionConflictError(revision, resolved.revision)
+    }
+    dependencies.initializeProfile(resolved.profile)
+    dependencies.installDatabase(resolved.database)
+    await dependencies.initializeWorkingSet(resolved.database)
+    return { database: resolved.database, revision, officialEnabled }
 }

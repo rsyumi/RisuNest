@@ -19,6 +19,10 @@ import {
     DEFAULT_CHAT_LOAD_INITIAL_PAGES,
     normalizeChatLoadPages,
 } from '../chatLoadPages';
+import {
+    createPresetWorkingSetController,
+    readPersistentPresetBodies,
+} from './presetWorkingSetOperations';
 
 //APP_VERSION_POINT is to locate the app version in the database file for version bumping
 export let appVer = "2026.8.160" //<APP_VERSION_POINT>
@@ -2040,12 +2044,11 @@ export const defaultSdDataFunc = () =>{
     return safeStructuredClone(defaultSdData)
 }
 
-export function saveCurrentPreset(){
-    let db = DBState.db
-    let pres = db.botPresets
+export function captureCurrentPreset(db: Database = getDatabase()): botPreset | null {
+    const pres = db.botPresets
 
     if(db.botPresetsId === -1){
-        return
+        return null
     }
     const savedPreset:botPreset =  {
         name: pres[db.botPresetsId].name,
@@ -2128,37 +2131,51 @@ export function saveCurrentPreset(){
         dynamicOutput: db.dynamicOutput ?? null
     }
     
-    if(!Array.isArray(pres)){
-        pres = []
-    }
-    //if out of bounds, create a new preset
-    if(db.botPresetsId >= pres.length){
-        pres.push(savedPreset)
-    }
-    else{
-        pres[db.botPresetsId] = savedPreset
-    }
-    db.botPresets = pres
+    return savedPreset
 }
 
-export function copyPreset(id:number){
-    saveCurrentPreset()
-    let db = DBState.db
-    let pres = db.botPresets
-    const newPres = safeStructuredClone(pres[id])
-    newPres.name += " Copy"
-    db.botPresets.push(newPres)
+const presetWorkingSetController = createPresetWorkingSetController({
+    getDatabase,
+    captureCurrentPreset,
+    applyPreset(root, preset) {
+        setPreset(root as Database, preset)
+    },
+    async mutatePersistentPresets(reason, mutate) {
+        const runtime = await import('./persistentDataRuntime.svelte')
+        await runtime.mutatePersistentPresets(reason, mutate)
+    },
+})
+
+export function saveCurrentPreset(): Promise<void> {
+    return presetWorkingSetController.saveCurrentPreset()
 }
 
-export function changeToPreset(id =0, savecurrent = true){
-    if(savecurrent){
-        saveCurrentPreset()
-    }
-    let db = DBState.db
-    let pres = db.botPresets
-    const newPres = pres[id]
-    db.botPresetsId = id
-    setPreset(db, newPres)
+export function copyPreset(id: number): Promise<number> {
+    return presetWorkingSetController.copyPreset(id)
+}
+
+export function changeToPreset(id = 0, savecurrent = true): Promise<void> {
+    return presetWorkingSetController.changeToPreset(id, savecurrent)
+}
+
+export function addPreset(preset: botPreset, activate = false): Promise<number> {
+    return presetWorkingSetController.addPreset(preset, activate)
+}
+
+export function removePreset(id: number): Promise<void> {
+    return presetWorkingSetController.removePreset(id)
+}
+
+export function movePreset(fromIndex: number, toIndex: number): Promise<void> {
+    return presetWorkingSetController.movePreset(fromIndex, toIndex)
+}
+
+export function renamePreset(id: number, name: string): Promise<void> {
+    return presetWorkingSetController.renamePreset(id, name)
+}
+
+export function updateActivePresetImage(image: string): Promise<void> {
+    return presetWorkingSetController.updateActivePresetImage(image)
 }
 
 export function setPreset(db:Database, newPres: botPreset){
@@ -2297,10 +2314,7 @@ import type { Loadout } from '../loadout';
 
 export async function downloadPreset(id:number, type:'json'|'risupreset'|'return' = 'json'){
     const { downloadFile } = await import('../globalApi.svelte')
-    saveCurrentPreset()
-    let db = getDatabase()
-    let pres = safeStructuredClone(db.botPresets[id])
-    console.log(pres)
+    const pres = await readPresetBody(id)
     pres.openAIKey = ''
     pres.forceReplaceUrl = ''
     pres.forceReplaceUrl2 = ''
@@ -2344,6 +2358,17 @@ export async function downloadPreset(id:number, type:'json'|'risupreset'|'return
     }
 }
 
+export async function readPresetBody(id: number): Promise<botPreset> {
+    return (await readPresetBodies([id]))[0]
+}
+
+export async function readPresetBodies(ids: readonly number[]): Promise<botPreset[]> {
+    await saveCurrentPreset()
+    const { getPersistentDataRuntime } = await import('./persistentDataRuntime.svelte')
+    const runtime = getPersistentDataRuntime()
+    return readPersistentPresetBodies(runtime.store, runtime.revision, ids)
+}
+
 
 export async function importPreset(f:{
     name:string
@@ -2374,7 +2399,6 @@ export async function importPreset(f:{
     if(pre?.promptTemplate !== undefined){
         pre.promptTemplate = normalizePromptTemplate(pre.promptTemplate)
     }
-    let db = DBState.db
     if(pre.presetVersion && pre.presetVersion >= 3){
         //NAI preset
         const pr = safeStructuredClone(prebuiltPresets.NAI)
@@ -2395,7 +2419,7 @@ export async function importPreset(f:{
         pr.NAISettings.mirostat_lr = pre.parameters.mirostat_lr
         pr.NAISettings.mirostat_tau = pre.parameters.mirostat_tau
         pr.name = pre.name ?? "Imported"
-        db.botPresets.push(pr)
+        await addPreset(pr)
         return
     }
 
@@ -2501,14 +2525,11 @@ export async function importPreset(f:{
         }
         pr.promptTemplate = normalizePromptTemplate(pr.promptTemplate)
         pr.name = "Imported ST Preset"
-        db.botPresets.push(pr)
+        await addPreset(pr)
         return
     }
     pre.name ??= "Imported"
-    if(!Array.isArray(db.botPresets)){
-        db.botPresets = []
-    }
-    db.botPresets.push(pre)
+    await addPreset(pre)
 }
 
 function normalizePromptRole(role: unknown): 'user'|'bot'|'system'|null {

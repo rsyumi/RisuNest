@@ -4,7 +4,9 @@ import type { InlayAsset } from '../inlays'
 import {
     getInlayAsset,
     getInlayAssetBlob,
+    getInlayAssetRenderUrl,
     listInlayAssets,
+    listInlayAssetMetadata,
     migrateLegacyInlayAsset,
     readLegacyInlayPayload,
     postInlayAsset,
@@ -13,6 +15,7 @@ import {
     setInlayAsset,
     writeInlayImage,
 } from '../inlays'
+import { createBackedBlobStore } from 'src/ts/storage/platformBlobStore'
 
 //#region module mocks
 
@@ -35,11 +38,16 @@ vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: a
 const store = new Map<string, unknown>()
 let corruptReadKey: string | undefined
 let throwReadKey: string | undefined
+let payloadReads = 0
+let legacyReads = 0
+let legacyKeyLists = 0
 
 vi.mock('localforage', () => ({
     default: {
-        createInstance: () => ({
+        createInstance: (options?: { name?: string }) => ({
             getItem: vi.fn(async (key: string) => {
+                if (options?.name === 'inlay') legacyReads += 1
+                if (key.startsWith('blobstore/inlays/')) payloadReads += 1
                 if (key === throwReadKey) {
                     throwReadKey = undefined
                     throw new Error('verification read failed')
@@ -56,7 +64,10 @@ vi.mock('localforage', () => ({
             removeItem: vi.fn(async (key: string) => {
                 store.delete(key)
             }),
-            keys: vi.fn(async () => [...store.keys()]),
+            keys: vi.fn(async () => {
+                if (options?.name === 'inlay') legacyKeyLists += 1
+                return [...store.keys()]
+            }),
             iterate: vi.fn(async (cb: (value: unknown, key: string) => void) => {
                 for (const [key, value] of store) {
                     cb(value, key)
@@ -117,6 +128,9 @@ beforeEach(() => {
     store.clear()
     corruptReadKey = undefined
     throwReadKey = undefined
+    payloadReads = 0
+    legacyReads = 0
+    legacyKeyLists = 0
 })
 
 describe('setInlayAsset', () => {
@@ -281,6 +295,83 @@ describe('listInlayAssets', () => {
             ['id-a', { name: 'a.png' }],
             ['id-b', { name: 'b.mp3' }],
         ])
+    })
+})
+
+describe('native inlay rendering', () => {
+    test('lists native metadata without reading or enumerating the legacy store', async () => {
+        store.set('legacy-id', {
+            data: new Blob(['legacy'], { type: 'image/webp' }),
+            ext: 'webp',
+            name: 'legacy.webp',
+            type: 'image',
+        } satisfies InlayAsset)
+        store.set('blobstore/inlays/6e65772d6964.bin', new Uint8Array([1]))
+        store.set('blobstore/metadata/6e65772d6964.json', new TextEncoder().encode(JSON.stringify({
+            key: 'new-id', kind: 'inlay', size: 1, mime: 'image/png', name: 'new.png', ext: 'png',
+            inlayType: 'image',
+        })))
+
+        await expect(listInlayAssetMetadata({ migrateLegacy: false })).resolves.toMatchObject([{ key: 'new-id' }])
+        expect(legacyReads).toBe(0)
+        expect(legacyKeyLists).toBe(0)
+        expect(payloadReads).toBe(0)
+    })
+
+    test('migrates legacy entries once before returning metadata-only listings', async () => {
+        store.set('legacy-id', {
+            data: new Blob(['legacy'], { type: 'image/webp' }),
+            ext: 'webp',
+            height: 2,
+            width: 3,
+            name: 'legacy.webp',
+            type: 'image',
+        } satisfies InlayAsset)
+
+        await expect(listInlayAssetMetadata()).resolves.toEqual([{
+            key: 'legacy-id', kind: 'inlay', size: 6, mime: 'image/webp', name: 'legacy.webp', ext: 'webp',
+            inlayType: 'image', width: 3, height: 2,
+        }])
+        expect(payloadReads).toBeGreaterThan(0)
+
+        payloadReads = 0
+        await expect(listInlayAssetMetadata()).resolves.toHaveLength(1)
+        expect(payloadReads).toBe(0)
+    })
+
+    test('lists metadata without reading payload bytes', async () => {
+        store.set('blobstore/inlays/69642d61.bin', new Uint8Array([1, 2, 3]))
+        store.set('blobstore/metadata/69642d61.json', new TextEncoder().encode(JSON.stringify({
+            key: 'id-a', kind: 'inlay', size: 3, mime: 'image/png', name: 'a.png', ext: 'png',
+            inlayType: 'image', width: 2, height: 1,
+        })))
+        const result = await listInlayAssetMetadata()
+        expect(result).toEqual([{
+            key: 'id-a', kind: 'inlay', size: 3, mime: 'image/png', name: 'a.png', ext: 'png',
+            inlayType: 'image', width: 2, height: 1,
+        }])
+        expect(payloadReads).toBe(0)
+    })
+
+    test('returns a render URL without reading the payload', async () => {
+        store.set('blobstore/inlays/69642d61.bin', new Uint8Array([1, 2, 3]))
+        store.set('blobstore/metadata/69642d61.json', new TextEncoder().encode(JSON.stringify({
+            key: 'id-a', kind: 'inlay', size: 3, mime: 'image/png', name: 'a.png', ext: 'png', inlayType: 'image',
+        })))
+        const blobStore = createBackedBlobStore({
+            write: async () => {},
+            read: async (key) => {
+                if (key.startsWith('blobstore/inlays/')) payloadReads += 1
+                return store.get(key) as Uint8Array | null ?? null
+            },
+            keys: async () => [...store.keys()],
+            remove: async () => {},
+            resolveUrl: async (key) => `asset://${key}`,
+        })
+        await expect(getInlayAssetRenderUrl('id-a', 256, blobStore)).resolves.toBe(
+            'asset://blobstore/inlays/69642d61.bin?thumb=256',
+        )
+        expect(payloadReads).toBe(0)
     })
 })
 

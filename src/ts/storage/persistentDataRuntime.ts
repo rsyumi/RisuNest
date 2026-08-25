@@ -1,19 +1,53 @@
-import type { Chat, Database, character, groupChat } from './database.svelte'
+import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import { ActiveWorkingSet, type CharacterActivationOptions } from './activeWorkingSet.svelte'
-import type { DataRevision, PersistentDataStore } from './persistentDataStore'
+import type {
+    CharacterDetail,
+    DataRevision,
+    PersistentDataStore,
+    PersistentRoot,
+} from './persistentDataStore'
 import {
     SaveCoordinator,
     type CharacterAdditionRequest,
     type OfficialRevisionPublisher,
+    type PersistentPresetMutation,
+    type PersistentPresetMutationResult,
+    type PersistentCharacterDetailMutation,
+    type PersistentCharacterMutationResult,
+    type PersistentDatabaseSnapshot,
+    type PersistentMutationToken,
+    type PersistentSelectedConversation,
+    type PersistentCompleteCharacterMutation,
+    type PersistentCompleteCharacterUpsert,
+    type PersistentCompleteCharacterUpsertOptions,
+    type PersistentReplacementOptions,
     type SaveCoordinatorClock,
 } from './saveCoordinator'
+import {
+    type WorkingSetResidencyRegistry,
+    workingSetResidency,
+} from './workingSetResidency'
+import {
+    createCatalogCharacterStub,
+    getCatalogCharacterMetadata,
+    hasIncompletePersistentWorkingSet,
+    isCatalogCharacterStub,
+    isCatalogPresetWorkingSet,
+    patchWorkingSetCharacterDetail,
+} from './workingSetCatalog'
 
 type CompleteCharacter = character | groupChat
-type RootDatabase = Omit<Database, 'characters'>
+type RootDatabase = PersistentRoot
 
 export function capturePersistentRoot(database: Database): RootDatabase {
-    const { characters: _characters, ...root } = database
+    const { characters: _characters, botPresets: _botPresets, ...root } = database
     return root
+}
+
+export function capturePersistentPresets(database: Database): botPreset[] | null {
+    const presets = database.botPresets ?? []
+    if (isCatalogPresetWorkingSet(presets)) return null
+    return presets
 }
 
 export function captureSelectedPersistentCharacter(
@@ -23,14 +57,142 @@ export function captureSelectedPersistentCharacter(
     return database.characters[selectedIndex] ?? null
 }
 
+export function restoreStableWorkingSetSelection(
+    database: Database,
+    characterId: string | null,
+    conversationId: string | null,
+    selectCharacterIndex: (index: number) => void,
+): void {
+    if (!characterId) {
+        selectCharacterIndex(-1)
+        return
+    }
+    const characterIndex = database.characters.findIndex(
+        (candidate) => candidate.chaId === characterId,
+    )
+    if (characterIndex < 0) {
+        selectCharacterIndex(-1)
+        return
+    }
+    const character = database.characters[characterIndex]
+    if (conversationId) {
+        const conversationIndex = character.chats.findIndex(
+            (candidate) => candidate.id === conversationId,
+        )
+        if (conversationIndex >= 0) character.chatPage = conversationIndex
+    }
+    selectCharacterIndex(characterIndex)
+}
+
+export function captureResidentPersistentCharacter(
+    database: Database,
+    id: string,
+    residency: WorkingSetResidencyRegistry = workingSetResidency,
+): CompleteCharacter | null {
+    if (residency.isCharacterReleased(id)) return null
+    const character = database.characters.find((candidate) => candidate.chaId === id) ?? null
+    if (character && isCatalogCharacterStub(character)) return null
+    return character
+}
+
+export function publishPersistentCharacterMutationToWorkingSet(
+    database: Database,
+    state: PersistentCharacterMutationResult,
+    residency: WorkingSetResidencyRegistry,
+    selectedIndex: number,
+    selectCharacterIndex: (index: number) => void,
+): void {
+    Object.assign(database, state.root)
+    const index = database.characters.findIndex(
+        (candidate) => candidate.chaId === state.characterId,
+    )
+    if (state.kind === 'delete') {
+        const selected = database.characters[selectedIndex]
+        if (
+            selected?.type === 'group' &&
+            Array.isArray(selected.characters) &&
+            selected.chaId !== state.characterId
+        ) {
+            const retainedIndices = selected.characters
+                .map((id, memberIndex) => ({ id, memberIndex }))
+                .filter(({ id }) => id !== state.characterId)
+            selected.characters = retainedIndices.map(({ id }) => id)
+            selected.characterTalks = retainedIndices.map(
+                ({ memberIndex }) => selected.characterTalks?.[memberIndex] ?? 1 / 6 * 4,
+            )
+            selected.characterActive = retainedIndices.map(
+                ({ memberIndex }) => selected.characterActive?.[memberIndex] ?? true,
+            )
+        }
+        if (index >= 0) database.characters.splice(index, 1)
+        residency.forgetCharacter(state.characterId)
+        if (selectedIndex === index) selectCharacterIndex(-1)
+        else if (index >= 0 && selectedIndex > index) selectCharacterIndex(selectedIndex - 1)
+        return
+    }
+    if (!state.character) return
+    if (state.kind === 'detail') {
+        if (index >= 0) patchWorkingSetCharacterDetail(database.characters[index], state.character)
+        return
+    }
+
+    const complete = state.character as CompleteCharacter
+    const keepBounded = residency.allowsEviction && (
+        state.kind === 'add' ||
+        index < 0 ||
+        isCatalogCharacterStub(database.characters[index]) ||
+        residency.isCharacterReleased(state.characterId)
+    )
+    if (keepBounded) {
+        const configuredIndex = index >= 0
+            ? getCatalogCharacterMetadata(database.characters[index])?.configuredIndex ?? index
+            : database.characters.length
+        const stub = createCatalogCharacterStub({
+            id: complete.chaId,
+            name: complete.name,
+            image: complete.image,
+            configuredIndex,
+            recentAt: complete.lastInteraction ?? 0,
+            trashed: complete.trashTime !== undefined,
+            conversationCount: complete.chats.length,
+            type: complete.type,
+            creatorNotes: complete.creatorNotes,
+            trashTime: complete.trashTime,
+        })
+        if (index < 0) database.characters.push(stub)
+        else database.characters[index] = stub
+        residency.markCharacterReleased(state.characterId)
+        return
+    }
+    if (index < 0) database.characters.push(complete)
+    else database.characters[index] = complete
+    residency.markCharacterHydrated(state.characterId)
+}
+
 export interface PersistentDataRuntimeStateAdapter {
     captureRoot(): RootDatabase
+    capturePresets?(): botPreset[] | null
     captureSelectedCharacter(): CompleteCharacter | null
     captureCharacter(id: string): CompleteCharacter | null
     getSelectedCharacterId(): string | null | undefined
-    replaceDatabase(database: Database): void
+    getSelectedConversationId?(): string | null | undefined
+    replaceDatabase(
+        database: Database,
+        activeCharacterIds?: ReadonlySet<string>,
+        forceScalableProjection?: boolean,
+    ): void
+    publishPresetWorkingSet?(state: PersistentPresetMutationResult): void
+    publishCharacterMutation?(state: PersistentCharacterMutationResult): void
+    installCompleteDatabase?(database: Database): void
+    restoreSelection?(characterId: string | null, conversationId: string | null): void
     publishCharacter(character: CompleteCharacter): void
+    publishCharacterSet?(primary: CompleteCharacter, related: CompleteCharacter[]): void
     publishConversation(characterId: string, conversation: Chat): void
+    canActivateWorkingSet?(): boolean
+    canDeactivateWorkingSet?(): boolean
+    canDeactivateCharacter?(id: string): boolean
+    releaseInactiveCharacter?(id: string): void
+    releaseInactiveCharacters?(selectedId: string | null, activeIds?: ReadonlySet<string>): void
 }
 
 export interface PersistentDataRuntimeDependencies {
@@ -55,9 +217,113 @@ export interface PersistentDataRuntime {
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void>
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
-    replacePersistentDatabase(database: Database, reason: string): Promise<void>
+    deactivateActiveWorkingSet(): Promise<boolean>
+    reconcileActiveCharacterIds(
+        database: Database,
+        selectedCharacterId: string | null,
+    ): ReadonlySet<string>
+    getNavigationGeneration(): number
+    invalidateNavigation(): void
+    replacePersistentDatabase(
+        database: Database,
+        reason: string,
+        options?: PersistentReplacementOptions,
+    ): Promise<void>
+    mutatePersistentPresets(reason: string, mutate: PersistentPresetMutation): Promise<void>
+    mutatePersistentCharacterDetail(
+        characterId: string,
+        reason: string,
+        mutate: PersistentCharacterDetailMutation,
+    ): Promise<boolean>
+    replacePersistentCompleteCharacter(
+        characterId: string,
+        reason: string,
+        mutate: PersistentCompleteCharacterMutation,
+    ): Promise<boolean>
+    upsertPersistentCompleteCharacter(
+        characterId: string,
+        reason: string,
+        createOrMutate: PersistentCompleteCharacterUpsert,
+        options?: PersistentCompleteCharacterUpsertOptions,
+    ): Promise<boolean>
+    readPersistentCharacterDetail(characterId: string, reason: string): Promise<CharacterDetail | null>
+    readPersistentCompleteCharacter(
+        characterId: string,
+        reason: string,
+    ): Promise<CompleteCharacter | null>
+    readPersistentConversation(
+        characterId: string,
+        conversationId: string,
+        reason: string,
+    ): Promise<Chat | null>
+    readPersistentConversationAt(
+        characterId: string,
+        orderedPosition: number,
+        reason: string,
+    ): Promise<Chat | null>
+    readPersistentSelectedConversation(
+        characterId: string,
+        reason: string,
+    ): Promise<PersistentSelectedConversation | null>
+    capturePersistentMutationToken(reason: string): Promise<PersistentMutationToken>
+    materializePersistentDatabaseSnapshot(reason: string): Promise<Database>
+    materializePersistentDatabaseSnapshotWithRevision(
+        reason: string,
+    ): Promise<PersistentDatabaseSnapshot>
+    materializeMaximumCompatibilityWorkingSet(): Promise<void>
+    releaseInactiveWorkingSet(
+        canRelease?: () => boolean | Promise<boolean>,
+        isCurrent?: () => boolean,
+    ): Promise<boolean>
     publishCurrentOfficialRevision(): Promise<void>
     hasPendingOfficialPublication(): boolean
+}
+
+export interface MaximumCompatibilityWorkingSetDependencies {
+    getSelectedCharacterId(): string | null | undefined
+    getSelectedConversationId(): string | null | undefined
+    flushPendingData(): Promise<void>
+    getRevision(): DataRevision
+    getMutationGeneration(): number
+    getNavigationGeneration(): number
+    materializeDatabase(revision: DataRevision): Promise<Database>
+    installCompleteDatabase(database: Database): void
+    restoreSelection(characterId: string | null, conversationId: string | null): void
+    adoptMaterializedDatabase(
+        revision: DataRevision,
+        mutationGeneration: number,
+        database: Database,
+    ): boolean
+}
+
+const MAXIMUM_COMPATIBILITY_MATERIALIZATION_ATTEMPTS = 3
+
+export async function installMaximumCompatibilityWorkingSet(
+    dependencies: MaximumCompatibilityWorkingSetDependencies,
+): Promise<void> {
+    for (let attempt = 0; attempt < MAXIMUM_COMPATIBILITY_MATERIALIZATION_ATTEMPTS; attempt++) {
+        await dependencies.flushPendingData()
+        const revision = dependencies.getRevision()
+        const mutationGeneration = dependencies.getMutationGeneration()
+        const navigationGeneration = dependencies.getNavigationGeneration()
+        const selectedCharacterId = dependencies.getSelectedCharacterId() ?? null
+        const selectedConversationId = dependencies.getSelectedConversationId() ?? null
+        const database = await dependencies.materializeDatabase(revision)
+        if (
+            revision !== dependencies.getRevision() ||
+            mutationGeneration !== dependencies.getMutationGeneration() ||
+            navigationGeneration !== dependencies.getNavigationGeneration() ||
+            selectedCharacterId !== (dependencies.getSelectedCharacterId() ?? null) ||
+            selectedConversationId !== (dependencies.getSelectedConversationId() ?? null)
+        ) continue
+        if (!dependencies.adoptMaterializedDatabase(revision, mutationGeneration, database)) {
+            continue
+        }
+        dependencies.installCompleteDatabase(database)
+        dependencies.restoreSelection(selectedCharacterId, selectedConversationId)
+        return
+    }
+    throw new Error('Working set changed during maximum compatibility materialization')
 }
 
 function createDynamicOfficialPublisher(
@@ -84,9 +350,21 @@ export function createPersistentDataRuntime(
     const coordinator = new SaveCoordinator({
         store: dependencies.store,
         captureRoot: dependencies.state.captureRoot,
+        capturePresets: dependencies.state.capturePresets,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         captureCharacter: dependencies.state.captureCharacter,
-        replaceDatabase: dependencies.state.replaceDatabase,
+        replaceDatabase: (database) => {
+            const activeCharacterIds = workingSet.reconcileActiveCharacterIds(
+                database,
+                dependencies.state.getSelectedCharacterId() ?? null,
+            )
+            dependencies.state.replaceDatabase(database, activeCharacterIds)
+        },
+        publishPresetWorkingSet: dependencies.state.publishPresetWorkingSet,
+        publishCharacterMutation: dependencies.state.publishCharacterMutation,
+        isIncompleteWorkingSet: (database) =>
+            hasIncompletePersistentWorkingSet(database, workingSetResidency),
+        getNavigationGeneration: () => workingSet.navigationGenerationToken,
         officialPublisher: dependencies.officialPublisher || dependencies.getOfficialPublisher
             ? createDynamicOfficialPublisher(
                 dependencies.getOfficialPublisher
@@ -104,7 +382,15 @@ export function createPersistentDataRuntime(
         coordinator,
         getSelectedCharacterId: dependencies.state.getSelectedCharacterId,
         publishCharacter: dependencies.state.publishCharacter,
+        publishCharacterSet: dependencies.state.publishCharacterSet ?? ((primary, related) => {
+            for (const character of related) dependencies.state.publishCharacter(character)
+            dependencies.state.publishCharacter(primary)
+        }),
         publishConversation: dependencies.state.publishConversation,
+        canActivateWorkingSet: dependencies.state.canActivateWorkingSet,
+        canDeactivateWorkingSet: dependencies.state.canDeactivateWorkingSet,
+        canDeactivateCharacter: dependencies.state.canDeactivateCharacter,
+        releaseInactiveCharacter: dependencies.state.releaseInactiveCharacter,
     })
     const activateCharacter = (
         id: string,
@@ -135,9 +421,106 @@ export function createPersistentDataRuntime(
             coordinator.commitCharacterAddition(request, reason),
         activateCharacter,
         activateConversation: (id) => workingSet.activateConversation(id),
-        async replacePersistentDatabase(database, reason) {
-            const prepared = await dependencies.prepareDatabase(database)
-            await coordinator.replacePersistentDatabase(prepared, reason)
+        deactivateActiveWorkingSet: () => workingSet.deactivate(),
+        reconcileActiveCharacterIds: (database, selectedCharacterId) =>
+            workingSet.reconcileActiveCharacterIds(database, selectedCharacterId),
+        getNavigationGeneration: () => workingSet.navigationGenerationToken,
+        invalidateNavigation: () => workingSet.invalidateNavigation(),
+        replacePersistentDatabase: (database, reason, options) => {
+            if (
+                !options?.authoritative &&
+                hasIncompletePersistentWorkingSet(database, workingSetResidency)
+            ) {
+                return Promise.reject(
+                    new Error(
+                        'Cannot replace persistent data from an incomplete persistent working set',
+                    ),
+                )
+            }
+            return coordinator.replacePreparedPersistentDatabase(
+                () => dependencies.prepareDatabase(database),
+                reason,
+                options,
+            )
+        },
+        mutatePersistentPresets: (reason, mutate) =>
+            coordinator.mutatePersistentPresets(reason, mutate),
+        mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
+            coordinator.mutatePersistentCharacterDetail(characterId, reason, mutate),
+        replacePersistentCompleteCharacter: (characterId, reason, mutate) =>
+            coordinator.replacePersistentCompleteCharacter(characterId, reason, mutate),
+        upsertPersistentCompleteCharacter: (characterId, reason, createOrMutate, options) =>
+            coordinator.upsertPersistentCompleteCharacter(
+                characterId,
+                reason,
+                createOrMutate,
+                options,
+            ),
+        readPersistentCharacterDetail: (characterId, reason) =>
+            coordinator.readPersistentCharacterDetail(characterId, reason),
+        readPersistentCompleteCharacter: (characterId, reason) =>
+            coordinator.readPersistentCompleteCharacter(characterId, reason),
+        readPersistentConversation: (characterId, conversationId, reason) =>
+            coordinator.readPersistentConversation(characterId, conversationId, reason),
+        readPersistentConversationAt: (characterId, orderedPosition, reason) =>
+            coordinator.readPersistentConversationAt(characterId, orderedPosition, reason),
+        readPersistentSelectedConversation: (characterId, reason) =>
+            coordinator.readPersistentSelectedConversation(characterId, reason),
+        capturePersistentMutationToken: (reason) =>
+            coordinator.capturePersistentMutationToken(reason),
+        materializePersistentDatabaseSnapshot: (reason) =>
+            coordinator.materializePersistentDatabaseSnapshot(reason),
+        materializePersistentDatabaseSnapshotWithRevision: (reason) =>
+            coordinator.materializePersistentDatabaseSnapshotWithRevision(reason),
+        materializeMaximumCompatibilityWorkingSet: () =>
+            installMaximumCompatibilityWorkingSet({
+                getSelectedCharacterId: dependencies.state.getSelectedCharacterId,
+                getSelectedConversationId: () =>
+                    dependencies.state.getSelectedConversationId?.() ?? null,
+                flushPendingData: () => coordinator.flushPendingData('plugin-maximum-compatibility'),
+                getRevision: () => coordinator.revision,
+                getMutationGeneration: () => coordinator.mutationGeneration,
+                getNavigationGeneration: () => workingSet.navigationGenerationToken,
+                materializeDatabase: (revision) => dependencies.store.materializeDatabase(revision),
+                installCompleteDatabase: (database) =>
+                    (dependencies.state.installCompleteDatabase
+                        ?? dependencies.state.replaceDatabase)(database),
+                restoreSelection: (characterId, conversationId) =>
+                    dependencies.state.restoreSelection?.(characterId, conversationId),
+                adoptMaterializedDatabase: (revision, mutationGeneration, database) =>
+                    coordinator.adoptMaterializedDatabase(revision, mutationGeneration, database),
+            }),
+        async releaseInactiveWorkingSet(canRelease, isCurrent) {
+            const snapshot = await coordinator.materializePersistentDatabaseSnapshotWithRevision(
+                'plugin-scalable-working-set',
+            )
+            const selectedCharacterId = dependencies.state.getSelectedCharacterId() ?? null
+            const selectedConversationId =
+                dependencies.state.getSelectedConversationId?.() ?? null
+            const navigationGeneration = workingSet.navigationGenerationToken
+            const releaseAllowed = canRelease ? await canRelease() : true
+            if (
+                !releaseAllowed ||
+                isCurrent?.() === false ||
+                snapshot.revision !== coordinator.revision ||
+                snapshot.mutationGeneration !== coordinator.mutationGeneration ||
+                navigationGeneration !== workingSet.navigationGenerationToken ||
+                selectedCharacterId !==
+                    (dependencies.state.getSelectedCharacterId() ?? null) ||
+                selectedConversationId !==
+                    (dependencies.state.getSelectedConversationId?.() ?? null)
+            ) return false
+            const activeCharacterIds = workingSet.reconcileActiveCharacterIds(
+                snapshot.database,
+                selectedCharacterId,
+            )
+            dependencies.state.replaceDatabase(
+                snapshot.database,
+                activeCharacterIds,
+                true,
+            )
+            dependencies.state.restoreSelection?.(selectedCharacterId, selectedConversationId)
+            return true
         },
         publishCurrentOfficialRevision: () => coordinator.publishCurrentOfficialRevision(),
         hasPendingOfficialPublication: () => coordinator.hasPendingOfficialPublication,

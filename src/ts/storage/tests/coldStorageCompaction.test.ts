@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import { compactColdStorageDatabase } from '../coldStorageCompaction'
+import { createCatalogCharacterStub } from '../workingSetCatalog'
 
 function fixtureDatabase(): Database {
     return {
@@ -135,6 +136,36 @@ describe('compactColdStorageDatabase', () => {
 
         const changed = await compactColdStorageDatabase(live, {
             now,
+            createId: () => 'unused',
+            write,
+            read,
+            replaceDatabase,
+        })
+
+        expect(changed).toBe(false)
+        expect(write).not.toHaveBeenCalled()
+        expect(read).not.toHaveBeenCalled()
+        expect(replaceDatabase).not.toHaveBeenCalled()
+    })
+
+    it('skips maintenance before cloning an incomplete catalog working set', async () => {
+        const live = fixtureDatabase()
+        live.botPresets = []
+        live.characters = [createCatalogCharacterStub({
+            id: 'character-1',
+            type: 'character',
+            name: 'Archived character',
+            configuredIndex: 0,
+            recentAt: 1,
+            trashed: false,
+            conversationCount: 1,
+        })]
+        const write = vi.fn(async () => true)
+        const read = vi.fn(async () => null)
+        const replaceDatabase = vi.fn(async () => undefined)
+
+        const changed = await compactColdStorageDatabase(live, {
+            now: 20 * 24 * 60 * 60 * 1000,
             createId: () => 'unused',
             write,
             read,

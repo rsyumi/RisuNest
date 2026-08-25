@@ -1,7 +1,18 @@
 <script lang="ts">
     import { alertCardExport, alertConfirm, alertError } from "../../ts/alert";
     import { language } from "../../lang";
-    import { changeToPreset, copyPreset, downloadPreset, importPreset } from "../../ts/storage/database.svelte";
+    import {
+        addPreset,
+        changeToPreset,
+        copyPreset,
+        downloadPreset,
+        importPreset,
+        movePreset,
+        readPresetBodies,
+        removePreset,
+        renamePreset,
+        type botPreset,
+    } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { CopyIcon, Share2Icon, PencilIcon, HardDriveUploadIcon, PlusIcon, TrashIcon, XIcon, GitCompare } from "@lucide/svelte";
     import TextInput from "../UI/GUI/TextInput.svelte";
@@ -24,29 +35,8 @@
     let selectedDiffPreset = $state<number | null>(null)
     let firstPresetId = $state<number | null>(null);
     let secondPresetId = $state<number | null>(null);
-
-    function movePreset(fromIndex: number, toIndex: number) {
-        if (fromIndex === toIndex) return;
-        if (fromIndex < 0 || toIndex < 0 || fromIndex >= DBState.db.botPresets.length || toIndex > DBState.db.botPresets.length) return;
-
-        let botPresets = [...DBState.db.botPresets];
-        const movedItem = botPresets.splice(fromIndex, 1)[0];
-        if (!movedItem) return;
-
-        const adjustedToIndex = fromIndex < toIndex ? toIndex - 1 : toIndex;
-        botPresets.splice(adjustedToIndex, 0, movedItem);
-
-        const currentId = DBState.db.botPresetsId;
-        if (currentId === fromIndex) {
-            DBState.db.botPresetsId = adjustedToIndex;
-        } else if (fromIndex < currentId && adjustedToIndex >= currentId) {
-            DBState.db.botPresetsId = currentId - 1;
-        } else if (fromIndex > currentId && adjustedToIndex <= currentId) {
-            DBState.db.botPresetsId = currentId + 1;
-        }
-
-        DBState.db.botPresets = botPresets;
-    }
+    let firstDiffPreset = $state<botPreset | null>(null)
+    let secondDiffPreset = $state<botPreset | null>(null)
 
     function isPresetDrag(e: DragEvent) {
         return e.dataTransfer?.types.includes(RISU_PRESET_DRAG_TYPE) ?? false;
@@ -58,14 +48,15 @@
         e.dataTransfer.setData(RISU_PRESET_DRAG_TYPE, index.toString());
     }
 
-    function handlePresetDrop(targetIndex: number, e: DragEvent) {
+    async function handlePresetDrop(targetIndex: number, e: DragEvent) {
         if (!isPresetDrag(e)) {
             return;
         }
         e.preventDefault();
         e.stopPropagation();
         const sourceIndex = parseInt(e.dataTransfer?.getData(RISU_PRESET_DRAG_TYPE) || '0');
-        movePreset(sourceIndex, targetIndex);
+        if (sourceIndex === targetIndex) return
+        await movePreset(sourceIndex, targetIndex);
     }
 
 
@@ -87,7 +78,15 @@
 
         secondPresetId = id
         selectedDiffPreset = null
-        showDiffModal = true
+        try {
+            [firstDiffPreset, secondDiffPreset] = await readPresetBodies([
+                firstPresetId!,
+                secondPresetId,
+            ])
+            showDiffModal = true
+        } catch (error) {
+            alertError(error instanceof Error ? error.message : String(error))
+        }
     }
 
     function closeDiff() {
@@ -95,6 +94,8 @@
         firstPresetId = null;
         secondPresetId = null;
         selectedDiffPreset = null;
+        firstDiffPreset = null;
+        secondDiffPreset = null;
     }
 
 </script>
@@ -129,15 +130,15 @@
                 ondragleave={(e) => {
                     dragOverIndex = -1
                 }}
-                ondrop={(e) => {
-                    handlePresetDrop(i, e)
+                ondrop={async (e) => {
+                    await handlePresetDrop(i, e)
                     dragOverIndex = -1
                 }}>
             </div>
             
-            <button onclick={() => {
+            <button onclick={async () => {
                 if(!editMode){
-                    changeToPreset(i)
+                    await changeToPreset(i)
                     close()
                 }
             }} 
@@ -184,12 +185,14 @@
                     dragOverIndex = i + 1
                 }
             }}
-            ondrop={(e) => {
-                handlePresetDrop(dragOverIndex, e)
+            ondrop={async (e) => {
+                await handlePresetDrop(dragOverIndex, e)
                 dragOverIndex = -1
             }}>
                 {#if editMode}
-                    <TextInput bind:value={DBState.db.botPresets[i].name} placeholder="string" padding={false}/>
+                    <TextInput value={preset.name} onchange={async (event) => {
+                        await renamePreset(i, event.currentTarget.value)
+                    }} placeholder="string" padding={false}/>
                 {:else}
                     {#if i < 9}
                         <span class="w-2 text-center mr-2 text-textcolor2">{i + 1}</span>
@@ -213,9 +216,9 @@
                             <GitCompare size={18}/>
                         </div>
                     {/if}
-                    <div class="text-textcolor2 hover:text-green-500 cursor-pointer mr-2" role="button" tabindex="0" onclick={(e) => {
+                    <div class="text-textcolor2 hover:text-green-500 cursor-pointer mr-2" role="button" tabindex="0" onclick={async (e) => {
                         e.stopPropagation()
-                        copyPreset(i)
+                        await copyPreset(i)
                     }} onkeydown={(e) => {
                         if(e.key === 'Enter' && e.currentTarget instanceof HTMLElement){
                             e.currentTarget.click()
@@ -228,7 +231,7 @@
                         const data = await alertCardExport('preset')
                         console.log(data.type)
                         if(data.type === ''){
-                            downloadPreset(i, 'risupreset')
+                            await downloadPreset(i, 'risupreset')
                         }
                         if(data.type === 'realm'){
                             $ShowRealmFrameStore = `preset:${i}`
@@ -249,11 +252,7 @@
                         }
                         const d = await alertConfirm(`${language.removeConfirm}${preset.name}`)
                         if(d){
-                            changeToPreset(0)
-                            let botPresets = DBState.db.botPresets
-                            botPresets.splice(i, 1)
-                            DBState.db.botPresets = botPresets
-                            changeToPreset(0, false)
+                            await removePreset(i)
                         }
                     }} onkeydown={(e) => {
                         if(e.key === 'Enter' && e.currentTarget instanceof HTMLElement){
@@ -285,25 +284,22 @@
             ondragleave={(e) => {
                 dragOverIndex = -1
             }}
-            ondrop={(e) => {
-                handlePresetDrop(DBState.db.botPresets.length, e)
+            ondrop={async (e) => {
+                await handlePresetDrop(DBState.db.botPresets.length, e)
                 dragOverIndex = -1
             }}>
         </div>
         
         <div class="flex mt-2 items-center">
-            <button class="text-textcolor2 hover:text-green-500 cursor-pointer mr-1" onclick={() => {
-                let botPresets = DBState.db.botPresets
-                let newPreset = safeStructuredClone(prebuiltPresets.OAI2)
+            <button class="text-textcolor2 hover:text-green-500 cursor-pointer mr-1" onclick={async () => {
+                const newPreset = structuredClone(prebuiltPresets.OAI2)
                 newPreset.name = `New Preset`
-                botPresets.push(newPreset)
-
-                DBState.db.botPresets = botPresets
+                await addPreset(newPreset)
             }}>
                 <PlusIcon/>
             </button>
-            <button class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer" onclick={() => {
-                importPreset()
+            <button class="text-textcolor2 hover:text-green-500 mr-2 cursor-pointer" onclick={async () => {
+                await importPreset()
             }}>
                 <HardDriveUploadIcon size={18}/>
             </button>
@@ -317,10 +313,10 @@
     </div>
 </div>
 
-{#if showDiffModal && firstPresetId !== null && secondPresetId !== null}
+{#if showDiffModal && firstDiffPreset !== null && secondDiffPreset !== null}
   <PromptDiffModal
-    firstPresetId={firstPresetId}
-    secondPresetId={secondPresetId}
+    firstPreset={firstDiffPreset}
+    secondPreset={secondDiffPreset}
     onClose={closeDiff}
   />
 {/if}

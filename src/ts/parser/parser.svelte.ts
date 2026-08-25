@@ -12,6 +12,7 @@ import { selectedCharID } from '../stores.svelte';
 import { calcString } from '../process/infunctions';
 import { findCharacterbyId, getPersonaPrompt, getUserIcon, getUserName, pickHashRand, replaceAsync} from '../util';
 import { getInlayAssetBlob } from '../process/files/inlays';
+import { getInlayRenderSources, renderInlaySourceMarkup, type InlayRenderSource } from '../process/files/inlayRenderSource';
 import { getModuleAssets, getModuleLorebooks, getModules } from '../process/modules';
 import hljs from 'highlight.js/lib/core'
 import 'highlight.js/styles/atom-one-dark.min.css'
@@ -666,32 +667,53 @@ const blobUrlCache = new Map<string, string>()
 async function parseInlayAssets(data:string){
     const inlayMatch = data.match(/{{(inlay|inlayed|inlayeddata)::(.+?)}}/g)
     if(inlayMatch){
+        const nativeSources = isTauri
+            ? await getInlayRenderSources(inlayMatch.map((inlay) => inlay.substring(inlay.indexOf('::') + 2, inlay.length - 2)), true)
+            : null
         for(const inlay of inlayMatch){
             const inlayType = inlay.startsWith('{{inlayed') ? 'inlayed' : 'inlay'
             const id = inlay.substring(inlay.indexOf('::') + 2, inlay.length - 2)
             let prefix = inlayType !== 'inlay' ? `<div class="risu-inlay-image">` : ''
             let postfix = inlayType !== 'inlay' ? `</div>\n\n` : ''
 
-            const asset = await getInlayAssetBlob(id)
-            let url = blobUrlCache.get(id)
-            if(!url && asset?.data){
-                url = URL.createObjectURL(asset.data)
-                blobUrlCache.set(id, url)
-            } 
-            switch(asset?.type){
+            let source: InlayRenderSource | null = null
+            if(isTauri){
+                source = nativeSources?.get(id) ?? null
+            }
+            else{
+                const asset = await getInlayAssetBlob(id)
+                let url = blobUrlCache.get(id)
+                if(!url && asset?.data){
+                    url = URL.createObjectURL(asset.data)
+                    blobUrlCache.set(id, url)
+                }
+                if(asset && url){
+                    source = {
+                        url,
+                        mime: asset.data.type,
+                        type: asset.type,
+                        name: asset.name,
+                        size: asset.data.size,
+                        width: asset.width,
+                        height: asset.height,
+                        objectUrl: true,
+                    }
+                }
+            }
+            switch(source?.type){
                 case 'image':
                     // Hide inlay images when hideAllImages is enabled
                     if(DBState.db.hideAllImages){
                         data = data.replace(inlay, '')
                         break
                     }
-                    data = data.replace(inlay, `${prefix}<img src="${url}"/>${postfix}`)
+                    data = data.replace(inlay, `${prefix}${renderInlaySourceMarkup(source)}${postfix}`)
                     break
                 case 'video':
-                    data = data.replace(inlay, `${prefix}<video controls><source src="${url}" type="video/mp4"></video>${postfix}`)
+                    data = data.replace(inlay, `${prefix}${renderInlaySourceMarkup(source)}${postfix}`)
                     break
                 case 'audio':
-                    data = data.replace(inlay, `${prefix}<audio controls><source src="${url}" type="audio/mpeg"></audio>${postfix}`)
+                    data = data.replace(inlay, `${prefix}${renderInlaySourceMarkup(source)}${postfix}`)
                     break
             }
             

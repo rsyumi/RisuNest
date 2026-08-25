@@ -42,13 +42,15 @@ function makeHarness(input: {
     }
     const dependencies: OfficialAccountBootstrapDependencies = {
         isTauri: false,
-        local: { database: local, revision: 1 },
-        store: {
-            materializeDatabase: vi.fn(async () => {
-                events.push('materialize')
-                return structuredClone(input.materialized ?? local)
-            }),
-        },
+        local: { database: local, revision: 1, profile: 'scalable-v3' },
+        resolveWorkingSet: vi.fn(async (revision) => {
+            events.push('resolve')
+            return {
+                database: structuredClone(input.materialized ?? local),
+                revision,
+                profile: 'scalable-v3' as const,
+            }
+        }),
         adapter,
         readRemoteDatabase: vi.fn(async (): Promise<AccountReadResult> =>
             input.remoteRead ?? { kind: 'missing' }),
@@ -69,6 +71,7 @@ function makeHarness(input: {
         }),
         chooseExistingRemote: vi.fn(async (): Promise<'pull' | 'push'> => 'pull'),
         confirmInitialPush: vi.fn(async () => true),
+        initializeProfile: vi.fn(() => { events.push('profile') }),
         installDatabase: vi.fn(() => { events.push('install') }),
         initializeWorkingSet: vi.fn(async () => { events.push('initialize') }),
         onRemoteError: vi.fn((error) => { events.push(`error:${(error as Error).message}`) }),
@@ -91,6 +94,39 @@ describe('official account production bootstrap', () => {
         expect(dispose).toHaveBeenCalledOnce()
     })
 
+    it('preserves the publish error when publish and dispose both fail', async () => {
+        const publishError = new Error('publish failed')
+        const disposeError = new Error('dispose failed')
+        const publication = {
+            publish: vi.fn(async () => { throw publishError }),
+            dispose: vi.fn(async () => { throw disposeError }),
+        }
+
+        await expect(publishOfficialRevisionIfChanged(
+            true,
+            { pin: vi.fn(async () => publication) },
+            4,
+        )).rejects.toBe(publishError)
+
+        expect(publication.dispose).toHaveBeenCalledOnce()
+    })
+
+    it('reports dispose failure after a successful publish', async () => {
+        const disposeError = new Error('dispose failed')
+        const publication = {
+            publish: vi.fn(async () => undefined),
+            dispose: vi.fn(async () => { throw disposeError }),
+        }
+
+        await expect(publishOfficialRevisionIfChanged(
+            true,
+            { pin: vi.fn(async () => publication) },
+            4,
+        )).rejects.toBe(disposeError)
+
+        expect(publication.publish).toHaveBeenCalledOnce()
+    })
+
     it('initializes local data without account requests when account mode is disabled', async () => {
         const harness = makeHarness({})
 
@@ -103,6 +139,7 @@ describe('official account production bootstrap', () => {
         expect(harness.events).toEqual([
             'publisher:off',
             'asset:off',
+            'profile',
             'install',
             'initialize',
         ])
@@ -123,7 +160,13 @@ describe('official account production bootstrap', () => {
         expect(harness.dependencies.installDatabase).toHaveBeenCalledWith(harness.local)
         expect(harness.dependencies.initializeWorkingSet).toHaveBeenCalledWith(harness.local)
         expect(harness.dependencies.accountMode.isAccount).toBe(false)
-        expect(harness.events).toEqual(['publisher:off', 'asset:off', 'install', 'initialize'])
+        expect(harness.events).toEqual([
+            'publisher:off',
+            'asset:off',
+            'profile',
+            'install',
+            'initialize',
+        ])
     })
 
     it('activates a fresh remote revision before installing the final working set', async () => {
@@ -146,7 +189,8 @@ describe('official account production bootstrap', () => {
             'pull',
             'publisher:on',
             'asset:on',
-            'materialize',
+            'resolve',
+            'profile',
             'install',
             'initialize',
         ])
@@ -164,7 +208,7 @@ describe('official account production bootstrap', () => {
         const result = await initializeOfficialAccountBootstrap(harness.dependencies)
 
         expect(result).toMatchObject({ database: harness.local, revision: 1, officialEnabled: true })
-        expect(harness.dependencies.store.materializeDatabase).not.toHaveBeenCalled()
+        expect(harness.dependencies.resolveWorkingSet).not.toHaveBeenCalled()
         expect(harness.adapter.pin).not.toHaveBeenCalled()
         expect(harness.dependencies.onPullSkipped).toHaveBeenCalledWith({ conflict: true })
         expect(harness.events).toEqual([
@@ -173,6 +217,7 @@ describe('official account production bootstrap', () => {
             'skip:true',
             'publisher:on',
             'asset:on',
+            'profile',
             'install',
             'initialize',
         ])
@@ -257,6 +302,7 @@ describe('official account production bootstrap', () => {
             'publisher:off',
             'asset:off',
             'error:account offline',
+            'profile',
             'install',
             'initialize',
         ])

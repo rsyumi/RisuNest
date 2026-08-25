@@ -1,5 +1,7 @@
 import type { BlobStore, BlobWriteMetadata, InlayBlobMetadata } from '../storage/blobStore'
+import type { Database } from '../storage/database.svelte'
 import { readActiveAsset, storeActiveAsset } from '../storage/accountAssetAccess'
+import { listCharacterResources, listDatabaseRootResources } from '../process/coldstorageData'
 
 const INLAY_ENTRY_NAME = /^inlay_((?:[0-9a-f]{2})+)\.risuinlay$/
 const INLAY_TYPES = new Set(['image', 'video', 'audio', 'signature'])
@@ -14,14 +16,70 @@ export function selectLegacyBackupAssetKeys(keys: readonly string[]): string[] {
 }
 
 export async function collectBackupAssetKeys(
-    store: BlobStore,
+    _store: BlobStore,
     referencedKeys: Iterable<string>,
 ): Promise<string[]> {
-    const keys = new Set((await store.list({ kind: 'asset' })).map((asset) => asset.key))
+    const keys = new Set<string>()
     for (const key of referencedKeys) {
         if (isLegacyBackupAssetKey(key)) keys.add(key.replace(/\\/g, '/'))
     }
     return Array.from(keys).sort()
+}
+
+export function collectPinnedBackupAssetReferences(
+    database: Database,
+    coldPayloadValues: readonly unknown[],
+): string[] {
+    const coldCharacters = new Map<string, Database['characters'][number]>()
+    for (const value of coldPayloadValues) {
+        if (!value || typeof value !== 'object' || Array.isArray(value) || !('character' in value)) {
+            continue
+        }
+        const character = value.character
+        if (!character || typeof character !== 'object' || !('chaId' in character)
+            || typeof character.chaId !== 'string') {
+            continue
+        }
+        coldCharacters.set(character.chaId, character as Database['characters'][number])
+    }
+
+    const references = new Set<string>()
+    const add = (key: string) => {
+        if (isLegacyBackupAssetKey(key)) references.add(key.replace(/\\/g, '/'))
+    }
+    for (const key of listDatabaseRootResources(database)) add(key)
+    for (const character of database.characters) {
+        for (const key of listCharacterResources(
+            coldCharacters.get(character.chaId) ?? character,
+        )) add(key)
+    }
+    return Array.from(references).sort()
+}
+
+function collectInlayReferences(value: unknown, references: Set<string>, seen: WeakSet<object>): void {
+    if (typeof value === 'string') {
+        for (const match of value.matchAll(/\{\{(?:inlay|inlayed|inlayeddata)::(.+?)\}\}/g)) {
+            references.add(match[1])
+        }
+        return
+    }
+    if (!value || typeof value !== 'object' || seen.has(value)) return
+    seen.add(value)
+    for (const child of Object.values(value)) collectInlayReferences(child, references, seen)
+}
+
+export async function collectReferencedBackupInlays(
+    store: BlobStore,
+    logicalSnapshot: unknown,
+): Promise<InlayBlobMetadata[]> {
+    const references = new Set<string>()
+    collectInlayReferences(logicalSnapshot, references, new WeakSet())
+    return (await store.list({ kind: 'inlay' })).filter(
+        (metadata): metadata is InlayBlobMetadata =>
+            metadata.kind === 'inlay'
+            && !isLegacyBackupAssetKey(metadata.key)
+            && references.has(metadata.key),
+    )
 }
 
 export function readBackupAsset(

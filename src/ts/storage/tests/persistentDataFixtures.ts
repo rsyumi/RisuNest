@@ -68,6 +68,10 @@ export const fixtureDatabase = {
     apiType: 'fixture-provider',
     username: 'Fixture User',
     formatversion: 4,
+    botPresets: [
+        { name: 'Preset Beta', image: 'preset-beta.png', mainPrompt: 'second' },
+        { name: 'Preset Alpha', mainPrompt: 'first' },
+    ],
     characters: [
         makeCharacter({
             id: 'char-b',

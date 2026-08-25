@@ -13,7 +13,8 @@ import { setDatabase, getDatabase, type Database } from "./storage/database.svel
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
-import { loadPlugins } from "./plugins/plugins.svelte";
+import { loadPlugins, pluginCompatibility } from "./plugins/plugins.svelte";
+import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
 import { alertConfirm, alertError, alertInput, alertMd, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { characterURLImport } from "./characterCards";
@@ -26,7 +27,11 @@ import { startObserveDom } from "./observer.svelte";
 import { updateGuisize } from "./gui/guisize";
 import { initMobileGesture } from "./hotkey";
 import { moduleUpdate } from "./process/modules";
-import { AccountStorage } from "./storage/accountStorage";
+import {
+    AccountStorage,
+    resetAccountStorageSession,
+    type AccountStorageCache,
+} from "./storage/accountStorage";
 import {
     getAccountColdStorageItem,
     getColdStorageItem,
@@ -49,8 +54,17 @@ import { appDataDir, join } from "@tauri-apps/api/path";
 import {
     checkNewFormat as migrateDatabaseFormat,
     prepareDatabaseForPersistence,
+    preparePersistentRootForWorkingSet,
 } from "./storage/databasePreparation";
 import { bootstrapPersistentDatabase } from "./storage/persistentBootstrap";
+import {
+    createCatalogPresetWorkingSet,
+    hasIncompletePersistentWorkingSet,
+    isCatalogCharacterStub,
+    projectCatalogWorkingSet,
+    projectCompleteScalableWorkingSet,
+} from "./storage/workingSetCatalog";
+import { workingSetResidency } from "./storage/workingSetResidency";
 import {
     getPersistentDataRuntime,
     initializeActiveWorkingSet,
@@ -67,7 +81,7 @@ import {
 import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
 import { formatNameList, summarizeSyncConflict } from "./storage/sync/syncConflictSummary";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
-import { schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
+import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
     initializeOfficialAccountBootstrap,
     publishOfficialRevisionIfChanged,
@@ -77,6 +91,18 @@ import {
     configureOfficialAccountAssetReader,
     createStructuredAccountAssetReader,
 } from "./storage/accountAssetAccess";
+import {
+    createNativeAppKv,
+    createNativeAppKvStringStorage,
+} from "./storage/nativeAppKv";
+import {
+    configureNativeOfficialAccountFlow,
+    createNativeOfficialAccountFlowService,
+    type NativeOfficialAccountFlow,
+    type NativeOfficialAccountFlowService,
+    nativeOfficialAccountKeys,
+    normalizeNativeOfficialAccountCredential,
+} from "./storage/sync/nativeOfficialAccountFlow";
 export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
@@ -103,13 +129,118 @@ export async function loadData() {
 
         await initializePersistentStorage()
         const runtime = getPersistentDataRuntime()
-        const local = await bootstrapPersistentDatabase({
+        const resolvePersistentWorkingSet = () => bootstrapPersistentDatabase({
             store: runtime.store,
             prepareDatabase: prepareDatabaseForPersistence,
+            prepareRoot: preparePersistentRootForWorkingSet,
+            projectScalableWorkingSet: (input) => projectCatalogWorkingSet(
+                input.root,
+                input.characters,
+                createCatalogPresetWorkingSet(input.presetCatalog, input.activePreset),
+            ),
         })
-        setDatabase(local.database)
+        const local = await resolvePersistentWorkingSet()
+        const nativeAppKv = isTauri ? createNativeAppKv() : null
+        if (nativeAppKv) localStorage.removeItem('fallbackRisuToken')
+        const nativeCredential = nativeAppKv
+            ? normalizeNativeOfficialAccountCredential(
+                await nativeAppKv.get(nativeOfficialAccountKeys.credential),
+            )
+            : null
+        if (isTauri) local.database.account = nativeCredential ?? undefined
+        const installPersistentWorkingSet = (database: Database) => {
+            workingSetResidency.clear()
+            for (const character of database.characters) {
+                if (isCatalogCharacterStub(character)) {
+                    workingSetResidency.markCharacterReleased(character.chaId)
+                }
+            }
+            setDatabase(database)
+        }
+        pluginCompatibility.initialize(local.profile)
+        configurePersistentDataRuntime({
+            projectWorkingSet(
+                database,
+                selectedCharacterId,
+                _selectedConversationId,
+                activeCharacterIds,
+                forceScalableProjection,
+            ) {
+                if (!shouldProjectScalableWorkingSet(
+                    pluginCompatibility,
+                    forceScalableProjection,
+                )) return database
+                const projected = projectCompleteScalableWorkingSet(
+                    database,
+                    selectedCharacterId,
+                    runtime.revision,
+                    activeCharacterIds,
+                )
+                for (const character of projected.characters) {
+                    if (isCatalogCharacterStub(character)) {
+                        workingSetResidency.markCharacterReleased(character.chaId)
+                    }
+                }
+                return projected
+            },
+        })
+        installPersistentWorkingSet(local.database)
         performance.mark('boot:local-data-ready')
-        const accountStorage = new AccountStorage()
+        const uncachedNativeAccountStorage: AccountStorageCache = {
+            getItem: async () => null,
+            setItem: async () => undefined,
+        }
+        let nativeOfficialFlow: NativeOfficialAccountFlow | null = null
+        let snapshotRequestReauthentication:
+            NativeOfficialAccountFlowService['snapshotRequestReauthentication'] | null = null
+        const nativeAccountStorageOptions = {
+            databaseCache: uncachedNativeAccountStorage,
+            assetCache: uncachedNativeAccountStorage,
+        }
+        const accountStorage = new AccountStorage(isTauri ? {
+            ...nativeAccountStorageOptions,
+            credentialRouting: {
+                getToken: () => nativeOfficialFlow?.getToken(),
+                reauthenticate: async (loginResult) => {
+                    if (!snapshotRequestReauthentication) {
+                        throw new Error('Native snapshot reauthentication is not configured')
+                    }
+                    await snapshotRequestReauthentication.reauthenticate(loginResult)
+                },
+            },
+        } : {})
+        const liveAccountStorage = isTauri
+            ? new AccountStorage({
+                ...nativeAccountStorageOptions,
+                credentialRouting: {
+                    getToken: () => nativeOfficialFlow?.getToken(),
+                    reauthenticate: async (loginResult) => {
+                        if (!nativeOfficialFlow) {
+                            throw new Error('Native official account flow is not configured')
+                        }
+                        await nativeOfficialFlow.reauthenticate(loginResult)
+                    },
+                },
+            })
+            : accountStorage
+        const nativeAssociation = nativeAppKv
+            ? await createNativeAppKvStringStorage(
+                nativeAppKv,
+                nativeOfficialAccountKeys.association,
+            )
+            : null
+        const nativeAssetLedger = nativeAppKv
+            ? await createNativeAppKvStringStorage(
+                nativeAppKv,
+                nativeOfficialAccountKeys.assetLedger,
+            )
+            : null
+        const associationStorage = nativeAssociation?.storage ?? localStorage
+        const ledgerStorage = nativeAssetLedger?.storage ?? localStorage
+        const officialAssetLedger = createAccountScopedOfficialAssetLedger(
+            ledgerStorage,
+            () => getDatabase().account?.id,
+        )
         const officialAdapter = new OfficialAccountSnapshotAdapter({
             store: runtime.store,
             resolveBlobs: resolveBlobStore,
@@ -125,14 +256,12 @@ export async function loadData() {
             },
             prepareCandidate: prepareDatabaseForPersistence,
             markPublished: () => undefined,
-            ledger: createAccountScopedOfficialAssetLedger(
-                localStorage,
-                () => getDatabase().account?.id,
-            ),
-            association: createOfficialAssociationMarkers(localStorage),
+            ledger: officialAssetLedger,
+            association: createOfficialAssociationMarkers(associationStorage),
             conflict: {
                 resolve: async ({ remote, syncedAt }) => {
-                    const summary = summarizeSyncConflict(local.database, remote)
+                    const localComplete = await runtime.store.materializeDatabase(runtime.revision)
+                    const summary = summarizeSyncConflict(localComplete, remote)
                     const details = [language.syncConflictDetected]
                     if (syncedAt !== null) {
                         details.push(language.syncConflictLastSynced
@@ -166,7 +295,7 @@ export async function loadData() {
         const accountBootstrap = await initializeOfficialAccountBootstrap({
             isTauri,
             local,
-            store: runtime.store,
+            resolveWorkingSet: async () => resolvePersistentWorkingSet(),
             adapter: officialAdapter,
             readRemoteDatabase: () => accountStorage.readItem('database/database.bin', {
                 progress: (value) => {
@@ -194,7 +323,8 @@ export async function loadData() {
             ]) === '0' ? 'pull' : 'push',
             confirmInitialPush: async () =>
                 await alertInput('to overwrite your data, type "RISUAI"') === 'RISUAI',
-            installDatabase: setDatabase,
+            initializeProfile: (profile) => pluginCompatibility.initialize(profile),
+            installDatabase: installPersistentWorkingSet,
             initializeWorkingSet: (database) => initializeActiveWorkingSet(database),
             onRemoteError: (error) => {
                 console.error(error)
@@ -207,6 +337,40 @@ export async function loadData() {
                     : 'Official account pull skipped: local revisions were never published. Republishing local data.')
             },
         })
+        if (nativeAppKv) {
+            const assetReader = createStructuredAccountAssetReader(liveAccountStorage)
+            configureOfficialAccountAssetReader(nativeCredential ? assetReader : null)
+            const service = createNativeOfficialAccountFlowService({
+                appKv: nativeAppKv,
+                adapter: officialAdapter,
+                initialCredential: nativeCredential,
+                flushPendingData: (reason) => runtime.flushPendingData(reason),
+                getRevision: () => runtime.revision,
+                restart: restartNativeApp,
+                clearLegacyFallback: () => localStorage.removeItem('fallbackRisuToken'),
+                setRouting: (credential) => {
+                    getDatabase().account = credential ?? undefined
+                    forageStorage.setAccountModeForSession(false)
+                    configurePersistentDataRuntime({ officialPublisher: null })
+                    configureOfficialAccountAssetReader(credential ? assetReader : null)
+                },
+                flushMetadata: async () => {
+                    await nativeAssociation?.flush()
+                    await nativeAssetLedger?.flush()
+                },
+                resetMetadata: () => {
+                    nativeAssociation?.reset()
+                    nativeAssetLedger?.reset()
+                    officialAssetLedger.reset()
+                },
+                resetAccountSession: resetAccountStorageSession,
+            })
+            nativeOfficialFlow = service.flow
+            snapshotRequestReauthentication = service.snapshotRequestReauthentication
+            configureNativeOfficialAccountFlow(service.flow)
+        } else {
+            configureNativeOfficialAccountFlow(null)
+        }
         performance.mark('boot:account-ready')
         if (officialReconcilePublish && accountBootstrap.officialEnabled) {
             publishCurrentOfficialRevision().catch((error) => {
@@ -239,7 +403,8 @@ export async function loadData() {
         }
 
         LoadingStatusState.text = 'Checking For Format Update...'
-        const coldStorageChanged = await makeColdData()
+        const fullDatabaseResident = pluginCompatibility.profile === 'maximum-compatibility'
+        const coldStorageChanged = fullDatabaseResident ? await makeColdData() : false
         await publishOfficialRevisionIfChanged(
             coldStorageChanged && accountBootstrap.officialEnabled,
             officialAdapter,
@@ -254,7 +419,7 @@ export async function loadData() {
             console.error(error)
         }
         performance.mark('boot:plugins-ready')
-        if (getDatabase().account) {
+        if (!isTauri && getDatabase().account) {
             LoadingStatusState.text = 'Checking Account Data...'
             try {
                 await loadRisuAccountData()
@@ -298,7 +463,7 @@ export async function loadData() {
         await saveDb()
         if (isTauri) schedulePeriodicNativeSnapshot()
         moduleUpdate()
-        cleanChunks()
+        if (fullDatabaseResident) cleanChunks()
         void alertTOS().then((accepted) => {
             if (accepted === false) location.reload()
         })
@@ -386,6 +551,7 @@ async function cleanChunks(options:{
 } = {}) {
     const cleanColdStorage = options.cleanColdStorage ?? false
     const db = getDatabase()
+    if (hasIncompletePersistentWorkingSet(db, workingSetResidency)) return
     if (db.account?.useSync) {
         return
     }

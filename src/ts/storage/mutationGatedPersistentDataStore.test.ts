@@ -12,6 +12,8 @@ function makeStore() {
         acquireRevision: vi.fn(),
         open: vi.fn(),
         readRoot: vi.fn(),
+        queryPresets: vi.fn(),
+        readPreset: vi.fn(),
         queryCharacters: vi.fn(),
         readCharacter: vi.fn(),
         queryConversations: vi.fn(),
@@ -65,6 +67,8 @@ describe('createMutationGatedPersistentDataStore', () => {
         await expect(gated.materializeDatabase(2)).resolves.toBe(database)
         await gated.acquireRevision(2)
         await gated.readRoot()
+        await gated.queryPresets()
+        await gated.readPreset('0')
 
         expect(gate.runWrite).not.toHaveBeenCalled()
     })

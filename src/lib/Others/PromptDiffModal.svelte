@@ -1,14 +1,15 @@
 <script lang="ts">
     import { XIcon } from "@lucide/svelte"
-    import { getDatabase, type PromptDiffPrefs } from "../../ts/storage/database.svelte"
+    import { getDatabase, type botPreset, type PromptDiffPrefs } from "../../ts/storage/database.svelte"
+    import { safeStructuredClone } from "../../ts/polyfill"
     import type { PromptItem, PromptItemPlain, PromptItemChatML, PromptItemTyped, PromptItemAuthorNote, PromptItemChat } from "src/ts/process/prompt.ts";
 
     interface Props {
-        firstPresetId: number;
-        secondPresetId: number;
+        firstPreset: botPreset;
+        secondPreset: botPreset;
         onClose?: () => void;
     }
-    let { firstPresetId, secondPresetId, onClose = () => {} }: Props = $props();
+    let { firstPreset, secondPreset, onClose = () => {} }: Props = $props();
 
 
 // Lazy-loaded diff module
@@ -234,8 +235,8 @@
 
 // Inputs
 // -----------------------------------------------------------------------------
-    const firstCards  = $derived.by(() => getPromptCards(firstPresetId))
-    const secondCards = $derived.by(() => getPromptCards(secondPresetId))
+    const firstCards  = $derived.by(() => getPromptCards(firstPreset))
+    const secondCards = $derived.by(() => getPromptCards(secondPreset))
 
 // Effects (state invariants + diff recompute)
 // -----------------------------------------------------------------------------
@@ -337,7 +338,7 @@
 
 // Data shaping (prompt → cards/lines/raw)
 // -----------------------------------------------------------------------------
-    function getPromptCards(id: number): PromptCard[] {
+    function getPromptCards(preset: botPreset): PromptCard[] {
         const isPromptItemPlain = (item: PromptItem): item is PromptItemPlain =>
             item.type === 'plain' || item.type === 'jailbreak' || item.type === 'cot'
        
@@ -357,8 +358,7 @@
         const isPromptItemChat = (item: PromptItem): item is PromptItemChat =>
             item.type === 'chat'
         
-        const db = getDatabase()
-        const formated = safeStructuredClone(db.botPresets[id].promptTemplate)
+        const formated = safeStructuredClone(preset.promptTemplate ?? [])
         const cards: PromptCard[] = []
 
         for(let i=0;i<formated.length;i++){

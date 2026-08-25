@@ -4,10 +4,21 @@ import { get } from 'svelte/store'
 const mocks = vi.hoisted(() => ({
     database: { characters: [] as any[] },
     nextId: 0,
+    navigationGeneration: 0,
     activateCharacter: vi.fn(async (_id?: string, _options?: any) => true),
+    deactivateActiveWorkingSet: vi.fn(async () => true),
+    getPersistentNavigationGeneration: vi.fn(() => mocks.navigationGeneration),
+    invalidatePersistentNavigation: vi.fn(() => {
+        mocks.navigationGeneration++
+    }),
     commitCharacterAddition: vi.fn(async (request: any, _reason: string) => request.install()),
     markPersistentDataDirty: vi.fn(),
-    replacePersistentDatabase: vi.fn(async (_database: any, _reason: string) => undefined),
+    mutatePersistentCharacterDetail: vi.fn(),
+    materializePersistentDatabaseSnapshotWithRevision: vi.fn(),
+    replacePersistentDatabase: vi.fn(),
+    readPersistentCharacterDetail: vi.fn(),
+    replacePersistentCompleteCharacter: vi.fn(),
+    reconcilePersistentActiveCharacterIds: vi.fn(),
     getColdStorageItem: vi.fn(),
     alertConfirm: vi.fn(async () => true),
     alertAddCharacter: vi.fn(async () => 'createfromScratch'),
@@ -80,8 +91,17 @@ vi.mock('./process/coldstorage.svelte', () => ({ getColdStorageItem: mocks.getCo
 vi.mock('./storage/persistentDataRuntime.svelte', () => ({
     activateCharacter: mocks.activateCharacter,
     commitCharacterAddition: mocks.commitCharacterAddition,
+    deactivateActiveWorkingSet: mocks.deactivateActiveWorkingSet,
+    getPersistentNavigationGeneration: mocks.getPersistentNavigationGeneration,
+    invalidatePersistentNavigation: mocks.invalidatePersistentNavigation,
     markPersistentDataDirty: mocks.markPersistentDataDirty,
+    mutatePersistentCharacterDetail: mocks.mutatePersistentCharacterDetail,
+    materializePersistentDatabaseSnapshotWithRevision:
+        mocks.materializePersistentDatabaseSnapshotWithRevision,
     replacePersistentDatabase: mocks.replacePersistentDatabase,
+    readPersistentCharacterDetail: mocks.readPersistentCharacterDetail,
+    replacePersistentCompleteCharacter: mocks.replacePersistentCompleteCharacter,
+    reconcilePersistentActiveCharacterIds: mocks.reconcilePersistentActiveCharacterIds,
 }))
 
 import {
@@ -95,19 +115,62 @@ import {
     removeChar,
     removeChat,
 } from './characters'
-import { MobileGUIStack } from './stores.svelte'
+import { MobileGUIStack, OpenRealmStore, selectedCharID } from './stores.svelte'
+import { doingChat } from './process/index.svelte'
+
+function deferred<T>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((resolvePromise) => {
+        resolve = resolvePromise
+    })
+    return { promise, resolve }
+}
 
 describe('runtime chat identity', () => {
     beforeEach(() => {
         mocks.database.characters = []
         mocks.nextId = 0
+        mocks.navigationGeneration = 0
+        OpenRealmStore.set(false)
+        doingChat.set(false)
         vi.clearAllMocks()
         mocks.activateCharacter.mockResolvedValue(true)
+        mocks.deactivateActiveWorkingSet.mockResolvedValue(true)
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.alertAddCharacter.mockResolvedValue('createfromScratch')
         mocks.commitCharacterAddition.mockImplementation(async (request) => request.install())
+        mocks.mutatePersistentCharacterDetail.mockImplementation(async (id, _reason, mutate) => {
+            const index = mocks.database.characters.findIndex((character) => character.chaId === id)
+            if (index < 0) return false
+            const { chats: _chats, ...detail } = structuredClone(mocks.database.characters[index])
+            const state = { root: {}, character: detail }
+            const result = await mutate(state)
+            Object.assign(mocks.database, state.root)
+            if (result?.delete) mocks.database.characters.splice(index, 1)
+            else Object.assign(mocks.database.characters[index], state.character)
+            return true
+        })
+        mocks.materializePersistentDatabaseSnapshotWithRevision.mockImplementation(async () => ({
+            database: structuredClone(mocks.database),
+            revision: 1,
+            mutationGeneration: 0,
+        }))
         mocks.replacePersistentDatabase.mockImplementation(async (database) => {
             Object.assign(mocks.database, structuredClone(database))
+        })
+        mocks.readPersistentCharacterDetail.mockImplementation(async (id) => {
+            const character = mocks.database.characters.find((candidate) => candidate.chaId === id)
+            if (!character) return null
+            const { chats: _chats, ...detail } = structuredClone(character)
+            return detail
+        })
+        mocks.replacePersistentCompleteCharacter.mockImplementation(async (id, _reason, mutate) => {
+            const index = mocks.database.characters.findIndex((character) => character.chaId === id)
+            if (index < 0) return false
+            mocks.database.characters[index] = await mutate(
+                structuredClone(mocks.database.characters[index]),
+            )
+            return true
         })
     })
 
@@ -126,7 +189,7 @@ describe('runtime chat identity', () => {
         expect(mocks.activateCharacter).toHaveBeenCalledWith(first.chaId, undefined)
     })
 
-    it('replaces persistent data before publishing character removal', async () => {
+    it('commits a stable-ID character deletion through one authoritative replacement', async () => {
         const first = createBlankChar()
         const second = createBlankChar()
         mocks.database.characters.push(first, second)
@@ -134,9 +197,9 @@ describe('runtime chat identity', () => {
         await removeChar(first.chaId, first.name, 'permanentForce')
 
         expect(mocks.replacePersistentDatabase).toHaveBeenCalledOnce()
-        const [candidate, reason] = mocks.replacePersistentDatabase.mock.calls[0]
-        expect(reason).toBe('character-removal')
-        expect(candidate.characters.map((character: any) => character.chaId)).toEqual([second.chaId])
+        expect(mocks.replacePersistentDatabase.mock.calls[0][1]).toBe('character-removal')
+        expect(mocks.database.characters.map((character: any) => character.chaId)).toEqual([second.chaId])
+        expect(mocks.deactivateActiveWorkingSet).toHaveBeenCalledTimes(2)
     })
 
     it('removes the character ID captured before confirmation', async () => {
@@ -150,8 +213,239 @@ describe('runtime chat identity', () => {
 
         await removeChar(0, first.name, 'permanent')
 
-        const [candidate] = mocks.replacePersistentDatabase.mock.calls[0]
-        expect(candidate.characters.map((character: any) => character.chaId)).toEqual([second.chaId])
+        expect(mocks.replacePersistentDatabase).toHaveBeenCalledOnce()
+        expect(mocks.database.characters.map((character: any) => character.chaId)).toEqual([second.chaId])
+    })
+
+    it('does not trash a selected character when safe deactivation fails', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.deactivateActiveWorkingSet.mockResolvedValueOnce(false)
+
+        await removeChar(character.chaId, character.name, 'normal')
+
+        expect(mocks.database.characters[0].trashTime).toBeUndefined()
+        expect(get(selectedCharID)).toBe(0)
+        expect(mocks.deactivateActiveWorkingSet).toHaveBeenCalledOnce()
+        expect(mocks.mutatePersistentCharacterDetail).not.toHaveBeenCalled()
+    })
+
+    it('keeps selection when the selected-character trash mutation does not commit', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.mutatePersistentCharacterDetail.mockResolvedValueOnce(false)
+
+        await removeChar(character.chaId, character.name, 'normal')
+
+        expect(mocks.deactivateActiveWorkingSet).toHaveBeenCalledOnce()
+        expect(mocks.mutatePersistentCharacterDetail).toHaveBeenCalledOnce()
+        expect(get(selectedCharID)).toBe(0)
+        expect(mocks.activateCharacter).toHaveBeenCalledWith(character.chaId)
+    })
+
+    it('deselects a released stub when busy generation blocks failure restoration', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        const mutation = deferred<boolean>()
+        mocks.mutatePersistentCharacterDetail.mockReturnValueOnce(mutation.promise)
+        mocks.activateCharacter.mockResolvedValueOnce(false)
+
+        const removal = removeChar(character.chaId, character.name, 'normal')
+        await vi.waitFor(() => expect(mocks.mutatePersistentCharacterDetail).toHaveBeenCalledOnce())
+        doingChat.set(true)
+        mutation.resolve(false)
+        await removal
+
+        expect(mocks.activateCharacter).toHaveBeenCalledWith(character.chaId)
+        expect(get(selectedCharID)).toBe(-1)
+        expect(mocks.reconcilePersistentActiveCharacterIds).toHaveBeenCalledWith(
+            mocks.database,
+            null,
+        )
+    })
+
+    it('deselects a released stub when failure restoration rejects', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.mutatePersistentCharacterDetail.mockResolvedValueOnce(false)
+        mocks.activateCharacter.mockRejectedValueOnce(new Error('restore read failed'))
+
+        await expect(
+            removeChar(character.chaId, character.name, 'normal'),
+        ).resolves.toBeUndefined()
+
+        expect(get(selectedCharID)).toBe(-1)
+        expect(mocks.reconcilePersistentActiveCharacterIds).toHaveBeenCalledWith(
+            mocks.database,
+            null,
+        )
+    })
+
+    it('preserves the mutation error when failure restoration also rejects', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.mutatePersistentCharacterDetail.mockRejectedValueOnce(
+            new Error('mutation failed'),
+        )
+        mocks.activateCharacter.mockRejectedValueOnce(new Error('restore read failed'))
+
+        await expect(
+            removeChar(character.chaId, character.name, 'normal'),
+        ).rejects.toThrow('mutation failed')
+
+        expect(get(selectedCharID)).toBe(-1)
+        expect(mocks.reconcilePersistentActiveCharacterIds).toHaveBeenCalledWith(
+            mocks.database,
+            null,
+        )
+    })
+
+    it('does not restore an old selection after a newer navigation wins', async () => {
+        const first = createBlankChar()
+        const second = createBlankChar()
+        mocks.database.characters.push(first, second)
+        selectedCharID.set(0)
+        const mutation = deferred<boolean>()
+        mocks.mutatePersistentCharacterDetail.mockReturnValueOnce(mutation.promise)
+
+        const removal = removeChar(first.chaId, first.name, 'normal')
+        await vi.waitFor(() => expect(mocks.mutatePersistentCharacterDetail).toHaveBeenCalledOnce())
+        mocks.navigationGeneration++
+        selectedCharID.set(1)
+        mutation.resolve(false)
+        await removal
+
+        expect(get(selectedCharID)).toBe(1)
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+    })
+
+    it('does not clear a newer selection when delayed removal succeeds', async () => {
+        const first = createBlankChar()
+        const second = createBlankChar()
+        mocks.database.characters.push(first, second)
+        selectedCharID.set(0)
+        const mutation = deferred<boolean>()
+        mocks.mutatePersistentCharacterDetail.mockReturnValueOnce(mutation.promise)
+
+        const removal = removeChar(first.chaId, first.name, 'normal')
+        await vi.waitFor(() => expect(mocks.mutatePersistentCharacterDetail).toHaveBeenCalledOnce())
+        mocks.navigationGeneration++
+        selectedCharID.set(1)
+        mutation.resolve(true)
+        await removal
+
+        expect(get(selectedCharID)).toBe(1)
+        expect(mocks.reconcilePersistentActiveCharacterIds).not.toHaveBeenCalled()
+    })
+
+    it('clears selection only after the selected-character trash mutation commits', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+
+        await removeChar(character.chaId, character.name, 'normal')
+
+        expect(mocks.deactivateActiveWorkingSet.mock.invocationCallOrder[0]).toBeLessThan(
+            mocks.mutatePersistentCharacterDetail.mock.invocationCallOrder[0],
+        )
+        expect(mocks.database.characters[0].trashTime).toEqual(expect.any(Number))
+        expect(get(selectedCharID)).toBe(-1)
+        expect(mocks.reconcilePersistentActiveCharacterIds).toHaveBeenCalledWith(
+            mocks.database,
+            null,
+        )
+    })
+
+    it('keeps a locally committed trash when official publication fails', async () => {
+        const character = createBlankChar()
+        mocks.database.characters.push(character)
+        selectedCharID.set(0)
+        mocks.mutatePersistentCharacterDetail.mockImplementationOnce(
+            async (id, _reason, mutate) => {
+                const target = mocks.database.characters.find((candidate) => candidate.chaId === id)
+                const { chats: _chats, ...detail } = structuredClone(target)
+                await mutate({ root: {}, character: detail })
+                Object.assign(target, detail)
+                throw new Error('official publish failed')
+            },
+        )
+
+        await expect(
+            removeChar(character.chaId, character.name, 'normal'),
+        ).rejects.toThrow('official publish failed')
+
+        expect(mocks.database.characters[0].trashTime).toEqual(expect.any(Number))
+        expect(get(selectedCharID)).toBe(-1)
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+    })
+
+    it('persists selected-group cleanup only after permanent member deletion succeeds', async () => {
+        const group = {
+            type: 'group',
+            chaId: 'group-a',
+            name: 'Group',
+            characters: ['member-a', 'member-b'],
+            characterTalks: [0.25, 0.75],
+            characterActive: [false, true],
+            chats: [],
+        }
+        const memberA = createBlankChar()
+        memberA.chaId = 'member-a'
+        const memberB = createBlankChar()
+        memberB.chaId = 'member-b'
+        mocks.database.characters.push(group, memberA, memberB)
+        selectedCharID.set(0)
+
+        await removeChar('member-a', memberA.name, 'permanentForce')
+
+        expect(mocks.replacePersistentDatabase).toHaveBeenCalledOnce()
+        const updatedGroup = mocks.database.characters.find(
+            (character) => character.chaId === 'group-a',
+        )
+        expect(updatedGroup.characters).toEqual(['member-b'])
+        expect(updatedGroup.characterTalks).toEqual([0.75])
+        expect(updatedGroup.characterActive).toEqual([true])
+        expect(mocks.deactivateActiveWorkingSet).toHaveBeenCalledTimes(2)
+    })
+
+    it('keeps permanent deletion and every group reference locally consistent when publication fails', async () => {
+        const group = {
+            type: 'group',
+            chaId: 'group-a',
+            characters: ['member-a', 'member-b'],
+            characterTalks: [0.25, 0.75],
+            characterActive: [false, true],
+            chats: [],
+        }
+        const memberA = createBlankChar()
+        memberA.chaId = 'member-a'
+        const memberB = createBlankChar()
+        memberB.chaId = 'member-b'
+        mocks.database.characters.push(group, memberA, memberB)
+        selectedCharID.set(0)
+        mocks.replacePersistentDatabase.mockImplementationOnce(async (database) => {
+            Object.assign(mocks.database, structuredClone(database))
+            throw new Error('official publish failed')
+        })
+
+        await expect(
+            removeChar('member-a', memberA.name, 'permanentForce'),
+        ).rejects.toThrow('official publish failed')
+
+        expect(mocks.database.characters.some((character) => character.chaId === 'member-a')).toBe(false)
+        const updatedGroup = mocks.database.characters.find(
+            (character) => character.chaId === 'group-a',
+        )
+        expect(updatedGroup.characters).toEqual(['member-b'])
+        expect(updatedGroup.characterTalks).toEqual([0.75])
+        expect(updatedGroup.characterActive).toEqual([true])
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(mocks.deactivateActiveWorkingSet).toHaveBeenCalledTimes(2)
     })
 
     it('persists a restored cold character before activating it', async () => {
@@ -163,15 +457,13 @@ describe('runtime chat identity', () => {
         mocks.database.characters.push(stub)
         mocks.getColdStorageItem.mockResolvedValue({ character: restored })
         const events: string[] = []
-        mocks.replacePersistentDatabase.mockImplementation(async (database) => {
+        mocks.replacePersistentCompleteCharacter.mockImplementation(async (id, _reason, mutate) => {
             events.push('replace')
-            Object.assign(mocks.database, structuredClone(database))
+            const index = mocks.database.characters.findIndex((character) => character.chaId === id)
+            mocks.database.characters[index] = await mutate(mocks.database.characters[index])
+            return true
         })
-        mocks.activateCharacter.mockImplementation(async (_id, options) => {
-            const prepared = await options.prepare()
-            if(prepared){
-                await mocks.replacePersistentDatabase(prepared.database, prepared.reason)
-            }
+        mocks.activateCharacter.mockImplementation(async () => {
             events.push('activate')
             return true
         })
@@ -181,6 +473,35 @@ describe('runtime chat identity', () => {
         expect(changed).toBe(true)
         expect(events).toEqual(['replace', 'activate'])
         expect(mocks.database.characters[0].name).toBe('Restored')
+    })
+
+    it('restores cold group members before activating the group', async () => {
+        const group = {
+            type: 'group',
+            chaId: 'group-a',
+            name: 'Group',
+            characters: ['member-a'],
+            chats: [],
+        }
+        const member = createBlankChar()
+        member.chaId = 'member-a'
+        member.name = 'Cold member'
+        member.coldstorage = 'member-cold-key'
+        const restored = structuredClone(member)
+        restored.name = 'Restored member'
+        delete restored.coldstorage
+        mocks.database.characters.push(group, member)
+        mocks.getColdStorageItem.mockResolvedValue({ character: restored })
+
+        expect(await changeChar(0)).toBe(true)
+
+        expect(mocks.replacePersistentCompleteCharacter).toHaveBeenCalledWith(
+            'member-a',
+            'cold-character-restore',
+            expect.any(Function),
+        )
+        expect(mocks.database.characters[1].name).toBe('Restored member')
+        expect(mocks.activateCharacter).toHaveBeenCalledWith('group-a', undefined)
     })
 
     it('assigns an ID before a new character first chat is inserted', () => {
@@ -278,14 +599,118 @@ describe('character activation retry', () => {
     beforeEach(() => {
         mocks.database.characters = []
         mocks.nextId = 0
+        mocks.navigationGeneration = 0
+        OpenRealmStore.set(false)
         vi.clearAllMocks()
-        mocks.activateCharacter.mockResolvedValue(true)
+        mocks.deactivateActiveWorkingSet.mockResolvedValue(true)
+        mocks.activateCharacter.mockReset()
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration++
+            return true
+        })
+        mocks.readPersistentCharacterDetail.mockImplementation(async (id) => {
+            const character = mocks.database.characters.find((candidate) => candidate.chaId === id)
+            if (!character) return null
+            const { chats: _chats, ...detail } = structuredClone(character)
+            return detail
+        })
+    })
+
+    it('deactivates the working set before opening the Realm catalog', async () => {
+        mocks.alertAddCharacter.mockResolvedValue('importFromRealm')
+
+        await addCharacter()
+
+        expect(mocks.deactivateActiveWorkingSet).toHaveBeenCalledOnce()
+    })
+
+    it('keeps the current destination when Realm deactivation fails', async () => {
+        mocks.alertAddCharacter.mockResolvedValue('importFromRealm')
+        mocks.deactivateActiveWorkingSet.mockResolvedValueOnce(false)
+
+        await addCharacter()
+
+        expect(get(OpenRealmStore)).toBe(false)
+    })
+
+    it('does not let a slow cold character restore override a newer character navigation', async () => {
+        const first = createBlankChar()
+        first.coldstorage = 'first-cold-key'
+        const second = createBlankChar()
+        mocks.database.characters.push(first, second)
+        const firstDetail = deferred<any>()
+        mocks.readPersistentCharacterDetail.mockImplementation(async (id) => {
+            if (id === first.chaId) return firstDetail.promise
+            const character = mocks.database.characters.find((candidate) => candidate.chaId === id)
+            if (!character) return null
+            const { chats: _chats, ...detail } = structuredClone(character)
+            return detail
+        })
+
+        const older = changeChar(0)
+        await vi.waitFor(() => expect(mocks.readPersistentCharacterDetail).toHaveBeenCalledWith(
+            first.chaId,
+            'cold-character-inspection',
+        ))
+
+        await expect(changeChar(1)).resolves.toBe(true)
+        const { chats: _chats, ...detail } = structuredClone(first)
+        firstDetail.resolve(detail)
+
+        await expect(older).resolves.toBe(false)
+        expect(mocks.activateCharacter.mock.calls.map(([id]) => id)).toEqual([second.chaId])
+        expect(mocks.getColdStorageItem).not.toHaveBeenCalled()
+    })
+
+    it('does not let a slow cold character restore override Home navigation', async () => {
+        const character = createBlankChar()
+        character.coldstorage = 'cold-key'
+        mocks.database.characters.push(character)
+        const detailRead = deferred<any>()
+        mocks.readPersistentCharacterDetail.mockReturnValue(detailRead.promise)
+
+        const pending = changeChar(0)
+        await vi.waitFor(() => expect(mocks.readPersistentCharacterDetail).toHaveBeenCalledOnce())
+        mocks.invalidatePersistentNavigation()
+        const { chats: _chats, ...detail } = structuredClone(character)
+        detailRead.resolve(detail)
+
+        await expect(pending).resolves.toBe(false)
+        expect(mocks.activateCharacter).not.toHaveBeenCalled()
+        expect(mocks.getColdStorageItem).not.toHaveBeenCalled()
+    })
+
+    it('does not retry an activation superseded by newer character navigation', async () => {
+        const first = createBlankChar()
+        const second = createBlankChar()
+        mocks.database.characters.push(first, second)
+        const firstActivation = deferred<boolean>()
+        mocks.activateCharacter.mockImplementation(async (id) => {
+            mocks.navigationGeneration++
+            if (id === first.chaId) return firstActivation.promise
+            return true
+        })
+
+        const older = changeChar(0)
+        await vi.waitFor(() => expect(mocks.activateCharacter).toHaveBeenCalledWith(first.chaId, undefined))
+        await expect(changeChar(1)).resolves.toBe(true)
+        firstActivation.resolve(false)
+
+        await expect(older).resolves.toBe(false)
+        expect(mocks.activateCharacter.mock.calls.map(([id]) => id)).toEqual([
+            first.chaId,
+            second.chaId,
+        ])
     })
 
     it('retries activation once when the first attempt fails', async () => {
         const character = createBlankChar()
         mocks.database.characters.push(character)
-        mocks.activateCharacter.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+        const results = [false, true]
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration++
+            return results.shift() ?? false
+        })
 
         const changed = await changeChar(0)
 
@@ -296,7 +721,10 @@ describe('character activation retry', () => {
     it('gives up after exactly one retry', async () => {
         const character = createBlankChar()
         mocks.database.characters.push(character)
-        mocks.activateCharacter.mockResolvedValue(false)
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration++
+            return false
+        })
 
         const changed = await changeChar(0)
 

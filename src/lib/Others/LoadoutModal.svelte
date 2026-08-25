@@ -63,9 +63,9 @@
         return getSortedLoadouts();
     }
 
-    function onSelect(loadout: Loadout) {
+    async function onSelect(loadout: Loadout) {
         const apply = (Object.keys(loadOptions) as LoadoutApplyOption[]).filter(k => loadOptions[k]);
-        applyLoadout(loadout, apply);
+        await applyLoadout(loadout, apply);
         close();
     }
 

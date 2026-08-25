@@ -39,21 +39,65 @@ pub(super) fn apply_pending_restore(
         validate_restore_database(&target)?;
 
         let database_path = persistent_dir.join(DATABASE_FILE);
-        if database_path.is_file() {
-            let connection = Connection::open(&database_path)?;
-            create(&connection, snapshots_dir, "pre-restore")?;
-            drop(connection);
-        }
+        let candidate = prepare_restore_candidate(persistent_dir, &target)?;
+        let replacement = (|| -> StoreResult<()> {
+            if database_path.is_file() {
+                let connection = Connection::open(&database_path)?;
+                create(&connection, snapshots_dir, "pre-restore")?;
+                drop(connection);
+            }
 
-        replace_database(&database_path, &target)?;
+            replace_database(&database_path, &candidate)?;
+            Ok(())
+        })();
+        if let Err(error) = remove_database_files(&candidate) {
+            eprintln!("persistent restore candidate cleanup skipped: {error}");
+        }
+        replacement?;
         Ok(())
     })();
 
-    fs::remove_file(&marker)?;
-    if let Err(error) = result {
-        eprintln!("persistent snapshot restore skipped: {error}");
+    match result {
+        Ok(()) => fs::remove_file(&marker)?,
+        Err(error) => eprintln!("persistent snapshot restore skipped: {error}"),
     }
     Ok(())
+}
+
+fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResult<PathBuf> {
+    let candidate = persistent_dir.join(format!(
+        "persistent.db.restore-candidate-{}",
+        Uuid::new_v4()
+    ));
+    fs::copy(target, &candidate)
+        .map_err(|error| path_error("copy restore candidate", &candidate, error))?;
+
+    let result = (|| -> StoreResult<()> {
+        let mut connection = Connection::open(&candidate)?;
+        super::schema::initialize(&mut connection)?;
+        let _ = super::query::materialize(&connection, None)?;
+        let integrity: String =
+            connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(validation("migrated snapshot integrity check failed"));
+        }
+        checkpoint(&connection, CheckpointMode::Truncate)?;
+        drop(connection);
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&candidate)?
+            .sync_all()?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        if let Err(error) = remove_database_files(&candidate) {
+            eprintln!("persistent restore candidate cleanup skipped: {error}");
+        }
+    }
+    result?;
+    Ok(candidate)
 }
 
 pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreResult<()> {
@@ -123,7 +167,7 @@ pub(super) fn acquire_revision(
         "INSERT INTO root (generation, value) SELECT ?1, value FROM root WHERE generation = ?2",
         params![generation, source],
     )?;
-    for table in ["characters", "conversations", "messages"] {
+    for table in ["bot_presets", "characters", "conversations", "messages"] {
         let sql = format!(
             "INSERT INTO {table} SELECT ?1, {} FROM {table} WHERE generation = ?2",
             columns_without_generation(table)
@@ -233,7 +277,8 @@ pub(super) fn restore_request(snapshots_dir: &Path, path: &Path) -> StoreResult<
 
 fn columns_without_generation(table: &str) -> &'static str {
     match table {
-        "characters" => "character_id, configured_index, recent_at, trashed, name, image, conversation_count, detail",
+        "bot_presets" => "preset_id, configured_index, name, image, value",
+        "characters" => "character_id, configured_index, recent_at, trashed, name, image, conversation_count, type, creator_notes, trash_time, detail",
         "conversations" => "character_id, conversation_id, configured_index, recent_at, name, message_count, detail",
         "messages" => "character_id, conversation_id, message_index, message_id, value",
         _ => unreachable!(),
@@ -241,7 +286,13 @@ fn columns_without_generation(table: &str) -> &'static str {
 }
 
 fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) -> StoreResult<()> {
-    for table in ["messages", "conversations", "characters", "root"] {
+    for table in [
+        "messages",
+        "conversations",
+        "characters",
+        "bot_presets",
+        "root",
+    ] {
         transaction.execute(
             &format!("DELETE FROM {table} WHERE generation = ?1"),
             [generation],
@@ -323,7 +374,7 @@ fn validate_restore_database(path: &Path) -> StoreResult<()> {
         return Err(validation("snapshot integrity check failed"));
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 1 {
+    if !matches!(version, 1 | 2) {
         return Err(validation("snapshot schema version is not supported"));
     }
     Ok(())

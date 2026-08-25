@@ -7,6 +7,8 @@ import { updateTextThemeAndCSS } from "./gui/colorscheme"
 import { defaultHotkeys } from "./defaulthotkeys"
 import { doingChat, previewBody, sendChat } from "./process/index.svelte"
 import { RISU_SIDEBAR_DRAG_TYPE } from "./dragTypes"
+import { changeChar } from "./characters"
+import { deactivateActiveWorkingSet } from "./storage/persistentDataRuntime.svelte"
 
 export function initHotkey(){
     document.addEventListener('keydown', async (ev) => {
@@ -73,7 +75,11 @@ export function initHotkey(){
                     break
                 }
                 case 'home':{
-                    selectedCharID.set(-1)
+                    try {
+                        if (await deactivateActiveWorkingSet()) selectedCharID.set(-1)
+                    } catch {
+                        // Keep the current selection when persistence cannot settle safely.
+                    }
                     break
                 }
                 case 'presets':{
@@ -100,7 +106,9 @@ export function initHotkey(){
                     if(currentIndex >= sorted.length - 1){
                         return
                     }
-                    selectedCharID.set(sorted[currentIndex - 1].i)
+                    if(!await changeChar(sorted[currentIndex - 1].i)){
+                        break
+                    }
                     PlaygroundStore.set(0)
                     OpenRealmStore.set(false)
                     break
@@ -116,7 +124,9 @@ export function initHotkey(){
                     if(currentIndex >= sorted.length - 1){
                         return
                     }
-                    selectedCharID.set(sorted[currentIndex + 1].i)
+                    if(!await changeChar(sorted[currentIndex + 1].i)){
+                        break
+                    }
                     PlaygroundStore.set(0)
                     OpenRealmStore.set(false)
                     break
@@ -181,61 +191,10 @@ export function initHotkey(){
 
 
         if(ev.ctrlKey){
-            switch (ev.key){
-                case "1":{
-                    changeToPreset(0)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "2":{
-                    changeToPreset(1)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "3":{
-                    changeToPreset(2)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "4":{
-                    changeToPreset(3)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "5":{
-                    changeToPreset(4)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "6":{
-                    changeToPreset(5)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "7":{
-                    changeToPreset(6)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "8":{
-                    changeToPreset(7)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
-                case "9":{
-                    changeToPreset(8)
-                    ev.preventDefault()
-                    ev.stopPropagation()
-                    break
-                }
+            if (/^[1-9]$/.test(ev.key)) {
+                ev.preventDefault()
+                ev.stopPropagation()
+                await changeToPreset(Number(ev.key) - 1)
             }
         }
         if(ev.key === 'Escape'){
@@ -410,13 +369,13 @@ export function initMobileGesture(){
     })
 }
 
-function changeToPreset(num:number){
+async function changeToPreset(num:number){
     if(!doingAlert()){
         let db = getDatabase()
         let pres = db.botPresets
         if(pres.length > num){
+            await changeToPreset2(num)
             alertToast(`Changed to Preset: ${pres[num].name}`)
-            changeToPreset2(num)
         }
     }
 }

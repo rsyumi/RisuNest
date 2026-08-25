@@ -5,6 +5,7 @@
     import { addCharacter, changeChar, getCharImage } from "src/ts/characters";
     import { MobileSearch } from "src/ts/stores.svelte";
     import { MessageSquareIcon, PlusIcon } from "@lucide/svelte";
+    import { getCatalogConversationCount } from "src/ts/storage/workingSetCatalog";
 
     interface Props {
         endGrid?: () => void;
@@ -57,7 +58,7 @@
             return {
                 name: c.name || "Unnamed",
                 image: c.image,
-                chats: c.chats.length,
+                chats: getCatalogConversationCount(c),
                 i: i,
                 interaction: c.lastInteraction || 0,
                 agoText: makeAgoText(c.lastInteraction || 0),

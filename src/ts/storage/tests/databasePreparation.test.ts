@@ -49,7 +49,12 @@ vi.mock('../../model/modellist', () => ({
     LLMTokenizer: {},
 }))
 import type { Database } from '../database.svelte'
-import { checkCharOrder, prepareDatabaseForPersistence } from '../databasePreparation'
+import {
+    checkCharOrder,
+    prepareDatabaseForPersistence,
+    preparePersistentRootForWorkingSet,
+} from '../databasePreparation'
+import type { PersistentRoot } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
 
 function deterministicIds(...ids: string[]): () => string {
@@ -58,6 +63,36 @@ function deterministicIds(...ids: string[]): () => string {
 }
 
 describe('prepareDatabaseForPersistence', () => {
+    it('normalizes root data without treating the catalog order as missing characters', async () => {
+        const database = structuredClone(fixtureDatabase)
+        database.formatversion = 4
+        database.loreBookToken = 400
+        database.characterOrder = [
+            {
+                name: 'Favorites',
+                id: 'folder-favorites',
+                color: '#ffffff',
+                data: ['char-a', 'missing-character'],
+            },
+            'char-b',
+        ]
+        const { characters: _characters, botPresets: _botPresets, ...root } = database
+        delete (root as Partial<PersistentRoot>).language
+        const original = structuredClone(root)
+
+        const prepared = await preparePersistentRootForWorkingSet(root, {
+            now: 1_700_000_000_000,
+        })
+
+        expect(root).toEqual(original)
+        expect(prepared).not.toHaveProperty('characters')
+        expect(prepared).not.toHaveProperty('botPresets')
+        expect(prepared.formatversion).toBe(5)
+        expect(prepared.loreBookToken).toBe(8000)
+        expect(prepared.language).toBe('en')
+        expect(prepared.characterOrder).toEqual(original.characterOrder)
+    })
+
     it('normalizes a detached database without changing the input', async () => {
         const input = structuredClone(fixtureDatabase)
         input.formatversion = 4

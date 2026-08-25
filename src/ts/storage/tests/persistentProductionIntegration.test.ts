@@ -4,10 +4,12 @@ import type { Database } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import {
     capturePersistentRoot,
+    capturePersistentPresets,
     captureSelectedPersistentCharacter,
     createPersistentDataRuntime,
     type PersistentDataRuntimeStateAdapter,
 } from '../persistentDataRuntime'
+import { createCatalogPresetWorkingSet } from '../workingSetCatalog'
 import { decodeRisuSave } from '../risuSave'
 import {
     createPersistentSaveObserverInstallation,
@@ -51,9 +53,10 @@ function makeAdapter(database: Database): PersistentDataRuntimeStateAdapter & {
     return {
         current: () => workingCopy,
         captureRoot: () => {
-            const { characters: _characters, ...root } = structuredClone(workingCopy)
+            const { characters: _characters, botPresets: _botPresets, ...root } = structuredClone(workingCopy)
             return root
         },
+        capturePresets: () => capturePersistentPresets(workingCopy),
         captureSelectedCharacter: () => structuredClone(workingCopy.characters[0] ?? null),
         captureCharacter: (id) => {
             const character = workingCopy.characters.find((item) => item.chaId === id)
@@ -62,6 +65,23 @@ function makeAdapter(database: Database): PersistentDataRuntimeStateAdapter & {
         getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
         replaceDatabase: (replacement) => {
             workingCopy = structuredClone(replacement)
+        },
+        publishPresetWorkingSet: ({ revision, root, presets }) => {
+            Object.assign(workingCopy, root)
+            const catalog = {
+                revision,
+                items: presets.map((preset, configuredIndex) => ({
+                    id: String(configuredIndex),
+                    configuredIndex,
+                    name: preset.name ?? '',
+                    image: preset.image,
+                })),
+            }
+            const active = catalog.items[root.botPresetsId]
+            workingCopy.botPresets = createCatalogPresetWorkingSet(catalog, active ? {
+                summary: active,
+                value: presets[active.configuredIndex],
+            } : null)
         },
         publishCharacter: (character) => {
             const index = workingCopy.characters.findIndex((item) => item.chaId === character.chaId)
@@ -122,6 +142,54 @@ describe('persistent production runtime', () => {
         expect(reopened.characters[0].name).toBe('Changed character')
         expect(revisions).toEqual([2])
         expect(legacyWriter).not.toHaveBeenCalled()
+    })
+
+    it('preserves inactive preset rows across scalable root flushes and active switches', async () => {
+        const complete = makeDatabase()
+        complete.botPresetsId = 0
+        complete.botPresets = [
+            { name: 'First', mainPrompt: 'complete first' },
+            { name: 'Second', mainPrompt: 'complete second' },
+        ] as Database['botPresets']
+        const store = makeStore(`runtime-scalable-presets-${crypto.randomUUID()}`)
+        await store.open()
+        await store.replaceFromDatabase(complete)
+        const live = structuredClone(complete)
+        live.botPresets = createCatalogPresetWorkingSet({
+            revision: 1,
+            items: complete.botPresets.map((preset, configuredIndex) => ({
+                id: String(configuredIndex),
+                configuredIndex,
+                name: preset.name,
+            })),
+        }, {
+            summary: { id: '0', configuredIndex: 0, name: 'First' },
+            value: structuredClone(complete.botPresets[0]),
+        })
+        const adapter = makeAdapter(live)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(live)
+
+        adapter.current().username = 'Scalable root edit'
+        runtime.markPersistentDataDirty(1)
+        await runtime.flushPendingData('scalable-root')
+        expect((await store.readPreset('1'))?.value.mainPrompt).toBe('complete second')
+
+        await runtime.mutatePersistentPresets('switch-preset', ({ root }) => {
+            root.botPresetsId = 1
+        })
+
+        const persisted = await store.materializeDatabase(runtime.revision)
+        expect(persisted.botPresets.map((preset) => preset.mainPrompt)).toEqual([
+            'complete first',
+            'complete second',
+        ])
+        expect(adapter.current().botPresets[0]).toEqual({ name: 'First' })
+        expect(adapter.current().botPresets[1].mainPrompt).toBe('complete second')
     })
 
     it('commits a character addition through the production request API', async () => {

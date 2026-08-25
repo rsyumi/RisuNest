@@ -1,6 +1,6 @@
 import { type MCPTool, MCPToolHandler, type RPCToolCallContent } from '../mcplib'
-import { getCharacter } from './utils'
-import { type character, type groupChat } from 'src/ts/storage/database.svelte'
+import { readPersistentSelectedConversation } from 'src/ts/storage/persistentDataRuntime.svelte'
+import { resolveCharacterId } from './utils'
 
 export class ChatHandler extends MCPToolHandler {
   getTools(): MCPTool[] {
@@ -40,8 +40,8 @@ export class ChatHandler extends MCPToolHandler {
   }
 
   async getChatHistory(id: string, count: number = 20, offset: number = 0): Promise<RPCToolCallContent[]> {
-    const char: character | groupChat = getCharacter(id)
-    if (!char) {
+    const characterId = resolveCharacterId(id)
+    if (!characterId) {
       return [
         {
           type: 'text',
@@ -49,11 +49,34 @@ export class ChatHandler extends MCPToolHandler {
         },
       ]
     }
+
+    const selected = await readPersistentSelectedConversation(
+      characterId,
+      'risuaccess-chat-history-read',
+    )
+    if (!selected) {
+      return [
+        {
+          type: 'text',
+          text: `Error: Character with ID ${id} not found.`,
+        },
+      ]
+    }
+
+    const { character: char, conversation } = selected
     if (char.type === 'group') {
       return [
         {
           type: 'text',
           text: `Error: The id pointed to a group chat, not a character.`,
+        },
+      ]
+    }
+    if (!conversation) {
+      return [
+        {
+          type: 'text',
+          text: JSON.stringify([]),
         },
       ]
     }
@@ -63,7 +86,7 @@ export class ChatHandler extends MCPToolHandler {
     if (offset < 0) offset = 0
 
     // To get "newest first", we must reverse the array.
-    const reversedMessages = [...char.chats[char.chatPage].message].reverse()
+    const reversedMessages = [...conversation.message].reverse()
 
     // Now that the array is sorted from newest to oldest, we can slice it
     const history = reversedMessages.slice(offset, offset + count)

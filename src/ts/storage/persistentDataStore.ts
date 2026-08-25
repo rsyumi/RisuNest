@@ -1,4 +1,4 @@
-import type { Chat, Database, Message, character, groupChat } from './database.svelte'
+import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
 
 export type DataRevision = number
 
@@ -9,6 +9,8 @@ export interface Versioned<T> {
 
 export type CharacterDetail = Omit<character, 'chats'> | Omit<groupChat, 'chats'>
 
+export type PersistentRoot = Omit<Database, 'characters' | 'botPresets'>
+
 export interface CharacterSummary {
     id: string
     name: string
@@ -17,6 +19,21 @@ export interface CharacterSummary {
     recentAt: number
     trashed: boolean
     conversationCount: number
+    type: CharacterDetail['type']
+    creatorNotes?: string
+    trashTime?: number
+}
+
+export interface PresetSummary {
+    id: string
+    name: string
+    image?: string
+    configuredIndex: number
+}
+
+export interface PresetCatalog {
+    revision: DataRevision
+    items: PresetSummary[]
 }
 
 export interface ConversationSummary {
@@ -93,7 +110,8 @@ export type ConversationMutation =
 
 export interface WorkingSetCommit {
     expectedRevision: DataRevision
-    root?: Omit<Database, 'characters'>
+    root?: PersistentRoot
+    replacePresets?: botPreset[]
     character?: CharacterDetail
     replaceCharacter?: character | groupChat
     addCharacter?: character | groupChat
@@ -122,7 +140,9 @@ export class SnapshotReleasedError extends Error {
 
 export interface PersistentRevisionLease {
     readonly revision: DataRevision
-    readRoot(): Promise<Versioned<Omit<Database, 'characters'>>>
+    readRoot(): Promise<Versioned<PersistentRoot>>
+    queryPresets(): Promise<PresetCatalog>
+    readPreset(id: string): Promise<Versioned<botPreset> | null>
     queryCharacters(input: CharacterQuery): Promise<CharacterPage>
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
     queryConversations(input: ConversationQuery): Promise<ConversationPage>
@@ -135,7 +155,9 @@ export interface PersistentRevisionLease {
 
 export interface PersistentDataStore {
     open(): Promise<void>
-    readRoot(): Promise<Versioned<Omit<Database, 'characters'>>>
+    readRoot(): Promise<Versioned<PersistentRoot>>
+    queryPresets(): Promise<PresetCatalog>
+    readPreset(id: string): Promise<Versioned<botPreset> | null>
     queryCharacters(input: CharacterQuery): Promise<CharacterPage>
     readCharacter(id: string): Promise<Versioned<CharacterDetail> | null>
     queryConversations(input: ConversationQuery): Promise<ConversationPage>
