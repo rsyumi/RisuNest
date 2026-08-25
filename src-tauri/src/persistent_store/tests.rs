@@ -1262,6 +1262,32 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
             }]),
         })
         .expect("prepare group and plugin value");
+    let configured_index_before = store
+        .query_characters(
+            &CharacterQuery {
+                search: None,
+                order: QueryOrder::Configured,
+                trash: false,
+                limit: 100,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("query group before batch")
+        .items
+        .into_iter()
+        .find(|summary| summary.id == "char-b")
+        .expect("group summary before batch")
+        .configured_index;
+    let chats_before = store
+        .materialize(None)
+        .expect("materialize chats before batch")["characters"]
+        .as_array()
+        .expect("characters before batch")
+        .iter()
+        .find(|character| character["chaId"] == "char-b")
+        .expect("group before batch")["chats"]
+        .clone();
     let lease = store
         .acquire_revision(prepared.revision)
         .expect("acquire batch mutation lease");
@@ -1351,6 +1377,37 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
             .value,
         json!(0)
     );
+    assert_eq!(
+        store
+            .query_characters(
+                &CharacterQuery {
+                    search: None,
+                    order: QueryOrder::Configured,
+                    trash: false,
+                    limit: 100,
+                    cursor: None,
+                },
+                None,
+            )
+            .expect("query group after batch")
+            .items
+            .into_iter()
+            .find(|summary| summary.id == "char-b")
+            .expect("group summary after batch")
+            .configured_index,
+        configured_index_before
+    );
+    assert_eq!(
+        store
+            .materialize(None)
+            .expect("materialize chats after batch")["characters"]
+            .as_array()
+            .expect("characters after batch")
+            .iter()
+            .find(|character| character["chaId"] == "char-b")
+            .expect("group after batch")["chats"],
+        chats_before
+    );
     assert!(store
         .read_character("char-a", Some(&lease.lease))
         .expect("read leased target")
@@ -1374,6 +1431,57 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
     store
         .release_revision(&lease.lease)
         .expect("release batch mutation lease");
+}
+
+#[test]
+fn invalid_batch_character_detail_ids_leave_every_character_row_unchanged() {
+    let (_directory, mut store, _) = open_fixture();
+    let before = store
+        .materialize(None)
+        .expect("materialize before invalid batches");
+    let detail = store
+        .read_character("char-b", None)
+        .expect("read batch detail")
+        .expect("batch detail exists")
+        .value;
+    let mut empty = detail.clone();
+    empty["chaId"] = json!("");
+    let mut missing = detail.clone();
+    missing["chaId"] = json!("missing-character");
+    let cases = vec![
+        ("empty", vec![empty], None),
+        ("duplicate", vec![detail.clone(), detail.clone()], None),
+        ("deleted", vec![detail.clone()], Some("char-b".to_owned())),
+        ("missing", vec![missing], None),
+    ];
+
+    for (name, character_details, delete_character_id) in cases {
+        let result = store.commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Must not persist" })),
+            replace_presets: None,
+            character: None,
+            character_details: Some(character_details),
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id,
+            plugin_storage: None,
+        });
+
+        assert!(
+            matches!(result, Err(StoreError::Validation { .. })),
+            "{name} batch detail should be rejected"
+        );
+        assert_eq!(store.revision().expect("revision after invalid batch"), 1);
+        assert_eq!(
+            store
+                .materialize(None)
+                .expect("materialize after invalid batch"),
+            before,
+            "{name} batch detail changed stored character rows"
+        );
+    }
 }
 
 #[test]

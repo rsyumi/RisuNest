@@ -167,6 +167,60 @@ describe('persistent character mutation publication', () => {
         expect(captureResidentPersistentCharacter(database, 'char-a', residency)).toBe(readded)
     })
 
+    it('keeps a related scalable group as a catalog stub after deletion publication', () => {
+        const residency = new WorkingSetResidencyRegistry()
+        const groupStub = createCatalogCharacterStub({
+            id: 'group-a',
+            name: 'Group',
+            configuredIndex: 0,
+            recentAt: 0,
+            trashed: false,
+            conversationCount: 3,
+            type: 'group',
+        })
+        const targetStub = createCatalogCharacterStub({
+            id: 'char-a',
+            name: 'Target',
+            configuredIndex: 1,
+            recentAt: 0,
+            trashed: false,
+            conversationCount: 1,
+            type: 'character',
+        })
+        const database = {
+            ...makeDatabase('Scalable delete'),
+            characters: [groupStub, targetStub],
+        } as Database
+
+        publishPersistentCharacterMutationToWorkingSet(
+            database,
+            {
+                revision: 2,
+                root: capturePersistentRoot(database),
+                characterId: 'char-a',
+                kind: 'delete',
+                character: null,
+                relatedCharacters: [{
+                    type: 'group',
+                    chaId: 'group-a',
+                    name: 'Updated group',
+                    characters: ['char-b'],
+                    characterTalks: [0.75],
+                    characterActive: [true],
+                } as any],
+            },
+            residency,
+            -1,
+            vi.fn(),
+        )
+
+        expect(database.characters).toHaveLength(1)
+        expect(database.characters[0].name).toBe('Updated group')
+        expect(isCatalogCharacterStub(database.characters[0])).toBe(true)
+        expect(database.characters[0]).not.toHaveProperty('characters')
+        expect(database.characters[0].chats).toEqual([])
+    })
+
     it('keeps scalable add, released replace, and detail mutations bounded', () => {
         const residency = new WorkingSetResidencyRegistry()
         const database = makeDatabase('Catalog')

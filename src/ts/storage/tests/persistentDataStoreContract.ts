@@ -401,8 +401,14 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 chats: [],
                 ...(trashTime === undefined ? {} : { trashTime }),
             }) as Database['characters'][number]
+            const activeGroup = makeGroup('group-active', ['char-b', 'char-a'])
+            activeGroup.chats = [{
+                id: 'group-chat',
+                name: 'Group chat',
+                message: [{ role: 'user', data: 'keep me', chatId: 'group-message' }],
+            } as Database['characters'][number]['chats'][number]]
             database.characters.push(
-                makeGroup('group-active', ['char-b', 'char-a']),
+                activeGroup,
                 makeGroup('group-trash', ['char-a', 'char-c'], 500),
                 makeGroup('group-unreferenced', ['char-b']),
             )
@@ -411,6 +417,15 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             const imported = await store.replaceFromDatabase(database)
             const lease = await store.acquireRevision(imported.revision)
             const root = (await store.readRoot()).value
+            const activeSummaryBefore = (await store.queryCharacters({
+                order: 'configured',
+                trash: false,
+                limit: 100,
+            })).items.find((item) => item.id === 'group-active')!
+            const activeConversationBefore = await store.readConversation(
+                'group-active',
+                'group-chat',
+            )
             const active = (await store.readCharacter('group-active'))!.value as groupChat
             const trash = (await store.readCharacter('group-trash'))!.value as groupChat
             active.characters = ['char-b']
@@ -440,6 +455,18 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                     characterActive: [true],
                 },
             })
+            expect((await store.queryCharacters({
+                order: 'configured',
+                trash: false,
+                limit: 100,
+            })).items.find((item) => item.id === 'group-active')).toEqual({
+                ...activeSummaryBefore,
+                conversationCount: 1,
+            })
+            expect(await store.readConversation('group-active', 'group-chat')).toEqual({
+                ...activeConversationBefore,
+                revision: committed.revision,
+            })
             expect(await store.readCharacter('group-trash')).toMatchObject({
                 revision: committed.revision,
                 value: {
@@ -468,6 +495,55 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect((await store.readRoot()).revision).toBe(committed.revision)
             expect((await store.readPluginStorage('zero'))?.value).toBe(0)
         })
+
+        it.each(['empty', 'duplicate', 'deleted', 'missing'] as const)(
+            'rejects %s IDs in batch details without changing any character rows',
+            async (invalidCase) => {
+                const { store } = await createHarness()
+                const imported = await store.replaceFromDatabase(fixtureDatabase)
+                const beforeDatabase = await store.materializeDatabase()
+                const beforeCatalog = await store.queryCharacters({
+                    order: 'configured',
+                    trash: false,
+                    limit: 100,
+                })
+                const beforeConversations = await store.queryConversations({
+                    characterId: 'char-b',
+                    order: 'configured',
+                    limit: 100,
+                })
+                const detail = (await store.readCharacter('char-b'))!.value
+                const invalidDetail = structuredClone(detail)
+                let characterDetails = [invalidDetail]
+                let deleteCharacterId: string | undefined
+                if (invalidCase === 'empty') invalidDetail.chaId = ''
+                if (invalidCase === 'duplicate') {
+                    characterDetails = [invalidDetail, structuredClone(invalidDetail)]
+                }
+                if (invalidCase === 'deleted') deleteCharacterId = 'char-b'
+                if (invalidCase === 'missing') invalidDetail.chaId = 'missing-character'
+
+                await expect(store.commit({
+                    expectedRevision: imported.revision,
+                    root: { ...(await store.readRoot()).value, username: 'Must not persist' },
+                    characterDetails,
+                    deleteCharacterId,
+                })).rejects.toThrow()
+
+                expect((await store.readRoot()).revision).toBe(imported.revision)
+                expect(await store.queryCharacters({
+                    order: 'configured',
+                    trash: false,
+                    limit: 100,
+                })).toEqual(beforeCatalog)
+                expect(await store.queryConversations({
+                    characterId: 'char-b',
+                    order: 'configured',
+                    limit: 100,
+                })).toEqual(beforeConversations)
+                expect(await store.materializeDatabase()).toEqual(beforeDatabase)
+            },
+        )
 
         it('commits a replacement range and increments the revision once', async () => {
             const { store } = await createHarness()
