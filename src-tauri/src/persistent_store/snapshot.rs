@@ -1,6 +1,6 @@
 use super::{
     active_generation, current_revision, CheckpointMode, LeaseResult, SnapshotCreated,
-    SnapshotInfo, StoreError, StoreResult,
+    SnapshotInfo, StoreError, StoreResult, GENERATION_TABLES,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -103,32 +103,41 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
 pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreResult<()> {
     let cutoff = now_ms() - LEASE_TTL_MS;
     let transaction = connection.transaction()?;
+    let expired_generations = {
+        let mut statement =
+            transaction.prepare("SELECT generation FROM snapshot_leases WHERE created_at < ?1")?;
+        let generations = statement
+            .query_map([cutoff], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        generations
+    };
     transaction.execute(
         "DELETE FROM snapshot_leases WHERE created_at < ?1",
         [cutoff],
     )?;
+    let active = active_generation(&transaction)?;
+    let mut statement = transaction.prepare(
+        "SELECT generation FROM root
+         WHERE generation LIKE 'staging-%'
+            OR generation LIKE 'snapshot-%'",
+    )?;
+    let mut stale = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    stale.extend(expired_generations);
+    stale.sort();
+    stale.dedup();
+    for generation in stale {
+        if generation != active && !generation_is_leased(&transaction, &generation)? {
+            delete_generation(&transaction, &generation)?;
+        }
+    }
     transaction.execute(
         "DELETE FROM snapshot_leases
          WHERE generation NOT IN (SELECT generation FROM root)",
         [],
     )?;
-
-    let generations = ["staging-%", "snapshot-%"];
-    for pattern in generations {
-        let mut statement = transaction.prepare(
-            "SELECT generation FROM root
-             WHERE generation LIKE ?1
-               AND (generation LIKE 'staging-%'
-                    OR generation NOT IN (SELECT generation FROM snapshot_leases))",
-        )?;
-        let stale = statement
-            .query_map([pattern], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for generation in stale {
-            delete_generation(&transaction, &generation)?;
-        }
-    }
     transaction.commit()?;
     Ok(())
 }
@@ -147,7 +156,7 @@ pub(super) fn acquire_revision(
     }
 
     let source = active_generation(&transaction)?;
-    let generation = format!("snapshot-{revision}-{}", Uuid::new_v4());
+    let lease = format!("snapshot-{revision}-{}", Uuid::new_v4());
     let root_exists = transaction
         .query_row(
             "SELECT 1 FROM root WHERE generation = ?1",
@@ -164,37 +173,33 @@ pub(super) fn acquire_revision(
     }
 
     transaction.execute(
-        "INSERT INTO root (generation, value) SELECT ?1, value FROM root WHERE generation = ?2",
-        params![generation, source],
-    )?;
-    for table in [
-        "bot_presets",
-        "characters",
-        "conversations",
-        "messages",
-        "plugin_storage",
-    ] {
-        let sql = format!(
-            "INSERT INTO {table} SELECT ?1, {} FROM {table} WHERE generation = ?2",
-            columns_without_generation(table)
-        );
-        transaction.execute(&sql, params![generation, source])?;
-    }
-    transaction.execute(
-        "INSERT INTO snapshot_leases (generation, created_at) VALUES (?1, ?2)",
-        params![generation, now_ms()],
+        "INSERT INTO snapshot_leases (lease, generation, revision, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![lease, source, revision, now_ms()],
     )?;
     transaction.commit()?;
-    Ok(LeaseResult { lease: generation })
+    Ok(LeaseResult { lease })
 }
 
 pub(super) fn release_revision(connection: &mut Connection, lease: &str) -> StoreResult<()> {
     if !lease.starts_with("snapshot-") {
-        return Err(validation("revision lease must be a snapshot generation"));
+        return Err(validation("revision lease must be a snapshot lease"));
     }
     let transaction = connection.transaction()?;
-    delete_generation(&transaction, lease)?;
-    transaction.execute("DELETE FROM snapshot_leases WHERE generation = ?1", [lease])?;
+    let generation = transaction
+        .query_row(
+            "SELECT generation FROM snapshot_leases WHERE lease = ?1",
+            [lease],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    transaction.execute("DELETE FROM snapshot_leases WHERE lease = ?1", [lease])?;
+    if let Some(generation) = generation {
+        let active = active_generation(&transaction)?;
+        if generation != active && !generation_is_leased(&transaction, &generation)? {
+            delete_generation(&transaction, &generation)?;
+        }
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -281,32 +286,28 @@ pub(super) fn restore_request(snapshots_dir: &Path, path: &Path) -> StoreResult<
     Ok(())
 }
 
-fn columns_without_generation(table: &str) -> &'static str {
-    match table {
-        "bot_presets" => "preset_id, configured_index, name, image, value",
-        "characters" => "character_id, configured_index, recent_at, trashed, name, image, conversation_count, type, creator_notes, trash_time, detail",
-        "conversations" => "character_id, conversation_id, configured_index, recent_at, name, message_count, detail",
-        "messages" => "character_id, conversation_id, message_index, message_id, value",
-        "plugin_storage" => "storage_key, byte_size, ordinal, value",
-        _ => unreachable!(),
-    }
-}
-
 fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) -> StoreResult<()> {
-    for table in [
-        "messages",
-        "conversations",
-        "characters",
-        "bot_presets",
-        "plugin_storage",
-        "root",
-    ] {
+    for (table, _) in GENERATION_TABLES.iter().rev() {
         transaction.execute(
             &format!("DELETE FROM {table} WHERE generation = ?1"),
             [generation],
         )?;
     }
     Ok(())
+}
+
+fn generation_is_leased(
+    transaction: &rusqlite::Transaction<'_>,
+    generation: &str,
+) -> StoreResult<bool> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM snapshot_leases WHERE generation = ?1 LIMIT 1",
+            [generation],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn validate_snapshot_path(snapshots_dir: &Path, path: &Path) -> StoreResult<PathBuf> {
@@ -382,7 +383,7 @@ fn validate_restore_database(path: &Path) -> StoreResult<()> {
         return Err(validation("snapshot integrity check failed"));
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if !matches!(version, 1 | 2 | 3 | 4) {
+    if !matches!(version, 1 | 2 | 3 | 4 | 5) {
         return Err(validation("snapshot schema version is not supported"));
     }
     Ok(())

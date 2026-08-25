@@ -54,6 +54,35 @@ async function writeRawRecords(
     database.close()
 }
 
+async function countPersistentDataRecords(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<Record<string, number>> {
+    const storeNames = [
+        'root',
+        'presets',
+        'catalog',
+        'characters',
+        'conversations',
+        'messagePages',
+    ]
+    const database = await openDatabase(indexedDB, databaseName)
+    const transaction = database.transaction(storeNames, 'readonly')
+    const entries = await Promise.all(
+        storeNames.map(async (storeName) => {
+            const request = transaction.objectStore(storeName).count()
+            const count = await new Promise<number>((resolve, reject) => {
+                request.onsuccess = () => resolve(request.result)
+                request.onerror = () => reject(request.error)
+            })
+            return [storeName, count] as const
+        }),
+    )
+    await completeTransaction(transaction)
+    database.close()
+    return Object.fromEntries(entries)
+}
+
 async function createVersion1Database(
     indexedDB: IDBFactory,
     databaseName: string,
@@ -323,6 +352,20 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         expect(openSpy).toHaveBeenCalledTimes(1)
         openSpy.mockRestore()
         expect((await store.readRoot()).revision).toBe(0)
+    })
+
+    it('acquires a revision by reference without copying persistent records', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `revision-reference-count-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        const before = await countPersistentDataRecords(indexedDB, databaseName)
+
+        const lease = await store.acquireRevision(imported.revision)
+
+        expect(await countPersistentDataRecords(indexedDB, databaseName)).toEqual(before)
+        await lease.release()
     })
 
     it('rejects non-positive query limits instead of returning a stuck cursor', async () => {
@@ -1221,9 +1264,12 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await store.open()
         const stale = 'snapshot-crashed-stale'
         const legacy = 'snapshot-crashed-legacy'
+        const cow = 'revision-cow-stale'
+        const cowLease = 'snapshot-9-cow-stale'
         await writeRawRecords(indexedDB, databaseName, 'root', [
             { key: stale, generation: stale, value: {} },
             { key: legacy, generation: legacy, value: {} },
+            { key: cow, generation: cow, value: {} },
         ])
         await writeRawRecords(indexedDB, databaseName, 'meta', [
             {
@@ -1232,15 +1278,22 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 createdAt: Date.now() - 25 * 60 * 60 * 1000,
             },
             { key: `snapshotLease:${legacy}`, value: legacy },
+            {
+                key: `snapshotLease:${cowLease}`,
+                value: { generation: cow, revision: 9 },
+                createdAt: Date.now() - 25 * 60 * 60 * 1000,
+            },
         ])
 
         const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
         await reopened.open()
 
-        for (const generation of [stale, legacy]) {
+        for (const generation of [stale, legacy, cow]) {
             expect(await readRawRecord(indexedDB, databaseName, 'root', generation)).toBeUndefined()
+        }
+        for (const lease of [stale, legacy, cowLease]) {
             expect(
-                await readRawRecord(indexedDB, databaseName, 'meta', `snapshotLease:${generation}`),
+                await readRawRecord(indexedDB, databaseName, 'meta', `snapshotLease:${lease}`),
             ).toBeUndefined()
         }
     })

@@ -62,7 +62,7 @@ pub(super) fn create(
         &ownership_path,
         &ExportOwnership {
             export_id: id.to_string(),
-            lease: target.generation.clone(),
+            lease: lease.to_owned(),
         },
     )?;
 
@@ -804,11 +804,14 @@ mod tests {
     #[test]
     fn removes_partial_output_when_export_fails() {
         let (_directory, store, _revision, lease) = fixture();
+        let generation = read_target(&store.connection, Some(&lease))
+            .unwrap()
+            .generation;
         store
             .connection
             .execute(
                 "UPDATE root SET value = '{' WHERE generation = ?1",
-                [&lease],
+                [&generation],
             )
             .unwrap();
 

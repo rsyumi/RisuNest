@@ -23,13 +23,23 @@ import type {
 } from './persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
 
-const DATABASE_VERSION = 6
+const DATABASE_VERSION = 7
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
-const STORE_NAMES = ['meta', 'root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const
-const DATA_STORE_NAMES = ['root', 'presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const
-const activeSnapshotGenerations = new Set<string>()
+// Add every generation-scoped record family here so lease COW and cleanup cannot omit it.
+const INDEXED_GENERATION_STORE_NAMES = [
+    'presets',
+    'catalog',
+    'characters',
+    'conversations',
+    'messagePages',
+    'pluginStorage',
+    'pluginStorageMetadata',
+] as const
+const DATA_STORE_NAMES = ['root', ...INDEXED_GENERATION_STORE_NAMES] as const
+const STORE_NAMES = ['meta', ...DATA_STORE_NAMES] as const
+const activeSnapshotLeases = new Set<string>()
 
 interface StoredRecord<T> {
     key: string
@@ -91,6 +101,17 @@ function comparePluginStorageRecords(
     if (leftIndex !== null) return -1
     if (rightIndex !== null) return 1
     return left.ordinal - right.ordinal || left.storageKey.localeCompare(right.storageKey)
+}
+
+interface SnapshotLeaseTarget {
+    generation: string
+    revision: DataRevision
+}
+
+interface SnapshotLeaseRecord {
+    key: string
+    value: string | SnapshotLeaseTarget
+    createdAt?: number
 }
 
 export type PersistentGenerationCleanupErrorHandler = (
@@ -386,7 +407,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
 
             const revision = active.revision + 1
-            const generation = active.generation
+            const generation = await this.ensureWritableGeneration(
+                transaction,
+                active.generation,
+                revision,
+            )
             if (input.root) this.putRoot(transaction, generation, input.root)
             if (input.replacePresets) await this.putPresets(transaction, generation, input.replacePresets)
             if (input.deleteCharacterId) {
@@ -433,12 +458,8 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             const revision = active.revision + 1
             const generation = this.generationFor(revision)
             await this.stageDatabase(transaction, databaseValue, generation)
-            transaction.objectStore('root').delete(active.generation)
-            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const) {
-                await this.deleteIndexRange(
-                    transaction.objectStore(storeName).index('byGeneration'),
-                    this.keyRangeFactory.only(active.generation),
-                )
+            if (!(await this.generationIsLeased(transaction, active.generation))) {
+                await this.deleteGenerationFromTransaction(transaction, active.generation)
             }
             this.setActive(transaction, revision, generation)
             await transactionDone(transaction)
@@ -541,9 +562,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     async acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease> {
         const database = this.requireDatabase()
-        const generation = `snapshot-${revision}-${globalThis.crypto.randomUUID()}`
-        const transaction = database.transaction([...STORE_NAMES], 'readwrite')
-        activeSnapshotGenerations.add(generation)
+        const lease = `snapshot-${revision}-${globalThis.crypto.randomUUID()}`
+        const transaction = database.transaction(['meta', 'root'], 'readwrite')
+        activeSnapshotLeases.add(lease)
+        let generation = ''
         try {
             const active = await this.readActive(transaction)
             if (active.revision !== revision) {
@@ -553,22 +575,15 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 transaction.objectStore('root').get(active.generation),
             )) as StoredRecord<PersistentRoot> | undefined
             if (!root) throw new RevisionConflictError(revision, active.revision)
-            transaction.objectStore('root').put({ ...root, key: generation, generation })
+            generation = active.generation
             transaction.objectStore('meta').put({
-                key: this.snapshotLeaseKey(generation),
-                value: generation,
+                key: this.snapshotLeaseKey(lease),
+                value: { generation, revision } satisfies SnapshotLeaseTarget,
                 createdAt: Date.now(),
             })
-            for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const) {
-                await this.copyGeneration(
-                    transaction.objectStore(storeName),
-                    active.generation,
-                    generation,
-                )
-            }
             await transactionDone(transaction)
         } catch (error) {
-            activeSnapshotGenerations.delete(generation)
+            activeSnapshotLeases.delete(lease)
             try {
                 transaction.abort()
             } catch {}
@@ -673,10 +688,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             release: async () => {
                 if (releasePromise) return releasePromise
-                releasePromise = this.releaseSnapshotLease(generation).then(
+                releasePromise = this.releaseSnapshotLease(lease).then(
                     () => {
                         released = true
-                        activeSnapshotGenerations.delete(generation)
+                        activeSnapshotLeases.delete(lease)
                     },
                     (error) => {
                         releasePromise = undefined
@@ -948,6 +963,45 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         })
     }
 
+    private async ensureWritableGeneration(
+        transaction: IDBTransaction,
+        sourceGeneration: string,
+        revision: DataRevision,
+    ): Promise<string> {
+        if (!(await this.generationIsLeased(transaction, sourceGeneration))) {
+            return sourceGeneration
+        }
+        const targetGeneration = this.generationFor(revision)
+        const root = (await requestResult(
+            transaction.objectStore('root').get(sourceGeneration),
+        )) as StoredRecord<PersistentRoot> | undefined
+        if (!root) throw new Error('Persistent active generation root is missing')
+        transaction.objectStore('root').put({
+            ...root,
+            key: targetGeneration,
+            generation: targetGeneration,
+        })
+        for (const storeName of INDEXED_GENERATION_STORE_NAMES) {
+            await this.copyGeneration(
+                transaction.objectStore(storeName),
+                sourceGeneration,
+                targetGeneration,
+            )
+        }
+        return targetGeneration
+    }
+
+    private async generationIsLeased(
+        transaction: IDBTransaction,
+        generation: string,
+    ): Promise<boolean> {
+        const records = await this.readMetaRecordsByPrefix<string | SnapshotLeaseTarget>(
+            transaction.objectStore('meta'),
+            'snapshotLease:',
+        )
+        return records.some((record) => this.snapshotLeaseTarget(record).generation === generation)
+    }
+
     private async stageDatabase(
         transaction: IDBTransaction,
         databaseValue: Database,
@@ -986,18 +1040,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    private async deleteGeneration(generation: string): Promise<void> {
-        const transaction = this.requireDatabase().transaction([...DATA_STORE_NAMES], 'readwrite')
-        await this.deleteGenerationFromTransaction(transaction, generation)
-        await transactionDone(transaction)
-    }
-
     private async deleteGenerationFromTransaction(
         transaction: IDBTransaction,
         generation: string,
     ): Promise<void> {
         transaction.objectStore('root').delete(generation)
-        for (const storeName of ['presets', 'catalog', 'characters', 'conversations', 'messagePages', 'pluginStorage', 'pluginStorageMetadata'] as const) {
+        for (const storeName of INDEXED_GENERATION_STORE_NAMES) {
             await this.deleteIndexRange(
                 transaction.objectStore(storeName).index('byGeneration'),
                 this.keyRangeFactory.only(generation),
@@ -1013,61 +1061,89 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
-    private snapshotLeaseKey(generation: string): string {
-        return `snapshotLease:${generation}`
+    private snapshotLeaseKey(lease: string): string {
+        return `snapshotLease:${lease}`
     }
 
-    private async releaseSnapshotLease(generation: string): Promise<void> {
-        await this.deleteGeneration(generation)
-        const transaction = this.requireDatabase().transaction('meta', 'readwrite')
-        transaction.objectStore('meta').delete(this.snapshotLeaseKey(generation))
+    private async releaseSnapshotLease(lease: string): Promise<void> {
+        const transaction = this.requireDatabase().transaction([...STORE_NAMES], 'readwrite')
+        const meta = transaction.objectStore('meta')
+        const record = (await requestResult(
+            meta.get(this.snapshotLeaseKey(lease)),
+        )) as SnapshotLeaseRecord | undefined
+        if (!record) {
+            await transactionDone(transaction)
+            return
+        }
+        const target = this.snapshotLeaseTarget(record)
+        await requestResult(meta.delete(record.key))
+        const active = await this.readActive(transaction)
+        if (
+            target.generation !== active.generation &&
+            !(await this.generationIsLeased(transaction, target.generation))
+        ) {
+            await this.deleteGenerationFromTransaction(transaction, target.generation)
+        }
         await transactionDone(transaction)
     }
 
-    /**
-     * Removes snapshot copies abandoned by an interrupted export. A lease record keeps snapshots
-     * that another open document is still reading, which a module-local set cannot see; leases
-     * older than the TTL are treated as crash leftovers and reclaimed with their generations.
-     */
+    /** Removes abandoned staging data and generations retained only by expired leases. */
     private async sweepTemporaryGenerations(): Promise<void> {
         const database = this.requireDatabase()
         const cutoff = Date.now() - SNAPSHOT_LEASE_TTL_MS
         const leaseTransaction = database.transaction('meta', 'readwrite')
         const meta = leaseTransaction.objectStore('meta')
-        const leaseRecords = await this.readMetaRecordsByPrefix<string>(meta, 'snapshotLease:')
+        const leaseRecords = await this.readMetaRecordsByPrefix<string | SnapshotLeaseTarget>(
+            meta,
+            'snapshotLease:',
+        )
         const leased = new Set<string>()
+        const reclaimCandidates = new Set<string>()
         for (const record of leaseRecords) {
+            const target = this.snapshotLeaseTarget(record)
+            const lease = record.key.slice('snapshotLease:'.length)
             const live =
-                activeSnapshotGenerations.has(record.value) || (record.createdAt ?? 0) >= cutoff
-            if (live) leased.add(record.value)
-            else meta.delete(record.key)
+                activeSnapshotLeases.has(lease) || (record.createdAt ?? 0) >= cutoff
+            if (live) leased.add(target.generation)
+            else {
+                reclaimCandidates.add(target.generation)
+                meta.delete(record.key)
+            }
         }
+        const active = await this.readActive(leaseTransaction)
         await transactionDone(leaseTransaction)
 
-        const snapshots = this.keyRangeFactory.bound('snapshot-', 'snapshot-￿')
-        const abandoned = (generation: string) =>
-            !leased.has(generation) && !activeSnapshotGenerations.has(generation)
+        const rootTransaction = database.transaction('root', 'readonly')
+        const rootKeys = await requestResult(rootTransaction.objectStore('root').getAllKeys())
+        await transactionDone(rootTransaction)
+        for (const key of rootKeys) {
+            const generation = String(key)
+            if (generation.startsWith('snapshot-') || generation.startsWith('staging-')) {
+                reclaimCandidates.add(generation)
+            }
+        }
+
         const transaction = database.transaction([...DATA_STORE_NAMES], 'readwrite')
-        for (const storeName of DATA_STORE_NAMES) {
-            const store = transaction.objectStore(storeName)
-            // Only the root store is keyed by generation; the rest carry it on an index.
-            const request = storeName === 'root'
-                ? store.openKeyCursor(snapshots)
-                : store.index('byGeneration').openKeyCursor(snapshots)
-            await new Promise<void>((resolve, reject) => {
-                request.onerror = () => reject(request.error)
-                request.onsuccess = () => {
-                    const cursor = request.result
-                    if (!cursor) {
-                        resolve()
-                        return
-                    }
-                    if (abandoned(String(cursor.key))) store.delete(cursor.primaryKey)
-                    cursor.continue()
-                }
-            })
+        for (const generation of reclaimCandidates) {
+            if (generation === active.generation || leased.has(generation)) continue
+            await this.deleteGenerationFromTransaction(transaction, generation)
         }
         await transactionDone(transaction)
+    }
+
+    private snapshotLeaseTarget(record: SnapshotLeaseRecord): SnapshotLeaseTarget {
+        if (typeof record.value === 'string') {
+            return {
+                generation: record.value,
+                revision: this.revisionFromLease(record.key.slice('snapshotLease:'.length)),
+            }
+        }
+        return record.value
+    }
+
+    private revisionFromLease(lease: string): DataRevision {
+        const revision = Number.parseInt(lease.slice('snapshot-'.length).split('-')[0], 10)
+        return Number.isFinite(revision) ? revision : 0
     }
 
     private readMetaRecordsByPrefix<T>(

@@ -1129,6 +1129,162 @@ fn revision_leases_are_isolated_then_released() {
 }
 
 #[test]
+fn revision_acquire_reuses_generation_records() {
+    let (_directory, mut store, _) = open_fixture();
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: None,
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "counted-zero".to_owned(),
+                value: json!(0),
+            }]),
+        })
+        .expect("seed counted plugin record");
+    let tables = [
+        "root",
+        "bot_presets",
+        "characters",
+        "conversations",
+        "messages",
+        "plugin_storage",
+    ];
+    let count_records = |store: &PersistentStore| {
+        tables
+            .iter()
+            .map(|table| {
+                store
+                    .connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .expect("count generation records")
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = count_records(&store);
+
+    let lease = store.acquire_revision(2).expect("acquire revision lease");
+
+    assert_eq!(count_records(&store), before);
+    store.release_revision(&lease.lease).expect("release lease");
+}
+
+#[test]
+fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
+    let (_directory, mut store, database) = open_fixture();
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: None,
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "pinned-zero".to_owned(),
+                value: json!(0),
+            }]),
+        })
+        .expect("seed pinned plugin value");
+    let lease = store.acquire_revision(2).expect("acquire revision lease");
+    let revision = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 2,
+            root: Some(json!({ "apiType": "fixture-provider", "username": "Changed" })),
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-short".to_owned(),
+                start: 2,
+                delete_count: 0,
+                messages: vec![message("active-append")],
+                conversation: None,
+            }]),
+            delete_character_id: Some("char-b".to_owned()),
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "pinned-zero".to_owned(),
+                value: json!(1),
+            }]),
+        })
+        .expect("commit active changes")
+        .revision;
+    assert!(store
+        .read_character("char-b", None)
+        .expect("read active character")
+        .is_none());
+
+    let staging = store.replace_begin().expect("begin staged replacement");
+    store
+        .replace_put_root(&staging.staging_id, &root(&database))
+        .expect("stage root");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            database["botPresets"].as_array().expect("fixture presets"),
+        )
+        .expect("stage presets");
+    store
+        .replace_add_characters(
+            &staging.staging_id,
+            database["characters"]
+                .as_array()
+                .expect("fixture characters"),
+        )
+        .expect("stage characters");
+    store
+        .replace_commit(&staging.staging_id, Some(revision))
+        .expect("activate staged replacement");
+
+    assert_eq!(
+        store
+            .read_root(Some(&lease.lease))
+            .expect("read leased root")
+            .value["username"],
+        "Fixture User"
+    );
+    assert!(store
+        .read_character("char-b", Some(&lease.lease))
+        .expect("read leased character")
+        .is_some());
+    assert_eq!(
+        store
+            .read_conversation("char-a", "conv-short", Some(&lease.lease))
+            .expect("read leased conversation")
+            .expect("leased conversation exists")
+            .value["message"]
+            .as_array()
+            .expect("leased messages")
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("pinned-zero", Some(&lease.lease))
+            .expect("read leased plugin value")
+            .expect("leased plugin value exists")
+            .value,
+        json!(0)
+    );
+    store.release_revision(&lease.lease).expect("release lease");
+    assert!(matches!(
+        store.read_root(Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+}
+
+#[test]
 fn releasing_a_non_snapshot_generation_cannot_delete_active_data() {
     let (_directory, mut store, database) = open_fixture();
 
@@ -1766,6 +1922,19 @@ fn revision_leases_isolate_conversation_reads() {
 fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
     let (directory, mut store, _) = open_fixture();
     let lease = store.acquire_revision(1).expect("acquire revision lease");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Active after lease" })),
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+        })
+        .expect("fork active generation");
     drop(store);
 
     let store = PersistentStore::open(directory.path()).expect("reopen with fresh lease");
@@ -1790,15 +1959,22 @@ fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
         store.read_root(Some(&lease.lease)),
         Err(StoreError::SnapshotReleased)
     ));
-    let orphan_rows: i64 = store
+    let expired_generation_rows: i64 = store
         .connection
         .query_row(
-            "SELECT COUNT(*) FROM root WHERE generation = ?1",
-            [lease.lease.as_str()],
+            "SELECT COUNT(*) FROM root WHERE generation = 'revision-1'",
+            [],
             |row| row.get(0),
         )
-        .expect("count swept generation rows");
-    assert_eq!(orphan_rows, 0);
+        .expect("count expired generation rows");
+    assert_eq!(expired_generation_rows, 0);
+    assert_eq!(
+        store
+            .read_root(None)
+            .expect("read active root after sweep")
+            .value["username"],
+        "Active after lease"
+    );
 }
 
 #[test]
@@ -1975,6 +2151,68 @@ fn create_v2_database(path: &Path) {
         .expect("write v2 plugin root");
 }
 
+fn create_v2_database_with_lease(path: &Path) {
+    create_v2_database(path);
+    let connection = rusqlite::Connection::open(path).expect("open v2 fixture database");
+    connection
+        .execute_batch(
+            "
+            INSERT INTO root (generation, value)
+                VALUES ('snapshot-7-v2fixture',
+                        '{\"username\":\"V2 leased\",\"pluginCustomStorage\":{\"leased-zero\":0}}');
+            INSERT INTO snapshot_leases (generation, created_at)
+                VALUES ('snapshot-7-v2fixture', 4102444800000);
+            ",
+        )
+        .expect("create v2 fixture lease");
+}
+
+#[test]
+fn schema_v5_migrates_v2_snapshot_lease_and_plugin_records() {
+    let directory = tempfile::tempdir().expect("create v2 migration directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_v2_database_with_lease(&database_path);
+
+    let mut store = PersistentStore::open(directory.path()).expect("migrate v2 store");
+    assert_eq!(
+        store
+            .read_root(Some("snapshot-7-v2fixture"))
+            .expect("read migrated lease")
+            .value["username"],
+        "V2 leased"
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("leased-zero", Some("snapshot-7-v2fixture"))
+            .expect("read migrated leased plugin value")
+            .expect("leased plugin value exists")
+            .value,
+        json!(0)
+    );
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read migrated version");
+    assert_eq!(version, 5);
+
+    store
+        .release_revision("snapshot-7-v2fixture")
+        .expect("release migrated lease");
+    assert!(matches!(
+        store.read_root(Some("snapshot-7-v2fixture")),
+        Err(StoreError::SnapshotReleased)
+    ));
+    let snapshot_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM plugin_storage WHERE generation = 'snapshot-7-v2fixture'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count released migrated plugin records");
+    assert_eq!(snapshot_rows, 0);
+}
+
 fn create_v3_database(path: &Path) {
     create_v2_database(path);
     let connection = rusqlite::Connection::open(path).expect("open v2 database for v3 setup");
@@ -2040,7 +2278,7 @@ fn create_v3_database(path: &Path) {
 }
 
 #[test]
-fn schema_v4_migrates_existing_v2_plugin_storage() {
+fn schema_v5_migrates_existing_v2_plugin_storage() {
     let directory = tempfile::tempdir().expect("create v2 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database(&database_path);
@@ -2065,11 +2303,11 @@ fn schema_v4_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
-fn schema_v4_adds_durable_plugin_ordinals_to_v3() {
+fn schema_v5_adds_durable_plugin_ordinals_to_task4_v3() {
     let directory = tempfile::tempdir().expect("create v3 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v3_database(&database_path);
@@ -2090,11 +2328,11 @@ fn schema_v4_adds_durable_plugin_ordinals_to_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
-fn schema_v4_migrates_large_retained_roots_one_generation_at_a_time() {
+fn schema_v5_migrates_large_retained_roots_one_generation_at_a_time() {
     let directory = tempfile::tempdir().expect("create retained root migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database(&database_path);
@@ -2140,7 +2378,7 @@ fn schema_v4_migrates_large_retained_roots_one_generation_at_a_time() {
 }
 
 #[test]
-fn schema_v4_migrates_records_for_every_v1_generation() {
+fn schema_v5_migrates_records_for_every_v1_generation() {
     let directory = tempfile::tempdir().expect("create migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -2228,11 +2466,11 @@ fn schema_v4_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
-fn schema_v4_rolls_back_when_v1_bot_presets_is_not_an_array() {
+fn schema_v5_rolls_back_when_v1_bot_presets_is_not_an_array() {
     let directory = tempfile::tempdir().expect("create migration rollback directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -2294,7 +2532,7 @@ fn schema_v4_rolls_back_when_v1_bot_presets_is_not_an_array() {
 }
 
 #[test]
-fn schema_v4_rolls_back_when_v1_plugin_storage_is_not_an_object() {
+fn schema_v5_rolls_back_when_v1_plugin_storage_is_not_an_object() {
     let directory = tempfile::tempdir().expect("create plugin migration rollback directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -2343,9 +2581,9 @@ fn schema_v4_rolls_back_when_v1_plugin_storage_is_not_an_object() {
 }
 
 #[test]
-fn pending_v1_snapshot_restores_then_migrates_to_v4() {
+fn pending_v1_snapshot_restores_then_migrates_to_v5() {
     let directory = tempfile::tempdir().expect("create restore directory");
-    let store = PersistentStore::open(directory.path()).expect("open current v2 store");
+    let store = PersistentStore::open(directory.path()).expect("open current v5 store");
     let candidate = directory
         .path()
         .join("persistent/snapshots/persistent-v1.db");
@@ -2370,13 +2608,13 @@ fn pending_v1_snapshot_restores_then_migrates_to_v4() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 }
 
 #[test]
 fn invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
     let directory = tempfile::tempdir().expect("create invalid restore directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open current v2 store");
+    let mut store = PersistentStore::open(directory.path()).expect("open current v5 store");
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
@@ -2441,7 +2679,7 @@ fn invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
 #[test]
 fn semantically_invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
     let directory = tempfile::tempdir().expect("create semantic restore directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open current v2 store");
+    let mut store = PersistentStore::open(directory.path()).expect("open current v5 store");
     store
         .commit(&WorkingSetCommit {
             expected_revision: 0,
@@ -2514,7 +2752,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 4);
+    assert_eq!(integer_pragma("user_version"), 5);
 }
 
 #[test]
@@ -2785,7 +3023,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 5;")
+                .execute_batch("PRAGMA user_version = 6;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");

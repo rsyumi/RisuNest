@@ -39,22 +39,22 @@ async function concatenate(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Arra
     return result
 }
 
-async function snapshotGenerations(indexedDB: IDBFactory, databaseName: string): Promise<string[]> {
+async function snapshotLeases(indexedDB: IDBFactory, databaseName: string): Promise<string[]> {
     const request = indexedDB.open(databaseName)
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
     })
-    const transaction = database.transaction('root', 'readonly')
-    const records = await new Promise<Array<{ generation: string }>>((resolve, reject) => {
-        const values = transaction.objectStore('root').getAll()
+    const transaction = database.transaction('meta', 'readonly')
+    const records = await new Promise<IDBValidKey[]>((resolve, reject) => {
+        const values = transaction.objectStore('meta').getAllKeys(
+            IDBKeyRange.bound('snapshotLease:', 'snapshotLease:\uffff'),
+        )
         values.onsuccess = () => resolve(values.result)
         values.onerror = () => reject(values.error)
     })
     database.close()
-    return records
-        .map((record) => record.generation)
-        .filter((generation) => generation.startsWith('snapshot-'))
+    return records.map(String)
 }
 
 describe('RisuSave persistent store adapter', () => {
@@ -282,7 +282,7 @@ describe('RisuSave persistent store adapter', () => {
         expect(second).toEqual(first)
     })
 
-    it('releases its temporary generation when iteration is cancelled', async () => {
+    it('releases its temporary lease when iteration is cancelled', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = 'risu-save-cancelled-export'
         const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
@@ -291,10 +291,10 @@ describe('RisuSave persistent store adapter', () => {
         const iterator = streamRisuSaveFromStore(store, imported.revision)[Symbol.asyncIterator]()
 
         await iterator.next()
-        expect(await snapshotGenerations(indexedDB, databaseName)).toHaveLength(1)
+        expect(await snapshotLeases(indexedDB, databaseName)).toHaveLength(1)
         await iterator.return?.(undefined)
 
-        expect(await snapshotGenerations(indexedDB, databaseName)).toEqual([])
+        expect(await snapshotLeases(indexedDB, databaseName)).toEqual([])
     })
 
     it('exports a flushed pinned revision instead of released live message arrays', async () => {
@@ -343,7 +343,7 @@ describe('RisuSave persistent store adapter', () => {
         expect((await decodeRisuSave(exported)).characters[0].chats[0].message).toEqual(
             risuSaveFixtureDatabase.characters[0].chats[0].message,
         )
-        expect(await snapshotGenerations(indexedDB, databaseName)).toEqual([])
+        expect(await snapshotLeases(indexedDB, databaseName)).toEqual([])
     })
 
     it('releases a flushed export lease when the backup fails', async () => {
@@ -365,7 +365,7 @@ describe('RisuSave persistent store adapter', () => {
             throw error
         })).rejects.toBe(error)
 
-        expect(await snapshotGenerations(indexedDB, databaseName)).toEqual([])
+        expect(await snapshotLeases(indexedDB, databaseName)).toEqual([])
     })
 
     it('preserves the export failure when lease cleanup also fails', async () => {
@@ -478,6 +478,6 @@ describe('RisuSave persistent store adapter', () => {
         const iterator = streamRisuSaveFromStore(store, imported.revision - 1)[Symbol.asyncIterator]()
 
         await expect(iterator.next()).rejects.toBeInstanceOf(RevisionConflictError)
-        expect(await snapshotGenerations(indexedDB, databaseName)).toEqual([])
+        expect(await snapshotLeases(indexedDB, databaseName)).toEqual([])
     })
 })

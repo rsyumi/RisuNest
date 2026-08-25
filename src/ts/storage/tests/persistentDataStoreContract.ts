@@ -249,6 +249,65 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             await expect(lease.queryPresets()).rejects.toBeInstanceOf(SnapshotReleasedError)
         })
 
+        it('keeps the acquired revision exact through active commits and staged replacement', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const lease = await store.acquireRevision(imported.revision)
+            const root = (await store.readRoot()).value
+            const committed = await store.commit({
+                expectedRevision: imported.revision,
+                root: { ...root, username: 'Committed after lease' },
+                deleteCharacterId: 'char-b',
+                conversations: [
+                    {
+                        type: 'replace-range',
+                        characterId: 'char-a',
+                        conversationId: 'conv-short',
+                        start: 2,
+                        deleteCount: 0,
+                        messages: [
+                            { role: 'user', data: 'active append', chatId: 'active-append' },
+                        ],
+                    },
+                ],
+            })
+
+            expect((await store.readRoot()).value.username).toBe('Committed after lease')
+            expect(await store.readCharacter('char-b')).toBeNull()
+            expect((await store.readConversation('char-a', 'conv-short'))?.value.message).toHaveLength(3)
+
+            const replacement = structuredClone(fixtureDatabase)
+            replacement.username = 'Staged after lease'
+            await store.replaceFromDatabase(replacement, committed.revision)
+
+            expect((await lease.readRoot()).value.username).toBe('Fixture User')
+            expect((await lease.readCharacter('char-b'))?.value.name).toBe('Beta')
+            expect((await lease.readConversation('char-a', 'conv-short'))?.value.message).toHaveLength(2)
+            expect((await store.readRoot()).value.username).toBe('Staged after lease')
+
+            await lease.release()
+            await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        })
+
+        it('releases shared revision leases independently', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const first = await store.acquireRevision(imported.revision)
+            const second = await store.acquireRevision(imported.revision)
+
+            await store.commit({
+                expectedRevision: imported.revision,
+                root: { ...(await store.readRoot()).value, username: 'New active root' },
+            })
+            await first.release()
+
+            await expect(first.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
+            expect((await second.readRoot()).value.username).toBe('Fixture User')
+
+            await second.release()
+            await expect(second.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
+        })
+
         it('queries the character catalog without hydrating conversations', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(fixtureDatabase)

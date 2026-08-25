@@ -1,6 +1,6 @@
 use super::{
     active_generation, current_revision, ConversationMutation, PluginStorageMutation,
-    RevisionResult, StagingResult, StoreError, StoreResult, WorkingSetCommit,
+    RevisionResult, StagingResult, StoreError, StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
@@ -25,15 +25,17 @@ pub(super) fn commit(
         validate_character(character, "Character addition")?;
     }
 
-    let generation = active_generation(&transaction)?;
+    let active = active_generation(&transaction)?;
     if let Some(details) = &input.character_details {
         validate_character_details(
             &transaction,
-            &generation,
+            &active,
             details,
             input.delete_character_id.as_deref(),
         )?;
     }
+    let revision = actual_revision + 1;
+    let generation = writable_generation(&transaction, &active, revision)?;
     if let Some(root) = &input.root {
         put_root(&transaction, &generation, root)?;
     }
@@ -68,7 +70,6 @@ pub(super) fn commit(
         apply_plugin_storage_mutation(&transaction, &generation, mutation)?;
     }
 
-    let revision = actual_revision + 1;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })
@@ -159,7 +160,9 @@ pub(super) fn replace_commit(
     let active = active_generation(&transaction)?;
     let revision = actual_revision + 1;
     let generation = format!("revision-{revision}");
-    delete_generation(&transaction, &active)?;
+    if !generation_is_leased(&transaction, &active)? {
+        delete_generation(&transaction, &active)?;
+    }
     move_generation(&transaction, staging_id, &generation)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
@@ -841,21 +844,12 @@ fn delete_character_contents(
 }
 
 fn delete_generation(transaction: &Transaction<'_>, generation: &str) -> StoreResult<()> {
-    transaction.execute(
-        "DELETE FROM plugin_storage WHERE generation = ?1",
-        [generation],
-    )?;
-    transaction.execute("DELETE FROM messages WHERE generation = ?1", [generation])?;
-    transaction.execute(
-        "DELETE FROM conversations WHERE generation = ?1",
-        [generation],
-    )?;
-    transaction.execute("DELETE FROM characters WHERE generation = ?1", [generation])?;
-    transaction.execute(
-        "DELETE FROM bot_presets WHERE generation = ?1",
-        [generation],
-    )?;
-    transaction.execute("DELETE FROM root WHERE generation = ?1", [generation])?;
+    for (table, _) in GENERATION_TABLES.iter().rev() {
+        transaction.execute(
+            &format!("DELETE FROM {table} WHERE generation = ?1"),
+            [generation],
+        )?;
+    }
     transaction.execute(
         "DELETE FROM snapshot_leases WHERE generation = ?1",
         [generation],
@@ -864,31 +858,45 @@ fn delete_generation(transaction: &Transaction<'_>, generation: &str) -> StoreRe
 }
 
 fn move_generation(transaction: &Transaction<'_>, source: &str, target: &str) -> StoreResult<()> {
-    transaction.execute(
-        "UPDATE root SET generation = ?2 WHERE generation = ?1",
-        params![source, target],
-    )?;
-    transaction.execute(
-        "UPDATE characters SET generation = ?2 WHERE generation = ?1",
-        params![source, target],
-    )?;
-    transaction.execute(
-        "UPDATE bot_presets SET generation = ?2 WHERE generation = ?1",
-        params![source, target],
-    )?;
-    transaction.execute(
-        "UPDATE conversations SET generation = ?2 WHERE generation = ?1",
-        params![source, target],
-    )?;
-    transaction.execute(
-        "UPDATE messages SET generation = ?2 WHERE generation = ?1",
-        params![source, target],
-    )?;
-    transaction.execute(
-        "UPDATE plugin_storage SET generation = ?2 WHERE generation = ?1",
-        params![source, target],
-    )?;
+    for (table, _) in GENERATION_TABLES {
+        transaction.execute(
+            &format!("UPDATE {table} SET generation = ?2 WHERE generation = ?1"),
+            params![source, target],
+        )?;
+    }
     Ok(())
+}
+
+fn writable_generation(
+    transaction: &Transaction<'_>,
+    source: &str,
+    revision: i64,
+) -> StoreResult<String> {
+    if !generation_is_leased(transaction, source)? {
+        return Ok(source.to_owned());
+    }
+    let target = format!("revision-{revision}");
+    for (table, columns) in GENERATION_TABLES {
+        transaction.execute(
+            &format!(
+                "INSERT INTO {table} (generation, {columns})
+                 SELECT ?1, {columns} FROM {table} WHERE generation = ?2"
+            ),
+            params![target, source],
+        )?;
+    }
+    Ok(target)
+}
+
+fn generation_is_leased(transaction: &Transaction<'_>, generation: &str) -> StoreResult<bool> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM snapshot_leases WHERE generation = ?1 LIMIT 1",
+            [generation],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn set_active(transaction: &Transaction<'_>, revision: i64, generation: &str) -> StoreResult<()> {

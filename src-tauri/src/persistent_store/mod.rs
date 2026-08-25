@@ -15,6 +15,31 @@ use std::path::{Path, PathBuf};
 
 pub(super) type StoreResult<T> = Result<T, StoreError>;
 
+// Add every generation-scoped record family here so lease COW and cleanup cannot omit it.
+pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
+    ("root", "value"),
+    (
+        "bot_presets",
+        "preset_id, configured_index, name, image, value",
+    ),
+    (
+        "characters",
+        "character_id, configured_index, recent_at, trashed, name, image, conversation_count, type, creator_notes, trash_time, detail",
+    ),
+    (
+        "conversations",
+        "character_id, conversation_id, configured_index, recent_at, name, message_count, detail",
+    ),
+    (
+        "messages",
+        "character_id, conversation_id, message_index, message_id, value",
+    ),
+    (
+        "plugin_storage",
+        "storage_key, byte_size, ordinal, value",
+    ),
+];
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "code", rename_all = "kebab-case")]
 pub(crate) enum StoreError {
@@ -600,26 +625,18 @@ pub(super) fn read_target(connection: &Connection, lease: Option<&str>) -> Store
             revision: current_revision(connection)?,
             generation: active_generation(connection)?,
         }),
-        Some(generation) => {
-            let exists = connection
+        Some(lease) => {
+            let target = connection
                 .query_row(
-                    "SELECT 1 FROM snapshot_leases WHERE generation = ?1",
-                    [generation],
-                    |_| Ok(()),
+                    "SELECT generation, revision FROM snapshot_leases WHERE lease = ?1",
+                    [lease],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()?
-                .is_some();
-            if !exists {
-                return Err(StoreError::SnapshotReleased);
-            }
-            let revision = generation
-                .strip_prefix("snapshot-")
-                .and_then(|value| value.split('-').next())
-                .and_then(|value| value.parse::<i64>().ok())
                 .ok_or(StoreError::SnapshotReleased)?;
             Ok(ReadTarget {
-                revision,
-                generation: generation.to_owned(),
+                generation: target.0,
+                revision: target.1,
             })
         }
     }
