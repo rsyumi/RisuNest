@@ -1921,10 +1921,26 @@ fn revision_leases_isolate_conversation_reads() {
 #[test]
 fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
     let (directory, mut store, _) = open_fixture();
-    let lease = store.acquire_revision(1).expect("acquire revision lease");
     store
         .commit(&WorkingSetCommit {
             expected_revision: 1,
+            root: None,
+            replace_presets: None,
+            character: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "ttl-zero".to_owned(),
+                value: json!(0),
+            }]),
+        })
+        .expect("seed leased plugin value");
+    let lease = store.acquire_revision(2).expect("acquire revision lease");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 2,
             root: Some(json!({ "username": "Active after lease" })),
             replace_presets: None,
             character: None,
@@ -1944,6 +1960,14 @@ fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
             .expect("fresh lease survives reopen")
             .value["username"],
         "Fixture User"
+    );
+    assert_eq!(
+        store
+            .read_plugin_storage("ttl-zero", Some(&lease.lease))
+            .expect("read fresh leased plugin value")
+            .expect("fresh leased plugin value exists")
+            .value,
+        json!(0)
     );
     store
         .connection
@@ -1968,6 +1992,14 @@ fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
         )
         .expect("count expired generation rows");
     assert_eq!(expired_generation_rows, 0);
+    assert_eq!(
+        store
+            .read_plugin_storage("ttl-zero", None)
+            .expect("read active plugin value after sweep")
+            .expect("active plugin value survives sweep")
+            .value,
+        json!(0)
+    );
     assert_eq!(
         store
             .read_root(None)
@@ -2275,6 +2307,127 @@ fn create_v3_database(path: &Path) {
     connection
         .pragma_update(None, "user_version", 3)
         .expect("set v3 schema version");
+}
+
+fn create_snapshot_v3_database(path: &Path) {
+    create_v2_database(path);
+    let connection = rusqlite::Connection::open(path).expect("open snapshot v3 fixture database");
+    connection
+        .execute_batch(
+            "
+            DROP TABLE snapshot_leases;
+            CREATE TABLE snapshot_leases (
+                lease TEXT PRIMARY KEY,
+                generation TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX snapshot_leases_generation ON snapshot_leases (generation);
+            INSERT INTO snapshot_leases (lease, generation, revision, created_at)
+                VALUES ('snapshot-v3fixture', 'revision-7', 7, 4102444800000);
+            PRAGMA user_version = 3;
+            ",
+        )
+        .expect("create snapshot v3 fixture schema");
+}
+
+fn create_task4_v4_database(path: &Path) {
+    create_v3_database(path);
+    let connection = rusqlite::Connection::open(path).expect("open Task 4 v4 fixture database");
+    connection
+        .execute_batch(
+            "
+            ALTER TABLE plugin_storage ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0;
+            UPDATE plugin_storage AS target
+            SET ordinal = (
+                SELECT COUNT(*) - 1
+                FROM plugin_storage AS predecessor
+                WHERE predecessor.generation = target.generation
+                  AND predecessor.storage_key <= target.storage_key
+            );
+            INSERT INTO root (generation, value)
+                VALUES ('snapshot-7-task4v4', '{\"username\":\"Task 4 v4 leased\"}');
+            INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
+                VALUES ('snapshot-7-task4v4', 'leased-zero', 1, 0, '0');
+            INSERT INTO snapshot_leases (generation, created_at)
+                VALUES ('snapshot-7-task4v4', 4102444800000);
+            PRAGMA user_version = 4;
+            ",
+        )
+        .expect("create Task 4 v4 fixture schema");
+}
+
+#[test]
+fn schema_v5_migrates_snapshot_v3_without_plugin_table() {
+    let directory = tempfile::tempdir().expect("create snapshot v3 migration directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_snapshot_v3_database(&database_path);
+
+    let mut store = PersistentStore::open(directory.path()).expect("migrate snapshot v3 store");
+    assert_eq!(
+        store
+            .read_plugin_storage("v2-memory", Some("snapshot-v3fixture"))
+            .expect("read snapshot v3 migrated plugin value")
+            .expect("snapshot v3 plugin value exists")
+            .value,
+        json!({ "lossless": true })
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read snapshot v3 migrated version"),
+        5
+    );
+    store
+        .release_revision("snapshot-v3fixture")
+        .expect("release snapshot v3 lease");
+    assert_eq!(
+        store
+            .read_plugin_storage("v2-memory", None)
+            .expect("read active migrated plugin value")
+            .expect("active migrated plugin value exists")
+            .value,
+        json!({ "lossless": true })
+    );
+}
+
+#[test]
+fn schema_v5_migrates_task4_v4_lease_with_plugin_ordinal() {
+    let directory = tempfile::tempdir().expect("create Task 4 v4 migration directory");
+    let database_path = directory.path().join("persistent/persistent.db");
+    create_task4_v4_database(&database_path);
+
+    let mut store = PersistentStore::open(directory.path()).expect("migrate Task 4 v4 store");
+    assert_eq!(
+        store
+            .read_plugin_storage("leased-zero", Some("snapshot-7-task4v4"))
+            .expect("read Task 4 v4 leased plugin value")
+            .expect("Task 4 v4 leased plugin value exists")
+            .value,
+        json!(0)
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read Task 4 v4 migrated version"),
+        5
+    );
+    store
+        .release_revision("snapshot-7-task4v4")
+        .expect("release Task 4 v4 lease");
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM plugin_storage WHERE generation = 'snapshot-7-task4v4'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count released Task 4 v4 plugin rows"),
+        0
+    );
 }
 
 #[test]

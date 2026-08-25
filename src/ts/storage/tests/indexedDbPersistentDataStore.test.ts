@@ -360,7 +360,11 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const databaseName = `revision-reference-count-${databaseSequence++}`
         const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
         await store.open()
-        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        let imported = await store.replaceFromDatabase(fixtureDatabase)
+        imported = await store.commit({
+            expectedRevision: imported.revision,
+            pluginStorage: [{ type: 'set', key: 'counted-zero', value: 0 }],
+        })
         const before = await countPersistentDataRecords(indexedDB, databaseName)
 
         const lease = await store.acquireRevision(imported.revision)
@@ -1230,7 +1234,11 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const databaseName = `revision-copy-rollback-${databaseSequence++}`
         const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
         await store.open()
-        const imported = await store.replaceFromDatabase(fixtureDatabase)
+        let imported = await store.replaceFromDatabase(fixtureDatabase)
+        imported = await store.commit({
+            expectedRevision: imported.revision,
+            pluginStorage: [{ type: 'set', key: 'rollback-zero', value: 0 }],
+        })
         const lease = await store.acquireRevision(imported.revision)
         const countsBefore = await countPersistentDataRecords(indexedDB, databaseName)
         const copyError = new Error('injected generation copy failure')
@@ -1263,6 +1271,14 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await expect(lease.readRoot()).resolves.toMatchObject({
             revision: imported.revision,
             value: { username: fixtureDatabase.username },
+        })
+        await expect(store.readPluginStorage('rollback-zero')).resolves.toMatchObject({
+            revision: imported.revision,
+            value: 0,
+        })
+        await expect(lease.readPluginStorage('rollback-zero')).resolves.toMatchObject({
+            revision: imported.revision,
+            value: 0,
         })
         await lease.release()
     })
