@@ -3932,6 +3932,114 @@ describe('SaveCoordinator', () => {
         }
     })
 
+    it('adopts materialized baselines without traversing inactive conversation bodies', async () => {
+        let database = makeDatabase()
+        database.pluginCustomStorage = {}
+        const commit = vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage,
+            capturePresets: () => database.botPresets,
+            captureSelectedCharacter: () =>
+                database.characters.find((candidate) => candidate.chaId === 'char-a') ?? null,
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7)
+
+        const authoritative = makeDatabase()
+        authoritative.username = 'Adopted root'
+        authoritative.botPresets = [
+            { name: 'Adopted preset', mainPrompt: 'Before preset edit' },
+        ] as Database['botPresets']
+        authoritative.pluginCustomStorage = JSON.parse(
+            '{"zeta":0,"__proto__":false,"alpha":""}',
+        )
+        authoritative.characters[0].chats = [{
+            id: 'chat-a',
+            name: 'Selected chat',
+            note: '',
+            localLore: [],
+            message: [{ chatId: 'message-a', role: 'char', data: 'Before message edit' }],
+        } as Chat]
+        const inactive = structuredClone(authoritative.characters[0])
+        inactive.chaId = 'char-b'
+        inactive.name = 'Inactive'
+        inactive.chats = [{
+            id: 'chat-b',
+            name: 'Inactive chat',
+            note: '',
+            localLore: [],
+            message: [{ chatId: 'message-b', role: 'char', data: 'Do not traverse' }],
+        } as Chat]
+        Object.defineProperty(inactive.chats[0].message[0], 'data', {
+            enumerable: true,
+            get: () => {
+                throw new Error('inactive conversation body was traversed')
+            },
+        })
+        authoritative.characters.push(inactive)
+
+        expect(coordinator.adoptMaterializedDatabase(
+            7,
+            coordinator.mutationGeneration,
+            authoritative,
+        )).toBe(true)
+        database = authoritative
+
+        await coordinator.flushPendingData('clean-adopted-baseline')
+        expect(commit).not.toHaveBeenCalled()
+        expect(Object.keys(database.pluginCustomStorage)).toEqual([
+            'zeta',
+            '__proto__',
+            'alpha',
+        ])
+        expect(Object.hasOwn(database.pluginCustomStorage, '__proto__')).toBe(true)
+        expect(database.pluginCustomStorage.__proto__).toBe(false)
+        expect(database.pluginCustomStorage).toMatchObject({
+            zeta: 0,
+            alpha: '',
+        })
+
+        database.username = 'Edited root'
+        database.botPresets[0].mainPrompt = 'After preset edit'
+        database.pluginCustomStorage.__proto__ = 0
+        database.characters[0].chats[0].message[0].data = 'After message edit'
+        coordinator.markPersistentDataDirty(1)
+
+        await coordinator.flushPendingData('after-adopted-mutations')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 7,
+            root: { username: 'Edited root' },
+            pluginStorage: [{ type: 'set', key: '__proto__', value: 0 }],
+            replacePresets: [
+                { name: 'Adopted preset', mainPrompt: 'After preset edit' },
+            ],
+            conversations: [{
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'chat-a',
+                start: 0,
+                deleteCount: 1,
+                messages: [{
+                    chatId: 'message-a',
+                    role: 'char',
+                    data: 'After message edit',
+                }],
+                conversation: {
+                    id: 'chat-a',
+                    name: 'Selected chat',
+                    note: '',
+                    localLore: [],
+                },
+            }],
+        })
+    })
+
     it('publishes immediately on explicit request despite the publish interval', async () => {
         vi.useFakeTimers()
         try {

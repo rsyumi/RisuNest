@@ -2230,24 +2230,36 @@ export class SaveCoordinator {
     }
 
     private captureDatabase(database: Database): CapturedState {
-        const cloned = canonicalDatabaseClone(database)
-        const { root, characters, presets, pluginStorage } = splitDatabase(cloned)
+        const {
+            characters,
+            botPresets,
+            pluginCustomStorage,
+            ...rootValue
+        } = database
+        const rootCanonical = canonicalJson(rootValue)
+        const presetsCanonical = canonicalJson(botPresets ?? [])
         const pluginStorageUnavailable =
-            !Object.prototype.hasOwnProperty.call(cloned, 'pluginCustomStorage') &&
-            this.dependencies.isIncompleteWorkingSet?.(cloned) === true
+            !Object.prototype.hasOwnProperty.call(database, 'pluginCustomStorage') &&
+            this.dependencies.isIncompleteWorkingSet?.(database) === true
+        const pluginStorageCanonical = pluginStorageUnavailable
+            ? null
+            : pluginStorageJson(pluginCustomStorage ?? {})
         const selectedId = this.dependencies.captureSelectedCharacter()?.chaId
         const character = selectedId ? characters.find((candidate) => candidate.chaId === selectedId) ?? null : null
+        const characterCanonical = character ? canonicalJson(character) : null
         return {
-            root,
-            rootCanonical: JSON.stringify(root),
-            pluginStorage: pluginStorageUnavailable ? null : pluginStorage,
-            pluginStorageCanonical: pluginStorageUnavailable
+            root: JSON.parse(rootCanonical) as RootDatabase,
+            rootCanonical,
+            pluginStorage: pluginStorageCanonical === null
                 ? null
-                : JSON.stringify(pluginStorage),
-            presets,
-            presetsCanonical: JSON.stringify(presets),
-            character,
-            characterCanonical: character ? JSON.stringify(character) : null,
+                : JSON.parse(pluginStorageCanonical) as Database['pluginCustomStorage'],
+            pluginStorageCanonical,
+            presets: JSON.parse(presetsCanonical) as botPreset[],
+            presetsCanonical,
+            character: characterCanonical
+                ? JSON.parse(characterCanonical) as CompleteCharacter
+                : null,
+            characterCanonical,
             conversationStubIds: new Set(),
         }
     }
