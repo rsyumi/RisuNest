@@ -6,6 +6,7 @@
   import { alertConfirm } from 'src/ts/alert'
   import { listInlayAssetMetadata, removeInlayAsset } from 'src/ts/process/files/inlays'
   import { getInlayRenderSource, getNativeInlayThumbnailSize } from 'src/ts/process/files/inlayRenderSource'
+  import type { InlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
   import { isTauri } from 'src/ts/platform'
   import type { InlayBlobMetadata } from 'src/ts/storage/blobStore'
   import Button from '../UI/GUI/Button.svelte'
@@ -17,8 +18,10 @@
   let displayCount = $state(PAGE_SIZE)
   let loading = $state(true)
   let loadMoreSentinel: HTMLDivElement | null = $state(null)
-  // For revoking
-  let previewURLs = $state<Map<string, string>>(new Map())
+  let previewSources = $state<Map<string, InlayRenderSource>>(new Map())
+  const pendingPreviews = new Map<string, Promise<string | null>>()
+  const previewGenerations = new Map<string, number>()
+  let destroyed = false
   let selection = $state<Set<string>>(new SvelteSet())
 
   const displayedAssets = $derived(allAssets.slice(0, displayCount))
@@ -27,13 +30,38 @@
 
   const getPreviewURL = async (asset: InlayBlobMetadata) => {
     const id = asset.key
-    if (previewURLs.has(id)) return previewURLs.get(id)!
-    const source = await getInlayRenderSource(id, isTauri, getNativeInlayThumbnailSize(asset, isTauri), asset)
-    if (source) {
-      previewURLs.set(id, source.url)
+    const cached = previewSources.get(id)
+    if (cached) return cached.url
+    const existing = pendingPreviews.get(id)
+    if (existing) return existing
+    const generation = previewGenerations.get(id) ?? 0
+    const pending = (async () => {
+      const source = await getInlayRenderSource(id, isTauri, getNativeInlayThumbnailSize(asset, isTauri), asset)
+      if (!source) return null
+      if (destroyed || (previewGenerations.get(id) ?? 0) !== generation) {
+        if (source.objectUrl) URL.revokeObjectURL(source.url)
+        return null
+      }
+      previewSources.set(id, source)
       return source.url
+    })()
+    pendingPreviews.set(id, pending)
+    try {
+      return await pending
+    } catch {
+      return null
+    } finally {
+      if (pendingPreviews.get(id) === pending) {
+        pendingPreviews.delete(id)
+      }
     }
-    return null
+  }
+
+  const removePreview = (id: string) => {
+    previewGenerations.set(id, (previewGenerations.get(id) ?? 0) + 1)
+    const source = previewSources.get(id)
+    if (source?.objectUrl) URL.revokeObjectURL(source.url)
+    previewSources.delete(id)
   }
 
   const toggleSelect = (id: string) => {
@@ -57,10 +85,7 @@
       return
     }
     await removeInlayAsset(id)
-    if (previewURLs.has(id)) {
-        if (!isTauri) URL.revokeObjectURL(previewURLs.get(id)!)
-      previewURLs.delete(id)
-    }
+    removePreview(id)
     selection.delete(id)
     allAssets = allAssets.filter((asset) => asset.key !== id)
   }
@@ -72,10 +97,7 @@
     }
     for (const id of selection) {
       await removeInlayAsset(id)
-      if (previewURLs.has(id)) {
-      if (!isTauri) URL.revokeObjectURL(previewURLs.get(id)!)
-        previewURLs.delete(id)
-      }
+      removePreview(id)
     }
     allAssets = allAssets.filter((asset) => !selection.has(asset.key))
     selection.clear()
@@ -128,7 +150,13 @@
   })
 
   onDestroy(() => {
-    if (!isTauri) previewURLs.forEach((url) => URL.revokeObjectURL(url))
+    destroyed = true
+    previewSources.forEach((source) => {
+      if (source.objectUrl) URL.revokeObjectURL(source.url)
+    })
+    previewSources.clear()
+    pendingPreviews.clear()
+    previewGenerations.clear()
     observer?.disconnect()
   })
 
