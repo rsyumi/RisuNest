@@ -54,6 +54,7 @@
     let resolvedUserImage = $state<string | null>(null);
     let imagesReady = $state(false);
     let imageResolutionGeneration = 0;
+    let hasRenderedChat = false;
     let simpleChar = $derived(createSimpleCharacter(currentCharacter));
     let parserCharacter = $derived(simpleChar ? {
         chaId: simpleChar.chaId,
@@ -71,6 +72,8 @@
         void $ReloadGUIPointer;
         const generation = ++imageResolutionGeneration;
         imagesReady = false;
+        resolvedCharacterImage = null;
+        resolvedUserImage = null;
         void Promise.allSettled([
             getCharImage(characterImageSource, 'css'),
             getCharImage(userImageSource, 'css'),
@@ -223,6 +226,7 @@
         }
 
         renderKeys = currentRenderKeys;
+        hasRenderedChat = true;
         
     };
 
@@ -263,7 +267,7 @@
     $effect(() => {
         console.log('Updating Chats');
         void $ReloadChatPointer; // Make $effect track ReloadChatPointer changes
-        if (!imagesReady) return;
+        if (!imagesReady && !hasRenderedChat) return;
         const wasAtBottom = checkIfAtBottom();
         updateChatBody()
         

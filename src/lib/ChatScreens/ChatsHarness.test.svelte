@@ -46,6 +46,11 @@
     export function setImage(image: string) {
         currentCharacter.image = image
     }
+
+    export function switchCharacter(character: character, nextMessages: Message[]) {
+        currentCharacter = character
+        messages = nextMessages
+    }
 </script>
 
 <div class="scroll-parent">

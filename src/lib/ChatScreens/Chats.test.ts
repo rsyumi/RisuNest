@@ -7,11 +7,17 @@ import type { character, Message } from 'src/ts/storage/database.svelte'
 const imageMocks = vi.hoisted(() => ({
     mode: 'normal',
     staleReject: undefined as ((reason?: unknown) => void) | undefined,
+    pendingResolve: undefined as ((value: string) => void) | undefined,
     getCharImage: vi.fn((source: string | undefined) => {
         if (source === 'reject.png') return Promise.reject(new Error('image rejected'))
         if (source === 'stale-reject.png') {
             return new Promise<string>((_resolve, reject) => {
                 imageMocks.staleReject = reject
+            })
+        }
+        if (source === 'pending.png') {
+            return new Promise<string>((resolve) => {
+                imageMocks.pendingResolve = resolve
             })
         }
         return Promise.resolve(`${imageMocks.mode}:${source ?? ''}`)
@@ -59,6 +65,7 @@ interface HarnessInstance {
     mutateAssetTuple(path: string): void
     mutateScriptOutput(output: string): void
     setImage(image: string): void
+    switchCharacter(character: character, messages: Message[]): void
 }
 
 function makeMessage(index: number, overrides: Partial<Message> = {}): Message {
@@ -108,6 +115,7 @@ describe('Chats imperative mount lifecycle', () => {
         resetChatMountProbe()
         imageMocks.mode = 'normal'
         imageMocks.staleReject = undefined
+        imageMocks.pendingResolve = undefined
         imageMocks.getCharImage.mockClear()
         target = document.createElement('div')
         document.body.appendChild(target)
@@ -267,6 +275,36 @@ describe('Chats imperative mount lifecycle', () => {
         imageMocks.staleReject?.(new Error('stale image rejected'))
         await tick()
         expect(probeElements(target)[0]?.dataset.image).toBe('normal:latest.png')
+    })
+
+    test('publishes a new character immediately while its image resolution is pending', async () => {
+        const oldMessages = [makeMessage(0, { data: 'old-character-message', role: 'char' })]
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: oldMessages, initialCharacter: makeCharacter(oldMessages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)[0]?.dataset.message).toBe('old-character-message'))
+        const oldInstance = probeIdForMessage(target, 'old-character-message')
+
+        const newMessages = [makeMessage(1, { data: 'new-character-message', role: 'char' })]
+        const newCharacter = makeCharacter(newMessages)
+        newCharacter.chaId = 'new-character-id'
+        newCharacter.name = 'New Character'
+        newCharacter.image = 'pending.png'
+        newCharacter.chats[0].id = 'new-chat-room-id'
+        ;(mounted as HarnessInstance).switchCharacter(newCharacter, newMessages)
+        await tick()
+        await vi.waitFor(() => expect(imageMocks.pendingResolve).toBeTypeOf('function'))
+
+        await vi.waitFor(() => expect(probeElements(target).map((element) => element.dataset.message)).toEqual([
+            'new-character-message',
+        ]))
+        expect(target.textContent).not.toContain('old-character-message')
+        expect(chatMountProbe.unmounts).toContain(oldInstance)
+        expect(probeElements(target)[0]?.dataset.image).toBe('')
+
+        imageMocks.pendingResolve?.('resolved:pending.png')
+        await vi.waitFor(() => expect(probeElements(target)[0]?.dataset.image).toBe('resolved:pending.png'))
     })
 
     test('memoizes a 10k asset stamp across streaming chunks and rescans after an in-place edit', async () => {
