@@ -29,3 +29,30 @@ it('loads Wasmoon only on the first explicit Lua factory request', async () => {
     expect(runtimeState.moduleEvaluations).toBe(1)
     expect(runtimeState.factoryConstructions).toBe(2)
 })
+
+it('shares a failed import with concurrent callers and retries after rejection', async () => {
+    const { createLuaFactoryLoader } = await import('./luaRuntime')
+    const failure = new Error('lazy runtime load failed')
+    let rejectFirst!: (error: Error) => void
+    const firstImport = new Promise<never>((_resolve, reject) => {
+        rejectFirst = reject
+    })
+    const importRuntime = vi
+        .fn()
+        .mockReturnValueOnce(firstImport)
+        .mockResolvedValueOnce({
+            LuaFactory: class {},
+        })
+    const makeFactory = createLuaFactoryLoader(importRuntime)
+
+    const firstCaller = makeFactory()
+    const concurrentCaller = makeFactory()
+    rejectFirst(failure)
+
+    await expect(firstCaller).rejects.toBe(failure)
+    await expect(concurrentCaller).rejects.toBe(failure)
+    expect(importRuntime).toHaveBeenCalledTimes(1)
+
+    await expect(makeFactory()).resolves.toBeInstanceOf(Object)
+    expect(importRuntime).toHaveBeenCalledTimes(2)
+})

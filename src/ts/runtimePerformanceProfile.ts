@@ -30,7 +30,8 @@ type RuntimePerformanceProfileListener = (
     budgets: Readonly<RuntimePerformanceBudgets>,
 ) => void
 
-let currentProfile: RuntimePerformanceProfile = 'normal'
+const configuredProfile = import.meta.env.VITE_RUNTIME_PERFORMANCE_PROFILE
+let currentProfile: RuntimePerformanceProfile = configuredProfile === 'low-spec' ? 'low-spec' : 'normal'
 const listeners = new Set<RuntimePerformanceProfileListener>()
 
 export function getRuntimePerformanceProfile(): RuntimePerformanceProfile {

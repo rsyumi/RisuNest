@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { beforeAll, expect, test, vi } from 'vitest'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
+import { requestChatData } from './request/request'
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -223,6 +224,62 @@ test('trims idle Lua engines when switching to the lower low-spec budget', async
   setRuntimePerformanceProfile('normal')
 
   expect(result.res).toBe(1)
+})
+
+test('keeps active Lua engines open during a profile switch and evicts after completion', async () => {
+  setRuntimePerformanceProfile('normal')
+  const pendingInputs = Array.from({ length: 5 }, () => {
+    let resolve!: (value: unknown) => void
+    const promise = new Promise<unknown>((done) => {
+      resolve = done
+    })
+    return { promise, resolve }
+  })
+  const mockedRequestChatData = vi.mocked(requestChatData)
+  mockedRequestChatData.mockImplementation((request) =>
+    pendingInputs[Number(request.formated[0].content)].promise as never
+  )
+  const code = `
+    counter = 0
+    for i = 0, 4 do
+      _G["active-low-spec-" .. i] = async(function(id)
+        counter = counter + 1
+        LLM(id, {{ role = "user", content = tostring(i) }})
+        return counter
+      end)
+    end
+  `
+  const invocations = Array.from({ length: 5 }, (_, index) =>
+    runScripted(code, {
+      char: { chaId: 'active-low-spec-owner' } as never,
+      chat: { message: [] } as never,
+      lowLevelAccess: true,
+      mode: `active-low-spec-${index}`,
+    })
+  )
+
+  await vi.waitFor(() => expect(mockedRequestChatData).toHaveBeenCalledTimes(5))
+  setRuntimePerformanceProfile('low-spec')
+
+  pendingInputs[0].resolve({ type: 'success', result: 'released' })
+  await expect(invocations[0]).resolves.toEqual(expect.objectContaining({ res: 1 }))
+
+  mockedRequestChatData.mockResolvedValue({ type: 'success', result: 'released' } as never)
+  const recreated = await runScripted(code, {
+    char: { chaId: 'active-low-spec-owner' } as never,
+    chat: { message: [] } as never,
+    lowLevelAccess: true,
+    mode: 'active-low-spec-0',
+  })
+
+  for (const pending of pendingInputs.slice(1)) {
+    pending.resolve({ type: 'success', result: 'released' })
+  }
+  await Promise.all(invocations.slice(1))
+  setRuntimePerformanceProfile('normal')
+  mockedRequestChatData.mockReset()
+
+  expect(recreated.res).toBe(1)
 })
 
 test('does not retain an editDisplay access ID after its handler returns', async () => {

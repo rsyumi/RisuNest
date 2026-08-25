@@ -1227,21 +1227,14 @@ async function makeLuaFactory(){
 
 async function ensureLuaFactory() {
     if (luaFactory) return;
-    
-    if (luaFactoryPromise) {
-        try {
-            await luaFactoryPromise;
-        } catch (error) {
-            luaFactoryPromise = null;
-        }
-        return;
-    }
 
+    const pendingFactory = (luaFactoryPromise ??= makeLuaFactory())
     try {
-        luaFactoryPromise = makeLuaFactory();
-        await luaFactoryPromise;
+        await pendingFactory
     } finally {
-        luaFactoryPromise = null;
+        if (luaFactoryPromise === pendingFactory) {
+            luaFactoryPromise = null
+        }
     }
 }
 
