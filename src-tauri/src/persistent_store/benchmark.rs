@@ -1,6 +1,6 @@
 use super::{
     CharacterQuery, CheckpointMode, ConversationMutation, ConversationQuery, PersistentStore,
-    QueryOrder, WorkingSetCommit,
+    PluginStorageMutation, QueryOrder, WorkingSetCommit,
 };
 use rusqlite::{ffi, Connection};
 use serde::Serialize;
@@ -17,6 +17,12 @@ const RUNS: usize = 11;
 const MAX_BATCH_CHARACTERS: usize = 16;
 const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const EXPORT_PAGE_SIZE: i64 = 128;
+const POST_LEASE_RUNS: usize = 11;
+const POST_LEASE_CHARACTERS: usize = 50;
+const POST_LEASE_CHATS_PER_CHARACTER: usize = 5;
+const POST_LEASE_TURNS_PER_CHAT: usize = 50;
+const POST_LEASE_STRESS_TURNS: usize = 1_000;
+const POST_LEASE_STRESS_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct Statistics {
@@ -121,6 +127,38 @@ struct BenchmarkResult {
     aggregate: Aggregate,
     samples: Vec<Sample>,
     one_gib_diagnostic: Option<OneGibDiagnostic>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostLeaseCommitSample {
+    plugin_us: u64,
+    root_us: u64,
+    message_us: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostLeaseCommitAggregate {
+    plugin_us: Statistics,
+    root_us: Statistics,
+    message_us: Statistics,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostLeaseCommitBenchmarkResult {
+    schema_version: u32,
+    benchmark: &'static str,
+    source_revision: Option<String>,
+    discarded_warmup_runs: usize,
+    measured_runs: usize,
+    fixture_characters: usize,
+    fixture_conversations: usize,
+    fixture_messages: usize,
+    fixture_serialized_bytes: u64,
+    aggregate: PostLeaseCommitAggregate,
+    samples: Vec<PostLeaseCommitSample>,
 }
 
 fn nearest_rank(values: &[u64]) -> Statistics {
@@ -711,6 +749,190 @@ fn run_one_gib_diagnostic() -> OneGibDiagnostic {
         },
         samples,
     }
+}
+
+fn post_lease_commit(store: &mut PersistentStore, input: WorkingSetCommit, label: &str) -> u64 {
+    let revision = store.revision().expect("read post-lease revision");
+    assert_eq!(input.expected_revision, revision);
+    let lease = store
+        .acquire_revision(revision)
+        .expect("acquire post-lease revision");
+    let started = Instant::now();
+    assert_eq!(
+        store
+            .commit(&input)
+            .unwrap_or_else(|error| panic!("commit post-lease {label} mutation: {error}"))
+            .revision,
+        revision + 1
+    );
+    let elapsed = elapsed_us(started);
+    store
+        .release_revision(&lease.lease)
+        .expect("release post-lease revision");
+    elapsed
+}
+
+fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSample> {
+    let directory = tempfile::tempdir().expect("create post-lease benchmark directory");
+    let mut store =
+        PersistentStore::open(directory.path()).expect("open post-lease benchmark store");
+    let staging = store
+        .replace_begin()
+        .expect("begin post-lease fixture import");
+    store
+        .replace_put_root(&staging.staging_id, &root_without_characters(database))
+        .expect("stage post-lease fixture root");
+    stage_in_public_batches(
+        &mut store,
+        &staging.staging_id,
+        database["characters"].as_array().unwrap(),
+    );
+    store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("commit post-lease fixture import");
+
+    (0..POST_LEASE_RUNS)
+        .map(|run| {
+            let revision = store.revision().unwrap();
+            let plugin_us = post_lease_commit(
+                &mut store,
+                WorkingSetCommit {
+                    expected_revision: revision,
+                    root: None,
+                    replace_presets: None,
+                    character: None,
+                    replace_character: None,
+                    add_character: None,
+                    conversations: None,
+                    delete_character_id: None,
+                    plugin_storage: Some(vec![PluginStorageMutation::Set {
+                        key: "benchmark-plugin".to_owned(),
+                        value: json!(deterministic_text(run, 1024)),
+                    }]),
+                },
+                "plugin",
+            );
+
+            let mut root = store.read_root(None).unwrap().value;
+            root["postLeaseBenchmarkRun"] = json!(run);
+            let revision = store.revision().unwrap();
+            let root_us = post_lease_commit(
+                &mut store,
+                WorkingSetCommit {
+                    expected_revision: revision,
+                    root: Some(root),
+                    replace_presets: None,
+                    character: None,
+                    replace_character: None,
+                    add_character: None,
+                    conversations: None,
+                    delete_character_id: None,
+                    plugin_storage: None,
+                },
+                "root",
+            );
+
+            let revision = store.revision().unwrap();
+            let message_us = post_lease_commit(
+                &mut store,
+                WorkingSetCommit {
+                    expected_revision: revision,
+                    root: None,
+                    replace_presets: None,
+                    character: None,
+                    replace_character: None,
+                    add_character: None,
+                    conversations: Some(vec![ConversationMutation::ReplaceRange {
+                        character_id: "character-0000".to_owned(),
+                        conversation_id: "chat-0000-00".to_owned(),
+                        start: 0,
+                        delete_count: 1,
+                        messages: vec![message(0, 0, 0, 32)],
+                        conversation: None,
+                    }]),
+                    delete_character_id: None,
+                    plugin_storage: None,
+                },
+                "message",
+            );
+
+            PostLeaseCommitSample {
+                plugin_us,
+                root_us,
+                message_us,
+            }
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "release-only first-post-lease commit benchmark"]
+fn first_post_lease_commit_measurements() {
+    assert_eq!(
+        std::env::var("VITE_DISABLE_REALM").as_deref(),
+        Ok("true"),
+        "persistent store benchmarks require VITE_DISABLE_REALM=true"
+    );
+    let mut database = generate_save_large(
+        POST_LEASE_CHARACTERS,
+        POST_LEASE_CHATS_PER_CHARACTER,
+        POST_LEASE_TURNS_PER_CHAT,
+        POST_LEASE_STRESS_TURNS,
+        POST_LEASE_STRESS_TEXT_BYTES,
+    );
+    database["pluginCustomStorage"] = Value::Object(
+        (0..256)
+            .map(|index| {
+                (
+                    format!("plugin-{index:04}"),
+                    json!(deterministic_text(index, 1024)),
+                )
+            })
+            .collect(),
+    );
+    let serialized_bytes = serde_json::to_vec(&database).unwrap().len() as u64;
+    let mut samples = run_post_lease_commit_benchmark(&database);
+    samples.remove(0);
+    let result = PostLeaseCommitBenchmarkResult {
+        schema_version: 1,
+        benchmark: "first-post-lease-commit",
+        source_revision: std::env::var("RISUNEST_POST_LEASE_BENCH_REVISION").ok(),
+        discarded_warmup_runs: 1,
+        measured_runs: samples.len(),
+        fixture_characters: POST_LEASE_CHARACTERS,
+        fixture_conversations: POST_LEASE_CHARACTERS * POST_LEASE_CHATS_PER_CHARACTER + 1,
+        fixture_messages: POST_LEASE_CHARACTERS
+            * POST_LEASE_CHATS_PER_CHARACTER
+            * POST_LEASE_TURNS_PER_CHAT
+            + POST_LEASE_STRESS_TURNS,
+        fixture_serialized_bytes: serialized_bytes,
+        aggregate: PostLeaseCommitAggregate {
+            plugin_us: nearest_rank(
+                &samples
+                    .iter()
+                    .map(|sample| sample.plugin_us)
+                    .collect::<Vec<_>>(),
+            ),
+            root_us: nearest_rank(
+                &samples
+                    .iter()
+                    .map(|sample| sample.root_us)
+                    .collect::<Vec<_>>(),
+            ),
+            message_us: nearest_rank(
+                &samples
+                    .iter()
+                    .map(|sample| sample.message_us)
+                    .collect::<Vec<_>>(),
+            ),
+        },
+        samples,
+    };
+    let encoded = serde_json::to_string(&result).expect("serialize post-lease benchmark result");
+    if let Ok(path) = std::env::var("RISUNEST_POST_LEASE_BENCH_OUTPUT") {
+        std::fs::write(path, encoded.as_bytes()).expect("write post-lease benchmark result");
+    }
+    println!("{encoded}");
 }
 
 #[test]
