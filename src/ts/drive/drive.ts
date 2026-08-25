@@ -179,7 +179,8 @@ async function backupDriveSnapshot(
         if(fileNames.includes(payload.backupName)){
             continue
         }
-        await createFileInFolder(ACCESS_TOKEN, payload.backupName, payload.encoded)
+        const encoded = new TextEncoder().encode(JSON.stringify(payload.value))
+        await createFileInFolder(ACCESS_TOKEN, payload.backupName, encoded)
     }
 
     const dbData = await pinned.collectBytes()

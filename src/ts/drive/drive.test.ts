@@ -26,7 +26,6 @@ const state = vi.hoisted(() => ({
         key: string
         backupName: string
         value: unknown
-        encoded: Uint8Array
     }>,
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
 }))
@@ -291,7 +290,10 @@ describe('Drive restore cold snapshot assets', () => {
                     image: 'assets/cold-pinned.png',
                 },
             },
-            encoded: Uint8Array.of(1),
+        }, {
+            key: 'cold-message',
+            backupName: 'coldstorage_cold-message.json',
+            value: { message: [{ role: 'user', data: 'second payload' }] },
         }]
         state.runtime = {
             store,
@@ -337,6 +339,12 @@ describe('Drive restore cold snapshot assets', () => {
         )
         expect(uploads.has('cold-pinned.png.bin')).toBe(true)
         expect(uploads.has('second-read.png.bin')).toBe(false)
+        expect([...uploads.entries()].filter(([name]) => name.startsWith('coldstorage_'))).toEqual(
+            state.coldStoragePayloads.map((payload) => [
+                payload.backupName,
+                new TextEncoder().encode(JSON.stringify(payload.value)),
+            ]),
+        )
         expect(state.getUncleanables).not.toHaveBeenCalled()
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith('drive-backup')
     })

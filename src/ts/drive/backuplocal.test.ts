@@ -19,8 +19,10 @@ const state = vi.hoisted(() => ({
         key: string
         backupName: string
         value: unknown
-        encoded: Uint8Array
     }>,
+    missingColdStorageKeys: [] as string[],
+    invalidColdStorageKeys: [] as string[],
+    confirmColdStorage: vi.fn(async () => true),
     getUncleanables: vi.fn(async () => ['assets/second-read.png']),
 }))
 
@@ -67,9 +69,13 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
 vi.mock('../process/coldstorage.svelte', () => ({
     collectColdStorageBackupPayloads: vi.fn(async (database: Database) => {
         state.snapshotSeenByColdStorage = database
-        return { payloads: state.coldStoragePayloads, missingKeys: [], invalidKeys: [] }
+        return {
+            payloads: state.coldStoragePayloads,
+            missingKeys: state.missingColdStorageKeys,
+            invalidKeys: state.invalidColdStorageKeys,
+        }
     }),
-    confirmIncompleteColdStorageOperation: vi.fn(async () => true),
+    confirmIncompleteColdStorageOperation: state.confirmColdStorage,
     getColdStorageBackupKey: vi.fn(),
     getColdStorageItem: vi.fn(),
     isColdStorageBackupData: vi.fn(),
@@ -115,6 +121,8 @@ describe('local backup persistent snapshot', () => {
         state.written.clear()
         state.snapshotSeenByColdStorage = null
         state.coldStoragePayloads = []
+        state.missingColdStorageKeys = []
+        state.invalidColdStorageKeys = []
         state.blobStore = emptyBlobStore()
     })
 
@@ -174,6 +182,15 @@ describe('local backup persistent snapshot', () => {
                 mutationGeneration: 0,
             })),
         } as unknown as PersistentDataRuntime
+        state.coldStoragePayloads = [{
+            key: 'partial-first',
+            backupName: 'coldstorage_partial-first.json',
+            value: { message: [{ role: 'user', data: 'first partial payload' }] },
+        }, {
+            key: 'partial-second',
+            backupName: 'coldstorage_partial-second.json',
+            value: { message: [{ role: 'user', data: 'second partial payload' }] },
+        }]
 
         const { SavePartialLocalBackup } = await import('./backuplocal')
         await SavePartialLocalBackup()
@@ -186,6 +203,12 @@ describe('local backup persistent snapshot', () => {
         )
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith(
             'partial-local-backup',
+        )
+        expect([...state.written.entries()].filter(([name]) => name.startsWith('coldstorage_'))).toEqual(
+            state.coldStoragePayloads.map((payload) => [
+                payload.backupName,
+                new TextEncoder().encode(JSON.stringify(payload.value)),
+            ]),
         )
     })
 
@@ -216,7 +239,10 @@ describe('local backup persistent snapshot', () => {
                     chats: [{ message: [{ data: '{{inlay::cold-inlay}}' }] }],
                 },
             },
-            encoded: new Uint8Array([1]),
+        }, {
+            key: 'cold-message',
+            backupName: 'coldstorage_cold-message.json',
+            value: { message: [{ role: 'user', data: 'second payload' }] },
         }]
         const inlayBytes = new Uint8Array([4, 5, 6])
         state.blobStore = {
@@ -245,7 +271,45 @@ describe('local backup persistent snapshot', () => {
         expect(state.written.has(getBackupInlayName('post-pin-orphan'))).toBe(false)
         expect(state.written.has('cold-pinned.png')).toBe(true)
         expect(state.written.has('second-read.png')).toBe(false)
+        expect([...state.written.entries()].filter(([name]) => name.startsWith('coldstorage_'))).toEqual(
+            state.coldStoragePayloads.map((payload) => [
+                payload.backupName,
+                new TextEncoder().encode(JSON.stringify(payload.value)),
+            ]),
+        )
         expect(state.getUncleanables).not.toHaveBeenCalled()
+    })
+
+    it('preserves missing and invalid cold storage confirmation before writing', async () => {
+        const store = new IndexedDbPersistentDataStore(
+            `cold-confirm-local-backup-${crypto.randomUUID()}`,
+            new IDBFactory(),
+            IDBKeyRange,
+        )
+        await store.open()
+        const imported = await store.replaceFromDatabase(structuredClone(risuSaveFixtureDatabase))
+        state.currentDatabase = structuredClone(risuSaveFixtureDatabase)
+        state.runtime = {
+            store,
+            revision: imported.revision,
+            capturePersistentMutationToken: vi.fn(async () => ({
+                revision: imported.revision,
+                mutationGeneration: 0,
+            })),
+        } as unknown as PersistentDataRuntime
+        state.missingColdStorageKeys = ['missing-cold']
+        state.invalidColdStorageKeys = ['invalid-cold']
+        state.confirmColdStorage.mockResolvedValueOnce(false)
+
+        const { SaveLocalBackup } = await import('./backuplocal')
+        await SaveLocalBackup()
+
+        expect(state.confirmColdStorage).toHaveBeenCalledWith(
+            expect.any(Object),
+            ['missing-cold', 'invalid-cold'],
+            'backup',
+        )
+        expect(state.written.size).toBe(0)
     })
 
     it('reads a native pinned export once for the bytes-only local writer boundary', async () => {

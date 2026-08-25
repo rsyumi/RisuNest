@@ -234,7 +234,6 @@ export type ColdStorageBackupPayload = {
     key: string
     backupName: string
     value: unknown
-    encoded: Uint8Array
 }
 
 export async function collectColdStorageBackupPayloads(db: Pick<Database, 'characters'> = DBState.db): Promise<{
@@ -264,7 +263,6 @@ export async function collectColdStorageBackupPayloads(db: Pick<Database, 'chara
                 key,
                 backupName: getColdStorageBackupName(key),
                 value,
-                encoded: new TextEncoder().encode(JSON.stringify(value))
             })
         } catch (error) {
             console.error(`Failed to read cold storage item ${key}:`, error)

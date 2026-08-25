@@ -175,7 +175,8 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
         const payload = coldStoragePayloads.payloads[i]
         let message = `Saving local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
         alertWait(message)
-        await writer.writeBackup(payload.backupName, payload.encoded)
+        const encoded = new TextEncoder().encode(JSON.stringify(payload.value))
+        await writer.writeBackup(payload.backupName, encoded)
     }
 
     let dbData = await readPinnedLocalBackupDatabase(pinned)
@@ -350,7 +351,8 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
         const payload = coldStoragePayloads.payloads[i]
         let message = `Saving partial local Backup Cold data... (${i + 1} / ${coldStoragePayloads.payloads.length})`
         alertWait(message)
-        await writer.writeBackup(payload.backupName, payload.encoded)
+        const encoded = new TextEncoder().encode(JSON.stringify(payload.value))
+        await writer.writeBackup(payload.backupName, encoded)
     }
 
     const dbData = await readPinnedLocalBackupDatabase(pinned)

@@ -26,6 +26,29 @@ beforeEach(() => {
 })
 
 describe('official account cold storage transport', () => {
+    it('collects decoded cold backup payloads without retaining encoded bytes', async () => {
+        const key = '12345678-1234-1234-1234-123456789abc'
+        const value = { message: [{ role: 'user', data: 'cold backup' }] }
+        mocks.database.characters = [{ coldstorage: key }]
+        mocks.fetchProtectedResource.mockResolvedValueOnce(new Response(
+            (await import('fflate')).compressSync(
+                new TextEncoder().encode(JSON.stringify(value)),
+            ).buffer as ArrayBuffer,
+            { status: 200 },
+        ))
+        const { collectColdStorageBackupPayloads } = await import('./coldstorage.svelte')
+
+        await expect(collectColdStorageBackupPayloads(mocks.database)).resolves.toEqual({
+            payloads: [{
+                key,
+                backupName: `coldstorage_${key}.json`,
+                value,
+            }],
+            missingKeys: [],
+            invalidKeys: [],
+        })
+    })
+
     it('skips public cleanup for an incomplete catalog working set', async () => {
         const { createCatalogCharacterStub } = await import('../storage/workingSetCatalog')
         mocks.database.characters = [createCatalogCharacterStub({
