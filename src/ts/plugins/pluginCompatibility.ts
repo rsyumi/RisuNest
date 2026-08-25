@@ -5,6 +5,12 @@ export interface PluginCompatibilityDescriptor {
     enabled?: boolean
 }
 
+export function getManualPluginInstallVersion(
+    apiVersion: string,
+): '2.1' | '3.0' | null {
+    return apiVersion === '2.1' || apiVersion === '3.0' ? apiVersion : null
+}
+
 export interface PluginCompatibilityController {
     readonly profile: PluginCompatibilityProfile
     readonly allowsEviction: boolean

@@ -5,6 +5,7 @@ import {
     createPluginCompatibilityController,
     createPluginLoadOrchestrator,
     createPluginLoadReentrancyGuard,
+    getManualPluginInstallVersion,
     runPluginUnloadCallbacks,
     runAwaitablePluginLoader,
     selectPluginCompatibilityProfile,
@@ -25,6 +26,14 @@ function deferred<T>() {
     })
     return { promise, resolve, reject }
 }
+
+describe('manual plugin installation compatibility', () => {
+    it('allows API v2.1 and v3.0 while rejecting v2.0', () => {
+        expect(getManualPluginInstallVersion('2.1')).toBe('2.1')
+        expect(getManualPluginInstallVersion('3.0')).toBe('3.0')
+        expect(getManualPluginInstallVersion('2.0')).toBeNull()
+    })
+})
 
 describe('plugin compatibility profiles', () => {
     it('selects scalable mode unless an enabled API v2.1 plugin exists', () => {

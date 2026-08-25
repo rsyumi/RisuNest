@@ -17,6 +17,7 @@ import {
     createPluginCompatibilityController,
     createPluginLoadOrchestrator,
     createPluginLoadReentrancyGuard,
+    getManualPluginInstallVersion,
     runAwaitablePluginLoader,
     runPluginUnloadCallbacks,
     selectPluginCompatibilityProfile,
@@ -361,19 +362,27 @@ export async function importPlugin(code:string|null = null, argu:{
             }
         }
 
-        let apiInternalVersion: 2|'2.1'|'3.0' = '2.1'
+        const apiInternalVersion = getManualPluginInstallVersion(apiVersion)
 
-        if(apiVersion === '2.1'){
-            showError('Your plugin specifies API version 2.1, which is outdated and no longer supported. Please update your plugin to use at least API version 3.0.')
-            return
-        }
-        else if(apiVersion === '2.0'){
+        if(apiInternalVersion === null){
             //Only block installing
-            showError('Your code does not include //@api or specifies API version 2.0, which is outdated. Please update your plugin to use at least API version 3.0.')
+            showError('Your code does not include //@api or specifies API version 2.0, which is outdated. Please update your plugin to use at least API version 2.1.')
             return
         }
-        else if(apiVersion === '3.0'){
-            apiInternalVersion = '3.0'
+        else if(apiInternalVersion === '2.1'){
+            const safety = await checkCodeSafety(jsFile)
+            if(!safety.isSafe){
+                pluginAlertModalStore.errors = safety.errors
+                pluginAlertModalStore.open = true
+
+                while(pluginAlertModalStore.open){
+                    await sleep(100)
+                }
+
+                if(pluginAlertModalStore.errors.length > 0){
+                    return
+                }
+            }
         }
 
         if(apiInternalVersion !== '3.0' && argu.isHotReload){
