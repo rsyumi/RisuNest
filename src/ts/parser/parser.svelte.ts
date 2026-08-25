@@ -782,6 +782,11 @@ const trimPurifyConfig = {
 }
 
 export function trimMarkdown(data:string){
+
+    if(!data){
+        return ''
+    }
+    
     // Without a <risu-style> there is nothing to decode, so the plain string
     // result is already final. Note the tag itself is not trusted input:
     // risu-style is in ADD_TAGS, so cards, model output and user scripts can
