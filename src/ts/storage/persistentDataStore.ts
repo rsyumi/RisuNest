@@ -156,7 +156,7 @@ export class SnapshotReleasedError extends Error {
     }
 }
 
-export interface PersistentRevisionLease {
+export interface PersistentRevisionReader {
     readonly revision: DataRevision
     readRoot(): Promise<Versioned<PersistentRoot>>
     queryPresets(): Promise<PresetCatalog>
@@ -170,6 +170,9 @@ export interface PersistentRevisionLease {
     ): Promise<Versioned<ConversationWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
+}
+
+export interface PersistentRevisionLease extends PersistentRevisionReader {
     release(): Promise<void>
 }
 

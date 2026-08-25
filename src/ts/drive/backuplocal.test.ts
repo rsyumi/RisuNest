@@ -167,6 +167,9 @@ describe('local backup persistent snapshot', () => {
         await store.open()
         const persisted = structuredClone(risuSaveFixtureDatabase) as Database
         const imported = await store.replaceFromDatabase(persisted)
+        const materializeDatabase = vi.spyOn(store, 'materializeDatabase').mockRejectedValue(
+            new Error('local backup must not materialize the database'),
+        )
         const live = structuredClone(persisted)
         live.characters[0].chats[0].message = []
         state.currentDatabase = live
@@ -189,9 +192,8 @@ describe('local backup persistent snapshot', () => {
             persisted.characters[0].chats[0].message,
         )
         expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
-        expect(state.snapshotSeenByColdStorage?.characters[0].chats[0].message).toEqual(
-            persisted.characters[0].chats[0].message,
-        )
+        expect(state.snapshotSeenByColdStorage).toEqual({ characters: [] })
+        expect(materializeDatabase).not.toHaveBeenCalled()
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith('local-backup')
     })
 
@@ -203,7 +205,20 @@ describe('local backup persistent snapshot', () => {
         )
         await store.open()
         const persisted = structuredClone(risuSaveFixtureDatabase) as Database
+        persisted.pluginCustomStorage = { zero: 0 }
         const imported = await store.replaceFromDatabase(persisted)
+        const materializeDatabase = vi.spyOn(store, 'materializeDatabase').mockRejectedValue(
+            new Error('partial backup must not materialize the database'),
+        )
+        const acquireRevision = store.acquireRevision.bind(store)
+        let readPluginStorage: ReturnType<typeof vi.fn> | undefined
+        vi.spyOn(store, 'acquireRevision').mockImplementation(async (revision) => {
+            const lease = await acquireRevision(revision)
+            const readPinnedPluginStorage = lease.readPluginStorage.bind(lease)
+            readPluginStorage = vi.fn(readPinnedPluginStorage)
+            lease.readPluginStorage = readPluginStorage
+            return lease
+        })
         const live = structuredClone(persisted)
         live.characters[0].chats[0].message = []
         state.currentDatabase = live
@@ -235,6 +250,10 @@ describe('local backup persistent snapshot', () => {
             persisted.characters[0].chats[0].message,
         )
         expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
+        expect(backedUp.pluginCustomStorage.zero).toBe(0)
+        expect(readPluginStorage).toHaveBeenCalledTimes(1)
+        expect(state.snapshotSeenByColdStorage).toEqual({ characters: [] })
+        expect(materializeDatabase).not.toHaveBeenCalled()
         expect(state.runtime.capturePersistentMutationToken).toHaveBeenCalledWith(
             'partial-local-backup',
         )
@@ -375,6 +394,7 @@ describe('local backup persistent snapshot', () => {
         await expect(writePinnedLocalBackupDatabase({ writeBackupStream } as any, {
             revision: 3,
             mutationGeneration: 0,
+            reader: { revision: 3 } as never,
             countCharacters: vi.fn(),
             materializeDatabase: vi.fn(),
             stream: vi.fn(),

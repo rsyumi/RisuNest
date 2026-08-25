@@ -5,6 +5,7 @@ import {
     collectBackupAssetKeys,
     collectPinnedBackupAssetReferences,
     collectReferencedBackupInlays,
+    createPinnedBackupReferenceAccumulator,
     decodeBackupInlayEntry,
     encodeBackupInlayEntry,
     getBackupInlayName,
@@ -110,16 +111,236 @@ describe('backup inlay entries', () => {
     })
 
     test('keeps only inlays referenced by the pinned logical snapshot', async () => {
-        const referenced = { chats: [{ data: '{{inlayed::pinned-id}}' }] }
         const list = vi.fn(async () => [
             { ...metadata, key: 'pinned-id' },
             { ...metadata, key: 'created-after-pin' },
         ])
         const store = { list } as unknown as BlobStore
 
-        await expect(collectReferencedBackupInlays(store, referenced)).resolves.toEqual([
+        await expect(collectReferencedBackupInlays(store, ['pinned-id'])).resolves.toEqual([
             { ...metadata, key: 'pinned-id' },
         ])
+    })
+})
+
+describe('pinned backup reference accumulator', () => {
+    test('collects full references record by record and lets cold characters override stubs', () => {
+        const accumulator = createPinnedBackupReferenceAccumulator('full')
+        accumulator.visitRoot({
+            customBackground: 'assets/root.png',
+            modules: [],
+            personas: [],
+            characterOrder: [],
+            note: '{{inlay::root-inlay}}',
+        } as never)
+        accumulator.visitPreset({ id: 'preset', name: 'Preset', image: 'assets/preset.png' } as never)
+        accumulator.visitCharacter({
+            summary: {
+                id: 'char-1', name: 'Character', image: 'assets/stub.png', configuredIndex: 0,
+                recentAt: 0, trashed: false, conversationCount: 1, type: 'character',
+            },
+            detail: {
+                chaId: 'char-1', name: 'Character', type: 'character', image: 'assets/stub.png',
+                additionalAssets: [['stub-extra', 'assets/stub-extra.png', 'png']],
+                coldstorage: 'cold-character', coldStoragedChats: ['cold-old-chat'],
+            } as never,
+        })
+        accumulator.visitConversation({
+            summary: {
+                id: 'chat-1', characterId: 'char-1', name: 'Chat', configuredIndex: 0,
+                recentAt: 0, messageCount: 2,
+            },
+            value: {
+                id: 'chat-1', name: 'Chat',
+                message: [
+                    { role: 'user', data: '\uEF01COLDSTORAGE\uEF01cold-chat', time: 1 },
+                    { role: 'char', data: '{{inlayed::chat-inlay}}', time: 2 },
+                ],
+            } as never,
+        })
+        accumulator.visitPluginStorage({ value: 0, markup: '{{inlayeddata::plugin-inlay}}' })
+        accumulator.visitColdPayload({
+            character: {
+                chaId: 'char-1', name: 'Character', type: 'character', chats: [],
+                image: 'assets/cold.png',
+                additionalAssets: [['cold-extra', 'assets/cold-extra.png', 'png']],
+            },
+            text: '{{inlay::cold-inlay}}',
+        })
+
+        const result = accumulator.finish()
+
+        expect(result.assetKeys).toEqual([
+            'assets/cold-extra.png',
+            'assets/cold.png',
+            'assets/root.png',
+        ])
+        expect(result.inlayKeys).toEqual([
+            'chat-inlay',
+            'cold-inlay',
+            'plugin-inlay',
+            'root-inlay',
+        ])
+        expect(result.coldKeys).toEqual(['cold-character', 'cold-old-chat', 'cold-chat'])
+        expect(result.assetLabels.has('assets/cold.png')).toBe(false)
+        expect(result.coldCharacterReferences).toEqual([{
+            characterId: 'char-1',
+            characterName: 'Character',
+            keys: ['cold-character', 'cold-old-chat', 'cold-chat'],
+        }])
+    })
+
+    test('keeps partial backup selection limited to documented profile assets', () => {
+        const accumulator = createPinnedBackupReferenceAccumulator('partial')
+        accumulator.visitRoot({
+            userIcon: 'assets/user.png',
+            customBackground: 'assets/background.png',
+            personas: [{ name: 'Persona', icon: 'assets/persona.png' }],
+            characterOrder: [{
+                name: 'Folder', img: 'assets/folder-img.png', imgFile: 'assets/folder-file.png',
+            }],
+        } as never)
+        accumulator.visitPreset({ id: 'preset', name: 'Preset', image: 'assets/preset.png' } as never)
+        accumulator.visitCharacter({
+            summary: {
+                id: 'char-1', name: 'Character', image: 'assets/profile.png', configuredIndex: 0,
+                recentAt: 0, trashed: false, conversationCount: 0, type: 'character',
+            },
+            detail: {
+                chaId: 'char-1', name: 'Character', type: 'character', image: 'assets/profile.png',
+                additionalAssets: [['bulk', 'assets/bulk.png', 'png']],
+            } as never,
+        })
+
+        const result = accumulator.finish()
+
+        expect(result.assetKeys).toEqual([
+            'assets/profile.png',
+            'assets/user.png',
+            'assets/persona.png',
+            'assets/background.png',
+            'assets/folder-img.png',
+            'assets/folder-file.png',
+            'assets/preset.png',
+        ])
+        expect(result.inlayKeys).toEqual([])
+        expect(result.assetLabels.get('assets/profile.png')?.assetName).toBe('Profile Image')
+    })
+
+    test('ignores an empty top-level coldstorage field', () => {
+        const accumulator = createPinnedBackupReferenceAccumulator('full')
+        accumulator.visitCharacter({
+            summary: {
+                id: 'char-empty', name: 'Empty marker', configuredIndex: 0,
+                recentAt: 0, trashed: false, conversationCount: 0, type: 'character',
+            },
+            detail: {
+                chaId: 'char-empty', name: 'Empty marker', type: 'character',
+                coldstorage: '',
+            } as never,
+        })
+
+        expect(accumulator.finish()).toMatchObject({
+            coldKeys: [],
+            coldCharacterReferences: [],
+        })
+    })
+
+    test('preserves an empty cold key from the legacy coldStoragedChats array', () => {
+        const accumulator = createPinnedBackupReferenceAccumulator('full')
+        accumulator.visitCharacter({
+            summary: {
+                id: 'char-empty', name: 'Empty marker', configuredIndex: 0,
+                recentAt: 0, trashed: false, conversationCount: 0, type: 'character',
+            },
+            detail: {
+                chaId: 'char-empty', name: 'Empty marker', type: 'character',
+                coldStoragedChats: [''],
+            } as never,
+        })
+
+        expect(accumulator.finish()).toMatchObject({
+            coldKeys: [''],
+            coldCharacterReferences: [{
+                characterId: 'char-empty',
+                characterName: 'Empty marker',
+                keys: [''],
+            }],
+        })
+    })
+
+    test('preserves an empty cold key from a header-only conversation marker', () => {
+        const accumulator = createPinnedBackupReferenceAccumulator('full')
+        accumulator.visitCharacter({
+            summary: {
+                id: 'char-empty', name: 'Empty marker', configuredIndex: 0,
+                recentAt: 0, trashed: false, conversationCount: 1, type: 'character',
+            },
+            detail: {
+                chaId: 'char-empty', name: 'Empty marker', type: 'character',
+            } as never,
+        })
+        accumulator.visitConversation({
+            summary: {
+                id: 'chat-empty', characterId: 'char-empty', name: 'Chat', configuredIndex: 0,
+                recentAt: 0, messageCount: 1,
+            },
+            value: {
+                id: 'chat-empty', name: 'Chat',
+                message: [{ role: 'user', data: '\uEF01COLDSTORAGE\uEF01', time: 1 }],
+            } as never,
+        })
+
+        expect(accumulator.finish()).toMatchObject({
+            coldKeys: [''],
+            coldCharacterReferences: [{
+                characterId: 'char-empty',
+                characterName: 'Empty marker',
+                keys: [''],
+            }],
+        })
+    })
+
+    test('retains no character entry for records without assets or cold keys', () => {
+        const accumulator = createPinnedBackupReferenceAccumulator('full')
+        for (let index = 0; index < 512; index += 1) {
+            accumulator.visitCharacter({
+                summary: {
+                    id: `empty-${index}`, name: `Empty ${index}`, configuredIndex: index,
+                    recentAt: 0, trashed: false, conversationCount: 0, type: 'character',
+                },
+                detail: {
+                    chaId: `empty-${index}`, name: `Empty ${index}`, type: 'character',
+                } as never,
+            })
+        }
+
+        expect(accumulator.finish()).toMatchObject({
+            assetKeys: [],
+            coldKeys: [],
+            coldCharacterReferences: [],
+        })
+    })
+
+    test('removes a stub asset set when a cold character overrides it with no assets', () => {
+        const accumulator = createPinnedBackupReferenceAccumulator('full')
+        accumulator.visitCharacter({
+            summary: {
+                id: 'cold-empty', name: 'Cold empty', configuredIndex: 0,
+                recentAt: 0, trashed: false, conversationCount: 0, type: 'character',
+            },
+            detail: {
+                chaId: 'cold-empty', name: 'Cold empty', type: 'character',
+                image: 'assets/stub.png',
+            } as never,
+        })
+        accumulator.visitColdPayload({
+            character: {
+                chaId: 'cold-empty', name: 'Cold empty', type: 'character', chats: [],
+            },
+        })
+
+        expect(accumulator.finish().assetKeys).toEqual([])
     })
 })
 

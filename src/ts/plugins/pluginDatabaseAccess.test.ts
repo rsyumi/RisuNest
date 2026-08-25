@@ -6,7 +6,9 @@ import type {
     ConversationWindow,
     PersistentDataStore,
     PluginStorageMutation,
+    PersistentRevisionLease,
 } from '../storage/persistentDataStore'
+import { RevisionConflictError } from '../storage/persistentDataStore'
 import { getPersistentDataStore } from '../storage/persistentDataStoreFactory'
 import { createCatalogCharacterStub } from '../storage/workingSetCatalog'
 import {
@@ -76,23 +78,114 @@ function createHarness() {
     let compatibilityProfile: 'scalable-v3' | 'maximum-compatibility' = 'scalable-v3'
     let navigationGeneration = 0
     const materializedDatabases: Database[] = []
+    const pinnedDatabases: Database[] = []
+    const releasedLeases: Array<ReturnType<typeof vi.fn>> = []
     const authoritativeSnapshots: Array<{
         database: Database
         revision: number
         mutationGeneration?: number
     }> = []
+    const readRoot = vi.fn(async () => {
+        const database = pinnedDatabases[0]!
+        const { characters, botPresets, pluginCustomStorage, ...root } = database
+        return { revision: 4, value: root }
+    })
+    const acquireRevision = vi.fn(async (revision: number) => {
+        const database = pinnedDatabases.shift()!
+        const characters = database.characters ?? []
+        const presets = database.botPresets ?? []
+        const pluginStorage = database.pluginCustomStorage ?? {}
+        const release = vi.fn(async () => undefined)
+        releasedLeases.push(release)
+        return {
+            revision,
+            readRoot: async () => {
+                const { characters: _characters, botPresets, pluginCustomStorage, ...root } = database
+                return { revision, value: root }
+            },
+            queryPresets: async () => ({
+                revision,
+                items: presets.map((preset, configuredIndex) => ({
+                    id: String(configuredIndex),
+                    name: preset.name,
+                    image: preset.image,
+                    configuredIndex,
+                })),
+            }),
+            readPreset: async (id: string) => ({ revision, value: presets[Number(id)] }),
+            queryCharacters: async ({ trash, limit, cursor }) => {
+                const values = characters
+                    .map((character, configuredIndex) => ({ character, configuredIndex }))
+                    .filter(({ character }) => Boolean(character.trashTime) === trash)
+                const start = cursor ? Number(cursor) : 0
+                const end = Math.min(start + limit, values.length)
+                return {
+                    revision,
+                    items: values.slice(start, end).map(({ character, configuredIndex }) => ({
+                        id: character.chaId,
+                        name: character.name,
+                        image: character.image,
+                        configuredIndex,
+                        recentAt: character.lastInteraction ?? 0,
+                        trashed: trash,
+                        conversationCount: character.chats.length,
+                        type: character.type,
+                    })),
+                    nextCursor: end < values.length ? String(end) : undefined,
+                }
+            },
+            readCharacter: async (id: string) => {
+                const character = characters.find((value) => value.chaId === id)
+                if (!character) return null
+                const { chats, ...detail } = character
+                return { revision, value: detail }
+            },
+            queryConversations: async ({ characterId, limit, cursor }) => {
+                const chats = characters.find((value) => value.chaId === characterId)?.chats ?? []
+                const start = cursor ? Number(cursor) : 0
+                const end = Math.min(start + limit, chats.length)
+                return {
+                    revision,
+                    items: chats.slice(start, end).map((chat, index) => ({
+                        id: chat.id,
+                        characterId,
+                        name: chat.name ?? '',
+                        configuredIndex: start + index,
+                        recentAt: chat.lastDate ?? 0,
+                        messageCount: chat.message.length,
+                    })),
+                    nextCursor: end < chats.length ? String(end) : undefined,
+                }
+            },
+            readConversation: async (characterId: string, conversationId: string) => {
+                const chat = characters
+                    .find((value) => value.chaId === characterId)
+                    ?.chats.find((value) => value.id === conversationId)
+                return chat ? { revision, value: chat } : null
+            },
+            queryPluginStorage: async () => ({
+                revision,
+                items: Object.keys(pluginStorage).map((key) => ({ key, byteSize: 0 })),
+            }),
+            readPluginStorage: async (key: string) => Object.prototype.hasOwnProperty.call(
+                pluginStorage,
+                key,
+            ) ? { revision, value: pluginStorage[key] } : null,
+            release,
+        } as unknown as PersistentRevisionLease
+    })
     const store = {
         open: vi.fn(async () => undefined),
         queryCharacters: vi.fn(async () => characterPage),
         queryConversations: vi.fn(async () => conversationPage),
         readConversationWindow: vi.fn(async () => ({ revision: 4, value: conversationWindow })),
         materializeDatabase: vi.fn(async () => materializedDatabases.shift()!),
-        readRoot: vi.fn(),
+        readRoot,
         readCharacter: vi.fn(),
         readConversation: vi.fn(),
         commit: vi.fn(),
         replaceFromDatabase: vi.fn(),
-        acquireRevision: vi.fn(),
+        acquireRevision,
     } as unknown as PersistentDataStore
     const flushPendingData = vi.fn(async () => undefined)
     const snapshot = vi.fn((value: unknown) => structuredClone(value))
@@ -155,6 +248,8 @@ function createHarness() {
         prepareAuthoritativeDatabaseUpdate,
         readPluginStorageSnapshot,
         invalidatePluginStorage,
+        pinnedDatabases,
+        releasedLeases,
         replacePersistentDatabase,
         setCompatibilityProfile(profile: 'scalable-v3' | 'maximum-compatibility') {
             compatibilityProfile = profile
@@ -396,15 +491,23 @@ describe('plugin database access', () => {
         expect(harness.readPluginStorageSnapshot).toHaveBeenCalledOnce()
         expect(harness.materializeDatabaseSnapshot).not.toHaveBeenCalled()
         expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
+        expect(harness.store.queryCharacters).not.toHaveBeenCalled()
+        expect(harness.store.readCharacter).not.toHaveBeenCalled()
+        expect(harness.store.acquireRevision).not.toHaveBeenCalled()
     })
 
-    it('materializes characters only for the explicit full compatibility snapshot', async () => {
+    it('builds the explicit scalable character result directly from one pinned reader', async () => {
         const harness = createHarness()
-        const materialized = {
+        const pinned = {
             username: 'Persisted user from the same revision',
-            characters: [{ chaId: 'persisted-character' }],
+            characters: [{
+                type: 'character',
+                chaId: 'persisted-character',
+                name: 'Persisted character',
+                chats: [{ id: 'persisted-chat', name: 'Chat', message: [] }],
+            }],
         } as unknown as Database
-        harness.materializedDatabases.push(materialized)
+        harness.pinnedDatabases.push(pinned)
         Object.defineProperty(harness.compatibilityDatabase, 'characters', {
             get() {
                 throw new Error('full snapshot read compatibility characters')
@@ -414,13 +517,66 @@ describe('plugin database access', () => {
         await expect(
             harness.access.getDatabaseSnapshot('all', ['characters', 'username', 'unknown']),
         ).resolves.toEqual({
-            characters: materialized.characters,
+            characters: pinned.characters,
             username: 'Persisted user from the same revision',
             unknown: undefined,
         })
         expect(harness.flushPendingData).toHaveBeenCalledWith('plugin-full-database-snapshot')
         expect(harness.store.open).toHaveBeenCalledTimes(1)
-        expect(harness.store.materializeDatabase).toHaveBeenCalledTimes(1)
+        expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
+        expect(harness.store.acquireRevision).toHaveBeenCalledWith(4)
+        expect(harness.releasedLeases[0]).toHaveBeenCalledTimes(1)
+    })
+
+    it('retries a scalable character snapshot when current revision acquisition races a commit', async () => {
+        const harness = createHarness()
+        const stale = {
+            username: 'Stale',
+            characters: [{ type: 'character', chaId: 'stale', name: 'Stale', chats: [] }],
+        } as unknown as Database
+        const current = {
+            username: 'Current',
+            characters: [{ type: 'character', chaId: 'current', name: 'Current', chats: [] }],
+        } as unknown as Database
+        harness.pinnedDatabases.push(stale, current)
+        vi.mocked(harness.store.readRoot)
+            .mockResolvedValueOnce({ revision: 4, value: { username: 'Stale' } as never })
+            .mockResolvedValueOnce({ revision: 5, value: { username: 'Current' } as never })
+        const acquireRevision = vi.mocked(harness.store.acquireRevision)
+        const acquirePinnedReader = acquireRevision.getMockImplementation()!
+        acquireRevision
+            .mockImplementationOnce(async () => {
+                harness.pinnedDatabases.shift()
+                throw new RevisionConflictError(4, 5)
+            })
+            .mockImplementationOnce(acquirePinnedReader)
+
+        await expect(harness.access.getDatabaseSnapshot(
+            ['characters', 'username'],
+            ['characters', 'username'],
+        )).resolves.toEqual({
+            characters: current.characters,
+            username: 'Current',
+        })
+        expect(acquireRevision.mock.calls.map(([revision]) => revision)).toEqual([4, 5])
+        expect(harness.releasedLeases[0]).toHaveBeenCalledTimes(1)
+    })
+
+    it('bounds scalable character snapshot revision acquisition retries', async () => {
+        const harness = createHarness()
+        vi.mocked(harness.store.readRoot).mockResolvedValue({
+            revision: 4,
+            value: { username: 'Racing' } as never,
+        })
+        vi.mocked(harness.store.acquireRevision).mockRejectedValue(
+            new RevisionConflictError(4, 5),
+        )
+
+        await expect(harness.access.getDatabaseSnapshot(
+            ['characters'],
+            ['characters'],
+        )).rejects.toBeInstanceOf(RevisionConflictError)
+        expect(harness.store.acquireRevision).toHaveBeenCalledTimes(3)
     })
 
     it('snapshots maximum compatibility root and v2.1 character edits from one live value', async () => {
@@ -442,18 +598,65 @@ describe('plugin database access', () => {
         expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
     })
 
-    it('does not retain full compatibility snapshots between calls', async () => {
+    it('does not retain pinned character results between calls', async () => {
         const harness = createHarness()
-        const first = { characters: [{ chaId: 'first' }] } as unknown as Database
-        const second = { characters: [{ chaId: 'second' }] } as unknown as Database
-        harness.materializedDatabases.push(first, second)
+        const first = {
+            characters: [{ type: 'character', chaId: 'first', name: 'First', chats: [] }],
+        } as unknown as Database
+        const second = {
+            characters: [{ type: 'character', chaId: 'second', name: 'Second', chats: [] }],
+        } as unknown as Database
+        harness.pinnedDatabases.push(first, second)
 
         const firstResult = await harness.access.getDatabaseSnapshot(['characters'], ['characters'])
         const secondResult = await harness.access.getDatabaseSnapshot(['characters'], ['characters'])
 
         expect(firstResult.characters).toEqual(first.characters)
         expect(secondResult.characters).toEqual(second.characters)
-        expect(harness.store.materializeDatabase).toHaveBeenCalledTimes(2)
+        expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
+        expect(harness.store.acquireRevision).toHaveBeenCalledTimes(2)
+    })
+
+    it('preserves a falsy plugin value in an explicit scalable character snapshot', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push({
+            characters: [],
+            pluginCustomStorage: { zero: 0 },
+        } as unknown as Database)
+
+        await expect(harness.access.getDatabaseSnapshot(
+            ['characters', 'pluginCustomStorage'],
+            ['characters', 'pluginCustomStorage'],
+        )).resolves.toEqual({
+            characters: [],
+            pluginCustomStorage: { zero: 0 },
+        })
+        expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
+    })
+
+    it('releases the pinned reader when an explicit scalable snapshot fails', async () => {
+        const harness = createHarness()
+        harness.pinnedDatabases.push({
+            characters: [{
+                type: 'character',
+                chaId: 'broken',
+                name: 'Broken',
+                chats: [{ id: 'missing', name: 'Missing', message: [] }],
+            }],
+        } as unknown as Database)
+        const acquireRevision = vi.mocked(harness.store.acquireRevision)
+        const acquirePinnedReader = acquireRevision.getMockImplementation()!
+        acquireRevision.mockImplementationOnce(async (revision) => {
+            const reader = await acquirePinnedReader(revision)
+            reader.readConversation = vi.fn(async () => null)
+            return reader
+        })
+
+        await expect(harness.access.getDatabaseSnapshot(
+            ['characters'],
+            ['characters'],
+        )).rejects.toThrow('Missing conversation missing')
+        expect(harness.releasedLeases[0]).toHaveBeenCalledTimes(1)
     })
 
     it('omits unapproved selected keys and snapshots live non-character values', async () => {

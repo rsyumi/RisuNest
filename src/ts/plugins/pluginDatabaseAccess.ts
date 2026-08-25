@@ -8,8 +8,15 @@ import type {
     ConversationWindow,
     DataRevision,
     PersistentDataStore,
+    PersistentRevisionLease,
     PluginStorageMutation,
 } from '../storage/persistentDataStore'
+import { RevisionConflictError } from '../storage/persistentDataStore'
+import {
+    assertPinnedRevision,
+    iteratePinnedCharacters,
+    iteratePinnedConversations,
+} from '../storage/persistentRecordIterator'
 import type { PluginCompatibilityProfile } from './pluginCompatibility'
 
 export const PLUGIN_SUMMARY_QUERY_DEFAULT_LIMIT = 50
@@ -254,6 +261,16 @@ export function createPluginDatabaseAccess(
 ): PluginDatabaseAccess {
     let openPromise: Promise<void> | undefined
     const openStore = () => (openPromise ??= dependencies.store.open())
+    const acquireCurrentRevisionReader = async (): Promise<PersistentRevisionLease> => {
+        for (let attempt = 0; ; attempt++) {
+            const rootRecord = await dependencies.store.readRoot()
+            try {
+                return await dependencies.store.acquireRevision(rootRecord.revision)
+            } catch (error) {
+                if (!(error instanceof RevisionConflictError) || attempt >= 2) throw error
+            }
+        }
+    }
     const prepareQuery = async () => {
         await dependencies.flushPendingData('plugin-database-query')
         await openStore()
@@ -360,17 +377,90 @@ export function createPluginDatabaseAccess(
                 return result
             }
             const compatibilityProfile = dependencies.getCompatibilityProfile()
-            let sourceDatabase: Database
             if (compatibilityProfile === 'scalable-v3') {
                 await dependencies.flushPendingData('plugin-full-database-snapshot')
                 await openStore()
-                sourceDatabase = dependencies.snapshot(
-                    await dependencies.store.materializeDatabase(),
-                )
-            } else {
-                sourceDatabase = dependencies.snapshot(dependencies.getCompatibilityDatabase())
+                const reader = await acquireCurrentRevisionReader()
+                try {
+                    const pinnedRoot = await reader.readRoot()
+                    assertPinnedRevision(reader.revision, pinnedRoot.revision, 'Root')
+                    const result: Record<string, unknown> = {}
+                    for (const key of requestedKeys) {
+                        if (key === 'characters') {
+                            const characters: Database['characters'] = []
+                            for await (const character of iteratePinnedCharacters(reader)) {
+                                const chats: Database['characters'][number]['chats'] = []
+                                for await (const conversation of iteratePinnedConversations(
+                                    reader,
+                                    character.summary.id,
+                                )) {
+                                    chats.push(conversation.value)
+                                }
+                                characters.push(dependencies.snapshot({
+                                    ...character.detail,
+                                    chats,
+                                } as Database['characters'][number]))
+                            }
+                            result[key] = characters
+                            continue
+                        }
+                        if (key === 'botPresets') {
+                            const catalog = await reader.queryPresets()
+                            assertPinnedRevision(
+                                reader.revision,
+                                catalog.revision,
+                                'Preset catalog',
+                            )
+                            const presets: Database['botPresets'] = []
+                            for (const summary of catalog.items) {
+                                const preset = await reader.readPreset(summary.id)
+                                if (!preset) throw new Error(`Missing preset ${summary.id}`)
+                                assertPinnedRevision(
+                                    reader.revision,
+                                    preset.revision,
+                                    `Preset ${summary.id}`,
+                                )
+                                presets.push(dependencies.snapshot(preset.value))
+                            }
+                            result[key] = presets
+                            continue
+                        }
+                        if (key === 'pluginCustomStorage') {
+                            const catalog = await reader.queryPluginStorage()
+                            assertPinnedRevision(
+                                reader.revision,
+                                catalog.revision,
+                                'Plugin storage catalog',
+                            )
+                            const storage: Record<string, unknown> = {}
+                            for (const summary of catalog.items) {
+                                const value = await reader.readPluginStorage(summary.key)
+                                if (!value) {
+                                    throw new Error(
+                                        `Missing plugin storage value for ${summary.key}`,
+                                    )
+                                }
+                                assertPinnedRevision(
+                                    reader.revision,
+                                    value.revision,
+                                    `Plugin storage value ${summary.key}`,
+                                )
+                                storage[summary.key] = dependencies.snapshot(value.value)
+                            }
+                            result[key] = storage
+                            continue
+                        }
+                        result[key] = dependencies.snapshot(
+                            (pinnedRoot.value as unknown as Record<string, unknown>)[key],
+                        )
+                    }
+                    return result
+                } finally {
+                    await reader.release()
+                }
             }
 
+            const sourceDatabase = dependencies.snapshot(dependencies.getCompatibilityDatabase())
             const result: Record<string, unknown> = {}
             for (const key of requestedKeys) {
                 const value = (sourceDatabase as unknown as Record<string, unknown>)[key]

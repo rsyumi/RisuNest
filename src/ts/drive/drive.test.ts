@@ -274,6 +274,9 @@ describe('Drive restore cold snapshot assets', () => {
         )
         await store.open()
         const imported = await store.replaceFromDatabase(persisted)
+        const materializeDatabase = vi.spyOn(store, 'materializeDatabase').mockRejectedValue(
+            new Error('Drive backup must not materialize the full database'),
+        )
         const live = structuredClone(persisted)
         live.characters[0].chats[0].message = []
         state.currentDatabase = live
@@ -335,9 +338,8 @@ describe('Drive restore cold snapshot assets', () => {
             persisted.characters[0].chats[0].message,
         )
         expect(backedUp.pluginCustomStorage).toEqual(persisted.pluginCustomStorage)
-        expect(state.snapshotSeenByColdStorage?.characters[0].chats[0].message).toEqual(
-            persisted.characters[0].chats[0].message,
-        )
+        expect(state.snapshotSeenByColdStorage).toEqual({ characters: [] })
+        expect(materializeDatabase).not.toHaveBeenCalled()
         expect(uploads.has('cold-pinned.png.bin')).toBe(true)
         expect(uploads.has('second-read.png.bin')).toBe(false)
         expect([...uploads.entries()].filter(([name]) => name.startsWith('coldstorage_'))).toEqual(

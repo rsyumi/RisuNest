@@ -6,14 +6,14 @@ import { resolveBlobStore } from "../storage/platformBlobStore";
 import type { BlobStore } from "../storage/blobStore";
 import {
     collectBackupAssetKeys,
-    collectPinnedBackupAssetReferences,
     collectReferencedBackupInlays,
+    createColdStorageReferenceDatabase,
     decodeBackupInlayEntry,
     encodeBackupInlayEntry,
     getBackupInlayName,
     isLegacyBackupAssetKey,
     readBackupAsset,
-    selectLegacyBackupAssetKeys,
+    scanPinnedBackupRecords,
     writeBackupAsset,
 } from "./backupAssets";
 import { classifyPocketRisuEntry, PocketRisuInlayImporter } from "./pocketRisuBackup";
@@ -109,12 +109,21 @@ export async function SaveLocalBackup(){
 }
 
 async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuSaveExport) {
-    const db = await pinned.materializeDatabase()
-    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+    const { root, accumulator } = await scanPinnedBackupRecords(pinned.reader, 'full')
+    const coldReferenceDatabase = createColdStorageReferenceDatabase(
+        accumulator.finish().coldCharacterReferences,
+    )
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(coldReferenceDatabase)
     const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
-    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
+    if(!await confirmIncompleteColdStorageOperation(
+        coldReferenceDatabase,
+        unavailableColdStorageKeys,
+        'backup',
+    )){
         return
     }
+    for (const payload of coldStoragePayloads.payloads) accumulator.visitColdPayload(payload.value)
+    const references = accumulator.finish()
 
     const writer = new LocalWriter()
     const r = await writer.init('RisuAI Backup', ['bin'], 'risu-backup.bin')
@@ -123,54 +132,12 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
         return
     }
 
-    const assetMap = new Map<string, { charName: string, assetName: string }>()
-    if (db.characters) {
-        for (const char of db.characters) {
-            if (!char) continue
-            const charName = char.name ?? 'Unknown Character'
-            
-            if (char.image) assetMap.set(char.image, { charName: charName, assetName: 'Main Image' })
-            
-            if (char.emotionImages) {
-                for (const em of char.emotionImages) {
-                    if (em && em[1]) assetMap.set(em[1], { charName: charName, assetName: em[0] })
-                }
-            }
-            if (char.type !== 'group') {
-                if (char.additionalAssets) {
-                    for (const em of char.additionalAssets) {
-                        if (em && em[1]) assetMap.set(em[1], { charName: charName, assetName: em[0] })
-                    }
-                }
-                if (char.vits) {
-                    const keys = Object.keys(char.vits.files)
-                    for (const key of keys) {
-                        const vit = char.vits.files[key]
-                        if (vit) assetMap.set(vit, { charName: charName, assetName: key })
-                    }
-                }
-                if (char.ccAssets) {
-                    for (const asset of char.ccAssets) {
-                        if (asset && asset.uri) assetMap.set(asset.uri, { charName: charName, assetName: asset.name })
-                    }
-                }
-            }
-        }
-    }
-    if (db.userIcon) {
-        assetMap.set(db.userIcon, { charName: 'User Settings', assetName: 'User Icon' })
-    }
-    if (db.customBackground) {
-        assetMap.set(db.customBackground, { charName: 'User Settings', assetName: 'Custom Background' })
-    }
+    const assetMap = references.assetLabels
     const missingAssets: string[] = []
 
     const backupAssetKeys = await collectBackupAssetKeys(
         blobStore,
-        collectPinnedBackupAssetReferences(
-            db,
-            coldStoragePayloads.payloads.map((payload) => payload.value),
-        ),
+        references.assetKeys,
     )
     for(let i=0;i<backupAssetKeys.length;i++){
         const key = backupAssetKeys[i]
@@ -187,7 +154,7 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
         let data = await blobStore.read(key)
         let readRemotely = false
         if (data === null && forageStorage.isAccount) {
-            if (db.skipSavingAssetsOnWebSync) {
+            if (root.skipSavingAssetsOnWebSync) {
                 continue
             }
             data = await readBackupAsset(blobStore, key, true)
@@ -203,10 +170,7 @@ async function saveLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuS
         }
     }
 
-    const inlays = await collectReferencedBackupInlays(blobStore, [
-        db,
-        ...coldStoragePayloads.payloads.map((payload) => payload.value),
-    ])
+    const inlays = await collectReferencedBackupInlays(blobStore, references.inlayKeys)
     for(let i=0;i<inlays.length;i++){
         const metadata = inlays[i]
         alertWait(`Saving local Backup inlays... (${i + 1} / ${inlays.length})`)
@@ -296,10 +260,18 @@ export async function SavePartialLocalBackup(){
 }
 
 async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: PinnedRisuSaveExport) {
-    const db = await pinned.materializeDatabase()
-    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+    const { accumulator } = await scanPinnedBackupRecords(pinned.reader, 'partial')
+    const references = accumulator.finish()
+    const coldReferenceDatabase = createColdStorageReferenceDatabase(
+        references.coldCharacterReferences,
+    )
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(coldReferenceDatabase)
     const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
-    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
+    if(!await confirmIncompleteColdStorageOperation(
+        coldReferenceDatabase,
+        unavailableColdStorageKeys,
+        'backup',
+    )){
         return
     }
 
@@ -310,65 +282,10 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
         return
     }
 
-    const assetMap = new Map<string, { charName: string, assetName: string }>()
-    
-    // Only collect main profile images for both characters and groups
-    if (db.characters) {
-        for (const char of db.characters) {
-            if (!char) continue
-            const charName = char.name ?? 'Unknown Character'
-            
-            // Save the main profile image (supports both character and group types)
-            // Note: emotionImages are intentionally excluded from partial backup
-            if (char.image) {
-                assetMap.set(char.image, { charName: charName, assetName: 'Profile Image' })
-            }
-        }
-    }
-    
-    // User icon
-    if (db.userIcon) {
-        assetMap.set(db.userIcon, { charName: 'User Settings', assetName: 'User Icon' })
-    }
-    
-    // Persona icons
-    if (db.personas) {
-        for (const persona of db.personas) {
-            if (persona && persona.icon) {
-                assetMap.set(persona.icon, { charName: 'Persona', assetName: `${persona.name} Icon` })
-            }
-        }
-    }
-    
-    // Custom background
-    if (db.customBackground) {
-        assetMap.set(db.customBackground, { charName: 'User Settings', assetName: 'Custom Background' })
-    }
-    
-    // Folder images in characterOrder
-    if (db.characterOrder) {
-        for (const item of db.characterOrder) {
-            if (typeof item !== 'string' && item.img) {
-                assetMap.set(item.img, { charName: 'Folder', assetName: `${item.name} Folder Image` })
-            }
-            if (typeof item !== 'string' && item.imgFile) {
-                assetMap.set(item.imgFile, { charName: 'Folder', assetName: `${item.name} Folder Image File` })
-            }
-        }
-    }
-    
-    // Bot preset images
-    if (db.botPresets) {
-        for (const preset of db.botPresets) {
-            if (preset && preset.image) {
-                assetMap.set(preset.image, { charName: 'Preset', assetName: `${preset.name} Preset Image` })
-            }
-        }
-    }
-    
+    const assetMap = references.assetLabels
     const missingAssets: string[] = []
 
-    const assetKeys = selectLegacyBackupAssetKeys(Array.from(assetMap.keys()))
+    const assetKeys = references.assetKeys
     for(let i=0;i<assetKeys.length;i++){
         const key = assetKeys[i]
         let message = `Saving partial local backup... (${i + 1} / ${assetKeys.length})`

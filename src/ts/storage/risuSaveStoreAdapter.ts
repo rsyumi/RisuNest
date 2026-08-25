@@ -6,11 +6,18 @@ import {
     withPinnedNativePersistentRisuSaveFile,
 } from './nativePersistentExport'
 import type {
-    CharacterSummary,
     DataRevision,
     PersistentDataStore,
     PersistentRevisionLease,
+    PersistentRevisionReader,
 } from './persistentDataStore'
+import {
+    assertPinnedRevision,
+    collectPinnedCharacterIds,
+    countPinnedCharacters,
+    iteratePinnedCharacters,
+    iteratePinnedConversations,
+} from './persistentRecordIterator'
 import {
     replaceCharacterResources,
     replaceDatabaseRootResources,
@@ -29,50 +36,13 @@ export async function importRisuSaveToStore(
     return store.replaceFromDatabase((await decodeRisuSave(bytes)) as Database)
 }
 
-async function characterSummaries(lease: PersistentRevisionLease): Promise<CharacterSummary[]> {
-    const summaries: CharacterSummary[] = []
-    for (const trash of [false, true]) {
-        let cursor: string | undefined
-        do {
-            const page = await lease.queryCharacters({
-                order: 'configured',
-                trash,
-                limit: 128,
-                cursor,
-            })
-            summaries.push(...page.items)
-            cursor = page.nextCursor
-        } while (cursor !== undefined)
-    }
-    return summaries.sort((left, right) => left.configuredIndex - right.configuredIndex)
-}
-
-async function* characterValues(lease: PersistentRevisionLease): AsyncGenerator<Database['characters'][number]> {
-    for (const summary of await characterSummaries(lease)) {
-        const detail = await lease.readCharacter(summary.id)
-        if (!detail) throw new Error(`Missing character detail for ${summary.id}`)
+async function* characterValues(reader: PersistentRevisionReader): AsyncGenerator<Database['characters'][number]> {
+    for await (const record of iteratePinnedCharacters(reader)) {
         const chats: Database['characters'][number]['chats'] = []
-        let conversationCursor: string | undefined
-        do {
-            const conversations = await lease.queryConversations({
-                characterId: summary.id,
-                order: 'configured',
-                limit: 128,
-                cursor: conversationCursor,
-            })
-            for (const conversation of conversations.items) {
-                const storedConversation = await lease.readConversation(
-                    summary.id,
-                    conversation.id,
-                )
-                if (!storedConversation) {
-                    throw new Error(`Missing conversation ${conversation.id}`)
-                }
-                chats.push(storedConversation.value)
-            }
-            conversationCursor = conversations.nextCursor
-        } while (conversationCursor !== undefined)
-        yield { ...detail.value, chats } as Database['characters'][number]
+        for await (const conversation of iteratePinnedConversations(reader, record.summary.id)) {
+            chats.push(conversation.value)
+        }
+        yield { ...record.detail, chats } as Database['characters'][number]
     }
 }
 
@@ -114,37 +84,47 @@ export interface RisuSaveStreamOptions {
     omitAccount?: boolean
 }
 
-async function presetValues(lease: PersistentRevisionLease): Promise<Database['botPresets']> {
+async function presetValues(reader: PersistentRevisionReader): Promise<Database['botPresets']> {
     const presets: Database['botPresets'] = []
-    const catalog = await lease.queryPresets()
+    const catalog = await reader.queryPresets()
+    assertPinnedRevision(reader.revision, catalog.revision, 'Preset catalog')
     for (const summary of catalog.items) {
-        const preset = await lease.readPreset(summary.id)
+        const preset = await reader.readPreset(summary.id)
         if (!preset) throw new Error(`Missing preset ${summary.id}`)
+        assertPinnedRevision(reader.revision, preset.revision, `Preset ${summary.id}`)
         presets.push(preset.value)
     }
     return presets
 }
 
 async function pluginStorageValues(
-    lease: PersistentRevisionLease,
+    reader: PersistentRevisionReader,
 ): Promise<Database['pluginCustomStorage']> {
     const storage: Database['pluginCustomStorage'] = {}
-    const catalog = await lease.queryPluginStorage()
+    const catalog = await reader.queryPluginStorage()
+    assertPinnedRevision(reader.revision, catalog.revision, 'Plugin storage catalog')
     for (const summary of catalog.items) {
-        const value = await lease.readPluginStorage(summary.key)
+        const value = await reader.readPluginStorage(summary.key)
         if (!value) throw new Error(`Missing plugin storage value for ${summary.key}`)
+        assertPinnedRevision(
+            reader.revision,
+            value.revision,
+            `Plugin storage value ${summary.key}`,
+        )
         storage[summary.key] = value.value
     }
     return storage
 }
 
 export async function* streamRisuSaveFromLease(
-    lease: PersistentRevisionLease,
+    reader: PersistentRevisionReader,
     options?: RisuSaveStreamOptions,
 ): AsyncGenerator<Uint8Array> {
-    const storedRoot = (await lease.readRoot()).value
-    const storedPresets = await presetValues(lease)
-    const storedPluginStorage = await pluginStorageValues(lease)
+    const storedRootRecord = await reader.readRoot()
+    assertPinnedRevision(reader.revision, storedRootRecord.revision, 'Root')
+    const storedRoot = storedRootRecord.value
+    const storedPresets = await presetValues(reader)
+    const storedPluginStorage = await pluginStorageValues(reader)
     const rootWithPresets = {
         ...storedRoot,
         botPresets: storedPresets,
@@ -160,7 +140,7 @@ export async function* streamRisuSaveFromLease(
         'plugins',
         'pluginStorage',
     ]
-    const characterIds = (await characterSummaries(lease)).map((item) => item.id)
+    const characterIds = await collectPinnedCharacterIds(reader)
     directory.push(...characterIds, 'config')
 
     const {
@@ -195,7 +175,7 @@ export async function* streamRisuSaveFromLease(
             name,
         })
     }
-    for await (const storedCharacter of characterValues(lease)) {
+    for await (const storedCharacter of characterValues(reader)) {
         const character = options?.replaceResources
             ? replaceCharacterResources(storedCharacter, options.replaceResources)
             : storedCharacter
@@ -225,6 +205,7 @@ export interface RisuSaveExportRuntime {
 export interface PinnedRisuSaveExport {
     readonly revision: DataRevision
     readonly mutationGeneration: number
+    readonly reader: PersistentRevisionReader
     countCharacters(): Promise<number>
     materializeDatabase(): Promise<Database>
     stream(options?: RisuSaveStreamOptions): AsyncGenerator<Uint8Array>
@@ -236,13 +217,15 @@ export interface PinnedRisuSaveExport {
 }
 
 async function materializeDatabaseFromLease(
-    lease: PersistentRevisionLease,
+    reader: PersistentRevisionReader,
 ): Promise<Database> {
-    const root = (await lease.readRoot()).value
-    const botPresets = await presetValues(lease)
-    const pluginCustomStorage = await pluginStorageValues(lease)
+    const rootRecord = await reader.readRoot()
+    assertPinnedRevision(reader.revision, rootRecord.revision, 'Root')
+    const root = rootRecord.value
+    const botPresets = await presetValues(reader)
+    const pluginCustomStorage = await pluginStorageValues(reader)
     const characters: Database['characters'] = []
-    for await (const character of characterValues(lease)) {
+    for await (const character of characterValues(reader)) {
         characters.push(character)
     }
     return { ...root, characters, botPresets, pluginCustomStorage } as Database
@@ -270,11 +253,20 @@ export async function withFlushedRisuSaveExport<T>(
     callback: (pinned: PinnedRisuSaveExport) => Promise<T>,
 ): Promise<T> {
     const token = await runtime.capturePersistentMutationToken(reason)
-    const lease = await runtime.store.acquireRevision(token.revision)
+    return withPinnedRisuSaveExport(runtime.store, token, callback)
+}
+
+export async function withPinnedRisuSaveExport<T>(
+    store: PersistentDataStore,
+    token: { revision: DataRevision; mutationGeneration: number },
+    callback: (pinned: PinnedRisuSaveExport) => Promise<T>,
+): Promise<T> {
+    const lease = await store.acquireRevision(token.revision)
     const pinned: PinnedRisuSaveExport = {
         revision: token.revision,
         mutationGeneration: token.mutationGeneration,
-        countCharacters: async () => (await characterSummaries(lease)).length,
+        reader: lease,
+        countCharacters: () => countPinnedCharacters(lease),
         materializeDatabase: () => materializeDatabaseFromLease(lease),
         stream: (options) => streamRisuSaveFromLease(lease, options),
         collectBytes: (options) => collectChunks(streamRisuSaveFromLease(lease, options)),

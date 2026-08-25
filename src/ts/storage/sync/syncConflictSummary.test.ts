@@ -1,6 +1,15 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
-import { formatNameList, summarizeSyncConflict } from './syncConflictSummary'
+import type {
+    CharacterSummary,
+    ConversationSummary,
+    PersistentRevisionReader,
+} from '../persistentDataStore'
+import {
+    formatNameList,
+    summarizePinnedSyncConflict,
+    summarizeSyncConflict,
+} from './syncConflictSummary'
 
 interface CharacterSeed {
     chaId: string
@@ -54,6 +63,92 @@ describe('summarizeSyncConflict', () => {
             remoteOnlyNames: [],
             changedNames: [],
         })
+    })
+
+    it('reads late local descriptors from bounded pages without loading record bodies', async () => {
+        const character = (
+            id: string,
+            name: string,
+            configuredIndex: number,
+            trashed = false,
+        ): CharacterSummary => ({
+            id,
+            name,
+            image: '',
+            configuredIndex,
+            recentAt: 0,
+            trashed,
+            conversationCount: id === 'shared' ? 129 : 0,
+            type: 'character',
+        })
+        const active = [
+            character('shared', 'Shared', 0),
+            ...Array.from({ length: 127 }, (_, index) => (
+                character(`matched-${index}`, `Matched ${index}`, index + 1)
+            )),
+            character('late-local', 'Late local', 200),
+        ]
+        const trash = [character('trash-local', 'Trash local', 64.5, true)]
+        const conversations = Array.from({ length: 129 }, (_, index): ConversationSummary => ({
+            id: `chat-${index}`,
+            characterId: 'shared',
+            name: `Chat ${index}`,
+            configuredIndex: index,
+            recentAt: index,
+            messageCount: index === 128 ? 2 : 1,
+        }))
+        const readCharacter = vi.fn()
+        const readConversation = vi.fn()
+        const reader = {
+            revision: 8,
+            queryCharacters: vi.fn(async ({ trash: trashed, cursor }: {
+                trash: boolean
+                cursor?: string
+            }) => {
+                const values = trashed ? trash : active
+                const start = cursor ? Number(cursor) : 0
+                const end = Math.min(start + 128, values.length)
+                return {
+                    revision: 8,
+                    items: values.slice(start, end),
+                    nextCursor: end < values.length ? String(end) : undefined,
+                }
+            }),
+            queryConversations: vi.fn(async ({ characterId, cursor }: {
+                characterId: string
+                cursor?: string
+            }) => {
+                const values = characterId === 'shared' ? conversations : []
+                const start = cursor ? Number(cursor) : 0
+                const end = Math.min(start + 128, values.length)
+                return {
+                    revision: 8,
+                    items: values.slice(start, end),
+                    nextCursor: end < values.length ? String(end) : undefined,
+                }
+            }),
+            readCharacter,
+            readConversation,
+        } as unknown as PersistentRevisionReader
+        const remote = makeDatabase([
+            { chaId: 'shared', name: 'Shared', chats: Array.from({ length: 129 }, (_, index) => ({
+                message: index === 128 ? [1] : [1],
+            })) },
+            ...active.slice(1, -1).map((summary) => ({
+                chaId: summary.id,
+                name: summary.name,
+                chats: [],
+            })),
+            { chaId: 'remote-only', name: 'Remote only', chats: [] },
+        ])
+
+        await expect(summarizePinnedSyncConflict(reader, remote)).resolves.toEqual({
+            localOnlyNames: ['Trash local', 'Late local'],
+            remoteOnlyNames: ['Remote only'],
+            changedNames: ['Shared'],
+        })
+        expect(readCharacter).not.toHaveBeenCalled()
+        expect(readConversation).not.toHaveBeenCalled()
     })
 })
 

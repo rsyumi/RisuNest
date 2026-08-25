@@ -14,13 +14,21 @@ import type {
 import type { BlobStore } from '../blobStore'
 import type { Database } from '../database.svelte'
 import type {
-    CharacterSummary,
     DataRevision,
     PersistentDataStore,
     PersistentRevisionLease,
+    PersistentRevisionReader,
 } from '../persistentDataStore'
+import {
+    assertPinnedRevision,
+    iteratePinnedCharacters,
+    iteratePinnedConversations,
+} from '../persistentRecordIterator'
 import { decodeRisuSave } from '../risuSave'
-import { streamRisuSaveFromLease } from '../risuSaveStoreAdapter'
+import {
+    streamRisuSaveFromLease,
+    withPinnedRisuSaveExport,
+} from '../risuSaveStoreAdapter'
 import {
     canonicalJson,
     type OfficialRevisionPublisher,
@@ -205,64 +213,32 @@ export function createOfficialAssociationMarkers(storage: {
     }
 }
 
-async function listCharacterSummaries(
-    lease: PersistentRevisionLease,
-): Promise<CharacterSummary[]> {
-    const values: CharacterSummary[] = []
-    for (const trash of [false, true]) {
-        let cursor: string | undefined
-        do {
-            const page = await lease.queryCharacters({
-                order: 'configured',
-                trash,
-                limit: 128,
-                cursor,
-            })
-            values.push(...page.items)
-            cursor = page.nextCursor
-        } while (cursor !== undefined)
-    }
-    return values.sort((left, right) => left.configuredIndex - right.configuredIndex)
-}
-
-async function readCompleteCharacter(
-    lease: PersistentRevisionLease,
-    summary: CharacterSummary,
-): Promise<Database['characters'][number]> {
-    const detail = await lease.readCharacter(summary.id)
-    if (!detail) throw new Error(`Missing character detail for ${summary.id}`)
-    const chats: Database['characters'][number]['chats'] = []
-    let cursor: string | undefined
-    do {
-        const page = await lease.queryConversations({
-            characterId: summary.id,
-            order: 'configured',
-            limit: 128,
-            cursor,
-        })
-        for (const conversation of page.items) {
-            const value = await lease.readConversation(summary.id, conversation.id)
-            if (!value) throw new Error(`Missing conversation ${conversation.id}`)
-            chats.push(value.value)
-        }
-        cursor = page.nextCursor
-    } while (cursor !== undefined)
-    return { ...detail.value, chats } as Database['characters'][number]
-}
-
-async function collectPinnedReferences(lease: PersistentRevisionLease): Promise<{
+async function collectPinnedReferences(reader: PersistentRevisionReader): Promise<{
     accountId: string | undefined
     assets: string[]
     coldKeys: string[]
 }> {
-    const root = (await lease.readRoot()).value
+    const rootRecord = await reader.readRoot()
+    assertPinnedRevision(reader.revision, rootRecord.revision, 'Root')
+    const root = rootRecord.value
     const assets = new Set<string>()
     addOfficialAssets(assets, listDatabaseRootResources(root))
     const coldKeys = new Set<string>()
-    for (const summary of await listCharacterSummaries(lease)) {
-        const character = await readCompleteCharacter(lease, summary)
-        addOfficialAssets(assets, listCharacterResources(character))
-        for (const key of listColdDataKeysFromCharacter(character)) coldKeys.add(key)
+    for await (const character of iteratePinnedCharacters(reader)) {
+        const detail = {
+            ...character.detail,
+            chats: [],
+        } as Database['characters'][number]
+        addOfficialAssets(assets, listCharacterResources(detail))
+        for (const key of listColdDataKeysFromCharacter(detail)) coldKeys.add(key)
+        for await (const conversation of iteratePinnedConversations(reader, character.summary.id)) {
+            for (const key of listColdDataKeysFromCharacter({
+                ...detail,
+                coldstorage: undefined,
+                coldStoragedChats: [],
+                chats: [conversation.value],
+            })) coldKeys.add(key)
+        }
     }
     return {
         accountId: root.account?.id,
@@ -555,13 +531,14 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         conflict: OfficialSyncConflictHandler,
         revision: DataRevision,
     ): Promise<void> {
-        const lease = await this.dependencies.store.acquireRevision(revision)
-        try {
-            const bytes = await concatenate(streamRisuSaveFromLease(lease))
-            const characterCount = (await listCharacterSummaries(lease)).length
-            await conflict.backup({ side: 'local', bytes, characterCount })
-        } finally {
-            await lease.release()
-        }
+        await withPinnedRisuSaveExport(
+            this.dependencies.store,
+            { revision, mutationGeneration: 0 },
+            async (pinned) => {
+                const bytes = await pinned.collectBytes()
+                const characterCount = await pinned.countCharacters()
+                await conflict.backup({ side: 'local', bytes, characterCount })
+            },
+        )
     }
 }

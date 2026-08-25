@@ -11,6 +11,7 @@ import {
     streamRisuSaveFromStore,
     withFlushedRisuSaveExport,
 } from '../risuSaveStoreAdapter'
+import { iteratePinnedCharacters } from '../persistentRecordIterator'
 import { risuSaveFixtureDatabase, risuSaveFixtures } from './risuSaveFixtures'
 
 vi.mock('../database.svelte', () => ({
@@ -319,6 +320,14 @@ describe('RisuSave persistent store adapter', () => {
             capturePersistentMutationToken,
         }, 'local-backup', async (pinned) => {
             expect(pinned.mutationGeneration).toBe(7)
+            expect(pinned.reader.revision).toBe(revision)
+            const ids: string[] = []
+            for await (const record of iteratePinnedCharacters(pinned.reader)) {
+                ids.push(record.summary.id)
+            }
+            expect(ids).toEqual(
+                risuSaveFixtureDatabase.characters.map((character) => character.chaId),
+            )
             const snapshot = await pinned.materializeDatabase()
             expect(snapshot.characters[0].chats[0].message).toEqual(
                 risuSaveFixtureDatabase.characters[0].chats[0].message,
@@ -399,6 +408,16 @@ describe('RisuSave persistent store adapter', () => {
             4,
         ))).rejects.toBe(exportError)
         expect(release).toHaveBeenCalledTimes(2)
+    })
+
+    it('rejects a reader whose root reports a different revision before yielding bytes', async () => {
+        const lease = {
+            revision: 4,
+            readRoot: vi.fn(async () => ({ revision: 5, value: {} })),
+        } as unknown as PersistentRevisionLease
+        const iterator = streamRisuSaveFromLease(lease)[Symbol.asyncIterator]()
+
+        await expect(iterator.next()).rejects.toThrow('Root returned revision 5, expected 4')
     })
 
     it('counts characters from the pinned catalog without materializing the database', async () => {

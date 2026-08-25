@@ -79,7 +79,7 @@ import {
     createOfficialAssociationMarkers,
 } from "./storage/sync/officialAccountSnapshot";
 import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
-import { formatNameList, summarizeSyncConflict } from "./storage/sync/syncConflictSummary";
+import { formatNameList, summarizePinnedSyncConflict } from "./storage/sync/syncConflictSummary";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
@@ -263,8 +263,14 @@ export async function loadData() {
             association: createOfficialAssociationMarkers(associationStorage),
             conflict: {
                 resolve: async ({ remote, syncedAt }) => {
-                    const localComplete = await runtime.store.materializeDatabase(runtime.revision)
-                    const summary = summarizeSyncConflict(localComplete, remote)
+                    const lease = await runtime.store.acquireRevision(runtime.revision)
+                    const summary = await (async () => {
+                        try {
+                            return await summarizePinnedSyncConflict(lease, remote)
+                        } finally {
+                            await lease.release()
+                        }
+                    })()
                     const details = [language.syncConflictDetected]
                     if (syncedAt !== null) {
                         details.push(language.syncConflictLastSynced

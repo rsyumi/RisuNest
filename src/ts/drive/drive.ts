@@ -5,8 +5,9 @@ import { resolveBlobStore } from "../storage/platformBlobStore";
 import type { BlobStore } from "../storage/blobStore";
 import {
     collectBackupAssetKeys,
-    collectPinnedBackupAssetReferences,
+    createColdStorageReferenceDatabase,
     readBackupAsset,
+    scanPinnedBackupRecords,
     writeBackupAsset,
 } from "./backupAssets";
 import { isTauri } from "src/ts/platform"
@@ -137,25 +138,31 @@ async function backupDriveSnapshot(
     blobStore: BlobStore,
     pinned: PinnedRisuSaveExport,
 ) {
-    const db = await pinned.materializeDatabase()
+    const { accumulator } = await scanPinnedBackupRecords(pinned.reader, 'full')
+    const coldReferenceDatabase = createColdStorageReferenceDatabase(
+        accumulator.finish().coldCharacterReferences,
+    )
     const files:DriveFile[] = await getFilesInFolder(ACCESS_TOKEN)
 
     const fileNames = files.map((d) => {
         return d.name
     })
 
-    const coldStoragePayloads = await collectColdStorageBackupPayloads(db)
+    const coldStoragePayloads = await collectColdStorageBackupPayloads(coldReferenceDatabase)
     const unavailableColdStorageKeys = [...coldStoragePayloads.missingKeys, ...coldStoragePayloads.invalidKeys]
-    if(!await confirmIncompleteColdStorageOperation(db, unavailableColdStorageKeys, 'backup')){
+    if(!await confirmIncompleteColdStorageOperation(
+        coldReferenceDatabase,
+        unavailableColdStorageKeys,
+        'backup',
+    )){
         return
     }
+    for (const payload of coldStoragePayloads.payloads) accumulator.visitColdPayload(payload.value)
+    const references = accumulator.finish()
 
     const assetKeys = await collectBackupAssetKeys(
         blobStore,
-        collectPinnedBackupAssetReferences(
-            db,
-            coldStoragePayloads.payloads.map((payload) => payload.value),
-        ),
+        references.assetKeys,
     )
     for(let i=0;i<assetKeys.length;i++){
         alertStore.set({
