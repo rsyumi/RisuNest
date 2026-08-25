@@ -36,6 +36,7 @@
     import { openPresetList } from "src/ts/stores.svelte";
     import { updateActivePresetImage } from "src/ts/storage/database.svelte";
     import { selectSingleFile } from "src/ts/util";
+    import { withObjectUrl } from "src/ts/objectUrl";
     import { getModelInfo, LLMFlags, LLMFormat, LLMProvider } from "src/ts/model/modellist";
     import RegexList from "src/lib/SideBars/Scripts/RegexList.svelte";
     import SettingRenderer from "../SettingRenderer.svelte";
@@ -810,13 +811,15 @@
             const img = new Image()
             //@ts-expect-error Uint8Array buffer type (ArrayBufferLike) is incompatible with BlobPart's ArrayBuffer
             const blob = new Blob([sel.data], {type: "image/png"})
-            img.src = URL.createObjectURL(blob)
-            await img.decode()
-            canvas.width = 48
-            canvas.height = 48
-            ctx.drawImage(img, 0, 0, 48, 48)
-            const data = canvas.toDataURL('image/jpeg', 0.7)
-            await updateActivePresetImage(data)
+            await withObjectUrl(blob, async (url) => {
+                img.src = url
+                await img.decode()
+                canvas.width = 48
+                canvas.height = 48
+                ctx.drawImage(img, 0, 0, 48, 48)
+                const data = canvas.toDataURL('image/jpeg', 0.7)
+                await updateActivePresetImage(data)
+            })
         }}>
             <UploadIcon />
         </button>

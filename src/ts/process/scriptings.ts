@@ -21,6 +21,7 @@ import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
 import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory } from './luaRuntime';
+import { withObjectUrl } from '../objectUrl';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
@@ -439,9 +440,14 @@ export async function runScripted(code:string, arg:{
                     const imgObj = new Image()
                     const extention = character.image.split('.').at(-1)
 
-                    imgObj.src = URL.createObjectURL(new Blob([asBuffer(img)], {type: `image/${extention}`}))
-
-                    const imgid = await writeInlayImage(imgObj, { name: character.image, ext: extention, id: character.image})
+                    const imgid = await withObjectUrl(
+                        new Blob([asBuffer(img)], {type: `image/${extention}`}),
+                        (url) => writeInlayImage(
+                            imgObj,
+                            { name: character.image, ext: extention, id: character.image },
+                            url,
+                        ),
+                    )
 
                     if (imgid) {
                         return `{{inlayed::${imgid}}}`
@@ -466,9 +472,10 @@ export async function runScripted(code:string, arg:{
                     const imgObj = new Image()
                     const extention = icon.split('.').at(-1)
 
-                    imgObj.src = URL.createObjectURL(new Blob([asBuffer(img)], {type: `image/${extention}`}))
-
-                    const imgid = await writeInlayImage(imgObj, { name: icon, ext: extention, id: icon})
+                    const imgid = await withObjectUrl(
+                        new Blob([asBuffer(img)], {type: `image/${extention}`}),
+                        (url) => writeInlayImage(imgObj, { name: icon, ext: extention, id: icon }, url),
+                    )
 
                     if (imgid) {
                         return `{{inlayed::${imgid}}}`

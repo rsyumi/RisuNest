@@ -5,6 +5,10 @@ import { resolve } from 'node:path'
 import { beforeAll, expect, test, vi } from 'vitest'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { requestChatData } from './request/request'
+import { readImage } from '../globalApi.svelte'
+import { getDatabase } from '../storage/database.svelte'
+import { asBuffer } from '../util'
+import { writeInlayImage } from './files/inlays'
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -306,4 +310,74 @@ test('does not retain an editDisplay access ID after its handler returns', async
   await runScripted(code, arg)
 
   expect(setVar).not.toHaveBeenCalled()
+})
+
+test('revokes the character image URL once after the inlay write succeeds', async () => {
+  vi.mocked(getDatabase).mockReturnValue({
+    characters: [{ type: 'character', image: 'character.jpg' }],
+  } as never)
+  vi.mocked(readImage).mockResolvedValue(new Uint8Array([1, 2, 3]))
+  vi.mocked(asBuffer).mockReturnValue(new ArrayBuffer(3))
+  vi.mocked(writeInlayImage).mockResolvedValue('character.jpg')
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:lua-character-success')
+  const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+  const previousImage = globalThis.Image
+  globalThis.Image = class {} as never
+
+  try {
+    const result = await runScripted(`
+      remaining_character_image_success = async(function(id)
+        return getCharacterImage(id)
+      end)
+    `, {
+      char: { chaId: 'remaining-character-image-success' } as never,
+      chat: { message: [] } as never,
+      lowLevelAccess: true,
+      mode: 'remaining_character_image_success',
+    })
+
+    expect(result.res).toBe('{{inlayed::character.jpg}}')
+    expect(revokeObjectURL).toHaveBeenCalledTimes(1)
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:lua-character-success')
+  }
+  finally {
+    globalThis.Image = previousImage
+    vi.restoreAllMocks()
+  }
+})
+
+test('revokes the character image URL once when the inlay write fails', async () => {
+  vi.mocked(getDatabase).mockReturnValue({
+    characters: [{ type: 'character', image: 'character.jpg' }],
+  } as never)
+  vi.mocked(readImage).mockResolvedValue(new Uint8Array([1, 2, 3]))
+  vi.mocked(asBuffer).mockReturnValue(new ArrayBuffer(3))
+  vi.mocked(writeInlayImage).mockRejectedValue(new Error('write failed'))
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:lua-character-failure')
+  const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const previousImage = globalThis.Image
+  globalThis.Image = class {} as never
+
+  try {
+    const result = await runScripted(`
+      remaining_character_image_failure = async(function(id)
+        return getCharacterImage(id)
+      end)
+    `, {
+      char: { chaId: 'remaining-character-image-failure' } as never,
+      chat: { message: [] } as never,
+      lowLevelAccess: true,
+      mode: 'remaining_character_image_failure',
+    })
+
+    expect(result.res).toBe('')
+    expect(consoleError).toHaveBeenCalled()
+    expect(revokeObjectURL).toHaveBeenCalledTimes(1)
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:lua-character-failure')
+  }
+  finally {
+    globalThis.Image = previousImage
+    vi.restoreAllMocks()
+  }
 })

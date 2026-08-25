@@ -14,6 +14,7 @@
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
     import sendSound from '../../etc/send.mp3'
+    import { withObjectUrl } from "src/ts/objectUrl";
 
 
 
@@ -150,21 +151,23 @@
             
 
             //check duration
-            let duration = 0
-            {
+            const duration = await withObjectUrl(file, async (url) => {
                 const video = document.createElement('video')
-                video.src = URL.createObjectURL(file)
-                video.preload = 'metadata'
-                video.muted = true
-                await video.play()
-                const d = video.duration
-                if(isNaN(d)){
-                    alertError('This video does not have a duration')
-                    return
+                try {
+                    video.src = url
+                    video.preload = 'metadata'
+                    video.muted = true
+                    await video.play()
+                    return video.duration
                 }
-                video.pause()
-                video.remove()
-                duration = d
+                finally {
+                    video.pause()
+                    video.remove()
+                }
+            })
+            if(isNaN(duration)){
+                alertError('This video does not have a duration')
+                return
             }
 
             outputText = 'Converting video to audio...\n\n'

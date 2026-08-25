@@ -2,6 +2,7 @@ import { AppendableBuffer, saveAsset, type LocalWriter, type VirtualWriter } fro
 import * as fflate from "fflate";
 import { asBuffer, Semaphore, sleep } from "../util";
 import { alertStore } from "../alert";
+import { withObjectUrl } from "../objectUrl";
 
 // File size and chunk size constants
 const MAX_ASSET_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
@@ -68,18 +69,19 @@ export class CharXWriter{
             return
         }
         const imgBlob = new Blob([asBuffer(img)], {type: 'image/jpeg'})
-        const imgURL = URL.createObjectURL(imgBlob)
-        const imgElement = document.createElement('img')
-        imgElement.src = imgURL
-        await imgElement.decode()
-        canvas.width = imgElement.width
-        canvas.height = imgElement.height
-        ctx.drawImage(imgElement, 0, 0)
-        const blob = await (new Promise((res:BlobCallback, rej) => {
-            canvas.toBlob(res, 'image/jpeg')
-        }))
-        const buf = await blob.arrayBuffer()
-        this.apb.append(new Uint8Array(buf))
+        await withObjectUrl(imgBlob, async (imgURL) => {
+            const imgElement = document.createElement('img')
+            imgElement.src = imgURL
+            await imgElement.decode()
+            canvas.width = imgElement.width
+            canvas.height = imgElement.height
+            ctx.drawImage(imgElement, 0, 0)
+            const blob = await (new Promise((res:BlobCallback) => {
+                canvas.toBlob(res, 'image/jpeg')
+            }))
+            const buf = await blob.arrayBuffer()
+            this.apb.append(new Uint8Array(buf))
+        })
     }
 
     async write(key:string,data:Uint8Array|string, level?:0|1|2|3|4|5|6|7|8|9){
