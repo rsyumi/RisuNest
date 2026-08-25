@@ -3,7 +3,7 @@ import {
     SaveCoordinator as ProductionSaveCoordinator,
     type SaveCoordinatorDependencies,
 } from './saveCoordinator'
-import type { Database, character, groupChat } from './database.svelte'
+import type { Chat, Database, character, groupChat } from './database.svelte'
 import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
 
@@ -2035,6 +2035,126 @@ describe('SaveCoordinator', () => {
         return database
     }
 
+    it.each([
+        {
+            label: 'tail edit',
+            mutate: (chat: Chat) => {
+                chat.message[1] = { role: 'char', data: 'edited reply' }
+            },
+            expected: {
+                start: 1,
+                deleteCount: 1,
+                messages: [{ role: 'char', data: 'edited reply' }],
+            },
+        },
+        {
+            label: 'middle insert',
+            mutate: (chat: Chat) => {
+                chat.message.splice(1, 0, { role: 'user', data: 'inserted' })
+            },
+            expected: {
+                start: 1,
+                deleteCount: 0,
+                messages: [{ role: 'user', data: 'inserted' }],
+            },
+        },
+        {
+            label: 'middle delete',
+            mutate: (chat: Chat) => {
+                chat.message.splice(0, 1)
+            },
+            expected: {
+                start: 0,
+                deleteCount: 1,
+                messages: [],
+            },
+        },
+        {
+            label: 'complete replacement',
+            mutate: (chat: Chat) => {
+                chat.message.splice(
+                    0,
+                    chat.message.length,
+                    { role: 'char', data: 'replacement one' },
+                    { role: 'user', data: 'replacement two' },
+                )
+            },
+            expected: {
+                start: 0,
+                deleteCount: 2,
+                messages: [
+                    { role: 'char', data: 'replacement one' },
+                    { role: 'user', data: 'replacement two' },
+                ],
+            },
+        },
+        {
+            label: 'metadata-only mutation',
+            mutate: (chat: Chat) => {
+                chat.name = 'Renamed conversation'
+            },
+            expected: {
+                start: 2,
+                deleteCount: 0,
+                messages: [],
+            },
+        },
+    ])('commits the minimal conversation replace range for $label', async ({ mutate, expected }) => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(2)
+
+        mutate(database.characters[0].chats[1])
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('message-range')
+
+        const mutation = commit.mock.calls[0][0].conversations[0]
+        expect(mutation).toMatchObject({
+            type: 'replace-range',
+            characterId: 'char-a',
+            conversationId: 'two',
+            ...expected,
+        })
+        expect(mutation.conversation).toEqual({
+            id: 'two',
+            name: database.characters[0].chats[1].name,
+            localLore: [],
+            note: '',
+        })
+    })
+
+    it('preserves a shared suffix around a middle message edit', async () => {
+        const database = makeChattyDatabase()
+        database.characters[0].chats[1].message.push({ role: 'user', data: 'shared suffix' })
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(2)
+
+        database.characters[0].chats[1].message[1] = { role: 'char', data: 'middle edit' }
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('message-range')
+
+        expect(commit.mock.calls[0][0].conversations[0]).toMatchObject({
+            type: 'replace-range',
+            characterId: 'char-a',
+            conversationId: 'two',
+            start: 1,
+            deleteCount: 1,
+            messages: [{ role: 'char', data: 'middle edit' }],
+        })
+    })
+
     it('commits only the edited conversation when just chat content changes', async () => {
         const database = makeChattyDatabase()
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
@@ -2058,13 +2178,9 @@ describe('SaveCoordinator', () => {
                 type: 'replace-range',
                 characterId: 'char-a',
                 conversationId: 'two',
-                start: 0,
-                deleteCount: 2,
-                messages: [
-                    { role: 'user', data: 'hello two' },
-                    { role: 'char', data: 'reply two' },
-                    { role: 'user', data: 'follow-up' },
-                ],
+                start: 2,
+                deleteCount: 0,
+                messages: [{ role: 'user', data: 'follow-up' }],
                 conversation: { id: 'two', name: 'Two', localLore: [], note: '' },
             },
         ])
@@ -2174,7 +2290,12 @@ describe('SaveCoordinator', () => {
 
         expect(commit).toHaveBeenCalledTimes(2)
         expect(commit.mock.calls[1][0].conversations).toMatchObject([
-            { conversationId: 'one', deleteCount: 1 },
+            {
+                conversationId: 'one',
+                start: 1,
+                deleteCount: 0,
+                messages: [{ role: 'user', data: 'retry me' }],
+            },
         ])
         expect(coordinator.revision).toBe(3)
     })

@@ -137,6 +137,34 @@ function canonicalValuesEqual(left: unknown, right: unknown): boolean {
     return canonicalJson({ value: left }) === canonicalJson({ value: right })
 }
 
+function messageReplaceRange<T>(
+    baseline: readonly T[],
+    current: readonly T[],
+): { start: number; deleteCount: number; messages: T[] } {
+    let start = 0
+    const sharedLength = Math.min(baseline.length, current.length)
+    while (start < sharedLength && canonicalValuesEqual(baseline[start], current[start])) {
+        start++
+    }
+
+    let baselineEnd = baseline.length
+    let currentEnd = current.length
+    while (
+        baselineEnd > start &&
+        currentEnd > start &&
+        canonicalValuesEqual(baseline[baselineEnd - 1], current[currentEnd - 1])
+    ) {
+        baselineEnd--
+        currentEnd--
+    }
+
+    return {
+        start,
+        deleteCount: baselineEnd - start,
+        messages: current.slice(start, currentEnd),
+    }
+}
+
 function stableArrayEntryId(value: unknown): string | null {
     if (!value || typeof value !== 'object') return null
     const record = value as Record<string, unknown>
@@ -1724,13 +1752,12 @@ export class SaveCoordinator {
                 return null
             }
             const { message, ...conversation } = capturedChat
+            const range = messageReplaceRange(baselineChat.message, message)
             mutations.push({
                 type: 'replace-range',
                 characterId: character.chaId,
                 conversationId,
-                start: 0,
-                deleteCount: baselineChat.message.length,
-                messages: message,
+                ...range,
                 conversation,
             })
         }
