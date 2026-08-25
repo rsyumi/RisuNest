@@ -7,35 +7,207 @@ import org.junit.Test
 
 class MainActivityBehaviorTest {
   @Test
+  fun `web view provider must meet the Vite 8 Chrome 111 baseline`() {
+    assertEquals(
+      WebViewProviderStatus.SUPPORTED,
+      decideWebViewProvider("com.google.android.webview", "111.0.5563.116").status,
+    )
+    assertEquals(
+      WebViewProviderStatus.OUTDATED,
+      decideWebViewProvider("com.google.android.webview", "110.0.5481.154").status,
+    )
+  }
+
+  @Test
+  fun `missing and unreadable web view providers are diagnosed separately`() {
+    assertEquals(
+      WebViewProviderStatus.MISSING,
+      decideWebViewProvider(null, null).status,
+    )
+    assertEquals(
+      WebViewProviderStatus.UNKNOWN_VERSION,
+      decideWebViewProvider("com.google.android.webview", "not-a-version").status,
+    )
+  }
+
+  @Test
+  fun `renderer recovery marker is consumed only once`() {
+    var marked = false
+    val marker = OneShotRecoveryMarker(
+      isMarked = { marked },
+      setMarked = { marked = it },
+    )
+
+    marker.mark()
+
+    assertEquals(true, marker.consume())
+    assertEquals(false, marker.consume())
+  }
+
+  @Test
+  fun `renderer recovery cleans the dead view before restarting`() {
+    val operations = mutableListOf<String>()
+    val coordinator = RendererRecoveryCoordinator { _, _ -> }
+
+    assertEquals(
+      true,
+      coordinator.recover(
+        removeFromParent = { operations.add("remove-parent") },
+        removeJavascriptBridge = { operations.add("remove-bridge") },
+        destroyView = { operations.add("destroy-view") },
+        clearReference = { operations.add("clear-reference") },
+        markRecovery = { operations.add("mark-recovery") },
+        restart = {
+          operations.add("restart")
+          true
+        },
+      ),
+    )
+
+    assertEquals(
+      listOf(
+        "remove-parent",
+        "remove-bridge",
+        "destroy-view",
+        "clear-reference",
+        "mark-recovery",
+        "restart",
+      ),
+      operations,
+    )
+  }
+
+  @Test
+  fun `renderer recovery logs failures and declines handling when restart fails`() {
+    val operations = mutableListOf<String>()
+    val failures = mutableListOf<String>()
+    val coordinator = RendererRecoveryCoordinator { step, error ->
+      failures.add("$step: ${error.message}")
+    }
+
+    assertEquals(
+      false,
+      coordinator.recover(
+        removeFromParent = {
+          operations.add("remove-parent")
+          error("remove failed")
+        },
+        removeJavascriptBridge = { operations.add("remove-bridge") },
+        destroyView = {
+          operations.add("destroy-view")
+          error("destroy failed")
+        },
+        clearReference = { operations.add("clear-reference") },
+        markRecovery = {
+          operations.add("mark-recovery")
+          error("marker failed")
+        },
+        restart = {
+          operations.add("restart")
+          error("restart failed")
+        },
+      ),
+    )
+
+    assertEquals(
+      listOf(
+        "remove-parent",
+        "remove-bridge",
+        "destroy-view",
+        "clear-reference",
+        "mark-recovery",
+        "restart",
+      ),
+      operations,
+    )
+    assertEquals(
+      listOf(
+        "remove-from-parent: remove failed",
+        "destroy-view: destroy failed",
+        "mark-recovery: marker failed",
+        "restart: restart failed",
+      ),
+      failures,
+    )
+  }
+
+  @Test
+  fun `renderer recovery propagates a returning restart fallback failure`() {
+    val coordinator = RendererRecoveryCoordinator { _, _ -> }
+
+    assertEquals(
+      false,
+      coordinator.recover(
+        removeFromParent = {},
+        removeJavascriptBridge = {},
+        destroyView = {},
+        clearReference = {},
+        markRecovery = {},
+        restart = { false },
+      ),
+    )
+  }
+
+  @Test
+  fun `duplicate renderer termination callbacks recover only once`() {
+    var recoveries = 0
+    val coordinator = RendererRecoveryCoordinator { _, _ -> }
+    val recover = {
+      coordinator.recover(
+        removeFromParent = { recoveries += 1 },
+        removeJavascriptBridge = {},
+        destroyView = {},
+        clearReference = {},
+        markRecovery = {},
+        restart = { true },
+      )
+    }
+
+    assertEquals(true, recover())
+    assertEquals(true, recover())
+    assertEquals(1, recoveries)
+  }
+
+  @Test
   fun `cold restart relaunches the task before terminating the process`() {
     val operations = mutableListOf<String>()
     val dispatcher = ColdRestartDispatcher(
       relaunchTask = { operations.add("relaunch-task") },
       terminateProcess = { operations.add("terminate-process") },
+      logFailure = { _, _ -> },
     )
 
-    dispatcher.restart()
+    assertEquals(false, dispatcher.restart())
 
     assertEquals(listOf("relaunch-task", "terminate-process"), operations)
   }
 
   @Test
-  fun `cold restart does not terminate the process itself when relaunch throws`() {
+  fun `cold restart still attempts process termination when relaunch throws`() {
     val operations = mutableListOf<String>()
+    val failures = mutableListOf<String>()
     val dispatcher = ColdRestartDispatcher(
       relaunchTask = {
         operations.add("relaunch-task")
         error("launch failed")
       },
-      terminateProcess = { operations.add("terminate-process") },
+      terminateProcess = {
+        operations.add("terminate-process")
+        error("termination failed")
+      },
+      logFailure = { step, error -> failures.add("$step: ${error.message}") },
     )
 
-    try {
-      dispatcher.restart()
-    } catch (_: IllegalStateException) {
-    }
+    assertEquals(false, dispatcher.restart())
 
-    assertEquals(listOf("relaunch-task"), operations)
+    assertEquals(listOf("relaunch-task", "terminate-process"), operations)
+    assertEquals(
+      listOf(
+        "relaunch-task: launch failed",
+        "terminate-process: termination failed",
+      ),
+      failures,
+    )
   }
 
   @Test

@@ -1,3 +1,8 @@
-[build]
-
-[target]
+[env]
+WRY_RUSTWEBVIEWCLIENT_CLASS_EXTENSION = '''
+override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+    return (view.context as? RendererRecoveryHost)
+        ?.recoverRenderer(view, detail.didCrash())
+        ?: false
+}
+'''

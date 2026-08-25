@@ -4,11 +4,13 @@ import android.content.ComponentCallbacks2
 import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.util.Log
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
@@ -31,6 +33,105 @@ private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
 private const val EXIT_REASON = "exit"
+// Vite 8's pinned Baseline target starts at Chrome 111. Update this with the web build target.
+private const val MINIMUM_WEBVIEW_MAJOR = 111
+private const val NATIVE_RESILIENCE_PREFERENCES = "risu-native-resilience"
+private const val RENDERER_RECOVERY_MARKER = "renderer-recovery-warning"
+private const val TAG = "RisuNative"
+
+internal typealias RendererRecoveryFailureLogger = (step: String, error: Throwable) -> Unit
+
+private fun logRendererRecoveryFailure(step: String, error: Throwable) {
+  Log.e(TAG, "Renderer recovery step failed: $step", error)
+}
+
+internal enum class WebViewProviderStatus {
+  SUPPORTED,
+  MISSING,
+  OUTDATED,
+  UNKNOWN_VERSION,
+}
+
+internal data class WebViewProviderDecision(
+  val status: WebViewProviderStatus,
+  val majorVersion: Int?,
+)
+
+internal fun decideWebViewProvider(
+  packageName: String?,
+  versionName: String?,
+  minimumMajor: Int = MINIMUM_WEBVIEW_MAJOR,
+): WebViewProviderDecision {
+  if (packageName.isNullOrBlank()) {
+    return WebViewProviderDecision(WebViewProviderStatus.MISSING, null)
+  }
+  val majorVersion = versionName?.substringBefore('.')?.toIntOrNull()
+    ?: return WebViewProviderDecision(WebViewProviderStatus.UNKNOWN_VERSION, null)
+  return WebViewProviderDecision(
+    status = if (majorVersion >= minimumMajor) {
+      WebViewProviderStatus.SUPPORTED
+    } else {
+      WebViewProviderStatus.OUTDATED
+    },
+    majorVersion = majorVersion,
+  )
+}
+
+internal class OneShotRecoveryMarker(
+  private val isMarked: () -> Boolean,
+  private val setMarked: (Boolean) -> Unit,
+) {
+  fun mark() {
+    setMarked(true)
+  }
+
+  fun consume(): Boolean {
+    if (!isMarked()) return false
+    setMarked(false)
+    return true
+  }
+}
+
+internal class RendererRecoveryCoordinator(
+  private val logFailure: RendererRecoveryFailureLogger,
+) {
+  private var recovering = false
+
+  fun recover(
+    removeFromParent: () -> Unit,
+    removeJavascriptBridge: () -> Unit,
+    destroyView: () -> Unit,
+    clearReference: () -> Unit,
+    markRecovery: () -> Unit,
+    restart: () -> Boolean,
+  ): Boolean {
+    if (recovering) return true
+    recovering = true
+    listOf(
+      "remove-from-parent" to removeFromParent,
+      "remove-javascript-bridge" to removeJavascriptBridge,
+      "destroy-view" to destroyView,
+      "clear-reference" to clearReference,
+      "mark-recovery" to markRecovery,
+    ).forEach { (name, step) ->
+      try {
+        step()
+      } catch (error: Throwable) {
+        logFailure(name, error)
+      }
+    }
+    return try {
+      restart()
+    } catch (error: Throwable) {
+      logFailure("restart", error)
+      false
+    }
+  }
+}
+
+interface RendererRecoveryHost {
+  fun recoverRenderer(webView: WebView, didCrash: Boolean): Boolean
+}
 
 internal data class WebViewMargins(
   val left: Int,
@@ -142,19 +243,45 @@ internal class ExitFlushGate {
 internal class ColdRestartDispatcher(
   private val relaunchTask: () -> Unit,
   private val terminateProcess: () -> Unit,
+  private val logFailure: RendererRecoveryFailureLogger,
 ) {
-  fun restart() {
-    relaunchTask()
-    terminateProcess()
+  fun restart(): Boolean {
+    try {
+      relaunchTask()
+    } catch (error: Throwable) {
+      logFailure("relaunch-task", error)
+    }
+    try {
+      terminateProcess()
+    } catch (error: Throwable) {
+      logFailure("terminate-process", error)
+    }
+    return false
   }
 }
 
-class MainActivity : TauriActivity() {
+class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val backNavigationPolicy = BackNavigationPolicy()
   private var lifecycleWebView: WebView? = null
   private val lifecycleFlushDispatcher = LifecycleFlushDispatcher(::dispatchLifecycleFlush)
   private val exitFlushGate = ExitFlushGate()
+  private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val rendererRecoveryMarker by lazy {
+    val preferences = getSharedPreferences(NATIVE_RESILIENCE_PREFERENCES, MODE_PRIVATE)
+    OneShotRecoveryMarker(
+      isMarked = { preferences.getBoolean(RENDERER_RECOVERY_MARKER, false) },
+      setMarked = { marked ->
+        val editor = preferences.edit()
+        if (marked) {
+          editor.putBoolean(RENDERER_RECOVERY_MARKER, true)
+        } else {
+          editor.remove(RENDERER_RECOVERY_MARKER)
+        }
+        editor.commit()
+      },
+    )
+  }
   private val coldRestartDispatcher by lazy {
     ColdRestartDispatcher(
       relaunchTask = {
@@ -163,6 +290,7 @@ class MainActivity : TauriActivity() {
       terminateProcess = {
         android.os.Process.killProcess(android.os.Process.myPid())
       },
+      logFailure = ::logRendererRecoveryFailure,
     )
   }
   private var exitFlushSequence = 0L
@@ -170,6 +298,24 @@ class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    showRendererRecoveryWarning()
+    diagnoseWebViewProvider()
+  }
+
+  override fun recoverRenderer(webView: WebView, didCrash: Boolean): Boolean {
+    Log.e(TAG, "Android WebView renderer exited, didCrash=$didCrash")
+    return rendererRecoveryCoordinator.recover(
+      removeFromParent = { (webView.parent as? ViewGroup)?.removeView(webView) },
+      removeJavascriptBridge = { webView.removeJavascriptInterface(LIFECYCLE_BRIDGE_NAME) },
+      destroyView = webView::destroy,
+      clearReference = {
+        if (lifecycleWebView === webView) {
+          lifecycleWebView = null
+        }
+      },
+      markRecovery = rendererRecoveryMarker::mark,
+      restart = coldRestartDispatcher::restart,
+    )
   }
 
   override fun onWebViewCreate(webView: WebView) {
@@ -297,6 +443,42 @@ class MainActivity : TauriActivity() {
       WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("*"))
     } else {
       webView.evaluateJavascript(script, null)
+    }
+  }
+
+  private fun showRendererRecoveryWarning() {
+    if (rendererRecoveryMarker.consume()) {
+      Toast.makeText(this, R.string.renderer_recovery_warning, Toast.LENGTH_LONG).show()
+    }
+  }
+
+  private fun diagnoseWebViewProvider() {
+    val provider = WebViewCompat.getCurrentWebViewPackage(this)
+    val decision = decideWebViewProvider(provider?.packageName, provider?.versionName)
+    val hasDocumentStartScript = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+    Log.i(
+      TAG,
+      "Android WebView provider=${provider?.packageName ?: "missing"}, " +
+        "version=${provider?.versionName ?: "missing"}, " +
+        "major=${decision.majorVersion ?: "unknown"}, API=${Build.VERSION.SDK_INT}, " +
+        "documentStartScript=$hasDocumentStartScript",
+    )
+
+    val warning = when (decision.status) {
+      WebViewProviderStatus.SUPPORTED -> null
+      WebViewProviderStatus.MISSING -> getString(R.string.webview_provider_missing)
+      WebViewProviderStatus.OUTDATED -> getString(
+        R.string.webview_provider_outdated,
+        provider?.versionName ?: "unknown",
+        MINIMUM_WEBVIEW_MAJOR,
+      )
+      WebViewProviderStatus.UNKNOWN_VERSION -> getString(
+        R.string.webview_provider_unknown_version,
+        provider?.packageName ?: "unknown",
+      )
+    }
+    if (warning != null) {
+      Toast.makeText(this, warning, Toast.LENGTH_LONG).show()
     }
   }
 

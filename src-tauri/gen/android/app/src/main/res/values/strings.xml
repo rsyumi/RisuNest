@@ -2,4 +2,8 @@
     <string name="app_name">"RisuAI"</string>
     <string name="main_activity_title">"RisuAI"</string>
     <string name="press_back_again_to_exit">Press back again to exit</string>
+    <string name="renderer_recovery_warning">The Android WebView renderer stopped during the previous session. Saved data was reopened, but recent unsaved changes may need to be entered again.</string>
+    <string name="webview_provider_missing">Android System WebView is unavailable. Install or enable it before using the app.</string>
+    <string name="webview_provider_outdated">Android System WebView %1$s is too old for this app. Update it to version %2$d or newer.</string>
+    <string name="webview_provider_unknown_version">The version of Android System WebView provider %1$s could not be determined. Update it before using the app.</string>
 </resources>

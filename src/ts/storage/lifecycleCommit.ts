@@ -11,6 +11,13 @@ export type LifecycleCommitReason =
 
 type LifecycleFlush = (reason: LifecycleCommitReason) => Promise<void>
 type LifecycleCheckpoint = (mode: 'truncate') => Promise<void>
+type ConfirmExitWithoutSaving = () => Promise<boolean>
+type LifecycleSettleTimeout = (
+    settlement: Promise<boolean>,
+    timeoutMillis: number,
+) => Promise<boolean>
+
+const EXIT_SETTLE_TIMEOUT_MILLIS = 1_500
 
 export interface LifecycleExitSyncPolicy {
     isSyncActive(): boolean
@@ -70,30 +77,64 @@ const productionCheckpoint: LifecycleCheckpoint | undefined = isTauri
     ? checkpointNativePersistentStore
     : undefined
 
+function productionLifecycleSettleTimeout(
+    settlement: Promise<boolean>,
+    timeoutMillis: number,
+): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+        const timeout = globalThis.setTimeout(() => {
+            reject(new Error(`Lifecycle save did not settle within ${timeoutMillis} ms`))
+        }, timeoutMillis)
+        settlement.then(
+            (settled) => {
+                globalThis.clearTimeout(timeout)
+                resolve(settled)
+            },
+            (error) => {
+                globalThis.clearTimeout(timeout)
+                reject(error)
+            },
+        )
+    })
+}
+
 async function settleLifecycleCommit(
     reason: LifecycleCommitReason,
     flush: LifecycleFlush,
     checkpoint?: LifecycleCheckpoint,
-): Promise<void> {
+): Promise<boolean> {
+    let settled = true
     try {
         await flush(reason)
     } catch (error) {
+        settled = false
         console.error(`Lifecycle flush failed for ${reason}`, error)
     }
 
-    if (!checkpoint) return
+    if (!checkpoint) return settled
 
     try {
         await checkpoint('truncate')
     } catch (error) {
+        settled = false
         console.error(`Lifecycle checkpoint failed for ${reason}`, error)
     }
+    return settled
+}
+
+async function confirmDefaultExitWithoutSaving(): Promise<boolean> {
+    const { alertConfirm } = await import('../alert')
+    return alertConfirm(
+        'Saving failed. Choose Yes to exit without saving, or No to retry saving.',
+    )
 }
 
 export function registerLifecycleCommitListeners(
     flush: LifecycleFlush = flushPendingData,
     exitSyncPolicy?: LifecycleExitSyncPolicy,
     checkpoint: LifecycleCheckpoint | undefined = productionCheckpoint,
+    confirmExitWithoutSaving: ConfirmExitWithoutSaving = confirmDefaultExitWithoutSaving,
+    settleTimeout: LifecycleSettleTimeout = productionLifecycleSettleTimeout,
 ): () => void {
     const requestFlush = (reason: LifecycleCommitReason, ackToken?: string) => {
         void settleLifecycleCommit(reason, flush, checkpoint).then(() => {
@@ -103,16 +144,37 @@ export function registerLifecycleCommitListeners(
         })
     }
     const requestExitFlush = (ackToken: string) => {
-        if (!exitSyncPolicy?.isSyncActive() || !holdNativeExit(ackToken)) {
+        if (!holdNativeExit(ackToken)) {
             requestFlush('exit', ackToken)
             return
         }
-        void settleLifecycleCommit('exit', flush, checkpoint)
-            .then(async () => {
-                if (!exitSyncPolicy.hasPendingSync() || await exitSyncPolicy.confirmExit()) {
-                    requestNativeExit()
+        void (async () => {
+            let settled = false
+            do {
+                try {
+                    settled = await settleTimeout(
+                        settleLifecycleCommit('exit', flush, checkpoint),
+                        EXIT_SETTLE_TIMEOUT_MILLIS,
+                    )
+                } catch (error) {
+                    console.error('Lifecycle save timed out for exit', error)
+                    settled = false
                 }
-            })
+                if (settled) break
+                if (await confirmExitWithoutSaving()) {
+                    requestNativeExit()
+                    return
+                }
+            } while (!settled)
+            if (
+                exitSyncPolicy?.isSyncActive()
+                && exitSyncPolicy.hasPendingSync()
+                && !await exitSyncPolicy.confirmExit()
+            ) {
+                return
+            }
+            requestNativeExit()
+        })()
             .catch((error) => {
                 console.error('Lifecycle exit confirmation failed', error)
             })

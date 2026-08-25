@@ -245,6 +245,144 @@ describe('registerLifecycleCommitListeners', () => {
         delete (window as any).RisuLifecycleBridge
     })
 
+    it('holds explicit exit and offers retry when local flush fails', async () => {
+        const bridge = {
+            onFlushComplete: vi.fn(),
+            onFlushHold: vi.fn(),
+            requestExit: vi.fn(),
+        }
+        ;(window as any).RisuLifecycleBridge = bridge
+        const flush = vi.fn()
+            .mockRejectedValueOnce(new Error('flush failed'))
+            .mockResolvedValueOnce(undefined)
+        const confirmExitWithoutSaving = vi.fn(async () => false)
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const dispose = registerLifecycleCommitListeners(
+            flush,
+            undefined,
+            undefined,
+            confirmExitWithoutSaving,
+        )
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit', ackToken: 'exit-retry' },
+        }))
+
+        await vi.waitFor(() => expect(flush).toHaveBeenCalledTimes(2))
+        await vi.waitFor(() => expect(bridge.requestExit).toHaveBeenCalledTimes(1))
+        expect(bridge.onFlushHold).toHaveBeenCalledWith('exit-retry')
+        expect(confirmExitWithoutSaving).toHaveBeenCalledTimes(1)
+        expect(bridge.onFlushComplete).not.toHaveBeenCalled()
+        errorLog.mockRestore()
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('can exit without saving after an explicit exit checkpoint failure', async () => {
+        const bridge = {
+            onFlushComplete: vi.fn(),
+            onFlushHold: vi.fn(),
+            requestExit: vi.fn(),
+        }
+        ;(window as any).RisuLifecycleBridge = bridge
+        const checkpoint = vi.fn(async () => { throw new Error('checkpoint failed') })
+        const confirmExitWithoutSaving = vi.fn(async () => true)
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const dispose = registerLifecycleCommitListeners(
+            vi.fn(async () => undefined),
+            undefined,
+            checkpoint,
+            confirmExitWithoutSaving,
+        )
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit', ackToken: 'exit-without-saving' },
+        }))
+
+        await vi.waitFor(() => expect(confirmExitWithoutSaving).toHaveBeenCalledTimes(1))
+        expect(bridge.onFlushHold).toHaveBeenCalledWith('exit-without-saving')
+        expect(bridge.requestExit).toHaveBeenCalledTimes(1)
+        expect(bridge.onFlushComplete).not.toHaveBeenCalled()
+        errorLog.mockRestore()
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('offers exit without saving when an explicit exit flush never settles', async () => {
+        const bridge = {
+            onFlushComplete: vi.fn(),
+            onFlushHold: vi.fn(),
+            requestExit: vi.fn(),
+        }
+        ;(window as any).RisuLifecycleBridge = bridge
+        const flush = vi.fn(() => new Promise<void>(() => {}))
+        const confirmExitWithoutSaving = vi.fn(async () => true)
+        const settleTimeout = vi.fn(async () => {
+            throw new Error('local settle timed out')
+        })
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const dispose = registerLifecycleCommitListeners(
+            flush,
+            undefined,
+            undefined,
+            confirmExitWithoutSaving,
+            settleTimeout,
+        )
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit', ackToken: 'exit-timeout' },
+        }))
+
+        await vi.waitFor(() => expect(confirmExitWithoutSaving).toHaveBeenCalledTimes(1))
+        expect(bridge.onFlushHold).toHaveBeenCalledWith('exit-timeout')
+        expect(bridge.requestExit).toHaveBeenCalledTimes(1)
+        expect(bridge.onFlushComplete).not.toHaveBeenCalled()
+        errorLog.mockRestore()
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
+    it('offers exit without saving when an explicit exit checkpoint never settles', async () => {
+        const bridge = {
+            onFlushComplete: vi.fn(),
+            onFlushHold: vi.fn(),
+            requestExit: vi.fn(),
+        }
+        ;(window as any).RisuLifecycleBridge = bridge
+        const checkpoint = vi.fn(() => new Promise<void>(() => {}))
+        const confirmExitWithoutSaving = vi.fn(async () => true)
+        let rejectTimeout!: (reason: unknown) => void
+        const settleTimeout = vi.fn((
+            _settlement: Promise<boolean>,
+            _timeoutMillis: number,
+        ) => new Promise<boolean>((_resolve, reject) => {
+            rejectTimeout = reject
+        }))
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+        const dispose = registerLifecycleCommitListeners(
+            vi.fn(async () => undefined),
+            undefined,
+            checkpoint,
+            confirmExitWithoutSaving,
+            settleTimeout,
+        )
+
+        window.dispatchEvent(new CustomEvent('risu-native-lifecycle', {
+            detail: { reason: 'exit', ackToken: 'checkpoint-timeout' },
+        }))
+        await vi.waitFor(() => expect(checkpoint).toHaveBeenCalledWith('truncate'))
+
+        rejectTimeout(new Error('local settle timed out'))
+
+        await vi.waitFor(() => expect(confirmExitWithoutSaving).toHaveBeenCalledTimes(1))
+        expect(settleTimeout).toHaveBeenCalledWith(expect.any(Promise), 1_500)
+        expect(bridge.requestExit).toHaveBeenCalledTimes(1)
+        expect(bridge.onFlushComplete).not.toHaveBeenCalled()
+        errorLog.mockRestore()
+        dispose()
+        delete (window as any).RisuLifecycleBridge
+    })
+
     it('sends no acknowledgement without an ack token', async () => {
         const onFlushComplete = vi.fn()
         ;(window as any).RisuLifecycleBridge = { onFlushComplete }
@@ -367,28 +505,36 @@ describe('registerLifecycleCommitListeners', () => {
             dispose()
         })
 
-        it('still asks before exiting when the exit flush fails', async () => {
+        it('retries a failed local save before asking about pending sync', async () => {
             const bridge = makeBridge()
             const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
-            const flush = vi.fn(async () => {
-                throw new Error('flush failed')
-            })
+            const flush = vi.fn()
+                .mockRejectedValueOnce(new Error('flush failed'))
+                .mockResolvedValueOnce(undefined)
             const policy = {
                 isSyncActive: () => true,
                 hasPendingSync: vi.fn(() => true),
                 confirmExit: vi.fn(async () => false),
             }
-            const dispose = registerLifecycleCommitListeners(flush, policy)
+            const confirmExitWithoutSaving = vi.fn(async () => false)
+            const dispose = registerLifecycleCommitListeners(
+                flush,
+                policy,
+                undefined,
+                confirmExitWithoutSaving,
+            )
 
             dispatchExit()
 
             await vi.waitFor(() => expect(policy.confirmExit).toHaveBeenCalledTimes(1))
+            expect(flush).toHaveBeenCalledTimes(2)
+            expect(confirmExitWithoutSaving).toHaveBeenCalledTimes(1)
             expect(bridge.requestExit).not.toHaveBeenCalled()
             errorLog.mockRestore()
             dispose()
         })
 
-        it('uses the plain acknowledge path when sync is inactive', async () => {
+        it('holds and completes explicit exit when sync is inactive', async () => {
             const bridge = makeBridge()
             const flush = vi.fn(async () => undefined)
             const policy = {
@@ -400,9 +546,9 @@ describe('registerLifecycleCommitListeners', () => {
 
             dispatchExit('exit-9')
 
-            await vi.waitFor(() => expect(bridge.onFlushComplete).toHaveBeenCalledWith('exit-9'))
-            expect(bridge.onFlushHold).not.toHaveBeenCalled()
-            expect(bridge.requestExit).not.toHaveBeenCalled()
+            await vi.waitFor(() => expect(bridge.requestExit).toHaveBeenCalledTimes(1))
+            expect(bridge.onFlushHold).toHaveBeenCalledWith('exit-9')
+            expect(bridge.onFlushComplete).not.toHaveBeenCalled()
             dispose()
         })
 
