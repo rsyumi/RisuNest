@@ -801,6 +801,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                     root: None,
                     replace_presets: None,
                     character: None,
+                    character_details: None,
                     replace_character: None,
                     add_character: None,
                     conversations: None,
@@ -823,6 +824,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                     root: Some(root),
                     replace_presets: None,
                     character: None,
+                    character_details: None,
                     replace_character: None,
                     add_character: None,
                     conversations: None,
@@ -840,6 +842,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                     root: None,
                     replace_presets: None,
                     character: None,
+                    character_details: None,
                     replace_character: None,
                     add_character: None,
                     conversations: Some(vec![ConversationMutation::ReplaceRange {
