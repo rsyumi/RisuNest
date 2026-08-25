@@ -21,6 +21,15 @@ import katex from 'katex'
 import { getModelInfo } from '../model/modellist';
 import { registerCBS, type matcherArg, type RegisterCallback } from '../cbs';
 import cssSelectorParser from 'postcss-selector-parser'
+import {
+    createAssetLookupIndex,
+    getAssetDistance,
+    resolveAdditionalAsset,
+    resolveEmotionAsset,
+    type AssetLookupIndex,
+} from './assetLookup';
+
+export { getAssetDistance as getDistance } from './assetLookup';
 
 const markdownItOptions = {
     html: true,
@@ -408,49 +417,35 @@ async function renderHighlightableMarkdown(data:string) {
 
 export const assetRegex = /{{(raw|path|img|image|video|audio|bgm|bg|emotion|asset|video-img|source)::(.+?)}}/gms
 
-function getAssetSrc(assetArr: string[][], assetPaths: AssetPaths) {
-    for (const asset of assetArr) {
-        const key = asset[0].toLocaleLowerCase()
-        assetPaths[key] ??= {
-            srcPaths: [],
-            ext: asset[2]
-        }
-        if(assetPaths[key].ext === asset[2]){
-            assetPaths[key].srcPaths.push(asset[1])
-        }
-    }
-}
-
-function getEmoSrc(emoArr: string[][], emoPaths: AssetPaths) {
-    for (const emo of emoArr) {
-        emoPaths[emo[0].toLocaleLowerCase()] = {
-            srcPaths: [emo[1]]
-        }
-    }
-}
-
 async function getFileSrcCached(path:string){
     return await getFileSrc(path)
 }
 
-type AssetPaths = {[key:string]:{
-    srcPaths:string[]
-    ext?:string
-}}
+interface SelectedAssetLookupCache {
+    ownerToken: string
+    characterAssets: string[][]
+    emotionAssets: string[][]
+    index: AssetLookupIndex
+}
 
-let assetsCache: AssetPaths | null = null
-let emoAssetsCache: AssetPaths | null = null
+let selectedAssetLookupCache: SelectedAssetLookupCache | null = null
 
-export function resetAssetsCache(charAssets: string[][], emoAssets: string[][], moduleAssets: string[][]) {
-    const assetPaths: AssetPaths = {}
-    const charEmoPaths: AssetPaths = {}
-
-    getAssetSrc(charAssets, assetPaths)
-    getAssetSrc(moduleAssets, assetPaths)
-    getEmoSrc(emoAssets, charEmoPaths)
-
-    assetsCache = assetPaths
-    emoAssetsCache = charEmoPaths
+export function resetAssetsCache(
+    charAssets: string[][],
+    emoAssets: string[][],
+    moduleAssets: string[][],
+    ownerToken = 'manual',
+) {
+    selectedAssetLookupCache = {
+        ownerToken,
+        characterAssets: charAssets,
+        emotionAssets: emoAssets,
+        index: createAssetLookupIndex({
+            characterAssets: charAssets,
+            emotionAssets: emoAssets,
+            moduleAssets,
+        }),
+    }
 }
 
 $effect.root(() => {
@@ -458,6 +453,7 @@ $effect.root(() => {
         const charId = selIdState.selId
         const char = DBState.db.characters?.[charId]
         if (!char || char.type !== 'character') {
+            selectedAssetLookupCache = null
             return
         }
 
@@ -465,7 +461,7 @@ $effect.root(() => {
         const emoAssets = char.emotionImages ?? []
         const moduleAssets = getModuleAssets()
 
-        resetAssetsCache(charAssets, emoAssets, moduleAssets)
+        resetAssetsCache(charAssets, emoAssets, moduleAssets, `${charId}:${char.chaId}`)
     })
 })
 
@@ -475,12 +471,25 @@ const videoExtensions = ['mp4', 'webm', 'avi', 'm4p', 'm4v']
 async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|character, mode:'normal'|'back', arg:{ch:number}){
     const assetWidthString = (DBState.db.assetWidth && DBState.db.assetWidth !== -1 || DBState.db.assetWidth === 0) ? `max-width:${DBState.db.assetWidth}rem;` : ''
 
-    if (char.type === 'character' && (!assetsCache || !emoAssetsCache)) {
-        resetAssetsCache(char.additionalAssets ?? [], char.emotionImages, getModuleAssets())
-    }
-
-    const assetPaths = assetsCache ?? {}
-    const emoPaths = emoAssetsCache ?? {}
+    const characterAssets = char.additionalAssets ?? []
+    const emotionAssets = char.emotionImages ?? []
+    const selectedIndex = selIdState.selId
+    const selectedCharacter = DBState.db.characters?.[selectedIndex]
+    const selectedOwnerToken = `${selectedIndex}:${char.chaId}`
+    const canUseSelectedCache = selectedCharacter?.type === 'character'
+        && selectedCharacter.chaId === char.chaId
+        && selectedCharacter.additionalAssets === char.additionalAssets
+        && selectedCharacter.emotionImages === char.emotionImages
+        && selectedAssetLookupCache?.ownerToken === selectedOwnerToken
+        && selectedAssetLookupCache.characterAssets === characterAssets
+        && selectedAssetLookupCache.emotionAssets === emotionAssets
+    const assetLookup = canUseSelectedCache
+        ? selectedAssetLookupCache.index
+        : createAssetLookupIndex({
+            characterAssets,
+            emotionAssets,
+            moduleAssets: getModuleAssets(),
+        })
 
     let needsSourceAccess = false
     let cx: number|null = null
@@ -495,7 +504,7 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
         }
 
         if(type === 'emotion'){
-            const srcPath = emoPaths?.[name]?.srcPaths?.[0]
+            const srcPath = resolveEmotionAsset(assetLookup, name)?.srcPaths[0]
             const path = srcPath ? await getFileSrcCached(srcPath) : null
             if(!path){
                 return ''
@@ -515,20 +524,15 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
             }
         }
 
-        let match = assetPaths?.[name]
-
+        const exactOnly = DBState.db.legacyMediaFindings === true
+        const match = resolveAdditionalAsset(
+            assetLookup,
+            name,
+            exactOnly ? -1 : DBState.db.assetMaxDifference,
+            getAssetDistance,
+        )
         if(!match){
-            if(DBState.db.legacyMediaFindings){
-                return ''
-            }
-
-            if(assetPaths){
-                match = getClosestMatch(char, name, assetPaths)
-            }
-
-            if(!match){
-                return ''
-            }
+            return ''
         }
 
         let pSrc = match.srcPaths[0]
@@ -587,71 +591,6 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
     }
     
     return data
-}
-
-function getClosestMatch(char: simpleCharacterArgument|character, name:string, assetPaths:AssetPaths){   
-    if(!char.additionalAssets) return null
-
-    let closest = ''
-    let closestDist = 999999
-    let targetPath = ''
-    let targetExt = ''
-
-    const trimmedName = trimmer(name)
-    for(const asset of char.additionalAssets) {
-        const key = asset[0].toLocaleLowerCase()
-        const dist = getDistance(trimmedName, trimmer(key))
-        if(dist < closestDist){
-            closest = key
-            closestDist = dist
-            targetPath = asset[1]
-            targetExt = asset[2]
-        }
-    }
-    
-    if(closestDist > DBState.db.assetMaxDifference){
-        return null
-    }
-
-    assetPaths[closest] = {
-        srcPaths: [targetPath],
-        ext: targetExt
-    }
-
-    return assetPaths[closest]
-}
-
-//Levenshtein distance, new with 1d array
-export function getDistance(a:string, b:string) {
-    const h = a.length + 1
-    const w = b.length + 1
-    let d = new Int16Array(h * w)
-    for(let i=0;i<h;i++){
-        d[i * w] = i
-    }
-    for(let i=0;i<w;i++){
-        d[i] = i
-    }
-    for(let i=1; i<h; i++){
-        for(let j=1;j<w;j++){
-            d[i * w + j] = Math.min(
-                d[(i-1) * w + j-1] + (a.charAt(i-1)===b.charAt(j-1) ? 0 : 1),
-                d[(i-1) * w + j]+1, d[i * w + j-1]+1
-            )
-        }
-    }
-    return d[h * w - 1]
-}
-
-function trimmer(str:string){
-    const ext = ['webp', 'png', 'jpg', 'jpeg', 'gif', 'mp4', 'webm', 'avi', 'm4p', 'm4v', 'mp3', 'wav', 'ogg']
-    for(const e of ext){
-        if(str.endsWith('.' + e)){
-            str = str.substring(0, str.length - e.length - 1)
-        }
-    }
-
-    return str.trim().replace(/[_ -.]/g, '')
 }
 
 async function parseInlayAssets(data:string, deferredInlays?:DeferredInlayMarkerRegistry){
