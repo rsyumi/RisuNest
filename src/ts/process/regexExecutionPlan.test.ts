@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { customscript } from '../storage/database.svelte'
+import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { executeRegexPlanSync, getRegexExecutionPlan } from './regexExecutionPlan'
 
 function script(
@@ -32,6 +33,19 @@ describe('regex execution plans', () => {
         expect(Number.isSafeInteger(first.revision)).toBe(true)
         expect(changed).not.toBe(first)
         expect(changed.revision).toBeGreaterThan(first.revision)
+    })
+
+    it('clears retained plans when switching to the lower low-spec budget', () => {
+        setRuntimePerformanceProfile('normal')
+        const scripts = [script('profile-cache', 'changed')]
+        const beforeSwitch = getRegexExecutionPlan(scripts, 'editoutput')
+
+        setRuntimePerformanceProfile('low-spec')
+        const afterSwitch = getRegexExecutionPlan(scripts, 'editoutput')
+        setRuntimePerformanceProfile('normal')
+
+        expect(afterSwitch).not.toBe(beforeSwitch)
+        expect(afterSwitch.revision).toBeGreaterThan(beforeSwitch.revision)
     })
 
     it('applies descending order metadata with stable ties', () => {

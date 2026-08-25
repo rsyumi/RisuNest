@@ -1,7 +1,7 @@
 import type { customscript } from '../storage/database.svelte'
+import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { ByteBudgetLru } from '../util/byteBudgetLru'
 
-const PLAN_CACHE_LIMIT = 32
 const metadataPattern = /<(.+?)>/g
 const dataPattern = /{{data}}/g
 const supportedFlags = /[^dgimsuvy]/g
@@ -40,11 +40,18 @@ export interface RegexExecutionResult {
     errors: RegexExecutionError[]
 }
 
-const planCache = new ByteBudgetLru<string, RegexExecutionPlan>(
-    Number.POSITIVE_INFINITY,
-    () => 0,
-    PLAN_CACHE_LIMIT,
-)
+function createPlanCache() {
+    return new ByteBudgetLru<string, RegexExecutionPlan>(
+        Number.POSITIVE_INFINITY,
+        () => 0,
+        getRuntimePerformanceBudgets().regexPlanCacheEntries,
+    )
+}
+
+let planCache = createPlanCache()
+subscribeRuntimePerformanceProfile(() => {
+    planCache = createPlanCache()
+})
 let nextPlanRevision = 1
 
 function makePlanKey(scripts: customscript[], mode: string): string {

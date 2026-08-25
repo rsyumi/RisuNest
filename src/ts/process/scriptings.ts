@@ -1,7 +1,7 @@
 import { asBuffer } from 'src/ts/util';
 import { getChatVar, getGlobalChatVar, setChatVar } from "../parser/chatVar.svelte";
 import { hasher, type simpleCharacterArgument, risuChatParser } from "../parser/parser.svelte";
-import { LuaEngine, LuaFactory } from "wasmoon";
+import type { LuaEngine, LuaFactory } from "wasmoon";
 import { getCurrentCharacter, getCurrentChat, getDatabase, setDatabase, type Chat, type character, type groupChat, type triggerscript } from "../storage/database.svelte";
 import { get } from "svelte/store";
 import { DBState, ReloadChatPointer, ReloadGUIPointer, selectedCharID } from "../stores.svelte";
@@ -19,6 +19,8 @@ import { fetchNative, readImage } from "../globalApi.svelte";
 import { loadLoreBookV3Prompt } from './lorebook.svelte';
 import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
 import { isTauriMobile } from '../platform';
+import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
+import { createLuaFactory } from './luaRuntime';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
@@ -52,7 +54,10 @@ type ScriptingEngineState = LuaScriptingEngineState | PythonScriptingEngineState
 let ScriptingEngines = new Map<string, ScriptingEngineState>()
 let luaFactoryPromise: Promise<void> | null = null;
 let scriptingEngineRecency = 0
-const MAX_SCRIPTING_ENGINES = 16
+
+subscribeRuntimePerformanceProfile(() => {
+    evictIdleScriptingEngines()
+})
 
 export async function runScripted(code:string, arg:{
     char?:character|groupChat|simpleCharacterArgument,
@@ -1201,7 +1206,7 @@ export async function runScripted(code:string, arg:{
 }
 
 async function makeLuaFactory(){
-    const _luaFactory = new LuaFactory()
+    const _luaFactory = await createLuaFactory()
     async function mountFile(name:string){
         let code = ''
         for(let i = 0; i < 3; i++){
@@ -1265,7 +1270,8 @@ function getOrCreateEngineState(
 }
 
 function evictIdleScriptingEngines() {
-    while (ScriptingEngines.size > MAX_SCRIPTING_ENGINES) {
+    const maxEntries = getRuntimePerformanceBudgets().scriptingEngineCacheEntries
+    while (ScriptingEngines.size > maxEntries) {
         let oldest: ScriptingEngineState | undefined
         for (const state of ScriptingEngines.values()) {
             if (state.activeUses === 0 && (!oldest || state.lastUsed < oldest.lastUsed)) {

@@ -3,6 +3,7 @@
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { beforeAll, expect, test, vi } from 'vitest'
+import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -186,6 +187,40 @@ test('evicts the least recently used idle Lua engine after 17 modes', async () =
     ...baseArg,
     mode: 'phase1-lru-0',
   })
+
+  expect(result.res).toBe(1)
+})
+
+test('trims idle Lua engines when switching to the lower low-spec budget', async () => {
+  setRuntimePerformanceProfile('normal')
+  const code = `
+    counter = 0
+    for i = 0, 4 do
+      _G["low-spec-lru-" .. i] = function(id)
+        counter = counter + 1
+        return counter
+      end
+    end
+  `
+  const baseArg = {
+    char: { chaId: 'low-spec-lru-owner' } as never,
+    chat: { message: [] } as never,
+  }
+
+  for (let index = 0; index < 5; index++) {
+    const result = await runScripted(code, {
+      ...baseArg,
+      mode: `low-spec-lru-${index}`,
+    })
+    expect(result.res).toBe(1)
+  }
+
+  setRuntimePerformanceProfile('low-spec')
+  const result = await runScripted(code, {
+    ...baseArg,
+    mode: 'low-spec-lru-0',
+  })
+  setRuntimePerformanceProfile('normal')
 
   expect(result.res).toBe(1)
 })

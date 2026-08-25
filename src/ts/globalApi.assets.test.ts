@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { setRuntimePerformanceProfile } from './runtimePerformanceProfile'
 
 const state = vi.hoisted(() => ({
     isTauri: false,
@@ -130,6 +131,7 @@ function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime:
 }
 
 beforeEach(() => {
+    setRuntimePerformanceProfile('normal')
     state.isTauri = false
     ;(forageStorage as any).isAccount = false
     vi.spyOn(console, 'error').mockImplementation(() => undefined)
@@ -218,6 +220,20 @@ describe('getFileSrc browser asset route', () => {
     test('returns an empty string for a missing asset', async () => {
         state.blobStore = createFakeBlobStore({})
         expect(await getFileSrc('assets/web-missing.png')).toBe('')
+    })
+
+    test('clears retained data URLs when switching to the lower low-spec budget', async () => {
+        const bytes = new Uint8Array([4, 5, 6])
+        state.blobStore = createFakeBlobStore({ 'assets/profile.png': { data: bytes, mime: 'image/png' } })
+
+        await getFileSrc('assets/profile.png')
+        await getFileSrc('assets/profile.png')
+        expect(state.blobStore.read).toHaveBeenCalledTimes(1)
+
+        setRuntimePerformanceProfile('low-spec')
+
+        await getFileSrc('assets/profile.png')
+        expect(state.blobStore.read).toHaveBeenCalledTimes(2)
     })
 })
 

@@ -51,6 +51,7 @@ import { isLocalNetworkUrl } from "./network/localNetwork";
 import { decodeProxyJobWsChunk, formatProxyStreamErrorMessage, parseProxyJobWsEvent } from "./network/proxyJobWs";
 import { getNodeServerProxyAuth } from "./storage/nodeStorage";
 import { ByteBudgetLru } from "./util/byteBudgetLru";
+import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "./runtimePerformanceProfile";
 import { checkCharOrder as repairDatabaseCharacterOrder } from "./storage/databasePreparation";
 import {
     activateConversation,
@@ -141,10 +142,17 @@ let fileCache: {
     res: []
 }
 
-const browserAssetDataUrlCache = new ByteBudgetLru<string, string>(
-    16 * 1024 * 1024,
-    (_loc, dataUrl) => dataUrl.length,
-)
+function createBrowserAssetDataUrlCache() {
+    return new ByteBudgetLru<string, string>(
+        getRuntimePerformanceBudgets().browserAssetDataUrlCacheBytes,
+        (_loc, dataUrl) => dataUrl.length,
+    )
+}
+
+let browserAssetDataUrlCache = createBrowserAssetDataUrlCache()
+subscribeRuntimePerformanceProfile(() => {
+    browserAssetDataUrlCache = createBrowserAssetDataUrlCache()
+})
 const pendingBrowserAssetReads = new Map<string, Promise<string | null>>()
 const tauriAssetUrlCache = new Map<string, string>()
 

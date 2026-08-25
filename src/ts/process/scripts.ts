@@ -14,9 +14,7 @@ import { runTrigger } from "./triggers";
 import { ByteBudgetLru } from "../util/byteBudgetLru";
 import { canExecuteRegexPlanInWorker, executeRegexPlanSync, getRegexExecutionPlan, type RegexExecutionPlanEntry, type RegexExecutionResult } from "./regexExecutionPlan";
 import { RegexExecutionTimeoutError, getSharedRegexWorkerClient, isRegexWorkerAvailable } from "./regexWorkerClient";
-
-const SCRIPT_CACHE_BUDGET = 8 * 1024 * 1024
-const SCRIPT_CACHE_ENTRY_LIMIT = 1000
+import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "../runtimePerformanceProfile";
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 
@@ -73,12 +71,17 @@ let bestMatchCache = new Map<string, string>()
 let processScriptCache = createScriptCache()
 
 function createScriptCache() {
+    const budgets = getRuntimePerformanceBudgets()
     return new ByteBudgetLru<string, string>(
-        SCRIPT_CACHE_BUDGET,
+        budgets.scriptResultCacheBytes,
         (key, result) => 2 * (key.length + result.length),
-        SCRIPT_CACHE_ENTRY_LIMIT,
+        budgets.scriptResultCacheEntries,
     )
 }
+
+subscribeRuntimePerformanceProfile(() => {
+    processScriptCache = createScriptCache()
+})
 
 function generateScriptCacheKey(scripts: customscript[], data: string, mode: ScriptMode, chatID = -1, cbsConditions: CbsConditions = {}) {
     let hash = data + '|||' + mode + '|||';

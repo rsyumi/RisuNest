@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { character, customscript } from '../storage/database.svelte'
+import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 
 const mocks = vi.hoisted(() => {
     const state = {
@@ -120,6 +121,7 @@ const emptyResultWithAction = [
 
 describe('processScriptFull result caching', () => {
     beforeEach(() => {
+        setRuntimePerformanceProfile('normal')
         resetScriptCache()
         mocks.state.emotions = {}
         mocks.state.cbsPatternCalls = 0
@@ -289,6 +291,17 @@ describe('processScriptFull result caching', () => {
 
         expect((await processScriptFull(character, 'result-0', 'editoutput')).emoChanged).toBe(true)
         expect((await processScriptFull(character, 'result-1000', 'editoutput')).emoChanged).toBe(false)
+    })
+
+    it('clears retained results when switching to the lower low-spec budget', async () => {
+        const character = makeCharacter([makeScript('^', '@@emo happy')])
+
+        await processScriptFull(character, 'retained-before-profile-change', 'editoutput')
+        expect((await processScriptFull(character, 'retained-before-profile-change', 'editoutput')).emoChanged).toBe(false)
+
+        setRuntimePerformanceProfile('low-spec')
+
+        expect((await processScriptFull(character, 'retained-before-profile-change', 'editoutput')).emoChanged).toBe(true)
     })
 
     it('does not retain a completed result larger than the byte budget', async () => {
