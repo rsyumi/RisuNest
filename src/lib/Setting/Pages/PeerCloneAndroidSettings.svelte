@@ -124,7 +124,7 @@
             .then(([available, recovered]) => {
                 capabilities = available
                 refreshState()
-                if (recovered && recovered.phase !== 'completed' && recovered.phase !== 'cancelled' && recovered.phase !== 'failed') {
+                if (recovered?.phase === 'downloading' || recovered?.phase === 'awaitingActivation') {
                     beginProgressPolling()
                 }
             })
@@ -167,17 +167,17 @@
                 onclick={downloadClone}
             >{language.peerClone.download}</Button>
             <Button
-                disabled={!targetEnabled || busy || cloneState.phase !== 'cancelled'}
+                disabled={!targetEnabled || busy || (cloneState.phase !== 'paused' && cloneState.phase !== 'cancelled')}
                 onclick={resumeClone}
             >{language.peerClone.resume}</Button>
             <Button
                 styled="danger"
-                disabled={busy || cloneState.phase !== 'downloading'}
+                disabled={busy || (cloneState.phase !== 'paused' && cloneState.phase !== 'downloading')}
                 onclick={cancelClone}
             >{language.peerClone.cancel}</Button>
         </div>
 
-        {#if cloneState.phase === 'downloading' || cloneState.phase === 'cancelled' || cloneState.phase === 'completed'}
+        {#if cloneState.phase === 'paused' || cloneState.phase === 'downloading' || cloneState.phase === 'cancelled' || cloneState.phase === 'completed'}
             <label class="mt-3 block text-sm font-bold" for="android-peer-clone-progress">
                 {language.peerClone.progress}
             </label>

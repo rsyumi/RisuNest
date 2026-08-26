@@ -200,6 +200,36 @@ describe('Android peer clone facade', () => {
         expect(order).toEqual(['marker', 'platform'])
     })
 
+    it('recovers an interrupted foreground transfer as resumable instead of active', async () => {
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_android_current') {
+                return {
+                    jobId: '11111111-1111-4111-8111-111111111111',
+                    endpoint: 'http://192.168.1.4:43123/',
+                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
+                    manifestId: 'a'.repeat(64),
+                    phase: 'ready',
+                    completedBytes: 1,
+                    totalBytes: 42,
+                } as T
+            }
+            throw new Error(`unexpected command ${command}`)
+        })
+        const facade = createAndroidPeerCloneFacade({
+            invoke: invoke as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge('foreground'),
+            runtime: runtime().replacement,
+        })
+
+        await facade.recover()
+
+        expect(facade.getState()).toMatchObject({
+            phase: 'paused',
+            completedBytes: 1,
+            totalBytes: 42,
+        })
+    })
+
     it('fails closed when native lossless activation gates are unavailable', async () => {
         const invoke = vi.fn(async <T>(): Promise<T> => ({
             androidClient: true,

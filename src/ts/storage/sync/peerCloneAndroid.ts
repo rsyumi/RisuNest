@@ -39,14 +39,14 @@ export interface AndroidPeerCloneTargetStatus {
     endpoint: string
     sessionId: string
     manifestId: string
-    phase: 'ready' | 'downloading' | 'awaitingActivation' | 'cancelled' | 'completed' | 'failed'
+    phase: 'ready' | 'paused' | 'downloading' | 'awaitingActivation' | 'cancelled' | 'completed' | 'failed'
     completedBytes: number
     totalBytes?: number
     error?: string
 }
 
 export interface AndroidPeerCloneState {
-    phase: 'idle' | 'joined' | 'confirmed' | 'downloading' | 'cancelled' | 'completed' | 'failed'
+    phase: 'idle' | 'joined' | 'confirmed' | 'paused' | 'downloading' | 'cancelled' | 'completed' | 'failed'
     destructiveConfirmed: boolean
     completedBytes: number
     totalBytes?: number
@@ -122,9 +122,11 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
             manifestId: status.manifestId,
             claim: '',
         }
-        const phase = status.phase === 'ready' || status.phase === 'awaitingActivation'
-            ? 'downloading'
-            : status.phase
+        const phase = status.phase === 'ready' || status.phase === 'paused'
+            ? 'paused'
+            : status.phase === 'awaitingActivation'
+                ? 'downloading'
+                : status.phase
         state = {
             phase,
             destructiveConfirmed: true,
