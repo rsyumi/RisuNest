@@ -1,5 +1,6 @@
 use regex::{Captures, Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ const REGEX_COMPILE_NEST_LIMIT: u32 = REGEX_IR_NEST_LIMIT as u32 * 3 + 4;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RegexShadowPlan {
+pub(crate) struct RegexShadowPlan {
     version: u8,
     entries: Vec<RegexShadowEntry>,
 }
@@ -84,11 +85,12 @@ struct RegexShadowRuleError {
 }
 
 #[derive(Debug, Serialize)]
-struct RegexShadowResult {
+pub(crate) struct RegexShadowResult {
     data: String,
     errors: Vec<RegexShadowRuleError>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RegexShadowEvidence {
@@ -285,10 +287,12 @@ fn check_control(
     Ok(())
 }
 
+#[cfg(test)]
 fn sha256_hex(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 
+#[cfg(test)]
 fn first_differing_utf16_index(left: &str, right: &str) -> Option<usize> {
     let mut left_units = left.encode_utf16();
     let mut right_units = right.encode_utf16();
@@ -302,6 +306,7 @@ fn first_differing_utf16_index(left: &str, right: &str) -> Option<usize> {
     }
 }
 
+#[cfg(test)]
 fn compare_shadow(
     fixture_id: &str,
     plan_json: &str,
@@ -442,6 +447,7 @@ fn push_limited(
     Ok(())
 }
 
+#[cfg(test)]
 fn execute_plan(
     plan: RegexShadowPlan,
     input: &str,
@@ -457,6 +463,32 @@ fn execute_plan(
     )
 }
 
+fn execute_batch(
+    plan: RegexShadowPlan,
+    input: String,
+) -> Result<RegexShadowResult, RegexShadowFailure> {
+    execute_plan_with_control(
+        plan,
+        &input,
+        ExecutionControl {
+            cancelled: None,
+            deadline: Some(Instant::now() + Duration::from_secs(2)),
+            after_rule_compiled: None,
+        },
+    )
+}
+
+#[tauri::command(async)]
+pub(crate) async fn regex_execute_batch(
+    plan: RegexShadowPlan,
+    input: String,
+) -> Result<RegexShadowResult, String> {
+    tauri::async_runtime::spawn_blocking(move || execute_batch(plan, input))
+        .await
+        .map_err(|_| "regex_shadow_join".to_string())?
+        .map_err(|error| error.0.to_string())
+}
+
 fn execute_plan_with_control(
     plan: RegexShadowPlan,
     input: &str,
@@ -466,6 +498,7 @@ fn execute_plan_with_control(
     execute_compiled_plan(&plan, input, control)
 }
 
+#[cfg(test)]
 fn compile_plan(plan: RegexShadowPlan) -> Result<CompiledRegexShadowPlan, RegexShadowFailure> {
     compile_plan_with_control(
         plan,
@@ -597,6 +630,7 @@ fn execute_compiled_plan(
     Ok(RegexShadowResult { data, errors })
 }
 
+#[cfg(test)]
 fn execute_json(
     plan_json: &str,
     input: &str,
@@ -615,10 +649,12 @@ fn execute_json(
     )
 }
 
+#[cfg(test)]
 fn alternative(atoms: Vec<RegexShadowAtom>) -> RegexShadowAlternative {
     RegexShadowAlternative { atoms }
 }
 
+#[cfg(test)]
 fn generated_plan(index: usize) -> RegexShadowPlan {
     let entries = match index % 4 {
         0 => vec![RegexShadowEntry {
@@ -760,7 +796,7 @@ fn generated_plan(index: usize) -> RegexShadowPlan {
 #[cfg(test)]
 mod tests {
     use super::{
-        alternative, compare_shadow, compile_plan, compile_plan_with_control,
+        alternative, compare_shadow, compile_plan, compile_plan_with_control, execute_batch,
         execute_compiled_plan, execute_json, execute_plan, execute_plan_with_control,
         generated_plan, CompiledRegexShadowEntry, CompiledRegexShadowPlan, ExecutionControl,
         RegexShadowAlternative, RegexShadowAtom, RegexShadowEntry, RegexShadowPattern,
@@ -803,6 +839,14 @@ mod tests {
         plan.entries[0].pattern_bytes = 4_096;
         plan.entries[0].pattern.alternatives[0].atoms[0] = atom;
         plan
+    }
+
+    #[test]
+    fn batch_command_core_returns_only_the_complete_ordered_result() {
+        let result = execute_batch(literal_plan("b".to_string()), "aa".to_string()).unwrap();
+
+        assert_eq!(result.data, "bb");
+        assert!(result.errors.is_empty());
     }
 
     #[test]

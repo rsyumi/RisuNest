@@ -14,7 +14,7 @@ mod peer_sync;
 mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
-#[cfg(test)]
+#[cfg(any(test, target_os = "windows"))]
 mod regex_shadow;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -555,6 +555,8 @@ pub fn run() {
             persistent_store::commands::pds_get_app_kv,
             persistent_store::commands::pds_set_app_kv,
             persistent_store::commands::pds_remove_app_kv,
+            #[cfg(target_os = "windows")]
+            regex_shadow::regex_execute_batch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
