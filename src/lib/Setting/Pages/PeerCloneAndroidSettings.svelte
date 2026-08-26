@@ -83,7 +83,7 @@
             void facade.targetStatus()
                 .then(() => {
                     refreshState()
-                    error = ''
+                    error = cloneState.error ?? ''
                     if (
                         cloneState.phase === 'paused'
                         || cloneState.phase === 'completed'
