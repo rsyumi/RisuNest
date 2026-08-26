@@ -6,9 +6,31 @@ import {
     benchmarkAppDataDirectory,
     buildBenchmarkConfig,
     parseArguments,
+    summarizeUiEvidence,
     summarizeG6,
     tauriBuildInvocation,
 } from './tauri-cdp.mjs'
+
+test('summarizeUiEvidence counts mounted messages and unique live resource URLs', () => {
+    assert.deepEqual(
+        summarizeUiEvidence({
+            domNodeCount: 80,
+            mountedMessageCount: 6,
+            resourceUrls: [
+                'blob:first',
+                'blob:first',
+                'http://risuasset.localhost/aa',
+                'https://example.com/image.png',
+                '',
+            ],
+        }),
+        {
+            domNodeCount: 80,
+            mountedMessageCount: 6,
+            liveUrlCount: 2,
+        },
+    )
+})
 
 test('buildBenchmarkConfig isolates the Tauri identifier and WebView profile', () => {
     const original = {

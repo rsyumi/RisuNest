@@ -5,6 +5,7 @@ use super::{
 use rusqlite::{ffi, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{path::Path, time::Instant};
 
 const NORMAL_CHARACTERS: usize = 500;
@@ -112,6 +113,11 @@ struct FixtureDescription {
     total_messages: usize,
     serialized_bytes: u64,
     fnv1a64: String,
+    sha256: String,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[derive(Serialize)]
@@ -979,6 +985,7 @@ fn phase3_step5_measurements() {
                 + STRESS_TURNS,
             serialized_bytes: serialized.len() as u64,
             fnv1a64: format!("{:016x}", fnv1a64(&serialized)),
+            sha256: sha256_hex(&serialized),
         },
         discarded_warmup_runs: 1,
         measured_runs: all_samples.len(),
@@ -998,7 +1005,15 @@ fn phase3_step5_measurements() {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_save_large, nearest_rank};
+    use super::{generate_save_large, nearest_rank, sha256_hex};
+
+    #[test]
+    fn sha256_identity_is_lowercase_and_stable() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn deterministic_generator_has_expected_shape() {

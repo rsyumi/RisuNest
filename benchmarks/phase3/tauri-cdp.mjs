@@ -451,6 +451,35 @@ async function collectBootEvidence(page) {
     }))()`)
 }
 
+export function summarizeUiEvidence({ domNodeCount, mountedMessageCount, resourceUrls }) {
+    const liveUrls = new Set(resourceUrls.filter((value) => {
+        if (typeof value !== 'string' || value.length === 0) return false
+        if (value.startsWith('blob:') || value.startsWith('risuasset:')) return true
+        try {
+            return new URL(value).hostname === 'risuasset.localhost'
+        } catch {
+            return false
+        }
+    }))
+    return {
+        domNodeCount,
+        mountedMessageCount,
+        liveUrlCount: liveUrls.size,
+    }
+}
+
+async function collectUiEvidence(page) {
+    const raw = await evaluate(page, `(() => ({
+        domNodeCount: document.querySelectorAll('*').length,
+        mountedMessageCount: document.querySelectorAll('.risu-chat').length,
+        resourceUrls: [...document.querySelectorAll('[src], [href], [poster]')]
+            .flatMap((element) => ['src', 'href', 'poster']
+                .map((attribute) => element.getAttribute(attribute))
+                .filter(Boolean)),
+    }))()`)
+    return summarizeUiEvidence(raw)
+}
+
 function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
@@ -558,6 +587,7 @@ async function runBenchmark(options) {
             snapshot.result.startedAt,
             snapshot.result.endedAt,
         )
+        const ui = await collectUiEvidence(page)
         nativeAppDataDirectory = benchmarkAppDataDirectory(
             snapshot.result.snapshot.path,
             benchmarkConfig.identifier,
@@ -603,6 +633,7 @@ async function runBenchmark(options) {
                 memorySamples: snapshot.samples,
                 peakMemory: snapshot.peak,
             },
+            ui,
             gates: { g6 },
             limits: [
                 'The setup is a benchmark-only explicit staged import through existing Tauri commands, not public file-picker UI automation.',
