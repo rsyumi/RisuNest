@@ -174,12 +174,23 @@ export async function planLogicalDeltaPull(input: {
     if (actualBaseManifestHash !== input.baseManifestHash) {
         throw new TypeError('Logical delta base manifest hash does not match the common base')
     }
+    const localManifestHash = await hashLogicalManifest(local)
     const remoteManifestHash = await hashLogicalManifest(remote)
     if (
-        remote.generation === base.generation
-        && remoteManifestHash !== actualBaseManifestHash
+        (
+            local.generation === base.generation
+            && localManifestHash !== actualBaseManifestHash
+        )
+        || (
+            remote.generation === base.generation
+            && remoteManifestHash !== actualBaseManifestHash
+        )
+        || (
+            remote.generation === local.generation
+            && remoteManifestHash !== localManifestHash
+        )
     ) {
-        throw new TypeError('Logical delta remote generation ID reuses different content')
+        throw new TypeError('Logical delta generation ID reuses different content')
     }
     if (
         remote.generationSequence === base.generationSequence
