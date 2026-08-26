@@ -126,23 +126,6 @@ function addCandidateHashes(
     for (const dependency of record.dependencies) candidates.add(dependency)
 }
 
-function missingCandidateHashes(
-    candidates: Set<string>,
-    local: LogicalManifest,
-): string[] {
-    const sortedCandidates = [...candidates].sort()
-    let localIndex = 0
-    return sortedCandidates.filter((hash) => {
-        while (
-            localIndex < local.objects.length
-            && local.objects[localIndex].hash < hash
-        ) {
-            localIndex += 1
-        }
-        return local.objects[localIndex]?.hash !== hash
-    })
-}
-
 export async function planLogicalDeltaPull(input: {
     baseManifestHash: string
     base: LogicalManifest
@@ -273,7 +256,7 @@ export async function planLogicalDeltaPull(input: {
         nextBaseGenerationSequence: remote.generationSequence,
         apply,
         preserveLocalKeys,
-        candidateObjectHashes: missingCandidateHashes(candidateObjectHashes, local),
+        candidateObjectHashes: [...candidateObjectHashes].sort(),
         nextBaseManifestHash: remoteManifestHash,
     }
 }

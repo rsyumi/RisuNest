@@ -222,7 +222,7 @@ describe('logical delta pull planner', () => {
         }
     })
 
-    it('transfers only changed-record objects absent from the local manifest', async () => {
+    it('returns the full changed-record graph for target-side transfer selection', async () => {
         const sharedCharacter = live(keys.character, hashes.remote, [hashes.payloadA])
         const base = manifest('generation-1', '1', [
             live(keys.root, hashes.base),
@@ -247,7 +247,11 @@ describe('logical delta pull planner', () => {
                 objectHash: hashes.remote,
                 dependencies: [hashes.payloadA, hashes.payloadB].sort(),
             }])
-            expect(result.candidateObjectHashes).toEqual([hashes.payloadB])
+            expect(result.candidateObjectHashes).toEqual([
+                hashes.remote,
+                hashes.payloadA,
+                hashes.payloadB,
+            ].sort())
         }
     })
 
