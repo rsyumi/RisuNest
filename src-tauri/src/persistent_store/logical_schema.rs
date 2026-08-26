@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use std::collections::HashSet;
 
 #[cfg(test)]
@@ -456,4 +456,12 @@ pub(crate) fn reset_validation_count() {
 #[cfg(test)]
 pub(crate) fn validation_count() -> usize {
     VALIDATION_COUNT.with(std::cell::Cell::get)
+}
+
+pub(super) fn create_logical_schema_strict(
+    transaction: &Transaction<'_>,
+) -> Result<(), LogicalSchemaError> {
+    let strict_schema = LOGICAL_SCHEMA_SQL.replace("IF NOT EXISTS ", "");
+    transaction.execute_batch(&strict_schema)?;
+    Ok(())
 }

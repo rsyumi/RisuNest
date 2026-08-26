@@ -4835,6 +4835,626 @@ fn create_v2_database_with_lease(path: &Path) {
         .expect("create v2 fixture lease");
 }
 
+fn table_columns(
+    connection: &rusqlite::Connection,
+    table: &str,
+) -> Vec<(String, String, bool, Option<String>, i64)> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info('{table}')"))
+        .expect("prepare table column query");
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(1)?,
+                row.get(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("query table columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect table columns")
+}
+
+fn assert_j2_v8_payload_schema(connection: &rusqlite::Connection) {
+    assert_eq!(
+        table_columns(connection, "asset_aliases"),
+        vec![
+            ("generation".to_owned(), "TEXT".to_owned(), true, None, 1),
+            ("logical_key".to_owned(), "TEXT".to_owned(), true, None, 3),
+            ("object_hash".to_owned(), "TEXT".to_owned(), false, None, 0),
+            ("kind".to_owned(), "TEXT".to_owned(), true, None, 2),
+            ("size".to_owned(), "INTEGER".to_owned(), true, None, 0),
+            ("mime".to_owned(), "TEXT".to_owned(), true, None, 0),
+            ("name".to_owned(), "TEXT".to_owned(), true, None, 0),
+            ("ext".to_owned(), "TEXT".to_owned(), true, None, 0),
+            ("inlay_type".to_owned(), "TEXT".to_owned(), false, None, 0),
+            ("width".to_owned(), "INTEGER".to_owned(), false, None, 0),
+            ("height".to_owned(), "INTEGER".to_owned(), false, None, 0),
+            (
+                "metadata".to_owned(),
+                "TEXT".to_owned(),
+                true,
+                Some("'{}'".to_owned()),
+                0,
+            ),
+        ]
+    );
+    assert_eq!(
+        table_columns(connection, "asset_owner_heads"),
+        vec![
+            ("generation".to_owned(), "TEXT".to_owned(), true, None, 1),
+            ("owner_kind".to_owned(), "TEXT".to_owned(), true, None, 2),
+            ("owner_locator".to_owned(), "TEXT".to_owned(), true, None, 3),
+            ("present".to_owned(), "INTEGER".to_owned(), true, None, 0),
+            (
+                "manifest_hash".to_owned(),
+                "TEXT".to_owned(),
+                false,
+                None,
+                0
+            ),
+            (
+                "entry_count".to_owned(),
+                "INTEGER".to_owned(),
+                true,
+                None,
+                0
+            ),
+        ]
+    );
+    assert_eq!(
+        table_columns(connection, "cold_aliases"),
+        vec![
+            ("generation".to_owned(), "TEXT".to_owned(), true, None, 1),
+            ("key".to_owned(), "TEXT".to_owned(), true, None, 2),
+            ("object_hash".to_owned(), "TEXT".to_owned(), false, None, 0),
+            ("size".to_owned(), "INTEGER".to_owned(), true, None, 0),
+            ("metadata".to_owned(), "TEXT".to_owned(), true, None, 0),
+        ]
+    );
+}
+
+fn assert_empty_logical_schema(connection: &rusqlite::Connection) {
+    const TABLES: &[&str] = &[
+        "logical_generation_session_pins",
+        "logical_library_head",
+        "logical_message_page_sources",
+        "logical_peer_common_bases",
+        "logical_record_dependencies",
+        "logical_record_heads",
+        "logical_sync_generations",
+    ];
+    const INDEXES: &[&str] = &[
+        "logical_generation_session_pins_generation",
+        "logical_message_page_sources_object",
+        "logical_peer_common_bases_manifest",
+        "logical_record_dependencies_object",
+        "logical_record_heads_kind",
+        "logical_record_heads_object",
+        "logical_sync_generations_manifest",
+        "logical_sync_generations_parent",
+    ];
+
+    let schema_names = |kind: &str| {
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = ?1 AND name LIKE 'logical_%'
+                 ORDER BY name",
+            )
+            .expect("prepare logical schema inventory query");
+        statement
+            .query_map([kind], |row| row.get::<_, String>(0))
+            .expect("query logical schema inventory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect logical schema inventory")
+    };
+
+    assert_eq!(
+        schema_names("table"),
+        TABLES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        schema_names("index"),
+        INDEXES
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    );
+    for table in TABLES {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count logical schema rows");
+        assert_eq!(count, 0, "{table} must start empty");
+    }
+
+    let expected_columns: &[(&str, &[&str])] = &[
+        (
+            "logical_sync_generations",
+            &[
+                "library_id",
+                "generation_id",
+                "generation_sequence",
+                "parent_generation_id",
+                "pds_generation",
+                "source_revision",
+                "state",
+                "manifest_hash",
+                "created_at",
+                "completed_at",
+            ],
+        ),
+        (
+            "logical_library_head",
+            &["singleton", "library_id", "generation_id"],
+        ),
+        (
+            "logical_generation_session_pins",
+            &["session_id", "library_id", "generation_id", "created_at"],
+        ),
+        (
+            "logical_record_heads",
+            &[
+                "library_id",
+                "generation_id",
+                "record_key",
+                "record_kind",
+                "state",
+                "object_hash",
+                "object_size",
+                "deleted_generation_sequence",
+            ],
+        ),
+        (
+            "logical_record_dependencies",
+            &[
+                "library_id",
+                "generation_id",
+                "record_key",
+                "object_hash",
+                "object_size",
+            ],
+        ),
+        (
+            "logical_message_page_sources",
+            &[
+                "library_id",
+                "generation_id",
+                "record_key",
+                "record_kind",
+                "page_index",
+                "first_message_index",
+                "message_count",
+                "object_hash",
+                "object_size",
+            ],
+        ),
+        (
+            "logical_peer_common_bases",
+            &[
+                "peer_id",
+                "library_id",
+                "generation_id",
+                "manifest_hash",
+                "generation_sequence",
+                "updated_at",
+            ],
+        ),
+    ];
+    for (table, expected) in expected_columns {
+        let actual = table_columns(connection, table)
+            .into_iter()
+            .map(|column| column.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect::<Vec<_>>(),
+            "{table} must contain only bounded logical metadata columns"
+        );
+    }
+}
+
+fn insert_logical_schema_fixture(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO logical_sync_generations (
+                library_id, generation_id, generation_sequence, parent_generation_id,
+                pds_generation, source_revision, state, manifest_hash, created_at, completed_at
+            ) VALUES (
+                'library-fixture', 'logical-generation-1', '1', NULL,
+                'revision-0', 0, 'complete',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 10, 11
+            );
+            INSERT INTO logical_record_heads (
+                library_id, generation_id, record_key, record_kind, state,
+                object_hash, object_size, deleted_generation_sequence
+            ) VALUES (
+                'library-fixture', 'logical-generation-1', 'r1:conversation:fixture',
+                'conversation', 'live',
+                '1111111111111111111111111111111111111111111111111111111111111111',
+                11, NULL
+            );
+            INSERT INTO logical_record_dependencies (
+                library_id, generation_id, record_key, object_hash, object_size
+            ) VALUES (
+                'library-fixture', 'logical-generation-1', 'r1:conversation:fixture',
+                '2222222222222222222222222222222222222222222222222222222222222222',
+                22
+            );
+            INSERT INTO logical_message_page_sources (
+                library_id, generation_id, record_key, record_kind, page_index,
+                first_message_index, message_count, object_hash, object_size
+            ) VALUES (
+                'library-fixture', 'logical-generation-1', 'r1:conversation:fixture',
+                'conversation', 0, 0, 4,
+                '2222222222222222222222222222222222222222222222222222222222222222',
+                22
+            );
+            INSERT INTO logical_peer_common_bases (
+                peer_id, library_id, generation_id, manifest_hash,
+                generation_sequence, updated_at
+            ) VALUES (
+                'peer-fixture', 'library-fixture', 'logical-generation-1',
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                '1', 12
+            );
+            "#,
+        )
+        .expect("insert logical schema fixture");
+}
+
+fn assert_logical_schema_fixture(connection: &rusqlite::Connection) {
+    let generation: (String, String, i64) = connection
+        .query_row(
+            "SELECT generation_sequence, manifest_hash, source_revision
+             FROM logical_sync_generations
+             WHERE library_id = 'library-fixture' AND generation_id = 'logical-generation-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read retained logical generation");
+    assert_eq!(generation, ("1".to_owned(), "aa".repeat(32), 0));
+
+    for table in [
+        "logical_record_heads",
+        "logical_record_dependencies",
+        "logical_message_page_sources",
+        "logical_peer_common_bases",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count retained logical rows");
+        assert_eq!(count, 1, "{table} fixture row must be retained");
+    }
+}
+
+#[test]
+fn fresh_schema_v9_creates_empty_logical_tables_without_changing_j2_schema() {
+    let directory = tempfile::tempdir().expect("create fresh v9 directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v9 store");
+
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read fresh schema version"),
+        9
+    );
+    assert_j2_v8_payload_schema(&store.connection);
+    assert_empty_logical_schema(&store.connection);
+}
+
+#[test]
+fn schema_v9_migrates_v8_table_only_and_preserves_j2_data() {
+    let directory = tempfile::tempdir().expect("create v8 migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create v8 store");
+    let cas_sentinel = directory
+        .path()
+        .join("assets-v2/objects/aa/preserved-object");
+    fs::create_dir_all(cas_sentinel.parent().expect("CAS sentinel parent"))
+        .expect("create CAS sentinel parent");
+    fs::write(&cas_sentinel, b"must remain untouched").expect("write CAS sentinel");
+    store
+        .connection
+        .execute_batch(
+            r#"
+            UPDATE root SET value = '{"v8":"preserved"}' WHERE generation = 'revision-0';
+            INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height, metadata
+            ) VALUES
+                (
+                    'revision-0', 'shared-key',
+                    '1111111111111111111111111111111111111111111111111111111111111111',
+                    'asset', 17, 'application/octet-stream', 'asset-name', 'BIN',
+                    NULL, NULL, NULL, '{"source":"v8-asset"}'
+                ),
+                (
+                    'revision-0', 'shared-key',
+                    '2222222222222222222222222222222222222222222222222222222222222222',
+                    'inlay', 23, 'image/webp', 'inlay-name', 'WebP',
+                    'image', 640, 480, '{"source":"v8-inlay","width":640,"height":480}'
+                );
+            INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+            ) VALUES (
+                'revision-0', 'root-module-assets', '0', 1,
+                '3333333333333333333333333333333333333333333333333333333333333333', 2
+            );
+            INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+            VALUES (
+                'revision-0', 'cold-preserved',
+                '4444444444444444444444444444444444444444444444444444444444444444',
+                29, '{"source":"v8-cold"}'
+            );
+            DROP TABLE logical_generation_session_pins;
+            DROP TABLE logical_library_head;
+            DROP TABLE logical_message_page_sources;
+            DROP TABLE logical_peer_common_bases;
+            DROP TABLE logical_record_dependencies;
+            DROP TABLE logical_record_heads;
+            DROP TABLE logical_sync_generations;
+            PRAGMA user_version = 8;
+            "#,
+        )
+        .expect("seed final J2 v8 data");
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read v8 fixture version"),
+        8
+    );
+    drop(store);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate v8 store to v9");
+
+    assert_eq!(
+        store
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read migrated schema version"),
+        9
+    );
+    assert_j2_v8_payload_schema(&store.connection);
+    assert_empty_logical_schema(&store.connection);
+    assert_eq!(
+        store.read_root(None).expect("read preserved v8 root").value,
+        json!({ "v8": "preserved" })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("asset", "shared-key", None)
+            .expect("read preserved ordinary alias")
+            .expect("ordinary alias exists")
+            .value,
+        AssetAlias {
+            key: "shared-key".to_owned(),
+            object_hash: Some("11".repeat(32)),
+            kind: "asset".to_owned(),
+            size: 17,
+            mime: "application/octet-stream".to_owned(),
+            name: "asset-name".to_owned(),
+            ext: "BIN".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({ "source": "v8-asset" }),
+        }
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("inlay", "shared-key", None)
+            .expect("read preserved Inlay alias")
+            .expect("Inlay alias exists")
+            .value,
+        AssetAlias {
+            key: "shared-key".to_owned(),
+            object_hash: Some("22".repeat(32)),
+            kind: "inlay".to_owned(),
+            size: 23,
+            mime: "image/webp".to_owned(),
+            name: "inlay-name".to_owned(),
+            ext: "WebP".to_owned(),
+            inlay_type: Some("image".to_owned()),
+            width: Some(640),
+            height: Some(480),
+            metadata: json!({
+                "source": "v8-inlay",
+                "width": 640,
+                "height": 480
+            }),
+        }
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+            .expect("read preserved owner head")
+            .expect("owner head exists")
+            .value,
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "33".repeat(32),
+            2,
+        )
+    );
+    assert_eq!(
+        store
+            .read_cold_alias("cold-preserved", None)
+            .expect("read preserved cold alias")
+            .expect("cold alias exists")
+            .value,
+        ColdAlias {
+            key: "cold-preserved".to_owned(),
+            object_hash: Some("44".repeat(32)),
+            size: 29,
+            metadata: json!({ "source": "v8-cold" }),
+        }
+    );
+    assert_eq!(
+        fs::read(&cas_sentinel).expect("read untouched CAS sentinel"),
+        b"must remain untouched"
+    );
+}
+
+#[test]
+fn schema_v9_migration_collision_rolls_back_version_and_preserves_v8_rows() {
+    let directory = tempfile::tempdir().expect("create v8 rollback directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            r#"
+            UPDATE root SET value = '{"rollback":"preserved"}' WHERE generation = 'revision-0';
+            INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height, metadata
+            ) VALUES (
+                'revision-0', 'rollback-asset', NULL, 'asset', 0,
+                'application/octet-stream', 'Rollback asset', 'bin',
+                NULL, NULL, NULL, '{"source":"v8"}'
+            );
+            INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+            ) VALUES (
+                'revision-0', 'root-module-assets', '0', 1,
+                '5555555555555555555555555555555555555555555555555555555555555555', 1
+            );
+            INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+            VALUES ('revision-0', 'rollback-cold', NULL, 0, '{"source":"v8"}');
+            DROP TABLE logical_generation_session_pins;
+            DROP TABLE logical_library_head;
+            DROP TABLE logical_message_page_sources;
+            DROP TABLE logical_peer_common_bases;
+            DROP TABLE logical_record_dependencies;
+            DROP TABLE logical_record_heads;
+            DROP TABLE logical_sync_generations;
+            CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
+            PRAGMA user_version = 8;
+            "#,
+        )
+        .expect("create colliding v8 fixture");
+    drop(store);
+
+    let error = match PersistentStore::open(directory.path()) {
+        Ok(_) => panic!("logical table collision must fail migration"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("logical_record_heads"));
+
+    let database_path = directory.path().join("persistent/persistent.db");
+    let connection = rusqlite::Connection::open(database_path).expect("reopen rolled-back v8 db");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read rolled-back schema version"),
+        8
+    );
+    assert_j2_v8_payload_schema(&connection);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM root WHERE generation = 'revision-0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read preserved v8 root"),
+        r#"{"rollback":"preserved"}"#
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT metadata FROM cold_aliases
+                 WHERE generation = 'revision-0' AND key = 'rollback-cold'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read preserved v8 cold alias"),
+        r#"{"source":"v8"}"#
+    );
+    for table in ["asset_aliases", "asset_owner_heads", "cold_aliases"] {
+        let count: i64 = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE generation = 'revision-0'"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count preserved v8 J2 rows");
+        assert_eq!(count, 1, "{table} row must survive migration rollback");
+    }
+    assert_eq!(
+        table_columns(&connection, "logical_record_heads"),
+        vec![(
+            "collision_marker".to_owned(),
+            "TEXT".to_owned(),
+            true,
+            None,
+            0,
+        )]
+    );
+    let partial_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN ('logical_sync_generations', 'logical_record_dependencies')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count rolled-back logical tables");
+    assert_eq!(partial_table_count, 0);
+}
+
+#[test]
+fn schema_v9_logical_rows_survive_snapshot_restore_and_reopen() {
+    let directory = tempfile::tempdir().expect("create v9 snapshot directory");
+    let store = PersistentStore::open(directory.path()).expect("open v9 store");
+    insert_logical_schema_fixture(&store.connection);
+    let snapshot = store
+        .snapshot_create("logical-v9")
+        .expect("create v9 logical snapshot");
+    store
+        .connection
+        .execute_batch(
+            "DELETE FROM logical_message_page_sources;
+             DELETE FROM logical_record_dependencies;
+             DELETE FROM logical_record_heads;
+             DELETE FROM logical_peer_common_bases;
+             DELETE FROM logical_sync_generations;",
+        )
+        .expect("change logical rows after snapshot");
+    store
+        .snapshot_restore_request(Path::new(&snapshot.path))
+        .expect("request v9 logical snapshot restore");
+    drop(store);
+
+    let restored = PersistentStore::open(directory.path()).expect("restore v9 snapshot on reopen");
+    assert_eq!(
+        restored
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read restored schema version"),
+        9
+    );
+    assert_logical_schema_fixture(&restored.connection);
+    drop(restored);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen restored v9 store");
+    assert_logical_schema_fixture(&reopened.connection);
+}
+
 #[test]
 fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
     let directory = tempfile::tempdir().expect("create v5 migration directory");
@@ -4848,6 +5468,13 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE asset_owner_heads;
              DROP TABLE cold_aliases;
              DROP TABLE asset_repository_authority;
+             DROP TABLE logical_generation_session_pins;
+             DROP TABLE logical_library_head;
+             DROP TABLE logical_message_page_sources;
+             DROP TABLE logical_peer_common_bases;
+             DROP TABLE logical_record_dependencies;
+             DROP TABLE logical_record_heads;
+             DROP TABLE logical_sync_generations;
              PRAGMA user_version = 5;",
         )
         .expect("downgrade fixture schema marker");
@@ -5001,6 +5628,13 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE asset_owner_heads;
             DROP TABLE cold_aliases;
             DROP TABLE asset_repository_authority;
+            DROP TABLE logical_generation_session_pins;
+            DROP TABLE logical_library_head;
+            DROP TABLE logical_message_page_sources;
+            DROP TABLE logical_peer_common_bases;
+            DROP TABLE logical_record_dependencies;
+            DROP TABLE logical_record_heads;
+            DROP TABLE logical_sync_generations;
             PRAGMA user_version = 6;
             ",
         )
@@ -5083,6 +5717,13 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             );
             DROP TABLE cold_aliases;
             DROP TABLE asset_repository_authority;
+            DROP TABLE logical_generation_session_pins;
+            DROP TABLE logical_library_head;
+            DROP TABLE logical_message_page_sources;
+            DROP TABLE logical_peer_common_bases;
+            DROP TABLE logical_record_dependencies;
+            DROP TABLE logical_record_heads;
+            DROP TABLE logical_sync_generations;
             PRAGMA user_version = 7;
             "#,
         )

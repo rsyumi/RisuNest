@@ -1,4 +1,4 @@
-use super::{StoreError, StoreResult};
+use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
@@ -27,7 +27,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
         5 => migrate_v5(connection),
         6 => migrate_v6_or_v7_to_v9(connection, true),
         7 => migrate_v6_or_v7_to_v9(connection, false),
-        8 => migrate_v8(connection),
+        8 => migrate_v8_to_v9(connection),
         SCHEMA_VERSION => Ok(()),
         _ => Err(StoreError::Store {
             message: format!("unsupported persistent schema version {version}"),
@@ -36,9 +36,9 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 }
 
 fn create_v9(connection: &mut Connection) -> StoreResult<()> {
-    connection.execute_batch(
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
         "
-        BEGIN IMMEDIATE;
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE app_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE snapshot_leases (
@@ -178,10 +178,28 @@ fn create_v9(connection: &mut Connection) -> StoreResult<()> {
             PRIMARY KEY (generation, key)
         );
         CREATE INDEX cold_aliases_generation ON cold_aliases (generation);
-        PRAGMA user_version = 9;
-        COMMIT;
         ",
     )?;
+    finish_v9_migration(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v8_to_v9(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    create_asset_repository_authority(&transaction)?;
+    finish_v9_migration(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn finish_v9_migration(transaction: &Transaction<'_>) -> StoreResult<()> {
+    logical_schema::create_logical_schema_strict(transaction).map_err(|error| {
+        StoreError::Store {
+            message: error.to_string(),
+        }
+    })?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -191,7 +209,7 @@ fn migrate_v5(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    finish_v9_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -353,7 +371,7 @@ fn migrate_v6_or_v7_to_v9(
     }
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    finish_v9_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -392,7 +410,7 @@ fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    finish_v9_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -417,7 +435,7 @@ fn migrate_v2(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    finish_v9_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -430,7 +448,7 @@ fn migrate_v3(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    finish_v9_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -443,7 +461,7 @@ fn migrate_v4(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    finish_v9_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
