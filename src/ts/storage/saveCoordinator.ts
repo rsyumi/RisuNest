@@ -1,4 +1,4 @@
-import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
+import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
 import type {
     CharacterDetail,
     ConversationMutation,
@@ -114,6 +114,11 @@ interface PendingConversationMutation {
     event: ActiveConversationMutationEvent
 }
 
+interface ConversationMutationProjection {
+    exactMutations: ConversationMutation[] | null
+    coveredPending: PendingConversationMutation[]
+}
+
 function canonicalize(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(canonicalize)
     if (value && typeof value === 'object') {
@@ -131,6 +136,34 @@ function canonicalize(value: unknown): unknown {
 
 export function canonicalJson(value: unknown): string {
     return JSON.stringify(canonicalize(value))
+}
+
+function messageMatchesAfterIdNormalization(
+    projected: Message,
+    captured: Message,
+): boolean {
+    if (canonicalJson(projected) === canonicalJson(captured)) return true
+    if (projected.chatId !== undefined || typeof captured.chatId !== 'string' || !captured.chatId) {
+        return false
+    }
+    const capturedWithoutId = safeStructuredClone(captured)
+    delete capturedWithoutId.chatId
+    return canonicalJson(projected) === canonicalJson(capturedWithoutId)
+}
+
+function conversationMatchesAfterIdNormalization(
+    projected: Chat,
+    captured: Chat,
+): boolean {
+    const { message: projectedMessages, ...projectedMetadata } = projected
+    const { message: capturedMessages, ...capturedMetadata } = captured
+    return (
+        canonicalJson(projectedMetadata) === canonicalJson(capturedMetadata) &&
+        projectedMessages.length === capturedMessages.length &&
+        projectedMessages.every((message, index) =>
+            messageMatchesAfterIdNormalization(message, capturedMessages[index]),
+        )
+    )
 }
 
 function canonicalClone<T>(value: T): T {
@@ -1857,10 +1890,11 @@ export class SaveCoordinator {
             const detached =
                 !captured.character || selectionSwitched ? this.captureDetachedCharacter() : null
             const addition = this.capturePendingAddition()
-            const recordedConversations = this.recordedConversationMutations(
+            const conversationProjection = this.projectConversationMutations(
                 captured,
                 pendingConversationMutations,
             )
+            const recordedConversations = conversationProjection?.exactMutations ?? null
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
             if (
@@ -1945,14 +1979,19 @@ export class SaveCoordinator {
                         addition.pending.baseline = captured.characterCanonical!
                     }
                 }
+                const committedConversationKeys = new Set(
+                    (commit.conversations ?? []).map(
+                        (mutation) => `${mutation.characterId}\u0000${mutation.conversationId}`,
+                    ),
+                )
+                const replacedCharacterId = commit.replaceCharacter?.chaId
                 const persistedConversationMutations =
-                    recordedConversations !== null &&
-                    commit.conversations === recordedConversations &&
-                    captured.character
-                        ? pendingConversationMutations.filter(
-                            ({ event }) => event.characterId === captured.character!.chaId,
-                        )
-                        : []
+                    conversationProjection?.coveredPending.filter(({ event }) =>
+                        event.characterId === replacedCharacterId ||
+                        committedConversationKeys.has(
+                            `${event.characterId}\u0000${event.conversationId}`,
+                        ),
+                    ) ?? []
                 if (persistedConversationMutations.length > 0) {
                     this.acknowledgeConversationMutations(
                         persistedConversationMutations,
@@ -2439,10 +2478,10 @@ export class SaveCoordinator {
         this.characterBaselineId = captured.character?.chaId ?? null
     }
 
-    private recordedConversationMutations(
+    private projectConversationMutations(
         captured: CapturedState,
         pending: readonly PendingConversationMutation[],
-    ): ConversationMutation[] | null {
+    ): ConversationMutationProjection | null {
         if (
             pending.length === 0 ||
             !captured.character ||
@@ -2451,62 +2490,118 @@ export class SaveCoordinator {
         ) return null
 
         const projected = JSON.parse(this.characterBaseline) as CompleteCharacter
-        const mutations: ConversationMutation[] = []
-        const sessionVersions = new Map<string, {
-            sessionToken: ConversationSessionToken
-            sessionVersion: number
-        }>()
-        for (const { event } of pending) {
-            if (event.characterId !== projected.chaId) continue
-            const conversation = projected.chats.find(
-                (candidate) => candidate.id === event.conversationId,
+        const relevantPending = pending.filter(
+            ({ event }) => event.characterId === projected.chaId,
+        )
+        if (relevantPending.length === 0) return null
+        const pendingByConversation = new Map<string, PendingConversationMutation[]>()
+        for (const pendingMutation of relevantPending) {
+            const conversationPending = pendingByConversation.get(
+                pendingMutation.event.conversationId,
+            ) ?? []
+            conversationPending.push(pendingMutation)
+            pendingByConversation.set(pendingMutation.event.conversationId, conversationPending)
+        }
+
+        const coveredSet = new Set<PendingConversationMutation>()
+        const mutationsByPending = new Map<
+            PendingConversationMutation,
+            ConversationMutation[]
+        >()
+        for (const [conversationId, conversationPending] of pendingByConversation) {
+            if (captured.conversationStubIds.has(conversationId)) continue
+            const projectedMatches = projected.chats.filter(
+                (candidate) => candidate.id === conversationId,
             )
-            if (!conversation || !Array.isArray(conversation.message)) return null
-            const previous = sessionVersions.get(event.conversationId)
-            if (previous) {
+            const capturedMatches = captured.character.chats.filter(
+                (candidate) => candidate.id === conversationId,
+            )
+            if (projectedMatches.length !== 1 || capturedMatches.length !== 1) continue
+            const projectedIndex = projected.chats.indexOf(projectedMatches[0])
+            let conversation = safeStructuredClone(projectedMatches[0])
+            if (!Array.isArray(conversation.message)) continue
+
+            let previousEvent: ActiveConversationMutationEvent | undefined
+            let coveredCount = 0
+            let coveredConversation: Chat | undefined
+            const conversationMutations: ConversationMutation[][] = []
+            for (const pendingMutation of conversationPending) {
+                const { event } = pendingMutation
+                const previous = previousEvent
                 const continuesSession =
+                    previous !== undefined &&
                     previous.sessionToken === event.sessionToken &&
                     previous.sessionVersion === event.previousVersion
                 const startsReplacementSession =
+                    previous !== undefined &&
                     previous.sessionToken !== event.sessionToken &&
                     event.previousVersion === 0
-                if (!continuesSession && !startsReplacementSession) return null
-            }
-            sessionVersions.set(event.conversationId, {
-                sessionToken: event.sessionToken,
-                sessionVersion: event.sessionVersion,
-            })
+                if (previous && !continuesSession && !startsReplacementSession) break
 
-            const conversationMetadata = safeStructuredClone(event.conversation) as Omit<Chat, 'message'>
-            for (const range of event.mutations) {
-                if (
-                    range.start > conversation.message.length ||
-                    range.deleteCount > conversation.message.length - range.start
-                ) return null
-                const messages = safeStructuredClone(range.messages)
-                conversation.message.splice(range.start, range.deleteCount, ...messages)
-                mutations.push({
-                    type: 'replace-range',
-                    characterId: event.characterId,
-                    conversationId: event.conversationId,
-                    start: range.start,
-                    deleteCount: range.deleteCount,
-                    messages,
-                    conversation: safeStructuredClone(conversationMetadata),
-                })
+                const eventMutations: ConversationMutation[] = []
+                const conversationMetadata = safeStructuredClone(
+                    event.conversation,
+                ) as Omit<Chat, 'message'>
+                let valid = true
+                for (const range of event.mutations) {
+                    if (
+                        range.start > conversation.message.length ||
+                        range.deleteCount > conversation.message.length - range.start
+                    ) {
+                        valid = false
+                        break
+                    }
+                    const messages = safeStructuredClone(range.messages)
+                    conversation.message.splice(range.start, range.deleteCount, ...messages)
+                    eventMutations.push({
+                        type: 'replace-range',
+                        characterId: event.characterId,
+                        conversationId: event.conversationId,
+                        start: range.start,
+                        deleteCount: range.deleteCount,
+                        messages,
+                        conversation: safeStructuredClone(conversationMetadata),
+                    })
+                }
+                if (!valid) break
+                const target = conversation as unknown as Record<string, unknown>
+                const metadata = event.conversation as Record<string, unknown>
+                for (const key of Object.keys(target)) {
+                    if (key !== 'message' && !Object.hasOwn(metadata, key)) delete target[key]
+                }
+                for (const [key, value] of Object.entries(metadata)) {
+                    if (key !== 'message') target[key] = safeStructuredClone(value)
+                }
+                conversationMutations.push(eventMutations)
+                previousEvent = event
+                if (conversationMatchesAfterIdNormalization(conversation, capturedMatches[0])) {
+                    coveredCount = conversationMutations.length
+                    coveredConversation = safeStructuredClone(conversation)
+                }
             }
-            const target = conversation as unknown as Record<string, unknown>
-            const metadata = event.conversation as Record<string, unknown>
-            for (const key of Object.keys(target)) {
-                if (key !== 'message' && !Object.hasOwn(metadata, key)) delete target[key]
-            }
-            for (const [key, value] of Object.entries(metadata)) {
-                if (key !== 'message') target[key] = safeStructuredClone(value)
+            if (coveredCount === 0 || !coveredConversation) continue
+            conversation = coveredConversation
+            projected.chats[projectedIndex] = conversation
+            for (let index = 0; index < coveredCount; index++) {
+                const pendingMutation = conversationPending[index]
+                coveredSet.add(pendingMutation)
+                mutationsByPending.set(pendingMutation, conversationMutations[index])
             }
         }
-        return mutations.length > 0 && canonicalJson(projected) === captured.characterCanonical
-            ? mutations
-            : null
+        const coveredPending = relevantPending.filter((pendingMutation) =>
+            coveredSet.has(pendingMutation),
+        )
+        const mutations = coveredPending.flatMap(
+            (pendingMutation) => mutationsByPending.get(pendingMutation) ?? [],
+        )
+        return {
+            exactMutations:
+                mutations.length > 0 &&
+                canonicalJson(projected) === captured.characterCanonical
+                    ? mutations
+                    : null,
+            coveredPending,
+        }
     }
 
     private acknowledgeConversationMutations(
