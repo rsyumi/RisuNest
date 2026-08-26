@@ -49,6 +49,7 @@ struct Sample {
     release_revision_us: u64,
     export_total_us: u64,
     export_traversal_json_bytes: u64,
+    export_traversal_sha256: String,
     snapshot_vacuum_duration_ms: u64,
     snapshot_us: u64,
     snapshot_bytes: u64,
@@ -392,11 +393,35 @@ fn assert_fixture_shape(
     );
 }
 
+struct FramedJsonDigest {
+    hasher: Sha256,
+}
+
+impl FramedJsonDigest {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn update(&mut self, value: &Value) -> u64 {
+        let bytes = serde_json::to_vec(value).expect("serialize export fragment");
+        self.hasher.update((bytes.len() as u64).to_le_bytes());
+        self.hasher.update(&bytes);
+        bytes.len() as u64
+    }
+
+    fn finish(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
+}
+
 struct ExportTraversal {
     acquire_revision_us: u64,
     traversal_us: u64,
     release_revision_us: u64,
     json_bytes: u64,
+    sha256: String,
 }
 
 fn export_traversal(store: &mut PersistentStore) -> ExportTraversal {
@@ -407,9 +432,8 @@ fn export_traversal(store: &mut PersistentStore) -> ExportTraversal {
         .expect("acquire export revision");
     let acquire_revision_us = elapsed_us(acquire_started);
     let traversal_started = Instant::now();
-    let mut bytes = serde_json::to_vec(&store.read_root(Some(&lease.lease)).unwrap().value)
-        .unwrap()
-        .len() as u64;
+    let mut digest = FramedJsonDigest::new();
+    let mut bytes = digest.update(&store.read_root(Some(&lease.lease)).unwrap().value);
     let mut character_count = 0;
     let mut conversation_count = 0;
     let mut message_count = 0;
@@ -470,7 +494,7 @@ fn export_traversal(store: &mut PersistentStore) -> ExportTraversal {
                     }
                 }
                 detail["chats"] = Value::Array(serialized_conversations);
-                bytes += serde_json::to_vec(&detail).unwrap().len() as u64;
+                bytes += digest.update(&detail);
             }
             character_cursor = page.next_cursor;
             if character_cursor.is_none() {
@@ -497,6 +521,7 @@ fn export_traversal(store: &mut PersistentStore) -> ExportTraversal {
         traversal_us,
         release_revision_us: elapsed_us(release_started),
         json_bytes: bytes,
+        sha256: digest.finish(),
     }
 }
 
@@ -649,6 +674,7 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
         release_revision_us: export_traversal.release_revision_us,
         export_total_us,
         export_traversal_json_bytes: export_traversal.json_bytes,
+        export_traversal_sha256: export_traversal.sha256,
         snapshot_vacuum_duration_ms: snapshot.duration_ms,
         snapshot_us,
         snapshot_bytes: snapshot.bytes,
@@ -976,6 +1002,9 @@ fn phase3_step5_measurements() {
         STRESS_TEXT_BYTES,
     );
     let serialized = serde_json::to_vec(&database).expect("serialize save-large fixture");
+    if let Ok(path) = std::env::var("RISUNEST_PHASE3_FIXTURE_OUTPUT") {
+        std::fs::write(path, &serialized).expect("write save-large fixture");
+    }
     let root = root_without_characters(&database);
     let stress_chat_json_bytes =
         serde_json::to_vec(&database["characters"][0]["chats"][CHATS_PER_CHARACTER])
@@ -1021,7 +1050,25 @@ fn phase3_step5_measurements() {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_save_large, nearest_rank, sha256_hex};
+    use super::{generate_save_large, nearest_rank, sha256_hex, FramedJsonDigest};
+    use serde_json::json;
+
+    #[test]
+    fn framed_export_digest_is_stable_and_preserves_fragment_boundaries() {
+        let digest = |values: &[serde_json::Value]| {
+            let mut digest = FramedJsonDigest::new();
+            for value in values {
+                digest.update(value);
+            }
+            digest.finish()
+        };
+
+        assert_eq!(
+            digest(&[json!({ "a": 1 }), json!([2, 3])]),
+            digest(&[json!({ "a": 1 }), json!([2, 3]),])
+        );
+        assert_ne!(digest(&[json!([1]), json!([2])]), digest(&[json!([1, 2])]));
+    }
 
     #[test]
     fn sha256_identity_is_lowercase_and_stable() {

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
@@ -12,12 +13,36 @@ const DEFAULT_FIXTURE_BYTES = 64 * 1024 * 1024
 const TEMP_PREFIX = 'risunest-phase3-tauri-'
 const CDP_HOST = '127.0.0.1'
 
+export function parseSaveLargeFixture(serialized) {
+    const database = JSON.parse(serialized.toString('utf8'))
+    if (!Array.isArray(database.characters)) {
+        throw new Error('Save-large fixture must contain a characters array')
+    }
+    const conversations = database.characters.flatMap((character) => character.chats ?? [])
+    const totalMessages = conversations.reduce(
+        (total, conversation) => total + (conversation.message?.length ?? 0),
+        0,
+    )
+    return {
+        database,
+        description: {
+            kind: 'phase3-step5-save-large',
+            serializedBytes: serialized.length,
+            serializedSha256: createHash('sha256').update(serialized).digest('hex'),
+            characters: database.characters.length,
+            totalConversations: conversations.length,
+            totalMessages,
+        },
+    }
+}
+
 export function parseArguments(argumentsList) {
     const options = {
         output: null,
         keepProfile: false,
         timeoutMs: DEFAULT_TIMEOUT_MS,
         fixtureBytes: DEFAULT_FIXTURE_BYTES,
+        saveLargeFixture: null,
     }
 
     for (let index = 0; index < argumentsList.length; index += 1) {
@@ -31,6 +56,8 @@ export function parseArguments(argumentsList) {
         } else if (argument === '--padding-mib') {
             const mebibytes = positiveInteger(requiredValue(argumentsList, ++index, argument), argument)
             options.fixtureBytes = mebibytes * 1024 * 1024
+        } else if (argument === '--save-large-fixture') {
+            options.saveLargeFixture = requiredValue(argumentsList, ++index, argument)
         } else if (argument === '--help' || argument === '-h') {
             return { help: true }
         } else {
@@ -55,8 +82,12 @@ function positiveInteger(value, option) {
     return parsed
 }
 
-export function buildBenchmarkConfig(original, port, runId) {
+export function buildBenchmarkConfig(original, port, runId, sourceRevision) {
     const safeRunId = runId.replaceAll(/[^a-zA-Z0-9]/g, '')
+    if (!/^[0-9a-f]{40}$/.test(sourceRevision)) {
+        throw new Error('Tauri benchmark source revision must be a full Git commit SHA')
+    }
+    const revisionSegment = `r${sourceRevision.slice(0, 12)}`
     const browserArguments = [
         `--remote-debugging-port=${port}`,
         '--remote-allow-origins=*',
@@ -74,7 +105,7 @@ export function buildBenchmarkConfig(original, port, runId) {
 
     return {
         ...structuredClone(original),
-        identifier: `co.aiclient.risu.phase3benchmark.${safeRunId}`,
+        identifier: `co.aiclient.risu.phase3benchmark.${revisionSegment}.${safeRunId}`,
         bundle: {
             ...original.bundle,
             active: false,
@@ -243,6 +274,21 @@ async function runCommand(command, args, options) {
     if (exitCode !== 0) throw new Error(`${command} exited with code ${exitCode}`)
 }
 
+async function captureCommand(command, args, cwd) {
+    const child = spawn(command, args, {
+        cwd,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    const [exitCode] = await once(child, 'exit')
+    if (exitCode !== 0) throw new Error(`${command} failed: ${stderr.trim()}`)
+    return stdout.trim()
+}
+
 async function waitForCdp(port, timeoutMs) {
     const deadline = Date.now() + timeoutMs
     let lastError
@@ -396,6 +442,58 @@ function explicitImportExpression(fixtureBytes) {
     })()`
 }
 
+async function invokeTauri(page, command, argumentsValue = {}) {
+    return evaluate(
+        page,
+        `globalThis.__TAURI_INTERNALS__.invoke(${JSON.stringify(command)}, ${JSON.stringify(argumentsValue)})`,
+    )
+}
+
+function characterBatches(characters, maximumBytes = 4 * 1024 * 1024) {
+    const batches = []
+    let batch = []
+    let batchBytes = 2
+    for (const character of characters) {
+        const characterBytes = Buffer.byteLength(JSON.stringify(character))
+        const separatorBytes = batch.length > 0 ? 1 : 0
+        if (batch.length > 0 && batchBytes + separatorBytes + characterBytes > maximumBytes) {
+            batches.push(batch)
+            batch = []
+            batchBytes = 2
+        }
+        batch.push(character)
+        batchBytes += (batch.length > 1 ? 1 : 0) + characterBytes
+    }
+    if (batch.length > 0) batches.push(batch)
+    return batches
+}
+
+async function stageSaveLargeFixture(page, database) {
+    const startedAt = await evaluate(page, 'performance.now()')
+    const { stagingId } = await invokeTauri(page, 'pds_replace_begin')
+    try {
+        const root = structuredClone(database)
+        delete root.characters
+        await invokeTauri(page, 'pds_replace_put_root', { stagingId, root })
+        await invokeTauri(page, 'pds_replace_put_presets', {
+            stagingId,
+            presets: database.botPresets,
+        })
+        for (const characters of characterBatches(database.characters)) {
+            await invokeTauri(page, 'pds_replace_add_characters', { stagingId, characters })
+        }
+        const committed = await invokeTauri(page, 'pds_replace_commit', { stagingId })
+        return {
+            startedAt,
+            endedAt: await evaluate(page, 'performance.now()'),
+            committed,
+        }
+    } catch (error) {
+        await invokeTauri(page, 'pds_replace_abort', { stagingId }).catch(() => {})
+        throw error
+    }
+}
+
 const INSTALL_LONG_TASK_OBSERVER = `(() => {
     globalThis.__risuPhase3LongTasks = []
     globalThis.__risuPhase3LongTaskSupported = PerformanceObserver.supportedEntryTypes.includes('longtask')
@@ -510,6 +608,10 @@ function assertSafeTemporaryDirectory(directory) {
 async function runBenchmark(options) {
     if (process.platform !== 'win32') throw new Error('This benchmark supports Windows only')
     const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+    const sourceRevision = await captureCommand('git.exe', ['rev-parse', 'HEAD'], repositoryRoot)
+    const saveLargeFixture = options.saveLargeFixture
+        ? parseSaveLargeFixture(await readFile(path.resolve(options.saveLargeFixture)))
+        : null
     const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), TEMP_PREFIX))
     const runId = path.basename(temporaryRoot).slice(TEMP_PREFIX.length)
     const isolatedRoaming = path.join(temporaryRoot, 'roaming')
@@ -529,7 +631,7 @@ async function runBenchmark(options) {
             path.join(repositoryRoot, 'src-tauri', 'tauri.conf.json'),
             'utf8',
         ))
-        const benchmarkConfig = buildBenchmarkConfig(baseConfig, port, runId)
+        const benchmarkConfig = buildBenchmarkConfig(baseConfig, port, runId, sourceRevision)
         const configPath = path.join(temporaryRoot, 'tauri.phase3-benchmark.json')
         await writeFile(configPath, JSON.stringify(benchmarkConfig), 'utf8')
         const benchmarkEnvironment = {
@@ -574,7 +676,9 @@ async function runBenchmark(options) {
         const boot = await collectBootEvidence(page)
         const bootMemory = await captureMemory('boot-interactive', page, browser, appProcess.pid)
         const imported = await observeOperation(
-            () => evaluate(page, explicitImportExpression(options.fixtureBytes)),
+            () => saveLargeFixture
+                ? stageSaveLargeFixture(page, saveLargeFixture.database)
+                : evaluate(page, explicitImportExpression(options.fixtureBytes)),
             (label) => captureMemory(`import-${label}`, page, browser, appProcess.pid),
         )
         await evaluate(page, INSTALL_LONG_TASK_OBSERVER)
@@ -605,10 +709,11 @@ async function runBenchmark(options) {
             build: {
                 release: true,
                 realmDisabled: true,
+                sourceRevision,
                 identifier: benchmarkConfig.identifier,
                 isolatedProfile: true,
             },
-            fixture: {
+            fixture: saveLargeFixture?.description ?? {
                 kind: 'explicit-staged-native-root-padding',
                 bytes: options.fixtureBytes,
                 deterministicByte: 'r',
@@ -637,7 +742,9 @@ async function runBenchmark(options) {
             gates: { g6 },
             limits: [
                 'The setup is a benchmark-only explicit staged import through existing Tauri commands, not public file-picker UI automation.',
-                'The deterministic 64 MiB root padding stresses SQLite import, IPC, snapshot duration, and memory, but it is not the full save-large domain fixture.',
+                saveLargeFixture
+                    ? 'The staged import uses the serialized Phase 3 save-large fixture supplied by the Roadmap 14 runner.'
+                    : 'The deterministic root padding is not the full save-large domain fixture.',
                 'Boot memory is the isolated fresh-install baseline before the explicit import.',
                 'G6 covers WebView main-thread long tasks overlapping pds_snapshot_create on Windows release Tauri only.',
                 'Windows working-set samples include the Tauri process and CDP-reported WebView processes; sampling can miss very short peaks.',
@@ -666,6 +773,7 @@ function usage() {
         '',
         'Options:',
         '  --padding-mib <integer>   Explicit import padding, default 64.',
+        '  --save-large-fixture <path>  Stage an exact serialized Phase 3 save-large fixture.',
         '  --timeout-ms <integer>    CDP and boot timeout, default 120000.',
         '  --output <path>           Also write the JSON result to this path.',
         '  --keep-profile            Keep the isolated temporary profile.',

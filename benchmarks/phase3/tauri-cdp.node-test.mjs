@@ -6,10 +6,32 @@ import {
     benchmarkAppDataDirectory,
     buildBenchmarkConfig,
     parseArguments,
+    parseSaveLargeFixture,
     summarizeUiEvidence,
     summarizeG6,
     tauriBuildInvocation,
 } from './tauri-cdp.mjs'
+
+test('parseSaveLargeFixture derives identity and shape from serialized fixture bytes', () => {
+    const serialized = Buffer.from(JSON.stringify({
+        characters: [
+            { chats: [{ message: [{ data: 'a' }, { data: 'b' }] }] },
+            { chats: [{ message: [{ data: 'c' }] }, { message: [] }] },
+        ],
+    }))
+
+    const parsed = parseSaveLargeFixture(serialized)
+
+    assert.deepEqual(parsed.description, {
+        kind: 'phase3-step5-save-large',
+        serializedBytes: serialized.length,
+        serializedSha256: '1a5cdea8a35fe9893cecd02a2117125ba0bec26b3fbb0c2f90bc5b10c6fddae3',
+        characters: 2,
+        totalConversations: 3,
+        totalMessages: 3,
+    })
+    assert.equal(parsed.database.characters.length, 2)
+})
 
 test('summarizeUiEvidence counts mounted messages and unique live resource URLs', () => {
     assert.deepEqual(
@@ -41,9 +63,14 @@ test('buildBenchmarkConfig isolates the Tauri identifier and WebView profile', (
         },
     }
 
-    const config = buildBenchmarkConfig(original, 9333, 'run-123')
+    const config = buildBenchmarkConfig(
+        original,
+        9333,
+        'run-123',
+        '742fb370742fb370742fb370742fb370742fb370',
+    )
 
-    assert.equal(config.identifier, 'co.aiclient.risu.phase3benchmark.run123')
+    assert.equal(config.identifier, 'co.aiclient.risu.phase3benchmark.r742fb370742f.run123')
     assert.equal(config.bundle.active, false)
     assert.equal(config.app.windows[0].dataDirectory, 'phase3-benchmark-run-123')
     assert.match(config.app.windows[0].additionalBrowserArgs, /--remote-debugging-port=9333/)
@@ -58,6 +85,7 @@ test('parseArguments defaults to the documented release measurement', () => {
         keepProfile: false,
         timeoutMs: 120_000,
         fixtureBytes: 64 * 1024 * 1024,
+        saveLargeFixture: null,
     })
 
     assert.deepEqual(
@@ -69,12 +97,15 @@ test('parseArguments defaults to the documented release measurement', () => {
             '90000',
             '--padding-mib',
             '96',
+            '--save-large-fixture',
+            'save-large.json',
         ]),
         {
             output: 'result.json',
             keepProfile: true,
             timeoutMs: 90_000,
             fixtureBytes: 96 * 1024 * 1024,
+            saveLargeFixture: 'save-large.json',
         },
     )
 })
