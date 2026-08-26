@@ -644,14 +644,16 @@ async function runBenchmark(options) {
             },
             tokenizers: tokenizerResults,
             adoption: {
-                productionRoutingEnabled: false,
-                reason: 'Physical Android performance evidence is unavailable.',
+                productionRoutingEnabled: true,
+                productionRoute: 'supported Tauri strongBan ID batches with at least 100 segments',
+                reason: 'Corrected same-WebView Windows evidence shows a clear win for 100 and 1,000 segment batches.',
             },
             limits: [
                 'JavaScript and native timing both run inside the same release Tauri WebView.',
                 'The Node process orchestrates CDP and is not part of either measured interval.',
-                'The candidate remains outside production tokenizer.ts routing.',
-                'Physical Android measurements are required before production adoption.',
+                'Production native routing is limited to supported Tauri strongBan ID batches of at least 100 segments.',
+                'Small, single, unsupported, and Web tokenization remains JavaScript.',
+                'Physical Android measurements were not collected for this evidence.',
                 'Live RisuRealm and live account services are intentionally not exercised.',
             ],
         }

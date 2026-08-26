@@ -95,7 +95,7 @@ describe('strong ban native batch routing', () => {
     })
 
     it('preserves the JavaScript error and partial bias mutation on native failure', async () => {
-        const input = '<|endoftext|>'
+        const input = '<|ENDOFTEXT|>'
         const baselineBias: Record<number, number> = {}
         harness.nativeBatch.mockResolvedValueOnce(null)
         let baselineError: unknown
@@ -104,6 +104,7 @@ describe('strong ban native batch routing', () => {
         } catch (error) {
             baselineError = error
         }
+        expect(Object.keys(baselineBias).length).toBeGreaterThan(0)
         localStorage.clear()
         const fallbackBias: Record<number, number> = {}
         harness.nativeBatch.mockRejectedValueOnce(new Error('native boundary failed'))
