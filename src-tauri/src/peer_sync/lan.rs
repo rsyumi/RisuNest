@@ -705,11 +705,12 @@ fn read_request(
             Ok(0) => return Err(RequestReadError::Http(400)),
             Ok(read) => head_len += read,
             Err(error) if is_timeout(&error) => {
-                return if stopped.load(Ordering::SeqCst) {
-                    Err(RequestReadError::Stopped)
-                } else {
-                    Err(RequestReadError::Http(408))
-                };
+                if stopped.load(Ordering::SeqCst) {
+                    return Err(RequestReadError::Stopped);
+                }
+                if request_started.elapsed() >= REQUEST_READ_DEADLINE {
+                    return Err(RequestReadError::Http(408));
+                }
             }
             Err(error) => return Err(RequestReadError::Io(error)),
         }
@@ -793,11 +794,12 @@ fn read_request(
             Ok(0) => return Err(RequestReadError::Http(400)),
             Ok(read) => body.extend_from_slice(&buffer[..read]),
             Err(error) if is_timeout(&error) => {
-                return if stopped.load(Ordering::SeqCst) {
-                    Err(RequestReadError::Stopped)
-                } else {
-                    Err(RequestReadError::Http(408))
-                };
+                if stopped.load(Ordering::SeqCst) {
+                    return Err(RequestReadError::Stopped);
+                }
+                if request_started.elapsed() >= REQUEST_READ_DEADLINE {
+                    return Err(RequestReadError::Http(408));
+                }
             }
             Err(error) => return Err(RequestReadError::Io(error)),
         }

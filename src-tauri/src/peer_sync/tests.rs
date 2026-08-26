@@ -973,6 +973,54 @@ fn lan_server_applies_an_overall_request_deadline_to_trickled_headers() {
 }
 
 #[test]
+fn lan_server_tolerates_read_poll_timeouts_within_the_overall_deadline() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
+
+    thread::sleep(Duration::from_millis(350));
+    write!(
+        stream,
+        "GET /v1/sessions/{}/manifest HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        pairing.session_id
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 401 "),
+        "request inside the overall deadline was rejected: {response:?}"
+    );
+
+    let body = json!({ "claim": pairing.claim }).to_string();
+    let mut body_stream =
+        TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
+    write!(
+        body_stream,
+        "POST /v1/sessions/{}/claim HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+        pairing.session_id,
+        body.len()
+    )
+    .unwrap();
+    body_stream.flush().unwrap();
+    thread::sleep(Duration::from_millis(350));
+    body_stream.write_all(body.as_bytes()).unwrap();
+    body_stream.flush().unwrap();
+    let mut body_response = String::new();
+    body_stream.read_to_string(&mut body_response).unwrap();
+    assert!(
+        body_response.starts_with("HTTP/1.1 200 "),
+        "request body inside the overall deadline was rejected: {body_response:?}"
+    );
+    host.stop().unwrap();
+}
+
+#[test]
 fn lan_client_bounds_an_incomplete_oversized_claim_response() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
