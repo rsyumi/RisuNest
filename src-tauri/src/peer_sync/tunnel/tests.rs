@@ -173,7 +173,7 @@ fn peer(state: &Arc<Mutex<FakeState>>, id: u64) -> FakePeerSession {
     }
 }
 
-fn expect_failure<P: TunnelProcess, S>(
+fn expect_failure<P: TunnelProcess, S: PeerSession>(
     result: Result<RunningTunnel, TunnelStartFailure<P, S>>,
 ) -> TunnelStartFailure<P, S> {
     match result {
@@ -182,7 +182,7 @@ fn expect_failure<P: TunnelProcess, S>(
     }
 }
 
-fn expect_running<P: TunnelProcess, S>(
+fn expect_running<P: TunnelProcess, S: PeerSession>(
     result: Result<RunningTunnel, TunnelStartFailure<P, S>>,
 ) -> RunningTunnel {
     match result {
@@ -191,7 +191,7 @@ fn expect_running<P: TunnelProcess, S>(
     }
 }
 
-fn expect_peer<P: TunnelProcess, S>(failure: TunnelStartFailure<P, S>) -> S {
+fn expect_peer<P: TunnelProcess, S: PeerSession>(failure: TunnelStartFailure<P, S>) -> S {
     match failure.into_peer_session() {
         Ok(peer) => peer,
         Err(_) => panic!("expected peer session ownership"),
@@ -388,6 +388,32 @@ fn discovery_failure_returns_peer_session_for_lan_fallback() {
 }
 
 #[test]
+fn dropping_discovery_failure_retries_owned_peer_revoke() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let adapter = TunnelAdapter::new(
+        FakeDiscovery {
+            executable: None,
+            error: Some(TunnelError::CloudflaredNotInstalled),
+        },
+        FakeLauncher {
+            state: Arc::clone(&state),
+            launch_error: None,
+            process: Mutex::new(None),
+        },
+    );
+    let mut owned_peer = peer(&state, 54);
+    owned_peer.revoke_results = VecDeque::from([Err("first revoke failed".into()), Ok(())]);
+
+    drop(expect_failure(adapter.start(
+        TunnelMode::Quick,
+        32145,
+        owned_peer,
+    )));
+
+    assert_eq!(state.lock().unwrap().session_revokes, 2);
+}
+
+#[test]
 fn launch_failure_returns_peer_session_without_exposing_a_token() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let adapter = TunnelAdapter::new(
@@ -410,6 +436,40 @@ fn launch_failure_returns_peer_session_without_exposing_a_token() {
     assert_eq!(returned.id, 42);
     let launches = &state.lock().unwrap().launches;
     assert!(!launches[0].1.iter().any(|arg| arg == "--token"));
+}
+
+#[test]
+fn dropping_launch_failure_bounds_owned_peer_revoke() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let adapter = TunnelAdapter::new(
+        FakeDiscovery {
+            executable: Some(VerifiedExecutable(PathBuf::from(
+                "C:/Program Files/cloudflared/cloudflared.exe",
+            ))),
+            error: None,
+        },
+        FakeLauncher {
+            state: Arc::clone(&state),
+            launch_error: Some("launch failed".into()),
+            process: Mutex::new(None),
+        },
+    );
+
+    let mut owned_peer = peer(&state, 55);
+    owned_peer.revoke_results = VecDeque::from([
+        Err("revoke failed 1".into()),
+        Err("revoke failed 2".into()),
+        Err("revoke failed 3".into()),
+        Err("must not be attempted".into()),
+    ]);
+
+    drop(expect_failure(adapter.start(
+        TunnelMode::Quick,
+        32145,
+        owned_peer,
+    )));
+
+    assert_eq!(state.lock().unwrap().session_revokes, 3);
 }
 
 #[test]
@@ -487,6 +547,38 @@ fn dropping_failed_start_retries_child_cleanup_automatically() {
     let state = state.lock().unwrap();
     assert_eq!(state.stop_timeouts.len(), 3);
     assert_eq!(state.process_drops, 1);
+}
+
+#[test]
+fn dropping_readiness_failure_cleans_process_and_peer_independently() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let mut process = fake_process(
+        &state,
+        Err(TunnelError::Readiness {
+            reason: "early exit".into(),
+            output: "bounded output".into(),
+        }),
+    );
+    process.stop_results = VecDeque::from([
+        Err("startup stop failed".into()),
+        Err("drop stop failed 1".into()),
+        Err("drop stop failed 2".into()),
+        Err("drop stop failed 3".into()),
+    ]);
+    let mut owned_peer = peer(&state, 56);
+    owned_peer.revoke_results = VecDeque::from([Err("first revoke failed".into()), Ok(())]);
+
+    drop(expect_failure(adapter(&state, process).start(
+        TunnelMode::Quick,
+        32145,
+        owned_peer,
+    )));
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.stop_timeouts.len(), 4);
+    assert_eq!(state.session_revokes, 2);
+    assert_eq!(state.process_drops, 1);
+    assert_eq!(state.peer_session_drops, 1);
 }
 
 #[test]

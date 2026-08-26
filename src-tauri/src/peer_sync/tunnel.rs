@@ -539,14 +539,14 @@ fn configure_no_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn configure_no_window(_command: &mut Command) {}
 
-struct TunnelStartFailure<P: TunnelProcess, S> {
+struct TunnelStartFailure<P: TunnelProcess, S: PeerSession> {
     error: TunnelError,
     process: Option<P>,
     peer_session: Option<S>,
     process_cleanup_error: Option<String>,
 }
 
-impl<P: TunnelProcess, S> TunnelStartFailure<P, S> {
+impl<P: TunnelProcess, S: PeerSession> TunnelStartFailure<P, S> {
     fn into_peer_session(mut self) -> Result<S, Self> {
         if self.process.is_none() {
             Ok(self.peer_session.take().expect("peer session is owned"))
@@ -556,7 +556,7 @@ impl<P: TunnelProcess, S> TunnelStartFailure<P, S> {
     }
 }
 
-impl<P: TunnelProcess, S> Drop for TunnelStartFailure<P, S> {
+impl<P: TunnelProcess, S: PeerSession> Drop for TunnelStartFailure<P, S> {
     fn drop(&mut self) {
         let mut stopped = false;
         if let Some(process) = &mut self.process {
@@ -570,12 +570,26 @@ impl<P: TunnelProcess, S> Drop for TunnelStartFailure<P, S> {
         if stopped {
             self.process = None;
         }
+
+        let mut revoked = false;
+        if let Some(peer_session) = &mut self.peer_session {
+            for _ in 0..DROP_CLEANUP_ATTEMPTS {
+                if peer_session.revoke().is_ok() {
+                    revoked = true;
+                    break;
+                }
+            }
+        }
+        if revoked {
+            self.peer_session = None;
+        }
     }
 }
 
 impl<P, S> TunnelStartFailure<P, S>
 where
     P: TunnelProcess,
+    S: PeerSession,
 {
     fn retry_process_stop(&mut self, timeout: Duration) -> Result<(), String> {
         let Some(process) = &mut self.process else {
