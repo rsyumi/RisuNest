@@ -30,9 +30,10 @@ function restoreStatus(
 }
 
 describe('native restore bootstrap reconciliation', () => {
-    it('reconciles persisted jobs on every Tauri target, including Android', () => {
-        expect(shouldReconcileNativeFileJobs(true)).toBe(true)
-        expect(shouldReconcileNativeFileJobs(false)).toBe(false)
+    it('reconciles persisted jobs on desktop and Android without widening to other targets', () => {
+        expect(shouldReconcileNativeFileJobs(true, false)).toBe(true)
+        expect(shouldReconcileNativeFileJobs(false, true)).toBe(true)
+        expect(shouldReconcileNativeFileJobs(false, false)).toBe(false)
     })
 
     it('waits for an active restore, finalizes staged data, and retains success for plugin reload', async () => {

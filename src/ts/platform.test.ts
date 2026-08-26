@@ -6,6 +6,7 @@ vi.mock('@tauri-apps/plugin-os', () => ({
 }))
 
 type ExpectedRuntime = {
+    isTauriAndroid: boolean
     isMobile: boolean
     isTauriMobile: boolean
     isTauriDesktop: boolean
@@ -13,18 +14,27 @@ type ExpectedRuntime = {
 
 const cases: Array<[string, boolean, string, ExpectedRuntime]> = [
     ['Android Tauri', true, 'Mozilla/5.0 (Linux; Android 14)', {
+        isTauriAndroid: true,
         isMobile: true,
         isTauriMobile: true,
         isTauriDesktop: false,
     }],
     ['Windows Tauri', true, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', {
+        isTauriAndroid: false,
         isMobile: false,
         isTauriMobile: false,
         isTauriDesktop: true,
     }],
     ['Android web', false, 'Mozilla/5.0 (Linux; Android 14)', {
+        isTauriAndroid: false,
         isMobile: true,
         isTauriMobile: false,
+        isTauriDesktop: false,
+    }],
+    ['iOS Tauri', true, 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', {
+        isTauriAndroid: false,
+        isMobile: true,
+        isTauriMobile: true,
         isTauriDesktop: false,
     }],
 ]
@@ -65,6 +75,7 @@ describe('runtime classification', () => {
         const runtime = await import('./platform')
 
         expect({
+            isTauriAndroid: runtime.isTauriAndroid,
             isMobile: runtime.isMobile,
             isTauriMobile: runtime.isTauriMobile,
             isTauriDesktop: runtime.isTauriDesktop,

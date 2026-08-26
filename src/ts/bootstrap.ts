@@ -47,7 +47,7 @@ import {
     invalidateAssetSourceCache,
     setUsingSw
 } from "./globalApi.svelte";
-import { isTauri, isTauriDesktop } from "./platform";
+import { isTauri, isTauriAndroid, isTauriDesktop } from "./platform";
 import { registerModelDynamic } from "./model/modellist";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { appDataDir, join } from "@tauri-apps/api/path";
@@ -136,7 +136,10 @@ export async function loadData() {
         }
 
         await initializePersistentStorage()
-        const recoveredNativeRestoreJobs = shouldReconcileNativeFileJobs(isTauri)
+        const recoveredNativeRestoreJobs = shouldReconcileNativeFileJobs(
+            isTauriDesktop,
+            isTauriAndroid,
+        )
             ? await reconcileNativeRestoresBeforeBootstrap()
             : []
         const runtime = getPersistentDataRuntime()
