@@ -5,6 +5,7 @@ use super::{
     WorkingSetCommit, GENERATION_TABLES,
 };
 use crate::asset_repository::PayloadCas;
+use crate::peer_sync::logical_delta::LOGICAL_MESSAGE_PAGE_SIZE;
 use std::collections::{BTreeMap, HashSet};
 
 pub(super) fn commit_asset_alias(
@@ -151,8 +152,16 @@ pub(super) fn commit(
         replace_character(&transaction, &generation, character)?;
     }
     let mut conversation_changes = Vec::new();
+    let mut shifted_conversation_indices = BTreeMap::new();
     for mutation in input.conversations.as_deref().unwrap_or_default() {
-        let change = apply_conversation_mutation(&transaction, &generation, mutation)?;
+        let (change, shifted_index) =
+            apply_conversation_mutation(&transaction, &generation, mutation)?;
+        if let Some((character_id, configured_index)) = shifted_index {
+            shifted_conversation_indices
+                .entry(character_id)
+                .and_modify(|current: &mut u64| *current = (*current).min(configured_index))
+                .or_insert(configured_index);
+        }
         super::logical_index::push_conversation_change(&mut conversation_changes, change)?;
     }
     for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
@@ -172,6 +181,7 @@ pub(super) fn commit(
             &logical,
             input,
             &conversation_changes,
+            &shifted_conversation_indices,
             &prior_character_conversations,
         )?;
         for alias in asset_aliases {
@@ -1183,7 +1193,10 @@ fn apply_conversation_mutation(
     transaction: &Transaction<'_>,
     generation: &str,
     mutation: &ConversationMutation,
-) -> StoreResult<super::logical_index::ConversationChange> {
+) -> StoreResult<(
+    super::logical_index::ConversationChange,
+    Option<(String, u64)>,
+)> {
     match mutation {
         ConversationMutation::Delete {
             character_id,
@@ -1198,10 +1211,13 @@ fn apply_conversation_mutation(
                 params![generation, character_id, conversation_id],
             )?;
             refresh_character_summary(transaction, generation, character_id)?;
-            Ok(super::logical_index::ConversationChange::Delete {
-                character_id: character_id.clone(),
-                conversation_id: conversation_id.clone(),
-            })
+            Ok((
+                super::logical_index::ConversationChange::Delete {
+                    character_id: character_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                },
+                None,
+            ))
         }
         ConversationMutation::ReplaceRange {
             character_id,
@@ -1270,16 +1286,28 @@ fn apply_conversation_mutation(
                     configured_index,
                 )?;
                 refresh_character_summary(transaction, generation, character_id)?;
-                return Ok(super::logical_index::ConversationChange::ReplaceRange {
-                    character_id: character_id.clone(),
-                    conversation_id: conversation_id.clone(),
-                    start: 0,
-                    old_count: 0,
-                    new_count: messages.len() as u64,
-                    affected_end: messages.len() as u64,
-                    force_tail: !messages.is_empty(),
-                    was_new: true,
-                });
+                let shifted_index = if configured_index < conversation_count {
+                    Some((
+                        character_id.clone(),
+                        u64::try_from(configured_index).map_err(|_| {
+                            validation("Conversation configured index must be nonnegative")
+                        })?,
+                    ))
+                } else {
+                    None
+                };
+                return Ok((
+                    super::logical_index::ConversationChange::ReplaceRange {
+                        character_id: character_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        old_count: 0,
+                        new_count: messages.len() as u64,
+                        fixed_page_ranges: Vec::new(),
+                        tail_from_page: Some(0),
+                        was_new: true,
+                    },
+                    shifted_index,
+                ));
             };
 
             let start = (*start).clamp(0, old_count);
@@ -1349,17 +1377,35 @@ fn apply_conversation_mutation(
                 &detail,
             )?;
             refresh_character_summary(transaction, generation, character_id)?;
-            Ok(super::logical_index::ConversationChange::ReplaceRange {
-                character_id: character_id.clone(),
-                conversation_id: conversation_id.clone(),
-                start: start as u64,
-                old_count: old_count as u64,
-                new_count: (old_count + delta) as u64,
-                affected_end: (start as u64)
-                    .saturating_add((delete_count as u64).max(messages.len() as u64)),
-                force_tail: delta != 0,
-                was_new: false,
-            })
+            let start = start as u64;
+            let affected_end =
+                start.saturating_add((delete_count as u64).max(messages.len() as u64));
+            let first_page = start / LOGICAL_MESSAGE_PAGE_SIZE as u64;
+            let (fixed_page_ranges, tail_from_page) = if delta != 0 {
+                (Vec::new(), Some(first_page))
+            } else if affected_end > start {
+                (
+                    vec![(
+                        first_page,
+                        (affected_end - 1) / LOGICAL_MESSAGE_PAGE_SIZE as u64 + 1,
+                    )],
+                    None,
+                )
+            } else {
+                (Vec::new(), None)
+            };
+            Ok((
+                super::logical_index::ConversationChange::ReplaceRange {
+                    character_id: character_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    old_count: old_count as u64,
+                    new_count: (old_count + delta) as u64,
+                    fixed_page_ranges,
+                    tail_from_page,
+                    was_new: false,
+                },
+                None,
+            ))
         }
     }
 }

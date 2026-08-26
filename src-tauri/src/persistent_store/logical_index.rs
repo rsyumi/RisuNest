@@ -33,6 +33,33 @@ const RECORD_KIND_ASSET: &str = "asset";
 const RECORD_KIND_INLAY: &str = "inlay";
 const RECORD_KIND_COLD: &str = "cold";
 
+#[cfg(test)]
+thread_local! {
+    static MESSAGE_PAGE_REHASH_READS: std::cell::RefCell<Vec<(String, String, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn reset_message_page_rehash_reads() {
+    MESSAGE_PAGE_REHASH_READS.with(|reads| reads.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn take_message_page_rehash_reads() -> Vec<(String, String, u64)> {
+    MESSAGE_PAGE_REHASH_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
+}
+
+#[cfg(test)]
+fn record_message_page_rehash_read(character_id: &str, conversation_id: &str, page_index: u64) {
+    MESSAGE_PAGE_REHASH_READS.with(|reads| {
+        reads.borrow_mut().push((
+            character_id.to_owned(),
+            conversation_id.to_owned(),
+            page_index,
+        ));
+    });
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LogicalIndexBuildRequest {
     pub(crate) library_id: String,
@@ -68,6 +95,13 @@ struct LogicalGenerationMetadata {
     manifest_hash: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum LogicalDeleteScope<'a> {
+    RecordKey(&'a str),
+    RecordKind(&'a str),
+    Generation,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct IncrementalLogicalCommit {
     library_id: String,
@@ -85,11 +119,10 @@ pub(super) enum ConversationChange {
     ReplaceRange {
         character_id: String,
         conversation_id: String,
-        start: u64,
         old_count: u64,
         new_count: u64,
-        affected_end: u64,
-        force_tail: bool,
+        fixed_page_ranges: Vec<(u64, u64)>,
+        tail_from_page: Option<u64>,
         was_new: bool,
     },
 }
@@ -123,32 +156,63 @@ pub(super) fn push_conversation_change(
         }
         (
             ConversationChange::ReplaceRange {
-                start,
                 old_count: _,
                 new_count,
-                affected_end,
-                force_tail,
+                fixed_page_ranges,
+                tail_from_page,
                 was_new: _,
                 ..
             },
             ConversationChange::ReplaceRange {
-                start: next_start,
                 old_count: next_old_count,
                 new_count: next_new_count,
-                affected_end: next_affected_end,
-                force_tail: next_force_tail,
+                fixed_page_ranges: next_fixed_page_ranges,
+                tail_from_page: next_tail_from_page,
                 ..
             },
         ) => {
             if *new_count != next_old_count {
                 return validation("conversation mutation counts are not sequential");
             }
-            *start = (*start).min(next_start);
             *new_count = next_new_count;
-            *affected_end = (*affected_end).max(next_affected_end);
-            *force_tail |= next_force_tail;
+            *tail_from_page = match (*tail_from_page, next_tail_from_page) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (Some(current), None) => Some(current),
+                (None, Some(next)) => Some(next),
+                (None, None) => None,
+            };
+            fixed_page_ranges.extend(next_fixed_page_ranges);
+            merge_fixed_page_ranges(fixed_page_ranges, *tail_from_page)?;
         }
     }
+    Ok(())
+}
+
+fn merge_fixed_page_ranges(
+    ranges: &mut Vec<(u64, u64)>,
+    tail_from_page: Option<u64>,
+) -> StoreResult<()> {
+    ranges.sort_unstable();
+    let mut merged = Vec::with_capacity(ranges.len());
+    for &(start, mut end) in ranges.iter() {
+        if start >= end {
+            return validation("conversation fixed page range is empty or reversed");
+        }
+        if let Some(tail) = tail_from_page {
+            if start >= tail {
+                continue;
+            }
+            end = end.min(tail);
+        }
+        if let Some((_, previous_end)) = merged.last_mut() {
+            if start <= *previous_end {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    *ranges = merged;
     Ok(())
 }
 
@@ -236,10 +300,11 @@ pub(super) fn cleanup_abandoned_logical_staging(connection: &mut Connection) -> 
              WHERE library_id = ?1 AND generation_id = ?2",
             params![library_id, generation_id],
         )?;
-        transaction.execute(
-            "DELETE FROM logical_sync_generations
-             WHERE library_id = ?1 AND generation_id = ?2",
-            params![library_id, generation_id],
+        delete_logical_rows(
+            &transaction,
+            &library_id,
+            &generation_id,
+            LogicalDeleteScope::Generation,
         )?;
         transaction.execute(
             "DELETE FROM snapshot_leases WHERE generation = ?1",
@@ -581,10 +646,11 @@ impl PersistentStore {
         if session_pinned {
             return validation("session-pinned logical generation cannot be pruned");
         }
-        transaction.execute(
-            "DELETE FROM logical_sync_generations
-             WHERE library_id = ?1 AND generation_id = ?2",
-            params![library_id, generation_id],
+        delete_logical_rows(
+            &transaction,
+            library_id,
+            generation_id,
+            LogicalDeleteScope::Generation,
         )?;
         let active = super::active_generation(&transaction)?;
         if pds_generation != active
@@ -817,10 +883,11 @@ pub(super) fn detach_logical_head_for_full_replace(
     }
     transaction.execute("DELETE FROM logical_library_head WHERE singleton = 1", [])?;
     if state == "building" {
-        transaction.execute(
-            "DELETE FROM logical_sync_generations
-             WHERE library_id = ?1 AND generation_id = ?2",
-            params![library_id, generation_id],
+        delete_logical_rows(
+            transaction,
+            &library_id,
+            &generation_id,
+            LogicalDeleteScope::Generation,
         )?;
     }
     Ok(())
@@ -859,6 +926,7 @@ pub(super) fn maintain_incremental_logical_commit(
     logical: &IncrementalLogicalCommit,
     input: &WorkingSetCommit,
     conversation_changes: &[ConversationChange],
+    shifted_conversation_indices: &BTreeMap<String, u64>,
     prior_character_conversations: &BTreeMap<String, Vec<String>>,
 ) -> StoreResult<()> {
     if input.root.is_some() {
@@ -926,6 +994,18 @@ pub(super) fn maintain_incremental_logical_commit(
         }
         maintain_conversation_projection(transaction, logical, change)?;
     }
+    for (character_id, configured_index) in shifted_conversation_indices {
+        if full_characters.iter().any(|full| full == character_id) {
+            continue;
+        }
+        refresh_shifted_conversation_envelopes(
+            transaction,
+            logical,
+            character_id,
+            *configured_index,
+            conversation_changes,
+        )?;
+    }
 
     for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
         match mutation {
@@ -950,6 +1030,66 @@ pub(super) fn maintain_incremental_logical_commit(
         }
     }
 
+    Ok(())
+}
+
+fn refresh_shifted_conversation_envelopes(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    character_id: &str,
+    configured_index: u64,
+    primary_changes: &[ConversationChange],
+) -> StoreResult<()> {
+    let conversations = {
+        let mut statement = transaction.prepare(
+            "SELECT conversation_id, configured_index, recent_at, detail, message_count
+             FROM conversations
+             WHERE generation = ?1 AND character_id = ?2 AND configured_index >= ?3
+             ORDER BY configured_index ASC, conversation_id ASC",
+        )?;
+        let rows = statement.query_map(
+            params![
+                logical.pds_generation,
+                character_id,
+                sqlite_i64(configured_index, "shifted conversation configured index")?,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        let conversations = rows.collect::<Result<Vec<_>, _>>()?;
+        conversations
+    };
+    for (conversation_id, configured_index, recent_at, detail, message_count) in conversations {
+        if primary_changes.iter().any(|change| {
+            let (changed_character_id, changed_conversation_id) =
+                conversation_change_identity(change);
+            changed_character_id == character_id && changed_conversation_id == conversation_id
+        }) {
+            continue;
+        }
+        let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+            character_id: character_id.to_owned(),
+            conversation_id,
+        })
+        .map_err(codec_error)?;
+        rebuild_conversation_head(
+            transaction,
+            logical,
+            &key,
+            configured_index,
+            recent_at,
+            serde_json::from_str(&detail)?,
+            nonnegative_u64(message_count, "conversation message count")?,
+            false,
+        )?;
+    }
     Ok(())
 }
 
@@ -995,12 +1135,12 @@ fn replace_kind_projection(
     logical: &IncrementalLogicalCommit,
     record_kind: &str,
 ) -> StoreResult<()> {
-    transaction.execute(
-        "DELETE FROM logical_record_heads
-         WHERE library_id = ?1 AND generation_id = ?2 AND record_kind = ?3",
-        params![logical.library_id, logical.generation_id, record_kind],
-    )?;
-    Ok(())
+    delete_logical_rows(
+        transaction,
+        &logical.library_id,
+        &logical.generation_id,
+        LogicalDeleteScope::RecordKind(record_kind),
+    )
 }
 
 fn delete_head(
@@ -1008,11 +1148,61 @@ fn delete_head(
     logical: &IncrementalLogicalCommit,
     record_key: &str,
 ) -> StoreResult<()> {
+    delete_logical_rows(
+        transaction,
+        &logical.library_id,
+        &logical.generation_id,
+        LogicalDeleteScope::RecordKey(record_key),
+    )
+}
+
+fn delete_logical_rows(
+    transaction: &Transaction<'_>,
+    library_id: &str,
+    generation_id: &str,
+    scope: LogicalDeleteScope<'_>,
+) -> StoreResult<()> {
+    let (record_key, record_kind) = match scope {
+        LogicalDeleteScope::RecordKey(record_key) => (Some(record_key), None),
+        LogicalDeleteScope::RecordKind(record_kind) => (None, Some(record_kind)),
+        LogicalDeleteScope::Generation => (None, None),
+    };
+    transaction.execute(
+        "DELETE FROM logical_record_dependencies
+         WHERE library_id = ?1 AND generation_id = ?2
+           AND (?3 IS NULL OR record_key = ?3)
+           AND (
+               ?4 IS NULL OR EXISTS (
+                   SELECT 1 FROM logical_record_heads AS head
+                   WHERE head.library_id = logical_record_dependencies.library_id
+                     AND head.generation_id = logical_record_dependencies.generation_id
+                     AND head.record_key = logical_record_dependencies.record_key
+                     AND head.record_kind = ?4
+               )
+           )",
+        params![library_id, generation_id, record_key, record_kind],
+    )?;
+    transaction.execute(
+        "DELETE FROM logical_message_page_sources
+         WHERE library_id = ?1 AND generation_id = ?2
+           AND (?3 IS NULL OR record_key = ?3)
+           AND (?4 IS NULL OR record_kind = ?4)",
+        params![library_id, generation_id, record_key, record_kind],
+    )?;
     transaction.execute(
         "DELETE FROM logical_record_heads
-         WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3",
-        params![logical.library_id, logical.generation_id, record_key],
+         WHERE library_id = ?1 AND generation_id = ?2
+           AND (?3 IS NULL OR record_key = ?3)
+           AND (?4 IS NULL OR record_kind = ?4)",
+        params![library_id, generation_id, record_key, record_kind],
     )?;
+    if matches!(scope, LogicalDeleteScope::Generation) {
+        transaction.execute(
+            "DELETE FROM logical_sync_generations
+             WHERE library_id = ?1 AND generation_id = ?2",
+            params![library_id, generation_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -1297,22 +1487,20 @@ fn maintain_conversation_projection(
         ConversationChange::ReplaceRange {
             character_id,
             conversation_id,
-            start,
             old_count,
             new_count,
-            affected_end,
-            force_tail,
+            fixed_page_ranges,
+            tail_from_page,
             was_new,
         } => refresh_conversation_range(
             transaction,
             logical,
             character_id,
             conversation_id,
-            *start,
             *old_count,
             *new_count,
-            *affected_end,
-            *force_tail,
+            fixed_page_ranges,
+            *tail_from_page,
             *was_new,
         ),
     }
@@ -1369,13 +1557,15 @@ fn refresh_conversation_range(
     logical: &IncrementalLogicalCommit,
     character_id: &str,
     conversation_id: &str,
-    start: u64,
     old_count: u64,
     new_count: u64,
-    affected_end: u64,
-    force_tail: bool,
+    fixed_page_ranges: &[(u64, u64)],
+    tail_from_page: Option<u64>,
     was_new: bool,
 ) -> StoreResult<()> {
+    if old_count != new_count && tail_from_page.is_none() {
+        return validation("conversation length change is missing a tail page range");
+    }
     let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
         character_id: character_id.to_owned(),
         conversation_id: conversation_id.to_owned(),
@@ -1411,8 +1601,32 @@ fn refresh_conversation_range(
          WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3",
         params![logical.library_id, logical.generation_id, key],
     )?;
-    let first_page = start / LOGICAL_MESSAGE_PAGE_SIZE as u64;
-    if force_tail || old_count != new_count {
+    for &(start_page, end_page) in fixed_page_ranges {
+        transaction.execute(
+            "DELETE FROM logical_message_page_sources
+             WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
+               AND page_index >= ?4 AND page_index < ?5",
+            params![
+                logical.library_id,
+                logical.generation_id,
+                key,
+                sqlite_i64(start_page, "first fixed message page")?,
+                sqlite_i64(end_page, "fixed message page end")?,
+            ],
+        )?;
+        for page_index in start_page..end_page {
+            insert_message_page_source(
+                transaction,
+                logical,
+                &key,
+                character_id,
+                conversation_id,
+                page_index,
+                new_count,
+            )?;
+        }
+    }
+    if let Some(first_page) = tail_from_page {
         transaction.execute(
             "DELETE FROM logical_message_page_sources
              WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
@@ -1421,7 +1635,7 @@ fn refresh_conversation_range(
                 logical.library_id,
                 logical.generation_id,
                 key,
-                sqlite_i64(first_page, "first affected message page")?,
+                sqlite_i64(first_page, "first tail message page")?,
             ],
         )?;
         let page_count = new_count.div_ceil(LOGICAL_MESSAGE_PAGE_SIZE as u64);
@@ -1436,34 +1650,6 @@ fn refresh_conversation_range(
                 new_count,
             )?;
         }
-    } else {
-        let changed_end = affected_end;
-        if changed_end > start {
-            let last_page = (changed_end - 1) / LOGICAL_MESSAGE_PAGE_SIZE as u64;
-            transaction.execute(
-                "DELETE FROM logical_message_page_sources
-                 WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
-                   AND page_index >= ?4 AND page_index <= ?5",
-                params![
-                    logical.library_id,
-                    logical.generation_id,
-                    key,
-                    sqlite_i64(first_page, "first affected message page")?,
-                    sqlite_i64(last_page, "last affected message page")?,
-                ],
-            )?;
-            for page_index in first_page..=last_page {
-                insert_message_page_source(
-                    transaction,
-                    logical,
-                    &key,
-                    character_id,
-                    conversation_id,
-                    page_index,
-                    new_count,
-                )?;
-            }
-        }
     }
     rebuild_conversation_head(
         transaction,
@@ -1473,6 +1659,7 @@ fn refresh_conversation_range(
         recent_at,
         serde_json::from_str(&raw)?,
         new_count,
+        true,
     )
 }
 
@@ -1493,6 +1680,8 @@ fn insert_message_page_source(
     if first_message_index >= message_count {
         return validation("conversation page starts beyond the final message count");
     }
+    #[cfg(test)]
+    record_message_page_rehash_read(character_id, conversation_id, page_index);
     let end = first_message_index
         .saturating_add(LOGICAL_MESSAGE_PAGE_SIZE as u64)
         .min(message_count);
@@ -1551,6 +1740,7 @@ fn rebuild_conversation_head(
     recent_at: i64,
     detail: Value,
     message_count: u64,
+    rebuild_dependencies: bool,
 ) -> StoreResult<()> {
     let mut statement = transaction.prepare(
         "SELECT page_index, first_message_index, message_count, object_hash, object_size
@@ -1619,6 +1809,9 @@ fn rebuild_conversation_head(
     )?;
     if changed != 1 {
         return validation("logical conversation head disappeared during targeted update");
+    }
+    if !rebuild_dependencies {
+        return Ok(());
     }
     let mut unique = BTreeMap::new();
     for page in pages {
@@ -3203,6 +3396,169 @@ mod tests {
         (asset.content_hash, inlay.content_hash)
     }
 
+    fn seed_conversation(
+        store: &PersistentStore,
+        conversation_id: &str,
+        configured_index: i64,
+        message_count: i64,
+    ) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO conversations (
+                    generation, character_id, conversation_id, configured_index, recent_at,
+                    name, message_count, detail
+                 ) VALUES ('revision-0', 'char', ?1, ?2, 30, ?1, ?3, ?4)",
+                params![
+                    conversation_id,
+                    configured_index,
+                    message_count,
+                    json!({"name": conversation_id}).to_string(),
+                ],
+            )
+            .expect("seed conversation");
+        for index in 0..message_count {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO messages (
+                        generation, character_id, conversation_id, message_index,
+                        message_id, value
+                     ) VALUES ('revision-0', 'char', ?1, ?2, ?3, ?4)",
+                    params![
+                        conversation_id,
+                        index,
+                        format!("{conversation_id}-m{index}"),
+                        json!({"id": format!("{conversation_id}-m{index}")}).to_string(),
+                    ],
+                )
+                .expect("seed conversation message");
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE characters SET conversation_count = (
+                    SELECT COUNT(*) FROM conversations
+                    WHERE generation = 'revision-0' AND character_id = 'char'
+                 ) WHERE generation = 'revision-0' AND character_id = 'char'",
+                [],
+            )
+            .expect("refresh seeded conversation count");
+    }
+
+    fn replace_chat_messages(store: &mut PersistentStore, message_count: i64) {
+        let transaction = store.connection.transaction().unwrap();
+        transaction
+            .execute(
+                "DELETE FROM messages
+                 WHERE generation = 'revision-0' AND character_id = 'char'
+                   AND conversation_id = 'chat'",
+                [],
+            )
+            .unwrap();
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO messages (
+                        generation, character_id, conversation_id, message_index,
+                        message_id, value
+                     ) VALUES ('revision-0', 'char', 'chat', ?1, ?2, ?3)",
+                )
+                .unwrap();
+            for index in 0..message_count {
+                statement
+                    .execute(params![
+                        index,
+                        format!("m{index}"),
+                        json!({"id": format!("m{index}")}).to_string(),
+                    ])
+                    .unwrap();
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE conversations SET message_count = ?1
+                 WHERE generation = 'revision-0' AND character_id = 'char'
+                   AND conversation_id = 'chat'",
+                [message_count],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+
+    fn reconstructed_conversation_index(
+        store: &PersistentStore,
+        cas: &PayloadCas,
+        built: &BuiltIndexedLogicalManifest,
+        conversation_id: &str,
+    ) -> u64 {
+        let record = built
+            .manifest
+            .records
+            .iter()
+            .find_map(|record| match record {
+                LogicalManifestRecord::Live(record) => {
+                    match decode_logical_record_key(&record.key).unwrap() {
+                        LogicalRecordLocator::Conversation {
+                            character_id,
+                            conversation_id: candidate,
+                        } if character_id == "char" && candidate == conversation_id => Some(record),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("conversation manifest record");
+        let bytes = store
+            .reconstruct_logical_object(
+                cas,
+                "library",
+                &built.manifest.generation,
+                &record.object_hash,
+            )
+            .expect("reconstruct canonical conversation envelope");
+        let LogicalRecordEnvelope::Conversation {
+            configured_index, ..
+        } = decode_logical_record(&bytes).unwrap()
+        else {
+            panic!("expected conversation envelope");
+        };
+        configured_index
+    }
+
+    fn logical_generation_row_count(
+        store: &PersistentStore,
+        table: &str,
+        generation_id: &str,
+    ) -> i64 {
+        store
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table}
+                     WHERE library_id = 'library' AND generation_id = ?1"
+                ),
+                [generation_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn assert_logical_generation_deleted(store: &PersistentStore, generation_id: &str) {
+        for table in [
+            "logical_record_dependencies",
+            "logical_message_page_sources",
+            "logical_record_heads",
+            "logical_sync_generations",
+        ] {
+            assert_eq!(
+                logical_generation_row_count(store, table, generation_id),
+                0,
+                "{table} retained rows for deleted logical generation"
+            );
+        }
+    }
+
     #[test]
     fn rebuild_projects_every_family_and_reconstructs_pages_and_exact_payloads() {
         let (_directory, mut store, cas) = open_j2_fixture();
@@ -3871,6 +4227,30 @@ mod tests {
     }
 
     #[test]
+    fn full_replace_detach_removes_building_generation_children() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        assert!(
+            logical_generation_row_count(&store, "logical_record_dependencies", "generation-0") > 0
+        );
+        assert!(
+            logical_generation_row_count(&store, "logical_message_page_sources", "generation-0")
+                > 0
+        );
+        let staging = store.replace_begin().unwrap();
+        store
+            .replace_put_root(&staging.staging_id, &json!({"replacement": true}))
+            .unwrap();
+
+        store.replace_commit(&staging.staging_id, Some(0)).unwrap();
+
+        assert_logical_generation_deleted(&store, "generation-0");
+    }
+
+    #[test]
     fn complete_generation_reconstructs_after_lease_release_reopen_and_sweep() {
         let (directory, mut store, cas) = open_j2_fixture();
         store
@@ -3966,6 +4346,31 @@ mod tests {
         store
             .prune_logical_generation("library", "generation-0")
             .unwrap();
+    }
+
+    #[test]
+    fn prune_removes_generation_children_with_foreign_keys_disabled() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        store
+            .commit(&root_commit(0, json!({"version": 1})))
+            .unwrap();
+        assert!(
+            logical_generation_row_count(&store, "logical_record_dependencies", "generation-0") > 0
+        );
+        assert!(
+            logical_generation_row_count(&store, "logical_message_page_sources", "generation-0")
+                > 0
+        );
+
+        store
+            .prune_logical_generation("library", "generation-0")
+            .unwrap();
+
+        assert_logical_generation_deleted(&store, "generation-0");
     }
 
     #[test]
@@ -4102,6 +4507,297 @@ mod tests {
     }
 
     #[test]
+    fn conversation_change_coalescing_preserves_disjoint_ranges_and_earliest_tail() {
+        let change = |old_count, new_count, fixed_page_ranges, tail_from_page, was_new| {
+            ConversationChange::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "chat".to_owned(),
+                old_count,
+                new_count,
+                fixed_page_ranges,
+                tail_from_page,
+                was_new,
+            }
+        };
+
+        let mut fixed = Vec::new();
+        push_conversation_change(&mut fixed, change(640, 640, vec![(0, 1)], None, false)).unwrap();
+        push_conversation_change(&mut fixed, change(640, 640, vec![(4, 5)], None, false)).unwrap();
+        let ConversationChange::ReplaceRange {
+            fixed_page_ranges,
+            tail_from_page,
+            ..
+        } = &fixed[0]
+        else {
+            panic!("expected fixed replacement");
+        };
+        assert_eq!(fixed_page_ranges, &vec![(0, 1), (4, 5)]);
+        assert_eq!(*tail_from_page, None);
+
+        let mut mixed = Vec::new();
+        push_conversation_change(&mut mixed, change(640, 640, vec![(0, 1)], None, false)).unwrap();
+        push_conversation_change(&mut mixed, change(640, 641, Vec::new(), Some(3), false)).unwrap();
+        push_conversation_change(&mut mixed, change(641, 641, vec![(4, 5)], None, false)).unwrap();
+        push_conversation_change(&mut mixed, change(641, 641, vec![(1, 2)], None, false)).unwrap();
+        let ConversationChange::ReplaceRange {
+            fixed_page_ranges,
+            tail_from_page,
+            ..
+        } = &mixed[0]
+        else {
+            panic!("expected mixed replacement");
+        };
+        assert_eq!(fixed_page_ranges, &vec![(0, 2)]);
+        assert_eq!(*tail_from_page, Some(3));
+
+        let mut recreated = vec![ConversationChange::Delete {
+            character_id: "char".to_owned(),
+            conversation_id: "chat".to_owned(),
+        }];
+        push_conversation_change(&mut recreated, change(0, 1, Vec::new(), Some(0), true)).unwrap();
+        let ConversationChange::ReplaceRange {
+            was_new,
+            tail_from_page,
+            ..
+        } = &recreated[0]
+        else {
+            panic!("expected recreated replacement");
+        };
+        assert!(*was_new);
+        assert_eq!(*tail_from_page, Some(0));
+    }
+
+    #[test]
+    fn inserted_conversation_refreshes_shifted_sibling_envelopes_without_body_reads() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        seed_conversation(&store, "sibling", 0, 1);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        reset_message_page_rehash_reads();
+        let mut commit = root_commit(0, json!({"unused": true}));
+        commit.root = None;
+        commit.conversations = Some(vec![ConversationMutation::ReplaceRange {
+            character_id: "char".to_owned(),
+            conversation_id: "inserted".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: Vec::new(),
+            conversation: Some(json!({"name": "Inserted", "lastDate": 40})),
+            configured_index: Some(0),
+        }]);
+
+        store.commit(&commit).unwrap();
+        assert!(take_message_page_rehash_reads().is_empty());
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        assert_eq!(
+            reconstructed_conversation_index(&store, &cas, &sealed, "sibling"),
+            1
+        );
+        assert_eq!(
+            reconstructed_conversation_index(&store, &cas, &sealed, "chat"),
+            2
+        );
+    }
+
+    #[test]
+    fn delete_then_recreate_refreshes_shifted_siblings_without_normalizing_indices() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        seed_conversation(&store, "first", 0, 1);
+        seed_conversation(&store, "sibling", 2, 1);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        reset_message_page_rehash_reads();
+        let mut commit = root_commit(0, json!({"unused": true}));
+        commit.root = None;
+        commit.conversations = Some(vec![
+            ConversationMutation::Delete {
+                character_id: "char".to_owned(),
+                conversation_id: "first".to_owned(),
+            },
+            ConversationMutation::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "first".to_owned(),
+                start: 0,
+                delete_count: 0,
+                messages: vec![json!({"id": "first-recreated"})],
+                conversation: Some(json!({"name": "First recreated", "lastDate": 50})),
+                configured_index: Some(0),
+            },
+        ]);
+
+        store.commit(&commit).unwrap();
+        assert_eq!(
+            take_message_page_rehash_reads(),
+            vec![("char".to_owned(), "first".to_owned(), 0)]
+        );
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        assert_eq!(
+            reconstructed_conversation_index(&store, &cas, &sealed, "chat"),
+            2
+        );
+        assert_eq!(
+            reconstructed_conversation_index(&store, &cas, &sealed, "sibling"),
+            3
+        );
+    }
+
+    #[test]
+    fn distant_fixed_replacements_rehash_only_disjoint_message_pages() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        replace_chat_messages(&mut store, 640);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+            character_id: "char".to_owned(),
+            conversation_id: "chat".to_owned(),
+        })
+        .unwrap();
+        let read_pages = |store: &PersistentStore| {
+            store
+                .connection
+                .prepare(
+                    "SELECT page_index, rowid, object_hash
+                     FROM logical_message_page_sources
+                     WHERE library_id = 'library' AND generation_id = 'generation-0'
+                       AND record_key = ?1 ORDER BY page_index",
+                )
+                .unwrap()
+                .query_map([key.as_str()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = read_pages(&store);
+        assert_eq!(before.len(), 5);
+        reset_message_page_rehash_reads();
+        let mut commit = root_commit(0, json!({"unused": true}));
+        commit.root = None;
+        commit.conversations = Some(vec![
+            ConversationMutation::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "chat".to_owned(),
+                start: 1,
+                delete_count: 1,
+                messages: vec![json!({"id": "first-page-replacement"})],
+                conversation: None,
+                configured_index: None,
+            },
+            ConversationMutation::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "chat".to_owned(),
+                start: 513,
+                delete_count: 1,
+                messages: vec![json!({"id": "last-page-replacement"})],
+                conversation: None,
+                configured_index: None,
+            },
+        ]);
+
+        store.commit(&commit).unwrap();
+        assert_eq!(
+            take_message_page_rehash_reads(),
+            vec![
+                ("char".to_owned(), "chat".to_owned(), 0),
+                ("char".to_owned(), "chat".to_owned(), 4),
+            ]
+        );
+        let after = read_pages(&store);
+        assert_eq!(&after[1..4], &before[1..4]);
+        assert_ne!(after[0].2, before[0].2);
+        assert_ne!(after[4].2, before[4].2);
+
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        let middle = decode_message_page(
+            &store
+                .reconstruct_logical_object(&cas, "library", "generation-0", &after[2].2)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(middle.len(), LOGICAL_MESSAGE_PAGE_SIZE);
+        assert_eq!(middle[0], json!({"id": "m256"}));
+        assert_eq!(
+            store
+                .build_indexed_logical_manifest("library", "generation-0")
+                .unwrap()
+                .manifest_hash,
+            sealed.manifest_hash,
+        );
+    }
+
+    #[test]
+    fn mixed_fixed_and_length_changes_keep_earlier_ranges_and_rebuild_only_the_tail() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        replace_chat_messages(&mut store, 640);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        reset_message_page_rehash_reads();
+        let mut commit = root_commit(0, json!({"unused": true}));
+        commit.root = None;
+        commit.conversations = Some(vec![
+            ConversationMutation::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "chat".to_owned(),
+                start: 1,
+                delete_count: 1,
+                messages: vec![json!({"id": "early-fixed"})],
+                conversation: None,
+                configured_index: None,
+            },
+            ConversationMutation::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "chat".to_owned(),
+                start: 384,
+                delete_count: 0,
+                messages: vec![json!({"id": "tail-insertion"})],
+                conversation: None,
+                configured_index: None,
+            },
+            ConversationMutation::ReplaceRange {
+                character_id: "char".to_owned(),
+                conversation_id: "chat".to_owned(),
+                start: 513,
+                delete_count: 1,
+                messages: vec![json!({"id": "covered-fixed"})],
+                conversation: None,
+                configured_index: None,
+            },
+        ]);
+
+        store.commit(&commit).unwrap();
+        assert_eq!(
+            take_message_page_rehash_reads(),
+            vec![
+                ("char".to_owned(), "chat".to_owned(), 0),
+                ("char".to_owned(), "chat".to_owned(), 3),
+                ("char".to_owned(), "chat".to_owned(), 4),
+                ("char".to_owned(), "chat".to_owned(), 5),
+            ]
+        );
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        assert_eq!(
+            store
+                .build_indexed_logical_manifest("library", "generation-0")
+                .unwrap()
+                .manifest_hash,
+            sealed.manifest_hash,
+        );
+    }
+
+    #[test]
     fn child_commit_records_plugin_deletion_as_tombstone() {
         let (_directory, mut store, cas) = open_j2_fixture();
         seed_all_record_families(&store, &cas);
@@ -4133,8 +4829,112 @@ mod tests {
     }
 
     #[test]
-    fn startup_cleanup_removes_crash_abandoned_complete_staging_generation() {
+    fn plugin_clear_removes_existing_dependencies_before_parent_tombstone() {
         let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        let dependency = cas.prepare_bytes(b"plugin dependency").unwrap();
+        let plugin_key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            storage_key: "plugin".to_owned(),
+        })
+        .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_record_dependencies (
+                    library_id, generation_id, record_key, object_hash, object_size
+                 ) VALUES ('library', 'generation-0', ?1, ?2, ?3)",
+                params![
+                    plugin_key,
+                    dependency.content_hash,
+                    i64::try_from(dependency.byte_size).unwrap(),
+                ],
+            )
+            .unwrap();
+        store.seal_active_logical_generation(&cas).unwrap();
+        let mut commit = root_commit(0, json!({"unused": true}));
+        commit.root = None;
+        commit.plugin_storage = Some(vec![PluginStorageMutation::Clear]);
+
+        store.commit(&commit).unwrap();
+
+        let dependency_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_record_dependencies AS dependency
+                 JOIN logical_library_head AS head
+                   ON head.library_id = dependency.library_id
+                  AND head.generation_id = dependency.generation_id
+                 WHERE dependency.record_key = ?1",
+                [plugin_key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dependency_count, 0);
+        store.seal_active_logical_generation(&cas).unwrap();
+    }
+
+    #[test]
+    fn child_conversation_deletion_removes_page_children_before_tombstone() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let mut commit = root_commit(0, json!({"unused": true}));
+        commit.root = None;
+        commit.conversations = Some(vec![ConversationMutation::Delete {
+            character_id: "char".to_owned(),
+            conversation_id: "chat".to_owned(),
+        }]);
+
+        store.commit(&commit).unwrap();
+        let conversation_key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+            character_id: "char".to_owned(),
+            conversation_id: "chat".to_owned(),
+        })
+        .unwrap();
+        let tombstone: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT state, deleted_generation_sequence
+                 FROM logical_record_heads
+                 JOIN logical_library_head USING (library_id, generation_id)
+                 WHERE record_key = ?1",
+                [conversation_key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tombstone, ("tombstone".to_owned(), "1".to_owned()));
+        for table in [
+            "logical_record_dependencies",
+            "logical_message_page_sources",
+        ] {
+            let count: i64 = store
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table} AS child
+                         JOIN logical_library_head AS head
+                           ON head.library_id = child.library_id
+                          AND head.generation_id = child.generation_id
+                         WHERE child.record_key = ?1"
+                    ),
+                    [conversation_key.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained tombstone children");
+        }
+        store.seal_active_logical_generation(&cas).unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_removes_abandoned_generation_children() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
         store
             .initialize_logical_index_building(&cas, logical_build_request())
             .unwrap();
@@ -4142,15 +4942,15 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO logical_sync_generations (
-                    library_id, generation_id, generation_sequence, parent_generation_id,
-                    pds_generation, source_revision, state, manifest_hash, created_at, completed_at
-                 ) VALUES (
-                    'library', 'staged-generation', '1', NULL,
-                    'staging-logical-abandoned', 0, 'complete', ?1, 0, 0
-                 )",
-                ["11".repeat(32)],
+                "UPDATE logical_sync_generations
+                 SET pds_generation = 'staging-logical-abandoned'
+                 WHERE library_id = 'library' AND generation_id = 'generation-0'",
+                [],
             )
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM logical_library_head WHERE singleton = 1", [])
             .unwrap();
         store
             .connection
@@ -4160,6 +4960,13 @@ mod tests {
                 [],
             )
             .unwrap();
+        assert!(
+            logical_generation_row_count(&store, "logical_record_dependencies", "generation-0") > 0
+        );
+        assert!(
+            logical_generation_row_count(&store, "logical_message_page_sources", "generation-0")
+                > 0
+        );
 
         cleanup_abandoned_logical_staging(&mut store.connection).unwrap();
         snapshot::sweep_temporary_generations(&mut store.connection).unwrap();
@@ -4172,6 +4979,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0);
+        assert_logical_generation_deleted(&store, "generation-0");
     }
 
     fn clone_pds_generation(connection: &Connection, from: &str, to: &str) {
