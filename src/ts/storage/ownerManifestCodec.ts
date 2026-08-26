@@ -16,13 +16,25 @@ const VERSION = 1
 const HEADER_BYTES = 9
 const MIN_ENTRY_BYTES = 13
 const MAX_U32 = 0xffff_ffff
+const MAX_INITIAL_CAPACITY = 64 * 1024 * 1024
+
+export const OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES = MAX_U32
 
 class ByteWriter {
     private bytes: Uint8Array
     private length = 0
 
-    constructor(estimatedLength: number) {
-        this.bytes = new Uint8Array(Math.max(HEADER_BYTES, estimatedLength))
+    constructor(
+        estimatedLength: number,
+        private readonly maximumLength: number,
+    ) {
+        this.bytes = new Uint8Array(
+            Math.min(
+                maximumLength,
+                MAX_INITIAL_CAPACITY,
+                Math.max(HEADER_BYTES, estimatedLength),
+            ),
+        )
     }
 
     writeByte(value: number): void {
@@ -49,7 +61,7 @@ class ByteWriter {
 
     private ensureCapacity(additionalBytes: number): void {
         const requiredLength = this.length + additionalBytes
-        if (requiredLength > MAX_U32) {
+        if (requiredLength > this.maximumLength) {
             throw new Error('owner manifest exceeds V1 size limit')
         }
         if (requiredLength <= this.bytes.byteLength) {
@@ -58,7 +70,10 @@ class ByteWriter {
 
         let capacity = this.bytes.byteLength
         while (capacity < requiredLength) {
-            capacity = Math.min(MAX_U32, Math.max(requiredLength, capacity * 2))
+            capacity = Math.min(
+                this.maximumLength,
+                Math.max(requiredLength, capacity * 2),
+            )
         }
         const grown = new Uint8Array(capacity)
         grown.set(this.bytes)
@@ -138,18 +153,30 @@ function readString(reader: ByteReader, decoder: TextDecoder): string {
     }
 }
 
+function validateMaximumCanonicalBytes(maximumCanonicalBytes: number): void {
+    if (
+        !Number.isInteger(maximumCanonicalBytes) ||
+        maximumCanonicalBytes < 0 ||
+        maximumCanonicalBytes > OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES
+    ) {
+        throw new Error('invalid owner manifest V1 size limit')
+    }
+}
+
 export function encodeOwnerManifest(
     entries: readonly OwnerManifestEntry[],
+    maximumCanonicalBytes = OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
 ): Uint8Array {
     if (entries.length > MAX_U32) {
         throw new Error('owner manifest entry count exceeds V1 limit')
     }
 
+    validateMaximumCanonicalBytes(maximumCanonicalBytes)
     const estimatedLength = Math.min(
-        MAX_U32,
+        maximumCanonicalBytes,
         HEADER_BYTES + entries.length * 64,
     )
-    const writer = new ByteWriter(estimatedLength)
+    const writer = new ByteWriter(estimatedLength, maximumCanonicalBytes)
     const encoder = new TextEncoder()
     writer.writeBytes(MAGIC)
     writer.writeByte(VERSION)
@@ -173,7 +200,14 @@ export function encodeOwnerManifest(
     return writer.finish()
 }
 
-export function decodeOwnerManifest(bytes: Uint8Array): OwnerManifestEntry[] {
+export function decodeOwnerManifest(
+    bytes: Uint8Array,
+    maximumCanonicalBytes = OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
+): OwnerManifestEntry[] {
+    validateMaximumCanonicalBytes(maximumCanonicalBytes)
+    if (bytes.byteLength > maximumCanonicalBytes) {
+        throw new Error('owner manifest exceeds V1 size limit')
+    }
     const reader = new ByteReader(bytes)
     const magic = reader.readBytes(MAGIC.byteLength, 'owner manifest magic')
     if (!magic.every((byte, index) => byte === MAGIC[index])) {
@@ -188,7 +222,7 @@ export function decodeOwnerManifest(bytes: Uint8Array): OwnerManifestEntry[] {
         throw new Error('owner manifest entry count exceeds remaining bytes')
     }
 
-    const decoder = new TextDecoder('utf-8', { fatal: true })
+    const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
     const entries: OwnerManifestEntry[] = []
     for (let index = 0; index < entryCount; index += 1) {
         const tuple: AssetTuple = [

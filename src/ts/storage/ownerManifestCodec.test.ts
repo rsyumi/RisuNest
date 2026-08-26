@@ -68,6 +68,16 @@ describe('owner manifest V1 codec', () => {
         )
     })
 
+    it('preserves a leading BOM in every tuple position', () => {
+        const decoded = decodeOwnerManifest(fromHex(golden.canonicalHex))
+
+        expect(decoded.at(-1)?.tuple).toEqual([
+            '\ufeffname',
+            '\ufeffpath',
+            '\ufeffextension',
+        ])
+    })
+
     it('rejects payload hashes that are not exactly 32 bytes', () => {
         expect(() =>
             encodeOwnerManifest([
@@ -77,6 +87,18 @@ describe('owner manifest V1 codec', () => {
                 },
             ]),
         ).toThrow('payload hash must be 32 bytes')
+    })
+
+    it('enforces the aggregate limit at the exact empty-manifest boundary', () => {
+        const emptyBytes = encodeOwnerManifest([], 9)
+        expect(toHex(emptyBytes)).toBe('524f4d460100000000')
+        expect(decodeOwnerManifest(emptyBytes, 9)).toEqual([])
+        expect(() => encodeOwnerManifest([], 8)).toThrow(
+            'owner manifest exceeds V1 size limit',
+        )
+        expect(() => decodeOwnerManifest(emptyBytes, 8)).toThrow(
+            'owner manifest exceeds V1 size limit',
+        )
     })
 
     it('rejects ill-formed JavaScript strings instead of normalizing them', () => {

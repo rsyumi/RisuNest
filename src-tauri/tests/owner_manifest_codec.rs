@@ -3,9 +3,10 @@ mod owner_manifest_codec;
 
 use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use owner_manifest_codec::{
-    decode_owner_manifest, decode_owner_manifest_property, encode_owner_manifest,
-    encode_owner_manifest_property, owner_manifest_identity, OwnerManifestEntry,
-    OwnerManifestProperty,
+    decode_owner_manifest, decode_owner_manifest_property, decode_owner_manifest_with_limit,
+    encode_owner_manifest, encode_owner_manifest_property, encode_owner_manifest_with_limit,
+    owner_manifest_identity, OwnerManifestEntry, OwnerManifestProperty,
+    OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -14,7 +15,8 @@ use std::io::{Read, Write};
 use std::time::Instant;
 
 const TUPLES_PER_OWNER: usize = 154_448;
-const BENCHMARK_SAMPLES: usize = 3;
+const BENCHMARK_SAMPLES: usize = 10;
+const BENCHMARK_WARMUP_SAMPLES: usize = 1;
 const LOCAL_COLD_DECODE_GATE_MS: f64 = 100.0;
 const FIXED_PAGE_ENTRIES: usize = 4_096;
 
@@ -142,6 +144,22 @@ fn compress_fixture(encoded: &[Option<Vec<u8>>]) -> Vec<Option<Vec<u8>>> {
         .collect()
 }
 
+fn inflate_with_limit(bytes: &[u8], maximum_decoded_bytes: usize) -> Result<Vec<u8>, &'static str> {
+    let read_limit = maximum_decoded_bytes
+        .checked_add(1)
+        .ok_or("decoded byte limit is too large")?;
+    let decoder = DeflateDecoder::new(bytes);
+    let mut limited = decoder.take(read_limit as u64);
+    let mut canonical = Vec::new();
+    limited
+        .read_to_end(&mut canonical)
+        .map_err(|_| "invalid deflate stream")?;
+    if canonical.len() > maximum_decoded_bytes {
+        return Err("decoded manifest exceeds byte limit");
+    }
+    Ok(canonical)
+}
+
 fn decode_fixture(encoded: &[Option<Vec<u8>>]) -> usize {
     encoded
         .iter()
@@ -160,27 +178,33 @@ fn decode_fixture(encoded: &[Option<Vec<u8>>]) -> usize {
         .sum()
 }
 
-fn decompress_and_decode_fixture(compressed: &[Option<Vec<u8>>]) -> usize {
+fn decompress_and_decode_fixture(
+    compressed: &[Option<Vec<u8>>],
+    encoded: &[Option<Vec<u8>>],
+) -> usize {
     compressed
         .iter()
-        .map(|manifest| match manifest {
-            None => 0,
-            Some(bytes) => {
-                let mut decoder = DeflateDecoder::new(bytes.as_slice());
-                let mut canonical = Vec::new();
-                decoder
-                    .read_to_end(&mut canonical)
-                    .expect("inflate benchmark manifest");
-                decode_owner_manifest(&canonical)
-                    .expect("decode inflated benchmark manifest")
-                    .len()
-            }
-        })
+        .zip(encoded)
+        .map(
+            |(manifest, canonical_limit)| match (manifest, canonical_limit) {
+                (None, None) => 0,
+                (Some(bytes), Some(canonical_limit)) => {
+                    let canonical = inflate_with_limit(bytes, canonical_limit.len())
+                        .expect("inflate bounded benchmark manifest");
+                    decode_owner_manifest(&canonical)
+                        .expect("decode inflated benchmark manifest")
+                        .len()
+                }
+                _ => panic!("compressed and canonical benchmark manifests must align"),
+            },
+        )
         .sum()
 }
 
 fn sample_durations(mut operation: impl FnMut()) -> Vec<f64> {
-    operation();
+    for _ in 0..BENCHMARK_WARMUP_SAMPLES {
+        operation();
+    }
     (0..BENCHMARK_SAMPLES)
         .map(|_| {
             let start = Instant::now();
@@ -192,8 +216,14 @@ fn sample_durations(mut operation: impl FnMut()) -> Vec<f64> {
 
 fn duration_summary(mut samples: Vec<f64>) -> Value {
     samples.sort_by(f64::total_cmp);
+    let middle = samples.len() / 2;
+    let median = if samples.len() % 2 == 0 {
+        (samples[middle - 1] + samples[middle]) / 2.0
+    } else {
+        samples[middle]
+    };
     serde_json::json!({
-        "medianMs": samples[samples.len() / 2],
+        "medianMs": median,
         "p95Ms": samples[((samples.len() as f64 * 0.95).ceil() as usize).saturating_sub(1)],
         "samplesMs": samples,
     })
@@ -226,7 +256,10 @@ fn benchmark_fixture(name: &str, fixture: &[OwnerManifestProperty]) -> (Value, f
     let encoded = encode_fixture(fixture);
     let compressed = compress_fixture(&encoded);
     assert_eq!(decode_fixture(&encoded), expected_entries);
-    assert_eq!(decompress_and_decode_fixture(&compressed), expected_entries);
+    assert_eq!(
+        decompress_and_decode_fixture(&compressed, &encoded),
+        expected_entries
+    );
 
     let encode_samples = sample_durations(|| {
         black_box(encode_fixture(black_box(fixture)));
@@ -245,7 +278,10 @@ fn benchmark_fixture(name: &str, fixture: &[OwnerManifestProperty]) -> (Value, f
     });
     let deflate_decode_samples = sample_durations(|| {
         assert_eq!(
-            black_box(decompress_and_decode_fixture(black_box(&compressed))),
+            black_box(decompress_and_decode_fixture(
+                black_box(&compressed),
+                black_box(&encoded),
+            )),
             expected_entries
         );
     });
@@ -275,6 +311,11 @@ fn benchmark_fixture(name: &str, fixture: &[OwnerManifestProperty]) -> (Value, f
             } else {
                 Value::from(compressed_bytes as f64 / canonical_bytes as f64)
             },
+            "maximumDecodedBufferBytes": encoded.iter().flatten().map(Vec::len).max().unwrap_or(0),
+            "decodedByteBound": "exact canonical bytes per manifest",
+            "peakMemoryMeasured": false,
+            "rawCanonicalRetainedDuringCompressedDecode": true,
+            "decodedEntriesOverlapCanonicalBuffer": true,
             "encode": duration_summary(encode_samples),
             "deflate": duration_summary(compress_samples),
             "rawHash": duration_summary(raw_hash_samples),
@@ -343,6 +384,14 @@ fn matches_typescript_golden_bytes_and_identity() {
     );
     assert_eq!(decode_owner_manifest(&canonical).unwrap(), entries);
     assert_eq!(
+        decode_owner_manifest(&canonical)
+            .unwrap()
+            .last()
+            .unwrap()
+            .tuple,
+        ["\u{feff}name", "\u{feff}path", "\u{feff}extension"]
+    );
+    assert_eq!(
         owner_manifest_identity(&canonical),
         golden["manifestHash"].as_str().unwrap()
     );
@@ -407,6 +456,57 @@ fn benchmark_fixtures_cover_presence_scale_and_duplicates() {
 }
 
 #[test]
+fn aggregate_size_limit_accepts_the_boundary_and_rejects_the_next_byte() {
+    let empty_bytes = encode_owner_manifest_with_limit(&[], 9).unwrap();
+    assert_eq!(hex::encode(&empty_bytes), "524f4d460100000000");
+    assert_eq!(
+        decode_owner_manifest_with_limit(&empty_bytes, 9).unwrap(),
+        vec![]
+    );
+    assert_eq!(
+        encode_owner_manifest_with_limit(&[], 8)
+            .unwrap_err()
+            .to_string(),
+        "owner manifest exceeds V1 size limit"
+    );
+    assert_eq!(
+        decode_owner_manifest_with_limit(&empty_bytes, 8)
+            .unwrap_err()
+            .to_string(),
+        "owner manifest exceeds V1 size limit"
+    );
+    assert_eq!(
+        golden()["maximumCanonicalBytes"].as_u64().unwrap(),
+        OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES as u64
+    );
+}
+
+#[test]
+fn benchmark_discards_one_warmup_and_summarizes_ten_samples() {
+    let mut operation_count = 0;
+    let samples = sample_durations(|| operation_count += 1);
+
+    assert_eq!(operation_count, 11);
+    assert_eq!(samples.len(), 10);
+
+    let summary = duration_summary((1..=10).map(f64::from).collect());
+    assert_eq!(summary["medianMs"], 5.5);
+    assert_eq!(summary["p95Ms"], 10.0);
+}
+
+#[test]
+fn compressed_decode_rejects_output_past_its_explicit_byte_limit() {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(6));
+    encoder.write_all(&vec![0; 4_096]).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    assert_eq!(
+        inflate_with_limit(&compressed, 128).unwrap_err(),
+        "decoded manifest exceeds byte limit"
+    );
+}
+
+#[test]
 #[ignore = "release-only ordered owner-manifest codec benchmark"]
 fn owner_manifest_release_benchmark() {
     assert!(
@@ -462,6 +562,8 @@ fn owner_manifest_release_benchmark() {
         "platform": std::env::consts::OS,
         "profile": "release",
         "sampleCount": BENCHMARK_SAMPLES,
+        "warmupSamplesDiscarded": BENCHMARK_WARMUP_SAMPLES,
+        "percentileMethod": "nearest-rank over 10 measured samples after 1 discarded warmup",
         "tuplesPerExpectedOwner": TUPLES_PER_OWNER,
         "retainedTupleCount": TUPLES_PER_OWNER * 3,
         "localColdDecodeGateMs": LOCAL_COLD_DECODE_GATE_MS,

@@ -5,6 +5,8 @@ const VERSION: u8 = 1;
 const HEADER_BYTES: usize = 9;
 const MIN_ENTRY_BYTES: usize = 13;
 
+pub const OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES: usize = u32::MAX as usize;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerManifestEntry {
     pub tuple: [String; 3],
@@ -88,16 +90,48 @@ fn read_string(reader: &mut ByteReader<'_>) -> Result<String, OwnerManifestCodec
 pub fn encode_owner_manifest(
     entries: &[OwnerManifestEntry],
 ) -> Result<Vec<u8>, OwnerManifestCodecError> {
+    encode_owner_manifest_with_limit(entries, OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES)
+}
+
+pub fn encode_owner_manifest_with_limit(
+    entries: &[OwnerManifestEntry],
+    maximum_canonical_bytes: usize,
+) -> Result<Vec<u8>, OwnerManifestCodecError> {
     let entry_count = u32::try_from(entries.len())
         .map_err(|_| OwnerManifestCodecError("owner manifest entry count exceeds V1 limit"))?;
-    let estimated_length = entries
-        .len()
-        .checked_mul(64)
-        .and_then(|entry_bytes| HEADER_BYTES.checked_add(entry_bytes))
-        .ok_or(OwnerManifestCodecError(
+    let maximum_canonical_bytes =
+        maximum_canonical_bytes.min(OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES);
+    let mut canonical_bytes = HEADER_BYTES;
+    for entry in entries {
+        for value in &entry.tuple {
+            let string_bytes = u32::try_from(value.len()).map_err(|_| {
+                OwnerManifestCodecError("owner manifest string exceeds V1 size limit")
+            })?;
+            canonical_bytes = canonical_bytes
+                .checked_add(4)
+                .and_then(|size| size.checked_add(string_bytes as usize))
+                .ok_or(OwnerManifestCodecError(
+                    "owner manifest exceeds V1 size limit",
+                ))?;
+        }
+        canonical_bytes = canonical_bytes
+            .checked_add(1 + usize::from(entry.payload_hash.is_some()) * 32)
+            .ok_or(OwnerManifestCodecError(
+                "owner manifest exceeds V1 size limit",
+            ))?;
+        if canonical_bytes > maximum_canonical_bytes {
+            return Err(OwnerManifestCodecError(
+                "owner manifest exceeds V1 size limit",
+            ));
+        }
+    }
+    if canonical_bytes > maximum_canonical_bytes {
+        return Err(OwnerManifestCodecError(
             "owner manifest exceeds V1 size limit",
-        ))?;
-    let mut bytes = Vec::with_capacity(estimated_length);
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(canonical_bytes);
     bytes.extend_from_slice(MAGIC);
     bytes.push(VERSION);
     bytes.extend_from_slice(&entry_count.to_le_bytes());
@@ -120,6 +154,20 @@ pub fn encode_owner_manifest(
 pub fn decode_owner_manifest(
     bytes: &[u8],
 ) -> Result<Vec<OwnerManifestEntry>, OwnerManifestCodecError> {
+    decode_owner_manifest_with_limit(bytes, OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES)
+}
+
+pub fn decode_owner_manifest_with_limit(
+    bytes: &[u8],
+    maximum_canonical_bytes: usize,
+) -> Result<Vec<OwnerManifestEntry>, OwnerManifestCodecError> {
+    let maximum_canonical_bytes =
+        maximum_canonical_bytes.min(OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES);
+    if bytes.len() > maximum_canonical_bytes {
+        return Err(OwnerManifestCodecError(
+            "owner manifest exceeds V1 size limit",
+        ));
+    }
     let mut reader = ByteReader::new(bytes);
     if reader.read_bytes(4, "truncated owner manifest magic")? != MAGIC {
         return Err(OwnerManifestCodecError("invalid owner manifest magic"));
