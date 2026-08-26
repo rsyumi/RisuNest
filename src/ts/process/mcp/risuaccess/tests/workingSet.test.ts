@@ -10,6 +10,7 @@ const runtimeMocks = vi.hoisted(() => ({
   readCharacter: vi.fn(),
   readConversationAt: vi.fn(),
   readSelectedConversation: vi.fn(),
+  readSelectedConversationWindow: vi.fn(),
 }))
 
 const alertMocks = vi.hoisted(() => ({
@@ -35,6 +36,7 @@ vi.mock(import('src/ts/storage/persistentDataRuntime.svelte'), () => ({
   readPersistentCharacterDetail: runtimeMocks.readCharacter,
   readPersistentConversationAt: runtimeMocks.readConversationAt,
   readPersistentSelectedConversation: runtimeMocks.readSelectedConversation,
+  readPersistentSelectedConversationWindow: runtimeMocks.readSelectedConversationWindow,
   releaseInactiveWorkingSet: vi.fn(),
 }))
 vi.mock('src/ts/stores.svelte', () => ({
@@ -103,6 +105,20 @@ beforeEach(() => {
     character: makeCharacterDetail(),
     conversation: makeCharacter().chats[0],
   })
+  runtimeMocks.readSelectedConversationWindow.mockResolvedValue({
+    revision: 4,
+    character: makeCharacterDetail(),
+    conversation: {
+      characterId: 'char-1',
+      conversationId: 'chat-1',
+      messages: makeCharacter().chats[0].message,
+      startIndex: 0,
+      endIndex: 2,
+      totalMessages: 2,
+      hasMoreBefore: false,
+      hasMoreAfter: false,
+    },
+  })
   runtimeMocks.mutateCharacter.mockImplementation(
     async (_id: string, _reason: string, mutate: (state: { character: character }) => void) => {
       const character = makeCharacter()
@@ -152,29 +168,33 @@ test('reads the selected inactive conversation with one atomic persistence opera
     { type: 'text', text: 'Catalog name: newest' },
     { type: 'text', text: 'User: oldest' },
   ]))
-  expect(runtimeMocks.readSelectedConversation).toHaveBeenCalledTimes(1)
-  expect(runtimeMocks.readSelectedConversation).toHaveBeenCalledWith(
+  expect(runtimeMocks.readSelectedConversationWindow).toHaveBeenCalledTimes(1)
+  expect(runtimeMocks.readSelectedConversationWindow).toHaveBeenCalledWith(
     'char-1',
+    20,
+    0,
     'risuaccess-chat-history-read',
   )
+  expect(runtimeMocks.readSelectedConversation).not.toHaveBeenCalled()
   expect(runtimeMocks.readCharacter).not.toHaveBeenCalled()
   expect(runtimeMocks.readConversationAt).not.toHaveBeenCalled()
   expect(DBState.db.characters[0]).toBe(stub)
 })
 
 test('reports a character missing when the atomic selected-conversation read returns null', async () => {
-  runtimeMocks.readSelectedConversation.mockResolvedValue(null)
+  runtimeMocks.readSelectedConversationWindow.mockResolvedValue(null)
 
   const result = await new ChatHandler().getChatHistory('char-1', 20, 0)
 
   expect((result[0] as RPCToolCallTextContent).text).toBe(
     'Error: Character with ID char-1 not found.',
   )
-  expect(runtimeMocks.readSelectedConversation).toHaveBeenCalledTimes(1)
+  expect(runtimeMocks.readSelectedConversationWindow).toHaveBeenCalledTimes(1)
 })
 
 test('returns an empty history when a character has no selected conversation', async () => {
-  runtimeMocks.readSelectedConversation.mockResolvedValue({
+  runtimeMocks.readSelectedConversationWindow.mockResolvedValue({
+    revision: 4,
     character: makeCharacterDetail(),
     conversation: null,
   })
@@ -182,11 +202,12 @@ test('returns an empty history when a character has no selected conversation', a
   const result = await new ChatHandler().getChatHistory('char-1', 20, 0)
 
   expect((result[0] as RPCToolCallTextContent).text).toBe(JSON.stringify([]))
-  expect(runtimeMocks.readSelectedConversation).toHaveBeenCalledTimes(1)
+  expect(runtimeMocks.readSelectedConversationWindow).toHaveBeenCalledTimes(1)
 })
 
 test('reports a group before treating its null selected conversation as empty history', async () => {
-  runtimeMocks.readSelectedConversation.mockResolvedValue({
+  runtimeMocks.readSelectedConversationWindow.mockResolvedValue({
+    revision: 4,
     character: { ...makeCharacterDetail(), type: 'group', name: 'Group' },
     conversation: null,
   })
@@ -196,7 +217,44 @@ test('reports a group before treating its null selected conversation as empty hi
   expect((result[0] as RPCToolCallTextContent).text).toBe(
     'Error: The id pointed to a group chat, not a character.',
   )
-  expect(runtimeMocks.readSelectedConversation).toHaveBeenCalledTimes(1)
+  expect(runtimeMocks.readSelectedConversationWindow).toHaveBeenCalledTimes(1)
+})
+
+test('preserves newest-first offset paging without requesting a complete conversation', async () => {
+  runtimeMocks.readSelectedConversationWindow.mockResolvedValue({
+    revision: 4,
+    character: makeCharacterDetail(),
+    conversation: {
+      characterId: 'char-1',
+      conversationId: 'chat-1',
+      messages: [
+        { role: 'char', data: 'third newest', chatId: 'duplicate' },
+        { role: 'user', data: 'second newest' },
+        { role: 'char', data: 'newest', chatId: 'duplicate' },
+      ],
+      startIndex: 97,
+      endIndex: 100,
+      totalMessages: 102,
+      hasMoreBefore: true,
+      hasMoreAfter: true,
+    },
+  })
+
+  const result = await new ChatHandler().getChatHistory('char-1', 3, 2)
+
+  expect((result[0] as RPCToolCallTextContent).text).toBe(JSON.stringify([
+    { type: 'text', text: 'Catalog name: newest' },
+    { type: 'text', text: 'User: second newest' },
+    { type: 'text', text: 'Catalog name: third newest' },
+  ]))
+  expect(runtimeMocks.readSelectedConversationWindow).toHaveBeenCalledWith(
+    'char-1',
+    3,
+    2,
+    'risuaccess-chat-history-read',
+  )
+  expect(runtimeMocks.readSelectedConversation).not.toHaveBeenCalled()
+  expect(runtimeMocks.readConversationAt).not.toHaveBeenCalled()
 })
 
 test('persists an inactive character write through a stable ID without mutating the catalog stub', async () => {

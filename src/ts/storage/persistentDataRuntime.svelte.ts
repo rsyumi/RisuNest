@@ -44,6 +44,10 @@ import {
     isCatalogPresetWorkingSet,
 } from './workingSetCatalog'
 import { notifyPluginStorageAuthorityReplacement } from '../plugins/pluginStorageStore'
+import {
+    readPinnedSelectedConversationWindow,
+    type PersistentSelectedConversationWindow,
+} from './persistentConversationRead'
 
 export type {
     PersistentDataRuntime,
@@ -408,6 +412,26 @@ export const readPersistentSelectedConversation = (
     reason: string,
 ): Promise<PersistentSelectedConversation | null> =>
     getPersistentDataRuntime().readPersistentSelectedConversation(characterId, reason)
+export const readPersistentSelectedConversationWindow = (
+    characterId: string,
+    count: number,
+    offset: number,
+    reason: string,
+    signal?: AbortSignal,
+): Promise<PersistentSelectedConversationWindow | null> => {
+    const runtime = getPersistentDataRuntime()
+    return readPinnedSelectedConversationWindow({
+        store: runtime.store,
+        flushPendingData: (readReason) => runtime.flushPendingData(readReason),
+        getNavigationGeneration: () => runtime.getNavigationGeneration(),
+    }, {
+        characterId,
+        count,
+        offset,
+        reason,
+        signal,
+    })
+}
 export const capturePersistentMutationToken = (
     reason: string,
 ): Promise<PersistentMutationToken> =>

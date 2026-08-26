@@ -1,5 +1,5 @@
 import { type MCPTool, MCPToolHandler, type RPCToolCallContent } from '../mcplib'
-import { readPersistentSelectedConversation } from 'src/ts/storage/persistentDataRuntime.svelte'
+import { readPersistentSelectedConversationWindow } from 'src/ts/storage/persistentDataRuntime.svelte'
 import { resolveCharacterId } from './utils'
 
 export class ChatHandler extends MCPToolHandler {
@@ -50,8 +50,14 @@ export class ChatHandler extends MCPToolHandler {
       ]
     }
 
-    const selected = await readPersistentSelectedConversation(
+    if (count > 100) count = 100
+    if (count < 1) count = 1
+    if (offset < 0) offset = 0
+
+    const selected = await readPersistentSelectedConversationWindow(
       characterId,
+      count,
+      offset,
       'risuaccess-chat-history-read',
     )
     if (!selected) {
@@ -81,15 +87,7 @@ export class ChatHandler extends MCPToolHandler {
       ]
     }
 
-    if (count > 100) count = 100
-    if (count < 1) count = 1
-    if (offset < 0) offset = 0
-
-    // To get "newest first", we must reverse the array.
-    const reversedMessages = [...conversation.message].reverse()
-
-    // Now that the array is sorted from newest to oldest, we can slice it
-    const history = reversedMessages.slice(offset, offset + count)
+    const history = [...conversation.messages].reverse()
 
     const ordered = history.map((entry) => ({
       type: 'text',
