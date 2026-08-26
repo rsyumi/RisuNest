@@ -26,6 +26,7 @@ const MAX_CLAIM_RESPONSE_BYTES: usize = 1024;
 const MAX_REQUEST_LINE_BYTES: usize = MAX_URL_BYTES + 32;
 const MAX_REQUEST_HEAD_BYTES: usize = MAX_REQUEST_LINE_BYTES + 2 + MAX_HEADER_BYTES + 4;
 const CONNECTION_IO_TIMEOUT: Duration = Duration::from_millis(250);
+const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(2);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -512,6 +513,7 @@ fn read_request(
     stream: &mut TcpStream,
     stopped: &AtomicBool,
 ) -> Result<HttpRequest, RequestReadError> {
+    let request_started = Instant::now();
     let mut head = [0_u8; MAX_REQUEST_HEAD_BYTES];
     let mut head_len = 0_usize;
     let head_end = loop {
@@ -520,6 +522,9 @@ fn read_request(
         }
         if let Some(position) = find_bytes(&head[..head_len], b"\r\n\r\n") {
             break position;
+        }
+        if request_started.elapsed() >= REQUEST_READ_DEADLINE {
+            return Err(RequestReadError::Http(408));
         }
         if let Some(line_end) = find_bytes(&head[..head_len], b"\r\n") {
             if line_end > MAX_REQUEST_LINE_BYTES
@@ -616,6 +621,9 @@ fn read_request(
         if stopped.load(Ordering::SeqCst) {
             return Err(RequestReadError::Stopped);
         }
+        if request_started.elapsed() >= REQUEST_READ_DEADLINE {
+            return Err(RequestReadError::Http(408));
+        }
         let remaining = content_length - body.len();
         let mut buffer = [0_u8; MAX_BODY_BYTES];
         match stream.read(&mut buffer[..remaining]) {
@@ -631,7 +639,6 @@ fn read_request(
             Err(error) => return Err(RequestReadError::Io(error)),
         }
     }
-
     Ok(HttpRequest {
         method: method.to_owned(),
         url: url.to_owned(),

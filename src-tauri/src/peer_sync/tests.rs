@@ -723,6 +723,43 @@ fn lan_server_rejects_oversized_request_lines_headers_and_bodies() {
 }
 
 #[test]
+fn lan_server_applies_an_overall_request_deadline_to_trickled_headers() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    host.start().unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let trickle = thread::spawn(move || {
+        for byte in b"GET / HTTP/1.1\r\nHost: localhost\r\n" {
+            if writer.write_all(&[*byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    let started = Instant::now();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let response_elapsed = started.elapsed();
+    trickle.join().unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 408 "),
+        "unexpected trickled-request response: {response:?}"
+    );
+    assert!(
+        response_elapsed < Duration::from_secs(3),
+        "trickled request exceeded the overall deadline"
+    );
+    host.stop().unwrap();
+}
+
+#[test]
 fn lan_client_bounds_an_incomplete_oversized_claim_response() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
