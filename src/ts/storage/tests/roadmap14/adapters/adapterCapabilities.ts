@@ -232,13 +232,25 @@ export const ADAPTER_CAPABILITY_MATRIX = {
         {
             id: 'lossless-package-v1',
             oracleStatus: 'known-gap',
-            resultWarning: 'The private native foundation preserves all package data, but production routing remains disabled pending physical atomicity gates.',
+            resultWarning: 'The private native foundation preserves payload bytes, but legacy block staging normalizes top-level database key order and its serde_json validator does not cover JavaScript-only values or synthetic card containers. Production routing remains disabled.',
             capabilities: [
-                ...COMPLETE_BACKUP_CAPABILITIES,
+                {
+                    feature: 'database',
+                    category: 'partial',
+                    warning: 'Validation covers serde_json values, but legacy block staging normalizes top-level key order. JavaScript undefined, sparse holes, and ABSENT are outside the production validator domain.',
+                },
+                { feature: 'ordinary-assets', category: 'preserved' },
+                { feature: 'inlays', category: 'preserved' },
+                { feature: 'cold-payloads', category: 'preserved' },
+                {
+                    feature: 'synthetic-card-containers',
+                    category: 'unsupported',
+                    warning: 'Synthetic card containers used by the F0 oracle are not part of the native package validator scope.',
+                },
                 {
                     feature: 'production-route',
                     category: 'partial',
-                    warning: 'The public route stays disabled until 10 GB, process-kill, disk-full, and Android evidence passes.',
+                    warning: 'The public route stays disabled. 10 GB, process-kill, disk-full, and Android evidence is deferred and not claimed.',
                 },
             ],
         },

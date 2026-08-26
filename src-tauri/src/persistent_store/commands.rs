@@ -210,11 +210,23 @@ pub(crate) fn pds_read_plugin_storage(
 #[tauri::command(async)]
 pub(crate) fn pds_read_asset_alias(
     state: State<'_, PersistentStoreState>,
+    kind: String,
     key: String,
     lease: Option<String>,
 ) -> Result<Option<Versioned<AssetAlias>>, StoreError> {
     with_store(state, |store| {
-        store.read_asset_alias(&key, lease.as_deref())
+        store.read_asset_alias(&kind, &key, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_asset_owner_head(
+    state: State<'_, PersistentStoreState>,
+    owner: AssetOwnerLocator,
+    lease: Option<String>,
+) -> Result<Option<Versioned<AssetOwnerHead>>, StoreError> {
+    with_store(state, |store| {
+        store.read_asset_owner_head(&owner, lease.as_deref())
     })
 }
 

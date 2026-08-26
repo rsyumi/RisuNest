@@ -1967,6 +1967,7 @@ impl Drop for JobOwnedFile {
 mod tests {
     use super::*;
     use crate::local_backup::NeverCancelled;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use std::{
         fs,
@@ -2117,6 +2118,117 @@ mod tests {
     }
 
     #[test]
+    fn production_block_decoder_discloses_the_wire_representable_w0_order_gap() {
+        let encoded = STANDARD
+            .decode(
+                include_str!(
+                    "../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-block-v4.input.base64"
+                )
+                .trim(),
+            )
+            .expect("decode frozen W0 block RisuSave");
+        assert_eq!(encoded.len(), 743);
+        assert_eq!(
+            hex::encode(Sha256::digest(&encoded)),
+            "6e179d45f5239d50562407e5b4808bab1b651c9425bde488137c5f5d538f36c1"
+        );
+        let directory = tempfile::tempdir().expect("create W0 production decode directory");
+        let database_path = directory.path().join("w0.risudat");
+        fs::write(&database_path, &encoded).expect("write W0 production artifact");
+        let database = StagedLosslessEntry {
+            logical_path: DATABASE_PATH.to_owned(),
+            logical_key: None,
+            kind: PayloadKind::Database,
+            byte_length: encoded.len() as u64,
+            sha256: hex::encode(Sha256::digest(&encoded)),
+            metadata: json!({}),
+            staged_path: Some(JobOwnedFile::new(database_path)),
+            immutable_object: None,
+        };
+        let mut store = PersistentStore::open(directory.path()).expect("open W0 staging store");
+        let staging_id = store
+            .replace_begin()
+            .expect("begin W0 production staging")
+            .staging_id;
+
+        stage_block_database(&mut store, &staging_id, &database, &NeverCancelled)
+            .expect("decode W0 through the production block reader");
+        let decoded = store
+            .materialize_staging(&staging_id)
+            .expect("materialize production-decoded W0");
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-block-v4.expected.json"
+        ))
+        .expect("parse frozen W0 expectation");
+
+        let expected_missing = [
+            F0ExpectedMissing {
+                target_kind: "persona".to_owned(),
+                target_key: "#undefined".to_owned(),
+            },
+            F0ExpectedMissing {
+                target_kind: "asset".to_owned(),
+                target_key: "fixture.png".to_owned(),
+            },
+            F0ExpectedMissing {
+                target_kind: "conversation".to_owned(),
+                target_key: "#undefined".to_owned(),
+            },
+        ];
+        let source_validation = validate_f0_v1(&expected, &[], &expected_missing)
+            .expect("validate the frozen W0 expectation through F0");
+        assert_eq!(
+            source_validation.canonical_database_sha256,
+            "9a8f355262eba1a3163b51e9c12e22802765305299c4f60eb4834d0d1122eec6"
+        );
+        let validation = validate_f0_v1(&decoded, &[], &expected_missing)
+            .expect("validate production-decoded W0 through F0");
+        assert_ne!(
+            decoded
+                .as_object()
+                .expect("production W0 database object")
+                .keys()
+                .collect::<Vec<_>>(),
+            expected
+                .as_object()
+                .expect("frozen W0 database object")
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            validation.canonical_database_sha256,
+            "55195e4a86e010d50bb37c502802f2180c769d508f210f4dc4846a89935a80f7"
+        );
+        assert_eq!(validation.references, source_validation.references);
+        assert_eq!(
+            validation
+                .references
+                .iter()
+                .map(|reference| (
+                    reference.target_kind.as_str(),
+                    reference.target_key.as_str(),
+                    reference.status,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("preset", "Fixture preset", F0ReferenceStatus::Present),
+                ("persona", "#undefined", F0ReferenceStatus::ExpectedMissing,),
+                ("preset", "<undefined>", F0ReferenceStatus::Invalid),
+                ("persona", "<undefined>", F0ReferenceStatus::Invalid),
+                ("asset", "fixture.png", F0ReferenceStatus::ExpectedMissing,),
+                (
+                    "conversation",
+                    "#undefined",
+                    F0ReferenceStatus::ExpectedMissing,
+                ),
+            ]
+        );
+        store
+            .replace_abort(&staging_id)
+            .expect("abort verified W0 staging generation");
+    }
+
+    #[test]
     fn sqlite_reopen_observes_complete_old_or_database_and_typed_payload_generation() {
         for fail_before_commit in [true, false] {
             let directory = tempfile::tempdir().unwrap();
@@ -2157,11 +2269,11 @@ mod tests {
                 assert_eq!(reopened.revision().unwrap(), 2);
                 assert_eq!(reopened.materialize(None).unwrap()["username"], "New");
                 let asset = reopened
-                    .read_asset_alias_by_kind("asset", "shared", None)
+                    .read_asset_alias("asset", "shared", None)
                     .unwrap()
                     .unwrap();
                 let inlay = reopened
-                    .read_asset_alias_by_kind("inlay", "shared", None)
+                    .read_asset_alias("inlay", "shared", None)
                     .unwrap()
                     .unwrap();
                 let cold = reopened.read_cold_alias("shared", None).unwrap().unwrap();
@@ -2243,7 +2355,12 @@ mod tests {
 
         assert_eq!(reopened.revision().unwrap(), 1);
         assert_eq!(reopened.materialize(None).unwrap()["username"], "Old");
-        assert_eq!(reopened.read_asset_alias("asset.bin", None).unwrap(), None);
+        assert_eq!(
+            reopened
+                .read_asset_alias("asset", "asset.bin", None)
+                .unwrap(),
+            None
+        );
         assert_eq!(reopened.read_cold_alias("character", None).unwrap(), None);
     }
 
@@ -2662,7 +2779,7 @@ mod tests {
         assert!(!backup_path.exists());
 
         let old_asset = store
-            .read_asset_alias_by_kind("asset", "shared", None)
+            .read_asset_alias("asset", "shared", None)
             .unwrap()
             .unwrap();
         let object = cas

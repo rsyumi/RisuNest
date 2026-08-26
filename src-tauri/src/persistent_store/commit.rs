@@ -22,10 +22,6 @@ pub(super) fn commit_asset_alias(
     let active = active_generation(&transaction)?;
     let revision = actual_revision + 1;
     let generation = writable_generation(&transaction, &active, revision)?;
-    transaction.execute(
-        "DELETE FROM asset_aliases WHERE generation = ?1 AND logical_key = ?2",
-        params![generation, alias.key],
-    )?;
     put_asset_alias(&transaction, &generation, alias)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
@@ -33,6 +29,7 @@ pub(super) fn commit_asset_alias(
 }
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 pub(super) fn commit(
     connection: &mut Connection,
@@ -100,7 +97,6 @@ pub(super) fn commit(
         apply_plugin_storage_mutation(&transaction, &generation, mutation)?;
     }
     replace_changed_owner_heads(&transaction, &generation, input)?;
-
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })

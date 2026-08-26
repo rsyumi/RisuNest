@@ -1,8 +1,7 @@
 use super::{
-    AssetAlias, AssetOwnerHead, AssetOwnerLocator, CharacterQuery, CheckpointMode,
-    ColdAlias, ConversationMutation, ConversationPage,
-    ConversationQuery, ConversationWindowQuery, PersistentStore, PluginStorageMutation, QueryOrder,
-    StoreError, WorkingSetCommit,
+    AssetAlias, AssetOwnerHead, AssetOwnerLocator, CharacterQuery, CheckpointMode, ColdAlias,
+    ConversationMutation, ConversationPage, ConversationQuery, ConversationWindowQuery,
+    PersistentStore, PluginStorageMutation, QueryOrder, StoreError, WorkingSetCommit,
 };
 use serde_json::{json, Value};
 use std::{
@@ -468,6 +467,97 @@ fn owner_head_validation_uses_the_final_character_parent_and_rejects_atomically(
 }
 
 #[test]
+fn unchanged_asset_owner_head_survives_cow_generation_and_pinned_reads() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut database_root = root(&database);
+    database_root["modules"] = json!([{
+        "id": "module",
+        "name": "Module",
+        "description": "",
+        "assets": [["asset", "assets/owner.bin", "BIN"]]
+    }]);
+    database_root["personas"] = json!([{
+        "name": "Absent assets",
+        "embeddedModule": { "id": "embedded", "name": "Embedded" }
+    }]);
+    let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
+    let head = AssetOwnerHead::present(owner.clone(), "81".repeat(32), 1);
+    let absent_owner = AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 };
+    let absent_head = AssetOwnerHead::absent(absent_owner.clone());
+    let committed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(database_root),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![head.clone(), absent_head.clone()]),
+        })
+        .expect("commit M5 owner head");
+    let lease = store
+        .acquire_revision(committed.revision)
+        .expect("pin M5 owner head");
+    let unrelated_alias = AssetAlias {
+        key: "assets/unrelated.bin".to_owned(),
+        object_hash: Some("82".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 1,
+        mime: "application/octet-stream".to_owned(),
+        name: "Unrelated".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let copied = store
+        .commit_asset_alias(&unrelated_alias, committed.revision)
+        .expect("commit unrelated generation mutation");
+
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, None)
+            .expect("read current owner head"),
+        Some(super::Versioned {
+            revision: copied.revision,
+            value: head.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, Some(&lease.lease))
+            .expect("read pinned owner head"),
+        Some(super::Versioned {
+            revision: committed.revision,
+            value: head,
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&absent_owner, None)
+            .expect("read current absent owner head"),
+        Some(super::Versioned {
+            revision: copied.revision,
+            value: absent_head.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&absent_owner, Some(&lease.lease))
+            .expect("read pinned absent owner head"),
+        Some(super::Versioned {
+            revision: committed.revision,
+            value: absent_head,
+        })
+    );
+}
+
+#[test]
 fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
     let directory = tempfile::tempdir().expect("create payload namespace directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
@@ -521,13 +611,13 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
         .expect("stage cold alias");
     assert_eq!(
         store
-            .read_asset_alias_by_kind("asset", key, None)
+            .read_asset_alias("asset", key, None)
             .expect("read pre-activation ordinary asset"),
         None
     );
     assert_eq!(
         store
-            .read_asset_alias_by_kind("inlay", key, None)
+            .read_asset_alias("inlay", key, None)
             .expect("read pre-activation Inlay"),
         None
     );
@@ -548,7 +638,7 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
 
     assert_eq!(
         store
-            .read_asset_alias_by_kind("asset", key, None)
+            .read_asset_alias("asset", key, None)
             .expect("read ordinary asset")
             .expect("ordinary asset exists")
             .value,
@@ -556,7 +646,7 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
     );
     assert_eq!(
         store
-            .read_asset_alias_by_kind("inlay", key, None)
+            .read_asset_alias("inlay", key, None)
             .expect("read Inlay")
             .expect("Inlay exists")
             .value,
@@ -569,6 +659,95 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
             .expect("cold alias exists")
             .value,
         cold
+    );
+}
+
+#[test]
+fn committing_one_alias_kind_preserves_the_sibling_kind_and_pinned_revision() {
+    let directory = tempfile::tempdir().expect("create alias namespace directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin staged replacement");
+    let key = "shared/mutation-key";
+    let asset = AssetAlias {
+        key: key.to_owned(),
+        object_hash: Some("41".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 1,
+        mime: "application/octet-stream".to_owned(),
+        name: "Asset".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let inlay = AssetAlias {
+        key: key.to_owned(),
+        object_hash: Some("42".repeat(32)),
+        kind: "inlay".to_owned(),
+        size: 2,
+        mime: "image/png".to_owned(),
+        name: "Inlay".to_owned(),
+        ext: "png".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: Some(2),
+        height: Some(3),
+        metadata: json!({}),
+    };
+    store
+        .replace_put_asset_aliases(&staging.staging_id, &[asset.clone(), inlay.clone()])
+        .expect("stage sibling alias kinds");
+    let first = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate sibling alias kinds");
+    let lease = store
+        .acquire_revision(first.revision)
+        .expect("pin sibling alias kinds");
+    let replacement = AssetAlias {
+        object_hash: Some("43".repeat(32)),
+        name: "Replacement asset".to_owned(),
+        ..asset.clone()
+    };
+
+    let second = store
+        .commit_asset_alias(&replacement, first.revision)
+        .expect("commit only ordinary asset kind");
+
+    assert_eq!(
+        store
+            .read_asset_alias("asset", key, None)
+            .expect("read current ordinary asset"),
+        Some(super::Versioned {
+            revision: second.revision,
+            value: replacement,
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("inlay", key, None)
+            .expect("read current Inlay"),
+        Some(super::Versioned {
+            revision: second.revision,
+            value: inlay.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("asset", key, Some(&lease.lease))
+            .expect("read pinned ordinary asset"),
+        Some(super::Versioned {
+            revision: first.revision,
+            value: asset,
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("inlay", key, Some(&lease.lease))
+            .expect("read pinned Inlay"),
+        Some(super::Versioned {
+            revision: first.revision,
+            value: inlay,
+        })
     );
 }
 
@@ -648,7 +827,7 @@ fn asset_alias_unknown_metadata_survives_activation_lease_and_reopen() {
     let store = PersistentStore::open(directory.path()).expect("reopen alias metadata store");
     assert_eq!(
         store
-            .read_asset_alias_by_kind("asset", &original.key, None)
+            .read_asset_alias("asset", &original.key, None)
             .expect("read current alias metadata"),
         Some(super::Versioned {
             revision: second.revision,
@@ -657,7 +836,7 @@ fn asset_alias_unknown_metadata_survives_activation_lease_and_reopen() {
     );
     assert_eq!(
         store
-            .read_asset_alias_by_kind("asset", &original.key, Some(&lease.lease))
+            .read_asset_alias("asset", &original.key, Some(&lease.lease))
             .expect("read leased alias metadata"),
         Some(super::Versioned {
             revision: first.revision,
@@ -666,7 +845,7 @@ fn asset_alias_unknown_metadata_survives_activation_lease_and_reopen() {
     );
     assert_eq!(
         store
-            .read_asset_alias_by_kind("inlay", &original.key, Some(&lease.lease))
+            .read_asset_alias("inlay", &original.key, Some(&lease.lease))
             .expect("read leased Inlay metadata"),
         Some(super::Versioned {
             revision: first.revision,
@@ -678,7 +857,7 @@ fn asset_alias_unknown_metadata_survives_activation_lease_and_reopen() {
             .list_asset_aliases(None)
             .expect("list current alias metadata")
             .value,
-        vec![replacement]
+        vec![replacement, original_inlay.clone()]
     );
     assert_eq!(
         store
@@ -800,7 +979,7 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
     );
     assert_eq!(
         store
-            .read_asset_alias_by_kind("inlay", "shared", Some(&lease.lease))
+            .read_asset_alias("inlay", "shared", Some(&lease.lease))
             .expect("read pinned Inlay")
             .expect("pinned Inlay exists")
             .value,
@@ -808,7 +987,7 @@ fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() 
     );
     assert_eq!(
         store
-            .read_asset_alias_by_kind("asset", "shared", None)
+            .read_asset_alias("asset", "shared", None)
             .expect("read current asset")
             .expect("current asset exists"),
         super::Versioned {
@@ -867,6 +1046,7 @@ fn cold_aliases_follow_copy_on_write_without_leaking_between_revisions() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("commit copy-on-write revision");
@@ -927,14 +1107,14 @@ fn asset_alias_overwrite_isolated_by_revision_lease() {
     let replacement = AssetAlias {
         key: original.key.clone(),
         object_hash: Some("22".repeat(32)),
-        kind: "inlay".to_owned(),
+        kind: "asset".to_owned(),
         size: 7,
-        mime: "image/webp".to_owned(),
+        mime: "application/octet-stream".to_owned(),
         name: "Shared Replacement".to_owned(),
-        ext: "WebP".to_owned(),
-        inlay_type: Some("image".to_owned()),
-        width: Some(320),
-        height: Some(180),
+        ext: "BIN".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
         metadata: json!({}),
     };
     let second = store
@@ -943,7 +1123,7 @@ fn asset_alias_overwrite_isolated_by_revision_lease() {
 
     assert_eq!(
         store
-            .read_asset_alias(&original.key, None)
+            .read_asset_alias("asset", &original.key, None)
             .expect("read current alias"),
         Some(super::Versioned {
             revision: second.revision,
@@ -952,13 +1132,13 @@ fn asset_alias_overwrite_isolated_by_revision_lease() {
     );
     assert_eq!(
         store
-            .read_asset_alias_by_kind("asset", &original.key, None)
-            .expect("read replaced ordinary alias"),
+            .read_asset_alias("inlay", &original.key, None)
+            .expect("read absent sibling Inlay alias"),
         None
     );
     assert_eq!(
         store
-            .read_asset_alias(&original.key, Some(&lease.lease))
+            .read_asset_alias("asset", &original.key, Some(&lease.lease))
             .expect("read leased alias"),
         Some(super::Versioned {
             revision: first.revision,
@@ -1025,7 +1205,7 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
 
     assert_eq!(
         store
-            .read_asset_alias(&zero_byte.key, None)
+            .read_asset_alias("asset", &zero_byte.key, None)
             .expect("read zero-byte alias"),
         Some(super::Versioned {
             revision: committed.revision,
@@ -1034,7 +1214,7 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
     );
     assert_eq!(
         store
-            .read_asset_alias(&missing_payload.key, None)
+            .read_asset_alias("inlay", &missing_payload.key, None)
             .expect("read missing-payload alias"),
         Some(super::Versioned {
             revision: committed.revision,
@@ -1043,7 +1223,7 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
     );
     assert_eq!(
         store
-            .read_asset_alias(&duplicate_bytes_alias.key, None)
+            .read_asset_alias("asset", &duplicate_bytes_alias.key, None)
             .expect("read duplicate-byte alias"),
         Some(super::Versioned {
             revision: committed.revision,
@@ -1052,7 +1232,7 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
     );
     assert_eq!(
         store
-            .read_asset_alias("assets/not-present.bin", None)
+            .read_asset_alias("asset", "assets/not-present.bin", None)
             .expect("read absent alias"),
         None
     );
@@ -1189,7 +1369,7 @@ fn invalid_asset_aliases_leave_revision_and_staging_rows_unchanged() {
         assert_eq!(store.revision().expect("read unchanged revision"), 0);
         assert_eq!(
             store
-                .read_asset_alias(&invalid.key, None)
+                .read_asset_alias("asset", &invalid.key, None)
                 .expect("read rejected current alias"),
             None
         );
@@ -1291,7 +1471,7 @@ fn corrupt_persisted_asset_alias_fails_direct_lookup_and_integrity_check() {
         .expect("restore alias check constraints");
 
     assert!(matches!(
-        store.read_asset_alias("assets/corrupt.bin", None),
+        store.read_asset_alias("asset", "assets/corrupt.bin", None),
         Err(StoreError::Validation { .. })
     ));
     let integrity: String = store
@@ -1320,13 +1500,13 @@ fn asset_alias_direct_lookup_is_scoped_to_generation_and_logical_key() {
 
     assert_eq!(
         store
-            .read_asset_alias("assets/requested.bin", None)
+            .read_asset_alias("asset", "assets/requested.bin", None)
             .expect("read requested alias"),
         None
     );
     assert_eq!(
         store
-            .read_asset_alias("assets/other.bin", None)
+            .read_asset_alias("asset", "assets/other.bin", None)
             .expect("read active other alias")
             .expect("active other alias exists")
             .value
@@ -1375,7 +1555,7 @@ fn native_export_lease_retains_its_asset_alias_generation() {
     assert!(Path::new(&exported.path).is_file());
     assert_eq!(
         store
-            .read_asset_alias(&original.key, Some(&lease.lease))
+            .read_asset_alias("asset", &original.key, Some(&lease.lease))
             .expect("read export alias lease"),
         Some(super::Versioned {
             revision: first.revision,
@@ -1784,6 +1964,7 @@ fn pinned_materialization_is_not_affected_by_active_changes() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("change active generation after lease");
@@ -3985,6 +4166,12 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             .value,
         Vec::<ColdAlias>::new()
     );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+            .expect("read empty migrated owner-head table"),
+        None
+    );
     let primary_key_columns = {
         let mut statement = store
             .connection
@@ -4006,40 +4193,34 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
 }
 
 #[test]
-fn schema_v8_preserves_reserved_v7_tables() {
+fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
     let directory = tempfile::tempdir().expect("create v7 migration directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
     store
         .connection
         .execute_batch(
-            "
-            DROP TABLE cold_aliases;
-            CREATE TABLE reserved_v7_records (
-                generation TEXT NOT NULL,
-                owner TEXT NOT NULL,
-                PRIMARY KEY (generation, owner)
+            r#"
+            UPDATE root
+            SET value = '{"modules":[{"id":"v7-module","assets":[["v7","assets/v7.bin","BIN"]]}]}'
+            WHERE generation = 'revision-0';
+            INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+            ) VALUES (
+                'revision-0', 'root-module-assets', '0', 1,
+                '8383838383838383838383838383838383838383838383838383838383838383', 1
             );
-            INSERT INTO reserved_v7_records (generation, owner)
-            VALUES ('revision-0', 'preserved');
+            DROP TABLE cold_aliases;
             PRAGMA user_version = 7;
-            ",
+            "#,
         )
-        .expect("create reserved v7 fixture");
+        .expect("create M5 v7 owner-head fixture");
     drop(store);
 
-    let store = PersistentStore::open(directory.path()).expect("migrate reserved v7 store");
+    let mut store = PersistentStore::open(directory.path()).expect("migrate M5 v7 store");
     let version: i64 = store
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    let reserved: String = store
-        .connection
-        .query_row(
-            "SELECT owner FROM reserved_v7_records WHERE generation = 'revision-0'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read preserved reserved v7 row");
     let cold_table_exists: bool = store
         .connection
         .query_row(
@@ -4052,8 +4233,72 @@ fn schema_v8_preserves_reserved_v7_tables() {
         .expect("query migrated cold table");
 
     assert_eq!(version, 8);
-    assert_eq!(reserved, "preserved");
     assert!(cold_table_exists);
+    let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
+    let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, None)
+            .expect("read migrated current owner head"),
+        Some(super::Versioned {
+            revision: 0,
+            value: head.clone(),
+        })
+    );
+    let lease = store.acquire_revision(0).expect("pin migrated v7 revision");
+    let alias = AssetAlias {
+        key: "assets/post-v7.bin".to_owned(),
+        object_hash: Some("84".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 1,
+        mime: "application/octet-stream".to_owned(),
+        name: "Post-v7".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let current = store
+        .commit_asset_alias(&alias, 0)
+        .expect("copy migrated owner head into new generation");
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, None)
+            .expect("read copied current owner head"),
+        Some(super::Versioned {
+            revision: current.revision,
+            value: head.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, Some(&lease.lease))
+            .expect("read migrated pinned owner head"),
+        Some(super::Versioned {
+            revision: 0,
+            value: head,
+        })
+    );
+}
+
+#[test]
+fn schema_v8_creates_the_m5_owner_head_table() {
+    let directory = tempfile::tempdir().expect("create owner-head schema directory");
+    let store = PersistentStore::open(directory.path()).expect("create v8 store");
+    let table_exists: bool = store
+        .connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type = 'table' AND name = 'asset_owner_heads'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query owner-head table");
+
+    assert!(table_exists);
 }
 
 #[test]
@@ -5110,7 +5355,7 @@ fn byte_rotation_uses_four_times_current_logical_database_size() {
     assert!(logical_bytes * 4 > 512 * MIB);
 
     let snapshots = snapshots_dir(&directory);
-    let sparse_bytes = logical_bytes * 3 / 4;
+    let sparse_bytes = logical_bytes * 2 / 3;
     let mut sparse = Vec::new();
     for index in 0..5 {
         let path = snapshots.join(format!("persistent-large-sparse-{index}.db"));
@@ -5125,6 +5370,7 @@ fn byte_rotation_uses_four_times_current_logical_database_size() {
     let total: u64 = listed.iter().map(|snapshot| snapshot.bytes).sum();
 
     assert!(total <= logical_bytes * 4);
+    assert!(total > 512 * MIB);
     assert!(!sparse[0].exists());
     assert!(sparse[1..].iter().all(|path| path.is_file()));
     assert!(Path::new(&created.path).is_file());
