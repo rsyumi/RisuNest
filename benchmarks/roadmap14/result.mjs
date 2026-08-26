@@ -1,0 +1,52 @@
+import { getRoadmap14Scenario } from './scenarios.mjs'
+import { validateRoadmap14Result } from './result-schema.mjs'
+
+export function createRoadmap14Result({
+    scenario: scenarioName,
+    status,
+    recordedAt,
+    build,
+    platform,
+    memory,
+    ui,
+    latency,
+    bytes,
+    canonicalOutputSha256,
+    source,
+    notes = [],
+}) {
+    const scenario = getRoadmap14Scenario(scenarioName)
+    const result = {
+        schemaVersion: 1,
+        kind: 'risunest-roadmap14-platform-result',
+        status,
+        scenario: scenario.name,
+        recordedAt,
+        fixture: {
+            name: scenario.name,
+            version: scenario.version,
+            identitySha256: scenario.identitySha256,
+            descriptor: scenario.descriptor,
+        },
+        build,
+        platform,
+        memory,
+        ui,
+        latency,
+        bytes,
+        canonicalOutputSha256,
+        source,
+        notes,
+    }
+    const errors = validateRoadmap14Result(result)
+    if (errors.length > 0) {
+        throw new Error(`Invalid Roadmap 14 result:\n${errors.join('\n')}`)
+    }
+    return result
+}
+
+export function requireRealmDisabled(environment = process.env) {
+    if (environment.VITE_DISABLE_REALM !== 'true') {
+        throw new Error('Roadmap 14 runners require VITE_DISABLE_REALM=true')
+    }
+}

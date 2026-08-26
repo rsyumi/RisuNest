@@ -1,0 +1,287 @@
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import process from 'node:process'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+import { createRoadmap14Result, requireRealmDisabled } from './result.mjs'
+
+export function convertExistingWindowsMeasurements({
+    phase3,
+    tauri,
+    canonicalOutputSha256,
+    buildIdentity,
+    platformIdentity,
+    appVersion,
+    recordedAt,
+    osVersion,
+    architecture,
+}) {
+    requireRealmDisabled()
+    if (phase3?.benchmark !== 'phase3-step5-persistent-store') {
+        throw new Error('Expected the Phase 3 save-large persistent-store result')
+    }
+    if (phase3.schemaVersion !== 1 || tauri?.schemaVersion !== 1) {
+        throw new Error('Expected schema version 1 from both existing measurements')
+    }
+    if (tauri.build?.release !== true || tauri.build?.realmDisabled !== true) {
+        throw new Error('Windows conversion requires a Realm-disabled release Tauri measurement')
+    }
+    if (!Array.isArray(phase3.samples) || phase3.samples.length === 0) {
+        throw new Error('Phase 3 result has no retained samples')
+    }
+
+    const memorySamples = [
+        tauri.boot?.memory,
+        ...(tauri.explicitImport?.memorySamples ?? []),
+        ...(tauri.snapshot?.memorySamples ?? []),
+    ].filter(Boolean)
+    const lastSample = phase3.samples.at(-1)
+
+    return createRoadmap14Result({
+        scenario: 'save-large',
+        status: 'completed',
+        recordedAt,
+        build: {
+            identity: buildIdentity,
+            sourceRevision: phase3.sourceRevision ?? null,
+            profile: 'release',
+            target: 'x86_64-pc-windows-msvc',
+            appVersion,
+            realmDisabled: true,
+        },
+        platform: {
+            family: 'windows',
+            identity: platformIdentity,
+            osVersion,
+            architecture,
+            webViewVersion: tauri.platform?.webViewUserAgent ?? null,
+            deviceModel: null,
+        },
+        memory: {
+            measurement: 'js-heap-and-rss',
+            heapUsedBytes: memorySamples.map((sample) => sample.jsHeap.usedBytes),
+            rssBytes: memorySamples.map((sample) => sample.processMemory.workingSetBytes),
+            pssBytes: [],
+        },
+        ui: {
+            domNodeCount: tauri.ui?.domNodeCount ?? null,
+            mountedMessageCount: tauri.ui?.mountedMessageCount ?? null,
+            liveUrlCount: tauri.ui?.liveUrlCount ?? null,
+        },
+        latency: {
+            saveMs: phase3.samples.map((sample) => sample.appendCommitUs / 1000),
+            importMs: phase3.samples.map((sample) => sample.importUs / 1000),
+            exportMs: phase3.samples.map((sample) => sample.exportTotalUs / 1000),
+            operationMs: phase3.samples.map((sample) => sample.snapshotUs / 1000),
+        },
+        bytes: {
+            fixtureBytes: phase3.fixture.serializedBytes,
+            savedBytes: lastSample.snapshotBytes,
+            importedBytes: phase3.fixture.serializedBytes,
+            exportedBytes: lastSample.exportTraversalJsonBytes,
+        },
+        canonicalOutputSha256: canonicalOutputSha256 ?? phase3.fixture.sha256,
+        source: {
+            runner: 'roadmap14-windows-v1',
+            measurements: [
+                'phase3-step5-persistent-store',
+                'phase3-windows-tauri-cdp',
+            ],
+        },
+        notes: [
+            'Phase 3 save-large timings are native SQLite measurements in a release Rust test process.',
+            'Heap and RSS samples come from the isolated release Tauri CDP measurement.',
+            'The Tauri staged import uses deterministic root padding and is not public picker automation.',
+            'Live RisuRealm is intentionally not exercised.',
+        ],
+    })
+}
+
+export function parseArguments(argumentsList) {
+    const options = {
+        phase3Result: null,
+        tauriResult: null,
+        output: null,
+        runExisting: false,
+        rawOutputDirectory: null,
+        canonicalOutputSha256: null,
+        buildIdentity: null,
+        platformIdentity: null,
+        recordedAt: null,
+    }
+    for (let index = 0; index < argumentsList.length; index += 1) {
+        const argument = argumentsList[index]
+        if (argument === '--phase3-result') {
+            options.phase3Result = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--tauri-result') {
+            options.tauriResult = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--output') {
+            options.output = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--run-existing') options.runExisting = true
+        else if (argument === '--raw-output-dir') {
+            options.rawOutputDirectory = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--canonical-output-sha256') {
+            options.canonicalOutputSha256 = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--build-identity') {
+            options.buildIdentity = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--platform-identity') {
+            options.platformIdentity = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--recorded-at') {
+            options.recordedAt = requiredValue(argumentsList, ++index, argument)
+        } else if (argument === '--help' || argument === '-h') options.help = true
+        else throw new Error(`Unknown argument: ${argument}`)
+    }
+    return options
+}
+
+function requiredValue(argumentsList, index, option) {
+    const value = argumentsList[index]
+    if (!value || value.startsWith('--')) throw new Error(`${option} requires a value`)
+    return value
+}
+
+async function runCommand(command, args, options) {
+    const child = spawn(command, args, {
+        cwd: options.cwd,
+        env: options.env,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    child.stdout.on('data', (chunk) => process.stderr.write(chunk))
+    child.stderr.on('data', (chunk) => process.stderr.write(chunk))
+    const [exitCode] = await once(child, 'exit')
+    if (exitCode !== 0) throw new Error(`${command} exited with code ${exitCode}`)
+}
+
+async function captureCommand(command, args, cwd) {
+    const child = spawn(command, args, {
+        cwd,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    const [exitCode] = await once(child, 'exit')
+    if (exitCode !== 0) throw new Error(`${command} failed: ${stderr.trim()}`)
+    return stdout.trim()
+}
+
+async function runExistingMeasurements(repositoryRoot, rawOutputDirectory, sourceRevision) {
+    if (process.platform !== 'win32') throw new Error('The existing release runner supports Windows only')
+    await mkdir(rawOutputDirectory, { recursive: true })
+    const phase3Result = path.join(rawOutputDirectory, 'phase3-save-large.json')
+    const tauriResult = path.join(rawOutputDirectory, 'phase3-tauri-cdp.json')
+    const environment = {
+        ...process.env,
+        VITE_DISABLE_REALM: 'true',
+        RISUNEST_PHASE3_BENCH_OUTPUT: phase3Result,
+        RISUNEST_PHASE3_BENCH_REVISION: sourceRevision,
+    }
+    await runCommand(
+        'cargo.exe',
+        [
+            'test',
+            '--manifest-path',
+            path.join(repositoryRoot, 'src-tauri', 'Cargo.toml'),
+            '--release',
+            '--locked',
+            '--lib',
+            'persistent_store::benchmark::phase3_step5_measurements',
+            '--',
+            '--ignored',
+            '--exact',
+            '--nocapture',
+            '--test-threads=1',
+        ],
+        { cwd: repositoryRoot, env: environment },
+    )
+    await runCommand(
+        process.execPath,
+        [path.join(repositoryRoot, 'benchmarks', 'phase3', 'tauri-cdp.mjs'), '--output', tauriResult],
+        { cwd: repositoryRoot, env: environment },
+    )
+    return { phase3Result, tauriResult }
+}
+
+function usage() {
+    return [
+        'Usage: node benchmarks/roadmap14/windows.mjs [options]',
+        '',
+        'Options:',
+        '  --run-existing                    Run the existing Phase 3 Rust and Tauri CDP measurements.',
+        '  --phase3-result <path>             Reuse a Phase 3 save-large JSON result.',
+        '  --tauri-result <path>              Reuse a Phase 3 Tauri CDP JSON result.',
+        '  --canonical-output-sha256 <hash>   Override the Phase 3 fixture SHA-256.',
+        '  --build-identity <value>           Optional build identity.',
+        '  --platform-identity <value>        Optional stable reference-host identity.',
+        '  --recorded-at <ISO date>           Optional stable timestamp.',
+        '  --raw-output-dir <path>            Existing measurement output directory.',
+        '  --output <path>                    Also write the shared JSON result.',
+        '  -h, --help                         Show this help.',
+    ].join(os.EOL)
+}
+
+async function main() {
+    requireRealmDisabled()
+    const options = parseArguments(process.argv.slice(2))
+    if (options.help) {
+        process.stdout.write(`${usage()}${os.EOL}`)
+        return
+    }
+    const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
+    const sourceRevision = await captureCommand('git.exe', ['rev-parse', 'HEAD'], repositoryRoot)
+    let phase3Result = options.phase3Result
+    let tauriResult = options.tauriResult
+    if (options.runExisting) {
+        const rawOutputDirectory = path.resolve(
+            options.rawOutputDirectory
+                ?? path.join(repositoryRoot, 'src-tauri', 'target', 'roadmap14-baseline'),
+        )
+        const paths = await runExistingMeasurements(repositoryRoot, rawOutputDirectory, sourceRevision)
+        phase3Result = paths.phase3Result
+        tauriResult = paths.tauriResult
+    }
+    if (!phase3Result || !tauriResult) {
+        throw new Error('Provide --run-existing or both --phase3-result and --tauri-result')
+    }
+    const [phase3, tauri, packageJson] = await Promise.all([
+        readJson(phase3Result),
+        readJson(tauriResult),
+        readJson(path.join(repositoryRoot, 'package.json')),
+    ])
+    const measurementRevision = phase3.sourceRevision ?? sourceRevision
+    const result = convertExistingWindowsMeasurements({
+        phase3,
+        tauri,
+        canonicalOutputSha256: options.canonicalOutputSha256 ?? phase3.fixture.sha256,
+        buildIdentity: options.buildIdentity ?? `${measurementRevision}-windows-release`,
+        platformIdentity: options.platformIdentity ?? `windows-${os.arch()}-${os.release()}`,
+        appVersion: packageJson.version,
+        recordedAt: options.recordedAt ?? new Date().toISOString(),
+        osVersion: `${os.type()} ${os.release()}`,
+        architecture: os.arch(),
+    })
+    const json = `${JSON.stringify(result, null, 2)}${os.EOL}`
+    if (options.output) {
+        const outputPath = path.resolve(options.output)
+        await mkdir(path.dirname(outputPath), { recursive: true })
+        await writeFile(outputPath, json, 'utf8')
+    }
+    process.stdout.write(json)
+}
+
+async function readJson(filePath) {
+    return JSON.parse(await readFile(path.resolve(filePath), 'utf8'))
+}
+
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+    main().catch((error) => {
+        process.stderr.write(`${error.stack ?? error}${os.EOL}`)
+        process.exitCode = 1
+    })
+}

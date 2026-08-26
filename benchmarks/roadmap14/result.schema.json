@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://risunest.local/schemas/roadmap14-platform-result-v1.json",
+  "title": "RisuNest Roadmap 14 platform result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "status",
+    "scenario",
+    "recordedAt",
+    "fixture",
+    "build",
+    "platform",
+    "memory",
+    "ui",
+    "latency",
+    "bytes",
+    "canonicalOutputSha256",
+    "source",
+    "notes"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "risunest-roadmap14-platform-result" },
+    "status": { "enum": ["completed", "pending", "failed"] },
+    "scenario": {
+      "enum": [
+        "library-many",
+        "save-large",
+        "stream-postprocess",
+        "asset-library"
+      ]
+    },
+    "recordedAt": { "type": "string", "format": "date-time" },
+    "fixture": { "$ref": "#/$defs/fixture" },
+    "build": { "$ref": "#/$defs/build" },
+    "platform": { "$ref": "#/$defs/platform" },
+    "memory": { "$ref": "#/$defs/memory" },
+    "ui": { "$ref": "#/$defs/ui" },
+    "latency": { "$ref": "#/$defs/latency" },
+    "bytes": { "$ref": "#/$defs/bytes" },
+    "canonicalOutputSha256": {
+      "anyOf": [
+        { "$ref": "#/$defs/sha256" },
+        { "type": "null" }
+      ]
+    },
+    "source": { "$ref": "#/$defs/source" },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "completed" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "canonicalOutputSha256": { "$ref": "#/$defs/sha256" },
+          "memory": {
+            "properties": {
+              "measurement": { "enum": ["js-heap-and-rss", "android-pss"] }
+            },
+            "anyOf": [
+              { "properties": { "heapUsedBytes": { "minItems": 1 } } },
+              { "properties": { "rssBytes": { "minItems": 1 } } },
+              { "properties": { "pssBytes": { "minItems": 1 } } }
+            ]
+          },
+          "ui": {
+            "properties": {
+              "domNodeCount": { "type": "integer", "minimum": 0 },
+              "mountedMessageCount": { "type": "integer", "minimum": 0 },
+              "liveUrlCount": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "latency": {
+            "anyOf": [
+              { "properties": { "saveMs": { "minItems": 1 } } },
+              { "properties": { "importMs": { "minItems": 1 } } },
+              { "properties": { "exportMs": { "minItems": 1 } } },
+              { "properties": { "operationMs": { "minItems": 1 } } }
+            ]
+          },
+          "bytes": {
+            "properties": {
+              "fixtureBytes": { "type": "integer", "minimum": 0 },
+              "savedBytes": { "type": "integer", "minimum": 0 },
+              "importedBytes": { "type": "integer", "minimum": 0 },
+              "exportedBytes": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "nullableCount": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "samples": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "minimum": 0
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "identitySha256", "descriptor"],
+      "properties": {
+        "name": {
+          "enum": [
+            "library-many",
+            "save-large",
+            "stream-postprocess",
+            "asset-library"
+          ]
+        },
+        "version": { "type": "integer", "minimum": 1 },
+        "identitySha256": { "$ref": "#/$defs/sha256" },
+        "descriptor": { "type": "object" }
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "sourceRevision",
+        "profile",
+        "target",
+        "appVersion",
+        "realmDisabled"
+      ],
+      "properties": {
+        "identity": { "type": "string", "minLength": 1 },
+        "sourceRevision": { "$ref": "#/$defs/nullableString" },
+        "profile": { "enum": ["release", "profile", "debug"] },
+        "target": { "type": "string", "minLength": 1 },
+        "appVersion": { "type": "string", "minLength": 1 },
+        "realmDisabled": { "const": true }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "identity",
+        "osVersion",
+        "architecture",
+        "webViewVersion",
+        "deviceModel"
+      ],
+      "properties": {
+        "family": { "enum": ["windows", "android"] },
+        "identity": { "type": "string", "minLength": 1 },
+        "osVersion": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "webViewVersion": { "$ref": "#/$defs/nullableString" },
+        "deviceModel": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["measurement", "heapUsedBytes", "rssBytes", "pssBytes"],
+      "properties": {
+        "measurement": {
+          "enum": ["js-heap-and-rss", "android-pss", "pending"]
+        },
+        "heapUsedBytes": { "$ref": "#/$defs/samples" },
+        "rssBytes": { "$ref": "#/$defs/samples" },
+        "pssBytes": { "$ref": "#/$defs/samples" }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domNodeCount", "mountedMessageCount", "liveUrlCount"],
+      "properties": {
+        "domNodeCount": { "$ref": "#/$defs/nullableCount" },
+        "mountedMessageCount": { "$ref": "#/$defs/nullableCount" },
+        "liveUrlCount": { "$ref": "#/$defs/nullableCount" }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["saveMs", "importMs", "exportMs", "operationMs"],
+      "properties": {
+        "saveMs": { "$ref": "#/$defs/samples" },
+        "importMs": { "$ref": "#/$defs/samples" },
+        "exportMs": { "$ref": "#/$defs/samples" },
+        "operationMs": { "$ref": "#/$defs/samples" }
+      }
+    },
+    "bytes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixtureBytes", "savedBytes", "importedBytes", "exportedBytes"],
+      "properties": {
+        "fixtureBytes": { "$ref": "#/$defs/nullableCount" },
+        "savedBytes": { "$ref": "#/$defs/nullableCount" },
+        "importedBytes": { "$ref": "#/$defs/nullableCount" },
+        "exportedBytes": { "$ref": "#/$defs/nullableCount" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runner", "measurements"],
+      "properties": {
+        "runner": { "type": "string", "minLength": 1 },
+        "measurements": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

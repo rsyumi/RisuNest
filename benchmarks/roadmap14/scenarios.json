@@ -1,0 +1,80 @@
+[
+  {
+    "name": "library-many",
+    "version": 1,
+    "descriptor": {
+      "seed": "risunest-roadmap14-library-many-v1",
+      "characters": 500,
+      "chatsPerCharacter": 10,
+      "turnsPerChat": 100,
+      "recentChatsPerCharacter": 5,
+      "coldChatsPerCharacter": 5,
+      "visitCharacters": 50,
+      "operations": [
+        "cold-start",
+        "list-library",
+        "visit-characters",
+        "evict-and-revisit"
+      ]
+    }
+  },
+  {
+    "name": "save-large",
+    "version": 1,
+    "descriptor": {
+      "seed": "risunest-roadmap14-save-large-v1",
+      "includes": ["library-many"],
+      "characters": 500,
+      "chatsPerCharacter": 10,
+      "turnsPerChat": 100,
+      "stressChat": {
+        "turns": 10000,
+        "textBytes": 8388608
+      },
+      "operations": [
+        "save",
+        "import",
+        "export",
+        "snapshot",
+        "crash-recovery"
+      ]
+    }
+  },
+  {
+    "name": "stream-postprocess",
+    "version": 1,
+    "descriptor": {
+      "seed": "risunest-roadmap14-stream-postprocess-v1",
+      "responseBytes": 32768,
+      "chunks": 512,
+      "regexRuleCounts": [20, 100, 500],
+      "deadlinePatternCount": 1,
+      "luaOutputTriggers": 3,
+      "modes": ["off", "balanced", "strong"],
+      "operations": [
+        "compile-rules",
+        "replay-stream",
+        "normal-eof",
+        "cancel"
+      ]
+    }
+  },
+  {
+    "name": "asset-library",
+    "version": 1,
+    "descriptor": {
+      "seed": "risunest-roadmap14-asset-library-v1",
+      "assets": 10000,
+      "duplicateContentPercent": 20,
+      "fourKImages": 100,
+      "operations": [
+        "cold-list",
+        "first-viewport",
+        "scroll-100-cycles",
+        "open-close-original",
+        "evict",
+        "deduplicate-and-collect"
+      ]
+    }
+  }
+]
