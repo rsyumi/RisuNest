@@ -255,6 +255,9 @@ export function isExpTranslator(){
 }
 
 export async function translateHTML(html: string, reverse:boolean, charArg:simpleCharacterArgument|string = '', chatID:number, regenerate = false): Promise<string> {
+    if(!html){
+        return html
+    }
     let alwaysExistChar: character | groupChat | simpleCharacterArgument;
     if(charArg !== ''){
         if(typeof(charArg) === 'string'){
@@ -504,7 +507,7 @@ function needSuperChunkedTranslate(){
 async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = await LLMCacheStorage.getItem(text)
-        if(cacheMatch){
+        if(cacheMatch !== null){
             return cacheMatch as string
         }
     }
