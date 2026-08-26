@@ -58,6 +58,7 @@
         resolveChatMessageTarget,
         type CapturedChatMessageTarget,
     } from '../../ts/chatMessageUi';
+    import { handleDefaultChatUnreroll } from './defaultChatReroll';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -397,26 +398,18 @@
         const mutationTarget = captureCurrentConversationTarget()
         if (!mutationTarget) return
         const history = getCurrentRerollHistory(mutationTarget)
-        if (!history) return
-        const genId = mutationTarget.conversation.message.at(-1)?.generationInfo?.generationId
-        if(genId){
-            const r = PreUnreroll(genId)
-            if(r){
-                replaceConversationRerollLastData(mutationTarget, r, 'unreroll')
-                const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
-                if (refreshedTarget) refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
-                else rerollHistory = null
-                return
-            }
-        }
-        if(history.index <= 0){
+        const result = handleDefaultChatUnreroll({
+            target: mutationTarget,
+            history,
+            preUnreroll: PreUnreroll,
+        })
+        if (result.type === 'precomputed') {
+            const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
+            if (refreshedTarget) refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
+            else rerollHistory = null
             return
         }
-        rerollHistory = moveConversationRerollHistory(
-            history,
-            mutationTarget,
-            'unreroll',
-        )
+        if (result.type === 'history') rerollHistory = result.history
     }
 
     let abortController:null|AbortController = null
