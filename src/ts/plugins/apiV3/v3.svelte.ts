@@ -42,6 +42,7 @@ import {
 } from "src/ts/storage/persistentDataRuntime.svelte";
 import {
     createProductionPluginDatabaseAccess,
+    linkPluginQueryAbortSignals,
     type PluginDatabaseAccess,
     type PluginCharacterQuery,
     type PluginConversationMessageQuery,
@@ -676,9 +677,16 @@ const authorizationHeaders = [
     'proxy-authorization',
 ]
 
+function throwIfPluginReadAborted(signal: AbortSignal): void {
+    if (!signal.aborted) return
+    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+}
+
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
     const oldApis = getV2PluginAPIs();
+    const pluginLifetime = new AbortController()
+    addPluginUnloadCallback(plugin.name, () => pluginLifetime.abort())
     return {
 
         //Old APIs from v2.1
@@ -809,8 +817,21 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return allowed ? getPluginDatabaseAccess().queryConversations(input) : null
         },
         queryConversationMessages: async (input: PluginConversationMessageQuery) => {
-            const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
-            return allowed ? getPluginDatabaseAccess().queryConversationMessages(input) : null
+            const linked = linkPluginQueryAbortSignals(input.signal, pluginLifetime.signal)
+            try {
+                throwIfPluginReadAborted(linked.signal)
+                const allowed = await getPluginPermission(plugin.name, 'db', 'periodically')
+                throwIfPluginReadAborted(linked.signal)
+                if (!allowed) return null
+                const result = await getPluginDatabaseAccess().queryConversationMessages({
+                    ...input,
+                    signal: linked.signal,
+                })
+                throwIfPluginReadAborted(linked.signal)
+                return result
+            } finally {
+                linked.dispose()
+            }
         },
 
         installPlugin: handlePluginInstallViaPlugin,

@@ -49,6 +49,11 @@ export interface PluginConversationMessageQuery {
     anchorMessageId?: string
     before?: number
     after?: number
+    signal?: AbortSignal
+}
+
+export interface PluginConversationWindow extends ConversationWindow {
+    revision: DataRevision
 }
 
 export interface PluginDatabaseAccessDependencies {
@@ -83,7 +88,7 @@ export interface PluginDatabaseAccess {
     queryConversations(input: PluginConversationQuery): Promise<ConversationPage>
     queryConversationMessages(
         input: PluginConversationMessageQuery,
-    ): Promise<ConversationWindow | null>
+    ): Promise<PluginConversationWindow | null>
     getDatabaseSnapshot(
         includeOnly: string[] | 'all',
         allowedKeys: readonly string[],
@@ -124,6 +129,39 @@ function nonnegativeWindow(value: number | undefined, name: string): number {
         throw new RangeError(`${name} must be a nonnegative safe integer`)
     }
     return size
+}
+
+export function linkPluginQueryAbortSignals(
+    ...signals: Array<AbortSignal | undefined>
+): {
+    signal: AbortSignal
+    dispose(): void
+} {
+    const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal))
+    if (activeSignals.length === 1) {
+        return { signal: activeSignals[0], dispose() {} }
+    }
+
+    const controller = new AbortController()
+    const listeners = activeSignals.map((signal) => {
+        const listener = () => controller.abort(signal.reason)
+        if (signal.aborted) listener()
+        else signal.addEventListener('abort', listener, { once: true })
+        return { signal, listener }
+    })
+    return {
+        signal: controller.signal,
+        dispose() {
+            for (const { signal, listener } of listeners) {
+                signal.removeEventListener('abort', listener)
+            }
+        },
+    }
+}
+
+function throwIfQueryAborted(signal: AbortSignal | undefined): void {
+    if (!signal?.aborted) return
+    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
 }
 
 function hasCharacterUpdate(database: Record<string, unknown>): boolean {
@@ -274,9 +312,12 @@ export function createPluginDatabaseAccess(
             }
         }
     }
-    const prepareQuery = async () => {
+    const prepareQuery = async (signal?: AbortSignal) => {
+        throwIfQueryAborted(signal)
         await dependencies.flushPendingData('plugin-database-query')
+        throwIfQueryAborted(signal)
         await openStore()
+        throwIfQueryAborted(signal)
     }
 
     return {
@@ -377,9 +418,11 @@ export function createPluginDatabaseAccess(
                 }
             }
 
-            await prepareQuery()
+            await prepareQuery(input.signal)
+            throwIfQueryAborted(input.signal)
             const result = await dependencies.store.readConversationWindow(query)
-            return result?.value ?? null
+            throwIfQueryAborted(input.signal)
+            return result ? { ...result.value, revision: result.revision } : null
         },
 
         async getDatabaseSnapshot(includeOnly, allowedKeys) {

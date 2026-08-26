@@ -1248,10 +1248,15 @@ interface PluginConversationMessage {
 }
 
 interface PluginConversationWindow {
+    /** Persistent revision represented by this window. Compare revisions across pages. */
+    revision: number;
     characterId: string;
     conversationId: string;
+    /** Messages in persistent stored order, from oldest to newest. */
     messages: PluginConversationMessage[];
+    /** Inclusive zero-based index of the first returned message. */
     startIndex: number;
+    /** Exclusive zero-based index after the last returned message. */
     endIndex: number;
     totalMessages: number;
     hasMoreBefore: boolean;
@@ -1293,6 +1298,8 @@ interface PluginConversationMessageQuery {
     before?: number;
     /** Messages after the anchor. The complete anchored window cannot exceed 128. */
     after?: number;
+    /** Cancels this read. Plugin unload also cancels any read still in progress. */
+    signal?: AbortSignal;
 }
 
 // ============================================================================
@@ -1554,10 +1561,12 @@ interface RisuaiPluginAPI {
     queryConversations(input: PluginConversationQuery): Promise<PluginConversationPage | null>;
 
     /**
-     * Reads a bounded latest, absolute-range, or anchored message window. Use startIndex
-     * with limit for absolute range mode. Omit startIndex, anchorMessageId, before, and
-     * after for latest mode. Returns null when permission is denied or anchored data does
-     * not exist.
+     * Reads a bounded latest, absolute-range, or anchored message window. Absolute ranges
+     * use stored-order indexes in the half-open interval [startIndex, endIndex), and all
+     * returned messages remain in stored order from oldest to newest. Compare revision
+     * across calls before combining multiple pages. Use startIndex with limit for absolute
+     * range mode. Omit startIndex, anchorMessageId, before, and after for latest mode.
+     * Returns null when permission is denied or anchored data does not exist.
      */
     queryConversationMessages(
         input: PluginConversationMessageQuery,

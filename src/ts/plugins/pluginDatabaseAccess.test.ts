@@ -14,6 +14,7 @@ import { createCatalogCharacterStub } from '../storage/workingSetCatalog'
 import {
     createPluginDatabaseAccess,
     createProductionPluginDatabaseAccess,
+    linkPluginQueryAbortSignals,
 } from './pluginDatabaseAccess'
 
 vi.mock('../storage/persistentDataStoreFactory', () => ({
@@ -317,7 +318,7 @@ describe('plugin database access', () => {
                 conversationId: 'conv-a',
                 limit: 10,
             }),
-        ).toEqual(conversationWindow)
+        ).toEqual({ ...conversationWindow, revision: 4 })
         expect(harness.snapshot).not.toHaveBeenCalled()
         expect(harness.store.open).toHaveBeenCalledTimes(1)
         expect(harness.store.readRoot).not.toHaveBeenCalled()
@@ -446,7 +447,7 @@ describe('plugin database access', () => {
                 before: 2,
                 after: 3,
             }),
-        ).toEqual(conversationWindow)
+        ).toEqual({ ...conversationWindow, revision: 4 })
         vi.mocked(harness.store.readConversationWindow).mockResolvedValueOnce(null)
         expect(
             await harness.access.queryConversationMessages({
@@ -454,6 +455,138 @@ describe('plugin database access', () => {
                 conversationId: 'missing',
             }),
         ).toBeNull()
+    })
+
+    it('returns revision evidence so callers can reject pages split by a commit', async () => {
+        const harness = createHarness()
+        const firstWindow: ConversationWindow = {
+            ...conversationWindow,
+            messages: [
+                { role: 'user', data: 'first', chatId: 'message-0' },
+                { role: 'char', data: 'shared', chatId: 'message-1' },
+            ],
+            startIndex: 0,
+            endIndex: 2,
+            totalMessages: 4,
+            hasMoreAfter: true,
+        }
+        const secondWindow: ConversationWindow = {
+            ...conversationWindow,
+            messages: [
+                { role: 'char', data: 'shared', chatId: 'message-1' },
+                { role: 'user', data: 'last', chatId: 'message-2' },
+            ],
+            startIndex: 2,
+            endIndex: 4,
+            totalMessages: 4,
+            hasMoreBefore: true,
+        }
+        vi.mocked(harness.store.readConversationWindow)
+            .mockResolvedValueOnce({ revision: 4, value: firstWindow })
+            .mockResolvedValueOnce({ revision: 5, value: secondWindow })
+
+        const first = await harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            startIndex: 0,
+            limit: 2,
+        })
+        const second = await harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            startIndex: 2,
+            limit: 2,
+        })
+
+        expect(first).toEqual({ ...firstWindow, revision: 4 })
+        expect(second).toEqual({ ...secondWindow, revision: 5 })
+        expect(first?.revision).not.toBe(second?.revision)
+        expect(first?.messages.map((message) => message.chatId)).toEqual([
+            'message-0',
+            'message-1',
+        ])
+        expect(second?.messages.map((message) => message.chatId)).toEqual([
+            'message-1',
+            'message-2',
+        ])
+    })
+
+    it('rejects an already cancelled message query before flushing', async () => {
+        const harness = createHarness()
+        const controller = new AbortController()
+        controller.abort()
+
+        await expect(harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            signal: controller.signal,
+        })).rejects.toMatchObject({ name: 'AbortError' })
+        expect(harness.flushPendingData).not.toHaveBeenCalled()
+        expect(harness.store.open).not.toHaveBeenCalled()
+        expect(harness.store.readConversationWindow).not.toHaveBeenCalled()
+    })
+
+    it('does not open persistence when cancelled while pending data flushes', async () => {
+        const harness = createHarness()
+        const controller = new AbortController()
+        const flush = deferred<void>()
+        vi.mocked(harness.flushPendingData).mockReturnValueOnce(flush.promise)
+
+        const result = harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            signal: controller.signal,
+        })
+        await vi.waitFor(() => expect(harness.flushPendingData).toHaveBeenCalledOnce())
+        controller.abort()
+        flush.resolve()
+
+        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+        expect(harness.store.open).not.toHaveBeenCalled()
+        expect(harness.store.readConversationWindow).not.toHaveBeenCalled()
+    })
+
+    it('does not start a read when plugin lifetime ends while persistence opens', async () => {
+        const harness = createHarness()
+        const caller = new AbortController()
+        const pluginLifetime = new AbortController()
+        const linked = linkPluginQueryAbortSignals(caller.signal, pluginLifetime.signal)
+        const opening = deferred<void>()
+        vi.mocked(harness.store.open).mockReturnValueOnce(opening.promise)
+
+        const result = harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            signal: linked.signal,
+        })
+        await vi.waitFor(() => expect(harness.store.open).toHaveBeenCalledOnce())
+        pluginLifetime.abort()
+        opening.resolve()
+
+        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+        linked.dispose()
+        expect(harness.store.readConversationWindow).not.toHaveBeenCalled()
+    })
+
+    it('does not return late success when cancelled during the message read', async () => {
+        const harness = createHarness()
+        const controller = new AbortController()
+        const reading = deferred<{
+            revision: number
+            value: ConversationWindow
+        }>()
+        vi.mocked(harness.store.readConversationWindow).mockReturnValueOnce(reading.promise)
+
+        const result = harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            signal: controller.signal,
+        })
+        await vi.waitFor(() => expect(harness.store.readConversationWindow).toHaveBeenCalledOnce())
+        controller.abort()
+        reading.resolve({ revision: 4, value: conversationWindow })
+
+        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
     })
 
     it('passes a bounded absolute message range without materializing a conversation', async () => {
