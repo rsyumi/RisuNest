@@ -9,7 +9,13 @@ import type {
     PersistentDataStore,
     PersistentRevisionReader,
 } from './persistentDataStore'
-import { createAssetRepository, createAssetRepositoryBlobStore } from './assetRepository'
+import {
+    createAssetRepository,
+    createAssetRepositoryBlobStore,
+    createTypedAssetRepository,
+    type AssetAliasCatalog,
+    type AssetAliasLegacyReader,
+} from './assetRepository'
 import { fixtureDatabase } from './tests/persistentDataFixtures'
 
 describe('AssetRepository BlobStore facade', () => {
@@ -553,5 +559,252 @@ describe('AssetRepository BlobStore facade', () => {
             size: 1,
         }), 3)
         expect(legacy.put).not.toHaveBeenCalled()
+    })
+})
+
+describe('typed AssetRepository port', () => {
+    it('keeps same-key asset and Inlay reads independent and range-bounded', async () => {
+        const key = 'shared'
+        const asset: AssetAlias = {
+            kind: 'asset',
+            key,
+            objectHash: '11'.repeat(32),
+            size: 3,
+            mime: 'application/octet-stream',
+            name: 'Asset',
+            ext: 'bin',
+        }
+        const inlay: AssetAlias = {
+            kind: 'inlay',
+            key,
+            objectHash: '22'.repeat(32),
+            size: 4,
+            mime: 'audio/ogg',
+            name: 'Inlay',
+            ext: 'ogg',
+            inlayType: 'audio',
+        }
+        const aliases = new Map<string, AssetAlias>([
+            [`asset:${key}`, asset],
+            [`inlay:${key}`, inlay],
+        ])
+        const catalog = {
+            readAssetAlias: vi.fn(async (identity: AssetAliasIdentity) => {
+                const value = aliases.get(`${identity.kind}:${identity.key}`)
+                return value ? { revision: 4, value } : null
+            }),
+        } as unknown as AssetAliasCatalog
+        const cas = {
+            readObject: vi.fn(async (hash: string) => {
+                if (hash === asset.objectHash) return new Uint8Array([1, 2, 3])
+                throw new Error('complete Inlay read is forbidden')
+            }),
+            statObject: vi.fn(async (hash: string) => hash === asset.objectHash ? 3 : 4),
+            readObjectRange: vi.fn(async () => new Uint8Array([8, 7])),
+        } as unknown as ImmutablePayloadCas
+        const repository = createTypedAssetRepository({
+            catalog,
+            cas,
+            legacy: {
+                async read() { return null },
+                async stat() { return null },
+            },
+            legacyFallback: false,
+        })
+
+        await expect(repository.read({ kind: 'asset', key })).resolves.toEqual({
+            revision: 4,
+            value: {
+                alias: asset,
+                data: new Uint8Array([1, 2, 3]),
+                source: 'cas',
+            },
+        })
+        await expect(repository.read(
+            { kind: 'inlay', key },
+            { start: 1, endExclusive: 3 },
+        )).resolves.toEqual({
+            revision: 4,
+            value: {
+                alias: inlay,
+                data: new Uint8Array([8, 7]),
+                source: 'cas',
+            },
+        })
+        await expect(repository.stat({ kind: 'inlay', key })).resolves.toEqual({
+            revision: 4,
+            value: {
+                alias: inlay,
+                objectSize: 4,
+                source: 'cas',
+            },
+        })
+        expect(catalog.readAssetAlias).toHaveBeenNthCalledWith(1, { kind: 'asset', key })
+        expect(catalog.readAssetAlias).toHaveBeenNthCalledWith(2, { kind: 'inlay', key })
+        expect(catalog.readAssetAlias).toHaveBeenNthCalledWith(3, { kind: 'inlay', key })
+        expect(cas.readObjectRange).toHaveBeenCalledWith(inlay.objectHash, {
+            start: 1,
+            endExclusive: 3,
+        })
+    })
+
+    it('keeps explicit legacy fallback kind-aware for a shared logical key', async () => {
+        const key = 'shared'
+        const aliases = new Map<string, AssetAlias>([
+            ['asset:shared', {
+                kind: 'asset',
+                key,
+                objectHash: null,
+                size: 1,
+                mime: 'application/octet-stream',
+                name: 'Asset',
+                ext: 'bin',
+            }],
+            ['inlay:shared', {
+                kind: 'inlay',
+                key,
+                objectHash: null,
+                size: 1,
+                mime: 'audio/ogg',
+                name: 'Inlay',
+                ext: 'ogg',
+                inlayType: 'audio',
+            }],
+        ])
+        const catalog = {
+            async readAssetAlias(identity: AssetAliasIdentity) {
+                const value = aliases.get(`${identity.kind}:${identity.key}`)
+                return value ? { revision: 5, value } : null
+            },
+        } as AssetAliasCatalog
+        const legacy: AssetAliasLegacyReader = {
+            async read(identity) {
+                return identity.kind === 'asset'
+                    ? new Uint8Array([1])
+                    : new Uint8Array([2])
+            },
+            async stat() {
+                return {
+                    kind: 'asset',
+                    key,
+                    size: 1,
+                    mime: 'application/octet-stream',
+                    name: 'Wrong kind',
+                    ext: 'bin',
+                }
+            },
+        }
+        const repository = createTypedAssetRepository({
+            catalog,
+            cas: {} as ImmutablePayloadCas,
+            legacy,
+            legacyFallback: true,
+        })
+
+        expect((await repository.read({ kind: 'asset', key }))?.value.data)
+            .toEqual(new Uint8Array([1]))
+        expect((await repository.read({ kind: 'inlay', key }))?.value.data)
+            .toEqual(new Uint8Array([2]))
+        await expect(repository.stat({ kind: 'inlay', key }))
+            .rejects.toThrow('legacy metadata does not match')
+    })
+
+    it('lists catalog pages and removes only the requested alias', async () => {
+        const key = 'shared'
+        const asset: AssetAlias = {
+            kind: 'asset',
+            key,
+            objectHash: '33'.repeat(32),
+            size: 1,
+            mime: 'application/octet-stream',
+            name: 'Asset',
+            ext: 'bin',
+        }
+        const inlay: AssetAlias = {
+            kind: 'inlay',
+            key,
+            objectHash: '44'.repeat(32),
+            size: 1,
+            mime: 'image/webp',
+            name: 'Inlay',
+            ext: 'webp',
+            inlayType: 'image',
+            width: 1,
+            height: 1,
+        }
+        const aliases = new Map<string, AssetAlias>([
+            [`asset:${key}`, asset],
+            [`inlay:${key}`, inlay],
+        ])
+        let revision = 9
+        const catalog: AssetAliasCatalog = {
+            async readAssetAlias(identity) {
+                const value = aliases.get(`${identity.kind}:${identity.key}`)
+                return value ? { revision, value } : null
+            },
+            async listAssetAliases(query) {
+                const items = [...aliases.values()].filter(
+                    (alias) => query.kind === undefined || alias.kind === query.kind,
+                )
+                return {
+                    revision,
+                    items: items.slice(0, query.limit),
+                    ...(items.length > query.limit ? { nextCursor: 'next' } : {}),
+                }
+            },
+            async deleteAssetAlias(identity, expectedRevision) {
+                expect(expectedRevision).toBe(revision)
+                aliases.delete(`${identity.kind}:${identity.key}`)
+                revision++
+                return { revision }
+            },
+        }
+        const objects = new Map([
+            [asset.objectHash!, new Uint8Array([3])],
+            [inlay.objectHash!, new Uint8Array([4])],
+        ])
+        const cas = createImmutablePayloadCas({
+            async putIfAbsent() { return false },
+            async read(physicalKey) {
+                const hash = physicalKey.replace('assets-v2/objects/', '').replace('/', '')
+                return objects.get(hash)?.slice() ?? null
+            },
+            async stat(physicalKey) {
+                const hash = physicalKey.replace('assets-v2/objects/', '').replace('/', '')
+                return objects.get(hash)?.byteLength ?? null
+            },
+        })
+        const repository = createTypedAssetRepository({
+            catalog,
+            cas,
+            legacy: {
+                async read() { return null },
+                async stat() { return null },
+            },
+            legacyFallback: false,
+        })
+
+        await expect(repository.list({ limit: 1 })).resolves.toEqual({
+            revision: 9,
+            items: [asset],
+            nextCursor: 'next',
+        })
+        await expect(repository.list({ kind: 'inlay', limit: 1 })).resolves.toEqual({
+            revision: 9,
+            items: [inlay],
+        })
+        await expect(repository.remove({ kind: 'asset', key }, 9)).resolves.toEqual({
+            revision: 10,
+        })
+        await expect(repository.read({ kind: 'asset', key })).resolves.toBeNull()
+        await expect(repository.read({ kind: 'inlay', key })).resolves.toEqual({
+            revision: 10,
+            value: {
+                alias: inlay,
+                data: new Uint8Array([4]),
+                source: 'cas',
+            },
+        })
+        await expect(cas.readObject(asset.objectHash!)).resolves.toEqual(new Uint8Array([3]))
     })
 })

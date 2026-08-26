@@ -5,9 +5,15 @@ import {
     type BlobStore,
 } from './blobStore'
 import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
-import { validateAssetAlias } from './persistentDataStore'
+import {
+    validateAssetAlias,
+    validateAssetAliasIdentity,
+} from './persistentDataStore'
 import type {
     AssetAlias,
+    AssetAliasIdentity,
+    AssetAliasKind,
+    DataRevision,
     PersistentDataStore,
     Versioned,
 } from './persistentDataStore'
@@ -35,6 +41,61 @@ export interface AssetRepositoryOptions {
     reader: Pick<PersistentDataStore, 'readAssetAlias'>
     cas: ImmutablePayloadCas
     legacy: BlobStore
+    legacyFallback: boolean
+}
+
+export interface AssetAliasListQuery {
+    kind?: AssetAliasKind
+    limit: number
+    cursor?: string
+}
+
+export interface AssetAliasPage {
+    revision: DataRevision
+    items: AssetAlias[]
+    nextCursor?: string
+}
+
+export interface AssetAliasCatalog {
+    readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
+    listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
+    deleteAssetAlias(
+        identity: AssetAliasIdentity,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }>
+}
+
+export interface AssetAliasLegacyReader {
+    read(identity: AssetAliasIdentity): Promise<Uint8Array | null>
+    stat(identity: AssetAliasIdentity): Promise<BlobMetadata | null>
+}
+
+export interface TypedAssetRepository {
+    read(
+        identity: AssetAliasIdentity,
+        range?: BlobReadRange,
+    ): Promise<Versioned<AssetAliasRead> | null>
+    stat(identity: AssetAliasIdentity): Promise<Versioned<AssetAliasStat> | null>
+    list(query: AssetAliasListQuery): Promise<AssetAliasPage>
+    remove(
+        identity: AssetAliasIdentity,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }>
+}
+
+export interface TypedAssetRepositoryOptions {
+    catalog: AssetAliasCatalog
+    cas: ImmutablePayloadCas
+    legacy: AssetAliasLegacyReader
+    legacyFallback: boolean
+}
+
+type TypedAssetRepositoryReader = Pick<TypedAssetRepository, 'read' | 'stat'>
+
+interface TypedAssetRepositoryReaderOptions {
+    reader: Pick<AssetAliasCatalog, 'readAssetAlias'>
+    cas: ImmutablePayloadCas
+    legacy: AssetAliasLegacyReader
     legacyFallback: boolean
 }
 
@@ -74,15 +135,22 @@ function aliasBlobMetadata(alias: AssetAlias): BlobMetadata {
     }
 }
 
-export function createAssetRepository(options: AssetRepositoryOptions): AssetRepository {
+function createTypedAssetRepositoryReader(
+    options: TypedAssetRepositoryReaderOptions,
+): TypedAssetRepositoryReader {
     const { reader, cas, legacy } = options
     return {
-        async read(key, range) {
+        async read(identity, range) {
+            validateAssetAliasIdentity(identity)
+            const { key } = identity
             if (range) validateBlobReadRange(range)
-            const versioned = await reader.readAssetAlias({ kind: 'asset', key })
+            const versioned = await reader.readAssetAlias(identity)
             if (!versioned) return null
             const alias = versioned.value
             validateAssetAlias(alias)
+            if (alias.kind !== identity.kind || alias.key !== identity.key) {
+                throw new TypeError('Asset alias does not match its requested identity')
+            }
             if (alias.objectHash !== null) {
                 if (range) {
                     const objectSize = await cas.statObject(alias.objectHash)
@@ -120,7 +188,7 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
                 }
             }
             if (options.legacyFallback) {
-                const data = await legacy.read(key)
+                const data = await legacy.read(identity)
                 if (data !== null) {
                     if (data.byteLength !== alias.size) {
                         throw new Error(`Asset alias legacy size mismatch for ${key}`)
@@ -142,11 +210,16 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
                 value: { alias, data: null, source: 'missing' },
             }
         },
-        async stat(key) {
-            const versioned = await reader.readAssetAlias({ kind: 'asset', key })
+        async stat(identity) {
+            validateAssetAliasIdentity(identity)
+            const { key } = identity
+            const versioned = await reader.readAssetAlias(identity)
             if (!versioned) return null
             const alias = versioned.value
             validateAssetAlias(alias)
+            if (alias.kind !== identity.kind || alias.key !== identity.key) {
+                throw new TypeError('Asset alias does not match its requested identity')
+            }
             if (alias.objectHash !== null) {
                 const objectSize = await cas.statObject(alias.objectHash)
                 if (objectSize !== null) {
@@ -160,8 +233,11 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
                 }
             }
             if (options.legacyFallback) {
-                const metadata = await legacy.stat(key)
+                const metadata = await legacy.stat(identity)
                 if (metadata !== null) {
+                    if (metadata.kind !== identity.kind || metadata.key !== identity.key) {
+                        throw new TypeError(`Asset alias legacy metadata does not match ${key}`)
+                    }
                     if (metadata.size !== alias.size) {
                         throw new Error(`Asset alias legacy size mismatch for ${key}`)
                     }
@@ -175,6 +251,45 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
                 revision: versioned.revision,
                 value: { alias, objectSize: null, source: 'missing' },
             }
+        },
+    }
+}
+
+export function createAssetRepository(options: AssetRepositoryOptions): AssetRepository {
+    const repository = createTypedAssetRepositoryReader({
+        reader: options.reader,
+        cas: options.cas,
+        legacy: {
+            read: (identity) => options.legacy.read(identity.key),
+            stat: (identity) => options.legacy.stat(identity.key),
+        },
+        legacyFallback: options.legacyFallback,
+    })
+    return {
+        read: (key, range) => repository.read({ kind: 'asset', key }, range),
+        stat: (key) => repository.stat({ kind: 'asset', key }),
+    }
+}
+
+export function createTypedAssetRepository(
+    options: TypedAssetRepositoryOptions,
+): TypedAssetRepository {
+    const repository = createTypedAssetRepositoryReader({
+        reader: options.catalog,
+        cas: options.cas,
+        legacy: options.legacy,
+        legacyFallback: options.legacyFallback,
+    })
+    return {
+        ...repository,
+        async list(query) {
+            const page = await options.catalog.listAssetAliases(query)
+            for (const alias of page.items) validateAssetAlias(alias)
+            return page
+        },
+        async remove(identity, expectedRevision) {
+            validateAssetAliasIdentity(identity)
+            return options.catalog.deleteAssetAlias(identity, expectedRevision)
         },
     }
 }
