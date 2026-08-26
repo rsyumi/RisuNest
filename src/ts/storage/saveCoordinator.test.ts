@@ -3299,6 +3299,72 @@ describe('SaveCoordinator', () => {
         expect(session.persistedVersion).toBe(1)
     })
 
+    it('retains then acknowledges a session command captured after a legacy structural append', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn()
+            .mockRejectedValueOnce(new Error('fallback write failed'))
+            .mockImplementation(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        let session!: ActiveConversationSession
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: (event) =>
+                session.beginPersistence(event.sessionVersion),
+            onConversationMutationPersisted: (event) => {
+                session.acknowledgePersisted(
+                    event.sessionToken,
+                    event.sessionVersion,
+                    event.revision,
+                )
+            },
+        })
+        coordinator.initialize(2)
+        const conversation = database.characters[0].chats[1]
+        const baselineMessageCount = conversation.message.length
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation,
+            storeRevision: 2,
+            maxResidentBytes: 0,
+            measureMessage: () => 1,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+        conversation.message.push({ role: 'char', data: 'legacy direct append' })
+
+        session.append({ role: 'user', data: 'session append' })
+        await expect(
+            coordinator.flushPendingData('legacy-structural-fallback-failed'),
+        ).rejects.toThrow('fallback write failed')
+
+        expect(session.persistedVersion).toBe(0)
+        expect(session.pinCount('pending-save')).toBe(0)
+
+        await coordinator.flushPendingData('legacy-structural-fallback-retry')
+
+        expect(session.residencyFallbackActive).toBe(true)
+        expect(session.persistedVersion).toBe(1)
+        expect(session.pinCount('dirty')).toBe(0)
+        expect(session.pinCount('pending-save')).toBe(0)
+        expect(session.residentBytes).toBe(0)
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].conversations).toEqual([
+            expect.objectContaining({
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'two',
+                start: 0,
+                deleteCount: baselineMessageCount,
+                messages: conversation.message,
+            }),
+        ])
+
+        await coordinator.flushPendingData('legacy-structural-fallback-repeat')
+        expect(commit).toHaveBeenCalledTimes(2)
+    })
+
     it('keeps strict replacement evidence across a session-token rollover before flush', async () => {
         const database = makeChattyDatabase()
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))

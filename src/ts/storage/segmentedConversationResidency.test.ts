@@ -18,6 +18,37 @@ function createResidency(options: { totalMessages?: number; maxResidentBytes?: n
 }
 
 describe('SegmentedConversationResidency', () => {
+    it('discards every retained payload when the complete owner takes over', () => {
+        const residency = createResidency({ maxResidentBytes: 1 })
+        residency.storeRange({
+            revision: 7,
+            startIndex: 0,
+            totalMessages: 6,
+            messages: [message('zero')],
+        })
+        const rangePin = residency.pinRange(0, 1, 'viewport')
+        residency.recordReplaceRange({
+            start: 6,
+            deleteCount: 0,
+            messages: [message('dirty')],
+            sessionVersion: 1,
+        })
+        const pendingSave = residency.beginPersistence(1)
+        residency.setStreamingOverlay(0, message('streaming'), 1)
+
+        residency.discardResidentState()
+
+        expect(residency.residentBytes).toBe(0)
+        expect(residency.residentIntervals).toEqual([])
+        expect(residency.pendingMutations).toEqual([])
+        expect(residency.pinCount('viewport')).toBe(0)
+        expect(residency.pinCount('dirty')).toBe(0)
+        expect(residency.pinCount('pending-save')).toBe(0)
+        expect(residency.pinCount('streaming')).toBe(0)
+        expect(() => rangePin.release()).not.toThrow()
+        expect(() => pendingSave.release()).not.toThrow()
+    })
+
     it('merges adjacent absolute ranges and returns detached snapshots plus missing intervals', () => {
         const residency = createResidency()
         const first = [message('zero'), message('one')]

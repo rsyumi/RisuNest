@@ -1055,6 +1055,35 @@ describe('ActiveConversationSession', () => {
         expect(session.evictionEnabled).toBe(false)
     })
 
+    it('emits a complete ordered fallback event for a multi-command transaction', () => {
+        const { conversation, onMutation, session } = createSession(chat([
+            message('first', 'first'),
+        ]))
+        conversation.message.push(message('legacy', 'legacy direct append'))
+
+        session.transaction((transaction) => {
+            transaction.append(message('second', 'second'))
+            transaction.append(message('third', 'third'))
+        })
+
+        expect(onMutation).toHaveBeenCalledOnce()
+        expect(onMutation.mock.calls[0][0].mutations).toEqual([
+            {
+                start: 0,
+                deleteCount: 1,
+                messages: conversation.message,
+                sessionVersion: 1,
+            },
+            {
+                start: 4,
+                deleteCount: 0,
+                messages: [],
+                sessionVersion: 2,
+            },
+        ])
+        expect(session.residencyFallbackActive).toBe(true)
+    })
+
     it('preserves complete reads when resident measurement rejects a cache entry', () => {
         const conversation = chat([message('first', 'first')])
         const session = new ActiveConversationSession({
@@ -1111,5 +1140,29 @@ describe('ActiveConversationSession', () => {
             session.residentIntervals[0].startIndex).toBe(2)
         expect(session.evictionEnabled).toBe(false)
         expect(session.materializeCompatibilityArray()).toBe(conversation.message)
+    })
+
+    it('transfers a detached compatibility snapshot without clearing its messages', () => {
+        const conversation = chat([
+            message('first', 'first'),
+            message('second', 'second'),
+        ])
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            maxResidentBytes: 0,
+            measureMessage: () => 1,
+        })
+        const snapshot = session.materializeCompatibilitySnapshot()
+
+        const transferred = snapshot.takeMessages()
+        snapshot.dispose()
+
+        expect(transferred).toEqual(conversation.message)
+        expect(transferred).not.toBe(conversation.message)
+        expect(snapshot.residentMessageCount).toBe(0)
+        expect(session.pinCount('compatibility')).toBe(0)
     })
 })

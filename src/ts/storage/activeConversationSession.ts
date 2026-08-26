@@ -157,20 +157,39 @@ export interface ActiveConversationSessionOptions {
 
 export class ActiveConversationCompatibilitySnapshot {
     private disposed = false
+    private retainedMessages: Message[]
 
     constructor(
-        readonly messages: Message[],
+        messages: Message[],
         private readonly onDispose: () => void,
-    ) {}
+    ) {
+        this.retainedMessages = messages
+    }
+
+    get messages(): Message[] {
+        return this.retainedMessages
+    }
 
     get residentMessageCount(): number {
-        return this.messages.length
+        return this.retainedMessages.length
+    }
+
+    takeMessages(): Message[] {
+        if (this.disposed) {
+            throw new Error('Conversation compatibility snapshot is disposed')
+        }
+        const messages = this.retainedMessages
+        this.retainedMessages = []
+        this.disposed = true
+        this.onDispose()
+        return messages
     }
 
     dispose(): void {
         if (this.disposed) return
         this.disposed = true
-        this.messages.splice(0)
+        this.retainedMessages.splice(0)
+        this.retainedMessages = []
         this.onDispose()
     }
 }
@@ -1014,6 +1033,7 @@ export class ActiveConversationSession {
     private transactionActive = false
     private active = true
     private compatibilityFallback = false
+    private compatibilityBaselineMessageCount: number | null = null
 
     constructor(options: ActiveConversationSessionOptions) {
         if (!options.conversation) {
@@ -1761,7 +1781,7 @@ export class ActiveConversationSession {
             try {
                 this.residency.acknowledgePersisted(sessionVersion, revision)
             } catch {
-                this.compatibilityFallback = true
+                this.activateCompatibilityFallback(this.conversation.message.length)
             }
         }
         this.persistedSessionVersion = sessionVersion
@@ -1807,7 +1827,7 @@ export class ActiveConversationSession {
         try {
             pin = this.residency.pinRange(startIndex, endIndex, 'background')
         } catch {
-            this.compatibilityFallback = true
+            this.activateCompatibilityFallback(this.conversation.message.length)
             return
         }
         try {
@@ -1827,7 +1847,7 @@ export class ActiveConversationSession {
                 })
             }
         } catch {
-            this.compatibilityFallback = true
+            this.activateCompatibilityFallback(this.conversation.message.length)
         } finally {
             pin.release()
         }
@@ -1855,6 +1875,13 @@ export class ActiveConversationSession {
         commands: readonly ActiveConversationCommandName[],
         mutations: readonly ActiveConversationMutationRange[] = [],
     ): void {
+        let detachedMutations = safeStructuredClone(mutations)
+        if (!this.compatibilityFallback && !this.canApplyResidentMutations(detachedMutations)) {
+            this.activateCompatibilityFallback(this.residency.totalMessages)
+        }
+        if (this.compatibilityFallback) {
+            detachedMutations = this.createCompatibilityFallbackMutations(previousVersion)
+        }
         const event: ActiveConversationMutationEvent = {
             characterId: this.characterId,
             conversationId: this.conversationId,
@@ -1862,22 +1889,53 @@ export class ActiveConversationSession {
             previousVersion,
             sessionVersion: this.sessionVersion,
             commands: [...commands],
-            mutations: safeStructuredClone(mutations),
+            mutations: detachedMutations,
             conversation: cloneConversationMetadata(this.conversation),
         }
-        if (!this.compatibilityFallback && !this.canApplyResidentMutations(event.mutations)) {
-            this.compatibilityFallback = true
-        }
         this.onMutation?.(event)
-        if (!this.compatibilityFallback) {
+        if (this.compatibilityFallback) {
+            this.compatibilityBaselineMessageCount = this.conversation.message.length
+        } else {
             try {
                 for (const mutation of event.mutations) {
                     this.residency.recordReplaceRange(mutation)
                 }
             } catch {
-                this.compatibilityFallback = true
+                this.activateCompatibilityFallback(this.conversation.message.length)
             }
         }
+    }
+
+    private activateCompatibilityFallback(expectedMessageCount: number): void {
+        if (this.compatibilityFallback) return
+        this.compatibilityFallback = true
+        this.compatibilityBaselineMessageCount = expectedMessageCount
+        this.residency.discardResidentState()
+    }
+
+    private createCompatibilityFallbackMutations(
+        previousVersion: number,
+    ): ActiveConversationMutationRange[] {
+        const messages = safeStructuredClone(this.conversation.message)
+        const mutations: ActiveConversationMutationRange[] = [{
+            start: 0,
+            deleteCount: this.compatibilityBaselineMessageCount ?? 0,
+            messages,
+            sessionVersion: previousVersion + 1,
+        }]
+        for (
+            let sessionVersion = previousVersion + 2;
+            sessionVersion <= this.sessionVersion;
+            sessionVersion++
+        ) {
+            mutations.push({
+                start: messages.length,
+                deleteCount: 0,
+                messages: [],
+                sessionVersion,
+            })
+        }
+        return mutations
     }
 
     private canApplyResidentMutations(

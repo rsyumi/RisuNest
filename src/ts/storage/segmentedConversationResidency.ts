@@ -318,6 +318,14 @@ export class SegmentedConversationResidency {
         }))
     }
 
+    discardResidentState(): void {
+        this.entries.clear()
+        this.pins.clear()
+        this.dirtyRecords.splice(0)
+        this.pendingSaveAttempts.clear()
+        this.streamingOverlay = null
+    }
+
     storeRange(input: SegmentedConversationRangeInput): void {
         if (input.revision !== this.baseRevision) {
             throw new Error(

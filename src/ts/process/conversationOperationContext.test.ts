@@ -1,5 +1,6 @@
 import { expect, test, vi } from 'vitest'
 import {
+    ActiveConversationCompatibilitySnapshot,
     ActiveConversationSession,
     ConversationSessionStaleError,
     MessageLocatorMismatchError,
@@ -58,6 +59,10 @@ test('marks an oversized full-history consumer as an explicit compatibility snap
     const conversation = chat(messages)
     const session = createSession(conversation)
     const snapshotSpy = vi.spyOn(session, 'materializeCompatibilitySnapshot')
+    const takeMessagesSpy = vi.spyOn(
+        ActiveConversationCompatibilitySnapshot.prototype,
+        'takeMessages',
+    )
 
     const operation = createConversationOperationContext(session, conversation)
     const snapshot = snapshotSpy.mock.results[0]?.value
@@ -65,6 +70,7 @@ test('marks an oversized full-history consumer as an explicit compatibility snap
     expect(operation.mode).toBe('compatibility')
     expect(operation.chat.message).toHaveLength(4097)
     expect(snapshotSpy).toHaveBeenCalledOnce()
+    expect(takeMessagesSpy).toHaveBeenCalledOnce()
     expect(snapshot.residentMessageCount).toBe(0)
     expect(session.pinCount('compatibility')).toBe(1)
 

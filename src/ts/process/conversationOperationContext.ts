@@ -131,7 +131,7 @@ export class ConversationOperationContext {
                 ? []
                 : this.mode === 'prefetched'
                     ? session.readRange(0, totalMessages).messages
-                    : safeStructuredClone(compatibilitySnapshot!.messages)
+                    : compatibilitySnapshot!.takeMessages()
             if (session.version !== this.baseVersion) {
                 throw new ConversationSessionStaleError(this.baseVersion, session.version)
             }
