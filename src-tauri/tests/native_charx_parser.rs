@@ -188,6 +188,27 @@ fn jpeg_with_a_non_card_trailing_zip_remains_an_asset_before_card_limits_apply()
 }
 
 #[test]
+fn jpeg_with_a_non_card_zip_and_invalid_local_entry_remains_an_asset() {
+    let archive = zip_bytes(
+        &[("payload.bin", b"payload", CompressionMethod::Stored)],
+        false,
+    );
+    let prefix = b"\xff\xd8\xff\xe0ordinary\xff\xd9";
+    let mut bytes = prefix.to_vec();
+    bytes.extend_from_slice(&archive);
+    bytes[prefix.len()] ^= 0xff;
+
+    let (_directory, inspection) = parse_card(
+        "ordinary-with-invalid-zip.jpeg",
+        &bytes,
+        CharXLimits::default(),
+    )
+    .expect("classify JPEG asset without opening non-card entries");
+
+    assert!(matches!(inspection, CharXInspection::OrdinaryJpegAsset(_)));
+}
+
+#[test]
 fn rejects_unsafe_duplicate_and_sanitized_collision_paths() {
     for path in [
         "/absolute.png",

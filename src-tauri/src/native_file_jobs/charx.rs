@@ -310,7 +310,7 @@ where
 
     cancellation.check()?;
     let archive_offset = archive.offset();
-    let has_card_entry = archive_has_card_entry(&mut archive, &cancellation)?;
+    let has_card_entry = archive_has_card_entry(&archive, &cancellation)?;
     if jpeg_name && (!has_card_entry || archive_offset == 0) {
         return Ok(CharXInspection::OrdinaryJpegAsset(
             OrdinaryJpegAssetDescriptor {
@@ -449,24 +449,15 @@ fn validate_limits(limits: CharXLimits) -> Result<(), CharXParseError> {
 }
 
 fn archive_has_card_entry<R, F>(
-    archive: &mut ZipArchive<R>,
+    archive: &ZipArchive<R>,
     cancellation: &Cancellation<F>,
 ) -> Result<bool, CharXParseError>
 where
     R: Read + Seek,
     F: FnMut() -> bool,
 {
-    for index in 0..archive.len() {
+    for name in archive.file_names() {
         cancellation.check()?;
-        let entry = archive
-            .by_index(index)
-            .map_err(|error| zip_error("inspect CharX entry", error))?;
-        let name = std::str::from_utf8(entry.name_raw()).map_err(|_| {
-            CharXParseError::new(
-                CharXParseErrorCode::InvalidPath,
-                "CharX entry name is not valid UTF-8",
-            )
-        })?;
         if name == "card.json" {
             return Ok(true);
         }
