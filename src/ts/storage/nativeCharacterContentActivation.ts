@@ -48,13 +48,12 @@ function requireCharacterCardMetadata(
     value: Record<string, unknown>,
 ): PreparedNativeCharacterCardMetadata {
     if (
-        (value.spec !== 'chara_card_v2' && value.spec !== 'chara_card_v3')
+        value.spec !== 'chara_card_v3'
         || typeof value.spec_version !== 'string'
         || !isRecord(value.data)
         || !isRecord(value.data.extensions)
         || (
-            value.spec === 'chara_card_v3'
-            && value.data.assets !== undefined
+            value.data.assets !== undefined
             && !Array.isArray(value.data.assets)
         )
     ) {

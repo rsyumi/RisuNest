@@ -179,6 +179,22 @@ describe('prepared native character content activation', () => {
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
+    it('keeps v2 JSON on the compatibility importer until native v2 payload extraction exists', async () => {
+        const deps = dependencies()
+
+        await expect(activatePreparedNativeCharacterContent({
+            ...content,
+            metadata: {
+                spec: 'chara_card_v2',
+                spec_version: '2.0',
+                data: { extensions: {} },
+            },
+        }, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
+
+        expect(deps.map).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
     it('commits a present empty additional-assets manifest', async () => {
         const character = mappedCharacter()
         character.additionalAssets = []
