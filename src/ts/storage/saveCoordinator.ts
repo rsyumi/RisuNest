@@ -2126,8 +2126,9 @@ export class SaveCoordinator {
             }
             this.currentRevision = committed.revision
             this.dependencies.onLocalRevision?.(committed.revision)
-            if (publishOfficial && this.dependencies.officialPublisher) {
-                await this.stagePublication(committed.revision)
+            if (this.dependencies.officialPublisher) {
+                if (publishOfficial) await this.stagePublication(committed.revision)
+                else this.deferPublication(committed.revision)
             }
 
             const current = this.captureResidentCharacter(pending.characterId)

@@ -1807,6 +1807,10 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                 if(signal.aborted){
                     return null
                 }
+                if(outputTarget?.commitData(reformatContent(prefix + snapshot))){
+                    lifecycle.responseApplied = true
+                    targetCharacter.reloadKeys += 1
+                }
                 throw error
             }
         }
@@ -1951,7 +1955,9 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                 return false
             }
             let msgIndex = operationChat.message.length
-            if(i === 0 && arg.continue){
+            const continuingFirstMessage = i === 0 && arg.continue
+            let continueBaseData = ''
+            if(continuingFirstMessage){
                 outputTarget = captureGenerationConversationOperation({
                     session: getActiveConversationSession(),
                     getCurrentSession: getActiveConversationSession,
@@ -1961,15 +1967,68 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                     continueLast: true,
                 })
                 generationHadOperation = true
-            }
-            let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
-            if(i === 0 && arg.continue){
-                const beforeChat = outputTarget?.snapshot()
+                const beforeChat = outputTarget.snapshot()
                 if(!beforeChat){
                     return false
                 }
-                msgIndex = outputTarget.absoluteIndex
-                result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex)
+                continueBaseData = beforeChat.data
+            }
+            let result2: Awaited<ReturnType<typeof processScriptFull>>
+            try {
+                result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
+                if(continuingFirstMessage){
+                    msgIndex = outputTarget!.absoluteIndex
+                    result2 = await processScriptFull(nowChatroom, reformatContent(continueBaseData + mess), 'editoutput', msgIndex)
+                }
+            }
+            catch(error){
+                const fallbackData = reformatContent(continueBaseData + mess)
+                let applied = false
+                try {
+                    if(continuingFirstMessage){
+                        applied = outputTarget?.commitMessage({
+                            role: 'char',
+                            data: fallbackData,
+                            saying: currentChar.chaId,
+                            time: Date.now(),
+                            generationInfo,
+                            promptInfo,
+                            chatId: generationId,
+                        }) ?? false
+                        outputMessageId = outputTarget?.messageId
+                    }
+                    else if(i === 0 && getTargetChat() === operationChat && isGenerationOwnerCurrent()){
+                        outputTarget = captureGenerationConversationOperation({
+                            session: getActiveConversationSession(),
+                            getCurrentSession: getActiveConversationSession,
+                            chat: operationChat,
+                            getCurrentChat: getTargetChat,
+                            isOwnerCurrent: isGenerationOwnerCurrent,
+                            append: {
+                                role: msg[0],
+                                data: fallbackData,
+                                saying: currentChar.chaId,
+                                time: Date.now(),
+                                generationInfo,
+                                promptInfo,
+                                chatId: generationId,
+                            },
+                        })
+                        generationHadOperation = true
+                        applied = outputTarget.isOwned()
+                        outputMessageId = outputTarget.messageId
+                    }
+                    else{
+                        applied = outputTarget?.commitData(fallbackData) ?? false
+                    }
+                    if(applied){
+                        result = fallbackData
+                        lifecycle.responseApplied = true
+                        targetCharacter.reloadKeys += 1
+                    }
+                }
+                catch {}
+                throw error
             }
             if(DBState.db.removeIncompleteResponse){
                 result2.data = trimUntilPunctuation(result2.data)

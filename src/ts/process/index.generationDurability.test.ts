@@ -44,7 +44,7 @@ const harness = vi.hoisted(() => {
     const tokenize = vi.fn(async () => 8)
     const tokenizeNum = vi.fn(async () => [1])
     const runTrigger = vi.fn(async (_char?: any, _event?: string, _context?: any): Promise<any> => null)
-    const processScriptFull = vi.fn(async (_char, data: string) => ({
+    const processScriptFull = vi.fn(async (_char, data: string, _mode?: string) => ({
         data,
         emoChanged: false,
     }))
@@ -264,6 +264,18 @@ function streaming(result: string) {
     }
 }
 
+function streamingSnapshots(...results: string[]) {
+    return {
+        type: 'streaming',
+        result: new ReadableStream({
+            start(controller) {
+                for (const result of results) controller.enqueue({ 0: result })
+                controller.close()
+            },
+        }),
+    }
+}
+
 function deferred<T = void>() {
     let resolve!: (value: T | PromiseLike<T>) => void
     let reject!: (reason?: unknown) => void
@@ -309,7 +321,7 @@ beforeEach(() => {
         return next
     })
     harness.runTrigger.mockResolvedValue(null)
-    harness.processScriptFull.mockImplementation(async (_char, data: string) => ({
+    harness.processScriptFull.mockImplementation(async (_char, data: string, _mode?: string) => ({
         data,
         emoChanged: false,
     }))
@@ -401,6 +413,78 @@ describe('sendChat generation durability control flow', () => {
         await expect(sendChat()).rejects.toBe(failure)
 
         expect(harness.DBState.db.characters[0].chats[0].message.at(-1).data).toBe('Kept response')
+        expect(harness.acknowledge).toHaveBeenCalledOnce()
+    })
+
+    it('stages the first raw provider result when its semantic output pass fails', async () => {
+        const failure = new Error('first semantic output pass failed')
+        const acknowledgement = deferred()
+        harness.requests.push(success('Raw provider response'))
+        harness.processScriptFull.mockImplementation(async (_char, data: string, mode?: string) => {
+            if (mode === 'editoutput') throw failure
+            return { data, emoChanged: false }
+        })
+        harness.acknowledge.mockImplementationOnce(async () => {
+            await acknowledgement.promise
+        })
+
+        const sending = sendChat()
+        await vi.waitFor(() => expect(harness.acknowledge).toHaveBeenCalledOnce())
+
+        const output = harness.DBState.db.characters[0].chats[0].message.at(-1)
+        expect(output).toMatchObject({
+            role: 'char',
+            data: 'Raw provider response',
+            generationInfo: expect.objectContaining({ generationId: expect.any(String) }),
+        })
+        const state = await Promise.race([
+            sending.then(() => 'resolved', () => 'rejected'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 0)),
+        ])
+        expect(state).toBe('pending')
+
+        acknowledgement.resolve()
+        await expect(sending).rejects.toBe(failure)
+    })
+
+    it('stages the latest multiline raw result when a middle semantic pass fails', async () => {
+        const failure = new Error('middle multiline semantic pass failed')
+        let outputPass = 0
+        harness.requests.push({
+            type: 'multiline',
+            result: [
+                ['char', 'First choice'],
+                ['char', 'Raw second choice'],
+                ['char', 'Unreached third choice'],
+            ],
+        })
+        harness.processScriptFull.mockImplementation(async (_char, data: string, mode?: string) => {
+            if (mode === 'editoutput' && ++outputPass === 2) throw failure
+            return { data, emoChanged: false }
+        })
+
+        await expect(sendChat()).rejects.toBe(failure)
+
+        expect(harness.DBState.db.characters[0].chats[0].message.at(-1).data).toBe(
+            'Raw second choice',
+        )
+        expect(harness.acknowledge).toHaveBeenCalledOnce()
+    })
+
+    it('stages the latest streaming snapshot when an intermediate semantic pass fails', async () => {
+        const failure = new Error('streaming semantic pass failed')
+        let outputPass = 0
+        harness.requests.push(streamingSnapshots('First snapshot', 'Latest raw snapshot'))
+        harness.processScriptFull.mockImplementation(async (_char, data: string, mode?: string) => {
+            if (mode === 'editoutput' && ++outputPass === 2) throw failure
+            return { data, emoChanged: false }
+        })
+
+        await expect(sendChat()).rejects.toBe(failure)
+
+        expect(harness.DBState.db.characters[0].chats[0].message.at(-1).data).toBe(
+            'Latest raw snapshot',
+        )
         expect(harness.acknowledge).toHaveBeenCalledOnce()
     })
 

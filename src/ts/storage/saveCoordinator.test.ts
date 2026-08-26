@@ -1722,6 +1722,106 @@ describe('SaveCoordinator', () => {
         }
     })
 
+    it('defers a local-only resident compensation revision for official publication', async () => {
+        const database = makeDatabase()
+        const target = database.characters[0] as character
+        target.chatPage = 0
+        target.chats = [{
+            id: 'chat-a',
+            name: 'Chat',
+            note: '',
+            localLore: [],
+            message: [],
+        }]
+        const selected = structuredClone(target)
+        selected.chaId = 'char-b'
+        selected.name = 'Beta'
+        selected.chats[0].id = 'chat-b'
+        database.characters.push(selected)
+        let coordinator!: SaveCoordinator
+        const commit = vi.fn(async ({ expectedRevision }) => {
+            const call = commit.mock.calls.length
+            if (call <= 4) {
+                target.chats[0].message = [{
+                    role: 'char',
+                    data: `Completed generation ${call}`,
+                    chatId: 'generation-message',
+                }]
+                coordinator.markPersistentDataDirty(1)
+            }
+            return { revision: expectedRevision + 1 }
+        })
+        const store = {
+            commit,
+            readRoot: vi.fn(async () => ({ revision: 10, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => ({
+                revision: 10,
+                value: { type: 'character', chaId: 'char-a', name: 'Alpha' },
+            })),
+            queryConversations: vi.fn(async () => ({ revision: 10, items: [] })),
+        } as unknown as PersistentDataStore
+        const publishedRevisions: number[] = []
+        const laterPublication = deferred<void>()
+        const pin = vi.fn(async (revision: number) => {
+            if (revision !== 14) await laterPublication.promise
+            return {
+                publish: async () => {
+                    publishedRevisions.push(revision)
+                },
+                dispose: async () => undefined,
+            }
+        })
+        coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[1],
+            captureCharacter: (id) =>
+                database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: vi.fn(),
+            officialPublisher: { pin },
+            clock: {
+                setTimeout: () => Symbol('timer'),
+                clearTimeout: () => undefined,
+            },
+        })
+        coordinator.initialize(10)
+
+        await expect(coordinator.replacePersistentCompleteCharacter(
+            'char-a',
+            'continuous-generation-edit',
+            (current) => ({ ...current, name: 'Explicit replacement' }),
+        )).rejects.toThrow('Resident character changed')
+        expect(publishedRevisions).toEqual([14])
+
+        const result = await Promise.race([
+            coordinator.flushPendingDataLocally('generation-completion').then(() => 'committed'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 25)),
+        ])
+
+        expect(result).toBe('committed')
+        expect(commit).toHaveBeenCalledTimes(5)
+        expect(commit.mock.calls[4][0]).toMatchObject({
+            expectedRevision: 14,
+            replaceCharacter: expect.objectContaining({
+                chaId: 'char-a',
+                chats: [expect.objectContaining({
+                    message: [expect.objectContaining({
+                        data: 'Completed generation 4',
+                    })],
+                })],
+            }),
+        })
+        expect(coordinator.revision).toBe(15)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        expect(pin).toHaveBeenCalledOnce()
+
+        const publishing = coordinator.publishCurrentOfficialRevision()
+        await vi.waitFor(() => expect(pin).toHaveBeenLastCalledWith(15))
+        laterPublication.resolve(undefined)
+        await publishing
+        expect(publishedRevisions).toEqual([14, 15])
+    })
+
     it('publishes a deferred target compensation when a tokened replacement then rejects', async () => {
         vi.useFakeTimers()
         try {
