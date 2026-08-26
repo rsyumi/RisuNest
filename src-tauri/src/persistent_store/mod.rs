@@ -751,6 +751,7 @@ pub(crate) struct PersistentStore {
     revision_leases: HashMap<String, snapshot::RevisionReadLease>,
     active_readers: Arc<snapshot::ActiveReaderRegistry>,
     connection: Connection,
+    repository_root: PathBuf,
     database_path: PathBuf,
     snapshots_dir: PathBuf,
 }
@@ -848,6 +849,7 @@ impl PersistentStore {
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
         kei::sweep_abandoned(&snapshots_dir);
+        logical_index::cleanup_abandoned_logical_staging(&mut connection)?;
         snapshot::sweep_temporary_generations(&mut connection)?;
         snapshot::checkpoint(&connection, CheckpointMode::Truncate)?;
 
@@ -856,6 +858,7 @@ impl PersistentStore {
             revision_leases: HashMap::new(),
             active_readers,
             connection,
+            repository_root: app_data_dir.to_owned(),
             database_path,
             snapshots_dir,
         })
@@ -1038,7 +1041,10 @@ impl PersistentStore {
         commit: &WorkingSetCommit,
         asset_aliases: &[AssetAlias],
     ) -> StoreResult<RevisionResult> {
-        commit::commit(&mut self.connection, commit, asset_aliases)
+        let cas = logical_index::logical_index_is_active(&self.connection)?
+            .then(|| crate::asset_repository::PayloadCas::new(&self.repository_root))
+            .transpose()?;
+        commit::commit(&mut self.connection, cas.as_ref(), commit, asset_aliases)
     }
 
     pub(crate) fn commit_asset_alias(
@@ -1046,7 +1052,10 @@ impl PersistentStore {
         alias: &AssetAlias,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        commit::commit_asset_alias(&mut self.connection, alias, expected_revision)
+        let cas = logical_index::logical_index_is_active(&self.connection)?
+            .then(|| crate::asset_repository::PayloadCas::new(&self.repository_root))
+            .transpose()?;
+        commit::commit_asset_alias(&mut self.connection, cas.as_ref(), alias, expected_revision)
     }
 
     pub(crate) fn delete_asset_alias(
@@ -1483,6 +1492,32 @@ pub(super) fn active_generation(connection: &Connection) -> StoreResult<String> 
     Ok(serde_json::from_str(&value)?)
 }
 
+pub(super) fn generation_is_retained(
+    connection: &Connection,
+    generation: &str,
+) -> StoreResult<bool> {
+    let logical_schema_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'logical_sync_generations'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !logical_schema_exists {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_sync_generations
+                WHERE pds_generation = ?1 AND state = 'complete'
+             )",
+            [generation],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
 #[cfg(test)]
 mod benchmark;
 #[cfg(test)]

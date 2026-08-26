@@ -1,6 +1,6 @@
 use super::{
-    active_generation, current_revision, CheckpointMode, ReadTarget, SnapshotCreated, SnapshotInfo,
-    StoreError, StoreResult, GENERATION_TABLES,
+    active_generation, current_revision, generation_is_retained, CheckpointMode, ReadTarget,
+    SnapshotCreated, SnapshotInfo, StoreError, StoreResult, GENERATION_TABLES,
 };
 use crate::asset_repository::migration_gc::{
     snapshot_asset_root_sidecar_path, write_snapshot_asset_root_sidecar, AssetRootSet,
@@ -211,7 +211,7 @@ pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreR
     stale.sort();
     stale.dedup();
     for generation in stale {
-        if generation != active {
+        if generation != active && !generation_is_retained(&transaction, &generation)? {
             delete_generation(&transaction, &generation)?;
         }
     }

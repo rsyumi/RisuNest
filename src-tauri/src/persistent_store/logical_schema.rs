@@ -1,6 +1,11 @@
 use rusqlite::Connection;
 use std::collections::HashSet;
 
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // These rows are rebuildable indexes over PDS records and CAS objects. They never store record bytes.
 pub(crate) const LOGICAL_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS logical_sync_generations (
@@ -40,6 +45,27 @@ CREATE INDEX IF NOT EXISTS logical_sync_generations_parent
     ON logical_sync_generations (library_id, parent_generation_id);
 CREATE INDEX IF NOT EXISTS logical_sync_generations_manifest
     ON logical_sync_generations (manifest_hash);
+
+CREATE TABLE IF NOT EXISTS logical_library_head (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    library_id TEXT NOT NULL CHECK (length(library_id) > 0),
+    generation_id TEXT NOT NULL CHECK (length(generation_id) > 0),
+    FOREIGN KEY (library_id, generation_id)
+        REFERENCES logical_sync_generations (library_id, generation_id)
+        ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS logical_generation_session_pins (
+    session_id TEXT PRIMARY KEY CHECK (length(session_id) > 0),
+    library_id TEXT NOT NULL CHECK (length(library_id) > 0),
+    generation_id TEXT NOT NULL CHECK (length(generation_id) > 0),
+    created_at INTEGER NOT NULL CHECK (created_at >= 0),
+    FOREIGN KEY (library_id, generation_id)
+        REFERENCES logical_sync_generations (library_id, generation_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS logical_generation_session_pins_generation
+    ON logical_generation_session_pins (library_id, generation_id);
 
 CREATE TABLE IF NOT EXISTS logical_record_heads (
     library_id TEXT NOT NULL,
@@ -213,6 +239,14 @@ const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "logical_library_head",
+        &["singleton", "library_id", "generation_id"],
+    ),
+    (
+        "logical_generation_session_pins",
+        &["session_id", "library_id", "generation_id", "created_at"],
+    ),
+    (
         "logical_record_heads",
         &[
             "library_id",
@@ -265,6 +299,7 @@ const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
 const REQUIRED_INDEXES: &[&str] = &[
     "logical_sync_generations_parent",
     "logical_sync_generations_manifest",
+    "logical_generation_session_pins_generation",
     "logical_record_heads_kind",
     "logical_record_heads_object",
     "logical_record_dependencies_object",
@@ -301,6 +336,8 @@ pub(crate) fn create_logical_schema(connection: &Connection) -> Result<(), Logic
 }
 
 pub(crate) fn validate_logical_schema(connection: &Connection) -> Result<(), LogicalSchemaError> {
+    #[cfg(test)]
+    VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
     for (table, required_columns) in REQUIRED_TABLE_COLUMNS {
         let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns: HashSet<String> = statement
@@ -409,4 +446,14 @@ pub(crate) fn validate_logical_schema(connection: &Connection) -> Result<(), Log
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validation_count() {
+    VALIDATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn validation_count() -> usize {
+    VALIDATION_COUNT.with(std::cell::Cell::get)
 }

@@ -1,4 +1,7 @@
-use super::{logical_schema, read_target, PersistentStore, StoreError, StoreResult};
+use super::{
+    active_generation, current_revision, logical_schema, AssetAlias, PersistentStore,
+    PluginStorageMutation, ReadTarget, StoreError, StoreResult, WorkingSetCommit,
+};
 use crate::{
     asset_repository::{
         owner_manifest_codec::{decode_owner_manifest, encode_owner_manifest},
@@ -65,12 +68,134 @@ struct LogicalGenerationMetadata {
     manifest_hash: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct IncrementalLogicalCommit {
+    library_id: String,
+    generation_id: String,
+    generation_sequence: String,
+    pds_generation: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ConversationChange {
+    Delete {
+        character_id: String,
+        conversation_id: String,
+    },
+    ReplaceRange {
+        character_id: String,
+        conversation_id: String,
+        start: u64,
+        old_count: u64,
+        new_count: u64,
+        replaced_count: u64,
+        inserted_count: u64,
+        was_new: bool,
+    },
+}
+
+pub(super) fn logical_index_is_active(connection: &Connection) -> StoreResult<bool> {
+    let schema_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'logical_library_head'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !schema_exists {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM logical_library_head WHERE singleton = 1)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+pub(super) fn cleanup_abandoned_logical_staging(connection: &mut Connection) -> StoreResult<()> {
+    let schema_exists: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'logical_sync_generations'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !schema_exists {
+        return Ok(());
+    }
+    logical_schema::create_logical_schema(connection).map_err(schema_error)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active = super::active_generation(&transaction)?;
+    let abandoned = {
+        let mut statement = transaction.prepare(
+            "SELECT generation.library_id, generation.generation_id, generation.pds_generation
+             FROM logical_sync_generations AS generation
+             WHERE generation.pds_generation LIKE 'staging-logical-%'
+               AND generation.pds_generation != ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM logical_library_head AS head
+                   WHERE head.library_id = generation.library_id
+                     AND head.generation_id = generation.generation_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM logical_generation_session_pins AS pin
+                   WHERE pin.library_id = generation.library_id
+                     AND pin.generation_id = generation.generation_id
+               )",
+        )?;
+        let rows = statement
+            .query_map([active], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (library_id, generation_id, pds_generation) in abandoned {
+        transaction.execute(
+            "DELETE FROM logical_peer_common_bases
+             WHERE library_id = ?1 AND generation_id = ?2",
+            params![library_id, generation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM logical_sync_generations
+             WHERE library_id = ?1 AND generation_id = ?2",
+            params![library_id, generation_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM snapshot_leases WHERE generation = ?1",
+            [pds_generation],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 impl PersistentStore {
     pub(crate) fn rebuild_logical_index(
         &mut self,
         cas: &PayloadCas,
         request: LogicalIndexBuildRequest,
     ) -> StoreResult<BuiltIndexedLogicalManifest> {
+        self.initialize_logical_index_building(cas, request)?;
+        self.seal_active_logical_generation(cas)
+    }
+
+    pub(crate) fn initialize_logical_index_building(
+        &mut self,
+        cas: &PayloadCas,
+        request: LogicalIndexBuildRequest,
+    ) -> StoreResult<()> {
+        if request.lease.is_some() {
+            return validation("logical index build from a detached revision is not supported");
+        }
         logical_schema::create_logical_schema(&self.connection).map_err(schema_error)?;
         logical_schema::validate_logical_schema(&self.connection).map_err(schema_error)?;
         validate_pds_projection_contract(&self.connection)?;
@@ -78,7 +203,10 @@ impl PersistentStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let target = read_target(&transaction, request.lease.as_deref())?;
+        let target = ReadTarget {
+            revision: current_revision(&transaction)?,
+            generation: active_generation(&transaction)?,
+        };
         nonnegative_u64(target.revision, "source revision")?;
         let already_exists: bool = transaction.query_row(
             "SELECT EXISTS(
@@ -178,12 +306,60 @@ impl PersistentStore {
             )?;
         }
 
-        let built = scan_compact_manifest(
-            &transaction,
-            &request.library_id,
-            &request.generation_id,
-            false,
+        transaction.execute(
+            "INSERT INTO logical_library_head (singleton, library_id, generation_id)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                library_id = excluded.library_id,
+                generation_id = excluded.generation_id",
+            params![request.library_id, request.generation_id,],
         )?;
+        logical_schema::validate_logical_schema(&transaction).map_err(schema_error)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn seal_active_logical_generation(
+        &mut self,
+        cas: &PayloadCas,
+    ) -> StoreResult<BuiltIndexedLogicalManifest> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (library_id, generation_id): (String, String) = transaction
+            .query_row(
+                "SELECT library_id, generation_id
+                 FROM logical_library_head WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Validation {
+                message: "logical library head is not initialized".to_owned(),
+            })?;
+        let (pds_generation, source_revision, state, created_at): (String, i64, String, i64) =
+            transaction.query_row(
+                "SELECT pds_generation, source_revision, state, created_at
+                 FROM logical_sync_generations
+                 WHERE library_id = ?1 AND generation_id = ?2",
+                params![library_id, generation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let active = super::active_generation(&transaction)?;
+        let revision = super::current_revision(&transaction)?;
+        if pds_generation != active || source_revision != revision {
+            return validation("logical library head is not current with the active PDS revision");
+        }
+
+        if state == "complete" {
+            let built = scan_compact_manifest(&transaction, &library_id, &generation_id, true)?;
+            transaction.commit()?;
+            return Ok(built);
+        }
+        if state != "building" {
+            return validation("logical library head has an unsupported state");
+        }
+        let built = scan_compact_manifest(&transaction, &library_id, &generation_id, false)?;
         let prepared_manifest = cas.prepare_bytes(&built.manifest_bytes)?;
         if prepared_manifest.content_hash != built.manifest_hash
             || prepared_manifest.byte_size != built.manifest_bytes.len() as u64
@@ -193,20 +369,152 @@ impl PersistentStore {
             );
         }
         let completed_at = unix_millis()?.max(created_at);
-        transaction.execute(
+        let changed = transaction.execute(
             "UPDATE logical_sync_generations
              SET state = 'complete', manifest_hash = ?3, completed_at = ?4
              WHERE library_id = ?1 AND generation_id = ?2 AND state = 'building'",
-            params![
-                request.library_id,
-                request.generation_id,
-                built.manifest_hash,
-                completed_at,
-            ],
+            params![library_id, generation_id, built.manifest_hash, completed_at],
         )?;
+        if changed != 1 {
+            return validation("logical generation seal lost its building state");
+        }
         logical_schema::validate_logical_schema(&transaction).map_err(schema_error)?;
         transaction.commit()?;
         Ok(built)
+    }
+
+    pub(crate) fn pin_logical_generation(
+        &mut self,
+        library_id: &str,
+        generation_id: &str,
+    ) -> StoreResult<String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let complete: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_sync_generations
+                WHERE library_id = ?1 AND generation_id = ?2 AND state = 'complete'
+             )",
+            params![library_id, generation_id],
+            |row| row.get(0),
+        )?;
+        if !complete {
+            return validation("only a complete logical generation can be session-pinned");
+        }
+        let session_id = format!("logical-session-{}", uuid::Uuid::new_v4());
+        transaction.execute(
+            "INSERT INTO logical_generation_session_pins (
+                session_id, library_id, generation_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, library_id, generation_id, unix_millis()?],
+        )?;
+        transaction.commit()?;
+        Ok(session_id)
+    }
+
+    pub(crate) fn resume_logical_generation_pin(
+        &mut self,
+        session_id: &str,
+        library_id: &str,
+        generation_id: &str,
+    ) -> StoreResult<()> {
+        if !session_id.starts_with("logical-session-") {
+            return validation("logical generation session pin has an invalid ID");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tuple: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT pin.library_id, pin.generation_id, generation.state
+                 FROM logical_generation_session_pins AS pin
+                 JOIN logical_sync_generations AS generation
+                   ON generation.library_id = pin.library_id
+                  AND generation.generation_id = pin.generation_id
+                 WHERE pin.session_id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((pinned_library_id, pinned_generation_id, state)) = tuple else {
+            return validation("logical generation session pin does not exist");
+        };
+        if pinned_library_id != library_id || pinned_generation_id != generation_id {
+            return validation("logical generation session pin tuple does not match");
+        }
+        if state != "complete" {
+            return validation("logical generation session pin is not complete");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn release_logical_generation_pin(&mut self, session_id: &str) -> StoreResult<()> {
+        if !session_id.starts_with("logical-session-") {
+            return validation("logical generation session pin has an invalid ID");
+        }
+        self.connection.execute(
+            "DELETE FROM logical_generation_session_pins WHERE session_id = ?1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn prune_logical_generation(
+        &mut self,
+        library_id: &str,
+        generation_id: &str,
+    ) -> StoreResult<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pds_generation: String = transaction
+            .query_row(
+                "SELECT pds_generation FROM logical_sync_generations
+                 WHERE library_id = ?1 AND generation_id = ?2",
+                params![library_id, generation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Validation {
+                message: "logical generation index does not exist".to_owned(),
+            })?;
+        let is_head: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_library_head
+                WHERE library_id = ?1 AND generation_id = ?2
+             )",
+            params![library_id, generation_id],
+            |row| row.get(0),
+        )?;
+        if is_head {
+            return validation("logical library head cannot be pruned");
+        }
+        let session_pinned: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_generation_session_pins
+                WHERE library_id = ?1 AND generation_id = ?2
+             )",
+            params![library_id, generation_id],
+            |row| row.get(0),
+        )?;
+        if session_pinned {
+            return validation("session-pinned logical generation cannot be pruned");
+        }
+        transaction.execute(
+            "DELETE FROM logical_sync_generations
+             WHERE library_id = ?1 AND generation_id = ?2",
+            params![library_id, generation_id],
+        )?;
+        let active = super::active_generation(&transaction)?;
+        if pds_generation != active
+            && !super::generation_is_retained(&transaction, &pds_generation)?
+        {
+            super::commit::delete_generation(&transaction, &pds_generation)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub(crate) fn build_indexed_logical_manifest(
@@ -279,6 +587,1069 @@ impl PersistentStore {
         verify_object_bytes(&bytes, object_hash, expected_size)?;
         Ok(bytes)
     }
+}
+
+pub(super) fn begin_incremental_logical_commit(
+    transaction: &Transaction<'_>,
+    source_pds_generation: &str,
+    target_pds_generation: &str,
+    source_revision: i64,
+) -> StoreResult<Option<IncrementalLogicalCommit>> {
+    if !logical_index_is_active(transaction)? {
+        return Ok(None);
+    }
+    let (library_id, generation_id, generation_sequence, state, indexed_pds): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = transaction.query_row(
+        "SELECT generation.library_id, generation.generation_id,
+                generation.generation_sequence, generation.state, generation.pds_generation
+         FROM logical_library_head AS head
+         JOIN logical_sync_generations AS generation
+           ON generation.library_id = head.library_id
+          AND generation.generation_id = head.generation_id
+         WHERE head.singleton = 1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    if indexed_pds != source_pds_generation {
+        return validation("logical library head does not reference the active PDS generation");
+    }
+
+    if state == "building" {
+        transaction.execute(
+            "UPDATE logical_sync_generations
+             SET pds_generation = ?3, source_revision = ?4
+             WHERE library_id = ?1 AND generation_id = ?2 AND state = 'building'",
+            params![
+                library_id,
+                generation_id,
+                target_pds_generation,
+                source_revision,
+            ],
+        )?;
+        return Ok(Some(IncrementalLogicalCommit {
+            library_id,
+            generation_id,
+            generation_sequence,
+            pds_generation: target_pds_generation.to_owned(),
+        }));
+    }
+    if state != "complete" {
+        return validation("logical library head has an unsupported state");
+    }
+    if source_pds_generation == target_pds_generation {
+        return validation("a complete logical generation must use PDS copy-on-write");
+    }
+
+    let child_generation_id = format!("logical-generation-{}", uuid::Uuid::new_v4());
+    let child_sequence = increment_decimal(&generation_sequence)?;
+    transaction.execute(
+        "INSERT INTO logical_sync_generations (
+            library_id, generation_id, generation_sequence, parent_generation_id,
+            pds_generation, source_revision, state, manifest_hash, created_at, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'building', NULL, ?7, NULL)",
+        params![
+            library_id,
+            child_generation_id,
+            child_sequence,
+            generation_id,
+            target_pds_generation,
+            source_revision,
+            unix_millis()?,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind, state,
+            object_hash, object_size, deleted_generation_sequence
+         )
+         SELECT library_id, ?3, record_key, record_kind, state,
+                object_hash, object_size, deleted_generation_sequence
+         FROM logical_record_heads
+         WHERE library_id = ?1 AND generation_id = ?2",
+        params![library_id, generation_id, child_generation_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO logical_record_dependencies (
+            library_id, generation_id, record_key, object_hash, object_size
+         )
+         SELECT library_id, ?3, record_key, object_hash, object_size
+         FROM logical_record_dependencies
+         WHERE library_id = ?1 AND generation_id = ?2",
+        params![library_id, generation_id, child_generation_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO logical_message_page_sources (
+            library_id, generation_id, record_key, record_kind, page_index,
+            first_message_index, message_count, object_hash, object_size
+         )
+         SELECT library_id, ?3, record_key, record_kind, page_index,
+                first_message_index, message_count, object_hash, object_size
+         FROM logical_message_page_sources
+         WHERE library_id = ?1 AND generation_id = ?2",
+        params![library_id, generation_id, child_generation_id],
+    )?;
+    transaction.execute(
+        "UPDATE logical_library_head SET generation_id = ?2
+         WHERE singleton = 1 AND library_id = ?1",
+        params![library_id, child_generation_id],
+    )?;
+    Ok(Some(IncrementalLogicalCommit {
+        library_id,
+        generation_id: child_generation_id,
+        generation_sequence: child_sequence,
+        pds_generation: target_pds_generation.to_owned(),
+    }))
+}
+
+pub(super) fn detach_logical_head_for_full_replace(
+    transaction: &Transaction<'_>,
+    active_pds_generation: &str,
+) -> StoreResult<()> {
+    if !logical_index_is_active(transaction)? {
+        return Ok(());
+    }
+    let (library_id, generation_id, pds_generation, state): (String, String, String, String) =
+        transaction.query_row(
+            "SELECT generation.library_id, generation.generation_id,
+                    generation.pds_generation, generation.state
+             FROM logical_library_head AS head
+             JOIN logical_sync_generations AS generation
+               ON generation.library_id = head.library_id
+              AND generation.generation_id = head.generation_id
+             WHERE head.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    if pds_generation != active_pds_generation {
+        return validation("logical library head does not reference the replaced PDS generation");
+    }
+    transaction.execute("DELETE FROM logical_library_head WHERE singleton = 1", [])?;
+    if state == "building" {
+        transaction.execute(
+            "DELETE FROM logical_sync_generations
+             WHERE library_id = ?1 AND generation_id = ?2",
+            params![library_id, generation_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn increment_decimal(value: &str) -> StoreResult<String> {
+    if value.is_empty()
+        || value.bytes().any(|byte| !byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return validation("logical generation sequence is not canonical decimal");
+    }
+    let mut bytes = value.as_bytes().to_vec();
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        if bytes[index] != b'9' {
+            bytes[index] += 1;
+            return String::from_utf8(bytes).map_err(|_| StoreError::Validation {
+                message: "logical generation sequence is not ASCII".to_owned(),
+            });
+        }
+        bytes[index] = b'0';
+    }
+    let mut result = Vec::with_capacity(bytes.len() + 1);
+    result.push(b'1');
+    result.extend(bytes);
+    String::from_utf8(result).map_err(|_| StoreError::Validation {
+        message: "logical generation sequence is not ASCII".to_owned(),
+    })
+}
+
+pub(super) fn maintain_incremental_logical_commit(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    input: &WorkingSetCommit,
+    conversation_changes: &[ConversationChange],
+    prior_character_conversations: &BTreeMap<String, Vec<String>>,
+) -> StoreResult<()> {
+    if input.root.is_some() {
+        replace_root_projection(transaction, cas, logical)?;
+    }
+    if input.replace_presets.is_some() {
+        replace_kind_projection(transaction, logical, RECORD_KIND_PRESET)?;
+        project_presets(
+            transaction,
+            &logical.library_id,
+            &logical.generation_id,
+            &logical.pds_generation,
+        )?;
+        restore_parent_tombstones_for_kind(transaction, logical, RECORD_KIND_PRESET)?;
+    }
+
+    let mut full_characters = Vec::new();
+    if let Some(character_id) = input.delete_character_id.as_deref() {
+        delete_character_projection(
+            transaction,
+            logical,
+            character_id,
+            prior_character_conversations
+                .get(character_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )?;
+    }
+    for character in input
+        .replace_character
+        .iter()
+        .chain(input.add_character.iter())
+    {
+        if let Some(character_id) = character.get("chaId").and_then(Value::as_str) {
+            refresh_full_character_projection(
+                transaction,
+                cas,
+                logical,
+                character_id,
+                prior_character_conversations
+                    .get(character_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?;
+            full_characters.push(character_id.to_owned());
+        }
+    }
+    for character in input
+        .character
+        .iter()
+        .chain(input.character_details.iter().flatten())
+    {
+        if let Some(character_id) = character.get("chaId").and_then(Value::as_str) {
+            replace_character_projection(transaction, cas, logical, character_id)?;
+        }
+    }
+
+    for change in conversation_changes {
+        let character_id = match change {
+            ConversationChange::Delete { character_id, .. }
+            | ConversationChange::ReplaceRange { character_id, .. } => character_id,
+        };
+        if full_characters.iter().any(|full| full == character_id) {
+            continue;
+        }
+        maintain_conversation_projection(transaction, logical, change)?;
+    }
+
+    for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
+        match mutation {
+            PluginStorageMutation::Set { key, .. } => {
+                replace_plugin_projection(transaction, logical, key)?;
+            }
+            PluginStorageMutation::Delete { key } => {
+                delete_projection(
+                    transaction,
+                    logical,
+                    encode_logical_record_key(&LogicalRecordLocator::Plugin {
+                        storage_key: key.clone(),
+                    })
+                    .map_err(codec_error)?,
+                    RECORD_KIND_PLUGIN,
+                )?;
+            }
+            PluginStorageMutation::Clear => {
+                replace_kind_projection(transaction, logical, RECORD_KIND_PLUGIN)?;
+                restore_parent_tombstones_for_kind(transaction, logical, RECORD_KIND_PLUGIN)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(super) fn maintain_incremental_asset_alias(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    alias: &AssetAlias,
+) -> StoreResult<()> {
+    let locator = match alias.kind.as_str() {
+        RECORD_KIND_ASSET => LogicalRecordLocator::Asset {
+            logical_key: alias.key.clone(),
+        },
+        RECORD_KIND_INLAY => LogicalRecordLocator::Inlay {
+            logical_key: alias.key.clone(),
+        },
+        _ => return validation("asset alias kind is unsupported"),
+    };
+    let key = encode_logical_record_key(&locator).map_err(codec_error)?;
+    delete_head(transaction, logical, &key)?;
+    project_asset_alias_by_key(transaction, cas, logical, &alias.kind, &alias.key)?;
+    Ok(())
+}
+
+fn replace_root_projection(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+) -> StoreResult<()> {
+    let key = encode_logical_record_key(&LogicalRecordLocator::Root).map_err(codec_error)?;
+    delete_head(transaction, logical, &key)?;
+    project_root(
+        transaction,
+        cas,
+        &logical.library_id,
+        &logical.generation_id,
+        &logical.pds_generation,
+    )
+}
+
+fn replace_kind_projection(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    record_kind: &str,
+) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM logical_record_heads
+         WHERE library_id = ?1 AND generation_id = ?2 AND record_kind = ?3",
+        params![logical.library_id, logical.generation_id, record_kind],
+    )?;
+    Ok(())
+}
+
+fn delete_head(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    record_key: &str,
+) -> StoreResult<()> {
+    transaction.execute(
+        "DELETE FROM logical_record_heads
+         WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3",
+        params![logical.library_id, logical.generation_id, record_key],
+    )?;
+    Ok(())
+}
+
+fn delete_projection(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    record_key: String,
+    record_kind: &str,
+) -> StoreResult<()> {
+    delete_head(transaction, logical, &record_key)?;
+    let parent: Option<(String, Option<String>)> = transaction
+        .query_row(
+            "SELECT parent.state, parent.deleted_generation_sequence
+             FROM logical_sync_generations AS current
+             JOIN logical_record_heads AS parent
+               ON parent.library_id = current.library_id
+              AND parent.generation_id = current.parent_generation_id
+              AND parent.record_key = ?3
+             WHERE current.library_id = ?1 AND current.generation_id = ?2",
+            params![logical.library_id, logical.generation_id, record_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((parent_state, parent_deleted_sequence)) = parent else {
+        return Ok(());
+    };
+    let deleted_sequence = if parent_state == "tombstone" {
+        parent_deleted_sequence.ok_or_else(|| StoreError::Validation {
+            message: "parent logical tombstone is missing its deletion sequence".to_owned(),
+        })?
+    } else {
+        logical.generation_sequence.clone()
+    };
+    transaction.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind, state,
+            object_hash, object_size, deleted_generation_sequence
+         ) VALUES (?1, ?2, ?3, ?4, 'tombstone', NULL, 0, ?5)",
+        params![
+            logical.library_id,
+            logical.generation_id,
+            record_key,
+            record_kind,
+            deleted_sequence,
+        ],
+    )?;
+    Ok(())
+}
+
+fn restore_parent_tombstones_for_kind(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    record_kind: &str,
+) -> StoreResult<()> {
+    let parent: Option<String> = transaction.query_row(
+        "SELECT parent_generation_id FROM logical_sync_generations
+         WHERE library_id = ?1 AND generation_id = ?2",
+        params![logical.library_id, logical.generation_id],
+        |row| row.get(0),
+    )?;
+    if let Some(parent) = parent {
+        transaction.execute(
+            "INSERT INTO logical_record_heads (
+                library_id, generation_id, record_key, record_kind, state,
+                object_hash, object_size, deleted_generation_sequence
+             )
+             SELECT parent.library_id, ?2, parent.record_key, parent.record_kind, 'tombstone',
+                    NULL, 0,
+                    CASE WHEN parent.state = 'tombstone'
+                         THEN parent.deleted_generation_sequence ELSE ?5 END
+             FROM logical_record_heads AS parent
+             WHERE parent.library_id = ?1 AND parent.generation_id = ?3
+               AND parent.record_kind = ?4
+               AND NOT EXISTS (
+                   SELECT 1 FROM logical_record_heads AS current
+                   WHERE current.library_id = ?1 AND current.generation_id = ?2
+                     AND current.record_key = parent.record_key
+               )",
+            params![
+                logical.library_id,
+                logical.generation_id,
+                parent,
+                record_kind,
+                logical.generation_sequence,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_plugin_projection(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    storage_key: &str,
+) -> StoreResult<()> {
+    let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+        storage_key: storage_key.to_owned(),
+    })
+    .map_err(codec_error)?;
+    delete_head(transaction, logical, &key)?;
+    let row: Option<(i64, String)> = transaction
+        .query_row(
+            "SELECT ordinal, value FROM plugin_storage
+             WHERE generation = ?1 AND storage_key = ?2",
+            params![logical.pds_generation, storage_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((ordinal, raw)) = row {
+        insert_live_record(
+            transaction,
+            &logical.library_id,
+            &logical.generation_id,
+            key,
+            RECORD_KIND_PLUGIN,
+            LogicalRecordEnvelope::Plugin {
+                ordinal: nonnegative_u64(ordinal, "plugin storage ordinal")?,
+                value: serde_json::from_str(&raw)?,
+            },
+            Vec::new(),
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_character_projection(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    character_id: &str,
+) -> StoreResult<()> {
+    let key = encode_logical_record_key(&LogicalRecordLocator::Character {
+        character_id: character_id.to_owned(),
+    })
+    .map_err(codec_error)?;
+    delete_head(transaction, logical, &key)?;
+    if !project_character_by_id(transaction, cas, logical, character_id)? {
+        return validation("changed character is missing from the active PDS generation");
+    }
+    Ok(())
+}
+
+fn project_character_by_id(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    character_id: &str,
+) -> StoreResult<bool> {
+    let row: Option<(i64, String)> = transaction
+        .query_row(
+            "SELECT configured_index, detail FROM characters
+             WHERE generation = ?1 AND character_id = ?2",
+            params![logical.pds_generation, character_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((configured_index, raw)) = row else {
+        return Ok(false);
+    };
+    let owner_heads = validate_owner_heads(
+        cas,
+        load_owner_heads(transaction, &logical.pds_generation, Some(character_id))?,
+    )?;
+    let mut detail: Value = serde_json::from_str(&raw)?;
+    strip_character_owner_property(&mut detail, character_id, &owner_heads)?;
+    let dependencies = owner_dependencies(&owner_heads)?;
+    insert_live_record(
+        transaction,
+        &logical.library_id,
+        &logical.generation_id,
+        encode_logical_record_key(&LogicalRecordLocator::Character {
+            character_id: character_id.to_owned(),
+        })
+        .map_err(codec_error)?,
+        RECORD_KIND_CHARACTER,
+        LogicalRecordEnvelope::Character {
+            configured_index: nonnegative_u64(configured_index, "character configured index")?,
+            detail,
+            owner_heads: logical_owner_heads(&owner_heads),
+        },
+        dependencies,
+        &[],
+    )?;
+    Ok(true)
+}
+
+fn delete_character_projection(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    character_id: &str,
+    conversation_ids: &[String],
+) -> StoreResult<()> {
+    let key = encode_logical_record_key(&LogicalRecordLocator::Character {
+        character_id: character_id.to_owned(),
+    })
+    .map_err(codec_error)?;
+    delete_projection(transaction, logical, key, RECORD_KIND_CHARACTER)?;
+    for conversation_id in conversation_ids {
+        delete_projection(
+            transaction,
+            logical,
+            encode_logical_record_key(&LogicalRecordLocator::Conversation {
+                character_id: character_id.to_owned(),
+                conversation_id: conversation_id.clone(),
+            })
+            .map_err(codec_error)?,
+            RECORD_KIND_CONVERSATION,
+        )?;
+    }
+    Ok(())
+}
+
+fn refresh_full_character_projection(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    character_id: &str,
+    prior_conversation_ids: &[String],
+) -> StoreResult<()> {
+    let key = encode_logical_record_key(&LogicalRecordLocator::Character {
+        character_id: character_id.to_owned(),
+    })
+    .map_err(codec_error)?;
+    delete_head(transaction, logical, &key)?;
+    for conversation_id in prior_conversation_ids {
+        delete_projection(
+            transaction,
+            logical,
+            encode_logical_record_key(&LogicalRecordLocator::Conversation {
+                character_id: character_id.to_owned(),
+                conversation_id: conversation_id.clone(),
+            })
+            .map_err(codec_error)?,
+            RECORD_KIND_CONVERSATION,
+        )?;
+    }
+    if !project_character_by_id(transaction, cas, logical, character_id)? {
+        return validation("replaced character is missing from the active PDS generation");
+    }
+    let mut statement = transaction.prepare(
+        "SELECT conversation_id FROM conversations
+         WHERE generation = ?1 AND character_id = ?2 ORDER BY conversation_id ASC",
+    )?;
+    let conversations = statement
+        .query_map(params![logical.pds_generation, character_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for conversation_id in conversations {
+        let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+            character_id: character_id.to_owned(),
+            conversation_id: conversation_id.clone(),
+        })
+        .map_err(codec_error)?;
+        delete_head(transaction, logical, &key)?;
+        project_conversation_full(transaction, logical, character_id, &conversation_id)?;
+    }
+    Ok(())
+}
+
+fn maintain_conversation_projection(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    change: &ConversationChange,
+) -> StoreResult<()> {
+    match change {
+        ConversationChange::Delete {
+            character_id,
+            conversation_id,
+        } => delete_projection(
+            transaction,
+            logical,
+            encode_logical_record_key(&LogicalRecordLocator::Conversation {
+                character_id: character_id.clone(),
+                conversation_id: conversation_id.clone(),
+            })
+            .map_err(codec_error)?,
+            RECORD_KIND_CONVERSATION,
+        ),
+        ConversationChange::ReplaceRange {
+            character_id,
+            conversation_id,
+            start,
+            old_count,
+            new_count,
+            replaced_count,
+            inserted_count,
+            was_new,
+        } => refresh_conversation_range(
+            transaction,
+            logical,
+            character_id,
+            conversation_id,
+            *start,
+            *old_count,
+            *new_count,
+            *replaced_count,
+            *inserted_count,
+            *was_new,
+        ),
+    }
+}
+
+fn project_conversation_full(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    character_id: &str,
+    conversation_id: &str,
+) -> StoreResult<()> {
+    let (configured_index, recent_at, raw, expected_count): (i64, i64, String, i64) = transaction
+        .query_row(
+        "SELECT configured_index, recent_at, detail, message_count
+             FROM conversations
+             WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+        params![logical.pds_generation, character_id, conversation_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+        character_id: character_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+    })
+    .map_err(codec_error)?;
+    let pages = project_message_pages(
+        transaction,
+        &logical.pds_generation,
+        character_id,
+        conversation_id,
+        nonnegative_u64(expected_count, "conversation message count")?,
+    )?;
+    let dependencies = pages.iter().map(|page| page.object.clone()).collect();
+    let message_page_hashes = pages.iter().map(|page| page.object.hash.clone()).collect();
+    insert_live_record(
+        transaction,
+        &logical.library_id,
+        &logical.generation_id,
+        key,
+        RECORD_KIND_CONVERSATION,
+        LogicalRecordEnvelope::Conversation {
+            configured_index: nonnegative_u64(configured_index, "conversation configured index")?,
+            recent_at,
+            detail: serde_json::from_str(&raw)?,
+            message_page_hashes,
+        },
+        dependencies,
+        &pages,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_conversation_range(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    character_id: &str,
+    conversation_id: &str,
+    start: u64,
+    old_count: u64,
+    new_count: u64,
+    replaced_count: u64,
+    inserted_count: u64,
+    was_new: bool,
+) -> StoreResult<()> {
+    let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+        character_id: character_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+    })
+    .map_err(codec_error)?;
+    let existing_live: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM logical_record_heads
+            WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3 AND state = 'live'
+         )",
+        params![logical.library_id, logical.generation_id, key],
+        |row| row.get(0),
+    )?;
+    if was_new || !existing_live {
+        delete_head(transaction, logical, &key)?;
+        return project_conversation_full(transaction, logical, character_id, conversation_id);
+    }
+
+    let (configured_index, recent_at, raw, stored_count): (i64, i64, String, i64) = transaction
+        .query_row(
+            "SELECT configured_index, recent_at, detail, message_count
+             FROM conversations
+             WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+            params![logical.pds_generation, character_id, conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    if nonnegative_u64(stored_count, "conversation message count")? != new_count {
+        return validation("conversation mutation result count does not match PDS metadata");
+    }
+
+    transaction.execute(
+        "DELETE FROM logical_record_dependencies
+         WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3",
+        params![logical.library_id, logical.generation_id, key],
+    )?;
+    let first_page = start / LOGICAL_MESSAGE_PAGE_SIZE as u64;
+    if old_count != new_count {
+        transaction.execute(
+            "DELETE FROM logical_message_page_sources
+             WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
+               AND page_index >= ?4",
+            params![
+                logical.library_id,
+                logical.generation_id,
+                key,
+                sqlite_i64(first_page, "first affected message page")?,
+            ],
+        )?;
+        let page_count = new_count.div_ceil(LOGICAL_MESSAGE_PAGE_SIZE as u64);
+        for page_index in first_page..page_count {
+            insert_message_page_source(
+                transaction,
+                logical,
+                &key,
+                character_id,
+                conversation_id,
+                page_index,
+                new_count,
+            )?;
+        }
+    } else {
+        let changed_end = start.saturating_add(replaced_count.max(inserted_count));
+        if changed_end > start {
+            let last_page = (changed_end - 1) / LOGICAL_MESSAGE_PAGE_SIZE as u64;
+            transaction.execute(
+                "DELETE FROM logical_message_page_sources
+                 WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
+                   AND page_index >= ?4 AND page_index <= ?5",
+                params![
+                    logical.library_id,
+                    logical.generation_id,
+                    key,
+                    sqlite_i64(first_page, "first affected message page")?,
+                    sqlite_i64(last_page, "last affected message page")?,
+                ],
+            )?;
+            for page_index in first_page..=last_page {
+                insert_message_page_source(
+                    transaction,
+                    logical,
+                    &key,
+                    character_id,
+                    conversation_id,
+                    page_index,
+                    new_count,
+                )?;
+            }
+        }
+    }
+    rebuild_conversation_head(
+        transaction,
+        logical,
+        &key,
+        configured_index,
+        recent_at,
+        serde_json::from_str(&raw)?,
+        new_count,
+    )
+}
+
+fn insert_message_page_source(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    record_key: &str,
+    character_id: &str,
+    conversation_id: &str,
+    page_index: u64,
+    message_count: u64,
+) -> StoreResult<()> {
+    let first_message_index = page_index
+        .checked_mul(LOGICAL_MESSAGE_PAGE_SIZE as u64)
+        .ok_or_else(|| StoreError::Validation {
+            message: "conversation page first index overflow".to_owned(),
+        })?;
+    if first_message_index >= message_count {
+        return validation("conversation page starts beyond the final message count");
+    }
+    let end = first_message_index
+        .saturating_add(LOGICAL_MESSAGE_PAGE_SIZE as u64)
+        .min(message_count);
+    let expected_count = end - first_message_index;
+    let mut statement = transaction.prepare(
+        "SELECT message_index, value FROM messages
+         WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3
+           AND message_index >= ?4 AND message_index < ?5
+         ORDER BY message_index ASC",
+    )?;
+    let mut rows = statement.query(params![
+        logical.pds_generation,
+        character_id,
+        conversation_id,
+        sqlite_i64(first_message_index, "message page first index")?,
+        sqlite_i64(end, "message page end index")?,
+    ])?;
+    let mut messages = Vec::with_capacity(expected_count as usize);
+    let mut expected_index = first_message_index;
+    while let Some(row) = rows.next()? {
+        let message_index = nonnegative_u64(row.get(0)?, "message index")?;
+        if message_index != expected_index {
+            return validation("conversation messages are not contiguous in affected page");
+        }
+        messages.push(serde_json::from_str::<Value>(&row.get::<_, String>(1)?)?);
+        expected_index += 1;
+    }
+    if expected_index != end {
+        return validation("conversation affected page is incomplete");
+    }
+    let encoded = encode_message_page(&messages).map_err(codec_error)?;
+    transaction.execute(
+        "INSERT INTO logical_message_page_sources (
+            library_id, generation_id, record_key, page_index,
+            first_message_index, message_count, object_hash, object_size
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            logical.library_id,
+            logical.generation_id,
+            record_key,
+            sqlite_i64(page_index, "logical message page index")?,
+            sqlite_i64(first_message_index, "logical message first index")?,
+            sqlite_i64(expected_count, "logical message page count")?,
+            encoded.hash,
+            sqlite_i64(encoded.size, "logical message page object size")?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn rebuild_conversation_head(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    record_key: &str,
+    configured_index: i64,
+    recent_at: i64,
+    detail: Value,
+    message_count: u64,
+) -> StoreResult<()> {
+    let mut statement = transaction.prepare(
+        "SELECT page_index, first_message_index, message_count, object_hash, object_size
+         FROM logical_message_page_sources
+         WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
+         ORDER BY page_index ASC",
+    )?;
+    let mut rows = statement.query(params![
+        logical.library_id,
+        logical.generation_id,
+        record_key,
+    ])?;
+    let expected_pages = message_count.div_ceil(LOGICAL_MESSAGE_PAGE_SIZE as u64);
+    let mut pages = Vec::with_capacity(usize::try_from(expected_pages).map_err(|_| {
+        StoreError::Validation {
+            message: "logical conversation page count exceeds platform limits".to_owned(),
+        }
+    })?);
+    while let Some(row) = rows.next()? {
+        let page_index = nonnegative_u64(row.get(0)?, "logical message page index")?;
+        let first_message_index = nonnegative_u64(row.get(1)?, "logical message first index")?;
+        let count = nonnegative_u64(row.get(2)?, "logical message page count")?;
+        let remaining = message_count
+            .checked_sub(first_message_index)
+            .ok_or_else(|| StoreError::Validation {
+                message: "logical message page starts beyond the conversation".to_owned(),
+            })?;
+        let expected_first = page_index
+            .checked_mul(LOGICAL_MESSAGE_PAGE_SIZE as u64)
+            .ok_or_else(|| StoreError::Validation {
+                message: "logical message page first index overflow".to_owned(),
+            })?;
+        if page_index != pages.len() as u64
+            || first_message_index != expected_first
+            || count != remaining.min(LOGICAL_MESSAGE_PAGE_SIZE as u64)
+        {
+            return validation("logical conversation page metadata is not contiguous");
+        }
+        pages.push(LogicalManifestObject {
+            hash: row.get(3)?,
+            size: nonnegative_u64(row.get(4)?, "logical message page object size")?,
+        });
+    }
+    if pages.len() as u64 != expected_pages {
+        return validation("logical conversation page coverage is incomplete");
+    }
+    let envelope = LogicalRecordEnvelope::Conversation {
+        configured_index: nonnegative_u64(configured_index, "conversation configured index")?,
+        recent_at,
+        detail,
+        message_page_hashes: pages.iter().map(|page| page.hash.clone()).collect(),
+    };
+    let encoded = encode_logical_record(&envelope).map_err(codec_error)?;
+    let changed = transaction.execute(
+        "UPDATE logical_record_heads
+         SET record_kind = 'conversation', state = 'live', object_hash = ?4,
+             object_size = ?5, deleted_generation_sequence = NULL
+         WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3",
+        params![
+            logical.library_id,
+            logical.generation_id,
+            record_key,
+            encoded.hash,
+            sqlite_i64(encoded.size, "logical conversation object size")?,
+        ],
+    )?;
+    if changed != 1 {
+        return validation("logical conversation head disappeared during targeted update");
+    }
+    let mut unique = BTreeMap::new();
+    for page in pages {
+        if unique
+            .insert(page.hash.clone(), page.size)
+            .is_some_and(|old| old != page.size)
+        {
+            return validation("logical message page hash has conflicting sizes");
+        }
+    }
+    for (hash, size) in unique {
+        transaction.execute(
+            "INSERT INTO logical_record_dependencies (
+                library_id, generation_id, record_key, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                logical.library_id,
+                logical.generation_id,
+                record_key,
+                hash,
+                sqlite_i64(size, "logical dependency object size")?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_asset_alias_by_key(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    kind: &str,
+    logical_key: &str,
+) -> StoreResult<()> {
+    let row: (
+        Option<String>,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    ) = transaction.query_row(
+        "SELECT object_hash, size, mime, name, ext, inlay_type, width, height, metadata
+             FROM asset_aliases
+             WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
+        params![logical.pds_generation, kind, logical_key],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    let size = nonnegative_u64(row.1, "asset alias size")?;
+    let metadata = encode_asset_alias_metadata(&LogicalAssetAliasMetadata {
+        mime: row.2,
+        name: row.3,
+        ext: row.4,
+        inlay_type: row.5,
+        width: row.6,
+        height: row.7,
+        metadata: serde_json::from_str(&row.8)?,
+    })
+    .map_err(codec_error)?;
+    let dependencies = payload_dependency(cas, row.0.as_deref(), size)?;
+    let (locator, record_kind, envelope) = match kind {
+        RECORD_KIND_ASSET => (
+            LogicalRecordLocator::Asset {
+                logical_key: logical_key.to_owned(),
+            },
+            RECORD_KIND_ASSET,
+            LogicalRecordEnvelope::Asset {
+                object_hash: row.0,
+                size,
+                metadata,
+            },
+        ),
+        RECORD_KIND_INLAY => (
+            LogicalRecordLocator::Inlay {
+                logical_key: logical_key.to_owned(),
+            },
+            RECORD_KIND_INLAY,
+            LogicalRecordEnvelope::Inlay {
+                object_hash: row.0,
+                size,
+                metadata,
+            },
+        ),
+        _ => return validation("asset alias kind is unsupported"),
+    };
+    insert_live_record(
+        transaction,
+        &logical.library_id,
+        &logical.generation_id,
+        encode_logical_record_key(&locator).map_err(codec_error)?,
+        record_kind,
+        envelope,
+        dependencies,
+        &[],
+    )
 }
 
 fn validate_pds_projection_contract(connection: &Connection) -> StoreResult<()> {
@@ -1591,7 +2962,7 @@ mod tests {
         decode_asset_alias_metadata, decode_logical_record, decode_message_page,
         LogicalManifestRecord,
     };
-    use crate::persistent_store::snapshot;
+    use crate::persistent_store::{snapshot, ConversationMutation};
     use rusqlite::params;
     use serde_json::json;
 
@@ -2070,6 +3441,513 @@ mod tests {
         assert!(store
             .reconstruct_logical_object(&cas, "library", "building", &"11".repeat(32),)
             .is_err());
+    }
+
+    fn logical_build_request() -> LogicalIndexBuildRequest {
+        LogicalIndexBuildRequest {
+            library_id: "library".to_owned(),
+            generation_id: "generation-0".to_owned(),
+            generation_sequence: "0".to_owned(),
+            parent_generation_id: None,
+            lease: None,
+        }
+    }
+
+    fn root_commit(expected_revision: i64, value: Value) -> WorkingSetCommit {
+        WorkingSetCommit {
+            expected_revision,
+            root: Some(value),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: None,
+        }
+    }
+
+    #[test]
+    fn atomic_asset_alias_batch_updates_the_incremental_logical_child() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let replacement = cas.prepare_bytes(b"replacement asset bytes").unwrap();
+        let alias = AssetAlias {
+            key: "same".to_owned(),
+            object_hash: Some(replacement.content_hash.clone()),
+            kind: "asset".to_owned(),
+            size: i64::try_from(replacement.byte_size).unwrap(),
+            mime: "application/octet-stream".to_owned(),
+            name: "replacement.bin".to_owned(),
+            ext: "bin".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({ "source": "atomic-batch" }),
+        };
+        let mut commit = root_commit(0, json!({ "unused": true }));
+        commit.root = None;
+
+        store
+            .commit_with_asset_aliases(&commit, std::slice::from_ref(&alias))
+            .unwrap();
+
+        let record_key = encode_logical_record_key(&LogicalRecordLocator::Asset {
+            logical_key: alias.key.clone(),
+        })
+        .unwrap();
+        let (generation_id, state, object_hash): (String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT head.generation_id, head.state, head.object_hash
+                 FROM logical_record_heads AS head
+                 JOIN logical_library_head AS library
+                   ON library.library_id = head.library_id
+                  AND library.generation_id = head.generation_id
+                 WHERE head.record_key = ?1",
+                [record_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "live");
+        let bytes = store
+            .reconstruct_logical_object(&cas, "library", &generation_id, &object_hash)
+            .unwrap();
+        let LogicalRecordEnvelope::Asset {
+            object_hash,
+            size,
+            metadata,
+        } = decode_logical_record(&bytes).unwrap()
+        else {
+            panic!("atomic alias batch must produce an asset record");
+        };
+        assert_eq!(
+            object_hash.as_deref(),
+            Some(replacement.content_hash.as_str())
+        );
+        assert_eq!(size, replacement.byte_size);
+        let metadata = decode_asset_alias_metadata(&metadata).unwrap();
+        assert_eq!(metadata.metadata["source"], "atomic-batch");
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM logical_record_dependencies
+                     WHERE library_id = 'library' AND generation_id = ?1
+                       AND record_key = ?2 AND object_hash = ?3 AND object_size = ?4",
+                    params![
+                        generation_id,
+                        encode_logical_record_key(&LogicalRecordLocator::Asset {
+                            logical_key: alias.key,
+                        })
+                        .unwrap(),
+                        replacement.content_hash,
+                        i64::try_from(replacement.byte_size).unwrap(),
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn building_generation_absorbs_repeated_saves_without_pds_copy_on_write() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        logical_schema::reset_validation_count();
+
+        store
+            .commit(&root_commit(0, json!({"version": 1})))
+            .unwrap();
+        store
+            .commit(&root_commit(1, json!({"version": 2})))
+            .unwrap();
+
+        assert_eq!(
+            super::super::active_generation(&store.connection).unwrap(),
+            "revision-0"
+        );
+        let row: (String, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT generation_id, pds_generation, source_revision
+                 FROM logical_sync_generations WHERE state = 'building'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("generation-0".to_owned(), "revision-0".to_owned(), 2));
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM root", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+        );
+        assert_eq!(logical_schema::validation_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_leased_building_moves_once_then_resumes_in_place_saves() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        let lease = store.acquire_revision(0).unwrap().lease;
+
+        store
+            .commit(&root_commit(0, json!({"version": 1})))
+            .unwrap();
+        assert_eq!(
+            super::super::active_generation(&store.connection).unwrap(),
+            "revision-1"
+        );
+        let logical: (String, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT generation_id, pds_generation, source_revision
+                 FROM logical_sync_generations WHERE state = 'building'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            logical,
+            ("generation-0".to_owned(), "revision-1".to_owned(), 1)
+        );
+        store.release_revision(&lease).unwrap();
+
+        store
+            .commit(&root_commit(1, json!({"version": 2})))
+            .unwrap();
+        assert_eq!(
+            super::super::active_generation(&store.connection).unwrap(),
+            "revision-1"
+        );
+    }
+
+    #[test]
+    fn sealing_causes_exactly_one_cow_and_repeated_seal_is_a_no_op() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        let sealed_again = store.seal_active_logical_generation(&cas).unwrap();
+        assert_eq!(sealed_again.manifest_hash, sealed.manifest_hash);
+
+        store
+            .commit(&root_commit(0, json!({"version": 1})))
+            .unwrap();
+        assert_eq!(
+            super::super::active_generation(&store.connection).unwrap(),
+            "revision-1"
+        );
+        let child: (String, String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT generation_id, generation_sequence, parent_generation_id, state
+                 FROM logical_sync_generations
+                 WHERE generation_id != 'generation-0'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(child.1, "1");
+        assert_eq!(child.2, "generation-0");
+        assert_eq!(child.3, "building");
+
+        store
+            .commit(&root_commit(1, json!({"version": 2})))
+            .unwrap();
+        assert_eq!(
+            super::super::active_generation(&store.connection).unwrap(),
+            "revision-1"
+        );
+        let building_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_sync_generations WHERE state = 'building'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(building_count, 1);
+    }
+
+    #[test]
+    fn full_replace_detaches_the_old_head_until_one_bounded_rebuild() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let staging = store.replace_begin().unwrap();
+        store
+            .replace_put_root(&staging.staging_id, &json!({"replacement": true}))
+            .unwrap();
+        store.replace_commit(&staging.staging_id, Some(0)).unwrap();
+
+        assert!(!logical_index_is_active(&store.connection).unwrap());
+        assert!(store
+            .connection
+            .query_row(
+                "SELECT 1 FROM root WHERE generation = 'revision-0'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some());
+        store
+            .initialize_logical_index_building(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "generation-1".to_owned(),
+                    generation_sequence: "1".to_owned(),
+                    parent_generation_id: Some("generation-0".to_owned()),
+                    lease: None,
+                },
+            )
+            .unwrap();
+        let replacement = store.seal_active_logical_generation(&cas).unwrap();
+        assert_eq!(
+            replacement.manifest.parent_generation.as_deref(),
+            Some("generation-0")
+        );
+        assert_eq!(replacement.manifest.source_revision, 1);
+    }
+
+    #[test]
+    fn complete_generation_reconstructs_after_lease_release_reopen_and_sweep() {
+        let (directory, mut store, cas) = open_j2_fixture();
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
+        let root = sealed
+            .manifest
+            .records
+            .iter()
+            .find_map(|record| match record {
+                LogicalManifestRecord::Live(record)
+                    if matches!(
+                        decode_logical_record_key(&record.key).unwrap(),
+                        LogicalRecordLocator::Root
+                    ) =>
+                {
+                    Some(record.object_hash.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let session = store
+            .pin_logical_generation("library", "generation-0")
+            .unwrap();
+        let lease = snapshot::acquire_revision(&mut store.connection, 0)
+            .unwrap()
+            .lease;
+        store
+            .commit(&root_commit(0, json!({"version": 1})))
+            .unwrap();
+        snapshot::release_revision(&mut store.connection, &lease).unwrap();
+        drop(store);
+
+        let mut reopened = PersistentStore::open(directory.path()).unwrap();
+        snapshot::sweep_temporary_generations(&mut reopened.connection).unwrap();
+        reopened
+            .resume_logical_generation_pin(&session, "library", "generation-0")
+            .unwrap();
+        reopened
+            .resume_logical_generation_pin(&session, "library", "generation-0")
+            .unwrap();
+        let mismatch = reopened
+            .resume_logical_generation_pin(&session, "other-library", "generation-0")
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("tuple does not match"));
+        assert!(!reopened
+            .reconstruct_logical_object(&cas, "library", "generation-0", &root)
+            .unwrap()
+            .is_empty());
+        let pin_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_generation_session_pins WHERE session_id = ?1",
+                [session.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pin_count, 1);
+        reopened.release_logical_generation_pin(&session).unwrap();
+        reopened
+            .prune_logical_generation("library", "generation-0")
+            .unwrap();
+        assert!(reopened
+            .connection
+            .query_row(
+                "SELECT 1 FROM root WHERE generation = 'revision-0'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn session_pin_blocks_explicit_generation_prune() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let session = store
+            .pin_logical_generation("library", "generation-0")
+            .unwrap();
+        store
+            .commit(&root_commit(0, json!({"version": 1})))
+            .unwrap();
+        let error = store
+            .prune_logical_generation("library", "generation-0")
+            .unwrap_err();
+        assert!(error.to_string().contains("session-pinned"));
+        store.release_logical_generation_pin(&session).unwrap();
+        store
+            .prune_logical_generation("library", "generation-0")
+            .unwrap();
+    }
+
+    #[test]
+    fn range_append_rehashes_only_the_intersecting_128_message_page() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+            character_id: "char".to_owned(),
+            conversation_id: "chat".to_owned(),
+        })
+        .unwrap();
+        let before: Vec<(i64, String)> = store
+            .connection
+            .prepare(
+                "SELECT rowid, object_hash FROM logical_message_page_sources
+                 WHERE library_id = 'library' AND generation_id = 'generation-0'
+                   AND record_key = ?1 ORDER BY page_index",
+            )
+            .unwrap()
+            .query_map([key.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut commit = root_commit(0, json!({"theme": "dark"}));
+        commit.root = None;
+        commit.conversations = Some(vec![ConversationMutation::ReplaceRange {
+            character_id: "char".to_owned(),
+            conversation_id: "chat".to_owned(),
+            start: 129,
+            delete_count: 0,
+            messages: vec![json!({"chatId": "m129", "data": "new"})],
+            conversation: None,
+            configured_index: None,
+        }]);
+        store.commit(&commit).unwrap();
+        let after: Vec<(i64, String)> = store
+            .connection
+            .prepare(
+                "SELECT rowid, object_hash FROM logical_message_page_sources
+                 WHERE library_id = 'library' AND generation_id = 'generation-0'
+                   AND record_key = ?1 ORDER BY page_index",
+            )
+            .unwrap()
+            .query_map([key.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0], before[0]);
+        assert_ne!(after[1].1, before[1].1);
+    }
+
+    #[test]
+    fn child_commit_records_plugin_deletion_as_tombstone() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+        let mut commit = root_commit(0, json!({"theme": "dark"}));
+        commit.root = None;
+        commit.plugin_storage = Some(vec![PluginStorageMutation::Delete {
+            key: "plugin".to_owned(),
+        }]);
+        store.commit(&commit).unwrap();
+        let plugin_key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            storage_key: "plugin".to_owned(),
+        })
+        .unwrap();
+        let tombstone: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT state, deleted_generation_sequence
+                 FROM logical_record_heads
+                 JOIN logical_library_head USING (library_id, generation_id)
+                 WHERE record_key = ?1",
+                [plugin_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tombstone, ("tombstone".to_owned(), "1".to_owned()));
+    }
+
+    #[test]
+    fn startup_cleanup_removes_crash_abandoned_complete_staging_generation() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .initialize_logical_index_building(&cas, logical_build_request())
+            .unwrap();
+        clone_pds_generation(&store.connection, "revision-0", "staging-logical-abandoned");
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_sync_generations (
+                    library_id, generation_id, generation_sequence, parent_generation_id,
+                    pds_generation, source_revision, state, manifest_hash, created_at, completed_at
+                 ) VALUES (
+                    'library', 'staged-generation', '1', NULL,
+                    'staging-logical-abandoned', 0, 'complete', ?1, 0, 0
+                 )",
+                ["11".repeat(32)],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO snapshot_leases (lease, generation, revision, created_at)
+                 VALUES ('snapshot-staged', 'staging-logical-abandoned', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        cleanup_abandoned_logical_staging(&mut store.connection).unwrap();
+        snapshot::sweep_temporary_generations(&mut store.connection).unwrap();
+        let remaining: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM root WHERE generation = 'staging-logical-abandoned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     fn clone_pds_generation(connection: &Connection, from: &str, to: &str) {
