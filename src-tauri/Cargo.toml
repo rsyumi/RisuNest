@@ -45,7 +45,7 @@ webp = "0.3.1"
 flate2 = "1.1.2"
 crc32fast = "1.5.0"
 rmpv = "1.3.0"
-time = { version = "0.3.55", features = ["large-dates"] }
+time = { version = "0.3.55", features = ["formatting", "large-dates", "parsing"] }
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem
 # DO NOT REMOVE!!
@@ -75,7 +75,6 @@ tauri-plugin-updater = "2.10.1"
 tiny_http = "0.12.0"
 getrandom = "0.2.15"
 reqwest = { version = "0.11.16", features = ["blocking", "json"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [target.'cfg(windows)'.dependencies]
 regex = "1.13.1"
@@ -86,7 +85,7 @@ libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21.1"
-reqwest = { version = "0.11.16", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 reqwest = { version = "0.11.16", features = ["json"] }

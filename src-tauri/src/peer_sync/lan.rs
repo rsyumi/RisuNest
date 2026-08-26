@@ -1,42 +1,62 @@
+#[cfg(desktop)]
+use super::PreparedCloneSession;
 use super::{
     http_stream::HttpRangeStream,
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
-    PeerSyncError, PreparedCloneSession,
+    PeerSyncError,
 };
+#[cfg(desktop)]
 use crate::asset_repository::PayloadCas;
 use serde::{Deserialize, Serialize};
+#[cfg(desktop)]
 use sha2::{Digest, Sha256};
+#[cfg(desktop)]
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Seek, SeekFrom},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
-    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::Path,
+    time::Duration,
 };
 
+#[cfg(desktop)]
 const CLAIM_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_URL_BYTES: usize = 512;
+#[cfg(desktop)]
 const MAX_HEADER_BYTES: usize = 8 * 1024;
+#[cfg(desktop)]
 const MAX_BODY_BYTES: usize = 1024;
 const MAX_CLAIM_RESPONSE_BYTES: usize = 1024;
+#[cfg(desktop)]
 const MAX_REQUEST_LINE_BYTES: usize = MAX_URL_BYTES + 32;
+#[cfg(desktop)]
 const MAX_REQUEST_HEAD_BYTES: usize = MAX_REQUEST_LINE_BYTES + 2 + MAX_HEADER_BYTES + 4;
+#[cfg(desktop)]
 const CONNECTION_READ_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(desktop)]
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(desktop)]
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(desktop)]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(desktop)]
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
 const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(desktop)]
 pub struct LanPairing {
     pub session_id: String,
     pub manifest_id: String,
@@ -468,6 +488,7 @@ impl PersistedLanCredential {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg(desktop)]
 pub struct LanDevice {
     pub device_id: String,
     pub verified_bytes: u64,
@@ -476,17 +497,20 @@ pub struct LanDevice {
     pub revoked: bool,
 }
 
+#[cfg(desktop)]
 struct DeviceState {
     info: LanDevice,
     bearer_digest: [u8; 32],
 }
 
+#[cfg(desktop)]
 struct ClaimState {
     digest: [u8; 32],
     expires_at: Instant,
     consumed: bool,
 }
 
+#[cfg(desktop)]
 struct LanShared {
     session: PreparedCloneSession,
     manifest_bytes: Arc<[u8]>,
@@ -494,6 +518,7 @@ struct LanShared {
     devices: Mutex<BTreeMap<String, DeviceState>>,
 }
 
+#[cfg(desktop)]
 pub struct LanCloneHost {
     shared: Arc<LanShared>,
     address: Option<SocketAddr>,
@@ -502,6 +527,7 @@ pub struct LanCloneHost {
     thread: Option<JoinHandle<Result<(), PeerSyncError>>>,
 }
 
+#[cfg(desktop)]
 impl LanCloneHost {
     pub fn prepare(session: PreparedCloneSession) -> Self {
         Self {
@@ -621,12 +647,14 @@ impl LanCloneHost {
     }
 }
 
+#[cfg(desktop)]
 impl Drop for LanCloneHost {
     fn drop(&mut self) {
         let _ = self.stop();
     }
 }
 
+#[cfg(desktop)]
 fn serve(
     listener: TcpListener,
     shared: Arc<LanShared>,
@@ -658,6 +686,7 @@ fn serve(
     Ok(())
 }
 
+#[cfg(desktop)]
 fn configure_connection(stream: &TcpStream) -> Result<(), PeerSyncError> {
     stream.set_nonblocking(false).map_err(transport)?;
     stream
@@ -669,6 +698,7 @@ fn configure_connection(stream: &TcpStream) -> Result<(), PeerSyncError> {
     Ok(())
 }
 
+#[cfg(desktop)]
 struct HttpRequest {
     method: String,
     url: String,
@@ -678,12 +708,14 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+#[cfg(desktop)]
 enum RequestReadError {
     Http(u16),
     Io(io::Error),
     Stopped,
 }
 
+#[cfg(desktop)]
 fn handle_connection(
     mut stream: TcpStream,
     shared: &LanShared,
@@ -701,6 +733,7 @@ fn handle_connection(
     handle_request(&mut stream, request, shared, stopped)
 }
 
+#[cfg(desktop)]
 fn read_request(
     stream: &mut TcpStream,
     stopped: &AtomicBool,
@@ -708,6 +741,7 @@ fn read_request(
     read_request_started(stream, stopped, Instant::now())
 }
 
+#[cfg(desktop)]
 fn read_request_started(
     stream: &mut TcpStream,
     stopped: &AtomicBool,
@@ -716,6 +750,7 @@ fn read_request_started(
     read_request_with_elapsed(stream, stopped, || request_started.elapsed())
 }
 
+#[cfg(desktop)]
 fn read_request_with_elapsed(
     stream: &mut impl Read,
     stopped: &AtomicBool,
@@ -863,7 +898,7 @@ fn read_request_with_elapsed(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, desktop))]
 pub(super) fn read_request_with_elapsed_for_test(
     stream: &mut impl Read,
     stopped: &AtomicBool,
@@ -876,6 +911,7 @@ pub(super) fn read_request_with_elapsed_for_test(
     }
 }
 
+#[cfg(desktop)]
 fn handle_request(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -924,6 +960,7 @@ fn handle_request(
     }
 }
 
+#[cfg(desktop)]
 fn claim(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -978,6 +1015,7 @@ fn claim(
     respond_json(stream, 200, &response)
 }
 
+#[cfg(desktop)]
 fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
     let value = request.authorization.as_deref().ok_or(401_u16)?;
     let Some(bearer) = value.strip_prefix("Bearer ") else {
@@ -1000,6 +1038,7 @@ fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
     Err(401)
 }
 
+#[cfg(desktop)]
 fn progress(
     stream: &mut TcpStream,
     request: HttpRequest,
@@ -1024,6 +1063,7 @@ fn progress(
     respond_empty(stream, 204)
 }
 
+#[cfg(desktop)]
 fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
     let descriptor = &shared.session.manifest().objects[object];
     write_response_head(
@@ -1034,6 +1074,7 @@ fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), 
     )
 }
 
+#[cfg(desktop)]
 fn range(
     stream: &mut TcpStream,
     request: &HttpRequest,
@@ -1086,6 +1127,7 @@ struct ClaimRequest {
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(desktop)]
 struct ClaimResponse {
     device_id: String,
     bearer: String,
@@ -1240,27 +1282,32 @@ fn sync_parent_directory(_path: &Path) -> Result<(), PeerSyncError> {
     Ok(())
 }
 
+#[cfg(desktop)]
 fn random_secret() -> Result<[u8; 32], PeerSyncError> {
     let mut secret = [0; 32];
     getrandom::getrandom(&mut secret)
         .map_err(|error| PeerSyncError::Transport(error.to_string()))?;
     Ok(secret)
 }
+#[cfg(desktop)]
 fn digest(bytes: impl AsRef<[u8]>) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
+#[cfg(desktop)]
 fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
     left.iter()
         .zip(right)
         .fold(0_u8, |different, (a, b)| different | (a ^ b))
         == 0
 }
+#[cfg(desktop)]
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
 }
+#[cfg(desktop)]
 fn parse_range(value: &str) -> Option<(u64, u64)> {
     let value = value.strip_prefix("bytes=")?;
     if value.contains(',') || value.contains(char::is_whitespace) {
@@ -1275,11 +1322,13 @@ fn quoted(value: &str) -> String {
 fn transport(error: impl std::fmt::Display) -> PeerSyncError {
     PeerSyncError::Transport(error.to_string())
 }
+#[cfg(desktop)]
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
 }
+#[cfg(desktop)]
 fn valid_header_name(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
@@ -1303,12 +1352,14 @@ fn valid_header_name(value: &str) -> bool {
                 )
         })
 }
+#[cfg(desktop)]
 fn is_timeout(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     )
 }
+#[cfg(desktop)]
 fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -1326,6 +1377,7 @@ fn status_reason(status: u16) -> &'static str {
         _ => "Error",
     }
 }
+#[cfg(desktop)]
 fn write_response_head(
     stream: &mut TcpStream,
     status: u16,
@@ -1350,9 +1402,11 @@ fn write_response_head(
     response.push_str("\r\n");
     stream.write_all(response.as_bytes()).map_err(transport)
 }
+#[cfg(desktop)]
 fn respond_empty(stream: &mut TcpStream, status: u16) -> Result<(), PeerSyncError> {
     write_response_head(stream, status, &[], 0)
 }
+#[cfg(desktop)]
 fn respond_bytes(
     stream: &mut TcpStream,
     status: u16,
@@ -1362,6 +1416,7 @@ fn respond_bytes(
     write_response_head(stream, status, headers, body.len() as u64)?;
     stream.write_all(body).map_err(transport)
 }
+#[cfg(desktop)]
 fn respond_json<T: Serialize>(
     stream: &mut TcpStream,
     status: u16,
@@ -1376,6 +1431,7 @@ fn respond_json<T: Serialize>(
         &body,
     )
 }
+#[cfg(desktop)]
 fn copy_exact_response(
     stream: &mut TcpStream,
     reader: &mut dyn Read,
@@ -1407,7 +1463,7 @@ fn copy_exact_response(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, desktop))]
 mod timeout_tests {
     use super::*;
 

@@ -10,7 +10,7 @@ mod lossless_f0;
 pub mod native_file_jobs;
 mod native_media;
 mod native_tokenizer;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android"))]
 #[allow(dead_code, unused_imports)]
 mod peer_sync;
 mod persistent_store;
