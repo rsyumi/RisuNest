@@ -29,6 +29,11 @@ export type AssetRepositoryAuthorityState =
     | { format: 'preparing'; migrationId: string; sourceRevision: DataRevision }
     | { format: 'v2'; migrationId: string; compatibilityHash: string }
 
+export type ColdPayloadAuthorityState =
+    | { format: 'legacy' }
+    | { format: 'preparing'; migrationId: string; sourceRevision: DataRevision }
+    | { format: 'v2'; migrationId: string; compatibilityHash: string }
+
 export interface AssetAliasIdentity {
     kind: AssetAliasKind
     key: string
