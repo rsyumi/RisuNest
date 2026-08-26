@@ -106,6 +106,8 @@ pub(crate) struct LosslessCloneTargetAdapter<'a> {
     root: PathBuf,
     expected_revision: i64,
     cancellation: &'a dyn CancellationProbe,
+    #[cfg(test)]
+    fail_cleanup_after_commit: bool,
 }
 
 impl<'a> LosslessCloneTargetAdapter<'a> {
@@ -125,7 +127,14 @@ impl<'a> LosslessCloneTargetAdapter<'a> {
             root,
             expected_revision,
             cancellation,
+            #[cfg(test)]
+            fail_cleanup_after_commit: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_cleanup_after_commit_once_for_test(&mut self) {
+        self.fail_cleanup_after_commit = true;
     }
 
     fn current_marker(&self) -> Result<Option<ActiveManifestMarker>, PeerSyncError> {
@@ -267,6 +276,12 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
             self.cancellation,
         ) {
             Ok(_) => {
+                #[cfg(test)]
+                if std::mem::take(&mut self.fail_cleanup_after_commit) {
+                    return Err(PeerSyncError::Storage(
+                        "injected stage cleanup failure after clone commit".to_owned(),
+                    ));
+                }
                 self.remove_owned_stage(stage)?;
                 Ok(CloneActivation::Activated)
             }

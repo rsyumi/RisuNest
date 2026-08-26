@@ -99,6 +99,8 @@ pub struct LoopbackCloneClient {
     pause_after_cas_promotion: Option<PathBuf>,
     #[cfg(test)]
     pause_after_verified_chunk: Option<Arc<Barrier>>,
+    #[cfg(test)]
+    fail_record_activation: bool,
 }
 
 struct HttpCloneTransport {
@@ -174,6 +176,8 @@ impl LoopbackCloneClient {
             pause_after_cas_promotion: None,
             #[cfg(test)]
             pause_after_verified_chunk: None,
+            #[cfg(test)]
+            fail_record_activation: false,
         })
     }
 
@@ -215,6 +219,8 @@ impl LoopbackCloneClient {
             pause_after_cas_promotion: None,
             #[cfg(test)]
             pause_after_verified_chunk: None,
+            #[cfg(test)]
+            fail_record_activation: false,
         })
     }
 
@@ -264,6 +270,22 @@ impl LoopbackCloneClient {
         Ok((self.verified_bytes(manifest)?, total_bytes))
     }
 
+    pub(crate) fn all_objects_verified(&mut self) -> Result<bool, PeerSyncError> {
+        self.fetch_manifest()?;
+        let manifest = self.manifest.as_ref().unwrap();
+        if manifest.objects.keys().any(
+            |hash| !matches!(self.ledger.objects.get(hash), Some(progress) if progress.verified),
+        ) {
+            return Ok(false);
+        }
+        for (hash, object) in &manifest.objects {
+            if !self.verify_local_object(hash, object.size)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     #[cfg(test)]
     pub fn verified_chunk_count(&self, object: &str) -> usize {
         self.ledger
@@ -295,6 +317,11 @@ impl LoopbackCloneClient {
     #[cfg(test)]
     pub(crate) fn pause_after_verified_chunk_for_test(&mut self, pause: Arc<Barrier>) {
         self.pause_after_verified_chunk = Some(pause);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_record_activation_once_for_test(&mut self) {
+        self.fail_record_activation = true;
     }
 
     fn fetch_manifest(&mut self) -> Result<(), PeerSyncError> {
@@ -683,6 +710,12 @@ impl LoopbackCloneClient {
     }
 
     fn record_activation(&mut self) -> Result<(), PeerSyncError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_record_activation) {
+            return Err(PeerSyncError::Storage(
+                "injected clone activation ledger failure".to_owned(),
+            ));
+        }
         let manifest_id = self
             .manifest_id
             .clone()

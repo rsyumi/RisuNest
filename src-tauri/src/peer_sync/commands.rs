@@ -1,6 +1,7 @@
 use super::{
-    activate_downloaded_clone, prepare_lossless_clone_session, LanCloneClient, LanCloneHost,
-    LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError, TransferCancellation,
+    activate_downloaded_clone, prepare_lossless_clone_session, CloneTargetAdapter, LanCloneClient,
+    LanCloneHost, LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError,
+    TransferCancellation,
 };
 use crate::{
     asset_repository::PayloadCas,
@@ -159,6 +160,7 @@ impl PeerCloneTargetStatus {
 #[serde(rename_all = "camelCase")]
 pub struct PeerCloneFinalizeResult {
     revision: i64,
+    warning: Option<String>,
 }
 
 struct VerifiedCloneValidator;
@@ -202,6 +204,8 @@ struct TargetRuntime {
     cancellation: Option<TransferCancellation>,
     worker: Option<JoinHandle<()>>,
     status: PeerCloneTargetStatus,
+    #[cfg(test)]
+    fail_finalize_cleanup_once: bool,
 }
 
 #[derive(Default)]
@@ -535,6 +539,8 @@ impl PeerCloneCommandState {
             cancellation: None,
             worker: None,
             status: PeerCloneTargetStatus::idle(),
+            #[cfg(test)]
+            fail_finalize_cleanup_once: false,
         });
         Ok(())
     }
@@ -560,6 +566,42 @@ impl PeerCloneCommandState {
             PeerSyncError::Protocol("peer clone target client is unavailable".to_owned())
         })?;
         client.pause_after_verified_chunk_for_test(pause);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_target_after_cas_promotion_once_for_test(&self) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let target = runtime.target.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
+        })?;
+        let client = target.client.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target client is unavailable".to_owned())
+        })?;
+        client.fail_after_cas_promotion_once_for_test();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_target_finalize_cleanup_once_for_test(&self) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let target = runtime.target.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
+        })?;
+        target.fail_finalize_cleanup_once = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_target_activation_ledger_once_for_test(&self) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let target = runtime.target.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
+        })?;
+        let client = target.client.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target client is unavailable".to_owned())
+        })?;
+        client.fail_record_activation_once_for_test();
         Ok(())
     }
 
@@ -619,6 +661,8 @@ impl PeerCloneCommandState {
                 cancellation: None,
                 worker: None,
                 status: PeerCloneTargetStatus::idle(),
+                #[cfg(test)]
+                fail_finalize_cleanup_once: false,
             });
         }
         self.start_target_worker(peer_root, request, true)
@@ -673,7 +717,14 @@ impl PeerCloneCommandState {
                 }
             };
             update_target_progress(&runtime, &worker_request, verified_bytes, total_bytes);
-            if verified_bytes == total_bytes {
+            let all_objects_verified = match client.all_objects_verified() {
+                Ok(verified) => verified,
+                Err(error) => {
+                    finish_target_worker(&runtime, &worker_request, client, Err(error), None);
+                    return;
+                }
+            };
+            if all_objects_verified {
                 finish_target_worker(
                     &runtime,
                     &worker_request,
@@ -707,7 +758,7 @@ impl PeerCloneCommandState {
     }
 
     pub fn cancel_target(&self, request: &PeerCloneTargetRequest) -> Result<(), PeerSyncError> {
-        let worker = {
+        let (worker, fail_cleanup_after_commit) = {
             let mut runtime = self.lock_runtime()?;
             let target = require_target_request_mut(&mut runtime, request)?;
             if target.status.phase != PeerCloneTargetPhase::Downloading {
@@ -785,7 +836,13 @@ impl PeerCloneCommandState {
                 ));
             }
             target.status.phase = PeerCloneTargetPhase::Activating;
-            target.worker.take()
+            (
+                target.worker.take(),
+                #[cfg(test)]
+                std::mem::take(&mut target.fail_finalize_cleanup_once),
+                #[cfg(not(test))]
+                false,
+            )
         };
         if let Err(error) = join_target_worker(worker) {
             let mut runtime = self.lock_runtime()?;
@@ -819,12 +876,31 @@ impl PeerCloneCommandState {
                 expected_revision,
                 &NeverCancelled,
             )?;
+            #[cfg(test)]
+            if fail_cleanup_after_commit {
+                target.fail_cleanup_after_commit_once_for_test();
+            }
+            #[cfg(not(test))]
+            let _ = fail_cleanup_after_commit;
             let mut validator = VerifiedCloneValidator;
             let activation = activate_downloaded_clone(&mut client, &mut target, &mut validator);
+            let outcome = match activation {
+                Ok(()) | Err(PeerSyncError::AlreadyActivated) => Ok(None),
+                Err(error) => match target.active_manifest_id() {
+                    Ok(Some(active)) if active == request.manifest_id => {
+                        Ok(Some(bounded_finalize_warning(&error)))
+                    }
+                    Ok(_) => Err(error),
+                    Err(reconcile) => Err(PeerSyncError::Storage(format!(
+                        "{error}; failed to reconcile peer clone activation: {reconcile}"
+                    ))),
+                },
+            };
             drop(target);
-            match activation {
-                Ok(()) | Err(PeerSyncError::AlreadyActivated) => Ok(PeerCloneFinalizeResult {
+            match outcome {
+                Ok(warning) => Ok(PeerCloneFinalizeResult {
                     revision: store.revision().map_err(store_error)?,
+                    warning,
                 }),
                 Err(error) => Err(error),
             }
@@ -1077,6 +1153,10 @@ fn discover_lan_ipv4() -> Result<Ipv4Addr, PeerSyncError> {
 
 fn store_error(error: StoreError) -> PeerSyncError {
     PeerSyncError::Storage(error.to_string())
+}
+
+fn bounded_finalize_warning(error: &PeerSyncError) -> String {
+    error.to_string().chars().take(1_024).collect()
 }
 
 fn as_store_error(error: PeerSyncError) -> StoreError {
@@ -1433,6 +1513,7 @@ mod tests {
             .resume_target_download(&target_root.path().join("peer-sync"), request.clone())
             .unwrap();
         wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+        target.fail_target_finalize_cleanup_once_for_test().unwrap();
 
         let finalized = target
             .finalize_target(
@@ -1444,6 +1525,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(finalized.revision, 2);
+        assert!(finalized.warning.is_some());
         assert_eq!(
             target.target_status(&request).unwrap().phase,
             PeerCloneTargetPhase::Completed
@@ -1452,6 +1534,134 @@ mod tests {
             target_store.read_root(None).unwrap().value["username"],
             "Source"
         );
+    }
+
+    #[test]
+    fn product_post_commit_ledger_error_returns_committed_revision() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let target_cas = PayloadCas::new(target_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        let mut target_store = PersistentStore::open(target_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        seed_product_store(&mut target_store, "Target", 0);
+        let source = PeerCloneCommandState::default();
+        let prepared = source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_root.path().join("peer-sync"),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let running = source
+            .start_source(
+                prepared.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let pairing = parse_product_pairing(running.pairing_uri.as_deref().unwrap());
+        let request = PeerCloneTargetRequest {
+            endpoint: format!(
+                "http://127.0.0.1:{}",
+                source.source_bind_address().unwrap().unwrap().port()
+            ),
+            session_id: pairing.session_id,
+            manifest_id: pairing.manifest_id,
+        };
+        let peer_root = target_root.path().join("peer-sync");
+        let target = PeerCloneCommandState::default();
+        target
+            .claim_target(
+                &peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                &pairing.claim,
+            )
+            .unwrap();
+        target
+            .start_target_download(&peer_root, request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+        target
+            .fail_target_activation_ledger_once_for_test()
+            .unwrap();
+
+        let finalized = target
+            .finalize_target(&mut target_store, &target_cas, &peer_root, &request)
+            .unwrap();
+
+        assert_eq!(finalized.revision, 2);
+        assert!(finalized.warning.is_some());
+        assert_eq!(
+            target.target_status(&request).unwrap().phase,
+            PeerCloneTargetPhase::Completed
+        );
+        assert_eq!(
+            target_store.read_root(None).unwrap().value["username"],
+            "Source"
+        );
+        source.stop_source(&request.session_id).unwrap();
+    }
+
+    #[test]
+    fn product_resume_repairs_promoted_but_unrecorded_object_before_awaiting_activation() {
+        let source_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let source = PeerCloneCommandState::default();
+        let prepared = source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_root.path().join("peer-sync"),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let running = source
+            .start_source(
+                prepared.session_id.as_deref().unwrap(),
+                Ipv4Addr::new(192, 168, 1, 4),
+            )
+            .unwrap();
+        let pairing = parse_product_pairing(running.pairing_uri.as_deref().unwrap());
+        let request = PeerCloneTargetRequest {
+            endpoint: format!(
+                "http://127.0.0.1:{}",
+                source.source_bind_address().unwrap().unwrap().port()
+            ),
+            session_id: pairing.session_id,
+            manifest_id: pairing.manifest_id,
+        };
+        let peer_root = target_root.path().join("peer-sync");
+        let target = PeerCloneCommandState::default();
+        target
+            .claim_target(
+                &peer_root,
+                &request.endpoint,
+                &request.session_id,
+                &request.manifest_id,
+                &pairing.claim,
+            )
+            .unwrap();
+        target
+            .fail_target_after_cas_promotion_once_for_test()
+            .unwrap();
+        target
+            .start_target_download(&peer_root, request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::Failed);
+
+        target
+            .resume_target_download(&peer_root, request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
+
+        source.stop_source(&request.session_id).unwrap();
     }
 
     #[test]

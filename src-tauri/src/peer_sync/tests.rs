@@ -1890,6 +1890,7 @@ fn corrupt_or_mismatched_persisted_manifest_never_stages_activation() {
     ));
     assert_eq!(target.active_manifest, "old");
     assert_eq!(target.activation_count, 0);
+    assert_eq!(target.stage_count, 0);
 
     File::create(&manifest_path)
         .unwrap()
@@ -1902,6 +1903,7 @@ fn corrupt_or_mismatched_persisted_manifest_never_stages_activation() {
     ));
     assert_eq!(target.active_manifest, "old");
     assert_eq!(target.activation_count, 0);
+    assert_eq!(target.stage_count, 0);
 
     fs::write(&manifest_path, manifest_b_bytes).unwrap();
     let mut mismatched = LoopbackCloneClient::new(client_root.path(), session_url).unwrap();
@@ -1914,6 +1916,7 @@ fn corrupt_or_mismatched_persisted_manifest_never_stages_activation() {
     );
     assert_eq!(target.active_manifest, "old");
     assert_eq!(target.activation_count, 0);
+    assert_eq!(target.stage_count, 0);
 }
 
 #[test]
