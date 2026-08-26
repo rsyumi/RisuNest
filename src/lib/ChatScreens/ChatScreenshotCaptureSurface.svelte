@@ -3,13 +3,14 @@
     import type { ChatScreenshotJob, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import { getFileSrc } from 'src/ts/globalApi.svelte'
     import { onDestroy, tick } from 'svelte'
-    import ChatScreenshotMessage from './ChatScreenshotMessage.svelte'
+    import Chat from './Chat.svelte'
     import { CHAT_SCREENSHOT_PARSE_TIMEOUT_MS, CHAT_SCREENSHOT_WIDTH } from 'src/ts/chatScreenshotCapture'
 
     type BatchItem = {
         key: string
         generation: number
         turn: number
+        parserIndex: number
         message: Message
     }
 
@@ -78,18 +79,12 @@
         }
 
         const batchGeneration = ++generation
-        renderContext = context
-        ;[characterImage, userImage] = await Promise.all([
-            resolvePortrait(context.characterImageSource, context.settings.hideAllImages),
-            resolvePortrait(context.userImageSource, context.settings.hideAllImages),
-        ])
-        if (destroyed || signal.aborted) {
-            throw new DOMException('Screenshot capture was cancelled', 'AbortError')
-        }
-        batch = messages.map((message, index) => ({
+        const nextBatch = messages.map((message, index) => ({
             key: `${batchGeneration}:${index}`,
             generation: batchGeneration,
             turn: firstTurn + index,
+            parserIndex: (context.firstParserMessageIndex ?? 0) +
+                (firstTurn + index - (context.selectionStart ?? firstTurn)),
             message: message as Message,
         }))
 
@@ -97,7 +92,7 @@
             const abort = () => cancelReadiness('Screenshot capture was cancelled')
             readiness = {
                 generation: batchGeneration,
-                remaining: new Set(batch.map((item) => item.key)),
+                remaining: new Set(nextBatch.map((item) => item.key)),
                 resolve,
                 reject,
                 signal,
@@ -105,7 +100,7 @@
                 timeout: setTimeout(
                     () => reportError(
                         batchGeneration,
-                        new Error('Screenshot message parsing timed out'),
+                        new Error('Screenshot capture readiness timed out'),
                     ),
                     CHAT_SCREENSHOT_PARSE_TIMEOUT_MS,
                 ),
@@ -113,6 +108,27 @@
             signal.addEventListener('abort', abort, { once: true })
         })
 
+        try {
+            ;[characterImage, userImage] = await Promise.race([
+                Promise.all([
+                    resolvePortrait(context.characterImageSource, context.settings.hideAllImages),
+                    resolvePortrait(context.userImageSource, context.settings.hideAllImages),
+                ]),
+                result.then(() => {
+                    throw new DOMException('Screenshot capture setup was cancelled', 'AbortError')
+                }),
+            ])
+        } catch (error) {
+            reportError(batchGeneration, error)
+            return result
+        }
+
+        if (destroyed || signal.aborted) {
+            cancelReadiness('Screenshot capture was cancelled')
+            return result
+        }
+        renderContext = context
+        batch = nextBatch
         await tick()
         if (batch.length === 0) {
             const current = readiness
@@ -159,10 +175,27 @@
     <div data-screenshot-content>
         {#if renderContext}
             {#each batch as item (item.key)}
-                <ChatScreenshotMessage
-                    {item}
-                    context={renderContext}
-                    portraitStyle={item.message.role === 'user' ? userImage : characterImage}
+                <Chat
+                    message={item.message.data}
+                    name={item.message.role === 'user'
+                        ? renderContext.userName
+                        : renderContext.characterName}
+                    largePortrait={item.message.role === 'user'
+                        ? renderContext.userLargePortrait
+                        : renderContext.characterLargePortrait}
+                    isLastMemory={false}
+                    img={item.message.role === 'user' ? userImage : characterImage}
+                    idx={item.turn - 1}
+                    messageGenerationInfo={item.message.generationInfo ?? null}
+                    role={item.message.role}
+                    totalLength={renderContext.totalTurns ?? item.turn}
+                    character={renderContext.character as import('src/ts/parser/parser.svelte').simpleCharacterArgument | null}
+                    firstMessage={false}
+                    isComment={item.message.isComment ?? false}
+                    disabled={item.message.disabled ?? false}
+                    captureContext={renderContext}
+                    captureMessage={item.message}
+                    captureParserIndex={item.parserIndex}
                     onCaptureSettled={() => reportSettled(item.generation, item.key)}
                     onCaptureError={(_generation, error) => reportError(item.generation, error)}
                 />

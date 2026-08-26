@@ -1,12 +1,12 @@
 import { get } from "svelte/store";
 import { CharEmotion, selectedCharID } from "../stores.svelte";
-import { type character, type customscript, type groupChat, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
+import { type character, type customscript, type Database, type groupChat, type loreBook, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
 import { downloadFile } from "../globalApi.svelte";
 import { alertError, alertNormal } from "../alert";
 import { language } from "src/lang";
 import { selectSingleFile } from "../util";
 import { assetRegex, type CbsConditions, risuChatParser as risuChatParserOrg, type simpleCharacterArgument } from "../parser/parser.svelte";
-import { getModuleAssets, getModuleRegexScripts } from "./modules";
+import { getModuleAssets, getModuleRegexScripts, type RisuModule } from "./modules";
 import { HypaProcesser } from "./memory/hypamemory";
 import { runLuaEditTrigger } from "./scriptings";
 import { pluginV2 } from "../plugins/plugins.svelte";
@@ -32,6 +32,19 @@ export interface ProcessScriptCaptureContext {
     moduleAssets: readonly (readonly [string, string, string])[]
     dynamicAssets: boolean
     dynamicAssetsEditDisplay: boolean
+    parserContext: {
+        database: Database
+        character: character | groupChat
+        userName: string
+        personaPrompt: string
+        modules: RisuModule[]
+        moduleLorebooks: loreBook[]
+        selectedCharID: number
+        chatVariables: Record<string, string>
+        globalChatVariables: Record<string, string>
+        currentTime: number
+        triggerId?: string
+    }
 }
 
 export async function processScript(char:character|groupChat, data:string, mode:ScriptMode, cbsConditions:CbsConditions = {}){
@@ -92,13 +105,20 @@ subscribeRuntimePerformanceProfile(() => {
     processScriptCache = createScriptCache()
 })
 
-function generateScriptCacheKey(scripts: customscript[], data: string, mode: ScriptMode, chatID = -1, cbsConditions: CbsConditions = {}) {
+function generateScriptCacheKey(
+    scripts: customscript[],
+    data: string,
+    mode: ScriptMode,
+    chatID = -1,
+    cbsConditions: CbsConditions = {},
+    parseCbs = (value: string) => risuChatParser(value, { chatID, cbsConditions }),
+) {
     let hash = data + '|||' + mode + '|||';
     for (const script of scripts) {
         if(script.type !== mode){
             continue
         }
-        hash += `${script.flag?.includes('<cbs>') ? risuChatParser(script.in, { chatID: chatID, cbsConditions }) : script.in}|||${script.out}${chatID}|||${script.flag ?? ''}|||${script.ableFlag ? 1 : 0}`;
+        hash += `${script.flag?.includes('<cbs>') ? parseCbs(script.in) : script.in}|||${script.out}${chatID}|||${script.flag ?? ''}|||${script.ableFlag ? 1 : 0}`;
     }
     return hash;
 }
@@ -118,6 +138,22 @@ export function resetScriptCache(){
 export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     let db = getDatabase()
     const captureContext = options.captureContext
+    const parseCbs = (value: string) => risuChatParser(value, captureContext ? {
+        chatID,
+        cbsConditions,
+        db: captureContext.parserContext.database,
+        chara: captureContext.parserContext.character,
+        userName: captureContext.parserContext.userName,
+        personaPrompt: captureContext.parserContext.personaPrompt,
+        modules: captureContext.parserContext.modules,
+        moduleLorebooks: captureContext.parserContext.moduleLorebooks,
+        selectedCharID: captureContext.parserContext.selectedCharID,
+        chatVariables: captureContext.parserContext.chatVariables,
+        globalChatVariables: captureContext.parserContext.globalChatVariables,
+        currentTime: captureContext.parserContext.currentTime,
+        triggerId: captureContext.parserContext.triggerId,
+        role: cbsConditions.chatRole,
+    } : { chatID, cbsConditions })
     let emoChanged = false
     if (!captureContext) {
         data = await runLuaEditTrigger(char, mode, data, { index:chatID })
@@ -152,18 +188,18 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
     }
 
-    data = risuChatParser(data, { chatID: chatID, cbsConditions })
+    data = parseCbs(data)
     const scripts = [
         ...(captureContext?.presetRegex ?? db.presetRegex ?? []),
         ...char.customscript,
         ...(captureContext?.moduleRegexScripts ?? getModuleRegexScripts()),
     ]
     const useResultCache = options.cache !== 'bypass'
-    const hash = useResultCache ? generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions) : undefined
+    const hash = useResultCache ? generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions, parseCbs) : undefined
     if(!useResultCache){
         for(const script of scripts){
             if(script.type === mode && script.flag?.includes('<cbs>')){
-                risuChatParser(script.in, { chatID: chatID, cbsConditions })
+                parseCbs(script.in)
             }
         }
     }
@@ -182,7 +218,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
     }
 
     const plan = getRegexExecutionPlan(scripts, mode)
-    const parse = (value: string) => risuChatParser(value, { chatID: chatID, cbsConditions })
+    const parse = parseCbs
 
     function executeScript(entry:RegexExecutionPlanEntry){
         const script = entry.script

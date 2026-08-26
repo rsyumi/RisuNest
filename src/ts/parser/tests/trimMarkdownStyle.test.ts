@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { writable } from 'svelte/store'
-import { ParseMarkdown } from '../parser.svelte'
+import { ParseMarkdown, trimMarkdown } from '../parser.svelte'
 
 //#region module mocks
 
@@ -63,6 +63,16 @@ const expectScopedStyles = (body: HTMLElement, count: number) => {
 }
 
 describe('trimMarkdown style handling', () => {
+    it('honors the supplied image policy instead of the live database', () => {
+        const body = parse(trimMarkdown(
+            '<img src="https://example.test/image.png"><div style="background-image:url(https://example.test/bg.png)">x</div>',
+            true,
+        ))
+
+        expect(body.querySelector('img')?.getAttribute('src')).toBe('/none.webp')
+        expect(body.querySelector('div')?.getAttribute('style')).not.toContain('url(')
+    })
+
     it('decodes <style> into a scoped style tag', async () => {
         const out = await ParseMarkdown('<style>.mybox { color: red; }</style><div class="mybox">hello</div>', null, 'back')
         expect(out).toContain('<style>.chattext .x-risu-mybox{color:red;}</style>')

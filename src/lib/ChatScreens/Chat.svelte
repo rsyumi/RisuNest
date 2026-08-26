@@ -11,13 +11,13 @@
     import { DBState, ReloadChatPointer, CurrentTriggerIdStore, popupStore } from 'src/ts/stores.svelte'
     import { ConnectionOpenStore } from "src/ts/sync/multiuser"
     import { capitalize, getUserIcon, getUserName, sleep } from "src/ts/util"
-    import { onDestroy, onMount } from "svelte"
+    import { onDestroy, onMount, tick } from "svelte"
     import { type Unsubscriber } from "svelte/store"
     import { v4 as uuidv4, v4 } from 'uuid'
     import { language } from "../../lang"
     import { alertClear, alertConfirm, alertInput, alertNormal, alertRequestData, alertWait } from "../../ts/alert"
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
-    import { getCurrentCharacter, getCurrentChat, setCurrentChat, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
+    import { getCurrentCharacter, getCurrentChat, setCurrentChat, type Message, type MessageGenerationInfo, type StreamingDisplayOptimizationMode } from "../../ts/storage/database.svelte"
     import { selectedCharID } from "../../ts/stores.svelte"
     import { HideIconStore, ReloadGUIPointer, selIdState } from "../../ts/stores.svelte"
     import AutoresizeArea from "../UI/GUI/TextAreaResizable.svelte"
@@ -37,6 +37,7 @@
         toggleCapturedMessageRole,
         type CapturedChatMessageTarget,
     } from "../../ts/chatMessageUi"
+    import type { DeepReadonly, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -71,6 +72,10 @@
         streamingOptimizationMode?: StreamingDisplayOptimizationMode;
         rawStreamingText?: string;
         onCaptureSettled?: (generation: number) => void;
+        onCaptureError?: (generation: number, error: unknown) => void;
+        captureContext?: FrozenChatScreenshotRenderContext;
+        captureMessage?: DeepReadonly<Message>;
+        captureParserIndex?: number;
     }
 
     let {
@@ -97,9 +102,42 @@
         streamingOptimizationMode = 'off',
         rawStreamingText = message,
         onCaptureSettled,
+        onCaptureError,
+        captureContext,
+        captureMessage,
+        captureParserIndex = idx,
     }: Props = $props();
 
     let editDraft = $state(message)
+    let captureSettings = $derived(captureContext?.settings)
+    let captureCharacter = $derived(captureContext?.parserContext.character)
+    let captureChat = $derived(captureCharacter?.chats[captureCharacter.chatPage])
+    let captureTheme = $derived(captureSettings?.theme ?? DBState.db.theme)
+    let captureIconSize = $derived(captureSettings?.iconSize ?? DBState.db.iconsize)
+    let captureZoomSize = $derived(captureSettings?.zoomSize ?? DBState.db.zoomsize)
+    let captureLineHeight = $derived(captureSettings?.lineHeight ?? DBState.db.lineHeight ?? 1.25)
+    let hideCaptureIcon = $derived(captureSettings?.hideIcons ?? $HideIconStore)
+
+    function captureParserArgs() {
+        if (!captureContext) return {}
+        const parser = captureContext.parserContext
+        return {
+            db: parser.database,
+            chara: parser.character,
+            chatID: captureParserIndex,
+            userName: parser.userName,
+            personaPrompt: parser.personaPrompt,
+            modules: parser.modules,
+            moduleLorebooks: parser.moduleLorebooks,
+            selectedCharID: parser.selectedCharID,
+            chatVariables: parser.chatVariables,
+            globalChatVariables: parser.globalChatVariables,
+            currentTime: parser.currentTime,
+            triggerId: parser.triggerId,
+            role: captureMessage?.role,
+        } as unknown as Parameters<typeof risuChatParser>[1]
+    }
+
     let msgDisplay = $state('')
     let translated = $state(false)
     let partialEditEnabled = $state(true)
@@ -197,7 +235,11 @@
         try{
             const cbsConditions:CbsConditions = {
                 firstmsg: firstMessage ?? false,
-                chatRole: DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]?.message?.[idx]?.role ?? null,
+                chatRole: captureMessage?.role ?? (
+                    captureContext
+                        ? role
+                        : DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]?.message?.[idx]?.role ?? null
+                ),
             }
             return cbsConditions
         }
@@ -233,7 +275,14 @@
     }
 
     function displaya(message:string){
-        msgDisplay = risuChatParser(message, {chara: name, chatID: idx, rmVar: true, visualize: true, cbsConditions: getCbsCondition()})
+        msgDisplay = risuChatParser(message, {
+            chara: name,
+            chatID: idx,
+            rmVar: true,
+            visualize: true,
+            cbsConditions: getCbsCondition(),
+            ...captureParserArgs(),
+        })
     }
 
     const setStatusMessage = (message:string, timeout:number = 0)=>{
@@ -263,9 +312,11 @@
     const unsubscribers:Unsubscriber[] = []
 
     onMount(()=>{
-        unsubscribers.push(ReloadGUIPointer.subscribe((v) => {
-            updateDisplayedMessage()
-        }))
+        if (!captureContext) {
+            unsubscribers.push(ReloadGUIPointer.subscribe(() => {
+                updateDisplayedMessage()
+            }))
+        }
     })
 
     onDestroy(()=>{
@@ -275,7 +326,10 @@
     function RenderGUIHtml(html:string){
         try {
             const parser = new DOMParser()
-            const doc = parser.parseFromString(risuChatParser(html ?? '', {cbsConditions: getCbsCondition()}), 'text/html')
+            const doc = parser.parseFromString(risuChatParser(html ?? '', {
+                cbsConditions: getCbsCondition(),
+                ...captureParserArgs(),
+            }), 'text/html')
             return doc.body   
         } catch (error) {
             const placeholder = document.createElement('div')
@@ -325,11 +379,21 @@
         }
     }
 
-    let isBookmarked = $derived(
-        DBState.db.characters[selIdState.selId]
+    let isBookmarked = $derived(captureContext
+        ? captureChat?.bookmarks?.includes(captureMessage?.chatId ?? '') ?? false
+        : DBState.db.characters[selIdState.selId]
             ?.chats[DBState.db.characters[selIdState.selId].chatPage]
             ?.bookmarks?.includes(DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]?.chatId) ?? false
     );
+
+    let staticCaptureSettled = false
+    $effect(() => {
+        const customWithoutTextBox = captureTheme === 'customHTML' &&
+            !captureSettings?.guiHTML?.toLocaleLowerCase().includes('<risutextbox')
+        if (!captureContext || staticCaptureSettled || (!blankMessage && !customWithoutTextBox)) return
+        staticCaptureSettled = true
+        tick().then(() => onCaptureSettled?.(0))
+    })
 
     async function toggleBookmark(target: CapturedChatMessageTarget) {
         await toggleCapturedBookmark(target, chatMessageContext, {
@@ -359,7 +423,11 @@
 
 {#snippet genInfo()}
     <div class="flex flex-col items-end">
-        {#if messageGenerationInfo && (DBState.db.requestInfoInsideChat || aiLawApplies())}
+        {#if messageGenerationInfo && (
+            captureSettings
+                ? captureSettings.requestInfoInsideChat || captureSettings.aiLawApplies
+                : DBState.db.requestInfoInsideChat || aiLawApplies()
+        )}
             <button class="text-sm p-1 text-textcolor2 border-darkborderc float-end mr-2 my-1
                     hover:ring-darkbutton hover:ring-3 rounded-md hover:text-textcolor transition-all flex justify-center items-center" 
                     onclick={() => {
@@ -379,7 +447,7 @@
                 </span>
             </button>
         {/if}
-        {#if DBState.db.translatorType === 'llm' && translated}
+        {#if (captureSettings?.translatorType ?? DBState.db.translatorType) === 'llm' && translated}
             <button class="text-sm p-1 text-textcolor2 border-darkborderc float-end mr-2 my-1
                             hover:ring-darkbutton hover:ring-3 rounded-md hover:text-textcolor transition-all flex justify-center items-center"
                     onclick={() => {
@@ -446,20 +514,20 @@
             {language.noMessage}
         </div>
     {:else}
-        {@const chatReloadPointer = $ReloadGUIPointer + ($ReloadChatPointer[idx] ?? 0)}
+        {@const chatReloadPointer = captureContext ? 0 : $ReloadGUIPointer + ($ReloadChatPointer[idx] ?? 0)}
         {@const totalLengthPointer = (idx > totalLength - 6) ? totalLength : 0}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <span class="text chat-width chattext prose minw-0"
-            class:prose-invert={$ColorSchemeTypeStore}
+            class:prose-invert={captureSettings?.proseInvert ?? $ColorSchemeTypeStore}
             bind:this={bodyRoot}
             onclick={() => {
-            if(DBState.db.clickToEdit && idx > -1 && !isOptimizedStreamingMessage){
+            if(!captureContext && DBState.db.clickToEdit && idx > -1 && !isOptimizedStreamingMessage){
                 beginEdit()
             }
         }}
-            style:font-size="{0.875 * (DBState.db.zoomsize / 100)}rem"
-            style:line-height="{(DBState.db.lineHeight ?? 1.25) * (DBState.db.zoomsize / 100)}rem"
+            style:font-size="{0.875 * (captureZoomSize / 100)}rem"
+            style:line-height="{captureLineHeight * (captureZoomSize / 100)}rem"
         >
             {#key `${totalLengthPointer}|${chatReloadPointer}`}
                 <ChatBody
@@ -478,9 +546,11 @@
                     bind:retranslate={retranslate}
                     {renderRawStreaming}
                     {rawStreamingText}
-                    {onCaptureSettled} />
+                    {onCaptureSettled}
+                    {onCaptureError}
+                    {captureContext} />
             {/key}
-            {#if idx >= 0 && !editMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
+            {#if !captureContext && idx >= 0 && !editMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
                 <PartialEditController
                     messageData={message}
                     chatIndex={idx}
@@ -496,6 +566,9 @@
 {/snippet}
 
 {#snippet iconButtons(options:{applyTextColors?:boolean} = {})}
+    {#if captureContext}
+        <div class="grow"></div>
+    {:else}
     <div class="grow flex items-center justify-end" class:text-textcolor2={options?.applyTextColors !== false}>
         {#if isComment}
             <button
@@ -533,6 +606,7 @@
             </div>
         {/if}
     </div>
+    {/if}
 {/snippet}
 
 
@@ -930,9 +1004,9 @@
 {/snippet}
 
 {#snippet senderIcon(options:{rounded?:boolean,styleFix?:string} = {})}
-    {#if !blankMessage && !$HideIconStore}
-        {#if DBState.db.characters[selIdState.selId]?.chaId === "§playground"}
-        <div class="shadow-lg border-textcolor2 border flex justify-center items-center text-textcolor2" style={options?.styleFix ?? `height:${DBState.db.iconsize * 3.5 / 100}rem;width:${DBState.db.iconsize * 3.5 / 100}rem;min-width:${DBState.db.iconsize * 3.5 / 100}rem`}
+    {#if !blankMessage && !hideCaptureIcon}
+        {#if (captureCharacter?.chaId ?? DBState.db.characters[selIdState.selId]?.chaId) === "§playground"}
+        <div class="shadow-lg border-textcolor2 border flex justify-center items-center text-textcolor2" style={options?.styleFix ?? `height:${captureIconSize * 3.5 / 100}rem;width:${captureIconSize * 3.5 / 100}rem;min-width:${captureIconSize * 3.5 / 100}rem`}
             class:rounded-md={options?.rounded} class:rounded-full={options?.rounded}>
                 {#if name === 'assistant'}
                     <BotIcon />
@@ -942,14 +1016,14 @@
             </div>
         {:else}
             {#await img}
-                <div class="shadow-lg bg-textcolor2" style={options?.styleFix ??`height:${DBState.db.iconsize * 3.5 / 100}rem;width:${DBState.db.iconsize * 3.5 / 100}rem;min-width:${DBState.db.iconsize * 3.5 / 100}rem`}
+                <div class="shadow-lg bg-textcolor2" style={options?.styleFix ??`height:${captureIconSize * 3.5 / 100}rem;width:${captureIconSize * 3.5 / 100}rem;min-width:${captureIconSize * 3.5 / 100}rem`}
                 class:rounded-md={!options?.rounded} class:rounded-full={options?.rounded}></div>
             {:then m}
                 {#if largePortrait && (!options?.rounded)}
-                    <div class="shadow-lg bg-textcolor2" style={m + (options?.styleFix ?? `height:${DBState.db.iconsize * 3.5 / 100 / 0.75}rem;width:${DBState.db.iconsize * 3.5 / 100}rem;min-width:${DBState.db.iconsize * 3.5 / 100}rem`)}
+                    <div class="shadow-lg bg-textcolor2" style={m + (options?.styleFix ?? `height:${captureIconSize * 3.5 / 100 / 0.75}rem;width:${captureIconSize * 3.5 / 100}rem;min-width:${captureIconSize * 3.5 / 100}rem`)}
                     class:rounded-md={!options?.rounded} class:rounded-full={options?.rounded}></div>
                 {:else}
-                    <div class="shadow-lg bg-textcolor2" style={m + (options?.styleFix ?? `height:${DBState.db.iconsize * 3.5 / 100}rem;width:${DBState.db.iconsize * 3.5 / 100}rem;min-width:${DBState.db.iconsize * 3.5 / 100}rem`)}
+                    <div class="shadow-lg bg-textcolor2" style={m + (options?.styleFix ?? `height:${captureIconSize * 3.5 / 100}rem;width:${captureIconSize * 3.5 / 100}rem;min-width:${captureIconSize * 3.5 / 100}rem`)}
                     class:rounded-md={!options?.rounded} class:rounded-full={options?.rounded}></div>
                 {/if}
             {/await}
@@ -1103,11 +1177,13 @@
 {/if}
 <div class="flex max-w-full justify-center risu-chat"
      data-chat-index={idx}
-     data-chat-id={DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.chatId ?? ''}
-     style={isLastMemory ? `border-top:${DBState.db.memoryLimitThickness}px solid rgba(98, 114, 164, 0.7);` : ''}
+     data-chat-id={captureContext
+        ? captureMessage?.chatId ?? ''
+        : DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.chatId ?? ''}
+     style={isLastMemory ? `border-top:${captureSettings?.memoryLimitThickness ?? DBState.db.memoryLimitThickness}px solid rgba(98, 114, 164, 0.7);` : ''}
      onclickcapture={handleButtonTriggerWithin}>
     <div class="text-textcolor mt-1 ml-4 mr-4 mb-1 p-2 bg-transparent grow border-t-gray-900 border-opacity/30 border-transparent flexium items-start max-w-full" >
-        {#if DBState.db.theme === 'mobilechat' && !blankMessage}
+        {#if captureTheme === 'mobilechat' && !blankMessage}
             <div class={role === 'user' ? "flex items-start w-full justify-end" : "flex items-start"}>
                 {#if role !== 'user'}
                     {@render senderIcon({rounded: true})}
@@ -1118,7 +1194,9 @@
                     class:rounded-tr-none={role === 'user'}
                 >
                     <p class="text-gray-800">{@render textBox()}</p>
-                    {#if DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.time}
+                    {#if captureContext
+                        ? captureMessage?.time
+                        : DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.time}
                         <span class="text-xs text-textcolor2 mt-1 block">
                             {new Intl.DateTimeFormat(undefined, {
                                 hour: '2-digit',
@@ -1127,7 +1205,9 @@
                                 month: '2-digit',
                                 day: '2-digit',
                                 hour12: false
-                            }).format(DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].time)}
+                            }).format(captureContext
+                                ? captureMessage?.time
+                                : DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].time)}
                         </span>
                     {/if}
                 </div>
@@ -1135,7 +1215,7 @@
                     {@render senderIcon({rounded: true})}
                 {/if}
             </div>
-        {:else if DBState.db.theme === 'cardboard' && !blankMessage}
+        {:else if captureTheme === 'cardboard' && !blankMessage}
             <div class="w-full flex flex-col px-0 sm:px-4 py-4 relative">
                 <div class="bg-linear-to-b from-gray-100 to-gray-200 rounded-lg shadow-lg border-gray-400 border p-4 flex flex-col">
                     <div class="flex gap-4 mt-2 flex-col sm:flex-row">
@@ -1159,15 +1239,15 @@
                     {@render iconButtons({applyTextColors: false})}
                 </div>
             </div>
-        {:else if DBState.db.theme === 'customHTML' && !blankMessage}
-            {@render renderGuiHtmlPart(RenderGUIHtml(DBState.db.guiHTML))}
+        {:else if captureTheme === 'customHTML' && !blankMessage}
+            {@render renderGuiHtmlPart(RenderGUIHtml(captureSettings?.guiHTML ?? DBState.db.guiHTML))}
         {:else}
-            {@render senderIcon({rounded: DBState.db.roundIcons})}
+            {@render senderIcon({rounded: captureSettings?.roundIcons ?? DBState.db.roundIcons})}
             <span class="flex flex-col ml-4 w-full max-w-full min-w-0 text-black">
                 <div class="flexium items-center chat-width">
-                    {#if DBState.db.characters[selIdState.selId]?.chaId === "§playground" && !blankMessage && DBState.db.characters[selIdState.selId]?.chats?.[DBState.db.characters[selIdState.selId]?.chatPage]?.message?.[idx]}
+                    {#if (captureCharacter?.chaId ?? DBState.db.characters[selIdState.selId]?.chaId) === "§playground" && !blankMessage && (captureMessage ?? DBState.db.characters[selIdState.selId]?.chats?.[DBState.db.characters[selIdState.selId]?.chatPage]?.message?.[idx])}
                         <span class="chat-width text-xl border-darkborderc flex items-center text-textcolor">
-                            <span>{DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role === 'char' ? 'Assistant' : 'User'}</span>
+                            <span>{(captureMessage?.role ?? DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role) === 'char' ? 'Assistant' : 'User'}</span>
                             <button class="ml-2 text-textcolor2 hover:text-textcolor" onclick={() => {
                                 const target = captureCurrentMessage()
                                 if (!target || !toggleCapturedMessageRole(target, chatMessageContext)) return
@@ -1177,7 +1257,7 @@
                                 })
                             }}><ArrowLeftRightIcon size="18" /></button>
                         </span>
-                    {:else if !blankMessage && !$HideIconStore}
+                    {:else if !blankMessage && !hideCaptureIcon}
                         <div class="chat-width text-xl unmargin text-textcolor flex items-center">
                             <span>{name}</span>
                         </div>

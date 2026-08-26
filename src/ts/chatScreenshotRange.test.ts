@@ -6,6 +6,29 @@ import {
     validateScreenshotRange,
 } from './chatScreenshotRange'
 
+function parserContext() {
+    const character = {
+        type: 'character' as const,
+        name: 'Character',
+        chaId: 'character-1',
+        chatPage: 0,
+        chats: [{ message: [], note: '', name: '', localLore: [] }],
+        customscript: [],
+    }
+    return {
+        database: { characters: [character] } as any,
+        character: character as any,
+        userName: 'User',
+        personaPrompt: '',
+        modules: [],
+        moduleLorebooks: [],
+        selectedCharID: 0,
+        chatVariables: {},
+        globalChatVariables: {},
+        currentTime: 1,
+    }
+}
+
 describe('chat screenshot ranges', () => {
     it('accepts 1-based inclusive turn bounds and rejects invalid input', () => {
         expect(validateScreenshotRange(5, 1, 5)).toEqual({ ok: true, start: 1, end: 5 })
@@ -46,6 +69,7 @@ describe('chat screenshot ranges', () => {
                 presetRegex: [],
                 moduleRegexScripts: [],
                 assetStyle: 'default',
+                parserContext: parserContext(),
                 settings: {
                     autoTranslate: false,
                     autoTranslateCachedOnly: false,
@@ -111,6 +135,7 @@ describe('chat screenshot ranges', () => {
                 presetRegex: [],
                 moduleRegexScripts: [],
                 assetStyle: '',
+                parserContext: parserContext(),
                 settings: {
                     autoTranslate: false,
                     autoTranslateCachedOnly: false,
@@ -135,5 +160,64 @@ describe('chat screenshot ranges', () => {
         expect(job.messages).toEqual([
             { role: 'user', data: 'proxied', generationInfo: { model: 'model' } },
         ])
+    })
+
+    it('keeps only the selected messages and one frozen previous-message input for CBS', () => {
+        const messages = [
+            { role: 'char' as const, data: 'too old' },
+            { role: 'user' as const, data: 'previous' },
+            { role: 'char' as const, data: 'selected one' },
+            { role: 'user' as const, data: 'selected two' },
+        ]
+        const context = parserContext()
+        const job = createChatScreenshotJob({
+            characterId: 'character-1',
+            chatId: 'chat-1',
+            messages,
+            start: 3,
+            end: 4,
+            renderContext: {
+                character: null,
+                characterName: 'Character',
+                characterImageSource: '',
+                characterLargePortrait: false,
+                userName: 'User',
+                userImageSource: '',
+                userLargePortrait: false,
+                moduleAssets: [],
+                presetRegex: [],
+                moduleRegexScripts: [],
+                assetStyle: '',
+                parserContext: context,
+                settings: {
+                    autoTranslate: false,
+                    autoTranslateCachedOnly: false,
+                    translatorType: 'google',
+                    translateBeforeHTMLFormatting: false,
+                    legacyTranslation: false,
+                    showTranslationLoading: false,
+                    newImageHandlingBeta: false,
+                    assetWidth: -1,
+                    hideAllImages: false,
+                    iconSize: 100,
+                    zoomSize: 100,
+                    lineHeight: 1.25,
+                    dynamicAssets: false,
+                    dynamicAssetsEditDisplay: false,
+                    legacyMediaFindings: false,
+                    assetMaxDifference: 0.5,
+                },
+            },
+        })
+
+        const parserMessages = job.renderContext.parserContext.character.chats[0].message
+        expect(parserMessages.map((message) => message.data)).toEqual([
+            'previous',
+            'selected one',
+            'selected two',
+        ])
+        expect(parserMessages).not.toContainEqual(expect.objectContaining({ data: 'too old' }))
+        expect(parserMessages[1]).toBe(job.messages[0])
+        expect(job.renderContext.firstParserMessageIndex).toBe(1)
     })
 })

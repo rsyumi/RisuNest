@@ -1,6 +1,6 @@
 import DOMPurify from 'dompurify';
 import markdownit from 'markdown-it'
-import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type groupChat, type triggerscript } from '../storage/database.svelte';
+import { appVer, getCurrentCharacter, getDatabase, type Database, type character, type customscript, type groupChat, type loreBook, type triggerscript } from '../storage/database.svelte';
 import { DBState, selIdState } from '../stores.svelte';
 import { aiWatermarkingLawApplies, getFileSrc } from '../globalApi.svelte';
 import { isTauri, isNodeServer } from "src/ts/platform"
@@ -13,7 +13,7 @@ import { calcString } from '../process/infunctions';
 import { findCharacterbyId, getPersonaPrompt, getUserIcon, getUserName, pickHashRand, replaceAsync} from '../util';
 import { getInlayAssetMetadata } from '../process/files/inlays';
 import { DeferredInlayMarkerRegistry, getInlayRenderSources, renderDeferredInlaySourceMarkup, renderInlaySourceMarkup, type InlayRenderSource } from '../process/files/inlayRenderSource';
-import { getModuleAssets, getModuleLorebooks, getModules } from '../process/modules';
+import { getModuleAssets, getModuleLorebooks, getModules, type RisuModule } from '../process/modules';
 import hljs from 'highlight.js/lib/core'
 import 'highlight.js/styles/atom-one-dark.min.css'
 import { language } from 'src/lang';
@@ -53,6 +53,8 @@ const mdHighlight = markdownit({
 md.disable(['code'])
 mdHighlight.disable(['code'])
 
+let activeSanitizeHideAllImages: boolean | undefined
+
 DOMPurify.addHook("uponSanitizeElement", (node: HTMLElement, data) => {
     if (data.tagName === "iframe") {
        const src = node.getAttribute("src") || "";
@@ -62,7 +64,7 @@ DOMPurify.addHook("uponSanitizeElement", (node: HTMLElement, data) => {
     }
     if(data.tagName === 'img'){
         // Hide external images when hideAllImages is enabled
-        if(DBState.db?.hideAllImages){
+        if(activeSanitizeHideAllImages ?? DBState.db?.hideAllImages){
             const src = node.getAttribute("src") || "";
             // Replace with placeholder if it's an external/loaded image
             if(src && !src.startsWith('data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP')){
@@ -87,7 +89,7 @@ DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
     switch(data.attrName){
         case 'style':{
             // Remove background-image URLs when hideAllImages is enabled
-            if(DBState.db?.hideAllImages && data.attrValue){
+            if((activeSanitizeHideAllImages ?? DBState.db?.hideAllImages) && data.attrValue){
                 // Remove background-image property from inline styles
                 data.attrValue = data.attrValue.replace(/background(-image)?:\s*url\([^)]*\);?/gi, '')
                 // Also remove background property if it contains url()
@@ -159,10 +161,17 @@ export function risuEscape(text:string){
     })
 }
 
-function renderMarkdown(md:markdownit, data:string){
+interface MarkdownRenderSettings {
+    customQuotes?: boolean
+    customQuotesData?: [string, string, string, string]
+    unformatQuotes?: boolean
+    blockquoteStyling?: boolean
+}
+
+function renderMarkdown(md:markdownit, data:string, settings: MarkdownRenderSettings = DBState.db){
     let quotes = ['“', '”', '‘', '’']
-    if(DBState.db?.customQuotes){
-        quotes = DBState.db.customQuotesData ?? quotes
+    if(settings.customQuotes){
+        quotes = settings.customQuotesData ?? quotes
     }
     data = data.replace(/\$\$(.*?)\$\$/gs, (
         match:string,
@@ -188,11 +197,11 @@ function renderMarkdown(md:markdownit, data:string){
     })
     let text = risuUnescape(md.render(data.replace(/“|”/g, '"').replace(/‘|’/g, "'")))
 
-    if(DBState.db?.unformatQuotes){
+    if(settings.unformatQuotes){
         text = text.replace(/\uE9b0/gu, quotes[0]).replace(/\uE9b1/gu, quotes[1])
         text = text.replace(/\uE9b2/gu, quotes[2]).replace(/\uE9b3/gu, quotes[3])
     }
-    else if(DBState.db?.blockquoteStyling){
+    else if(settings.blockquoteStyling){
         text = text.replace(/\uE9b0(.+?)\uE9b1/gum, (full, content) => {
             content = content.replace(/\uE9b2/gu, '<mark risu-mark="quote1">' + quotes[2]).replace(/\uE9b3/gu, quotes[3] + '</mark>')
             return `<br><br><mark risu-mark="blockquote2">${quotes[0]}${content}${quotes[1]}</mark><br><br>`
@@ -213,8 +222,8 @@ function renderMarkdown(md:markdownit, data:string){
     return text
 }
 
-async function renderHighlightableMarkdown(data:string) {
-    let rendered = renderMarkdown(mdHighlight, data)
+async function renderHighlightableMarkdown(data:string, settings?: MarkdownRenderSettings) {
+    let rendered = renderMarkdown(mdHighlight, data, settings)
     const highlightPlaceholders = rendered.match(/<pre-hljs-placeholder lang="(.+?)">(.+?)<\/pre-hljs-placeholder>/gms)
     if (!highlightPlaceholders){
         return rendered
@@ -609,7 +618,7 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
     return data
 }
 
-async function parseInlayAssets(data:string, deferredInlays?:DeferredInlayMarkerRegistry){
+async function parseInlayAssets(data:string, deferredInlays?:DeferredInlayMarkerRegistry, hideAllImages?: boolean){
     const markerRegistry = deferredInlays ?? new DeferredInlayMarkerRegistry()
     const inlayMatch = data.match(/{{(inlay|inlayed|inlayeddata)::(.+?)}}/g)
     if(inlayMatch){
@@ -642,7 +651,7 @@ async function parseInlayAssets(data:string, deferredInlays?:DeferredInlayMarker
             switch(source?.type){
                 case 'image':
                     // Hide inlay images when hideAllImages is enabled
-                    if(DBState.db.hideAllImages){
+                    if(hideAllImages ?? DBState.db.hideAllImages){
                         data = data.replace(inlay, '')
                         break
                     }
@@ -681,6 +690,8 @@ export interface ParseMarkdownRenderContext {
     characterImageSource?: string
     userImageSource?: string
     scriptContext?: ProcessScriptCaptureContext
+    markdownSettings?: MarkdownRenderSettings
+    returnCSSError?: boolean
 }
 
 function parseThoughtsAndTools(data:string){
@@ -728,6 +739,7 @@ export async function ParseMarkdown(
     if(char){
         data = (await processScriptFull(char, data, 'editdisplay', chatID, cbsConditions, {
             captureContext: renderContext.scriptContext,
+            cache: renderContext.scriptContext ? 'bypass' : 'normal',
         })).data
     }
 
@@ -737,19 +749,25 @@ export async function ParseMarkdown(
         }, renderContext)
     }
 
-    data = await parseInlayAssets(data ?? '', renderContext.deferredInlays)
+    data = await parseInlayAssets(data ?? '', renderContext.deferredInlays, renderContext.hideAllImages)
 
     data = parseThoughtsAndTools(data)
 
     data = encodeStyle(data)
     if(mode === 'normal' || mode === 'notrim'){
-        data = await renderHighlightableMarkdown(data)
+        data = await renderHighlightableMarkdown(data, renderContext.markdownSettings)
 
         if(mode === 'notrim'){
             return data
         }
     }
-    return trimMarkdown(data)
+    return trimMarkdown(data, {
+        hideAllImages: renderContext.hideAllImages,
+        returnCSSError: renderContext.returnCSSError,
+        parserContext: renderContext.scriptContext?.parserContext,
+        chatID,
+        cbsConditions,
+    })
 }
 
 const trimPurifyConfig = {
@@ -757,48 +775,68 @@ const trimPurifyConfig = {
     ADD_ATTR: ["allow", "allowfullscreen", "frameborder", "scrolling", "risu-ctrl" ,"risu-btn", 'risu-trigger', 'risu-mark', 'risu-id', 'x-hl-lang', 'x-hl-text'],
 }
 
-export function trimMarkdown(data:string){
-    // Without a <risu-style> there is nothing to decode, so the plain string
-    // result is already final. Note the tag itself is not trusted input:
-    // risu-style is in ADD_TAGS, so cards, model output and user scripts can
-    // author one directly. Only its position in the parsed tree is relied on.
-    if(!data.includes('<risu-style')){
-        return DOMPurify.sanitize(data, trimPurifyConfig)
-    }
+export interface TrimMarkdownRenderContext {
+    hideAllImages?: boolean
+    returnCSSError?: boolean
+    parserContext?: ProcessScriptCaptureContext['parserContext']
+    chatID?: number
+    cbsConditions?: CbsConditions
+}
 
-    // Decoded CSS must never be handed back to the HTML sanitizer as <style>
-    // text: DOMPurify drops style nodes whose CSS contains '<' (SAFE_FOR_XML),
-    // which silently deletes svg data-uris and markup-like content strings.
-    // Take the DOM out of the sanitize we already run and swap the elements in
-    // place instead, so the CSS never re-enters the HTML parser at all.
-    // RETURN_DOM hands back the sanitized <body>, typed as Node. It is null only
-    // for empty input, which the guard above already excludes.
-    const root = DOMPurify.sanitize(data, {
-        ...trimPurifyConfig,
-        RETURN_DOM: true,
-    }) as HTMLElement | null
-    if(!root){
-        return ''
-    }
-
-    // Only real <risu-style> elements are decoded. A <risu-style> that survived
-    // inside an attribute value is not an element, so it is left as inert text
-    // and a <style> tag can never be restored into an attribute context.
-    for(const el of Array.from(root.querySelectorAll('risu-style'))){
-        const decoded = decodeStyleContent(el.textContent ?? '')
-        if(decoded.css === undefined){
-            el.replaceWith(root.ownerDocument.createTextNode(decoded.fallback ?? ''))
-            continue
+export function trimMarkdown(
+    data:string,
+    options: boolean | TrimMarkdownRenderContext = {},
+){
+    const renderContext = typeof options === 'boolean'
+        ? { hideAllImages: options }
+        : options
+    const previousHideAllImages = activeSanitizeHideAllImages
+    activeSanitizeHideAllImages = renderContext.hideAllImages
+    try {
+        // Without a <risu-style> there is nothing to decode, so the plain string
+        // result is already final. Note the tag itself is not trusted input:
+        // risu-style is in ADD_TAGS, so cards, model output and user scripts can
+        // author one directly. Only its position in the parsed tree is relied on.
+        if(!data.includes('<risu-style')){
+            return DOMPurify.sanitize(data, trimPurifyConfig)
         }
-        const style = root.ownerDocument.createElement('style')
-        // <style> is RAWTEXT, so '</style' is the only sequence that can end the
-        // block early and leak the rest of the CSS as markup once this string is
-        // parsed again ('\/' is still '/' inside CSS).
-        style.textContent = decoded.css.replaceAll(/<\/(?=style)/gi, '<\\/')
-        el.replaceWith(style)
-    }
 
-    return root.innerHTML
+        // Decoded CSS must never be handed back to the HTML sanitizer as <style>
+        // text: DOMPurify drops style nodes whose CSS contains '<' (SAFE_FOR_XML),
+        // which silently deletes svg data-uris and markup-like content strings.
+        // Take the DOM out of the sanitize we already run and swap the elements in
+        // place instead, so the CSS never re-enters the HTML parser at all.
+        // RETURN_DOM hands back the sanitized <body>, typed as Node. It is null only
+        // for empty input, which the guard above already excludes.
+        const root = DOMPurify.sanitize(data, {
+            ...trimPurifyConfig,
+            RETURN_DOM: true,
+        }) as HTMLElement | null
+        if(!root){
+            return ''
+        }
+
+        // Only real <risu-style> elements are decoded. A <risu-style> that survived
+        // inside an attribute value is not an element, so it is left as inert text
+        // and a <style> tag can never be restored into an attribute context.
+        for(const el of Array.from(root.querySelectorAll('risu-style'))){
+            const decoded = decodeStyleContent(el.textContent ?? '', renderContext)
+            if(decoded.css === undefined){
+                el.replaceWith(root.ownerDocument.createTextNode(decoded.fallback ?? ''))
+                continue
+            }
+            const style = root.ownerDocument.createElement('style')
+            // <style> is RAWTEXT, so '</style' is the only sequence that can end the
+            // block early and leak the rest of the CSS as markup once this string is
+            // parsed again ('\/' is still '/' inside CSS).
+            style.textContent = decoded.css.replaceAll(/<\/(?=style)/gi, '<\\/')
+            el.replaceWith(style)
+        }
+
+        return root.innerHTML
+    } finally {
+        activeSanitizeHideAllImages = previousHideAllImages
+    }
 }
 
 const metaCodes = [
@@ -860,8 +898,8 @@ function encodeMetadata(modelShortName:string){
     return encodedMetaCode
 }
 
-export function addMetadataToElement(data:string, modelShortName:string){
-    if(!aiWatermarkingLawApplies()){
+export function addMetadataToElement(data:string, modelShortName:string, lawApplies = aiWatermarkingLawApplies()){
+    if(!lawApplies){
         return data
     }
 
@@ -876,7 +914,7 @@ export function addMetadataToElement(data:string, modelShortName:string){
     return d + encodedMetaCode
 }
 
-export async function postTranslationParse(data:string){
+export async function postTranslationParse(data:string, settings?: MarkdownRenderSettings){
     let lines = data.split('\n')
 
     for(let i=0;i<lines.length;i++){
@@ -886,7 +924,7 @@ export async function postTranslationParse(data:string){
         }
     }
 
-    data = await renderHighlightableMarkdown(lines.join('\n'))
+    data = await renderHighlightableMarkdown(lines.join('\n'), settings)
     return data
 }
 
@@ -948,10 +986,28 @@ function decodeStyleRule(rule:CssAtRuleAST){
  * On a CSS parse error the style is dropped and `fallback` holds the text that
  * takes its place.
  */
-function decodeStyleContent(hexText:string):{css?:string, fallback?:string}{
+function decodeStyleContent(
+    hexText:string,
+    renderContext: TrimMarkdownRenderContext,
+):{css?:string, fallback?:string}{
     try {
         let text = Buffer.from(hexText, 'hex').toString('utf-8')
-        text = risuChatParser(text)
+        const parser = renderContext.parserContext
+        text = risuChatParser(text, parser ? {
+            chatID: renderContext.chatID,
+            cbsConditions: renderContext.cbsConditions,
+            db: parser.database,
+            chara: parser.character,
+            userName: parser.userName,
+            personaPrompt: parser.personaPrompt,
+            modules: parser.modules,
+            moduleLorebooks: parser.moduleLorebooks,
+            selectedCharID: parser.selectedCharID,
+            chatVariables: parser.chatVariables,
+            globalChatVariables: parser.globalChatVariables,
+            currentTime: parser.currentTime,
+            triggerId: parser.triggerId,
+        } : undefined)
         const ast = css.parse(text)
         const rules = ast?.stylesheet?.rules
         if(rules){
@@ -967,7 +1023,7 @@ function decodeStyleContent(hexText:string):{css?:string, fallback?:string}{
             })
         }
     } catch (error) {
-        if(DBState.db.returnCSSError){
+        if(renderContext.returnCSSError ?? DBState.db.returnCSSError){
             return { fallback: `CSS ERROR: ${error}` }
         }
         return { fallback: "" }
@@ -984,7 +1040,7 @@ export type CbsConditions = {
 }
 
 let matcherInitialized = false
-
+let activeMatcherContext: matcherArg | null = null
 
 const matcherMap = new Map<string, RegisterCallback>()
 
@@ -1008,24 +1064,33 @@ function initMatcher(){
                 matcherMap.set(name, callback)
             }
         },
-        getDatabase: getDatabase,
-        getUserName: getUserName,
-        getPersonaPrompt: getPersonaPrompt,
+        getDatabase: () => activeMatcherContext?.db ?? getDatabase(),
+        getUserName: () => activeMatcherContext?.userName ?? getUserName(),
+        getPersonaPrompt: () => activeMatcherContext?.personaPrompt ?? getPersonaPrompt(),
         risuChatParser: risuChatParser,
         makeArray: makeArray,
         safeStructuredClone: safeStructuredClone,
         parseArray: parseArray,
         parseDict: parseDict,
-        getChatVar: getChatVar,
-        setChatVar: setChatVar,
-        getGlobalChatVar: getGlobalChatVar,
+        getChatVar: (key) => activeMatcherContext?.chatVariables
+            ? activeMatcherContext.chatVariables[key] ?? 'null'
+            : getChatVar(key),
+        setChatVar: (key, value) => {
+            if (!activeMatcherContext?.chatVariables) setChatVar(key, value)
+        },
+        getGlobalChatVar: (key) => activeMatcherContext?.globalChatVariables
+            ? activeMatcherContext.globalChatVariables[key] ?? 'null'
+            : getGlobalChatVar(key),
         calcString: calcString,
-        dateTimeFormat: dateTimeFormat,
-        getModules: getModules,
-        getModuleLorebooks: getModuleLorebooks,
+        dateTimeFormat: (format, timestamp) => dateTimeFormat(
+            format,
+            timestamp || activeMatcherContext?.currentTime,
+        ),
+        getModules: () => activeMatcherContext?.modules ?? getModules(),
+        getModuleLorebooks: () => activeMatcherContext?.moduleLorebooks ?? getModuleLorebooks(),
         pickHashRand: pickHashRand,
         getSelectedCharID: () => {
-            return get(selectedCharID)
+            return activeMatcherContext?.selectedCharID ?? get(selectedCharID)
         },
         getModelInfo: getModelInfo,
         callInternalFunction: function (args: string[]): string {
@@ -1063,7 +1128,14 @@ function matcher (p1:string,matcherArg:matcherArg,vars:{[key:string]:string}|nul
         const args = splited.slice(1)
         const callback = matcherMap.get(name)
         if(callback){
-            return callback(p1, matcherArg, args,vars)
+            const previousContext = activeMatcherContext
+            activeMatcherContext = matcherArg
+            try {
+                return callback(p1, matcherArg, args,vars)
+            }
+            finally {
+                activeMatcherContext = previousContext
+            }
         }
     } catch (error) {}
 
@@ -1556,17 +1628,29 @@ export function risuChatParser(da:string, arg:{
     functions?:Map<string,{data:string,arg:string[]}>
     callStack?:number
     cbsConditions?:CbsConditions
+    triggerId?: string
+    userName?: string
+    personaPrompt?: string
+    modules?: RisuModule[]
+    moduleLorebooks?: loreBook[]
+    selectedCharID?: number
+    chatVariables?: Record<string, string>
+    globalChatVariables?: Record<string, string>
+    currentTime?: number
 } = {}):string{
     const chatID = arg.chatID ?? -1
     const db = arg.db ?? DBState.db
     const aChara = arg.chara
-    let chara:character|string = null
+    let chara:character|groupChat|string = null
 
     if(aChara){
         if(typeof(aChara) !== 'string' && aChara.type === 'group'){
             if(aChara.chats[aChara.chatPage].message.length > 0){
-                const gc = findCharacterbyId(aChara.chats[aChara.chatPage].message.at(-1).saying ?? '')
-                if(gc.name !== 'Unknown Character'){
+                const memberId = aChara.chats[aChara.chatPage].message.at(-1).saying ?? ''
+                const gc = arg.db
+                    ? db.characters.find((candidate) => candidate.chaId === memberId)
+                    : findCharacterbyId(memberId)
+                if(gc && gc.name !== 'Unknown Character'){
                     chara = gc
                 }
             }
@@ -1580,7 +1664,7 @@ export function risuChatParser(da:string, arg:{
     }
     if(arg.tokenizeAccurate){
         const db = arg.db ?? DBState.db
-        const selchar = chara ?? db.characters[get(selectedCharID)]
+        const selchar = chara ?? db.characters[arg.selectedCharID ?? get(selectedCharID)]
         if(!selchar){
             chara = 'bot'
         }
@@ -1625,6 +1709,15 @@ export function risuChatParser(da:string, arg:{
         runVar: arg.runVar ?? false,
         consistantChar: arg.consistantChar ?? false,
         cbsConditions: arg.cbsConditions ?? {},
+        triggerId: arg.triggerId,
+        userName: arg.userName,
+        personaPrompt: arg.personaPrompt,
+        modules: arg.modules,
+        moduleLorebooks: arg.moduleLorebooks,
+        selectedCharID: arg.selectedCharID,
+        chatVariables: arg.chatVariables,
+        globalChatVariables: arg.globalChatVariables,
+        currentTime: arg.currentTime,
         callStack: arg.callStack,
         getNested: () => {
             return nested

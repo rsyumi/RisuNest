@@ -20,6 +20,14 @@ vi.mock('html-to-image', () => htmlToImageMocks)
 afterEach(() => vi.useRealTimers())
 
 function job(count: number): ChatScreenshotJob {
+    const character = {
+        type: 'character' as const,
+        name: 'Character',
+        chaId: 'character',
+        chatPage: 0,
+        chats: [{ message: [], note: '', name: '', localLore: [] }],
+        customscript: [],
+    }
     return {
         characterId: 'character',
         chatId: 'chat',
@@ -42,6 +50,18 @@ function job(count: number): ChatScreenshotJob {
             presetRegex: [],
             moduleRegexScripts: [],
             assetStyle: '',
+            parserContext: {
+                database: { characters: [character] } as any,
+                character: character as any,
+                userName: 'User',
+                personaPrompt: '',
+                modules: [],
+                moduleLorebooks: [],
+                selectedCharID: 0,
+                chatVariables: {},
+                globalChatVariables: {},
+                currentTime: 1,
+            },
             settings: {
                 autoTranslate: false,
                 autoTranslateCachedOnly: false,

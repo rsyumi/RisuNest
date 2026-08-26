@@ -1,4 +1,4 @@
-import type { Database, character, loreBook } from './storage/database.svelte';
+import type { Database, character, groupChat, loreBook } from './storage/database.svelte';
 import type { CbsConditions } from './parser/parser.svelte';
 import type { RisuModule } from './process/modules';
 import type { LLMModel } from './model/modellist';
@@ -52,7 +52,7 @@ export const defaultCBSRegisterArg: CBSRegisterArg = {
 export type matcherArg = {
     chatID: number,
     db: Database,
-    chara: character | string,
+    chara: character | groupChat | string,
     rmVar: boolean,
     var?: { [key: string]: string }
     tokenizeAccurate?: boolean
@@ -66,6 +66,14 @@ export type matcherArg = {
     lowLevelAccess?: boolean
     cbsConditions: CbsConditions
     triggerId?: string
+    userName?: string
+    personaPrompt?: string
+    modules?: RisuModule[]
+    moduleLorebooks?: loreBook[]
+    selectedCharID?: number
+    chatVariables?: Record<string, string>
+    globalChatVariables?: Record<string, string>
+    currentTime?: number
     getNested?: () => string[]
     setNestedRoot?: (val:string) => void
 }
@@ -184,7 +192,9 @@ export function registerCBS(arg:CBSRegisterArg) {
     registerFunction({
         name: 'trigger_id',
         callback: (str, matcherArg, args, vars) => {
-            const currentTriggerId = get(CurrentTriggerIdStore)
+            const currentTriggerId = matcherArg.currentTime !== undefined
+                ? matcherArg.triggerId ?? null
+                : get(CurrentTriggerIdStore)
             return currentTriggerId ?? 'null'
         },
         alias: ['triggerid'],
@@ -506,7 +516,7 @@ export function registerCBS(arg:CBSRegisterArg) {
     registerFunction({
         name: 'unixtime',
         callback: (str, matcherArg, args, vars) => {
-            const now = new Date()
+            const now = new Date(matcherArg.currentTime ?? Date.now())
             return (now.getTime() / 1000).toFixed(0)
         },
         alias: [],
@@ -516,7 +526,7 @@ export function registerCBS(arg:CBSRegisterArg) {
     registerFunction({
         name: 'time',
         callback: (str, matcherArg, args, vars) => {
-            const now = new Date()
+            const now = new Date(matcherArg.currentTime ?? Date.now())
             return `${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`
         },
         alias: [],
@@ -526,7 +536,7 @@ export function registerCBS(arg:CBSRegisterArg) {
     registerFunction({
         name: 'isotime',
         callback: (str, matcherArg, args, vars) => {
-            const now = new Date()
+            const now = new Date(matcherArg.currentTime ?? Date.now())
             return `${now.getUTCHours()}:${now.getUTCMinutes()}:${now.getUTCSeconds()}`
         },
         alias: [],
@@ -536,7 +546,7 @@ export function registerCBS(arg:CBSRegisterArg) {
     registerFunction({
         name: 'isodate',
         callback: (str, matcherArg, args, vars) => {
-            const now = new Date()
+            const now = new Date(matcherArg.currentTime ?? Date.now())
             return `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}`
         },
         alias: [],
@@ -621,7 +631,7 @@ export function registerCBS(arg:CBSRegisterArg) {
                 return "[Cannot get time, message was sent in older version]"
             }
 
-            const now = new Date()
+            const now = new Date(matcherArg.currentTime ?? Date.now())
 
             let duration = now.getTime() - lastMessage.time
 
@@ -1566,7 +1576,7 @@ export function registerCBS(arg:CBSRegisterArg) {
         callback: (str, matcherArg, args, vars) => {
 
             if(args.length === 0){
-                const now = new Date()
+                const now = new Date(matcherArg.currentTime ?? Date.now())
                 return `${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`
             }
             const secondParam = args[1]
@@ -1588,7 +1598,7 @@ export function registerCBS(arg:CBSRegisterArg) {
         callback: (str, matcherArg, args, vars) => {
 
             if(args.length === 0){
-                const now = new Date()
+                const now = new Date(matcherArg.currentTime ?? Date.now())
                 return `${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`
             }
             const secondParam = args[1]

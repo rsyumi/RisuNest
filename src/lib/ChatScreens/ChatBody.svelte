@@ -11,6 +11,7 @@
     import { DeferredInlayMarkerRegistry, mountDeferredInlaySources, resolveDeferredInlaySources } from "src/ts/process/files/inlayRenderSource";
     import { onDestroy, tick } from 'svelte'
     import type { FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
+    import type { ProcessScriptCaptureContext } from 'src/ts/process/scripts'
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -70,6 +71,33 @@
     let activeParseJob: ChatBodyParseJob|null = null
     let parseGeneration = 0
 
+    function captureMarkdownSettings() {
+        if (!captureContext) return undefined
+        return {
+            customQuotes: captureContext.settings.customQuotes,
+            customQuotesData: captureContext.settings.customQuotesData
+                ? [...captureContext.settings.customQuotesData] as [string, string, string, string]
+                : undefined,
+            unformatQuotes: captureContext.settings.unformatQuotes,
+            blockquoteStyling: captureContext.settings.blockquoteStyling,
+        }
+    }
+
+    function finalizeParsedMarkup(value: string) {
+        const trimmed = captureContext
+            ? trimMarkdown(value, {
+                hideAllImages: captureContext.settings.hideAllImages,
+                returnCSSError: captureContext.settings.returnCSSError,
+                parserContext: captureContext.parserContext as unknown as ProcessScriptCaptureContext['parserContext'],
+                chatID: idx,
+                cbsConditions: getCbsCondition(),
+            })
+            : trimMarkdown(value)
+        return captureContext
+            ? addMetadataToElement(trimmed, modelShortName, captureContext.settings.aiLawApplies ?? false)
+            : addMetadataToElement(trimmed, modelShortName)
+    }
+
     function getCbsCondition(){
         try{
             const cbsConditions:CbsConditions = {
@@ -89,6 +117,9 @@
     let shouldRenderRawStreaming = $derived(renderRawStreaming && !translated && !retranslate)
 
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
+        const translationCharacter = (
+            captureContext?.character ?? charArg
+        ) as string | simpleCharacterArgument
         const parseForRender = (value:string, mode:'normal'|'back'|'pretranslate'|'notrim') => (
             ParseMarkdown(value, charArg, mode, chatID, getCbsCondition(), {
                 deferredInlays: job.deferredInlays,
@@ -99,13 +130,16 @@
                 assetMaxDifference: captureContext?.settings.assetMaxDifference,
                 characterImageSource: captureContext?.characterImageSource,
                 userImageSource: captureContext?.userImageSource,
-                scriptContext: captureContext ? {
+                scriptContext: captureContext ? ({
                     presetRegex: captureContext.presetRegex,
                     moduleRegexScripts: captureContext.moduleRegexScripts,
                     moduleAssets: captureContext.moduleAssets,
                     dynamicAssets: captureContext.settings.dynamicAssets,
                     dynamicAssetsEditDisplay: captureContext.settings.dynamicAssetsEditDisplay,
-                } : undefined,
+                    parserContext: captureContext.parserContext,
+                } as unknown as ProcessScriptCaptureContext) : undefined,
+                markdownSettings: captureMarkdownSettings(),
+                returnCSSError: captureContext?.settings.returnCSSError,
             })
         )
         // track 'translated' and 'retranslate' state
@@ -163,7 +197,13 @@
                 if(settings.translatorType === 'llm' && settings.translateBeforeHTMLFormatting){
                     await sleep(100)
                     translating = true
-                    data = await translateHTML(data, false, charArg, chatID, retranslate)
+                    data = await translateHTML(
+                        data,
+                        false,
+                        translationCharacter,
+                        chatID,
+                        retranslate,
+                    )
                     translating = false
                     const marked = await parseForRender(data, mode)
                     lastParsedQueue = marked
@@ -173,7 +213,13 @@
                 else if(!settings.legacyTranslation){
                     const marked = await parseForRender(data, 'pretranslate')
                     translating = true
-                    const translated = await postTranslationParse(await translateHTML(marked, false, charArg, chatID, retranslate))
+                    const translated = await postTranslationParse(await translateHTML(
+                        marked,
+                        false,
+                        translationCharacter,
+                        chatID,
+                        retranslate,
+                    ), captureMarkdownSettings())
                     translating = false
                     lastParsedQueue = translated
                     lastCharArg = charArg
@@ -182,7 +228,13 @@
                 else{
                     const marked = await parseForRender(data, mode)
                     translating = true
-                    const translated = await translateHTML(marked, false, charArg, chatID, retranslate)
+                    const translated = await translateHTML(
+                        marked,
+                        false,
+                        translationCharacter,
+                        chatID,
+                        retranslate,
+                    )
                     translating = false
                     lastParsedQueue = translated
                     lastCharArg = charArg
@@ -391,9 +443,9 @@
 {:else}
     <span style="display:contents" bind:this={renderRoot}>
         {#await markParsingResult?.promise}
-            {@html addMetadataToElement(trimMarkdown(lastParsed), modelShortName)}
+            {@html finalizeParsedMarkup(lastParsed)}
         {:then parsed}
-            {@html addMetadataToElement(trimMarkdown(parsed ?? ''), modelShortName)}
+            {@html finalizeParsedMarkup(parsed ?? '')}
         {/await}
     </span>
 {/if}

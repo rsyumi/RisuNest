@@ -5,11 +5,11 @@
     import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, easyPanelStore, chatPanelStore } from "../../ts/stores.svelte";
     import { onDestroy, tick } from 'svelte';
     import Chat from "./Chat.svelte";
-    import { type Message } from "../../ts/storage/database.svelte";
+    import { type Chat as ChatRecord, type Database, type character, type groupChat, type Message } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
     import { getCharImage } from "../../ts/characters";
     import { chatProcessStage, doingChat, sendChat } from "../../ts/process/index.svelte";
-    import { sleep } from "../../ts/util";
+    import { getPersonaPrompt, parseKeyValue, sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
     import { alertError, alertNormal, showHypaV2Alert } from "../../ts/alert";
@@ -64,7 +64,9 @@
     import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
     import { isTauri } from 'src/ts/platform';
-    import { getModuleAssets, getModuleRegexScripts } from 'src/ts/process/modules';
+    import { getModuleAssets, getModuleLorebooks, getModuleRegexScripts, getModules } from 'src/ts/process/modules';
+    import { ColorSchemeTypeStore } from 'src/ts/gui/colorscheme';
+    import { HideIconStore } from 'src/ts/stores.svelte';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -600,6 +602,125 @@
         screenshotDialogOpen = false
     }
 
+    function snapshotCaptureChat(chat: ChatRecord): ChatRecord {
+        return {
+            message: [],
+            note: chat.note ?? '',
+            name: chat.name ?? '',
+            localLore: chat.localLore ?? [],
+            scriptstate: chat.scriptstate ?? {},
+            modules: chat.modules ?? [],
+            id: chat.id,
+            bindedPersona: chat.bindedPersona,
+            fmIndex: chat.fmIndex ?? -1,
+            bookmarks: chat.bookmarks ?? [],
+            bookmarkNames: chat.bookmarkNames ?? {},
+            useLocallySetGlobalVariables: chat.useLocallySetGlobalVariables,
+            GLGlobalVariables: chat.GLGlobalVariables ?? {},
+        }
+    }
+
+    function snapshotCaptureCharacter(
+        source: character | groupChat,
+        chat: ChatRecord,
+    ): character | groupChat {
+        const shared = {
+            type: source.type,
+            name: source.name,
+            nickname: source.nickname,
+            chaId: source.chaId,
+            firstMessage: source.firstMessage ?? '',
+            alternateGreetings: source.alternateGreetings ?? [],
+            chats: [snapshotCaptureChat(chat)],
+            chatPage: 0,
+            customscript: source.customscript ?? [],
+            virtualscript: source.virtualscript,
+            globalLore: source.globalLore ?? [],
+            defaultVariables: source.defaultVariables ?? '',
+            additionalAssets: source.additionalAssets ?? [],
+            emotionImages: source.emotionImages ?? [],
+            prebuiltAssetStyle: source.prebuiltAssetStyle ?? '',
+        }
+        if (source.type === 'group') {
+            return {
+                ...shared,
+                type: 'group',
+                characters: source.characters ?? [],
+                characterTalks: source.characterTalks ?? [],
+                characterActive: source.characterActive ?? [],
+            } as groupChat
+        }
+        return {
+            ...shared,
+            type: 'character',
+            desc: source.desc ?? '',
+            personality: source.personality ?? '',
+            scenario: source.scenario ?? '',
+            exampleMessage: source.exampleMessage ?? '',
+            systemPrompt: source.systemPrompt ?? '',
+            postHistoryInstructions: source.postHistoryInstructions ?? '',
+            triggerscript: source.triggerscript ?? [],
+        } as character
+    }
+
+    function captureVariables(source: character | groupChat, chat: ChatRecord) {
+        const variables = Object.fromEntries([
+            ...parseKeyValue(DBState.db.templateDefaultVariables ?? ''),
+            ...parseKeyValue(source.defaultVariables ?? ''),
+        ])
+        for (const [key, value] of Object.entries(chat.scriptstate ?? {})) {
+            variables[key.replace(/^\$/, '')] = String(value)
+        }
+        return variables
+    }
+
+    function createCaptureParserContext(
+        source: character | groupChat,
+        chat: ChatRecord,
+        start: number,
+        end: number,
+    ) {
+        const character = snapshotCaptureCharacter(source, chat)
+        const memberIds = new Set(source.type === 'group' ? source.characters : [])
+        for (const message of chat.message.slice(Math.max(0, start - 2), end)) {
+            if (message.saying) memberIds.add(message.saying)
+        }
+        const members = DBState.db.characters
+            .filter((candidate) => candidate !== source && memberIds.has(candidate.chaId))
+            .map((candidate) => snapshotCaptureCharacter(
+                candidate,
+                candidate.chats[candidate.chatPage] ?? chat,
+            ))
+        const database = {
+            characters: [character, ...members],
+            mainPrompt: DBState.db.mainPrompt,
+            jailbreak: DBState.db.jailbreak,
+            globalNote: DBState.db.globalNote,
+            jailbreakToggle: DBState.db.jailbreakToggle,
+            maxContext: DBState.db.maxContext,
+            aiModel: DBState.db.aiModel,
+            subModel: DBState.db.subModel,
+            language: DBState.db.language,
+            promptTemplate: DBState.db.promptTemplate,
+        } as Database
+        const globalChatVariables = { ...(DBState.db.globalChatVariables ?? {}) }
+        for (const [key, value] of Object.entries(chat.GLGlobalVariables ?? {})) {
+            if (value && value !== 'null') globalChatVariables[key] = value
+        }
+        return {
+            database,
+            character,
+            userName: currentUsername,
+            personaPrompt: getPersonaPrompt(),
+            modules: getModules(),
+            moduleLorebooks: getModuleLorebooks(),
+            selectedCharID: 0,
+            chatVariables: captureVariables(source, chat),
+            globalChatVariables,
+            currentTime: Date.now(),
+        }
+    }
+
     async function startScreenshot(start: number, end: number) {
         if (screenshotRunning || !currentCharacter || !screenshotSurface) return
         const selectedChat = currentCharacter.chats[currentCharacter.chatPage]
@@ -632,6 +753,7 @@
                     presetRegex: DBState.db.presetRegex ?? [],
                     moduleRegexScripts: getModuleRegexScripts(),
                     assetStyle: currentCharacter.prebuiltAssetStyle ?? '',
+                    parserContext: createCaptureParserContext(currentCharacter, selectedChat, start, end),
                     settings: {
                         autoTranslate: DBState.db.autoTranslate,
                         autoTranslateCachedOnly: DBState.db.autoTranslateCachedOnly,
@@ -649,6 +771,22 @@
                         dynamicAssetsEditDisplay: DBState.db.dynamicAssetsEditDisplay,
                         legacyMediaFindings: DBState.db.legacyMediaFindings ?? false,
                         assetMaxDifference: DBState.db.assetMaxDifference,
+                        theme: DBState.db.theme,
+                        guiHTML: DBState.db.guiHTML,
+                        roundIcons: DBState.db.roundIcons,
+                        hideIcons: $HideIconStore,
+                        proseInvert: $ColorSchemeTypeStore === 'dark',
+                        requestInfoInsideChat: DBState.db.requestInfoInsideChat ?? false,
+                        aiLawApplies: aiLawApplies(),
+                        translator: DBState.db.translator,
+                        swipe: DBState.db.swipe,
+                        showFirstMessagePages: DBState.db.showFirstMessagePages,
+                        memoryLimitThickness: DBState.db.memoryLimitThickness ?? 1,
+                        customQuotes: DBState.db.customQuotes,
+                        customQuotesData: DBState.db.customQuotesData ?? ['“', '”', '‘', '’'],
+                        unformatQuotes: DBState.db.unformatQuotes,
+                        blockquoteStyling: DBState.db.blockquoteStyling ?? false,
+                        returnCSSError: DBState.db.returnCSSError ?? false,
                     },
                 },
             })

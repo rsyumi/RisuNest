@@ -1,5 +1,6 @@
 import type { Message, customscript } from './storage/database.svelte'
 import type { simpleCharacterArgument } from './parser/parser.svelte'
+import type { ProcessScriptCaptureContext } from './process/scripts'
 import rfdc from 'rfdc'
 
 const cloneScreenshotData = rfdc()
@@ -38,6 +39,22 @@ export interface ChatScreenshotRenderSettings {
     dynamicAssetsEditDisplay: boolean
     legacyMediaFindings: boolean
     assetMaxDifference: number
+    theme?: string
+    guiHTML?: string
+    roundIcons?: boolean
+    hideIcons?: boolean
+    proseInvert?: boolean
+    requestInfoInsideChat?: boolean
+    aiLawApplies?: boolean
+    translator?: string
+    swipe?: boolean
+    showFirstMessagePages?: boolean
+    memoryLimitThickness?: number
+    customQuotes?: boolean
+    customQuotesData?: [string, string, string, string]
+    unformatQuotes?: boolean
+    blockquoteStyling?: boolean
+    returnCSSError?: boolean
 }
 
 export interface ChatScreenshotRenderContext {
@@ -52,6 +69,10 @@ export interface ChatScreenshotRenderContext {
     presetRegex: customscript[]
     moduleRegexScripts: customscript[]
     assetStyle: string
+    parserContext: ProcessScriptCaptureContext['parserContext']
+    totalTurns?: number
+    selectionStart?: number
+    firstParserMessageIndex?: number
     settings: ChatScreenshotRenderSettings
 }
 
@@ -113,6 +134,19 @@ export function createChatScreenshotJob(input: {
     const selectedMessages = cloneScreenshotData(
         input.messages.slice(validation.start - 1, validation.end),
     )
+    const renderContext = cloneScreenshotData(input.renderContext)
+    const previousMessage = validation.start > 1
+        ? cloneScreenshotData(input.messages[validation.start - 2])
+        : null
+    const parserMessages = previousMessage
+        ? [previousMessage, ...selectedMessages]
+        : selectedMessages
+    const parserCharacter = renderContext.parserContext.character
+    parserCharacter.chats[parserCharacter.chatPage].message = parserMessages
+    renderContext.parserContext.database.characters[renderContext.parserContext.selectedCharID] = parserCharacter
+    renderContext.totalTurns = input.messages.length
+    renderContext.selectionStart = validation.start
+    renderContext.firstParserMessageIndex = previousMessage ? 1 : 0
     return deepFreeze({
         characterId: input.characterId,
         chatId: input.chatId,
@@ -120,6 +154,6 @@ export function createChatScreenshotJob(input: {
         start: validation.start,
         end: validation.end,
         messages: selectedMessages,
-        renderContext: cloneScreenshotData(input.renderContext),
+        renderContext,
     })
 }

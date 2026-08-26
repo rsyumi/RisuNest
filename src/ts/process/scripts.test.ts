@@ -126,6 +126,18 @@ it('uses frozen capture script inputs without reading the live selected conversa
             moduleAssets: [],
             dynamicAssets: false,
             dynamicAssetsEditDisplay: false,
+            parserContext: {
+                database: mocks.database as any,
+                character,
+                userName: 'Frozen User',
+                personaPrompt: 'Frozen Persona',
+                modules: [],
+                moduleLorebooks: [],
+                selectedCharID: 0,
+                chatVariables: {},
+                globalChatVariables: {},
+                currentTime: 1,
+            },
         },
     })
 
