@@ -165,17 +165,23 @@ impl PayloadCas {
         name: &str,
         directory_entries_synced: &mut bool,
     ) -> io::Result<PathBuf> {
+        self.ensure_directory_with_sync(parent, name, directory_entries_synced, sync_directory)
+    }
+
+    fn ensure_directory_with_sync(
+        &self,
+        parent: &Path,
+        name: &str,
+        directory_entries_synced: &mut bool,
+        mut sync_parent: impl FnMut(&Path) -> io::Result<bool>,
+    ) -> io::Result<PathBuf> {
         let path = parent.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) => self.validate_owned_directory(&path, &metadata)?,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 match fs::create_dir(&path) {
-                    Ok(()) => {
-                        *directory_entries_synced &= sync_directory(parent)?;
-                    }
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                        *directory_entries_synced &= sync_directory(parent)?;
-                    }
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
                 }
                 let metadata = fs::symlink_metadata(&path)?;
@@ -183,6 +189,7 @@ impl PayloadCas {
             }
             Err(error) => return Err(error),
         }
+        *directory_entries_synced &= sync_parent(parent)?;
         Ok(path)
     }
 
@@ -385,7 +392,36 @@ fn sync_directory(_path: &Path) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::create_staging_file;
+    use super::{create_staging_file, PayloadCas};
+
+    #[test]
+    fn existing_directory_from_a_crash_window_resyncs_its_parent_before_acceptance() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let cas = PayloadCas::new(directory.path()).expect("open repository");
+        let existing = directory.path().join("assets-v2");
+        std::fs::create_dir(&existing).expect("simulate concurrent directory creation");
+        let mut directory_entries_synced = true;
+        let mut synced_parent = None;
+
+        let accepted = cas
+            .ensure_directory_with_sync(
+                &cas.repository_root,
+                "assets-v2",
+                &mut directory_entries_synced,
+                |parent| {
+                    synced_parent = Some(parent.to_path_buf());
+                    Ok(false)
+                },
+            )
+            .expect("accept existing directory");
+
+        assert_eq!(accepted, cas.repository_root.join("assets-v2"));
+        assert_eq!(
+            synced_parent.as_deref(),
+            Some(cas.repository_root.as_path())
+        );
+        assert!(!directory_entries_synced);
+    }
 
     #[test]
     fn failed_create_new_does_not_own_or_remove_a_preexisting_staging_file() {
