@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, Metadata};
 use std::io::Read;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -24,7 +25,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 enum TunnelError {
     CloudflaredNotInstalled,
     UntrustedCloudflared,
-    InvalidOriginPort,
+    InvalidOrigin,
     Launch(String),
     Readiness {
         reason: String,
@@ -45,7 +46,9 @@ impl fmt::Display for TunnelError {
             Self::UntrustedCloudflared => {
                 formatter.write_str("cloudflared is not in a trusted installed location")
             }
-            Self::InvalidOriginPort => formatter.write_str("peer origin port must not be zero"),
+            Self::InvalidOrigin => {
+                formatter.write_str("quick tunnel origin must be 127.0.0.1 with a nonzero port")
+            }
             Self::Launch(error) => write!(formatter, "failed to launch cloudflared: {error}"),
             Self::Readiness { reason, .. } => {
                 write!(formatter, "cloudflared did not become ready: {reason}")
@@ -225,20 +228,24 @@ struct LaunchSpec {
 }
 
 impl TunnelMode {
-    fn launch(&self, origin_port: u16) -> Result<LaunchSpec, TunnelError> {
-        if origin_port == 0 {
-            return Err(TunnelError::InvalidOriginPort);
+    fn launch(&self, origin: SocketAddr) -> Result<LaunchSpec, TunnelError> {
+        let SocketAddr::V4(origin) = origin else {
+            return Err(TunnelError::InvalidOrigin);
+        };
+        if origin.ip() != &Ipv4Addr::LOCALHOST || origin.port() == 0 {
+            return Err(TunnelError::InvalidOrigin);
         }
+        let origin = format!("http://{origin}");
 
         Ok(LaunchSpec {
             args: vec![
                 "tunnel".into(),
                 "--no-autoupdate".into(),
                 "--url".into(),
-                format!("http://127.0.0.1:{origin_port}").into(),
+                origin.clone().into(),
             ],
             env_remove: ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"],
-            origin: format!("http://127.0.0.1:{origin_port}"),
+            origin,
         })
     }
 }
@@ -628,13 +635,13 @@ where
     fn start<S>(
         &self,
         mode: TunnelMode,
-        origin_port: u16,
+        origin: SocketAddr,
         peer_session: S,
     ) -> Result<RunningTunnel, TunnelStartFailure<L::Process, S>>
     where
         S: PeerSession,
     {
-        let launch = match mode.launch(origin_port) {
+        let launch = match mode.launch(origin) {
             Ok(launch) => launch,
             Err(error) => {
                 return Err(TunnelStartFailure {

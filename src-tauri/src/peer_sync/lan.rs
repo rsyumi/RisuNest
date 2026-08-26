@@ -503,6 +503,14 @@ impl LanCloneHost {
     }
 
     pub fn start(&mut self) -> Result<LanPairing, PeerSyncError> {
+        self.start_on(Ipv4Addr::UNSPECIFIED)
+    }
+
+    pub(crate) fn start_quick_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
+        self.start_on(Ipv4Addr::LOCALHOST)
+    }
+
+    fn start_on(&mut self, bind_address: Ipv4Addr) -> Result<LanPairing, PeerSyncError> {
         if self.thread.is_some() {
             return Err(PeerSyncError::Protocol(
                 "LAN clone host is already running".to_owned(),
@@ -514,12 +522,12 @@ impl LanCloneHost {
             expires_at: Instant::now() + CLAIM_TTL,
             consumed: false,
         });
-        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(transport)?;
+        let listener = TcpListener::bind((bind_address, 0)).map_err(transport)?;
         listener.set_nonblocking(true).map_err(transport)?;
         let address = listener.local_addr().map_err(transport)?;
-        if !address.ip().is_unspecified() {
+        if address.ip() != std::net::IpAddr::V4(bind_address) {
             return Err(PeerSyncError::Protocol(
-                "LAN clone server must bind 0.0.0.0".to_owned(),
+                "LAN clone server did not bind the requested IPv4 interface".to_owned(),
             ));
         }
         let stopped = Arc::new(AtomicBool::new(false));

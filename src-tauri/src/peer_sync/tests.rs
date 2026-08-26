@@ -459,6 +459,24 @@ fn lan_host_binds_only_on_explicit_start_and_stops_completely() {
 }
 
 #[test]
+fn quick_tunnel_origin_host_binds_only_ipv4_loopback() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+
+    host.start_quick_tunnel_origin().unwrap();
+
+    let address = host.address().unwrap();
+    assert_eq!(
+        address.ip(),
+        "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert_ne!(address.port(), 0);
+    host.stop().unwrap();
+}
+
+#[test]
 fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
