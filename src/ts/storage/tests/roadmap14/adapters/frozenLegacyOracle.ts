@@ -44,6 +44,26 @@ const canonicalArtifacts: Record<string, string> = {
     'risusave-block-v4.expected.json': blockExpectedCanonicalArtifact,
 }
 
+export function verifyFrozenCanonicalText({
+    artifactId,
+    checkoutText,
+    pinnedLfSha256,
+    actualCanonical,
+}: {
+    artifactId: string
+    checkoutText: string
+    pinnedLfSha256: string
+    actualCanonical: string
+}): void {
+    const expectedCanonical = checkoutText.replaceAll('\r\n', '\n')
+    if (sha256(expectedCanonical) !== pinnedLfSha256) {
+        throw new Error(`Frozen legacy canonical artifact changed: ${artifactId}`)
+    }
+    if (actualCanonical !== expectedCanonical) {
+        throw new Error(`Legacy reverse import changed: ${artifactId}`)
+    }
+}
+
 export async function verifyFrozenLegacyArtifacts(decode: RisuSaveDecoder): Promise<{
     artifactId: string
     status: 'passing'
@@ -58,9 +78,6 @@ export async function verifyFrozenLegacyArtifacts(decode: RisuSaveDecoder): Prom
         throw new Error('Frozen legacy manifest references an unknown output artifact')
     }
 
-    if (sha256(expectedCanonicalArtifact) !== manifest.expectedCanonicalSha256) {
-        throw new Error('Frozen legacy canonical artifact changed')
-    }
     const warnings = JSON.parse(warningArtifact) as string[]
     const results = []
     for (const artifact of manifest.artifacts) {
@@ -76,14 +93,17 @@ export async function verifyFrozenLegacyArtifacts(decode: RisuSaveDecoder): Prom
         const canonicalName = artifact.expectedCanonical ?? manifest.expectedCanonical
         const canonicalHash = artifact.expectedCanonicalSha256 ?? manifest.expectedCanonicalSha256
         const expectedCanonical = canonicalArtifacts[canonicalName]
-        if (expectedCanonical === undefined || sha256(expectedCanonical) !== canonicalHash) {
+        if (expectedCanonical === undefined) {
             throw new Error(`Frozen legacy canonical artifact changed: ${artifact.artifactId}`)
         }
         const decoded = await decode(input)
         const actualCanonical = `${JSON.stringify(decoded, null, 2)}\n`
-        if (actualCanonical !== expectedCanonical) {
-            throw new Error(`Legacy reverse import changed: ${artifact.artifactId}`)
-        }
+        verifyFrozenCanonicalText({
+            artifactId: artifact.artifactId,
+            checkoutText: expectedCanonical,
+            pinnedLfSha256: canonicalHash,
+            actualCanonical,
+        })
         results.push({ artifactId: artifact.artifactId, status: 'passing' as const, warnings })
     }
     return results
