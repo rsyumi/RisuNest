@@ -59,6 +59,60 @@ function deferred<T>() {
     return { promise, resolve }
 }
 
+function minimalCaptureContext() {
+    const character = {
+        type: 'character' as const,
+        name: 'Frozen Character',
+        chaId: 'frozen-character',
+        chatPage: 0,
+        chats: [{ message: [], note: '', name: '', localLore: [] }],
+        customscript: [],
+    }
+    return {
+        character: null,
+        characterName: 'Frozen Character',
+        characterImageSource: '',
+        characterLargePortrait: false,
+        userName: 'Frozen User',
+        userImageSource: '',
+        userLargePortrait: false,
+        moduleAssets: [],
+        presetRegex: [],
+        moduleRegexScripts: [],
+        assetStyle: '',
+        parserContext: {
+            database: { characters: [character] },
+            character,
+            userName: 'Frozen User',
+            personaPrompt: '',
+            modules: [],
+            moduleLorebooks: [],
+            selectedCharID: 0,
+            chatVariables: {},
+            globalChatVariables: {},
+            currentTime: 1,
+        },
+        settings: {
+            autoTranslate: false,
+            autoTranslateCachedOnly: false,
+            translatorType: 'mock',
+            translateBeforeHTMLFormatting: false,
+            legacyTranslation: false,
+            showTranslationLoading: false,
+            newImageHandlingBeta: false,
+            assetWidth: -1,
+            hideAllImages: false,
+            iconSize: 100,
+            zoomSize: 100,
+            lineHeight: 1.25,
+            dynamicAssets: false,
+            dynamicAssetsEditDisplay: false,
+            legacyMediaFindings: false,
+            assetMaxDifference: 0.5,
+        },
+    } as any
+}
+
 describe('ChatBody deferred inlay lifecycle', () => {
     let mounted: ReturnType<typeof mount> | undefined
     let target: HTMLDivElement
@@ -236,6 +290,29 @@ describe('ChatBody deferred inlay lifecycle', () => {
 
         mounted = mount(ChatBodyInlayHarness, { target, props: { onCaptureSettled } })
         await vi.waitFor(() => expect(onCaptureSettled).toHaveBeenCalledOnce())
+    })
+
+    test('reports a terminal capture parse failure instead of settling raw markup', async () => {
+        const parseError = new Error('terminal capture parse failure')
+        parserMocks.ParseMarkdown.mockRejectedValue(parseError)
+        const onCaptureSettled = vi.fn()
+        const onCaptureError = vi.fn()
+
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: {
+                captureContext: minimalCaptureContext(),
+                onCaptureSettled,
+                onCaptureError,
+            },
+        })
+
+        await vi.waitFor(() => expect(onCaptureError).toHaveBeenCalledWith(
+            expect.any(Number),
+            parseError,
+        ))
+        expect(onCaptureSettled).not.toHaveBeenCalled()
+        expect(target.textContent).not.toContain('first')
     })
 
     test('uses frozen capture character, role, settings, and assets without live lookups', async () => {

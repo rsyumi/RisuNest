@@ -45,16 +45,18 @@ export function getCurrentTranslatorPreset(database: Database = getDatabase()): 
 
 export async function translate(text:string, reverse:boolean, captureContext?: TranslateHTMLContext) {
     let db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
-    if(!reverse){
-        const ind = cache.origin.indexOf(text)
-        if(ind !== -1){
-            return cache.trans[ind]
+    if(!captureContext){
+        if(!reverse){
+            const ind = cache.origin.indexOf(text)
+            if(ind !== -1){
+                return cache.trans[ind]
+            }
         }
-    }
-    else{
-        const ind = cache.trans.indexOf(text)
-        if(ind !== -1){
-            return cache.origin[ind]
+        else{
+            const ind = cache.trans.indexOf(text)
+            if(ind !== -1){
+                return cache.origin[ind]
+            }
         }
     }
 
@@ -123,9 +125,10 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
 
     const result = fullResult.join("\n").trim()
 
-    cache.origin.push(reverse ? result : text)
-        
-    cache.trans.push(reverse ? text : result)
+    if(!captureContext){
+        cache.origin.push(reverse ? result : text)
+        cache.trans.push(reverse ? text : result)
+    }
 
 
     return result

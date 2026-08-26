@@ -89,6 +89,14 @@ export interface ChatScreenshotJob {
     readonly renderContext: FrozenChatScreenshotRenderContext
 }
 
+export interface ChatScreenshotDialogSnapshot {
+    readonly characterId: string
+    readonly chatId: string
+    readonly totalTurns: number
+    readonly messages: readonly DeepReadonly<Message>[]
+    readonly renderContext: FrozenChatScreenshotRenderContext
+}
+
 export function validateScreenshotRange(
     totalTurns: number,
     start: number,
@@ -182,6 +190,39 @@ function deepFreeze<T>(value: T): DeepReadonly<T> {
     return value as DeepReadonly<T>
 }
 
+export function createChatScreenshotDialogSnapshot(input: {
+    characterId: string
+    chatId: string
+    messages: Message[]
+    renderContext: ChatScreenshotRenderContext
+}): ChatScreenshotDialogSnapshot {
+    const messages = cloneScreenshotData(input.messages)
+    const renderContext = cloneScreenshotData(input.renderContext)
+    renderContext.totalTurns = messages.length
+    return deepFreeze({
+        characterId: input.characterId,
+        chatId: input.chatId,
+        totalTurns: messages.length,
+        messages,
+        renderContext,
+    })
+}
+
+export function createChatScreenshotJobFromDialogSnapshot(
+    snapshot: ChatScreenshotDialogSnapshot,
+    start: number,
+    end: number,
+): ChatScreenshotJob {
+    return createChatScreenshotJob({
+        characterId: snapshot.characterId,
+        chatId: snapshot.chatId,
+        messages: snapshot.messages as unknown as Message[],
+        start,
+        end,
+        renderContext: snapshot.renderContext as unknown as ChatScreenshotRenderContext,
+    })
+}
+
 export function createChatScreenshotJob(input: {
     characterId: string
     chatId: string
@@ -259,7 +300,7 @@ function deriveParserHistoryBounds(
         messages.slice(selectionStartIndex, selectionEndExclusive),
         renderContext,
     ]).join('\n')
-    if (/{{\s*(?:userhistory|usermessages|user_history|charhistory|charmessages|char_history|history|messages|messageunixtimearray|idleduration|idle_duration)(?=\s*(?:::|}}))/i.test(captureText)) {
+    if (/{{\s*(?:userhistory|usermessages|user_history|charhistory|charmessages|char_history|history|messages|messageunixtimearray|idleduration|idle_duration|lastmessage|lastmessageid|lastmessageindex)(?=\s*(?:::|}}))/i.test(captureText)) {
         start = 0
         end = messages.length
     }

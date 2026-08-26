@@ -288,7 +288,7 @@
         } catch (error) {
             //retry
             if(tries > 2){
-
+                if(captureContext) throw error
                 alertError(`Error while parsing chat message: ${translated}, ${error.message}, ${error.stack}`)
                 return data
             }
@@ -478,6 +478,8 @@
             {@html finalizeParsedMarkup(lastParsed)}
         {:then parsed}
             {@html finalizeParsedMarkup(parsed ?? '')}
+        {:catch}
+            {@html finalizeParsedMarkup(lastParsed)}
         {/await}
     </span>
 {/if}

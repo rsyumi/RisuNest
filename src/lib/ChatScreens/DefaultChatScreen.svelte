@@ -60,7 +60,13 @@
     import { handleDefaultChatUnreroll } from './defaultChatReroll';
     import ChatScreenshotDialog from './ChatScreenshotDialog.svelte';
     import ChatScreenshotCaptureSurface from './ChatScreenshotCaptureSurface.svelte';
-    import { createChatScreenshotJob, snapshotChatScreenshotCharacter } from 'src/ts/chatScreenshotRange';
+    import {
+        createChatScreenshotDialogSnapshot,
+        createChatScreenshotJobFromDialogSnapshot,
+        snapshotChatScreenshotCharacter,
+        type ChatScreenshotDialogSnapshot,
+        type ChatScreenshotRenderContext,
+    } from 'src/ts/chatScreenshotRange';
     import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
     import { isTauri } from 'src/ts/platform';
@@ -160,6 +166,7 @@
     let screenshotError = $state('')
     let screenshotController: AbortController | null = null
     let screenshotSurface: ChatScreenshotSurface | undefined
+    let screenshotDialogSnapshot: ChatScreenshotDialogSnapshot | null = null
 
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
@@ -589,7 +596,17 @@
     function openScreenshotDialog() {
         screenshotError = ''
         screenshotCompletedTurns = 0
-        screenshotTotalTurns = currentChat.length
+        const source = currentCharacter
+        const chat = source?.chats[source.chatPage]
+        screenshotDialogSnapshot = source && chat
+            ? createChatScreenshotDialogSnapshot({
+                characterId: source.chaId,
+                chatId: chat.id ?? `${source.chaId}:${source.chatPage}`,
+                messages: chat.message,
+                renderContext: createScreenshotRenderContext(source, chat),
+            })
+            : null
+        screenshotTotalTurns = screenshotDialogSnapshot?.totalTurns ?? 0
         screenshotDialogOpen = true
     }
 
@@ -600,6 +617,7 @@
     function closeScreenshotDialog() {
         cancelScreenshot()
         screenshotDialogOpen = false
+        screenshotDialogSnapshot = null
     }
 
     function captureVariables(source: character | groupChat, chat: ChatRecord) {
@@ -674,10 +692,65 @@
         }
     }
 
+    function createScreenshotRenderContext(
+        source: character | groupChat,
+        chat: ChatRecord,
+    ): ChatScreenshotRenderContext {
+        return {
+            character: createSimpleCharacter(source),
+            characterName: source.name,
+            characterImageSource: source.image,
+            characterLargePortrait: source.type === 'group'
+                ? false
+                : source.largePortrait ?? false,
+            userName: currentUsername,
+            userImageSource: userIcon,
+            userLargePortrait: userIconPortrait ?? false,
+            moduleAssets: getModuleAssets(),
+            presetRegex: DBState.db.presetRegex ?? [],
+            moduleRegexScripts: getModuleRegexScripts(),
+            assetStyle: source.prebuiltAssetStyle ?? '',
+            parserContext: createCaptureParserContext(source, chat, 1, chat.message.length),
+            settings: {
+                autoTranslate: DBState.db.autoTranslate,
+                autoTranslateCachedOnly: DBState.db.autoTranslateCachedOnly,
+                translatorType: DBState.db.translatorType,
+                translateBeforeHTMLFormatting: DBState.db.translateBeforeHTMLFormatting,
+                legacyTranslation: DBState.db.legacyTranslation,
+                showTranslationLoading: DBState.db.showTranslationLoading,
+                newImageHandlingBeta: DBState.db.newImageHandlingBeta ?? false,
+                assetWidth: DBState.db.assetWidth,
+                hideAllImages: DBState.db.hideAllImages ?? false,
+                iconSize: DBState.db.iconsize,
+                zoomSize: DBState.db.zoomsize,
+                lineHeight: DBState.db.lineHeight ?? 1.25,
+                dynamicAssets: DBState.db.dynamicAssets,
+                dynamicAssetsEditDisplay: DBState.db.dynamicAssetsEditDisplay,
+                legacyMediaFindings: DBState.db.legacyMediaFindings ?? false,
+                assetMaxDifference: DBState.db.assetMaxDifference,
+                theme: DBState.db.theme,
+                guiHTML: DBState.db.guiHTML,
+                roundIcons: DBState.db.roundIcons,
+                hideIcons: $HideIconStore,
+                proseInvert: $ColorSchemeTypeStore === 'dark',
+                requestInfoInsideChat: DBState.db.requestInfoInsideChat ?? false,
+                aiLawApplies: aiLawApplies(),
+                translator: DBState.db.translator,
+                swipe: DBState.db.swipe,
+                showFirstMessagePages: DBState.db.showFirstMessagePages,
+                memoryLimitThickness: DBState.db.memoryLimitThickness ?? 1,
+                customQuotes: DBState.db.customQuotes,
+                customQuotesData: DBState.db.customQuotesData ?? ['“', '”', '‘', '’'],
+                unformatQuotes: DBState.db.unformatQuotes,
+                blockquoteStyling: DBState.db.blockquoteStyling ?? false,
+                returnCSSError: DBState.db.returnCSSError ?? false,
+            },
+        }
+    }
+
     async function startScreenshot(start: number, end: number) {
-        if (screenshotRunning || !currentCharacter || !screenshotSurface) return
-        const selectedChat = currentCharacter.chats[currentCharacter.chatPage]
-        if (!selectedChat) return
+        const dialogSnapshot = screenshotDialogSnapshot
+        if (screenshotRunning || !dialogSnapshot || !screenshotSurface) return
 
         const controller = new AbortController()
         screenshotController = controller
@@ -686,63 +759,7 @@
         screenshotError = ''
 
         try {
-            const job = createChatScreenshotJob({
-                characterId: currentCharacter.chaId,
-                chatId: selectedChat.id ?? `${currentCharacter.chaId}:${currentCharacter.chatPage}`,
-                messages: selectedChat.message,
-                start,
-                end,
-                renderContext: {
-                    character: createSimpleCharacter(currentCharacter),
-                    characterName: currentCharacter.name,
-                    characterImageSource: currentCharacter.image,
-                    characterLargePortrait: currentCharacter.type === 'group'
-                        ? false
-                        : currentCharacter.largePortrait ?? false,
-                    userName: currentUsername,
-                    userImageSource: userIcon,
-                    userLargePortrait: userIconPortrait ?? false,
-                    moduleAssets: getModuleAssets(),
-                    presetRegex: DBState.db.presetRegex ?? [],
-                    moduleRegexScripts: getModuleRegexScripts(),
-                    assetStyle: currentCharacter.prebuiltAssetStyle ?? '',
-                    parserContext: createCaptureParserContext(currentCharacter, selectedChat, start, end),
-                    settings: {
-                        autoTranslate: DBState.db.autoTranslate,
-                        autoTranslateCachedOnly: DBState.db.autoTranslateCachedOnly,
-                        translatorType: DBState.db.translatorType,
-                        translateBeforeHTMLFormatting: DBState.db.translateBeforeHTMLFormatting,
-                        legacyTranslation: DBState.db.legacyTranslation,
-                        showTranslationLoading: DBState.db.showTranslationLoading,
-                        newImageHandlingBeta: DBState.db.newImageHandlingBeta ?? false,
-                        assetWidth: DBState.db.assetWidth,
-                        hideAllImages: DBState.db.hideAllImages ?? false,
-                        iconSize: DBState.db.iconsize,
-                        zoomSize: DBState.db.zoomsize,
-                        lineHeight: DBState.db.lineHeight ?? 1.25,
-                        dynamicAssets: DBState.db.dynamicAssets,
-                        dynamicAssetsEditDisplay: DBState.db.dynamicAssetsEditDisplay,
-                        legacyMediaFindings: DBState.db.legacyMediaFindings ?? false,
-                        assetMaxDifference: DBState.db.assetMaxDifference,
-                        theme: DBState.db.theme,
-                        guiHTML: DBState.db.guiHTML,
-                        roundIcons: DBState.db.roundIcons,
-                        hideIcons: $HideIconStore,
-                        proseInvert: $ColorSchemeTypeStore === 'dark',
-                        requestInfoInsideChat: DBState.db.requestInfoInsideChat ?? false,
-                        aiLawApplies: aiLawApplies(),
-                        translator: DBState.db.translator,
-                        swipe: DBState.db.swipe,
-                        showFirstMessagePages: DBState.db.showFirstMessagePages,
-                        memoryLimitThickness: DBState.db.memoryLimitThickness ?? 1,
-                        customQuotes: DBState.db.customQuotes,
-                        customQuotesData: DBState.db.customQuotesData ?? ['“', '”', '‘', '’'],
-                        unformatQuotes: DBState.db.unformatQuotes,
-                        blockquoteStyling: DBState.db.blockquoteStyling ?? false,
-                        returnCSSError: DBState.db.returnCSSError ?? false,
-                    },
-                },
-            })
+            const job = createChatScreenshotJobFromDialogSnapshot(dialogSnapshot, start, end)
             screenshotTotalTurns = job.totalTurns
 
             const fileBase = `chat-${crypto.randomUUID()}`
@@ -773,6 +790,7 @@
             }
             alertNormal(language.screenshotSaved)
             screenshotDialogOpen = false
+            screenshotDialogSnapshot = null
         } catch (error) {
             if (!(error instanceof DOMException && error.name === 'AbortError')) {
                 console.error(error)

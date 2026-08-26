@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+    createChatScreenshotDialogSnapshot,
     createChatScreenshotJob,
+    createChatScreenshotJobFromDialogSnapshot,
     fullScreenshotRange,
     recentScreenshotRange,
     validateScreenshotRange,
@@ -160,6 +162,70 @@ describe('chat screenshot ranges', () => {
         expect(job.messages).toEqual([
             { role: 'user', data: 'proxied', generationInfo: { model: 'model' } },
         ])
+    })
+
+    it('keeps dialog-open identity and messages after the live source changes', () => {
+        const messages = [
+            { role: 'user' as const, data: 'open-time first' },
+            { role: 'char' as const, data: 'open-time second' },
+        ]
+        const context = parserContext()
+        context.userName = 'Open User'
+        const dialogSnapshot = createChatScreenshotDialogSnapshot({
+            characterId: 'open-character',
+            chatId: 'open-chat',
+            messages,
+            renderContext: {
+                character: null,
+                characterName: 'Open Character',
+                characterImageSource: '',
+                characterLargePortrait: false,
+                userName: 'Open User',
+                userImageSource: '',
+                userLargePortrait: false,
+                moduleAssets: [],
+                presetRegex: [],
+                moduleRegexScripts: [],
+                assetStyle: '',
+                parserContext: context,
+                settings: {
+                    autoTranslate: false,
+                    autoTranslateCachedOnly: false,
+                    translatorType: 'google',
+                    translateBeforeHTMLFormatting: false,
+                    legacyTranslation: false,
+                    showTranslationLoading: false,
+                    newImageHandlingBeta: false,
+                    assetWidth: -1,
+                    hideAllImages: false,
+                    iconSize: 100,
+                    zoomSize: 100,
+                    lineHeight: 1.25,
+                    dynamicAssets: false,
+                    dynamicAssetsEditDisplay: false,
+                    legacyMediaFindings: false,
+                    assetMaxDifference: 0.5,
+                },
+            },
+        })
+
+        messages[0].data = 'changed first'
+        messages.push({ role: 'char', data: 'changed third' })
+        context.userName = 'Changed User'
+
+        const job = createChatScreenshotJobFromDialogSnapshot(dialogSnapshot, 1, 2)
+
+        expect(job).toMatchObject({
+            characterId: 'open-character',
+            chatId: 'open-chat',
+            totalTurns: 2,
+        })
+        expect(job.messages.map((message) => message.data)).toEqual([
+            'open-time first',
+            'open-time second',
+        ])
+        expect(job.renderContext.parserContext.userName).toBe('Open User')
+        expect(Object.isFrozen(dialogSnapshot.messages[0])).toBe(true)
     })
 
     it('keeps the selected messages and the derived frozen history window needed by CBS', () => {

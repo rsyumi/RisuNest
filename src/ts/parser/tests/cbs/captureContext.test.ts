@@ -6,6 +6,11 @@ const live = vi.hoisted(() => ({
     database: {} as Database,
     modules: [] as Array<{ id: string; name: string; namespace?: string }>,
 }))
+const bergamotTranslate = vi.hoisted(() => vi.fn(async (
+    _text: string,
+    from: string,
+    to: string,
+) => `${from}->${to}`))
 
 vi.mock('../../../storage/database.svelte', () => ({
     appVer: '1.0.0',
@@ -41,11 +46,12 @@ vi.mock('../../../process/triggers', () => ({ runTrigger: vi.fn() }))
 vi.mock('../../../alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
 vi.mock('../../../process/index.svelte', () => ({ doingChat: writable(false) }))
 vi.mock('../../../process/request/request', () => ({ requestChatData: vi.fn() }))
+vi.mock('../../../translator/bergamotTranslator', () => ({ bergamotTranslate }))
 
 const { ParseMarkdown, risuChatParser, trimMarkdown } = await import('../../parser.svelte')
 const { processScriptFull } = await import('../../../process/scripts')
 const { createChatScreenshotJob, snapshotChatScreenshotCharacter } = await import('../../../chatScreenshotRange')
-const { clearLLMCache, setLLMCache, translateHTML } = await import('../../../translator/translator')
+const { clearLLMCache, setLLMCache, translate, translateHTML } = await import('../../../translator/translator')
 
 function makeCharacter(name: string, messages = [
     { role: 'user' as const, data: `${name} previous` },
@@ -365,6 +371,90 @@ test('keeps absolute chatindex while previouscharchat scans the projected frozen
     expect(styled).toContain('content:"2|earlier character turn"')
 })
 
+test('keeps the original final message and absolute id for a middle capture range', async () => {
+    const frozenCharacter = makeCharacter('Frozen', [
+        { role: 'char', data: 'opening character turn' },
+        { role: 'user', data: 'first user turn' },
+        { role: 'char', data: '{{lastmessage}}|{{lastmessageid}}' },
+        { role: 'user', data: 'later user turn' },
+        { role: 'char', data: 'original final turn' },
+    ])
+    const frozenDatabase = makeDatabase(frozenCharacter, 'Frozen')
+    const job = createChatScreenshotJob({
+        characterId: frozenCharacter.chaId,
+        chatId: 'chat',
+        messages: frozenCharacter.chats[0].message,
+        start: 3,
+        end: 3,
+        renderContext: {
+            character: null,
+            characterName: 'Frozen',
+            characterImageSource: '',
+            characterLargePortrait: false,
+            userName: 'Frozen user',
+            userImageSource: '',
+            userLargePortrait: false,
+            moduleAssets: [],
+            presetRegex: [],
+            moduleRegexScripts: [],
+            assetStyle: '',
+            parserContext: {
+                database: frozenDatabase,
+                character: frozenCharacter,
+                userName: 'Frozen user',
+                personaPrompt: '',
+                modules: [],
+                moduleLorebooks: [],
+                selectedCharID: 0,
+                chatVariables: {},
+                globalChatVariables: {},
+                currentTime: 1,
+            },
+            settings: {
+                autoTranslate: false,
+                autoTranslateCachedOnly: false,
+                translatorType: 'google',
+                translateBeforeHTMLFormatting: false,
+                legacyTranslation: false,
+                showTranslationLoading: false,
+                newImageHandlingBeta: false,
+                assetWidth: -1,
+                hideAllImages: false,
+                iconSize: 100,
+                zoomSize: 100,
+                lineHeight: 1.25,
+                dynamicAssets: false,
+                dynamicAssetsEditDisplay: false,
+                legacyMediaFindings: false,
+                assetMaxDifference: 0.5,
+            },
+        },
+    })
+    const capture = job.renderContext
+
+    const output = await ParseMarkdown(
+        job.messages[0].data,
+        capture.parserContext.character as any,
+        'back',
+        job.start - 1,
+        { chatRole: 'char' },
+        {
+            projectedChatID: capture.firstParserMessageIndex,
+            scriptContext: {
+                presetRegex: capture.presetRegex,
+                moduleRegexScripts: capture.moduleRegexScripts,
+                moduleAssets: capture.moduleAssets,
+                dynamicAssets: capture.settings.dynamicAssets,
+                dynamicAssetsEditDisplay: capture.settings.dynamicAssetsEditDisplay,
+                parserContext: capture.parserContext,
+            },
+        } as any,
+    )
+
+    expect(output).toContain('original final turn|4')
+    expect(capture.parserContext.character.chats[0].message).toHaveLength(5)
+})
+
 test('uses frozen parser and regex inputs through real cached auto-translation', async () => {
     await clearLLMCache()
     const frozenCharacter = makeCharacter('Frozen', [
@@ -483,6 +573,66 @@ test('uses frozen parser and regex inputs through real cached auto-translation',
     expect(result).toBe('frozen module')
     expect(result).not.toContain('Changed')
     await clearLLMCache()
+})
+
+test('does not reuse a live text-only translation cache entry during capture', async () => {
+    const text = 'capture cache identity regression'
+    const liveCharacter = makeCharacter('Live')
+    live.database = {
+        ...makeDatabase(liveCharacter, 'Live'),
+        translatorType: 'bergamot',
+        translator: 'live-target',
+        translatorInputLanguage: 'en',
+        aiModel: '',
+        htmlTranslation: false,
+        combineTranslation: false,
+    } as Database
+    expect(await translate(text, false)).toBe('en->live-target')
+
+    const frozenCharacter = makeCharacter('Frozen')
+    const frozenDatabase = {
+        ...makeDatabase(frozenCharacter, 'Frozen'),
+        translatorType: 'bergamot',
+        translator: 'frozen-target',
+        translatorInputLanguage: 'en',
+        aiModel: '',
+        htmlTranslation: false,
+        combineTranslation: false,
+    } as Database
+    const result = await translateHTML(
+        `<p>${text}</p>`,
+        false,
+        frozenCharacter,
+        1,
+        false,
+        {
+            scriptContext: {
+                presetRegex: [],
+                moduleRegexScripts: [],
+                moduleAssets: [],
+                dynamicAssets: false,
+                dynamicAssetsEditDisplay: false,
+                parserContext: {
+                    database: frozenDatabase,
+                    character: frozenCharacter,
+                    userName: 'Frozen user',
+                    personaPrompt: '',
+                    modules: [],
+                    moduleLorebooks: [],
+                    selectedCharID: 0,
+                    chatVariables: {},
+                    globalChatVariables: {},
+                    currentTime: 1,
+                },
+            },
+            projectedChatID: 1,
+            chara: frozenCharacter,
+            cbsConditions: { chatRole: 'char' },
+        },
+    )
+
+    expect(result).toContain('frozen-target')
+    expect(result).not.toContain('live-target')
 })
 
 test('keeps chardisplayasset command and exclusions in the minimal frozen character', () => {
