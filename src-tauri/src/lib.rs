@@ -1,6 +1,6 @@
 #[allow(dead_code)]
 mod asset_repository;
-mod import_export_jobs;
+pub mod import_export_jobs;
 #[allow(dead_code)]
 mod local_backup;
 mod native_file_jobs;
