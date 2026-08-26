@@ -428,6 +428,7 @@ export function createPersistentDataRuntime(
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
         captureCharacter: dependencies.state.captureCharacter,
         replaceDatabase: (database) => {
+            workingSet.invalidateActiveConversationSession()
             const activeCharacterIds = workingSet.reconcileActiveCharacterIds(
                 database,
                 dependencies.state.getSelectedCharacterId() ?? null,
@@ -570,9 +571,12 @@ export function createPersistentDataRuntime(
                 getMutationGeneration: () => coordinator.mutationGeneration,
                 getNavigationGeneration: () => workingSet.navigationGenerationToken,
                 acquireRevision: (revision) => dependencies.store.acquireRevision(revision),
-                installCompleteDatabase: (database) =>
-                    (dependencies.state.installCompleteDatabase
-                        ?? dependencies.state.replaceDatabase)(database),
+                installCompleteDatabase: (database) => {
+                    workingSet.invalidateNavigation()
+                    const installDatabase = dependencies.state.installCompleteDatabase
+                        ?? dependencies.state.replaceDatabase
+                    installDatabase(database)
+                },
                 restoreSelection: (characterId, conversationId) =>
                     dependencies.state.restoreSelection?.(characterId, conversationId),
                 adoptMaterializedDatabase: (revision, mutationGeneration, database) =>
@@ -607,6 +611,7 @@ export function createPersistentDataRuntime(
                 selectedConversationId !==
                     (dependencies.state.getSelectedConversationId?.() ?? null)
             ) return false
+            workingSet.invalidateNavigation()
             const activeCharacterIds = workingSet.reconcileActiveCharacterIds(
                 database,
                 selectedCharacterId,

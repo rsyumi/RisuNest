@@ -109,6 +109,10 @@ export class ActiveWorkingSet {
         this.clearActiveConversationSession()
     }
 
+    invalidateActiveConversationSession(): void {
+        this.clearActiveConversationSession()
+    }
+
     async deactivate(): Promise<boolean> {
         if (this.dependencies.canDeactivateWorkingSet?.() === false) return false
         const generation = ++this.navigationGeneration

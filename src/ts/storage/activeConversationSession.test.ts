@@ -10,6 +10,8 @@ import {
     requireCurrentConversationSession,
     type ActiveConversationTransaction,
     type ActiveConversationPinReason,
+    type ConversationPosition,
+    type MessageLocator,
 } from './activeConversationSession'
 
 function message(id: string | undefined, data: string): Message {
@@ -74,12 +76,16 @@ describe('ActiveConversationSession', () => {
                     conversationId: 'conversation-a',
                     absoluteIndex: 1,
                     sessionVersion: 0,
+                    sessionToken: expect.any(String),
+                    locatorToken: expect.any(String),
                 },
                 {
                     conversationId: 'conversation-a',
                     absoluteIndex: 2,
                     expectedMessageId: 'duplicate',
                     sessionVersion: 0,
+                    sessionToken: expect.any(String),
+                    locatorToken: expect.any(String),
                 },
             ],
             startIndex: 1,
@@ -168,6 +174,8 @@ describe('ActiveConversationSession', () => {
             absoluteIndex: 4,
             expectedMessageId: 'append',
             sessionVersion: 1,
+            sessionToken: expect.any(String),
+            locatorToken: expect.any(String),
         })
         const edited = session.edit(appended, message('append', 'edited four'))
         expect(edited.sessionVersion).toBe(2)
@@ -262,6 +270,62 @@ describe('ActiveConversationSession', () => {
         expect(() => arrayCase.session.replaceTail(arrayPosition, [])).toThrow(
             MessageLocatorMismatchError,
         )
+    })
+
+    it('validates structural locator tokens across clone, spread, and proxy transport', () => {
+        const cloneCase = createSession()
+        const cloneLocator = cloneCase.session.locate(0)
+        expect(typeof cloneLocator.sessionToken).toBe('string')
+        expect(typeof cloneLocator.locatorToken).toBe('string')
+        expect(() => cloneCase.session.edit(
+            structuredClone(cloneLocator),
+            message('duplicate', 'cloned locator'),
+        )).not.toThrow()
+
+        const spreadCase = createSession()
+        const spreadLocator = { ...spreadCase.session.locate(1) }
+        expect(() => spreadCase.session.delete(spreadLocator)).not.toThrow()
+
+        const proxyCase = createSession()
+        const proxyLocator = new Proxy(proxyCase.session.locate(2), {})
+        expect(() => proxyCase.session.edit(
+            proxyLocator,
+            message('duplicate', 'proxied locator'),
+        )).not.toThrow()
+
+        const positionCase = createSession()
+        const clonedPosition = structuredClone(positionCase.session.positionAt(2))
+        expect(typeof clonedPosition.positionToken).toBe('string')
+        expect(() => positionCase.session.replaceTail(clonedPosition, [])).not.toThrow()
+
+        const forgedCase = createSession()
+        const valid = forgedCase.session.locate(0)
+        const forgedLocator = {
+            ...valid,
+            locatorToken: 'forged-locator-token',
+        } as MessageLocator
+        const forgedSession = {
+            ...valid,
+            sessionToken: 'forged-session-token',
+        } as MessageLocator
+        const forgedPosition = {
+            ...forgedCase.session.positionAt(1),
+            positionToken: 'forged-position-token',
+        } as ConversationPosition
+        expect(() => forgedCase.session.delete(forgedLocator)).toThrow(
+            MessageLocatorMismatchError,
+        )
+        expect(() => forgedCase.session.delete(forgedSession)).toThrow(
+            MessageLocatorMismatchError,
+        )
+        expect(() => forgedCase.session.replaceTail(forgedPosition, [])).toThrow(
+            MessageLocatorMismatchError,
+        )
+
+        const staleCase = createSession()
+        const stale = structuredClone(staleCase.session.locate(0))
+        staleCase.session.append(message('new', 'version advance'))
+        expect(() => staleCase.session.delete(stale)).toThrow(ConversationSessionStaleError)
     })
 
     it('publishes a successful transaction once and rolls back the whole draft after any failure', () => {

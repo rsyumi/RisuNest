@@ -9,17 +9,35 @@ export type ActiveConversationPinReason =
     | 'transaction'
     | 'compatibility'
 
+declare const conversationSessionTokenBrand: unique symbol
+declare const messageLocatorTokenBrand: unique symbol
+declare const conversationPositionTokenBrand: unique symbol
+
+export type ConversationSessionToken = string & {
+    readonly [conversationSessionTokenBrand]: true
+}
+export type MessageLocatorToken = string & {
+    readonly [messageLocatorTokenBrand]: true
+}
+export type ConversationPositionToken = string & {
+    readonly [conversationPositionTokenBrand]: true
+}
+
 export interface MessageLocator {
     conversationId: string
     absoluteIndex: number
     expectedMessageId?: string
     sessionVersion: number
+    sessionToken: ConversationSessionToken
+    locatorToken: MessageLocatorToken
 }
 
 export interface ConversationPosition {
     conversationId: string
     absoluteIndex: number
     sessionVersion: number
+    sessionToken: ConversationSessionToken
+    positionToken: ConversationPositionToken
 }
 
 export interface ActiveConversationWindow {
@@ -91,21 +109,126 @@ export interface ActiveConversationSessionOptions {
 }
 
 interface MessageLocatorIdentity {
+    type: 'message'
+    absoluteIndex: number
+    sessionVersion: number
     messages: readonly Message[]
     message: Message
 }
 
 interface ConversationPositionIdentity {
+    type: 'position'
+    absoluteIndex: number
+    sessionVersion: number
     messages: readonly Message[]
     before?: Message
     after?: Message
 }
 
-const messageLocatorIdentities = new WeakMap<MessageLocator, MessageLocatorIdentity>()
-const conversationPositionIdentities = new WeakMap<
-    ConversationPosition,
-    ConversationPositionIdentity
->()
+type ConversationTokenIdentity = MessageLocatorIdentity | ConversationPositionIdentity
+
+const MAX_ACTIVE_CONVERSATION_TOKENS = CONVERSATION_RANGE_MAX_LIMIT
+let nextConversationSessionToken = 0
+let nextConversationLocatorToken = 0
+
+class ConversationLocatorRegistry {
+    readonly sessionToken: ConversationSessionToken
+    private readonly identities = new Map<string, ConversationTokenIdentity>()
+
+    constructor(sessionToken?: ConversationSessionToken) {
+        this.sessionToken = sessionToken ?? createConversationSessionToken()
+    }
+
+    fork(): ConversationLocatorRegistry {
+        return new ConversationLocatorRegistry(this.sessionToken)
+    }
+
+    registerMessage(
+        messages: readonly Message[],
+        absoluteIndex: number,
+        sessionVersion: number,
+        message: Message,
+    ): MessageLocatorToken {
+        const token = createMessageLocatorToken()
+        this.set(token, {
+            type: 'message',
+            absoluteIndex,
+            sessionVersion,
+            messages,
+            message,
+        })
+        return token
+    }
+
+    registerPosition(
+        messages: readonly Message[],
+        absoluteIndex: number,
+        sessionVersion: number,
+    ): ConversationPositionToken {
+        const token = createConversationPositionToken()
+        this.set(token, {
+            type: 'position',
+            absoluteIndex,
+            sessionVersion,
+            messages,
+            before: messages[absoluteIndex - 1],
+            after: messages[absoluteIndex],
+        })
+        return token
+    }
+
+    matchesMessage(locator: MessageLocator, messages: readonly Message[]): boolean {
+        if (locator.sessionToken !== this.sessionToken) return false
+        const identity = this.identities.get(locator.locatorToken)
+        return identity?.type === 'message' &&
+            identity.absoluteIndex === locator.absoluteIndex &&
+            identity.sessionVersion === locator.sessionVersion &&
+            identity.messages === messages &&
+            identity.message === messages[locator.absoluteIndex]
+    }
+
+    matchesPosition(
+        position: ConversationPosition,
+        messages: readonly Message[],
+    ): boolean {
+        if (position.sessionToken !== this.sessionToken) return false
+        const identity = this.identities.get(position.positionToken)
+        return identity?.type === 'position' &&
+            identity.absoluteIndex === position.absoluteIndex &&
+            identity.sessionVersion === position.sessionVersion &&
+            identity.messages === messages &&
+            identity.before === messages[position.absoluteIndex - 1] &&
+            identity.after === messages[position.absoluteIndex]
+    }
+
+    clear(): void {
+        this.identities.clear()
+    }
+
+    private set(token: string, identity: ConversationTokenIdentity): void {
+        if (this.identities.size >= MAX_ACTIVE_CONVERSATION_TOKENS) {
+            const oldestToken = this.identities.keys().next().value
+            if (oldestToken !== undefined) this.identities.delete(oldestToken)
+        }
+        this.identities.set(token, identity)
+    }
+}
+
+function createConversationSessionToken(): ConversationSessionToken {
+    nextConversationSessionToken += 1
+    return `conversation-session-${nextConversationSessionToken}` as ConversationSessionToken
+}
+
+function createMessageLocatorToken(): MessageLocatorToken {
+    nextConversationLocatorToken += 1
+    return `message-locator-${nextConversationLocatorToken}` as MessageLocatorToken
+}
+
+function createConversationPositionToken(): ConversationPositionToken {
+    nextConversationLocatorToken += 1
+    return `conversation-position-${nextConversationLocatorToken}` as ConversationPositionToken
+}
+
 const finishConversationTransaction = Symbol('finishConversationTransaction')
 const abortConversationTransaction = Symbol('abortConversationTransaction')
 
@@ -113,6 +236,7 @@ interface CompletedConversationTransaction {
     messages: Message[]
     version: number
     commands: readonly ActiveConversationCommandName[]
+    locatorRegistry: ConversationLocatorRegistry
 }
 
 export class ConversationNotFoundError extends Error {
@@ -179,6 +303,7 @@ function createLocator(
     messages: readonly Message[],
     absoluteIndex: number,
     sessionVersion: number,
+    locatorRegistry: ConversationLocatorRegistry,
 ): MessageLocator {
     validateIndex(absoluteIndex, 'Message locator index')
     const message = messages[absoluteIndex]
@@ -188,8 +313,14 @@ function createLocator(
         absoluteIndex,
         ...(message.chatId === undefined ? {} : { expectedMessageId: message.chatId }),
         sessionVersion,
+        sessionToken: locatorRegistry.sessionToken,
+        locatorToken: locatorRegistry.registerMessage(
+            messages,
+            absoluteIndex,
+            sessionVersion,
+            message,
+        ),
     }
-    messageLocatorIdentities.set(locator, { messages, message })
     return locator
 }
 
@@ -198,6 +329,7 @@ function createPosition(
     messages: readonly Message[],
     absoluteIndex: number,
     sessionVersion: number,
+    locatorRegistry: ConversationLocatorRegistry,
 ): ConversationPosition {
     validateIndex(absoluteIndex, 'Conversation position index')
     if (absoluteIndex > messages.length) {
@@ -207,12 +339,13 @@ function createPosition(
         conversationId,
         absoluteIndex,
         sessionVersion,
+        sessionToken: locatorRegistry.sessionToken,
+        positionToken: locatorRegistry.registerPosition(
+            messages,
+            absoluteIndex,
+            sessionVersion,
+        ),
     }
-    conversationPositionIdentities.set(position, {
-        messages,
-        before: messages[absoluteIndex - 1],
-        after: messages[absoluteIndex],
-    })
     return position
 }
 
@@ -221,7 +354,9 @@ function validateLocator(
     messages: readonly Message[],
     sessionVersion: number,
     locator: MessageLocator,
+    locatorRegistry: ConversationLocatorRegistry,
     sourceMessages?: readonly Message[],
+    sourceLocatorRegistry?: ConversationLocatorRegistry,
 ): Message {
     if (locator.conversationId !== conversationId) {
         throw new MessageLocatorMismatchError(
@@ -234,12 +369,10 @@ function validateLocator(
     validateIndex(locator.absoluteIndex, 'Message locator index')
     const message = messages[locator.absoluteIndex]
     if (!message) throw new MessageLocatorNotFoundError(locator.absoluteIndex)
-    const identity = messageLocatorIdentities.get(locator)
-    const matchesCurrent = identity?.messages === messages && identity.message === message
+    const matchesCurrent = locatorRegistry.matchesMessage(locator, messages)
     const matchesSource =
         sourceMessages !== undefined &&
-        identity?.messages === sourceMessages &&
-        identity.message === sourceMessages[locator.absoluteIndex]
+        sourceLocatorRegistry?.matchesMessage(locator, sourceMessages) === true
     if (!matchesCurrent && !matchesSource) {
         throw new MessageLocatorMismatchError(
             `Message locator identity changed at index ${locator.absoluteIndex}`,
@@ -261,7 +394,9 @@ function validatePosition(
     messages: readonly Message[],
     sessionVersion: number,
     position: ConversationPosition,
+    locatorRegistry: ConversationLocatorRegistry,
     sourceMessages?: readonly Message[],
+    sourceLocatorRegistry?: ConversationLocatorRegistry,
 ): void {
     if (position.conversationId !== conversationId) {
         throw new MessageLocatorMismatchError(
@@ -275,13 +410,11 @@ function validatePosition(
     if (position.absoluteIndex > messages.length) {
         throw new MessageLocatorNotFoundError(position.absoluteIndex)
     }
-    const identity = conversationPositionIdentities.get(position)
-    const matches = (candidate: readonly Message[] | undefined) =>
-        candidate !== undefined &&
-        identity?.messages === candidate &&
-        identity.before === candidate[position.absoluteIndex - 1] &&
-        identity.after === candidate[position.absoluteIndex]
-    if (!matches(messages) && !matches(sourceMessages)) {
+    const matchesCurrent = locatorRegistry.matchesPosition(position, messages)
+    const matchesSource =
+        sourceMessages !== undefined &&
+        sourceLocatorRegistry?.matchesPosition(position, sourceMessages) === true
+    if (!matchesCurrent && !matchesSource) {
         throw new MessageLocatorMismatchError(
             `Conversation position identity changed at index ${position.absoluteIndex}`,
         )
@@ -294,6 +427,7 @@ function readRange(
     messages: readonly Message[],
     storeRevision: DataRevision,
     sessionVersion: number,
+    locatorRegistry: ConversationLocatorRegistry,
     requestedStart: number,
     limit: number,
 ): ActiveConversationWindow {
@@ -307,7 +441,13 @@ function readRange(
         conversationId,
         messages: safeStructuredClone(selected),
         locators: selected.map((_message, offset) =>
-            createLocator(conversationId, messages, startIndex + offset, sessionVersion),
+            createLocator(
+                conversationId,
+                messages,
+                startIndex + offset,
+                sessionVersion,
+                locatorRegistry,
+            ),
         ),
         startIndex,
         endIndex,
@@ -320,6 +460,7 @@ function readRange(
 export class ActiveConversationTransaction {
     private currentMessages: Message[]
     private currentVersion: number
+    private readonly locatorRegistry: ConversationLocatorRegistry
     private readonly commandNames: ActiveConversationCommandName[] = []
     private closed = false
 
@@ -328,10 +469,12 @@ export class ActiveConversationTransaction {
         private readonly conversationId: string,
         private readonly sourceMessages: readonly Message[],
         private readonly storeRevision: DataRevision,
+        private readonly sourceLocatorRegistry: ConversationLocatorRegistry,
         sessionVersion: number,
     ) {
         this.currentMessages = safeStructuredClone([...sourceMessages])
         this.currentVersion = sessionVersion
+        this.locatorRegistry = sourceLocatorRegistry.fork()
     }
 
     get version(): number {
@@ -351,6 +494,7 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             absoluteIndex,
             this.currentVersion,
+            this.locatorRegistry,
         )
     }
 
@@ -361,6 +505,7 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             absoluteIndex,
             this.currentVersion,
+            this.locatorRegistry,
         )
     }
 
@@ -372,6 +517,7 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             this.storeRevision,
             this.currentVersion,
+            this.locatorRegistry,
             startIndex,
             limit,
         )
@@ -392,7 +538,9 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.locatorRegistry,
             this.sourceMessages,
+            this.sourceLocatorRegistry,
         )
         const nextMessages = this.currentMessages.slice()
         nextMessages[locator.absoluteIndex] = safeStructuredClone(message)
@@ -408,7 +556,9 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.locatorRegistry,
             this.sourceMessages,
+            this.sourceLocatorRegistry,
         )
         this.currentMessages = [
             ...this.currentMessages.slice(0, locator.absoluteIndex),
@@ -424,7 +574,9 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.locatorRegistry,
             this.sourceMessages,
+            this.sourceLocatorRegistry,
         )
         this.currentMessages = this.currentMessages.slice(0, locator.absoluteIndex)
         this.record('truncate')
@@ -447,7 +599,9 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.locatorRegistry,
             this.sourceMessages,
+            this.sourceLocatorRegistry,
         )
         const endIndex = locator.absoluteIndex + 1
         return {
@@ -484,6 +638,7 @@ export class ActiveConversationTransaction {
             messages: this.currentMessages,
             version: this.currentVersion,
             commands: this.commandNames.slice(),
+            locatorRegistry: this.locatorRegistry,
         }
     }
 
@@ -501,7 +656,9 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             this.currentVersion,
             position,
+            this.locatorRegistry,
             this.sourceMessages,
+            this.sourceLocatorRegistry,
         )
         this.currentMessages = [
             ...this.currentMessages.slice(0, position.absoluteIndex),
@@ -512,6 +669,7 @@ export class ActiveConversationTransaction {
 
     private record(command: ActiveConversationCommandName): void {
         this.currentVersion += 1
+        this.locatorRegistry.clear()
         this.commandNames.push(command)
     }
 
@@ -529,6 +687,7 @@ export class ActiveConversationSession {
     private readonly conversation: Chat
     private readonly onMutation?: (event: ActiveConversationMutationEvent) => void
     private readonly pins = new Map<ActiveConversationPinReason, number>()
+    private locatorRegistry = new ConversationLocatorRegistry()
     private sessionVersion = 0
     private transactionActive = false
     private active = true
@@ -568,6 +727,7 @@ export class ActiveConversationSession {
             this.conversation.message,
             absoluteIndex,
             this.sessionVersion,
+            this.locatorRegistry,
         )
     }
 
@@ -578,6 +738,7 @@ export class ActiveConversationSession {
             this.conversation.message,
             absoluteIndex,
             this.sessionVersion,
+            this.locatorRegistry,
         )
     }
 
@@ -595,6 +756,7 @@ export class ActiveConversationSession {
             this.conversation.message,
             this.storeRevision,
             this.sessionVersion,
+            this.locatorRegistry,
             startIndex,
             limit,
         )
@@ -664,6 +826,7 @@ export class ActiveConversationSession {
             this.conversation.message,
             this.sessionVersion,
             locator,
+            this.locatorRegistry,
         )
         const endIndex = locator.absoluteIndex + 1
         return {
@@ -688,6 +851,7 @@ export class ActiveConversationSession {
             this.conversationId,
             this.conversation.message,
             this.storeRevision,
+            this.locatorRegistry,
             previousVersion,
         )
         try {
@@ -700,8 +864,10 @@ export class ActiveConversationSession {
             const completed = transaction[finishConversationTransaction]()
             if (completed.commands.length > 0) {
                 const previousMessages = this.conversation.message
+                const previousLocatorRegistry = this.locatorRegistry
                 this.conversation.message = completed.messages
                 this.sessionVersion = completed.version
+                this.locatorRegistry = completed.locatorRegistry
                 try {
                     this.onMutation?.({
                         characterId: this.characterId,
@@ -710,9 +876,12 @@ export class ActiveConversationSession {
                         sessionVersion: this.sessionVersion,
                         commands: completed.commands,
                     })
+                    previousLocatorRegistry.clear()
                 } catch (error) {
                     this.conversation.message = previousMessages
                     this.sessionVersion = previousVersion
+                    completed.locatorRegistry.clear()
+                    this.locatorRegistry = previousLocatorRegistry
                     throw error
                 }
             }
@@ -752,6 +921,7 @@ export class ActiveConversationSession {
         if (!this.active) return
         this.active = false
         this.pins.clear()
+        this.locatorRegistry.clear()
     }
 
     private assertActive(): void {

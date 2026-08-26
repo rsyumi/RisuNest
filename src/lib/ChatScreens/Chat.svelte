@@ -28,7 +28,7 @@
     import { DeferredInlayMarkerRegistry, withResolvedDeferredInlaySources } from "src/ts/process/files/inlayRenderSource"
     import { copyImageSourceToDataUrl } from "src/ts/process/files/chatCopyInlays"
     import { getActiveConversationSession } from "../../ts/storage/persistentDataRuntime.svelte"
-    import { requireCurrentConversationSession } from "../../ts/storage/activeConversationSession"
+    import { removeChatMessage } from "../../ts/chatRemoval"
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -114,50 +114,21 @@
     }
 
     async function rm(e:MouseEvent, rec?:boolean){
-        const session = currentConversationSession()
-        const locator = session?.locate(idx)
-        const truncate = () => {
-            if (session && locator) {
-                requireCurrentConversationSession(session, currentConversationSession()).truncate(locator)
-            }
-            else {
+        await removeChatMessage({
+            absoluteIndex: idx,
+            shiftKey: e.shiftKey,
+            recursive: rec ?? false,
+            askRemoval: DBState.db.askRemoval ?? false,
+            instantRemove: DBState.db.instantRemove ?? false,
+            captureCurrent: () => {
                 const character = DBState.db.characters[selIdState.selId]
-                const chat = character?.chats[character.chatPage]
-                if (chat) chat.message = chat.message.slice(0, idx)
-            }
-        }
-        const remove = () => {
-            if (session && locator) {
-                requireCurrentConversationSession(session, currentConversationSession()).delete(locator)
-            }
-            else {
-                const character = DBState.db.characters[selIdState.selId]
-                const chat = character?.chats[character.chatPage]
-                if (!chat) return
-                chat.message.splice(idx, 1)
-                chat.message = chat.message
-            }
-        }
-        if(e.shiftKey){
-            truncate()
-            return
-        }
-
-        const rm = DBState.db.askRemoval ? await alertConfirm(language.removeChat) : true
-        if(rm){
-            if(DBState.db.instantRemove || rec){
-                const r = await alertConfirm(language.instantRemoveConfirm)
-                if(!r){
-                    truncate()
-                }
-                else{
-                    remove()
-                }
-            }
-            else{
-                remove()
-            }
-        }
+                const conversation = character?.chats[character.chatPage]
+                return character && conversation ? { character, conversation } : null
+            },
+            getCurrentSession: currentConversationSession,
+            confirmRemoval: () => alertConfirm(language.removeChat),
+            confirmInstantRemoval: () => alertConfirm(language.instantRemoveConfirm),
+        })
     }
 
     async function edit(){

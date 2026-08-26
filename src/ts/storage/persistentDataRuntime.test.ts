@@ -40,6 +40,62 @@ function makeDatabase(username: string): Database {
     } as unknown as Database
 }
 
+function makeConversationDatabase(username: string): Database {
+    const database = makeDatabase(username)
+    database.characters[0].chatPage = 0
+    database.characters[0].chats = [{
+        id: 'chat-a',
+        name: 'Chat A',
+        note: '',
+        localLore: [],
+        message: [{ role: 'user', data: `${username} message`, chatId: 'message-a' }],
+    }]
+    return database
+}
+
+async function createActiveSessionRuntimeHarness() {
+    let database = makeConversationDatabase('Initial')
+    const store = {
+        open: vi.fn(async () => undefined),
+        readRoot: vi.fn(async () => ({
+            revision: 1,
+            value: capturePersistentRoot(database),
+        })),
+        replaceFromDatabase: vi.fn(async () => ({ revision: 2 })),
+        acquireRevision: vi.fn(async (revision: number) =>
+            makeDatabaseLease(structuredClone(database), revision)),
+    } as unknown as PersistentDataStore
+    const runtime = createPersistentDataRuntime({
+        store,
+        state: {
+            captureRoot: () => capturePersistentRoot(database),
+            capturePresets: () => database.botPresets,
+            captureSelectedCharacter: () => database.characters[0] ?? null,
+            captureCharacter: (id) =>
+                database.characters.find((character) => character.chaId === id) ?? null,
+            getSelectedCharacterId: () => database.characters[0]?.chaId,
+            getSelectedConversationId: () => database.characters[0]?.chats[0]?.id,
+            replaceDatabase: (replacement) => {
+                database = structuredClone(replacement)
+            },
+            installCompleteDatabase: (replacement) => {
+                database = structuredClone(replacement)
+            },
+            restoreSelection: vi.fn(),
+            publishCharacter: vi.fn(),
+            publishConversation: vi.fn(),
+        },
+        prepareDatabase: async (value) => value,
+    })
+    await runtime.initializeActiveWorkingSet(database)
+    return {
+        runtime,
+        get database() {
+            return database
+        },
+    }
+}
+
 function makeDatabaseLease(database: Database, revision: number): PersistentRevisionLease {
     const {
         characters,
@@ -466,6 +522,48 @@ describe('stable working-set selection', () => {
 })
 
 describe('prepared persistent replacement', () => {
+    it('invalidates the resident session after explicit database replacement', async () => {
+        const harness = await createActiveSessionRuntimeHarness()
+        const session = harness.runtime.getActiveConversationSession()!
+
+        await harness.runtime.replacePersistentDatabase(
+            makeConversationDatabase('Replacement'),
+            'replace-active-session',
+        )
+
+        expect(session.isActive).toBe(false)
+        expect(harness.runtime.getActiveConversationSession()).toBeNull()
+        expect(() => session.append({ role: 'char', data: 'detached replacement write' })).toThrow(
+            /inactive/,
+        )
+    })
+
+    it('invalidates the resident session after maximum compatibility materialization', async () => {
+        const harness = await createActiveSessionRuntimeHarness()
+        const session = harness.runtime.getActiveConversationSession()!
+
+        await harness.runtime.materializeMaximumCompatibilityWorkingSet()
+
+        expect(session.isActive).toBe(false)
+        expect(harness.runtime.getActiveConversationSession()).toBeNull()
+        expect(() => session.append({ role: 'char', data: 'detached materialization write' })).toThrow(
+            /inactive/,
+        )
+    })
+
+    it('invalidates the resident session after scalable working-set projection', async () => {
+        const harness = await createActiveSessionRuntimeHarness()
+        const session = harness.runtime.getActiveConversationSession()!
+
+        await expect(harness.runtime.releaseInactiveWorkingSet()).resolves.toBe(true)
+
+        expect(session.isActive).toBe(false)
+        expect(harness.runtime.getActiveConversationSession()).toBeNull()
+        expect(() => session.append({ role: 'char', data: 'detached projection write' })).toThrow(
+            /inactive/,
+        )
+    })
+
     it('rejects a catalog working set before database preparation', async () => {
         let database = makeDatabase('Initial')
         const prepareDatabase = vi.fn(async (value: Database) => value)
