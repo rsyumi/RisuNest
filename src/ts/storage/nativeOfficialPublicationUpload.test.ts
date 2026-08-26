@@ -7,6 +7,7 @@ import {
 
 describe('NativeOfficialPublicationFileUploader', () => {
     it('reauthenticates an ordinary 403 and retries the same file with its session', async () => {
+        let sharedSession: string | null = null
         let credential: NativeOfficialPublicationCredential = {
             kind: 'risu-auth',
             token: 'old-token',
@@ -41,6 +42,10 @@ describe('NativeOfficialPublicationFileUploader', () => {
             invoke,
             now,
             reauthenticate,
+            getSession: () => sharedSession,
+            setSession: (session) => {
+                sharedSession = session
+            },
         })
 
         await expect(uploader.upload({
@@ -56,6 +61,7 @@ describe('NativeOfficialPublicationFileUploader', () => {
         })
 
         expect(reauthenticate).toHaveBeenCalledOnce()
+        expect(sharedSession).toBe('session-42')
         expect(invoke.mock.calls).toEqual([
             ['official_publication_upload_file', {
                 request: {
@@ -79,6 +85,7 @@ describe('NativeOfficialPublicationFileUploader', () => {
     })
 
     it('returns a warning 403 without reauthentication', async () => {
+        let sharedSession: string | null = 'shared-session'
         const reauthenticate = vi.fn(async () => undefined)
         const uploader = new NativeOfficialPublicationFileUploader({
             baseUrl: 'https://account.invalid',
@@ -92,14 +99,20 @@ describe('NativeOfficialPublicationFileUploader', () => {
             })),
             now: () => 1000,
             reauthenticate,
+            getSession: () => sharedSession,
+            setSession: (session) => {
+                sharedSession = session
+            },
         })
 
         await expect(uploader.upload({ path: 'snapshot.risudat', bytes: 21 }))
             .resolves.toEqual({ kind: 'auth-warning', status: 403, bytesUploaded: 21 })
         expect(reauthenticate).not.toHaveBeenCalled()
+        expect(sharedSession).toBe('session-1')
     })
 
     it('rejects a mismatched uploaded byte count', async () => {
+        let sharedSession: string | null = null
         const uploader = new NativeOfficialPublicationFileUploader({
             baseUrl: 'https://account.invalid',
             credential: () => ({ kind: 'risu-auth', token: 'token' }),
@@ -113,6 +126,10 @@ describe('NativeOfficialPublicationFileUploader', () => {
             })),
             now: () => 1000,
             reauthenticate: vi.fn(),
+            getSession: () => sharedSession,
+            setSession: (session) => {
+                sharedSession = session
+            },
         })
 
         await expect(uploader.upload({ path: 'snapshot.risudat', bytes: 21 }))

@@ -4,6 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs::{self, File};
+#[cfg(feature = "official-publication-upload-pilot")]
+use std::io::Read;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -200,6 +202,31 @@ pub(super) fn cleanup(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
 }
 
 #[cfg(feature = "official-publication-upload-pilot")]
+fn open_regular_file_no_follow(path: &Path) -> StoreResult<(File, u64)> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(StoreError::Validation {
+            message: "Official publication source is not a regular file".to_owned(),
+        });
+    }
+    Ok((file, metadata.len()))
+}
+
+#[cfg(feature = "official-publication-upload-pilot")]
 pub(super) fn open_for_upload(
     connection: &Connection,
     snapshots_dir: &Path,
@@ -216,30 +243,24 @@ pub(super) fn open_for_upload(
             message: "Official publication source is outside the export directory".to_owned(),
         });
     }
-    let source_metadata = fs::symlink_metadata(path)?;
-    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
-        return Err(StoreError::Validation {
-            message: "Official publication source is not a regular export file".to_owned(),
-        });
-    }
+    let (source, source_len) = open_regular_file_no_follow(path)?;
     let ownership_path = exports_dir.join(format!("risusave-{id}.lease"));
-    let ownership_metadata = fs::symlink_metadata(&ownership_path)?;
-    if ownership_metadata.file_type().is_symlink()
-        || !ownership_metadata.is_file()
-        || ownership_metadata.len() > 4096
-    {
+    let (mut ownership_file, ownership_len) = open_regular_file_no_follow(&ownership_path)?;
+    if ownership_len > 4096 {
         return Err(StoreError::Validation {
             message: "Official publication source has no valid ownership marker".to_owned(),
         });
     }
-    let ownership: ExportOwnership = serde_json::from_slice(&fs::read(&ownership_path)?)?;
+    let mut ownership_bytes = Vec::with_capacity(ownership_len as usize);
+    ownership_file.read_to_end(&mut ownership_bytes)?;
+    let ownership: ExportOwnership = serde_json::from_slice(&ownership_bytes)?;
     if ownership.export_id != id {
         return Err(StoreError::Validation {
             message: "Official publication source ownership does not match its export".to_owned(),
         });
     }
     read_target(connection, Some(&ownership.lease))?;
-    Ok((File::open(path)?, source_metadata.len()))
+    Ok((source, source_len))
 }
 
 pub(super) fn sweep_abandoned(
@@ -766,6 +787,32 @@ mod tests {
         )
         .is_err());
         cleanup(&store.snapshots_dir, Path::new(&second.path)).unwrap();
+    }
+
+    #[cfg(feature = "official-publication-upload-pilot")]
+    #[test]
+    fn upload_sources_are_opened_without_following_file_symlinks() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("source.risudat");
+        let alias = directory.path().join("alias.risudat");
+        fs::write(&source, b"managed export").unwrap();
+
+        let (mut file, bytes) = open_regular_file_no_follow(&source).unwrap();
+        let mut body = Vec::new();
+        file.read_to_end(&mut body).unwrap();
+        assert_eq!(bytes, body.len() as u64);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&source, &alias).unwrap();
+            assert!(open_regular_file_no_follow(&alias).is_err());
+        }
+        #[cfg(windows)]
+        match std::os::windows::fs::symlink_file(&source, &alias) {
+            Ok(()) => assert!(open_regular_file_no_follow(&alias).is_err()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => panic!("could not create test symlink: {error}"),
+        }
     }
 
     #[cfg(feature = "official-publication-upload-pilot")]

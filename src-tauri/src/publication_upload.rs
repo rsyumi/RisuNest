@@ -269,8 +269,6 @@ pub(crate) async fn upload_open_file_attempt(
             let media_type = value.split(';').next().unwrap_or_default().trim();
             media_type.eq_ignore_ascii_case("application/json")
         });
-    let bytes = response_bytes(response).await?;
-
     if status == 304 {
         return Ok(OfficialPublicationUploadResult::NotModified {
             replacement_key: DATABASE_KEY.to_owned(),
@@ -297,6 +295,7 @@ pub(crate) async fn upload_open_file_attempt(
             }
         });
     }
+    let bytes = response_bytes(response).await?;
     let text = response_text(bytes)?;
     if !(200..300).contains(&status) {
         return Err(OfficialPublicationUploadError::HttpStatus {
@@ -339,6 +338,7 @@ mod tests {
     use super::{
         upload_file_attempt, upload_open_file_attempt, OfficialPublicationCredential,
         OfficialPublicationUploadRequest, OfficialPublicationUploadResult, DATABASE_KEY,
+        MAX_RESPONSE_BYTES,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -704,5 +704,40 @@ mod tests {
         assert_eq!(requests[2].headers["x-risu-auth"], "refreshed-secret");
         assert_eq!(requests[1].headers["x-risu-save-date"], "1725000000123");
         assert_eq!(requests[2].headers["x-risu-save-date"], "1725000000456");
+    }
+
+    #[test]
+    fn classifies_body_independent_statuses_without_draining_large_bodies() {
+        static OVERSIZED_BODY: [u8; MAX_RESPONSE_BYTES + 1] = [b'x'; MAX_RESPONSE_BYTES + 1];
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("snapshot.risudat");
+        std::fs::write(&source, b"database").unwrap();
+
+        for (status, headers, expected_kind) in [
+            (304, &[][..], "not-modified"),
+            (403, &[][..], "reauthentication-needed"),
+            (403, &[("x-risu-status", "warn")][..], "auth-warning"),
+        ] {
+            let (base_url, _requests, server) = mock_server(vec![MockResponse {
+                status,
+                headers,
+                body: &OVERSIZED_BODY,
+            }]);
+            let mut input = request(base_url, &source);
+            input.session = Some("existing".to_owned());
+
+            let result = tauri::async_runtime::block_on(upload_file_attempt(input)).unwrap();
+            server.join().unwrap();
+
+            let actual_kind = match result {
+                OfficialPublicationUploadResult::NotModified { .. } => "not-modified",
+                OfficialPublicationUploadResult::ReauthenticationNeeded { .. } => {
+                    "reauthentication-needed"
+                }
+                OfficialPublicationUploadResult::AuthWarning { .. } => "auth-warning",
+                OfficialPublicationUploadResult::Written { .. } => "written",
+            };
+            assert_eq!(actual_kind, expected_kind);
+        }
     }
 }

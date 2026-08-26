@@ -51,11 +51,8 @@ export interface NativeOfficialPublicationFileUploaderDependencies {
     invoke(command: string, args: Record<string, unknown>): Promise<unknown>
     now(): number
     reauthenticate(): Promise<void>
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-    if (!signal?.aborted) return
-    throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+    getSession(): string | null
+    setSession(session: string): void
 }
 
 function assertAttemptResult(value: unknown): NativeOfficialPublicationAttemptResult {
@@ -76,18 +73,14 @@ function assertAttemptResult(value: unknown): NativeOfficialPublicationAttemptRe
 }
 
 export class NativeOfficialPublicationFileUploader {
-    private session: string | null = null
-
     constructor(
         private readonly dependencies: NativeOfficialPublicationFileUploaderDependencies,
     ) {}
 
     async upload(
         file: NativeOfficialPublicationFile,
-        signal?: AbortSignal,
     ): Promise<NativeOfficialPublicationResult> {
         while (true) {
-            throwIfAborted(signal)
             const credential = this.dependencies.credential()
             if (!credential?.token) {
                 throw new Error('Official account credential is unavailable')
@@ -100,12 +93,11 @@ export class NativeOfficialPublicationFileUploader {
                         credential,
                         path: file.path,
                         saveDate: this.dependencies.now().toFixed(0),
-                        session: this.session,
+                        session: this.dependencies.getSession(),
                     },
                 },
             ))
-            throwIfAborted(signal)
-            this.session = result.session
+            this.dependencies.setSession(result.session)
             if (result.bytesUploaded !== file.bytes) {
                 throw new Error(
                     `Native official publication uploaded ${result.bytesUploaded} bytes, expected ${file.bytes}`,
