@@ -219,7 +219,7 @@ fn validation_requires_message_pages_to_be_manifest_dependencies() {
     let error = validate_logical_schema(&connection).expect_err("reject missing dependency");
     assert!(error
         .to_string()
-        .contains("message page must also be a record dependency"));
+        .contains("message page must also be a matching record dependency"));
 
     connection
         .execute(
@@ -455,4 +455,70 @@ fn rejects_invalid_object_sizes_and_empty_hash_size_mismatches() {
         [EMPTY_HASH],
     );
     assert!(positive_sized_page_with_empty_hash.is_err());
+}
+
+#[test]
+fn validation_rejects_message_page_dependency_size_mismatch() {
+    let connection = open_schema();
+    insert_complete_generation(&connection);
+    connection
+        .execute(
+            "INSERT INTO logical_record_heads (
+                library_id, generation_id, record_key, record_kind,
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES ('library-a', 'generation-a', 'r1:conversation',
+                       'conversation', 'live', ?1, 10, NULL)",
+            [HASH_A],
+        )
+        .expect("insert conversation head");
+    connection
+        .execute(
+            "INSERT INTO logical_record_dependencies (
+                library_id, generation_id, record_key, object_hash, object_size
+             ) VALUES ('library-a', 'generation-a', 'r1:conversation', ?1, 20)",
+            [HASH_B],
+        )
+        .expect("insert dependency");
+    connection
+        .execute(
+            "INSERT INTO logical_message_page_sources (
+                library_id, generation_id, record_key, page_index,
+                first_message_index, message_count, object_hash, object_size
+             ) VALUES ('library-a', 'generation-a', 'r1:conversation',
+                       0, 0, 1, ?1, 21)",
+            [HASH_B],
+        )
+        .expect("insert mismatched page source");
+
+    let error = validate_logical_schema(&connection).expect_err("reject page size mismatch");
+    assert!(error
+        .to_string()
+        .contains("message page must also be a matching record dependency"));
+}
+
+#[test]
+fn validation_rejects_cross_table_sizes_for_the_same_object_hash() {
+    let connection = open_schema();
+    insert_complete_generation(&connection);
+    connection
+        .execute(
+            "INSERT INTO logical_record_heads (
+                library_id, generation_id, record_key, record_kind,
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES ('library-a', 'generation-a', 'r1:root',
+                       'root', 'live', ?1, 10, NULL)",
+            [HASH_A],
+        )
+        .expect("insert root head");
+    connection
+        .execute(
+            "INSERT INTO logical_record_dependencies (
+                library_id, generation_id, record_key, object_hash, object_size
+             ) VALUES ('library-a', 'generation-a', 'r1:root', ?1, 11)",
+            [HASH_A],
+        )
+        .expect("insert conflicting dependency size");
+
+    let error = validate_logical_schema(&connection).expect_err("reject conflicting sizes");
+    assert!(error.to_string().contains("conflicting object sizes"));
 }

@@ -370,13 +370,41 @@ pub(crate) fn validate_logical_schema(connection: &Connection) -> Result<(), Log
           AND dependency.generation_id = page.generation_id
           AND dependency.record_key = page.record_key
           AND dependency.object_hash = page.object_hash
+          AND dependency.object_size = page.object_size
          WHERE dependency.object_hash IS NULL",
         [],
         |row| row.get(0),
     )?;
     if missing_page_dependency_count != 0 {
         return Err(LogicalSchemaError::Validation(
-            "every logical message page must also be a record dependency".to_string(),
+            "every logical message page must also be a matching record dependency".to_string(),
+        ));
+    }
+
+    let conflicting_object_size_count: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM (
+             SELECT library_id, generation_id, object_hash
+             FROM (
+                 SELECT library_id, generation_id, object_hash, object_size
+                 FROM logical_record_heads
+                 WHERE state = 'live'
+                 UNION ALL
+                 SELECT library_id, generation_id, object_hash, object_size
+                 FROM logical_record_dependencies
+                 UNION ALL
+                 SELECT library_id, generation_id, object_hash, object_size
+                 FROM logical_message_page_sources
+             ) AS logical_objects
+             GROUP BY library_id, generation_id, object_hash
+             HAVING MIN(object_size) != MAX(object_size)
+         ) AS conflicting_objects",
+        [],
+        |row| row.get(0),
+    )?;
+    if conflicting_object_size_count != 0 {
+        return Err(LogicalSchemaError::Validation(
+            "logical generation contains conflicting object sizes for one hash".to_string(),
         ));
     }
 
