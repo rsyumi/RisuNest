@@ -1,5 +1,7 @@
 import type { Chat, Database, Message, botPreset, character, groupChat } from './database.svelte'
 import type {
+    AssetAlias,
+    AssetOwnerHead,
     CharacterDetail,
     ConversationMutation,
     DataRevision,
@@ -682,8 +684,18 @@ export type PersistentCompleteCharacterUpsert = (
     character: CompleteCharacter | null,
 ) => CompleteCharacter | Promise<CompleteCharacter>
 
+export type PersistentCharacterAssetAlias = Extract<AssetAlias, { kind: 'asset' }>
+export type PersistentCharacterAssetOwnerHead = AssetOwnerHead & {
+    owner: {
+        kind: 'character-additional-assets'
+        characterId: string
+    }
+}
+
 export interface PersistentCompleteCharacterUpsertOptions {
     includeInCharacterOrder?: boolean
+    assetAliases?: readonly PersistentCharacterAssetAlias[]
+    assetOwnerHeads?: readonly PersistentCharacterAssetOwnerHead[]
 }
 
 function defaultClock(): SaveCoordinatorClock {
@@ -1522,6 +1534,25 @@ export class SaveCoordinator {
             }
 
             const commit: WorkingSetCommit = { expectedRevision: revision }
+            if (options.assetAliases !== undefined) {
+                const assetAliases = [...canonicalClone(options.assetAliases)]
+                if (assetAliases.some((alias) => alias.kind !== 'asset')) {
+                    throw new TypeError('Prepared character aliases must be ordinary assets')
+                }
+                commit.assetAliases = assetAliases
+            }
+            if (options.assetOwnerHeads !== undefined) {
+                const assetOwnerHeads = [...canonicalClone(options.assetOwnerHeads)]
+                if (assetOwnerHeads.some((head) => (
+                    head.owner.kind !== 'character-additional-assets'
+                    || head.owner.characterId !== characterId
+                ))) {
+                    throw new TypeError(
+                        `Prepared character owner heads must belong to ${characterId}`,
+                    )
+                }
+                commit.assetOwnerHeads = assetOwnerHeads
+            }
             let committedRoot = canonicalClone(rootValue.value)
             const mutatedRoot = canonicalClone(rootValue.value)
             if (current) {

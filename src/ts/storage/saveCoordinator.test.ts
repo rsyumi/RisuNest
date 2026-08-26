@@ -2486,6 +2486,80 @@ describe('SaveCoordinator', () => {
         }))
     })
 
+    it('commits prepared character assets and their owner head before publishing the character', async () => {
+        const database = makeDatabase()
+        database.characterOrder = ['char-a']
+        const added = {
+            type: 'character',
+            chaId: 'prepared-char',
+            name: 'Prepared',
+            chats: [],
+            additionalAssets: [['portrait', 'prepared/portrait.png', 'png']],
+        } as Database['characters'][number]
+        const assetAliases = [{
+            kind: 'asset' as const,
+            key: 'prepared/portrait.png',
+            objectHash: 'a'.repeat(64),
+            size: 4,
+            mime: 'image/png',
+            name: 'portrait.png',
+            ext: 'png',
+        }]
+        const assetOwnerHeads = [{
+            owner: {
+                kind: 'character-additional-assets' as const,
+                characterId: 'prepared-char',
+            },
+            present: true as const,
+            manifestHash: 'b'.repeat(64),
+            entryCount: 1,
+        }]
+        const events: string[] = []
+        const store = {
+            readRoot: vi.fn(async () => ({ revision: 23, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => null),
+            commit: vi.fn(async () => {
+                events.push('commit')
+                expect(database.characters.map((item) => item.chaId)).toEqual(['char-a'])
+                return { revision: 24 }
+            }),
+        } as unknown as PersistentDataStore
+        const publishCharacterMutation = vi.fn((state) => {
+            events.push('publish')
+            database.characters.push(state.character as Database['characters'][number])
+            Object.assign(database, state.root)
+        })
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: vi.fn(),
+            publishCharacterMutation,
+        })
+        coordinator.initialize(23)
+
+        await coordinator.upsertPersistentCompleteCharacter(
+            'prepared-char',
+            'prepared-native-character',
+            () => added,
+            { assetAliases, assetOwnerHeads },
+        )
+
+        expect(store.commit).toHaveBeenCalledWith({
+            expectedRevision: 23,
+            root: expect.objectContaining({ characterOrder: ['char-a', 'prepared-char'] }),
+            addCharacter: added,
+            assetAliases,
+            assetOwnerHeads,
+        })
+        expect(events).toEqual(['commit', 'publish'])
+        expect(database.characters.map((item) => item.chaId)).toEqual([
+            'char-a',
+            'prepared-char',
+        ])
+    })
+
     it('uses replacement instead of adding a duplicate complete character ID', async () => {
         const database = makeDatabase()
         const store = {
@@ -2543,6 +2617,146 @@ describe('SaveCoordinator', () => {
 
         expect(publishCharacterMutation).not.toHaveBeenCalled()
         expect(coordinator.revision).toBe(16)
+    })
+
+    it('leaves the working set unchanged when prepared character activation fails', async () => {
+        const database = makeDatabase()
+        database.characterOrder = ['char-a']
+        const before = structuredClone(database)
+        const store = {
+            readRoot: vi.fn(async () => ({ revision: 17, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => null),
+            commit: vi.fn().mockRejectedValue(new Error('activation failed')),
+        } as unknown as PersistentDataStore
+        const publishCharacterMutation = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            captureCharacter: (id) => database.characters.find((item) => item.chaId === id) ?? null,
+            replaceDatabase: vi.fn(),
+            publishCharacterMutation,
+        })
+        coordinator.initialize(17)
+
+        await expect(coordinator.upsertPersistentCompleteCharacter(
+            'prepared-char',
+            'prepared-native-character',
+            () => ({
+                type: 'character',
+                chaId: 'prepared-char',
+                name: 'Prepared',
+                chats: [],
+                additionalAssets: [['portrait', 'prepared/portrait.png', 'png']],
+            } as Database['characters'][number]),
+            {
+                assetAliases: [{
+                    kind: 'asset',
+                    key: 'prepared/portrait.png',
+                    objectHash: 'a'.repeat(64),
+                    size: 4,
+                    mime: 'image/png',
+                    name: 'portrait.png',
+                    ext: 'png',
+                }],
+                assetOwnerHeads: [{
+                    owner: {
+                        kind: 'character-additional-assets',
+                        characterId: 'prepared-char',
+                    },
+                    present: true,
+                    manifestHash: 'b'.repeat(64),
+                    entryCount: 1,
+                }],
+            },
+        )).rejects.toThrow('activation failed')
+
+        expect(publishCharacterMutation).not.toHaveBeenCalled()
+        expect(database).toEqual(before)
+        expect(coordinator.revision).toBe(17)
+    })
+
+    it('rejects an Inlay alias before prepared character activation', async () => {
+        const database = makeDatabase()
+        const store = {
+            readRoot: vi.fn(async () => ({ revision: 18, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => null),
+            commit: vi.fn(async () => ({ revision: 19 })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(18)
+
+        await expect(coordinator.upsertPersistentCompleteCharacter(
+            'prepared-char',
+            'prepared-native-character',
+            () => ({
+                type: 'character',
+                chaId: 'prepared-char',
+                name: 'Prepared',
+                chats: [],
+            } as Database['characters'][number]),
+            {
+                assetAliases: [{
+                    kind: 'inlay',
+                    key: 'prepared/portrait.png',
+                    objectHash: 'a'.repeat(64),
+                    size: 4,
+                    mime: 'image/png',
+                    name: 'portrait.png',
+                    ext: 'png',
+                    inlayType: 'image',
+                }],
+            } as any,
+        )).rejects.toThrow('Prepared character aliases must be ordinary assets')
+
+        expect(store.commit).not.toHaveBeenCalled()
+    })
+
+    it('rejects an owner head for another character before activation', async () => {
+        const database = makeDatabase()
+        const store = {
+            readRoot: vi.fn(async () => ({ revision: 20, value: captureRoot(database) })),
+            readCharacter: vi.fn(async () => null),
+            commit: vi.fn(async () => ({ revision: 21 })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(20)
+
+        await expect(coordinator.upsertPersistentCompleteCharacter(
+            'prepared-char',
+            'prepared-native-character',
+            () => ({
+                type: 'character',
+                chaId: 'prepared-char',
+                name: 'Prepared',
+                chats: [],
+            } as Database['characters'][number]),
+            {
+                assetOwnerHeads: [{
+                    owner: {
+                        kind: 'character-additional-assets',
+                        characterId: 'other-char',
+                    },
+                    present: true,
+                    manifestHash: 'b'.repeat(64),
+                    entryCount: 1,
+                }],
+            },
+        )).rejects.toThrow(
+            'Prepared character owner heads must belong to prepared-char',
+        )
+
+        expect(store.commit).not.toHaveBeenCalled()
     })
 
     it('can add an absent sentinel without adding it to character order', async () => {
