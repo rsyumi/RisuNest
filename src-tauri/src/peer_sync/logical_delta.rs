@@ -68,6 +68,64 @@ pub struct LogicalOwnerHead {
     pub entry_count: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LogicalAssetAliasMetadata {
+    pub mime: String,
+    pub name: String,
+    pub ext: String,
+    pub inlay_type: Option<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub metadata: Value,
+}
+
+impl LogicalAssetAliasMetadata {
+    fn validate(&self) -> Result<(), LogicalDeltaError> {
+        if !self.metadata.is_object() {
+            return Err(invalid(
+                "logical asset alias extension metadata must be an object",
+            ));
+        }
+        if self.width.is_some_and(|value| value < 0) || self.height.is_some_and(|value| value < 0) {
+            return Err(invalid(
+                "logical asset alias dimensions must be nonnegative",
+            ));
+        }
+        if self
+            .inlay_type
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "image" | "video" | "audio" | "signature"))
+        {
+            return Err(invalid("logical asset alias inlayType is invalid"));
+        }
+        Ok(())
+    }
+}
+
+pub fn encode_asset_alias_metadata(
+    metadata: &LogicalAssetAliasMetadata,
+) -> Result<Value, LogicalDeltaError> {
+    metadata.validate()?;
+    serde_json::to_value(metadata).map_err(|error| {
+        invalid(format!(
+            "logical asset alias metadata encoding failed: {error}"
+        ))
+    })
+}
+
+pub fn decode_asset_alias_metadata(
+    value: &Value,
+) -> Result<LogicalAssetAliasMetadata, LogicalDeltaError> {
+    let metadata: LogicalAssetAliasMetadata = serde_json::from_value(value.clone())
+        .map_err(|_| invalid("logical asset alias metadata is invalid"))?;
+    metadata.validate()?;
+    if encode_asset_alias_metadata(&metadata)? != *value {
+        return Err(invalid("logical asset alias metadata is not canonical"));
+    }
+    Ok(metadata)
+}
+
 impl LogicalOwnerHead {
     pub fn absent(owner: LogicalOwnerLocator) -> Self {
         Self {
@@ -1077,10 +1135,11 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        build_indexed_logical_manifest, build_logical_manifest, decode_logical_manifest,
-        decode_logical_record, decode_logical_record_key, decode_message_page,
-        encode_logical_manifest, encode_logical_record, encode_logical_record_key,
-        encode_message_page, IndexedLogicalManifestBuilderInput, IndexedLogicalRecord,
+        build_indexed_logical_manifest, build_logical_manifest, decode_asset_alias_metadata,
+        decode_logical_manifest, decode_logical_record, decode_logical_record_key,
+        decode_message_page, encode_asset_alias_metadata, encode_logical_manifest,
+        encode_logical_record, encode_logical_record_key, encode_message_page,
+        IndexedLogicalManifestBuilderInput, IndexedLogicalRecord, LogicalAssetAliasMetadata,
         LogicalManifest, LogicalManifestBuilderInput, LogicalManifestLiveRecord,
         LogicalManifestObject, LogicalManifestRecord, LogicalManifestTombstoneRecord,
         LogicalOwnerHead, LogicalOwnerLocator, LogicalRecordEnvelope, LogicalRecordLocator,
@@ -1249,6 +1308,24 @@ mod tests {
             metadata: Value::Null,
         })
         .is_err());
+    }
+
+    #[test]
+    fn asset_alias_metadata_preserves_typed_and_extension_fields() {
+        let typed = LogicalAssetAliasMetadata {
+            mime: "image/webp".to_owned(),
+            name: "inlay.webp".to_owned(),
+            ext: "webp".to_owned(),
+            inlay_type: Some("image".to_owned()),
+            width: Some(320),
+            height: Some(200),
+            metadata: json!({ "source": "legacy", "mime": "extension-value" }),
+        };
+        let encoded = encode_asset_alias_metadata(&typed).unwrap();
+
+        assert_eq!(decode_asset_alias_metadata(&encoded).unwrap(), typed);
+        assert_eq!(encoded["mime"], "image/webp");
+        assert_eq!(encoded["metadata"]["mime"], "extension-value");
     }
 
     #[test]

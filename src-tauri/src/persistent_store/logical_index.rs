@@ -2,11 +2,12 @@ use super::{logical_schema, read_target, PersistentStore, StoreError, StoreResul
 use crate::{
     asset_repository::PayloadCas,
     peer_sync::logical_delta::{
-        build_indexed_logical_manifest, decode_logical_record_key, encode_logical_record,
-        encode_logical_record_key, encode_message_page, BuiltIndexedLogicalManifest,
-        EncodedLogicalObject, IndexedLogicalManifestBuilderInput, IndexedLogicalRecord,
-        LogicalManifestObject, LogicalOwnerHead, LogicalOwnerLocator, LogicalRecordEnvelope,
-        LogicalRecordLocator, LOGICAL_MESSAGE_PAGE_SIZE,
+        build_indexed_logical_manifest, decode_logical_record_key, encode_asset_alias_metadata,
+        encode_logical_record, encode_logical_record_key, encode_message_page,
+        BuiltIndexedLogicalManifest, EncodedLogicalObject, IndexedLogicalManifestBuilderInput,
+        IndexedLogicalRecord, LogicalAssetAliasMetadata, LogicalManifestObject, LogicalOwnerHead,
+        LogicalOwnerLocator, LogicalRecordEnvelope, LogicalRecordLocator,
+        LOGICAL_MESSAGE_PAGE_SIZE,
     },
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -278,6 +279,12 @@ fn validate_pds_projection_contract(connection: &Connection) -> StoreResult<()> 
         "object_hash",
         "kind",
         "size",
+        "mime",
+        "name",
+        "ext",
+        "inlay_type",
+        "width",
+        "height",
         "metadata",
     ] {
         if !asset_columns.contains_key(required) {
@@ -588,7 +595,9 @@ fn project_asset_aliases(
     pds_generation: &str,
 ) -> StoreResult<()> {
     let mut statement = transaction.prepare(
-        "SELECT kind, logical_key, object_hash, size, metadata FROM asset_aliases
+        "SELECT kind, logical_key, object_hash, size, mime, name, ext,
+                inlay_type, width, height, metadata
+         FROM asset_aliases
          WHERE generation = ?1 ORDER BY kind ASC, logical_key ASC",
     )?;
     let mut rows = statement.query([pds_generation])?;
@@ -597,9 +606,17 @@ fn project_asset_aliases(
         let logical_key: String = row.get(1)?;
         let object_hash: Option<String> = row.get(2)?;
         let size = nonnegative_u64(row.get(3)?, "asset alias size")?;
-        let metadata: String = row.get(4)?;
+        let metadata = encode_asset_alias_metadata(&LogicalAssetAliasMetadata {
+            mime: row.get(4)?,
+            name: row.get(5)?,
+            ext: row.get(6)?,
+            inlay_type: row.get(7)?,
+            width: row.get(8)?,
+            height: row.get(9)?,
+            metadata: serde_json::from_str::<Value>(&row.get::<_, String>(10)?)?,
+        })
+        .map_err(codec_error)?;
         let dependencies = payload_dependency(cas, object_hash.as_deref(), size)?;
-        let metadata: Value = serde_json::from_str(&metadata)?;
         let (locator, record_kind, envelope) = match kind.as_str() {
             RECORD_KIND_ASSET => (
                 LogicalRecordLocator::Asset { logical_key },
@@ -760,9 +777,6 @@ fn payload_dependency(
     declared_size: u64,
 ) -> StoreResult<Vec<LogicalManifestObject>> {
     let Some(hash) = object_hash else {
-        if declared_size != 0 {
-            return validation("payload alias without an object must have size zero");
-        }
         return Ok(Vec::new());
     };
     let actual_size = require_cas_size(cas, hash)?;
@@ -1176,17 +1190,49 @@ fn reconstruct_asset_alias(
     kind: &str,
     logical_key: &str,
 ) -> StoreResult<LogicalRecordEnvelope> {
-    let (object_hash, size, metadata): (Option<String>, i64, String) = connection
+    let (object_hash, size, mime, name, ext, inlay_type, width, height, metadata): (
+        Option<String>,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    ) = connection
         .query_row(
-            "SELECT object_hash, size, metadata FROM asset_aliases
+            "SELECT object_hash, size, mime, name, ext, inlay_type, width, height, metadata
+             FROM asset_aliases
              WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
             params![pds_generation, kind, logical_key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
         )
         .optional()?
         .ok_or_else(|| missing_source(kind))?;
     let size = nonnegative_u64(size, "asset alias size")?;
-    let metadata = serde_json::from_str(&metadata)?;
+    let metadata = encode_asset_alias_metadata(&LogicalAssetAliasMetadata {
+        mime,
+        name,
+        ext,
+        inlay_type,
+        width,
+        height,
+        metadata: serde_json::from_str(&metadata)?,
+    })
+    .map_err(codec_error)?;
     Ok(if kind == RECORD_KIND_ASSET {
         LogicalRecordEnvelope::Asset {
             object_hash,
@@ -1341,7 +1387,8 @@ fn validation<T>(message: impl Into<String>) -> StoreResult<T> {
 mod tests {
     use super::*;
     use crate::peer_sync::logical_delta::{
-        decode_logical_record, decode_message_page, LogicalManifestRecord,
+        decode_asset_alias_metadata, decode_logical_record, decode_message_page,
+        LogicalManifestRecord,
     };
     use rusqlite::params;
     use serde_json::json;
@@ -1460,16 +1507,22 @@ mod tests {
             .connection
             .execute(
                 "INSERT INTO asset_aliases (
-                generation, logical_key, object_hash, kind, size, metadata
-             ) VALUES ('revision-0', 'same', ?1, 'asset', ?2, ?3),
-                      ('revision-0', 'same', ?4, 'inlay', ?5, ?6)",
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height, metadata
+             ) VALUES (
+                'revision-0', 'same', ?1, 'asset', ?2,
+                'application/octet-stream', 'asset.bin', 'bin', NULL, NULL, NULL, ?3
+             ), (
+                'revision-0', 'same', ?4, 'inlay', ?5,
+                'image/webp', 'inlay.webp', 'webp', 'image', 320, 200, ?6
+             )",
                 params![
                     asset.content_hash,
                     i64::try_from(asset.byte_size).unwrap(),
-                    r#"{"mime":"application/octet-stream"}"#,
+                    r#"{"source":"asset-extra"}"#,
                     inlay.content_hash,
                     i64::try_from(inlay.byte_size).unwrap(),
-                    r#"{"inlayType":"image"}"#,
+                    r#"{"source":"inlay-extra"}"#,
                 ],
             )
             .expect("seed asset and Inlay aliases");
@@ -1603,6 +1656,35 @@ mod tests {
                 .unwrap(),
             b"original inlay bytes",
         );
+        for record in &built.manifest.records {
+            let LogicalManifestRecord::Live(record) = record else {
+                continue;
+            };
+            let expected = match decode_logical_record_key(&record.key).unwrap() {
+                LogicalRecordLocator::Asset { .. } => {
+                    Some(("application/octet-stream", "asset-extra", None))
+                }
+                LogicalRecordLocator::Inlay { .. } => {
+                    Some(("image/webp", "inlay-extra", Some("image")))
+                }
+                _ => None,
+            };
+            let Some((mime, source, inlay_type)) = expected else {
+                continue;
+            };
+            let bytes = store
+                .reconstruct_logical_object(&cas, "library", "generation-0", &record.object_hash)
+                .unwrap();
+            let metadata = match decode_logical_record(&bytes).unwrap() {
+                LogicalRecordEnvelope::Asset { metadata, .. }
+                | LogicalRecordEnvelope::Inlay { metadata, .. } => metadata,
+                _ => unreachable!(),
+            };
+            let metadata = decode_asset_alias_metadata(&metadata).unwrap();
+            assert_eq!(metadata.mime, mime);
+            assert_eq!(metadata.inlay_type.as_deref(), inlay_type);
+            assert_eq!(metadata.metadata["source"], source);
+        }
         assert_eq!(
             store
                 .build_indexed_logical_manifest("library", "generation-0")
@@ -1610,6 +1692,65 @@ mod tests {
                 .manifest_hash,
             built.manifest_hash,
         );
+    }
+
+    #[test]
+    fn projection_preserves_missing_payload_reference_size_without_dependency() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        store
+            .connection
+            .execute(
+                "INSERT INTO asset_aliases (
+                    generation, logical_key, object_hash, kind, size, mime, name, ext,
+                    inlay_type, width, height, metadata
+                 ) VALUES (
+                    'revision-0', 'missing', NULL, 'asset', 99,
+                    'application/octet-stream', 'missing.bin', 'bin',
+                    NULL, NULL, NULL, '{\"legacy\":true}'
+                 )",
+                [],
+            )
+            .unwrap();
+        let built = store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "generation-0".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .unwrap();
+        let record = built
+            .manifest
+            .records
+            .iter()
+            .find_map(|record| match record {
+                LogicalManifestRecord::Live(record)
+                    if matches!(
+                        decode_logical_record_key(&record.key).unwrap(),
+                        LogicalRecordLocator::Asset { .. }
+                    ) =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(record.dependencies.is_empty());
+        let bytes = store
+            .reconstruct_logical_object(&cas, "library", "generation-0", &record.object_hash)
+            .unwrap();
+        assert!(matches!(
+            decode_logical_record(&bytes).unwrap(),
+            LogicalRecordEnvelope::Asset {
+                object_hash: None,
+                size: 99,
+                ..
+            }
+        ));
     }
 
     #[test]
