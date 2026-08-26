@@ -2626,6 +2626,45 @@ mod tests {
         }
     }
 
+    struct CommitSameManifestOnFirstCheck {
+        store_root: PathBuf,
+        manifest_id: String,
+        fired: AtomicBool,
+    }
+
+    impl CancellationProbe for CommitSameManifestOnFirstCheck {
+        fn is_cancelled(&self) -> bool {
+            if self.fired.swap(true, Ordering::SeqCst) {
+                return false;
+            }
+            let mut concurrent = PersistentStore::open(&self.store_root).unwrap();
+            let mut root = concurrent.read_root(None).unwrap().value;
+            root["username"] = Value::String("New".to_owned());
+            concurrent
+                .commit(&WorkingSetCommit {
+                    expected_revision: 1,
+                    root: Some(root),
+                    replace_presets: None,
+                    character: None,
+                    character_details: None,
+                    replace_character: None,
+                    add_character: None,
+                    conversations: None,
+                    delete_character_id: None,
+                    plugin_storage: None,
+                    asset_owner_heads: None,
+                })
+                .unwrap();
+            concurrent
+                .set_app_kv(
+                    "peerCloneActiveManifest",
+                    &json!({ "manifestId": self.manifest_id, "revision": 2 }),
+                )
+                .unwrap();
+            false
+        }
+    }
+
     #[test]
     fn versioned_package_round_trips_every_payload_kind_and_ordered_references_exactly() {
         let directory = tempfile::tempdir().expect("temporary package fixture");
@@ -3181,6 +3220,49 @@ mod tests {
             fs::read_dir(target_root.join("backups")).unwrap().count(),
             2
         );
+    }
+
+    #[test]
+    fn production_target_adopts_same_manifest_that_wins_the_commit_race() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let target_root = directory.path().join("peer-target");
+        let manifest_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let cancellation = CommitSameManifestOnFirstCheck {
+            store_root: directory.path().to_owned(),
+            manifest_id: manifest_id.to_owned(),
+            fired: AtomicBool::new(false),
+        };
+        let mut target =
+            LosslessCloneTargetAdapter::new(&mut store, &cas, &target_root, 1, &cancellation)
+                .unwrap();
+        let mut stage = target.begin(manifest_id).unwrap();
+        target
+            .stage_object(
+                &mut stage,
+                CloneObjectKind::Database,
+                "database",
+                &Value::Null,
+                &mut Cursor::new(incoming),
+            )
+            .unwrap();
+
+        assert_eq!(
+            target
+                .activate_if_current(&mut stage, None, manifest_id)
+                .unwrap(),
+            CloneActivation::AlreadyActive
+        );
+        target.abort(stage).unwrap();
+        drop(target);
+
+        assert_eq!(store.revision().unwrap(), 2);
+        assert_eq!(store.materialize(None).unwrap()["username"], "New");
     }
 
     #[test]

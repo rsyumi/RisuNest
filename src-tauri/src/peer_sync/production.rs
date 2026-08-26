@@ -271,9 +271,12 @@ impl CloneTargetAdapter for LosslessCloneTargetAdapter<'_> {
                 Ok(CloneActivation::Activated)
             }
             Err(error) if error.code == LosslessErrorCode::RevisionConflict => {
-                Ok(CloneActivation::Conflict {
-                    actual: self.active_manifest_id()?,
-                })
+                let actual = self.active_manifest_id()?;
+                if actual.as_deref() == Some(new_manifest_id) {
+                    Ok(CloneActivation::AlreadyActive)
+                } else {
+                    Ok(CloneActivation::Conflict { actual })
+                }
             }
             Err(error) => Err(lossless_error(error)),
         }
