@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import { isTauri } from '../platform'
+import {
+    copyNativeExportToAndroidSaf,
+    type AndroidSafDestinationRequest,
+    type AndroidSafDestinationResult,
+} from './androidSafBridge'
 
 export type NativeFileJobSource =
     | { type: 'desktopPath'; path: string }
@@ -22,11 +27,18 @@ export interface NativeFileJobResult {
     characterCount: number
     presetCount: number
     warningCodes: string[]
+    handoffPath?: string
+    recoveryPath?: string
 }
 
 export interface NativeFileJobStatus {
     jobId: string
-    kind: 'restore-block-risu-save' | 'export-block-risu-save' | 'kei-backup-upload'
+    kind:
+        | 'restore-block-risu-save'
+        | 'export-block-risu-save'
+        | 'restore-lossless-backup'
+        | 'export-lossless-backup'
+        | 'kei-backup-upload'
     expectedRevision?: number
     warningCodes?: string[]
     state: NativeFileJobState
@@ -82,16 +94,29 @@ export interface NativeFileExportJobOptions extends NativeFileJobOptions {
     omitAccount?: boolean
 }
 
+export type NativeLosslessBackupDestination =
+    | { type: 'desktopPath'; path: string }
+    | { type: 'androidSaf'; suggestedName: string }
+
 export interface NativeFileJobDependencies {
     isTauri(): boolean
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
     wait(milliseconds: number): Promise<void>
 }
 
+export interface NativeLosslessBackupDependencies extends NativeFileJobDependencies {
+    copyToAndroidSaf(request: AndroidSafDestinationRequest): Promise<AndroidSafDestinationResult>
+}
+
 const productionDependencies: NativeFileJobDependencies = {
     isTauri: () => isTauri,
     invoke: (command, args) => args === undefined ? invoke(command) : invoke(command, args),
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}
+
+const productionLosslessDependencies: NativeLosslessBackupDependencies = {
+    ...productionDependencies,
+    copyToAndroidSaf: (request) => copyNativeExportToAndroidSaf(request),
 }
 
 export class NativeFileJobError extends Error {
@@ -143,24 +168,29 @@ async function invokeNative(
     }
 }
 
-export async function runNativeBlockRisuSaveRestore(
+async function runNativeReplacementRestore(
+    kind: 'restore-block-risu-save' | 'restore-lossless-backup',
+    mutationReason: string,
     runtime: NativeBlockRestoreRuntime,
     source: NativeFileJobSource,
     options: NativeFileRestoreJobOptions = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
+    const operation = kind === 'restore-lossless-backup'
+        ? 'Native lossless backup restore'
+        : 'Native block RisuSave restore'
     if (!dependencies.isTauri()) {
-        throw new Error('Native block RisuSave restore requires Tauri')
+        throw new Error(`${operation} requires Tauri`)
     }
     if (options.signal?.aborted) throw abortError()
 
     const mutationToken = await runtime.capturePersistentMutationToken(
-        'native-block-risu-save-restore',
+        mutationReason,
     )
     if (options.signal?.aborted) throw abortError()
     const started = await invokeNative(dependencies, 'native_file_job_start', {
         request: {
-            kind: 'restore-block-risu-save',
+            kind,
             source,
             expectedRevision: mutationToken.revision,
         },
@@ -228,7 +258,7 @@ export async function runNativeBlockRisuSaveRestore(
 
         if (terminal.state === 'succeeded') {
             if (!terminal.result) {
-                throw new NativeFileJobError('missing-result', 'Native restore returned no result')
+                throw new NativeFileJobError('missing-result', `${operation} returned no result`)
             }
             if (!replacementFence) {
                 throw new NativeFileJobError(
@@ -270,7 +300,7 @@ export async function runNativeBlockRisuSaveRestore(
             ? abortError()
             : new NativeFileJobError(
                 terminal.error?.code ?? 'restore-failed',
-                terminal.error?.message ?? 'Native block RisuSave restore failed',
+                terminal.error?.message ?? `${operation} failed`,
             ))
         try {
             await invokeNative(dependencies, 'native_file_job_forget', {
@@ -284,6 +314,38 @@ export async function runNativeBlockRisuSaveRestore(
         replacementFence?.release()
         options.onBlockingChange?.(false)
     }
+}
+
+export function runNativeBlockRisuSaveRestore(
+    runtime: NativeBlockRestoreRuntime,
+    source: NativeFileJobSource,
+    options: NativeFileRestoreJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativeReplacementRestore(
+        'restore-block-risu-save',
+        'native-block-risu-save-restore',
+        runtime,
+        source,
+        options,
+        dependencies,
+    )
+}
+
+export function runNativeLosslessBackupRestore(
+    runtime: NativeBlockRestoreRuntime,
+    source: NativeFileJobSource,
+    options: NativeFileRestoreJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativeReplacementRestore(
+        'restore-lossless-backup',
+        'native-lossless-backup-restore',
+        runtime,
+        source,
+        options,
+        dependencies,
+    )
 }
 
 export async function runNativeBlockRisuSaveExport(
@@ -363,6 +425,139 @@ export async function runNativeBlockRisuSaveExport(
         }
         catch (error) {
             if (committedResult) {
+                committedResult.warningCodes = [
+                    ...committedResult.warningCodes
+                        .filter((code) => code !== 'cleanup-failed')
+                        .slice(0, 15),
+                    'cleanup-failed',
+                ]
+            }
+            else if (!outcomeFailed) throw error
+        }
+    }
+}
+
+export async function runNativeLosslessBackupExport(
+    runtime: {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    destination: NativeLosslessBackupDestination,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+): Promise<NativeFileJobResult> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native lossless backup export requires Tauri')
+    }
+    if (options.signal?.aborted) throw abortError()
+
+    await runtime.flushPendingData('native-lossless-backup-export')
+    if (options.signal?.aborted) throw abortError()
+    const expectedRevision = runtime.revision
+    const request = destination.type === 'desktopPath'
+        ? {
+            kind: 'export-lossless-backup',
+            destination: destination.path,
+            expectedRevision,
+        }
+        : {
+            kind: 'export-lossless-backup',
+            expectedRevision,
+        }
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request,
+    }) as { jobId: string; warningCodes?: string[] }
+    let cancellationRequested = false
+    let terminal: NativeFileJobStatus | undefined
+
+    while (!terminal) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId: started.jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
+            terminal = status
+            break
+        }
+        await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+
+    let outcomeFailed = false
+    let committedResult: NativeFileJobResult | undefined
+    let managedSource: string | undefined
+    try {
+        if (terminal.state === 'cancelled') throw abortError()
+        if (terminal.state !== 'succeeded') {
+            throw new NativeFileJobError(
+                terminal.error?.code ?? 'export-failed',
+                terminal.error?.message ?? 'Native lossless backup export failed',
+            )
+        }
+        if (!terminal.result) {
+            throw new NativeFileJobError('missing-result', 'Native lossless backup export returned no result')
+        }
+        committedResult = {
+            ...terminal.result,
+            warningCodes: [...new Set([
+                ...(started.warningCodes ?? []),
+                ...terminal.result.warningCodes,
+            ])].slice(0, 16),
+        }
+        if (destination.type === 'androidSaf') {
+            managedSource = committedResult.handoffPath
+            if (!managedSource) {
+                throw new NativeFileJobError(
+                    'missing-handoff',
+                    'Native lossless backup export returned no Android handoff path',
+                )
+            }
+            const published = await dependencies.copyToAndroidSaf({
+                sourcePath: managedSource,
+                suggestedName: destination.suggestedName,
+                signal: options.signal,
+            })
+            const { handoffPath: _handoffPath, ...publishedResult } = committedResult
+            committedResult = {
+                ...publishedResult,
+                warningCodes: [...new Set([
+                    ...publishedResult.warningCodes,
+                    ...published.warningCodes,
+                ])].slice(0, 16),
+            }
+        }
+        return committedResult
+    }
+    catch (error) {
+        outcomeFailed = true
+        throw error
+    }
+    finally {
+        if (managedSource) {
+            try {
+                await invokeNative(dependencies, 'pds_export_risu_save_cleanup', {
+                    path: managedSource,
+                })
+            }
+            catch (error) {
+                if (committedResult && !outcomeFailed) {
+                    committedResult.warningCodes = [
+                        ...committedResult.warningCodes
+                            .filter((code) => code !== 'cleanup-failed')
+                            .slice(0, 15),
+                        'cleanup-failed',
+                    ]
+                }
+            }
+        }
+        try {
+            await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+        }
+        catch (error) {
+            if (committedResult && !outcomeFailed) {
                 committedResult.warningCodes = [
                     ...committedResult.warningCodes
                         .filter((code) => code !== 'cleanup-failed')

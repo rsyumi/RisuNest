@@ -4,6 +4,8 @@ import {
     NativeFileJobActivationCommittedError,
     runNativeBlockRisuSaveRestore,
     runNativeBlockRisuSaveExport,
+    runNativeLosslessBackupExport,
+    runNativeLosslessBackupRestore,
     type NativeFileJobStatus,
 } from './nativeFileJobs'
 
@@ -52,6 +54,276 @@ function restoreRuntime(
 }
 
 describe('native file jobs', () => {
+    it('keeps unavailable lossless backup capability as a structured native error', async () => {
+        const calls: string[] = []
+
+        await expect(runNativeLosslessBackupExport(
+            {
+                revision: 5,
+                flushPendingData: async () => undefined,
+            },
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risulossless' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    calls.push(command)
+                    throw {
+                        code: 'capability-unavailable',
+                        message: 'native lossless backup requires v2 asset and cold authority',
+                    }
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
+            },
+        )).rejects.toMatchObject({
+            name: 'NativeFileJobError',
+            code: 'capability-unavailable',
+        })
+        expect(calls).toEqual(['native_file_job_start'])
+    })
+
+    it('restores a lossless package through the existing destructive replacement fence', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const events: string[] = []
+        const statuses: NativeFileJobStatus[] = [
+            {
+                ...status('waitingForInput'),
+                kind: 'restore-lossless-backup',
+                phase: 'awaiting-activation',
+            },
+            {
+                ...status('succeeded', {
+                    revision: 18,
+                    sourceBytes: 4096,
+                    sourceSha256: '8'.repeat(64),
+                    characterCount: 3,
+                    presetCount: 2,
+                    warningCodes: [],
+                    recoveryPath: 'C:\\app\\persistent\\exports\\risusave-recovery.risudat',
+                }),
+                kind: 'restore-lossless-backup',
+            },
+        ]
+
+        const result = await runNativeLosslessBackupRestore(
+            restoreRuntime(17, {
+                acquire: () => { events.push('fence-acquired') },
+                refresh: () => { events.push('refreshed') },
+                release: () => { events.push('fence-released') },
+            }),
+            { type: 'androidSpool', token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557' },
+            { afterRefresh: () => { events.push('plugins-reloaded') } },
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'lossless-restore' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result.revision).toBe(18)
+        expect(result.recoveryPath).toContain('risusave-recovery.risudat')
+        expect(events).toEqual([
+            'fence-acquired',
+            'refreshed',
+            'plugins-reloaded',
+            'fence-released',
+        ])
+        expect(calls).toEqual([
+            ['native_file_job_start', {
+                request: {
+                    kind: 'restore-lossless-backup',
+                    source: {
+                        type: 'androidSpool',
+                        token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557',
+                    },
+                    expectedRevision: 17,
+                },
+            }],
+            ['native_file_job_status', { jobId: 'lossless-restore' }],
+            ['native_file_job_finalize', { jobId: 'lossless-restore' }],
+            ['native_file_job_status', { jobId: 'lossless-restore' }],
+            ['native_file_job_forget', { jobId: 'lossless-restore' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
+    it('retains a committed lossless restore when renderer refresh fails', async () => {
+        const commands: string[] = []
+        const statuses: NativeFileJobStatus[] = [
+            {
+                ...status('waitingForInput'),
+                kind: 'restore-lossless-backup',
+                phase: 'awaiting-activation',
+            },
+            {
+                ...status('succeeded', {
+                    revision: 19,
+                    sourceBytes: 4096,
+                    sourceSha256: '9'.repeat(64),
+                    characterCount: 3,
+                    presetCount: 2,
+                    warningCodes: [],
+                    recoveryPath: 'C:\\app\\persistent\\exports\\risusave-recovery.risudat',
+                }),
+                kind: 'restore-lossless-backup',
+            },
+        ]
+
+        await expect(runNativeLosslessBackupRestore(
+            restoreRuntime(18, {
+                refresh: () => { throw new Error('refresh failed') },
+            }),
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risulossless' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'lossless-restore' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({
+            name: 'NativeFileJobActivationCommittedError',
+            committedRevision: 19,
+            recoveryRequired: true,
+        })
+        expect(commands).not.toContain('native_file_job_forget')
+    })
+
+    it('exports a complete lossless package to a desktop destination without bytes in IPC', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const terminal: NativeFileJobStatus = {
+            jobId: 'lossless-export',
+            kind: 'export-lossless-backup',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: {
+                completedBytes: 8192,
+                totalBytes: 8192,
+                completedItems: 8,
+                totalItems: 8,
+            },
+            result: {
+                revision: 23,
+                sourceBytes: 4096,
+                sourceSha256: 'a'.repeat(64),
+                characterCount: 3,
+                presetCount: 2,
+                warningCodes: [],
+            },
+        }
+
+        const result = await runNativeLosslessBackupExport(
+            {
+                revision: 22,
+                flushPendingData: async (reason) => {
+                    calls.push([`flush:${reason}`, undefined])
+                },
+            },
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risulossless' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
+            },
+        )
+
+        expect(result).toEqual(terminal.result)
+        expect(calls).toEqual([
+            ['flush:native-lossless-backup-export', undefined],
+            ['native_file_job_start', {
+                request: {
+                    kind: 'export-lossless-backup',
+                    destination: 'C:\\chosen\\backup.risulossless',
+                    expectedRevision: 22,
+                },
+            }],
+            ['native_file_job_status', { jobId: 'lossless-export' }],
+            ['native_file_job_forget', { jobId: 'lossless-export' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
+    it('hands a managed lossless export to Android SAF and cleans the native source', async () => {
+        const events: string[] = []
+        const handoffPath = 'C:\\app\\persistent\\exports\\risusave-123.risudat'
+        const terminal: NativeFileJobStatus = {
+            jobId: 'lossless-export',
+            kind: 'export-lossless-backup',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: {
+                completedBytes: 4096,
+                completedItems: 8,
+            },
+            result: {
+                revision: 22,
+                sourceBytes: 4096,
+                sourceSha256: 'b'.repeat(64),
+                characterCount: 3,
+                presetCount: 2,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+
+        const result = await runNativeLosslessBackupExport(
+            { revision: 22, flushPendingData: async () => undefined },
+            { type: 'androidSaf', suggestedName: 'backup.risulossless' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    events.push(`${command}:${JSON.stringify(args ?? {})}`)
+                    if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'pds_export_risu_save_cleanup') return undefined
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async (request) => {
+                    events.push(`saf:${request.sourcePath}:${request.suggestedName}`)
+                    return {
+                        bytes: 4096,
+                        warningCodes: ['android-saf-provider-not-atomic'],
+                    }
+                },
+            },
+        )
+
+        expect(result.handoffPath).toBeUndefined()
+        expect(result.warningCodes).toEqual(['android-saf-provider-not-atomic'])
+        expect(events).toEqual([
+            'native_file_job_start:{"request":{"kind":"export-lossless-backup","expectedRevision":22}}',
+            'native_file_job_status:{"jobId":"lossless-export"}',
+            `saf:${handoffPath}:backup.risulossless`,
+            `pds_export_risu_save_cleanup:{"path":"${handoffPath.replaceAll('\\', '\\\\')}"}`,
+            'native_file_job_forget:{"jobId":"lossless-export"}',
+        ])
+    })
+
     it('restores from a descriptor without sending file or database bytes through IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const statuses = [
