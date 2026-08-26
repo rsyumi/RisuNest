@@ -58,7 +58,7 @@ vi.mock('src/ts/stores.svelte', () => ({
 vi.mock('src/ts/storage/database.svelte', () => ({
     getDatabase: () => mocks.database,
     getCurrentCharacter: vi.fn(),
-    getCurrentChat: () => mocks.state.currentChat,
+    getCurrentChat: vi.fn(() => mocks.state.currentChat),
 }))
 vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
     peekActiveConversationSession: () => mocks.state.session,
@@ -464,7 +464,7 @@ describe('history-sensitive regex conversation operations', () => {
     })
 
     it.each(['rollp', 'rollpick'])(
-        'opens a conversation operation for the history-sensitive %s CBS helper',
+        'guards the read-only history-sensitive %s CBS helper without cloning history',
         async (helper) => {
             const chat = {
                 id: `history-${helper}-chat`,
@@ -495,7 +495,7 @@ describe('history-sensitive regex conversation operations', () => {
                     { cache: 'bypass', regexWorker: false },
                 )
 
-                expect(structuredCloneSpy).toHaveBeenCalled()
+                expect(structuredCloneSpy).not.toHaveBeenCalled()
                 expect(session.activePinReasons).toEqual([])
             } finally {
                 structuredCloneSpy.mockRestore()
@@ -565,7 +565,7 @@ describe('history-sensitive regex conversation operations', () => {
                 regexWorker: false,
             })
 
-            expect(structuredCloneSpy).toHaveBeenCalled()
+            expect(structuredCloneSpy).not.toHaveBeenCalled()
             expect(session.activePinReasons).toEqual([])
         } finally {
             structuredCloneSpy.mockRestore()

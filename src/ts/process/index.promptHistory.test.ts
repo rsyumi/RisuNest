@@ -30,8 +30,9 @@ vi.mock('../parser/parser.svelte', () => ({
             const callback = testState.cbsCallbacks.get(name)
             if (!callback) return source
             const result = callback(source, {
+                ...args,
                 chatID: args.chatID ?? -1,
-                db: {},
+                db: args.db ?? {},
                 chara: args.chara ?? '',
                 rmVar: false,
                 cbsConditions: args.cbsConditions ?? {},
@@ -45,6 +46,7 @@ vi.mock('../parser/parser.svelte', () => ({
 
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getActiveConversationSession: () => testState.activeSession,
+    peekActiveConversationSession: () => testState.activeSession,
 }))
 
 vi.mock('../plugins/plugins.svelte', () => ({

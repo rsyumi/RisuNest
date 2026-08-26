@@ -164,10 +164,9 @@ export function registerCBS(arg:CBSRegisterArg) {
     const getSelectedCharID = (): number => {
         const selectedCharacterId = currentMatcher?.selectedCharacterId
         if (selectedCharacterId !== undefined) {
-            const capturedIndex = getDatabase().characters.findIndex(
+            return getDatabase().characters.findIndex(
                 (character) => character.chaId === selectedCharacterId,
             )
-            if (capturedIndex !== -1) return capturedIndex
         }
         return currentMatcher?.selectedCharID ?? getDefaultSelectedCharID()
     }
