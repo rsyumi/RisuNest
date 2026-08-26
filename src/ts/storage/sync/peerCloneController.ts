@@ -85,9 +85,14 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         if (targetPolling) return
         targetPolling = true
         try {
-            await facade.targetStatus()
-            success()
+            const status = await facade.targetStatus()
             const phase = facade.getState().target.phase
+            if (phase === 'failed') {
+                snapshot = { ...snapshot, error: status.error ?? 'Peer clone target failed' }
+                publish()
+            } else {
+                success()
+            }
             if (phase === 'completed' || phase === 'failed') stopTargetPolling()
         } catch (cause) {
             failure(cause)
@@ -177,8 +182,10 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
                 } else {
                     stopSourcePolling()
                 }
+                if (sourceStatus.phase !== 'running') {
+                    snapshot = { ...snapshot, sourcePairingUri: '' }
+                }
             }
-            snapshot = { ...snapshot, sourcePairingUri: '' }
         }),
         revoke: (sessionId: string, deviceId: string) => run(async () => {
             await facade.revoke(sessionId, deviceId)

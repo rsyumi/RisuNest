@@ -101,6 +101,78 @@ describe('peer clone controller lifecycle', () => {
         expect(controller.snapshot().error).toBe('')
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_stop')).toHaveLength(2)
     })
+
+    it('preserves a native target failure until resume is accepted', async () => {
+        vi.useFakeTimers()
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return capabilities() as T
+            if (command === 'peer_clone_target_status') {
+                return {
+                    phase: 'failed',
+                    completedBytes: 64,
+                    totalBytes: 128,
+                    error: 'clone object hash mismatch',
+                } as T
+            }
+            return undefined as T
+        })
+        const controller = createPeerCloneController({
+            facade: createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: runtime(vi.fn(async (_revision: number) => undefined), vi.fn()),
+            }),
+            targetPollMilliseconds: 10,
+        })
+        controller.join(pairingUri)
+        controller.confirmDestructiveReplace()
+        await controller.download()
+        await vi.advanceTimersByTimeAsync(10)
+
+        expect(controller.snapshot().state.target.phase).toBe('failed')
+        expect(controller.snapshot().error).toBe('clone object hash mismatch')
+
+        await controller.resume()
+        expect(controller.snapshot().error).toBe('')
+    })
+
+    it('clears the one-shot pairing URI when host shutdown succeeds before cleanup fails', async () => {
+        let phase: 'prepared' | 'running' | 'stopping' = 'prepared'
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return capabilities() as T
+            if (command === 'peer_clone_start') {
+                phase = 'running'
+                return {
+                    phase,
+                    sessionId: 'source-session',
+                    pairingUri,
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_stop') {
+                phase = 'stopping'
+                throw new Error('cleanup failed')
+            }
+            if (command === 'peer_clone_status') {
+                return { phase, sessionId: 'source-session', devices: [] } as T
+            }
+            return undefined as T
+        })
+        const controller = createPeerCloneController({
+            facade: createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: runtime(vi.fn(async (_revision: number) => undefined), vi.fn()),
+            }),
+        })
+
+        await controller.start('source-session')
+        expect(controller.snapshot().sourcePairingUri).toBe(pairingUri)
+        await expect(controller.stop('source-session')).rejects.toThrow('cleanup failed')
+
+        expect(controller.snapshot().sourceStatus.phase).toBe('stopping')
+        expect(controller.snapshot().sourcePairingUri).toBe('')
+    })
 })
 
 function capabilities() {

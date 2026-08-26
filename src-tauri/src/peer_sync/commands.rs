@@ -708,8 +708,14 @@ impl PeerCloneCommandState {
         let worker_request = request.clone();
         let worker_cancellation = cancellation.clone();
         let handle = thread::spawn(move || {
-            let initial = client.transfer_progress();
-            let (verified_bytes, total_bytes) = match initial {
+            let all_objects_verified = match client.all_objects_verified(&worker_cancellation) {
+                Ok(verified) => verified,
+                Err(error) => {
+                    finish_target_worker(&runtime, &worker_request, client, Err(error), None);
+                    return;
+                }
+            };
+            let (verified_bytes, total_bytes) = match client.transfer_progress() {
                 Ok(progress) => progress,
                 Err(error) => {
                     finish_target_worker(&runtime, &worker_request, client, Err(error), None);
@@ -717,13 +723,6 @@ impl PeerCloneCommandState {
                 }
             };
             update_target_progress(&runtime, &worker_request, verified_bytes, total_bytes);
-            let all_objects_verified = match client.all_objects_verified() {
-                Ok(verified) => verified,
-                Err(error) => {
-                    finish_target_worker(&runtime, &worker_request, client, Err(error), None);
-                    return;
-                }
-            };
             if all_objects_verified {
                 finish_target_worker(
                     &runtime,

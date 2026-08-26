@@ -1608,6 +1608,56 @@ fn reopens_promoted_cas_object_without_redownload_before_verified_ledger_record(
 }
 
 #[test]
+fn cancels_local_verification_and_reconciles_corrupt_verified_progress() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(
+        source_root.path(),
+        &[(CLONE_CHUNK_SIZE + 64 * 1024) as usize],
+    );
+    let session = prepare(&source, session_root.path());
+    let hash = payload_hash(&session, 0);
+    let host = LoopbackCloneHost::start(session).unwrap();
+    let mut client = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
+    client.download(&TransferCancellation::new()).unwrap();
+    let (verified_before, total_bytes) = client.transfer_progress().unwrap();
+    assert_eq!(verified_before, total_bytes);
+    let object_path = client.verified_object_path(&hash).unwrap();
+    let object_size = fs::metadata(&object_path).unwrap().len();
+    fs::write(&object_path, vec![b'x'; object_size as usize]).unwrap();
+
+    let cancellation = TransferCancellation::new();
+    let pause = Arc::new(Barrier::new(2));
+    cancellation.pause_after_hash_read_for_test(Arc::clone(&pause));
+    let worker_cancellation = cancellation.clone();
+    let verification = thread::spawn(move || {
+        let result = client.all_objects_verified(&worker_cancellation);
+        (client, result)
+    });
+    pause.wait();
+    cancellation.cancel();
+    pause.wait();
+    let (mut client, result) = verification.join().unwrap();
+    assert_eq!(result.unwrap_err(), PeerSyncError::Cancelled);
+
+    assert!(!client
+        .all_objects_verified(&TransferCancellation::new())
+        .unwrap());
+    let (verified_after, recomputed_total) = client.transfer_progress().unwrap();
+    assert_eq!(recomputed_total, total_bytes);
+    assert!(verified_after < total_bytes);
+
+    let requests_before = host.total_range_requests(&hash);
+    client.download(&TransferCancellation::new()).unwrap();
+    assert!(host.total_range_requests(&hash) > requests_before);
+    assert_eq!(
+        client.transfer_progress().unwrap(),
+        (total_bytes, total_bytes)
+    );
+}
+
+#[test]
 fn resumes_after_actual_child_process_kill_in_the_middle_of_a_chunk() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();

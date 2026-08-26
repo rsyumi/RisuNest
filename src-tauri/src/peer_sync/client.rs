@@ -13,7 +13,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
-use std::sync::Barrier;
+use std::sync::{Barrier, Mutex};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -41,6 +41,8 @@ pub struct DownloadReport {
 #[derive(Debug, Clone, Default)]
 pub struct TransferCancellation {
     cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    pause_after_hash_read: Arc<Mutex<Option<Arc<Barrier>>>>,
 }
 
 impl TransferCancellation {
@@ -54,6 +56,19 @@ impl TransferCancellation {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_hash_read_for_test(&self, pause: Arc<Barrier>) {
+        *self.pause_after_hash_read.lock().unwrap() = Some(pause);
+    }
+
+    #[cfg(test)]
+    fn pause_after_hash_read_for_test_if_requested(&self) {
+        if let Some(pause) = self.pause_after_hash_read.lock().unwrap().take() {
+            pause.wait();
+            pause.wait();
+        }
     }
 }
 
@@ -270,20 +285,27 @@ impl LoopbackCloneClient {
         Ok((self.verified_bytes(manifest)?, total_bytes))
     }
 
-    pub(crate) fn all_objects_verified(&mut self) -> Result<bool, PeerSyncError> {
+    pub(crate) fn all_objects_verified(
+        &mut self,
+        cancellation: &TransferCancellation,
+    ) -> Result<bool, PeerSyncError> {
         self.fetch_manifest()?;
-        let manifest = self.manifest.as_ref().unwrap();
-        if manifest.objects.keys().any(
-            |hash| !matches!(self.ledger.objects.get(hash), Some(progress) if progress.verified),
-        ) {
-            return Ok(false);
-        }
+        let manifest = self.manifest.as_ref().unwrap().clone();
+        let mut all_verified = true;
         for (hash, object) in &manifest.objects {
-            if !self.verify_local_object(hash, object.size)? {
-                return Ok(false);
+            if cancellation.is_cancelled() {
+                return Err(PeerSyncError::Cancelled);
+            }
+            if !matches!(self.ledger.objects.get(hash), Some(progress) if progress.verified) {
+                all_verified = false;
+                continue;
+            }
+            if !self.verify_local_object(hash, object.size, Some(cancellation))? {
+                self.record_object_progress(hash, 0, false)?;
+                all_verified = false;
             }
         }
-        Ok(true)
+        Ok(all_verified)
     }
 
     #[cfg(test)]
@@ -438,7 +460,7 @@ impl LoopbackCloneClient {
             .unwrap_or_default();
         let download_directory = self.root.join("downloads");
         let part_path = download_directory.join(format!("{object_hash}.part"));
-        if self.verify_local_object(object_hash, descriptor.size)? {
+        if self.verify_local_object(object_hash, descriptor.size, Some(cancellation))? {
             if !current.verified {
                 self.record_object_progress(object_hash, descriptor.chunks.len(), true)?;
             }
@@ -547,7 +569,7 @@ impl LoopbackCloneClient {
         }
 
         file.seek(SeekFrom::Start(0))?;
-        if hash_reader(&mut file)? != object_hash {
+        if hash_reader(&mut file, Some(cancellation))? != object_hash {
             file.set_len(0)?;
             file.sync_all()?;
             self.record_object_progress(object_hash, 0, false)?;
@@ -558,6 +580,9 @@ impl LoopbackCloneClient {
         file.seek(SeekFrom::Start(0))?;
         let cas = PayloadCas::new(&self.root)?;
         let prepared = cas.prepare_reader(&mut file)?;
+        if cancellation.is_cancelled() {
+            return Err(PeerSyncError::Cancelled);
+        }
         if prepared.content_hash != object_hash || prepared.byte_size != descriptor.size {
             return Err(PeerSyncError::WholeObjectHashMismatch {
                 object: object_hash.to_owned(),
@@ -669,7 +694,12 @@ impl LoopbackCloneClient {
             .ok_or_else(|| PeerSyncError::Protocol("verified clone byte count overflow".to_owned()))
     }
 
-    fn verify_local_object(&self, object_hash: &str, size: u64) -> Result<bool, PeerSyncError> {
+    fn verify_local_object(
+        &self,
+        object_hash: &str,
+        size: u64,
+        cancellation: Option<&TransferCancellation>,
+    ) -> Result<bool, PeerSyncError> {
         let cas = PayloadCas::new(&self.root)?;
         let Some(mut file) = cas.open_object(object_hash)? else {
             return Ok(false);
@@ -677,7 +707,7 @@ impl LoopbackCloneClient {
         if file.metadata()?.len() != size {
             return Ok(false);
         }
-        Ok(hash_reader(&mut file)? == object_hash)
+        Ok(hash_reader(&mut file, cancellation)? == object_hash)
     }
 
     fn object_path(&self, object_hash: &str) -> PathBuf {
@@ -810,7 +840,7 @@ where
     for hash in manifest.objects.keys() {
         let progress = client.ledger.objects.get(hash);
         if !matches!(progress, Some(progress) if progress.verified)
-            || !client.verify_local_object(hash, manifest.objects[hash].size)?
+            || !client.verify_local_object(hash, manifest.objects[hash].size, None)?
         {
             return Err(PeerSyncError::Validation(
                 "clone activation requires every object to be locally verified".to_owned(),
@@ -1130,15 +1160,25 @@ fn parse_u64_header(
         })
 }
 
-fn hash_reader(reader: &mut impl Read) -> Result<String, PeerSyncError> {
+fn hash_reader(
+    reader: &mut impl Read,
+    cancellation: Option<&TransferCancellation>,
+) -> Result<String, PeerSyncError> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; TRANSFER_BUFFER_BYTES];
     loop {
+        if cancellation.is_some_and(TransferCancellation::is_cancelled) {
+            return Err(PeerSyncError::Cancelled);
+        }
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        #[cfg(test)]
+        if let Some(cancellation) = cancellation {
+            cancellation.pause_after_hash_read_for_test_if_requested();
+        }
     }
     Ok(hex::encode(hasher.finalize()))
 }
