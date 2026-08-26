@@ -264,7 +264,7 @@ pub(super) fn replace_put_root(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let mut staged_root = object(root, "Persistent root")?.clone();
-    if let Some(plugin_storage) = staged_root.remove("pluginCustomStorage") {
+    if let Some(plugin_storage) = staged_root.shift_remove("pluginCustomStorage") {
         let plugin_storage = plugin_storage
             .as_object()
             .ok_or_else(|| validation("pluginCustomStorage must be a JSON object"))?;
@@ -426,9 +426,9 @@ pub(super) fn replace_abort(connection: &mut Connection, staging_id: &str) -> St
 
 fn put_root(transaction: &Transaction<'_>, generation: &str, root: &Value) -> StoreResult<()> {
     let mut root = object(root, "Persistent root")?.clone();
-    root.remove("characters");
-    root.remove("botPresets");
-    root.remove("pluginCustomStorage");
+    root.shift_remove("characters");
+    root.shift_remove("botPresets");
+    root.shift_remove("pluginCustomStorage");
     transaction.execute(
         "INSERT INTO root (generation, value) VALUES (?1, ?2) ON CONFLICT(generation) DO UPDATE SET value = excluded.value",
         params![generation, serde_json::to_string(&root)?],

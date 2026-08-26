@@ -110,15 +110,15 @@ pub(crate) fn create_controlled(
         serde_json::from_str(&root)?,
         "Persistent root must be an object",
     )?;
-    root.remove("characters");
-    root.remove("botPresets");
+    root.shift_remove("characters");
+    root.shift_remove("botPresets");
     let modules = take_root_block_value(&mut root, "modules");
     let loadouts = take_root_block_value(&mut root, "loadouts");
     let plugins = take_root_block_value(&mut root, "plugins");
-    root.remove("pluginCustomStorage");
+    root.shift_remove("pluginCustomStorage");
     let plugin_storage = plugin_storage_value(connection, &target.generation)?;
     if omit_account {
-        root.remove("account");
+        root.shift_remove("account");
     }
 
     let character_ids = character_ids(connection, &target.generation)?;
@@ -817,7 +817,7 @@ fn into_object(value: Value, message: &str) -> StoreResult<Map<String, Value>> {
 }
 
 fn take_root_block_value(root: &mut Map<String, Value>, key: &str) -> Option<Value> {
-    root.get_mut(key).map(Value::take)
+    root.shift_remove(key)
 }
 
 #[cfg(test)]
@@ -997,12 +997,12 @@ mod tests {
             root["before"]["payload"].as_str().unwrap().as_ptr(),
             root_payload
         );
-        assert!(
-            root["modules"].is_null() && root["loadouts"].is_null() && root["plugins"].is_null()
-        );
+        assert!(!root.contains_key("modules"));
+        assert!(!root.contains_key("loadouts"));
+        assert!(!root.contains_key("plugins"));
         assert_eq!(
             root.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["before", "modules", "loadouts", "plugins", "after"]
+            ["before", "after"]
         );
         assert_eq!(
             modules[0]["payload"].as_str().unwrap().as_ptr(),

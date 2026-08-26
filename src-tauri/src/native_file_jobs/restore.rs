@@ -356,11 +356,11 @@ fn stage_legacy_database(
         Value::Object(root) => root,
         _ => return Err(invalid("legacy MessagePack database must be an object")),
     };
-    let characters = match root.remove("characters") {
+    let characters = match root.shift_remove("characters") {
         Some(Value::Array(characters)) => characters,
         _ => return Err(invalid("legacy MessagePack characters must be an array")),
     };
-    let presets = match root.remove("botPresets") {
+    let presets = match root.shift_remove("botPresets") {
         Some(Value::Array(presets)) => presets,
         Some(_) => return Err(invalid("legacy MessagePack botPresets must be an array")),
         None => Vec::new(),
@@ -674,7 +674,7 @@ fn parse_and_stage<R: Read>(
                     .as_object()
                     .cloned()
                     .ok_or_else(|| invalid("root block must be a JSON object"))?;
-                directory = Some(parse_directory(object.remove("__directory"))?);
+                directory = Some(parse_directory(object.shift_remove("__directory"))?);
                 root = Some(object);
             }
             2 | 7 => {

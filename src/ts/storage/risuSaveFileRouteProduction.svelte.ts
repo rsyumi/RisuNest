@@ -49,7 +49,9 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
         'risu-save-file-export',
         (pinned) => pinned.collectBytes({ omitAccount }),
     ),
-    downloadWebExport: downloadFile,
+    downloadWebExport: async (name, bytes) => {
+        await downloadFile(name, bytes)
+    },
     reloadPlugins: loadPlugins,
     reloadPluginsAfterNativeRestore: loadPluginsAfterAuthoritativeRestore,
 }
