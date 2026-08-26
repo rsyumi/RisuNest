@@ -5,7 +5,7 @@
       "id": "stale-block-cache",
       "adapter": "risusave-block",
       "inputBase64": "UklTVVNBVkUAAQAEcm9vdDAAAAB7ImZvcm1hdHZlcnNpb24iOjQsIl9fZGlyZWN0b3J5IjpbImNoYXItc3RhbGUiXX0=",
-      "warning": "Block RisuSave may complete a missing required block from stale local cache."
+      "warning": "Block RisuSave may complete a missing required block from stale local cache or silently skip it."
     },
     {
       "id": "invalid-required-block",

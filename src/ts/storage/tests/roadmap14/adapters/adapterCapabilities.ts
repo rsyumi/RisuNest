@@ -88,13 +88,13 @@ export const ADAPTER_CAPABILITY_MATRIX = {
         {
             id: 'local-full-backup',
             oracleStatus: 'known-gap',
-            resultWarning: 'Local backup restore has known truncation and pre-validation payload-write gaps.',
+            resultWarning: 'Local backup restore safety is fixture-only and unprobed at the production boundary.',
             capabilities: COMPLETE_BACKUP_CAPABILITIES,
         },
         {
             id: 'local-partial-backup',
             oracleStatus: 'known-gap',
-            resultWarning: 'Partial local backup restore shares the known local restore atomicity gaps.',
+            resultWarning: 'Partial local restore safety is fixture-only and unprobed at the production boundary.',
             capabilities: [
                 { feature: 'database', category: 'preserved' },
                 {
@@ -116,13 +116,33 @@ export const ADAPTER_CAPABILITY_MATRIX = {
         },
         {
             id: 'drive-snapshot',
-            oracleStatus: 'passing',
-            capabilities: COMPLETE_BACKUP_CAPABILITIES,
+            oracleStatus: 'known-gap',
+            resultWarning: 'Drive snapshot does not transfer referenced Inlay payload bytes.',
+            capabilities: [
+                { feature: 'database', category: 'preserved' },
+                { feature: 'ordinary-assets', category: 'preserved' },
+                {
+                    feature: 'inlays',
+                    category: 'unsupported',
+                    warning: 'Drive snapshot does not upload or restore referenced Inlay payload bytes.',
+                },
+                { feature: 'cold-payloads', category: 'preserved' },
+            ],
         },
         {
             id: 'official-snapshot',
-            oracleStatus: 'passing',
-            capabilities: COMPLETE_BACKUP_CAPABILITIES,
+            oracleStatus: 'known-gap',
+            resultWarning: 'Official snapshot does not transfer referenced Inlay payload bytes.',
+            capabilities: [
+                { feature: 'database', category: 'preserved' },
+                { feature: 'ordinary-assets', category: 'preserved' },
+                {
+                    feature: 'inlays',
+                    category: 'unsupported',
+                    warning: 'Official snapshot does not publish or restore referenced Inlay payload bytes.',
+                },
+                { feature: 'cold-payloads', category: 'preserved' },
+            ],
         },
         {
             id: 'kei-backup',
@@ -174,13 +194,13 @@ export const ADAPTER_CAPABILITY_MATRIX = {
         {
             id: 'card-charx',
             oracleStatus: 'known-gap',
-            resultWarning: 'CharX has known sanitized and case-folded path collision gaps.',
+            resultWarning: 'CharX collision safety is fixture-only and unprobed at the production boundary.',
             capabilities: CHARX_CAPABILITIES,
         },
         {
             id: 'card-charx-jpeg',
             oracleStatus: 'known-gap',
-            resultWarning: 'CharX-JPEG has known sanitized and case-folded path collision gaps.',
+            resultWarning: 'CharX-JPEG collision safety is fixture-only and unprobed at the production boundary.',
             capabilities: CHARX_CAPABILITIES,
         },
         {
@@ -225,21 +245,4 @@ export const ADAPTER_CAPABILITY_MATRIX = {
 } as const satisfies {
     version: number
     rows: readonly AdapterCapabilityRow[]
-}
-
-export function expectedAdapterWarnings(id: AdapterId): string[] {
-    const row = ADAPTER_CAPABILITY_MATRIX.rows.find((candidate) => candidate.id === id)
-    if (!row) throw new Error(`Unknown adapter capability row: ${id}`)
-    return row.capabilities.flatMap((capability) =>
-        capability.category === 'preserved' ? [] : [capability.warning],
-    )
-}
-
-export function adapterOracleResult(id: AdapterId):
-    | { status: 'passing' }
-    | { status: 'known-gap' | 'unsupported'; warning: string } {
-    const row = ADAPTER_CAPABILITY_MATRIX.rows.find((candidate) => candidate.id === id)
-    if (!row) throw new Error(`Unknown adapter capability row: ${id}`)
-    if (row.oracleStatus === 'passing') return { status: 'passing' }
-    return { status: row.oracleStatus, warning: row.resultWarning }
 }

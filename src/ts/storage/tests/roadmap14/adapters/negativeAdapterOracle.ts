@@ -63,8 +63,9 @@ export async function observeRisuSaveNegativeFixture(
                 }
                 : {
                     fixtureId: id,
-                    status: 'passing',
-                    observed: 'missing block was not completed from stale local cache',
+                    status: 'known-gap',
+                    observed: 'missing required block was silently skipped',
+                    warning: value.warning,
                 }
         }
 
@@ -100,10 +101,11 @@ function readUint32(bytes: Uint8Array, offset: number): number {
 export function inspectLocalBackupFixture(
     id: 'truncated-local-backup-tail' | 'payload-before-database',
 ): {
+    evidence: 'fixture-only'
     entries: string[]
     trailingByteLength: number
     payloadBeforeDatabase: boolean
-    result: { status: 'known-gap'; warning: string }
+    result: { status: 'unprobed-known-gap'; warning: string }
 } {
     const value = fixture(id)
     const bytes = fixtureBytes(id)
@@ -131,12 +133,13 @@ export function inspectLocalBackupFixture(
 
     const databaseIndex = entries.indexOf('database.risudat')
     return {
+        evidence: 'fixture-only',
         entries,
         trailingByteLength: bytes.byteLength - offset,
         payloadBeforeDatabase: databaseIndex > 0 && entries
             .slice(0, databaseIndex)
             .some((name) => name !== 'encryption.risudat'),
-        result: { status: 'known-gap', warning: value.warning },
+        result: { status: 'unprobed-known-gap', warning: value.warning },
     }
 }
 
@@ -159,10 +162,11 @@ function collisionKey(path: string): string | null {
 }
 
 export function inspectCharXCollisionFixture(): {
+    evidence: 'fixture-only'
     collisionGroups: string[][]
     extensions: (string | null)[]
     unsafePaths: string[]
-    result: { status: 'known-gap'; warning: string }
+    result: { status: 'unprobed-known-gap'; warning: string }
 } {
     const value = fixture('charx-extension-path-collisions')
     const paths = value.paths ?? []
@@ -179,9 +183,10 @@ export function inspectCharXCollisionFixture(): {
         .sort((left, right) => left === null ? -1 : right === null ? 1 : left.localeCompare(right))
 
     return {
+        evidence: 'fixture-only',
         collisionGroups: [...byKey.values()].filter((group) => group.length > 1),
         extensions,
         unsafePaths,
-        result: { status: 'known-gap', warning: value.warning },
+        result: { status: 'unprobed-known-gap', warning: value.warning },
     }
 }
