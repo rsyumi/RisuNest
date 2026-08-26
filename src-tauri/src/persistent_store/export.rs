@@ -23,6 +23,8 @@ const MODULES: u8 = 5;
 const PLUGINS: u8 = 9;
 const LOADOUTS: u8 = 10;
 const PLUGIN_STORAGE: u8 = 11;
+#[cfg(feature = "official-publication-upload-pilot")]
+const MAX_EXPORT_OWNERSHIP_BYTES: u64 = 4096;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -227,6 +229,19 @@ fn open_regular_file_no_follow(path: &Path) -> StoreResult<(File, u64)> {
 }
 
 #[cfg(feature = "official-publication-upload-pilot")]
+fn read_bounded_ownership(file: File, size_hint: u64) -> StoreResult<ExportOwnership> {
+    let mut bytes = Vec::with_capacity(size_hint.min(MAX_EXPORT_OWNERSHIP_BYTES) as usize);
+    file.take(MAX_EXPORT_OWNERSHIP_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_EXPORT_OWNERSHIP_BYTES {
+        return Err(StoreError::Validation {
+            message: "Official publication source has no valid ownership marker".to_owned(),
+        });
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(feature = "official-publication-upload-pilot")]
 pub(super) fn open_for_upload(
     connection: &Connection,
     snapshots_dir: &Path,
@@ -245,15 +260,13 @@ pub(super) fn open_for_upload(
     }
     let (source, source_len) = open_regular_file_no_follow(path)?;
     let ownership_path = exports_dir.join(format!("risusave-{id}.lease"));
-    let (mut ownership_file, ownership_len) = open_regular_file_no_follow(&ownership_path)?;
-    if ownership_len > 4096 {
+    let (ownership_file, ownership_len) = open_regular_file_no_follow(&ownership_path)?;
+    if ownership_len > MAX_EXPORT_OWNERSHIP_BYTES {
         return Err(StoreError::Validation {
             message: "Official publication source has no valid ownership marker".to_owned(),
         });
     }
-    let mut ownership_bytes = Vec::with_capacity(ownership_len as usize);
-    ownership_file.read_to_end(&mut ownership_bytes)?;
-    let ownership: ExportOwnership = serde_json::from_slice(&ownership_bytes)?;
+    let ownership = read_bounded_ownership(ownership_file, ownership_len)?;
     if ownership.export_id != id {
         return Err(StoreError::Validation {
             message: "Official publication source ownership does not match its export".to_owned(),
@@ -787,6 +800,22 @@ mod tests {
         )
         .is_err());
         cleanup(&store.snapshots_dir, Path::new(&second.path)).unwrap();
+    }
+
+    #[cfg(feature = "official-publication-upload-pilot")]
+    #[test]
+    fn ownership_reader_rejects_growth_beyond_its_opened_metadata_hint() {
+        let directory = TempDir::new().unwrap();
+        let marker = directory.path().join("marker.lease");
+        let mut contents = serde_json::to_vec(&ExportOwnership {
+            export_id: "id".to_owned(),
+            lease: "lease".to_owned(),
+        })
+        .unwrap();
+        contents.resize(4097, b' ');
+        fs::write(&marker, contents).unwrap();
+
+        assert!(read_bounded_ownership(File::open(marker).unwrap(), 1).is_err());
     }
 
     #[cfg(feature = "official-publication-upload-pilot")]
