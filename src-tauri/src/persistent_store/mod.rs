@@ -12,6 +12,7 @@ pub(crate) use logical_delta_target::establish_logical_common_base;
 mod logical_index;
 #[allow(dead_code)]
 mod logical_schema;
+mod owner_projection;
 mod query;
 mod schema;
 mod snapshot;
@@ -1025,12 +1026,26 @@ impl PersistentStore {
     }
 
     pub(crate) fn materialize(&self, revision: Option<i64>) -> StoreResult<Value> {
-        query::materialize(&self.connection, revision)
+        let (mut database, target) = query::materialize_with_target(&self.connection, revision)?;
+        owner_projection::OwnerManifestProjector::from_snapshots_dir(
+            &self.connection,
+            &target,
+            &self.snapshots_dir,
+        )?
+        .project_database(&mut database)?;
+        Ok(database)
     }
 
     pub(crate) fn materialize_lease(&self, lease: &str) -> StoreResult<Value> {
         let (connection, target) = self.read_view(Some(lease))?;
-        query::materialize_target(connection, &target)
+        let mut database = query::materialize_target(connection, &target)?;
+        owner_projection::OwnerManifestProjector::from_snapshots_dir(
+            connection,
+            &target,
+            &self.snapshots_dir,
+        )?
+        .project_database(&mut database)?;
+        Ok(database)
     }
 
     pub(crate) fn materialize_staging(&self, staging_id: &str) -> StoreResult<Value> {

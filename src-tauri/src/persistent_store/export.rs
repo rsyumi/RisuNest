@@ -1,3 +1,4 @@
+use super::owner_projection::OwnerManifestProjector;
 use super::{compare_plugin_storage_keys, ReadTarget, StoreError, StoreResult};
 use flate2::{Compression, GzBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -79,6 +80,8 @@ pub(crate) fn create_controlled(
     mut on_progress: impl FnMut(u64, u64, u64),
 ) -> StoreResult<ExportedRisuSave> {
     check_export_cancelled(&is_cancelled)?;
+    let owner_projector =
+        OwnerManifestProjector::from_snapshots_dir(connection, target, snapshots_dir)?;
     let exports_dir = export_directory(snapshots_dir)?;
     fs::create_dir_all(&exports_dir)?;
     let id = Uuid::new_v4();
@@ -112,6 +115,7 @@ pub(crate) fn create_controlled(
         serde_json::from_str(&root)?,
         "Persistent root must be an object",
     )?;
+    owner_projector.project_root(&mut root)?;
     root.shift_remove("characters");
     root.shift_remove("botPresets");
     let modules = take_root_block_value(&mut root, "modules");
@@ -124,6 +128,7 @@ pub(crate) fn create_controlled(
     }
 
     let character_ids = character_ids(connection, &target.generation)?;
+    owner_projector.validate_character_owners(&character_ids.iter().cloned().collect())?;
     let preset_count = preset_count(connection, &target.generation)?;
     let total_items = character_ids.len() as u64 + 7;
     let mut completed_items = 0u64;
@@ -229,6 +234,7 @@ pub(crate) fn create_controlled(
                     connection,
                     &target.generation,
                     character_id,
+                    &owner_projector,
                     writer,
                     &is_cancelled,
                 )
@@ -660,6 +666,7 @@ fn write_character(
     connection: &Connection,
     generation: &str,
     character_id: &str,
+    owner_projector: &OwnerManifestProjector,
     writer: &mut dyn Write,
     is_cancelled: &impl Fn() -> bool,
 ) -> StoreResult<()> {
@@ -677,6 +684,7 @@ fn write_character(
         serde_json::from_str(&detail)?,
         "Character detail must be an object",
     )?;
+    owner_projector.project_character(character_id, &mut character)?;
     character.remove("chats");
     write_object_with_array(writer, character, "chats", |writer| {
         write_conversations(connection, generation, character_id, writer, is_cancelled)

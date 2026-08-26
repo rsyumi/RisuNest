@@ -816,6 +816,130 @@ fn authority_marker_rejects_preparing_and_activates_v2_with_the_generation() {
 }
 
 #[test]
+fn v2_compatibility_materialization_and_export_fail_closed_on_corrupt_owner_manifest() {
+    use crate::asset_repository::{owner_manifest_codec, PayloadCas};
+
+    let directory = tempfile::tempdir().expect("create owner projection directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let tuples = json!([
+        ["first", "assets/shared.bin", "BIN"],
+        ["first", "assets/shared.bin", "BIN"]
+    ]);
+    let manifest_bytes = owner_manifest_codec::encode_owner_manifest(&[
+        owner_manifest_codec::OwnerManifestEntry {
+            tuple: [
+                "first".to_owned(),
+                "assets/shared.bin".to_owned(),
+                "BIN".to_owned(),
+            ],
+            payload_hash: None,
+        },
+        owner_manifest_codec::OwnerManifestEntry {
+            tuple: [
+                "first".to_owned(),
+                "assets/shared.bin".to_owned(),
+                "BIN".to_owned(),
+            ],
+            payload_hash: None,
+        },
+    ])
+    .expect("encode owner manifest");
+    let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+    let manifest = cas
+        .prepare_bytes(&manifest_bytes)
+        .expect("prepare owner manifest");
+    let staging = store.replace_begin().expect("begin v2 replacement");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({
+                "modules": [{
+                    "id": "module",
+                    "name": "Module",
+                    "description": "",
+                    "assets": tuples.clone()
+                }]
+            }),
+        )
+        .expect("stage v2 root");
+    store
+        .replace_put_asset_owner_heads(
+            &staging.staging_id,
+            &[AssetOwnerHead::present(
+                AssetOwnerLocator::RootModuleAssets { index: 0 },
+                manifest.content_hash.clone(),
+                2,
+            )],
+        )
+        .expect("stage owner head");
+    store
+        .replace_put_asset_repository_authority(
+            &staging.staging_id,
+            &AssetRepositoryAuthorityState::V2 {
+                migration_id: "projection-test".to_owned(),
+                compatibility_hash: "ab".repeat(32),
+            },
+        )
+        .expect("stage v2 authority");
+    let activated = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate v2 generation");
+    let lease = store
+        .acquire_revision(activated.revision)
+        .expect("acquire v2 revision");
+
+    assert_eq!(
+        store.materialize(None).expect("materialize valid v2 owner")["modules"][0]["assets"],
+        tuples
+    );
+    let exported = store
+        .export_risu_save(&lease.lease, false)
+        .expect("export valid v2 owner");
+    store
+        .cleanup_risu_save_export(Path::new(&exported.path))
+        .expect("clean valid export");
+
+    let generation = super::active_generation(&store.connection).expect("read active generation");
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+             ) VALUES (?1, 'root-module-assets', '00', 1, ?2, 2)",
+            params![generation, manifest.content_hash],
+        )
+        .expect("insert noncanonical duplicate owner locator");
+    let locator_error = store
+        .materialize(None)
+        .expect_err("noncanonical owner locators must fail closed");
+    assert!(locator_error.to_string().contains("locator"));
+    store
+        .connection
+        .execute(
+            "DELETE FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind = 'root-module-assets' AND owner_locator = '00'",
+            [generation],
+        )
+        .expect("remove noncanonical duplicate owner locator");
+
+    fs::write(directory.path().join(&manifest.physical_key), b"corrupt")
+        .expect("corrupt owner manifest object");
+
+    let materialize_error = store
+        .materialize(None)
+        .expect_err("materialization must validate owner manifest identity");
+    assert!(materialize_error.to_string().contains("owner manifest"));
+    let lease_error = store
+        .materialize_lease(&lease.lease)
+        .expect_err("leased materialization must validate owner manifest identity");
+    assert!(lease_error.to_string().contains("owner manifest"));
+    let export_error = store
+        .export_risu_save(&lease.lease, false)
+        .expect_err("native export must validate owner manifest identity");
+    assert!(export_error.to_string().contains("owner manifest"));
+}
+
+#[test]
 fn staged_owner_heads_activate_and_remain_pinned_with_their_database_generation() {
     let directory = tempfile::tempdir().expect("create staged owner-head directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");

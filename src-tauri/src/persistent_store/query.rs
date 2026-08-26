@@ -379,16 +379,11 @@ pub(super) fn list_asset_owner_heads(
                         character_id: owner_locator,
                     },
                     "root-module-assets" => AssetOwnerLocator::RootModuleAssets {
-                        index: owner_locator.parse().map_err(|_| StoreError::Validation {
-                            message: "Stored root module asset owner locator is invalid".to_owned(),
-                        })?,
+                        index: stored_asset_owner_index(&owner_locator, "root module")?,
                     },
                     "persona-embedded-module-assets" => {
                         AssetOwnerLocator::PersonaEmbeddedModuleAssets {
-                            index: owner_locator.parse().map_err(|_| StoreError::Validation {
-                                message: "Stored persona module asset owner locator is invalid"
-                                    .to_owned(),
-                            })?,
+                            index: stored_asset_owner_index(&owner_locator, "persona module")?,
                         }
                     }
                     _ => {
@@ -412,6 +407,18 @@ pub(super) fn list_asset_owner_heads(
         revision: target.revision,
         value: values,
     })
+}
+
+fn stored_asset_owner_index(value: &str, subject: &str) -> StoreResult<i64> {
+    let index = value.parse::<i64>().map_err(|_| StoreError::Validation {
+        message: format!("Stored {subject} asset owner locator is invalid"),
+    })?;
+    if index.to_string() != value {
+        return Err(StoreError::Validation {
+            message: format!("Stored {subject} asset owner locator is noncanonical"),
+        });
+    }
+    Ok(index)
 }
 
 pub(super) fn list_cold_aliases(
@@ -747,6 +754,13 @@ pub(super) fn read_conversation_window(
 }
 
 pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> StoreResult<Value> {
+    materialize_with_target(connection, revision).map(|(value, _)| value)
+}
+
+pub(super) fn materialize_with_target(
+    connection: &Connection,
+    revision: Option<i64>,
+) -> StoreResult<(Value, ReadTarget)> {
     let transaction = connection.unchecked_transaction()?;
     let actual = current_revision(&transaction)?;
     let expected = revision.unwrap_or(actual);
@@ -757,7 +771,13 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
     let value = materialize_generation(&transaction, &generation)?
         .ok_or(StoreError::RevisionConflict { expected, actual })?;
     transaction.commit()?;
-    Ok(value)
+    Ok((
+        value,
+        ReadTarget {
+            revision: actual,
+            generation,
+        },
+    ))
 }
 
 pub(super) fn materialize_target(
