@@ -1194,7 +1194,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     const MSGPACKR_PARITY_FIXTURE: &str = include_str!(
@@ -2378,6 +2378,106 @@ mod tests {
         );
         assert!(!jobs_root.join("jobs").join(&started.job_id).exists());
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 2);
+    }
+
+    #[test]
+    fn android_spool_restore_waits_for_finalize_and_cleans_the_claimed_source() {
+        let (directory, sink) = fixture();
+        let jobs_root = directory.path().join("native-file-jobs");
+        let state = NativeFileJobState::initialize(jobs_root.clone());
+        let token = Uuid::new_v4().to_string();
+        let spool = jobs_root.join("sources").join(&token);
+        fs::create_dir_all(&spool).unwrap();
+        let source = spool.join("source.risudat");
+        valid_save(&source);
+        let source_bytes = fs::metadata(&source).unwrap().len();
+        fs::write(
+            spool.join("ownership.json"),
+            serde_json::to_vec(&SpoolOwnership {
+                format: ANDROID_SPOOL_FORMAT.to_owned(),
+                version: ANDROID_SPOOL_VERSION,
+                token: token.clone(),
+                created_at_millis: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            spool.join("source.json"),
+            serde_json::to_vec(&SpoolManifest {
+                token: token.clone(),
+                state: SpoolState::Ready,
+                display_name: "backup.risudat".to_owned(),
+                bytes: Some(source_bytes),
+                total_bytes: Some(source_bytes),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let sink = Arc::new(sink);
+
+        let started = state
+            .spawn(
+                NativeFileJobTask::Restore {
+                    opened_source: None,
+                    source: JobSource::AndroidSpool {
+                        token: token.clone(),
+                    },
+                    expected_revision: 1,
+                    sink: RestoreJobSink::Test(sink.clone()),
+                },
+                true,
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let waiting = loop {
+            let status = state.status(&started.job_id).unwrap();
+            if status.state == JobState::WaitingForInput || status.state.is_terminal() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restore did not reach activation wait"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(waiting.state, JobState::WaitingForInput);
+        assert_eq!(waiting.phase, JobPhase::AwaitingActivation);
+        assert_eq!(waiting.expected_revision, Some(1));
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+        assert!(!spool.exists());
+        assert!(jobs_root
+            .join("jobs")
+            .join(&started.job_id)
+            .join("android-source")
+            .exists());
+        assert!(state
+            .list()
+            .unwrap()
+            .iter()
+            .any(|status| status.job_id == started.job_id));
+
+        assert_eq!(
+            state.finalize(&started.job_id).unwrap(),
+            FinalizeOutcome::Requested
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let completed = loop {
+            let status = state.status(&started.job_id).unwrap();
+            if status.state.is_terminal() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "restore did not finish after finalize"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(completed.state, JobState::Succeeded);
+        assert_eq!(completed.result.unwrap().revision, 2);
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 2);
+        assert!(!jobs_root.join("jobs").join(&started.job_id).exists());
     }
 
     struct BlockingBeginSink {
