@@ -13,7 +13,8 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use url::Url;
-use zip::{ZipArchive, SUPPORTED_COMPRESSION_METHODS};
+use zip::write::FileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter, SUPPORTED_COMPRESSION_METHODS};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CANCELLED_IO_MESSAGE: &str = "CharX parsing was cancelled";
@@ -96,6 +97,49 @@ impl fmt::Display for CharXParseError {
 
 impl std::error::Error for CharXParseError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CharXWriteErrorCode {
+    Io,
+    InvalidDescriptor,
+    PayloadHashMismatch,
+    Cancelled,
+}
+
+#[derive(Debug)]
+pub struct CharXWriteError {
+    code: CharXWriteErrorCode,
+    message: String,
+}
+
+impl CharXWriteError {
+    fn new(code: CharXWriteErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> CharXWriteErrorCode {
+        self.code
+    }
+}
+
+impl fmt::Display for CharXWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CharXWriteError {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrittenCharXFile {
+    pub path: PathBuf,
+    pub byte_length: u64,
+    pub sha256: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CharXContainerKind {
@@ -159,6 +203,32 @@ pub struct ParsedCharXDescriptor {
 pub enum CharXInspection {
     Card(ParsedCharXDescriptor),
     OrdinaryJpegAsset(OrdinaryJpegAssetDescriptor),
+}
+
+struct OwnedCharXOutput {
+    temporary: PathBuf,
+    keep: bool,
+}
+
+impl OwnedCharXOutput {
+    fn new(temporary: PathBuf) -> Self {
+        Self {
+            temporary,
+            keep: false,
+        }
+    }
+
+    fn preserve(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for OwnedCharXOutput {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +411,364 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+pub fn write_charx_file<F>(
+    descriptor: &ParsedCharXDescriptor,
+    output_root: &Path,
+    is_cancelled: F,
+) -> Result<WrittenCharXFile, CharXWriteError>
+where
+    F: FnMut() -> bool,
+{
+    let cancellation = Cancellation::new(is_cancelled);
+    check_write_cancellation(&cancellation)?;
+    validate_export_descriptor(descriptor)?;
+    let output_root = validate_plain_directory(output_root, "CharX export root")?;
+    let staging_root =
+        validate_plain_directory(&descriptor.staging_directory, "CharX staging root")?;
+    let output_id = uuid::Uuid::new_v4();
+    let temporary = output_root.join(format!("charx-{output_id}.tmp"));
+    let final_path = output_root.join(format!("charx-{output_id}.charx"));
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| write_io_error("create CharX export", error))?;
+    let output_guard = OwnedCharXOutput::new(temporary.clone());
+    let mut archive = ZipWriter::new(BufWriter::with_capacity(COPY_BUFFER_BYTES, file));
+
+    for payload in &descriptor.payloads {
+        check_write_cancellation(&cancellation)?;
+        let source = open_staged_payload(&staging_root, payload)?;
+        let options = FileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .large_file(payload.decoded_size >= u64::from(u32::MAX));
+        archive
+            .start_file(&payload.original_name, options)
+            .map_err(|error| write_zip_error("start CharX payload", error))?;
+        copy_verified_payload(&mut archive, source, payload, &cancellation)?;
+    }
+
+    check_write_cancellation(&cancellation)?;
+    archive
+        .start_file(
+            "card.json",
+            FileOptions::default().compression_method(CompressionMethod::Deflated),
+        )
+        .map_err(|error| write_zip_error("start CharX card metadata", error))?;
+    write_cancellable_bytes(
+        &mut archive,
+        descriptor.card_json.as_bytes(),
+        &cancellation,
+        "write CharX card metadata",
+    )?;
+    check_write_cancellation(&cancellation)?;
+    let mut writer = archive
+        .finish()
+        .map_err(|error| write_zip_error("finish CharX archive", error))?;
+    writer
+        .flush()
+        .map_err(|error| write_io_error("flush CharX archive", error))?;
+    writer
+        .get_ref()
+        .sync_all()
+        .map_err(|error| write_io_error("sync CharX archive", error))?;
+    drop(writer);
+
+    let (byte_length, sha256) = hash_file(&temporary, &cancellation)?;
+    check_write_cancellation(&cancellation)?;
+    fs::rename(&temporary, &final_path)
+        .map_err(|error| write_io_error("publish CharX export", error))?;
+    output_guard.preserve();
+    Ok(WrittenCharXFile {
+        path: final_path,
+        byte_length,
+        sha256,
+    })
+}
+
+fn validate_export_descriptor(descriptor: &ParsedCharXDescriptor) -> Result<(), CharXWriteError> {
+    let mut names = HashSet::with_capacity(descriptor.payloads.len() + 1);
+    let mut sanitized_names = HashMap::with_capacity(descriptor.payloads.len() + 1);
+    names.insert("card.json".to_owned());
+    sanitized_names.insert("card.json".to_owned(), "card.json".to_owned());
+    let mut entries = Vec::with_capacity(descriptor.payloads.len() + 1);
+    for (index, payload) in descriptor.payloads.iter().enumerate() {
+        let (normalized_name, sanitized_name) =
+            validate_archive_name(&payload.original_name, false).map_err(|error| {
+                CharXWriteError::new(CharXWriteErrorCode::InvalidDescriptor, error.to_string())
+            })?;
+        if normalized_name == "card.json" || normalized_name != payload.normalized_name {
+            return Err(CharXWriteError::new(
+                CharXWriteErrorCode::InvalidDescriptor,
+                "CharX payload descriptor has an inconsistent archive name",
+            ));
+        }
+        if !names.insert(normalized_name.clone()) {
+            return Err(CharXWriteError::new(
+                CharXWriteErrorCode::InvalidDescriptor,
+                "CharX payload descriptor contains a duplicate archive name",
+            ));
+        }
+        if sanitized_names
+            .insert(sanitized_name, normalized_name.clone())
+            .is_some()
+        {
+            return Err(CharXWriteError::new(
+                CharXWriteErrorCode::InvalidDescriptor,
+                "CharX payload descriptors collide after path sanitization",
+            ));
+        }
+        let extension = extension_of(&payload.original_name);
+        let normalized_extension = extension.as_ref().map(|value| value.to_ascii_lowercase());
+        if extension != payload.extension || normalized_extension != payload.normalized_extension {
+            return Err(CharXWriteError::new(
+                CharXWriteErrorCode::InvalidDescriptor,
+                "CharX payload descriptor has inconsistent extension metadata",
+            ));
+        }
+        entries.push(EntryMetadata {
+            index,
+            original_name: payload.original_name.clone(),
+            normalized_name,
+            extension,
+            normalized_extension,
+            compressed_size: payload.compressed_size,
+            decoded_size: payload.decoded_size,
+            expected_crc32: payload.crc32,
+            is_directory: false,
+        });
+    }
+    entries.push(EntryMetadata {
+        index: descriptor.payloads.len(),
+        original_name: "card.json".to_owned(),
+        normalized_name: "card.json".to_owned(),
+        extension: Some("json".to_owned()),
+        normalized_extension: Some("json".to_owned()),
+        compressed_size: 0,
+        decoded_size: descriptor.card_json.len() as u64,
+        expected_crc32: 0,
+        is_directory: false,
+    });
+    let references = validate_card_metadata(&descriptor.card_json, &entries).map_err(|error| {
+        CharXWriteError::new(CharXWriteErrorCode::InvalidDescriptor, error.to_string())
+    })?;
+    if references != descriptor.asset_references {
+        return Err(CharXWriteError::new(
+            CharXWriteErrorCode::InvalidDescriptor,
+            "CharX card references differ from its parsed descriptor",
+        ));
+    }
+    let mut types_by_name: HashMap<&str, Vec<String>> = HashMap::new();
+    for reference in &references {
+        types_by_name
+            .entry(&reference.normalized_name)
+            .or_default()
+            .push(reference.asset_type.clone());
+    }
+    if descriptor.payloads.iter().any(|payload| {
+        types_by_name
+            .remove(payload.normalized_name.as_str())
+            .unwrap_or_default()
+            != payload.card_asset_types
+    }) {
+        return Err(CharXWriteError::new(
+            CharXWriteErrorCode::InvalidDescriptor,
+            "CharX payload ownership differs from its card references",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_plain_directory(path: &Path, label: &str) -> Result<PathBuf, CharXWriteError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| write_io_error(&format!("read {label}"), error))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(CharXWriteError::new(
+            CharXWriteErrorCode::InvalidDescriptor,
+            format!("{label} must be a plain directory"),
+        ));
+    }
+    path.canonicalize()
+        .map_err(|error| write_io_error(&format!("resolve {label}"), error))
+}
+
+fn open_staged_payload(
+    staging_root: &Path,
+    payload: &StagedPayloadDescriptor,
+) -> Result<File, CharXWriteError> {
+    let metadata = fs::symlink_metadata(&payload.staged_path)
+        .map_err(|error| write_io_error("read staged CharX payload", error))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(CharXWriteError::new(
+            CharXWriteErrorCode::InvalidDescriptor,
+            "staged CharX payload must be a plain file",
+        ));
+    }
+    let canonical = payload
+        .staged_path
+        .canonicalize()
+        .map_err(|error| write_io_error("resolve staged CharX payload", error))?;
+    if canonical.parent() != Some(staging_root) {
+        return Err(CharXWriteError::new(
+            CharXWriteErrorCode::InvalidDescriptor,
+            "staged CharX payload escapes its owned directory",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options
+        .open(canonical)
+        .map_err(|error| write_io_error("open staged CharX payload", error))
+}
+
+fn write_cancellable_bytes<W, F>(
+    destination: &mut W,
+    bytes: &[u8],
+    cancellation: &Cancellation<F>,
+    operation: &str,
+) -> Result<(), CharXWriteError>
+where
+    W: Write,
+    F: FnMut() -> bool,
+{
+    for chunk in bytes.chunks(COPY_BUFFER_BYTES) {
+        check_write_cancellation(cancellation)?;
+        destination
+            .write_all(chunk)
+            .map_err(|error| write_io_error(operation, error))?;
+    }
+    Ok(())
+}
+
+fn copy_verified_payload<W, F>(
+    destination: &mut W,
+    mut source: File,
+    payload: &StagedPayloadDescriptor,
+    cancellation: &Cancellation<F>,
+) -> Result<(), CharXWriteError>
+where
+    W: Write,
+    F: FnMut() -> bool,
+{
+    let mut sha256 = Sha256::new();
+    let mut crc32 = Crc32Hasher::new();
+    let mut sniff = Vec::with_capacity(512);
+    let mut actual = 0_u64;
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    loop {
+        check_write_cancellation(cancellation)?;
+        let count = source
+            .read(&mut buffer)
+            .map_err(|error| write_io_error("read staged CharX payload", error))?;
+        if count == 0 {
+            break;
+        }
+        actual = actual.checked_add(count as u64).ok_or_else(|| {
+            CharXWriteError::new(
+                CharXWriteErrorCode::PayloadHashMismatch,
+                "staged CharX payload size overflowed",
+            )
+        })?;
+        if sniff.len() < 512 {
+            let sniff_count = (512 - sniff.len()).min(count);
+            sniff.extend_from_slice(&buffer[..sniff_count]);
+        }
+        sha256.update(&buffer[..count]);
+        crc32.update(&buffer[..count]);
+        destination
+            .write_all(&buffer[..count])
+            .map_err(|error| write_io_error("write CharX payload", error))?;
+    }
+    let actual_sha256 = hex::encode(sha256.finalize());
+    let actual_crc32 = crc32.finalize();
+    let actual_mime = detect_mime(&sniff, payload.normalized_extension.as_deref());
+    if actual != payload.decoded_size
+        || actual_sha256 != payload.sha256
+        || actual_crc32 != payload.crc32
+        || actual_mime != payload.mime_type
+    {
+        return Err(CharXWriteError::new(
+            CharXWriteErrorCode::PayloadHashMismatch,
+            format!(
+                "staged CharX payload no longer matches its descriptor: {}",
+                payload.original_name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_file<F>(
+    path: &Path,
+    cancellation: &Cancellation<F>,
+) -> Result<(u64, String), CharXWriteError>
+where
+    F: FnMut() -> bool,
+{
+    let mut file = File::open(path).map_err(|error| write_io_error("open CharX export", error))?;
+    let mut sha256 = Sha256::new();
+    let mut byte_length = 0_u64;
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    loop {
+        check_write_cancellation(cancellation)?;
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| write_io_error("hash CharX export", error))?;
+        if count == 0 {
+            break;
+        }
+        byte_length = byte_length.checked_add(count as u64).ok_or_else(|| {
+            CharXWriteError::new(CharXWriteErrorCode::Io, "CharX export size overflowed")
+        })?;
+        sha256.update(&buffer[..count]);
+    }
+    Ok((byte_length, hex::encode(sha256.finalize())))
+}
+
+fn check_write_cancellation<F>(cancellation: &Cancellation<F>) -> Result<(), CharXWriteError>
+where
+    F: FnMut() -> bool,
+{
+    if cancellation.is_cancelled() {
+        return Err(CharXWriteError::new(
+            CharXWriteErrorCode::Cancelled,
+            "CharX export was cancelled",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_: &fs::Metadata) -> bool {
+    false
+}
+
+fn write_io_error(operation: &str, error: io::Error) -> CharXWriteError {
+    CharXWriteError::new(CharXWriteErrorCode::Io, format!("{operation}: {error}"))
+}
+
+fn write_zip_error(operation: &str, error: zip::result::ZipError) -> CharXWriteError {
+    CharXWriteError::new(CharXWriteErrorCode::Io, format!("{operation}: {error}"))
 }
 
 fn inspect_card_container<F>(

@@ -1,6 +1,7 @@
 use crc32fast::hash as crc32;
 use risuai_lib::native_file_jobs::charx::{
-    inspect_charx_file, CharXContainerKind, CharXInspection, CharXLimits, CharXParseErrorCode,
+    inspect_charx_file, write_charx_file, CharXContainerKind, CharXInspection, CharXLimits,
+    CharXParseErrorCode, CharXWriteErrorCode,
 };
 use std::fs;
 use std::io::{Cursor, Write};
@@ -326,7 +327,13 @@ fn parses_zip64_and_preserves_bounded_card_metadata_and_payload_descriptors() {
         .expect("JSON payload descriptor");
     assert_eq!(json.extension.as_deref(), Some("JSON"));
     assert_eq!(json.mime_type, "application/json");
-    assert_eq!(json.card_asset_types, ["x-risu-asset"]);
+    assert_eq!(json.card_asset_types, ["x-risu-asset", "x-risu-asset"]);
+    assert_eq!(card.asset_references[1].order, 1);
+    assert_eq!(card.asset_references[2].order, 2);
+    assert_eq!(
+        card.asset_references[1].normalized_name,
+        card.asset_references[2].normalized_name,
+    );
     assert_eq!(
         fs::read(&json.staged_path).expect("staged JSON"),
         br#"{"enabled":true}"#
@@ -336,6 +343,126 @@ fn parses_zip64_and_preserves_bounded_card_metadata_and_payload_descriptors() {
         .payloads
         .iter()
         .all(|payload| payload.staged_path.starts_with(&card.staging_directory)));
+}
+
+#[test]
+fn native_export_second_import_preserves_card_graph_and_payload_hashes() {
+    let bytes = zip_bytes(&valid_entries(), true);
+    let (first_directory, first_inspection) =
+        parse_card("Golden.CHARX", &bytes, CharXLimits::default()).expect("first native import");
+    let CharXInspection::Card(first) = first_inspection else {
+        panic!("first import must produce a card")
+    };
+    let export_root = first_directory.path().join("exports");
+    fs::create_dir(&export_root).expect("export root");
+
+    let exported = write_charx_file(&first, &export_root, || false).expect("native export");
+
+    assert!(exported
+        .path
+        .starts_with(export_root.canonicalize().unwrap()));
+    assert_eq!(
+        exported.byte_length,
+        fs::metadata(&exported.path).unwrap().len()
+    );
+    assert_eq!(exported.sha256.len(), 64);
+    assert_eq!(fs::read_dir(&export_root).unwrap().count(), 1);
+
+    let second_staging = first_directory.path().join("second-import");
+    fs::create_dir(&second_staging).expect("second staging root");
+    let second_inspection = inspect_charx_file(
+        &exported.path,
+        "second.CHARX",
+        &second_staging,
+        CharXLimits::default(),
+        || false,
+    )
+    .expect("second native import");
+    let CharXInspection::Card(second) = second_inspection else {
+        panic!("second import must produce a card")
+    };
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&second.card_json).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&first.card_json).unwrap(),
+    );
+    assert_eq!(second.asset_references, first.asset_references);
+    assert_eq!(payload_graph(&second), payload_graph(&first));
+}
+
+#[test]
+fn native_export_rejects_changed_staged_payloads_without_leaving_output() {
+    let bytes = zip_bytes(&valid_entries(), false);
+    let (directory, inspection) =
+        parse_card("Golden.CHARX", &bytes, CharXLimits::default()).expect("native import");
+    let CharXInspection::Card(card) = inspection else {
+        panic!("fixture must produce a card")
+    };
+    fs::write(&card.payloads[0].staged_path, b"changed after inspection")
+        .expect("change staged payload");
+    let export_root = directory.path().join("exports");
+    fs::create_dir(&export_root).expect("export root");
+
+    let error = write_charx_file(&card, &export_root, || false)
+        .expect_err("changed payload must not be exported");
+
+    assert_eq!(error.code(), CharXWriteErrorCode::PayloadHashMismatch);
+    assert_eq!(fs::read_dir(export_root).unwrap().count(), 0);
+}
+
+#[test]
+fn native_export_cancellation_removes_only_its_owned_output() {
+    let bytes = zip_bytes(&valid_entries(), false);
+    let (directory, inspection) =
+        parse_card("Golden.CHARX", &bytes, CharXLimits::default()).expect("native import");
+    let CharXInspection::Card(card) = inspection else {
+        panic!("fixture must produce a card")
+    };
+    let export_root = directory.path().join("exports");
+    fs::create_dir(&export_root).expect("export root");
+    let unrelated = export_root.join("keep.charx");
+    fs::write(&unrelated, b"unrelated").expect("unrelated output");
+    let checks = AtomicUsize::new(0);
+
+    let error = write_charx_file(&card, &export_root, || {
+        checks.fetch_add(1, Ordering::SeqCst) >= 3
+    })
+    .expect_err("export must observe cancellation");
+
+    assert_eq!(error.code(), CharXWriteErrorCode::Cancelled);
+    assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+    assert_eq!(fs::read_dir(export_root).unwrap().count(), 1);
+    assert!(card
+        .payloads
+        .iter()
+        .all(|payload| payload.staged_path.exists()));
+}
+
+fn payload_graph(
+    card: &risuai_lib::native_file_jobs::charx::ParsedCharXDescriptor,
+) -> Vec<(
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    u64,
+    String,
+    Vec<String>,
+)> {
+    card.payloads
+        .iter()
+        .map(|payload| {
+            (
+                payload.original_name.clone(),
+                payload.extension.clone(),
+                payload.normalized_extension.clone(),
+                payload.mime_type.clone(),
+                payload.decoded_size,
+                payload.sha256.clone(),
+                payload.card_asset_types.clone(),
+            )
+        })
+        .collect()
 }
 
 #[test]

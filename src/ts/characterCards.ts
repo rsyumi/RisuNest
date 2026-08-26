@@ -60,7 +60,10 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
     lightningRealmImport?:boolean
     returnCharacter?:T //note That this option only works with v3 charx
 }):Promise<T extends true ? character | number | null : number | null>{
-    if(f.name.endsWith('json')){
+    const fileName = f.name.split(/[\\/]/).at(-1) ?? f.name
+    const separator = fileName.lastIndexOf('.')
+    const extension = separator < 0 ? '' : fileName.slice(separator + 1).toLowerCase()
+    if(extension === 'json'){
         if(f.data instanceof ReadableStream){
             return null
         }
@@ -86,7 +89,7 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
     let db = getDatabase()
     db.statics.imports += 1
 
-    if(f.name.endsWith('charx') || f.name.endsWith('jpg') || f.name.endsWith('jpeg')){
+    if(extension === 'charx' || extension === 'jpg' || extension === 'jpeg'){
         console.log('reading charx')
         alertStore.set({
             type: 'wait',
@@ -125,7 +128,7 @@ export async function importCharacterProcess<T extends boolean = false>(f:{
         return getDatabase().characters.findIndex((character) => character.chaId === v)
     }
 
-    if(!f.name.endsWith('png')){
+    if(extension !== 'png'){
         alertError(language.errors.noData)
         return
     }
@@ -1455,7 +1458,7 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
                                 'type': imageType
                             }), 'utf-8'), 6)
                         }
-                        await writer.write(path, Buffer.from(await compressImage(rData)))
+                        await writer.write(path, Buffer.from(rData))
                     }
                 }
             }

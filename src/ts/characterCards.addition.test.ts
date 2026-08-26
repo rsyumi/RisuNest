@@ -10,6 +10,9 @@ const mocks = vi.hoisted(() => ({
         mocks.database.characters.push(character)
         return character.chaId
     }),
+    readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
+    compressImage: vi.fn(async (_data: Uint8Array) => new Uint8Array([99])),
+    charxWrites: [] as Array<{ key: string; data: Uint8Array }>,
     nextId: 0,
 }))
 
@@ -51,7 +54,7 @@ vi.mock('./globalApi.svelte', () => ({
     loadAsset: vi.fn(),
     LocalWriter: class {},
     openURL: vi.fn(),
-    readImage: vi.fn(),
+    readImage: mocks.readImage,
     saveAsset: vi.fn(),
     VirtualWriter: class {},
 }))
@@ -68,9 +71,22 @@ vi.mock('./process/files/inlays', () => ({ reencodeImage: vi.fn() }))
 vi.mock('./pngChunk', () => ({ PngChunk: {} }))
 vi.mock('./process/processzip', () => ({
     CharXImporter: class {},
-    CharXWriter: class {},
+    CharXWriter: class {
+        constructor(_writer: unknown) {}
+        async init() {}
+        async write(key: string, data: Uint8Array | string) {
+            mocks.charxWrites.push({
+                key,
+                data: typeof data === 'string' ? new TextEncoder().encode(data) : data.slice(),
+            })
+        }
+        async end() {}
+    },
 }))
-vi.mock('./process/modules', () => ({ exportModuleLegacy: vi.fn(), readModule: vi.fn() }))
+vi.mock('./process/modules', () => ({
+    exportModuleLegacy: vi.fn(async () => new Uint8Array([111, 0, 0, 0, 0, 0])),
+    readModule: vi.fn(),
+}))
 vi.mock('@tauri-apps/plugin-fs', () => ({ readFile: vi.fn() }))
 vi.mock('@tauri-apps/plugin-deep-link', () => ({ getCurrent: vi.fn(), onOpenUrl: vi.fn() }))
 vi.mock('./storage/accountStorage', () => ({ AccountStorage: class {} }))
@@ -78,15 +94,23 @@ vi.mock('./realmAccess', () => ({
     fetchRealmResource: vi.fn(),
     isRealmAccessDisabled: () => true,
 }))
-vi.mock('./media', () => ({ compressImage: vi.fn(), getImageType: vi.fn() }))
+vi.mock('./media', () => ({
+    compressImage: mocks.compressImage,
+    getImageType: vi.fn(() => 'Unknown'),
+}))
 
-import { importCharacterCardSpec, importCharacterProcess } from './characterCards'
+import {
+    exportCharacterCard,
+    importCharacterCardSpec,
+    importCharacterProcess,
+} from './characterCards'
 
 describe('character card additions', () => {
     beforeEach(() => {
         mocks.database.characters = []
         mocks.database.statics.imports = 0
         mocks.nextId = 0
+        mocks.charxWrites = []
         vi.clearAllMocks()
         mocks.commitDetachedCharacter.mockImplementation(async (character, _reason) => {
             mocks.database.characters.push(character)
@@ -115,6 +139,22 @@ describe('character card additions', () => {
         expect(index).toBe(0)
     })
 
+    it('keeps the JavaScript card fallback for mixed-case JSON filenames', async () => {
+        const card = {
+            name: 'Mixed case card',
+            description: 'Description',
+            first_mes: 'Hello',
+        }
+
+        const index = await importCharacterProcess({
+            name: 'synthetic.JSON',
+            data: new TextEncoder().encode(JSON.stringify(card)),
+        })
+
+        expect(mocks.commitDetachedCharacter).toHaveBeenCalledOnce()
+        expect(index).toBe(0)
+    })
+
     it('maps the bounded native card.json golden through the existing semantic mapper', async () => {
         const mapped = await importCharacterCardSpec(
             JSON.parse(goldenCardJson),
@@ -137,7 +177,10 @@ describe('character card additions', () => {
             image: 'asset://portrait',
             utilityBot: true,
             largePortrait: false,
-            additionalAssets: [['config', 'asset://config', 'JSON']],
+            additionalAssets: [
+                ['config', 'asset://config', 'JSON'],
+                ['config duplicate', 'asset://config', 'JSON'],
+            ],
             alternateGreetings: ['Second hello'],
             tags: ['roadmap14', 'golden'],
             nickname: 'Golden',
@@ -151,5 +194,44 @@ describe('character card additions', () => {
             },
         })
         expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+    })
+
+    it('keeps ordinary asset bytes exact in the JavaScript CharX export fallback', async () => {
+        const character = {
+            type: 'character',
+            name: 'Exact asset card',
+            image: 'assets/avatar.bin',
+            firstMessage: 'Hello',
+            desc: '',
+            chats: [],
+            chatFolders: [],
+            chatPage: 0,
+            viewScreen: 'none',
+            bias: [],
+            emotionImages: [],
+            globalLore: [],
+            chaId: 'exact-asset-card',
+            customscript: [],
+            triggerscript: [],
+            alternateGreetings: [],
+            tags: [],
+            additionalAssets: [],
+            ccAssets: [{
+                type: 'x-risu-asset',
+                uri: 'assets/exact.bin',
+                name: 'exact',
+                ext: 'bin',
+            }],
+            extentions: {},
+        } as any
+
+        await exportCharacterCard(character, 'charx', {
+            spec: 'v3',
+            writer: {} as any,
+        })
+
+        const payload = mocks.charxWrites.find((entry) => entry.key.endsWith('/exact.bin'))
+        expect(Array.from(payload?.data ?? [])).toEqual([1, 2, 3, 4])
+        expect(mocks.compressImage).not.toHaveBeenCalled()
     })
 })

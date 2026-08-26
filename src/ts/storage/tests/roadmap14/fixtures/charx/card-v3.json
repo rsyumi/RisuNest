@@ -49,6 +49,12 @@
                 "uri": "embeded://assets/config.JSON",
                 "name": "config",
                 "ext": "JSON"
+            },
+            {
+                "type": "x-risu-asset",
+                "uri": "embeded://assets/config.JSON",
+                "name": "config duplicate",
+                "ext": "JSON"
             }
         ]
     }
