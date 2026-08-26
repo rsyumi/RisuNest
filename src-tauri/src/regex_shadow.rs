@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 const REGEX_IR_NEST_LIMIT: usize = 29;
 // regex-syntax also counts concat, alternation, bracketed class, and class union nodes.
 const REGEX_COMPILE_NEST_LIMIT: u32 = REGEX_IR_NEST_LIMIT as u32 * 3 + 4;
+const REGEX_PENDING_CANCELLATION_TTL: Duration = Duration::from_secs(2);
+const MAX_PENDING_REGEX_CANCELLATIONS: usize = 64;
+const MAX_REGEX_REQUEST_ID_BYTES: usize = 64;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,56 +117,123 @@ struct RegexShadowFailure(&'static str);
 
 #[derive(Default)]
 pub(crate) struct RegexCancellationRegistry {
-    active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    requests: Arc<Mutex<HashMap<String, RegexCancellationEntry>>>,
+}
+
+enum RegexCancellationEntry {
+    Pending { expires_at: Instant },
+    Active(Arc<AtomicBool>),
 }
 
 struct RegexCancellationRegistration {
     request_id: String,
     cancelled: Arc<AtomicBool>,
-    active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    requests: Arc<Mutex<HashMap<String, RegexCancellationEntry>>>,
 }
 
 impl RegexCancellationRegistry {
     fn register(&self, request_id: &str) -> Result<RegexCancellationRegistration, String> {
+        self.register_at(request_id, Instant::now())
+    }
+
+    fn register_at(
+        &self,
+        request_id: &str,
+        now: Instant,
+    ) -> Result<RegexCancellationRegistration, String> {
+        validate_request_id(request_id)?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut active = self
-            .active
+        let mut requests = self
+            .requests
             .lock()
             .map_err(|_| "regex_shadow_registry".to_string())?;
-        if active.contains_key(request_id) {
-            return Err("regex_shadow_request_active".to_string());
+        prune_pending_cancellations(&mut requests, now);
+        match requests.get(request_id) {
+            Some(RegexCancellationEntry::Active(_)) => {
+                return Err("regex_shadow_request_active".to_string());
+            }
+            Some(RegexCancellationEntry::Pending { .. }) => {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            None => {}
         }
-        active.insert(request_id.to_string(), Arc::clone(&cancelled));
+        requests.insert(
+            request_id.to_string(),
+            RegexCancellationEntry::Active(Arc::clone(&cancelled)),
+        );
         Ok(RegexCancellationRegistration {
             request_id: request_id.to_string(),
             cancelled,
-            active: Arc::clone(&self.active),
+            requests: Arc::clone(&self.requests),
         })
     }
 
     fn cancel(&self, request_id: &str) -> Result<bool, String> {
-        let active = self
-            .active
+        self.cancel_at(request_id, Instant::now())
+    }
+
+    fn cancel_at(&self, request_id: &str, now: Instant) -> Result<bool, String> {
+        validate_request_id(request_id)?;
+        let mut requests = self
+            .requests
             .lock()
             .map_err(|_| "regex_shadow_registry".to_string())?;
-        let Some(cancelled) = active.get(request_id) else {
-            return Ok(false);
-        };
-        cancelled.store(true, Ordering::Relaxed);
-        Ok(true)
+        prune_pending_cancellations(&mut requests, now);
+        match requests.get(request_id) {
+            Some(RegexCancellationEntry::Active(cancelled)) => {
+                cancelled.store(true, Ordering::Relaxed);
+                Ok(true)
+            }
+            Some(RegexCancellationEntry::Pending { .. }) => Ok(false),
+            None => {
+                let pending_count = requests
+                    .values()
+                    .filter(|entry| matches!(entry, RegexCancellationEntry::Pending { .. }))
+                    .count();
+                if pending_count >= MAX_PENDING_REGEX_CANCELLATIONS {
+                    return Err("regex_shadow_registry_limit".to_string());
+                }
+                requests.insert(
+                    request_id.to_string(),
+                    RegexCancellationEntry::Pending {
+                        expires_at: now + REGEX_PENDING_CANCELLATION_TTL,
+                    },
+                );
+                Ok(false)
+            }
+        }
     }
+}
+
+fn validate_request_id(request_id: &str) -> Result<(), String> {
+    if request_id.is_empty() || request_id.len() > MAX_REGEX_REQUEST_ID_BYTES {
+        Err("regex_shadow_request_id".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn prune_pending_cancellations(
+    requests: &mut HashMap<String, RegexCancellationEntry>,
+    now: Instant,
+) {
+    requests.retain(|_, entry| {
+        !matches!(entry, RegexCancellationEntry::Pending { expires_at } if *expires_at <= now)
+    });
 }
 
 impl Drop for RegexCancellationRegistration {
     fn drop(&mut self) {
-        let Ok(mut active) = self.active.lock() else {
+        let Ok(mut requests) = self.requests.lock() else {
             return;
         };
-        if active
+        if requests
             .get(&self.request_id)
-            .is_some_and(|cancelled| Arc::ptr_eq(cancelled, &self.cancelled))
+            .is_some_and(|entry| {
+                matches!(entry, RegexCancellationEntry::Active(cancelled) if Arc::ptr_eq(cancelled, &self.cancelled))
+            })
         {
-            active.remove(&self.request_id);
+            requests.remove(&self.request_id);
         }
     }
 }
@@ -942,10 +1012,10 @@ mod tests {
         let registry = RegexCancellationRegistry::default();
         {
             let _execution = registry.register("request-a").unwrap();
-            assert_eq!(registry.active.lock().unwrap().len(), 1);
+            assert_eq!(registry.requests.lock().unwrap().len(), 1);
         }
 
-        assert!(registry.active.lock().unwrap().is_empty());
+        assert!(registry.requests.lock().unwrap().is_empty());
         assert!(!registry.cancel("request-a").unwrap());
     }
 
@@ -959,6 +1029,37 @@ mod tests {
         assert!(execution
             .cancelled
             .load(std::sync::atomic::Ordering::Relaxed));
+        drop(execution);
+        assert!(registry.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_registry_expires_and_bounds_unmatched_cancellations() {
+        let registry = RegexCancellationRegistry::default();
+        let now = std::time::Instant::now();
+        assert_eq!(
+            registry
+                .cancel_at(&"x".repeat(super::MAX_REGEX_REQUEST_ID_BYTES + 1), now)
+                .unwrap_err(),
+            "regex_shadow_request_id",
+        );
+        for index in 0..super::MAX_PENDING_REGEX_CANCELLATIONS {
+            assert!(!registry
+                .cancel_at(&format!("request-{index}"), now)
+                .unwrap());
+        }
+        assert_eq!(
+            registry.cancel_at("over-limit", now).unwrap_err(),
+            "regex_shadow_registry_limit",
+        );
+
+        let expired_at = now + super::REGEX_PENDING_CANCELLATION_TTL;
+        let execution = registry.register_at("request-0", expired_at).unwrap();
+
+        assert!(!execution
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!registry.cancel_at("after-expiry", expired_at).unwrap());
     }
 
     #[test]
