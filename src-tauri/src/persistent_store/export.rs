@@ -4,6 +4,7 @@ use flate2::{Compression, GzBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::fs::{self, File};
 #[cfg(feature = "official-publication-upload-pilot")]
 use std::io::Read;
@@ -77,6 +78,50 @@ pub(crate) fn create_controlled(
     lease: &str,
     omit_account: bool,
     is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> StoreResult<ExportedRisuSave> {
+    create_controlled_inner(
+        connection,
+        snapshots_dir,
+        target,
+        lease,
+        omit_account,
+        None,
+        is_cancelled,
+        on_progress,
+    )
+}
+
+pub(crate) fn create_projected_controlled(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    target: &ReadTarget,
+    lease: &str,
+    omit_account: bool,
+    replacements: &HashMap<String, String>,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> StoreResult<ExportedRisuSave> {
+    create_controlled_inner(
+        connection,
+        snapshots_dir,
+        target,
+        lease,
+        omit_account,
+        Some(replacements),
+        is_cancelled,
+        on_progress,
+    )
+}
+
+fn create_controlled_inner(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    target: &ReadTarget,
+    lease: &str,
+    omit_account: bool,
+    replacements: Option<&HashMap<String, String>>,
+    is_cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(u64, u64, u64),
 ) -> StoreResult<ExportedRisuSave> {
     check_export_cancelled(&is_cancelled)?;
@@ -116,6 +161,9 @@ pub(crate) fn create_controlled(
         "Persistent root must be an object",
     )?;
     owner_projector.project_root(&mut root)?;
+    if let Some(replacements) = replacements {
+        project_root_resources(&mut root, replacements);
+    }
     root.shift_remove("characters");
     root.shift_remove("botPresets");
     let modules = take_root_block_value(&mut root, "modules");
@@ -235,6 +283,7 @@ pub(crate) fn create_controlled(
                     &target.generation,
                     character_id,
                     &owner_projector,
+                    replacements,
                     writer,
                     &is_cancelled,
                 )
@@ -667,6 +716,7 @@ fn write_character(
     generation: &str,
     character_id: &str,
     owner_projector: &OwnerManifestProjector,
+    replacements: Option<&HashMap<String, String>>,
     writer: &mut dyn Write,
     is_cancelled: &impl Fn() -> bool,
 ) -> StoreResult<()> {
@@ -685,6 +735,9 @@ fn write_character(
         "Character detail must be an object",
     )?;
     owner_projector.project_character(character_id, &mut character)?;
+    if let Some(replacements) = replacements {
+        project_character_resources(&mut character, replacements);
+    }
     character.remove("chats");
     write_object_with_array(writer, character, "chats", |writer| {
         write_conversations(connection, generation, character_id, writer, is_cancelled)
@@ -786,6 +839,97 @@ fn write_object_with_array(
     Ok(())
 }
 
+fn project_root_resources(root: &mut Map<String, Value>, replacements: &HashMap<String, String>) {
+    replace_mapped_string(root.get_mut("customBackground"), replacements);
+    replace_mapped_string(root.get_mut("userIcon"), replacements);
+
+    if let Some(Value::Array(modules)) = root.get_mut("modules") {
+        for module in modules {
+            let Value::Object(module) = module else {
+                continue;
+            };
+            project_tuple_resources(module.get_mut("assets"), replacements);
+            replace_mapped_string(module.get_mut("icon"), replacements);
+        }
+    }
+
+    if let Some(Value::Array(personas)) = root.get_mut("personas") {
+        for persona in personas {
+            let Value::Object(persona) = persona else {
+                continue;
+            };
+            replace_mapped_string(persona.get_mut("icon"), replacements);
+            let Some(Value::Object(embedded_module)) = persona.get_mut("embeddedModule") else {
+                continue;
+            };
+            project_tuple_resources(embedded_module.get_mut("assets"), replacements);
+            replace_mapped_string(embedded_module.get_mut("icon"), replacements);
+        }
+    }
+
+    if let Some(Value::Array(character_order)) = root.get_mut("characterOrder") {
+        for item in character_order {
+            let Value::Object(item) = item else {
+                continue;
+            };
+            replace_mapped_string(item.get_mut("imgFile"), replacements);
+        }
+    }
+}
+
+fn project_character_resources(
+    character: &mut Map<String, Value>,
+    replacements: &HashMap<String, String>,
+) {
+    replace_mapped_string(character.get_mut("image"), replacements);
+    project_tuple_resources(character.get_mut("emotionImages"), replacements);
+
+    if character.get("type").and_then(Value::as_str) == Some("group") {
+        return;
+    }
+
+    project_tuple_resources(character.get_mut("additionalAssets"), replacements);
+    if let Some(Value::Object(vits)) = character.get_mut("vits") {
+        if let Some(Value::Object(files)) = vits.get_mut("files") {
+            for file in files.values_mut() {
+                replace_mapped_string(Some(file), replacements);
+            }
+        }
+    }
+    if let Some(Value::Array(assets)) = character.get_mut("ccAssets") {
+        for asset in assets {
+            let Value::Object(asset) = asset else {
+                continue;
+            };
+            replace_mapped_string(asset.get_mut("uri"), replacements);
+        }
+    }
+}
+
+fn project_tuple_resources(value: Option<&mut Value>, replacements: &HashMap<String, String>) {
+    let Some(Value::Array(items)) = value else {
+        return;
+    };
+    for item in items {
+        let Value::Array(tuple) = item else {
+            continue;
+        };
+        replace_mapped_string(tuple.get_mut(1), replacements);
+    }
+}
+
+fn replace_mapped_string(value: Option<&mut Value>, replacements: &HashMap<String, String>) {
+    let Some(Value::String(source)) = value else {
+        return;
+    };
+    if source.is_empty() {
+        return;
+    }
+    if let Some(replacement) = replacements.get(source.as_str()) {
+        source.clone_from(replacement);
+    }
+}
+
 fn into_object(value: Value, message: &str) -> StoreResult<Map<String, Value>> {
     match value {
         Value::Object(object) => Ok(object),
@@ -805,6 +949,7 @@ mod tests {
     use crate::persistent_store::PersistentStore;
     use flate2::read::GzDecoder;
     use serde_json::{json, Value};
+    use std::collections::HashMap;
     use std::fs;
     use std::io::Read;
     use tempfile::TempDir;
@@ -877,6 +1022,64 @@ mod tests {
         (directory, store, revision, lease)
     }
 
+    fn projection_fixture(projected: bool) -> (TempDir, PersistentStore, i64, String) {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let staging = store.replace_begin().unwrap().staging_id;
+        let resource = if projected { "new" } else { "old" };
+        store
+            .replace_put_root(
+                &staging,
+                &json!({
+                    "customBackground": resource,
+                    "userIcon": resource,
+                    "unrelated": "old",
+                    "modules": [{
+                        "assets": [["module", resource, "png"]],
+                        "icon": resource,
+                        "unrelated": "old"
+                    }],
+                    "personas": [{
+                        "icon": resource,
+                        "embeddedModule": {
+                            "assets": [["persona", resource, "png"]],
+                            "icon": resource,
+                            "unrelated": "old"
+                        }
+                    }],
+                    "characterOrder": [{ "imgFile": resource, "unrelated": "old" }],
+                    "loadouts": [{ "resource": "old" }],
+                    "plugins": [{ "resource": "old" }],
+                    "pluginCustomStorage": { "resource": "old" }
+                }),
+            )
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        store
+            .replace_add_characters(
+                &staging,
+                &[json!({
+                    "type": "character",
+                    "chaId": "projected-character",
+                    "image": resource,
+                    "emotionImages": [["happy", resource]],
+                    "additionalAssets": [["additional", resource]],
+                    "vits": { "files": { "voice": resource } },
+                    "ccAssets": [{ "uri": resource }],
+                    "unrelated": "old",
+                    "chats": [{
+                        "id": "chat",
+                        "name": "old",
+                        "message": [{ "role": "user", "data": "old", "chatId": "message" }]
+                    }]
+                })],
+            )
+            .unwrap();
+        let revision = store.replace_commit(&staging, None).unwrap().revision;
+        let lease = store.acquire_revision(revision).unwrap().lease;
+        (directory, store, revision, lease)
+    }
+
     fn read_blocks(path: &Path) -> Vec<Block> {
         let bytes = fs::read(path).unwrap();
         assert_eq!(&bytes[..HEADER.len()], HEADER);
@@ -903,6 +1106,244 @@ mod tests {
             });
         }
         blocks
+    }
+
+    #[test]
+    fn projects_only_supported_root_resource_paths_with_exact_single_lookups() {
+        let replacements = HashMap::from([
+            ("old".to_owned(), "new".to_owned()),
+            ("chain-start".to_owned(), "chain-middle".to_owned()),
+            ("chain-middle".to_owned(), "chain-end".to_owned()),
+            ("erase".to_owned(), String::new()),
+            (r"path\old".to_owned(), r"path\new".to_owned()),
+            (String::new(), "must-not-replace-empty".to_owned()),
+        ]);
+        let mut root = into_object(
+            json!({
+                "customBackground": "old",
+                "userIcon": "erase",
+                "unrelated": "old",
+                "nested": { "icon": "old" },
+                "modules": [
+                    {
+                        "assets": [
+                            ["first", "old", "png"],
+                            ["second", "chain-start"],
+                            ["missing-value"],
+                            ["null-value", null],
+                            ["number-value", 7],
+                            null,
+                            "malformed"
+                        ],
+                        "icon": "path\\old",
+                        "unrelated": "old"
+                    },
+                    null,
+                    "malformed"
+                ],
+                "personas": [
+                    {
+                        "icon": "old",
+                        "embeddedModule": {
+                            "assets": [["embedded", "old"], null],
+                            "icon": "old",
+                            "unrelated": "old"
+                        }
+                    },
+                    { "icon": null, "embeddedModule": null },
+                    null
+                ],
+                "characterOrder": [
+                    { "imgFile": "old", "unrelated": "old" },
+                    { "imgFile": null },
+                    "old",
+                    null
+                ]
+            }),
+            "root",
+        )
+        .unwrap();
+
+        project_root_resources(&mut root, &replacements);
+
+        assert_eq!(
+            Value::Object(root),
+            json!({
+                "customBackground": "new",
+                "userIcon": "",
+                "unrelated": "old",
+                "nested": { "icon": "old" },
+                "modules": [
+                    {
+                        "assets": [
+                            ["first", "new", "png"],
+                            ["second", "chain-middle"],
+                            ["missing-value"],
+                            ["null-value", null],
+                            ["number-value", 7],
+                            null,
+                            "malformed"
+                        ],
+                        "icon": "path\\new",
+                        "unrelated": "old"
+                    },
+                    null,
+                    "malformed"
+                ],
+                "personas": [
+                    {
+                        "icon": "new",
+                        "embeddedModule": {
+                            "assets": [["embedded", "new"], null],
+                            "icon": "new",
+                            "unrelated": "old"
+                        }
+                    },
+                    { "icon": null, "embeddedModule": null },
+                    null
+                ],
+                "characterOrder": [
+                    { "imgFile": "new", "unrelated": "old" },
+                    { "imgFile": null },
+                    "old",
+                    null
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn projects_non_group_character_resources_without_touching_unrelated_values() {
+        let replacements = HashMap::from([
+            ("old".to_owned(), "new".to_owned()),
+            ("chain-start".to_owned(), "chain-middle".to_owned()),
+            ("chain-middle".to_owned(), "chain-end".to_owned()),
+        ]);
+        let mut character = into_object(
+            json!({
+                "type": null,
+                "image": "chain-start",
+                "emotionImages": [["happy", "old"], ["missing"], null, "malformed"],
+                "additionalAssets": [["asset", "old"], ["null", null], null],
+                "vits": {
+                    "files": { "voice": "old", "empty": "", "null": null, "number": 7 },
+                    "unrelated": "old"
+                },
+                "ccAssets": [{ "uri": "old", "unrelated": "old" }, { "uri": null }, null],
+                "chats": [{ "message": [{ "data": "old" }] }],
+                "plugin": { "resource": "old" },
+                "unrelated": "old"
+            }),
+            "character",
+        )
+        .unwrap();
+
+        project_character_resources(&mut character, &replacements);
+
+        assert_eq!(character["image"], json!("chain-middle"));
+        assert_eq!(character["emotionImages"][0][1], json!("new"));
+        assert_eq!(character["additionalAssets"][0][1], json!("new"));
+        assert_eq!(character["vits"]["files"]["voice"], json!("new"));
+        assert_eq!(character["vits"]["files"]["empty"], json!(""));
+        assert_eq!(character["vits"]["files"]["null"], Value::Null);
+        assert_eq!(character["vits"]["files"]["number"], json!(7));
+        assert_eq!(character["ccAssets"][0]["uri"], json!("new"));
+        assert_eq!(character["chats"][0]["message"][0]["data"], json!("old"));
+        assert_eq!(character["plugin"]["resource"], json!("old"));
+        assert_eq!(character["unrelated"], json!("old"));
+    }
+
+    #[test]
+    fn group_projection_skips_character_only_resource_paths() {
+        let replacements = HashMap::from([("old".to_owned(), "new".to_owned())]);
+        let mut group = into_object(
+            json!({
+                "type": "group",
+                "image": "old",
+                "emotionImages": [["happy", "old"]],
+                "additionalAssets": [["asset", "old"]],
+                "vits": { "files": { "voice": "old" } },
+                "ccAssets": [{ "uri": "old" }]
+            }),
+            "group",
+        )
+        .unwrap();
+
+        project_character_resources(&mut group, &replacements);
+
+        assert_eq!(group["image"], json!("new"));
+        assert_eq!(group["emotionImages"][0][1], json!("new"));
+        assert_eq!(group["additionalAssets"][0][1], json!("old"));
+        assert_eq!(group["vits"]["files"]["voice"], json!("old"));
+        assert_eq!(group["ccAssets"][0]["uri"], json!("old"));
+    }
+
+    #[test]
+    fn projected_export_matches_a_preprojected_fixture_and_preserves_other_blocks() {
+        let (_source_directory, source_store, _source_revision, source_lease) =
+            projection_fixture(false);
+        let (_expected_directory, expected_store, _expected_revision, expected_lease) =
+            projection_fixture(true);
+        let replacements = HashMap::from([("old".to_owned(), "new".to_owned())]);
+        let (source_connection, source_target) =
+            source_store.read_view(Some(&source_lease)).unwrap();
+
+        let actual = create_projected_controlled(
+            source_connection,
+            &source_store.snapshots_dir,
+            &source_target,
+            &source_lease,
+            false,
+            &replacements,
+            || false,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let expected = expected_store
+            .export_risu_save(&expected_lease, false)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&actual.path).unwrap(),
+            fs::read(&expected.path).unwrap()
+        );
+        let blocks = read_blocks(Path::new(&actual.path));
+        assert_eq!(blocks[0].value["customBackground"], json!("new"));
+        assert_eq!(blocks[0].value["unrelated"], json!("old"));
+        assert_eq!(blocks[2].value[0]["assets"][0][1], json!("new"));
+        assert_eq!(blocks[4].value[0]["resource"], json!("old"));
+        assert_eq!(blocks[5].value["resource"], json!("old"));
+        assert_eq!(blocks[6].value["image"], json!("new"));
+        assert_eq!(blocks[6].value["unrelated"], json!("old"));
+        assert_eq!(blocks[6].value["chats"][0]["name"], json!("old"));
+        assert_eq!(
+            blocks[6].value["chats"][0]["message"][0]["data"],
+            json!("old")
+        );
+    }
+
+    #[test]
+    fn empty_projection_map_is_byte_identical_to_the_ordinary_export() {
+        let (_directory, store, _revision, lease) = projection_fixture(false);
+        let ordinary = store.export_risu_save(&lease, false).unwrap();
+        let (connection, target) = store.read_view(Some(&lease)).unwrap();
+
+        let projected = create_projected_controlled(
+            connection,
+            &store.snapshots_dir,
+            &target,
+            &lease,
+            false,
+            &HashMap::new(),
+            || false,
+            |_, _, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(ordinary.path).unwrap(),
+            fs::read(projected.path).unwrap()
+        );
     }
 
     #[test]
