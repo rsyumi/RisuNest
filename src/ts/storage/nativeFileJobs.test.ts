@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+    continueNativeOfficialPublication,
     NativeFileJobActivationCommittedError,
     runNativeOfficialAccountSnapshotRestore,
     runNativeBlockRisuSaveRestore,
@@ -1233,7 +1234,7 @@ describe('native file jobs', () => {
             },
         }
 
-        const receipt = await runNativeOfficialPublicationAttempt(
+        const outcome = await runNativeOfficialPublicationAttempt(
             request,
             {},
             {
@@ -1265,9 +1266,12 @@ describe('native file jobs', () => {
             },
         )
 
-        expect(receipt).not.toBeNull()
-        expect(receipt?.jobId).toBe('publication-1')
-        expect(receipt?.result).toEqual(result)
+        expect(outcome?.kind).toBe('completed')
+        if (!outcome || outcome.kind !== 'completed') {
+            throw new Error('Expected a completed publication')
+        }
+        expect(outcome.receipt.jobId).toBe('publication-1')
+        expect(outcome.receipt.result).toEqual(result)
         expect(calls).toEqual([
             ['native_file_job_start', {
                 request: {
@@ -1281,8 +1285,8 @@ describe('native file jobs', () => {
         expect(JSON.stringify(calls)).not.toContain('path')
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
 
-        await receipt?.acknowledge()
-        await receipt?.acknowledge()
+        await outcome.receipt.acknowledge()
+        await outcome.receipt.acknowledge()
         expect(calls.slice(2)).toEqual([
             ['native_file_job_forget', { jobId: 'publication-1' }],
         ])
@@ -1466,7 +1470,7 @@ describe('native file jobs', () => {
             },
         }
 
-        const receipt = await runNativeOfficialPublicationAttempt(
+        const outcome = await runNativeOfficialPublicationAttempt(
             {
                 expectedRevision: 9,
                 lease: 'snapshot-publication-9',
@@ -1513,14 +1517,18 @@ describe('native file jobs', () => {
             },
         )
 
-        expect(receipt?.result).toEqual(result)
+        expect(outcome?.kind).toBe('completed')
+        if (!outcome || outcome.kind !== 'completed') {
+            throw new Error('Expected a completed publication')
+        }
+        expect(outcome.receipt.result).toEqual(result)
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
             'native_file_job_cancel',
             'native_file_job_status',
         ])
-        await receipt?.acknowledge()
+        await outcome.receipt.acknowledge()
         expect(commands.at(-1)).toBe('native_file_job_forget')
     })
 
@@ -1652,7 +1660,7 @@ describe('native file jobs', () => {
             saveDate: '1777777777777',
             status: 403,
         } satisfies NativeOfficialPublicationAttemptResult
-        const receipt = await runNativeOfficialPublicationAttempt(
+        const outcome = await runNativeOfficialPublicationAttempt(
             {
                 expectedRevision: 3,
                 lease: 'snapshot-publication-3',
@@ -1696,10 +1704,133 @@ describe('native file jobs', () => {
             },
         )
 
-        expect(receipt?.result.publication).toEqual(publication)
+        expect(outcome?.kind).toBe('completed')
+        if (!outcome || outcome.kind !== 'completed') {
+            throw new Error('Expected a completed publication')
+        }
+        expect(outcome.receipt.result.publication).toEqual(publication)
         expect(commands).not.toContain('native_file_job_forget')
-        await receipt?.acknowledge()
+        await outcome.receipt.acknowledge()
         expect(commands.at(-1)).toBe('native_file_job_forget')
+    })
+
+    it('keeps an ordinary publication 403 in the same job for reauthentication', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const outcome = await runNativeOfficialPublicationAttempt(
+            {
+                expectedRevision: 17,
+                lease: 'snapshot-publication-17',
+                accountId: 'account-1',
+                baseUrl: 'https://realm.example',
+                replacements: {},
+                session: null,
+                saveDate: '1000',
+                credential: { kind: 'risu-auth', token: 'old-token' },
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'publication-1' }
+                    if (command === 'native_file_job_status') return {
+                        jobId: 'publication-1',
+                        kind: 'official-publication-upload',
+                        state: 'waitingForInput',
+                        phase: 'awaiting-publication-retry',
+                        progress: { completedBytes: 256, completedItems: 1 },
+                        publicationAttempt: {
+                            kind: 'reauthentication-needed',
+                            accountId: 'account-1',
+                            session: 'session-42',
+                            saveDate: '1000',
+                            status: 403,
+                        },
+                    }
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => {
+                    throw new Error('Publication retry state was not surfaced')
+                },
+            },
+        )
+
+        expect(outcome).toEqual({
+            kind: 'waiting-for-reauthentication',
+            jobId: 'publication-1',
+            accountId: 'account-1',
+            session: 'session-42',
+        })
+        expect(calls.map(([command]) => command)).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+        ])
+    })
+
+    it('continues a publication with refreshed input without starting a second job', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const result = {
+            revision: 17,
+            sourceBytes: 512,
+            sourceSha256: 'f'.repeat(64),
+            characterCount: 2,
+            presetCount: 1,
+            warningCodes: [],
+            publication: {
+                kind: 'written' as const,
+                accountId: 'account-1',
+                session: 'session-42',
+                saveDate: '1001',
+                status: 200,
+                replacementKey: 'replacement-1',
+                warning: null,
+                reloadSession: false,
+            },
+        }
+        const outcome = await continueNativeOfficialPublication(
+            'publication-1',
+            {
+                accountId: 'account-1',
+                session: 'session-42',
+                saveDate: '1001',
+                credential: { kind: 'risu-auth', token: 'new-token' },
+            },
+            { revision: 17, accountId: 'account-1' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_official_publication_retry') return 'accepted'
+                    if (command === 'native_file_job_status') return {
+                        jobId: 'publication-1',
+                        kind: 'official-publication-upload',
+                        state: 'succeeded',
+                        phase: 'complete',
+                        progress: { completedBytes: 1024, completedItems: 2 },
+                        result,
+                    }
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(outcome.kind).toBe('completed')
+        if (outcome.kind !== 'completed') throw new Error('Expected a completed publication')
+        expect(outcome.receipt.result).toEqual(result)
+        expect(calls).toEqual([
+            ['native_file_job_official_publication_retry', {
+                request: {
+                    jobId: 'publication-1',
+                    accountId: 'account-1',
+                    session: 'session-42',
+                    saveDate: '1001',
+                    credential: { kind: 'risu-auth', token: 'new-token' },
+                },
+            }],
+            ['native_file_job_status', { jobId: 'publication-1' }],
+        ])
     })
 
     it('resumes an active publication as an unacknowledged terminal receipt', async () => {
@@ -1756,6 +1887,52 @@ describe('native file jobs', () => {
 
         await receipt?.acknowledge()
         expect(commands.at(-1)).toBe('native_file_job_forget')
+    })
+
+    it('cancels and forgets a recovered publication waiting for reauthentication', async () => {
+        const commands: string[] = []
+        let poll = 0
+
+        await expect(resumeNativeOfficialPublication('publication-waiting', {}, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                commands.push(command)
+                if (command === 'native_file_job_status') {
+                    if (poll++ === 0) return {
+                        jobId: 'publication-waiting',
+                        kind: 'official-publication-upload',
+                        state: 'waitingForInput',
+                        phase: 'awaiting-publication-retry',
+                        progress: { completedBytes: 128, completedItems: 1 },
+                        publicationAttempt: {
+                            kind: 'reauthentication-needed',
+                            accountId: 'account-1',
+                            session: 'session-1',
+                            saveDate: '1000',
+                            status: 403,
+                        },
+                    }
+                    return {
+                        jobId: 'publication-waiting',
+                        kind: 'official-publication-upload',
+                        state: 'cancelled',
+                        phase: 'complete',
+                        progress: { completedBytes: 128, completedItems: 1 },
+                    }
+                }
+                if (command === 'native_file_job_cancel') return 'requested'
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        })).resolves.toBeNull()
+
+        expect(commands).toEqual([
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
     })
 
     it('forgets a recovered failed publication without exposing an association receipt', async () => {

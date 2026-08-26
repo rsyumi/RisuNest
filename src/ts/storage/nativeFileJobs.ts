@@ -120,6 +120,18 @@ export interface NativeOfficialPublicationReceipt {
     acknowledge(): Promise<void>
 }
 
+export type NativeOfficialPublicationRunResult =
+    | {
+          kind: 'waiting-for-reauthentication'
+          jobId: string
+          accountId: string
+          session: string | null
+      }
+    | {
+          kind: 'completed'
+          receipt: NativeOfficialPublicationReceipt
+      }
+
 export interface NativeFileJobStatus {
     jobId: string
     kind:
@@ -143,6 +155,7 @@ export interface NativeFileJobStatus {
         | 'activating-database'
         | 'writing-export'
         | 'uploading-database'
+        | 'awaiting-publication-retry'
         | 'finalizing-publication'
         | 'publishing-destination'
         | 'finalizing-export'
@@ -153,6 +166,7 @@ export interface NativeFileJobStatus {
         completedItems: number
         totalItems?: number
     }
+    publicationAttempt?: NativeOfficialPublicationAttemptResult
     result?: NativeFileJobResult
     preparedContent?: PreparedNativeContent
     error?: {
@@ -1338,11 +1352,21 @@ function createOfficialPublicationReceipt(
     }
 }
 
+export interface NativeOfficialPublicationRetryRequest {
+    accountId: string
+    session: string | null
+    saveDate: string
+    credential: {
+        kind: 'risu-auth'
+        token: string
+    }
+}
+
 export async function runNativeOfficialPublicationAttempt(
     request: NativeOfficialPublicationRequest,
     options: NativeFileJobOptions = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
-): Promise<NativeOfficialPublicationReceipt | null> {
+): Promise<NativeOfficialPublicationRunResult | null> {
     if (!dependencies.isTauri()) {
         throw new Error('Native official publication requires Tauri')
     }
@@ -1380,51 +1404,183 @@ export async function runNativeOfficialPublicationAttempt(
         }
         throw error
     }
-    let cancellationRequested = false
-    let terminal: NativeFileJobStatus | undefined
-
-    while (!terminal) {
-        if (options.signal?.aborted && !cancellationRequested) {
-            cancellationRequested = true
-            try {
-                await invokeNative(dependencies, 'native_file_job_cancel', {
-                    jobId: started.jobId,
-                })
-            }
-            catch {}
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
-            terminal = status
-            break
-        }
-        await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
-
-    if (terminal.state !== 'succeeded') {
-        const error = terminal.state === 'cancelled'
-            ? abortError()
-            : new NativeFileJobError(
-                terminal.error?.code ?? 'publication-failed',
-                terminal.error?.message ?? 'Native official publication failed',
-            )
-        try {
-            await invokeNative(dependencies, 'native_file_job_forget', {
-                jobId: started.jobId,
-            })
-        }
-        catch {}
-        throw error
-    }
-    return createOfficialPublicationReceipt(terminal, dependencies, {
+    return await pollNativeOfficialPublication(started.jobId, {
         jobId: started.jobId,
         revision: request.expectedRevision,
         accountId: request.accountId,
         saveDate: request.saveDate,
-    }, started.warningCodes)
+    }, options, dependencies, {
+        startWarningCodes: started.warningCodes,
+        terminalFailure: 'throw',
+    })
+}
+
+export async function continueNativeOfficialPublication(
+    jobId: string,
+    request: NativeOfficialPublicationRetryRequest,
+    expected: {
+        revision: number
+        accountId: string
+    },
+    options: NativeFileJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeOfficialPublicationRunResult> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native official publication requires Tauri')
+    }
+    if (options.signal?.aborted) {
+        await cancelNativeOfficialPublication(jobId, {}, dependencies)
+        throw abortError()
+    }
+
+    await invokeNative(dependencies, 'native_file_job_official_publication_retry', {
+        request: { jobId, ...request },
+    })
+    const outcome = await pollNativeOfficialPublication(jobId, {
+        jobId,
+        revision: expected.revision,
+        accountId: expected.accountId,
+        saveDate: request.saveDate,
+    }, options, dependencies, { terminalFailure: 'throw' })
+    if (!outcome) {
+        throw new NativeFileJobError(
+            'publication-failed',
+            'Native official publication did not complete',
+        )
+    }
+    return outcome
+}
+
+interface NativeOfficialPublicationExpectedResult {
+    jobId: string
+    revision?: number
+    accountId?: string
+    saveDate?: string
+}
+
+async function requestNativeOfficialPublicationCancellation(
+    jobId: string,
+    dependencies: NativeFileJobDependencies,
+): Promise<void> {
+    try {
+        await invokeNative(dependencies, 'native_file_job_cancel', { jobId })
+    }
+    catch {}
+}
+
+async function pollNativeOfficialPublication(
+    jobId: string,
+    expected: NativeOfficialPublicationExpectedResult,
+    options: NativeFileJobOptions,
+    dependencies: NativeFileJobDependencies,
+    behavior: {
+        startWarningCodes?: readonly string[]
+        cancelImmediately?: boolean
+        cancelWhenWaiting?: boolean
+        terminalFailure: 'throw' | 'return-null'
+    },
+): Promise<NativeOfficialPublicationRunResult | null> {
+    let cancellationRequested = false
+    if (behavior.cancelImmediately) {
+        cancellationRequested = true
+        await requestNativeOfficialPublicationCancellation(jobId, dependencies)
+    }
+
+    while (true) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            await requestNativeOfficialPublicationCancellation(jobId, dependencies)
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (status.jobId !== jobId || status.kind !== 'official-publication-upload') {
+            throw new NativeFileJobError(
+                'invalid-result',
+                'Native official publication returned a mismatched job',
+            )
+        }
+        if (
+            status.state === 'waitingForInput'
+            && status.phase === 'awaiting-publication-retry'
+        ) {
+            if (behavior.cancelWhenWaiting && !cancellationRequested) {
+                cancellationRequested = true
+                await requestNativeOfficialPublicationCancellation(jobId, dependencies)
+            }
+            if (!cancellationRequested) {
+                const publication = assertOfficialPublicationResult(status.publicationAttempt)
+                if (
+                    publication.kind !== 'reauthentication-needed'
+                    || publication.status !== 403
+                    || (expected.accountId !== undefined
+                        && publication.accountId !== expected.accountId)
+                    || (expected.saveDate !== undefined
+                        && publication.saveDate !== expected.saveDate)
+                ) {
+                    await requestNativeOfficialPublicationCancellation(jobId, dependencies)
+                    throw new NativeFileJobError(
+                        'invalid-result',
+                        'Native official publication returned mismatched retry metadata',
+                    )
+                }
+                return {
+                    kind: 'waiting-for-reauthentication',
+                    jobId,
+                    accountId: publication.accountId,
+                    session: publication.session,
+                }
+            }
+        }
+        if (status.state === 'succeeded') {
+            return {
+                kind: 'completed',
+                receipt: createOfficialPublicationReceipt(
+                    status,
+                    dependencies,
+                    expected,
+                    behavior.startWarningCodes,
+                ),
+            }
+        }
+        if (status.state === 'failed' || status.state === 'cancelled') {
+            const error = status.state === 'cancelled'
+                ? abortError()
+                : new NativeFileJobError(
+                    status.error?.code ?? 'publication-failed',
+                    status.error?.message ?? 'Native official publication failed',
+                )
+            try {
+                await invokeNative(dependencies, 'native_file_job_forget', { jobId })
+            }
+            catch {}
+            if (behavior.terminalFailure === 'return-null') return null
+            throw error
+        }
+        await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+}
+
+export async function cancelNativeOfficialPublication(
+    jobId: string,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeOfficialPublicationReceipt | null> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native official publication requires Tauri')
+    }
+    const outcome = await pollNativeOfficialPublication(
+        jobId,
+        { jobId },
+        options,
+        dependencies,
+        {
+            cancelImmediately: true,
+            terminalFailure: 'return-null',
+        },
+    )
+    return outcome?.kind === 'completed' ? outcome.receipt : null
 }
 
 export async function resumeNativeOfficialPublication(
@@ -1435,25 +1591,15 @@ export async function resumeNativeOfficialPublication(
     if (!dependencies.isTauri()) {
         throw new Error('Native official publication requires Tauri')
     }
-    while (true) {
-        if (options.signal?.aborted) throw abortError()
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (status.jobId !== jobId || status.kind !== 'official-publication-upload') {
-            throw new NativeFileJobError(
-                'invalid-result',
-                'Native official publication recovery returned a mismatched job',
-            )
-        }
-        if (status.state === 'succeeded') {
-            return createOfficialPublicationReceipt(status, dependencies, { jobId })
-        }
-        if (status.state === 'failed' || status.state === 'cancelled') {
-            await invokeNative(dependencies, 'native_file_job_forget', { jobId })
-            return null
-        }
-        await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
+    const outcome = await pollNativeOfficialPublication(
+        jobId,
+        { jobId },
+        options,
+        dependencies,
+        {
+            cancelWhenWaiting: true,
+            terminalFailure: 'return-null',
+        },
+    )
+    return outcome?.kind === 'completed' ? outcome.receipt : null
 }
