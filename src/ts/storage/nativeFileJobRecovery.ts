@@ -15,8 +15,9 @@ const productionDependencies: NativeFileJobRecoveryDependencies = {
 export function shouldReconcileNativeFileJobs(
     isDesktop: boolean,
     isAndroid: boolean,
+    isAndroidSafEnabled: boolean,
 ): boolean {
-    return isDesktop || isAndroid
+    return isDesktop || (isAndroid && isAndroidSafEnabled)
 }
 
 function isTerminal(status: NativeFileJobStatus): boolean {

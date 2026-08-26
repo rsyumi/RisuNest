@@ -5,11 +5,17 @@ import {
     consumeAndroidSpoolBatch,
     copyNativeExportToAndroidSaf,
     getActiveAndroidSafSourceRequestIds,
+    isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
     type AndroidSafDestinationEvent,
 } from './androidSafBridge'
 
 describe('Android SAF bridge', () => {
+    it('reports SAF file jobs enabled only when the native bridge is installed', () => {
+        expect(isAndroidSafFileJobsEnabled(undefined)).toBe(false)
+        expect(isAndroidSafFileJobsEnabled({})).toBe(true)
+    })
+
     it('subscribes before consuming the replayed ready batch and removes the listener', async () => {
         const listeners = new Set<(event: Event) => void>()
         const batches: unknown[] = []

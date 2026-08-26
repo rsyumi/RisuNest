@@ -31,9 +31,10 @@ function restoreStatus(
 
 describe('native restore bootstrap reconciliation', () => {
     it('reconciles persisted jobs on desktop and Android without widening to other targets', () => {
-        expect(shouldReconcileNativeFileJobs(true, false)).toBe(true)
-        expect(shouldReconcileNativeFileJobs(false, true)).toBe(true)
-        expect(shouldReconcileNativeFileJobs(false, false)).toBe(false)
+        expect(shouldReconcileNativeFileJobs(true, false, false)).toBe(true)
+        expect(shouldReconcileNativeFileJobs(false, true, true)).toBe(true)
+        expect(shouldReconcileNativeFileJobs(false, true, false)).toBe(false)
+        expect(shouldReconcileNativeFileJobs(false, false, true)).toBe(false)
     })
 
     it('waits for an active restore, finalizes staged data, and retains success for plugin reload', async () => {

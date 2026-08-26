@@ -122,6 +122,14 @@ export interface AndroidSafDestinationDependencies {
     removeEventListener(name: string, listener: (event: Event) => void): void
 }
 
+export function isAndroidSafFileJobsEnabled(
+    bridge: unknown = (window as Window & {
+        RisuSafBridge?: AndroidSafJavascriptBridge
+    }).RisuSafBridge,
+): boolean {
+    return !!bridge
+}
+
 function productionBridge(): AndroidSafJavascriptBridge {
     const bridge = (window as Window & {
         RisuSafBridge?: AndroidSafJavascriptBridge

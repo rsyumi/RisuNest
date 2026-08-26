@@ -89,6 +89,7 @@ import {
     shouldReconcileNativeFileJobs,
 } from "./storage/nativeFileJobRecovery";
 import { registerAndroidRisuSaveRoute } from "./storage/androidRisuSaveRouteProduction.svelte";
+import { isAndroidSafFileJobsEnabled } from "./storage/androidSafBridge";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
     initializeOfficialAccountBootstrap,
@@ -139,6 +140,7 @@ export async function loadData() {
         const recoveredNativeRestoreJobs = shouldReconcileNativeFileJobs(
             isTauriDesktop,
             isTauriAndroid,
+            isAndroidSafFileJobsEnabled(),
         )
             ? await reconcileNativeRestoresBeforeBootstrap()
             : []

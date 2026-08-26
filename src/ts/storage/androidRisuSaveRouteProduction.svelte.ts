@@ -4,6 +4,7 @@ import { alertConfirm, alertError, alertNormal } from '../alert'
 import { isTauriAndroid } from '../platform'
 import { loadPluginsAfterAuthoritativeRestore } from '../plugins/plugins.svelte'
 import {
+    isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
     type AndroidSpoolFailure,
     type AndroidSpoolReady,
@@ -41,7 +42,7 @@ function showUnsupportedSpool(source: AndroidSpoolReady): void {
 }
 
 export function registerAndroidRisuSaveRoute(): void {
-    if (!isTauriAndroid || disposeSpoolListener) return
+    if (!isTauriAndroid || !isAndroidSafFileJobsEnabled() || disposeSpoolListener) return
 
     const route = createAndroidRisuSaveSpoolRoute({
         confirmRestore: async () =>
