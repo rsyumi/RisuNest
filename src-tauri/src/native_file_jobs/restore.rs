@@ -133,7 +133,7 @@ fn restore_risu_save_reader<R: Read>(
                 parse_and_stage_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
             RisuSaveFormat::HistoricalPrefixed => {
-                return Err(invalid("historical RisuSave codec is not enabled"))
+                parse_and_stage_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
             RisuSaveFormat::LegacyCompressed => {
                 parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
@@ -1085,6 +1085,9 @@ mod tests {
     const MSGPACKR_PARITY_FIXTURE: &str = include_str!(
         "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/msgpackr-parity-v1.json"
     );
+    const W0_RAW_FIXTURE: &str = include_str!(
+        "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-raw-v4.input.base64"
+    );
     const W0_COMPRESSED_FIXTURE: &str = include_str!(
         "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-compressed-v4.input.base64"
     );
@@ -1295,6 +1298,49 @@ mod tests {
         Value::Object(database)
     }
 
+    fn canonical_hash(value: &Value) -> String {
+        fn length_delimited(bytes: &[u8], output: &mut Vec<u8>) {
+            output.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            output.extend_from_slice(bytes);
+        }
+
+        fn encode(value: &Value) -> Vec<u8> {
+            let mut output = Vec::new();
+            match value {
+                Value::Null => output.push(b'N'),
+                Value::Bool(true) => output.push(b'T'),
+                Value::Bool(false) => output.push(b'F'),
+                Value::Number(number) => {
+                    output.push(b'D');
+                    length_delimited(&number.as_f64().unwrap().to_be_bytes(), &mut output);
+                }
+                Value::String(value) => {
+                    output.push(b'S');
+                    length_delimited(value.as_bytes(), &mut output);
+                }
+                Value::Array(values) => {
+                    output.push(b'L');
+                    output.extend_from_slice(&(values.len() as u32).to_be_bytes());
+                    for value in values {
+                        length_delimited(&encode(value), &mut output);
+                    }
+                }
+                Value::Object(entries) => {
+                    output.push(b'O');
+                    output.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+                    for (key, value) in entries {
+                        length_delimited(key.as_bytes(), &mut output);
+                        length_delimited(&encode(value), &mut output);
+                    }
+                }
+            }
+            output
+        }
+
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(encode(value)))
+    }
+
     #[test]
     fn strict_block_restore_activates_valid_file_through_staged_store() {
         let (directory, sink) = fixture();
@@ -1366,10 +1412,9 @@ mod tests {
             .unwrap();
         let second = restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
         assert_eq!(second.revision, 3);
-        assert_eq!(
-            sink.store.lock().unwrap().materialize(Some(3)).unwrap(),
-            first
-        );
+        let second = sink.store.lock().unwrap().materialize(Some(3)).unwrap();
+        assert_eq!(canonical_hash(&second), canonical_hash(&first));
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -1383,6 +1428,42 @@ mod tests {
         let bytes = legacy_wire(7, &payload);
 
         assert_failed_general_restore_preserves_active(&bytes, "extension 42");
+    }
+
+    #[test]
+    fn strict_raw_msgpackr_restore_accepts_w0_fixture_and_block_round_trip() {
+        use base64::Engine;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(W0_RAW_FIXTURE.trim())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("raw-w0.risudat");
+        fs::write(&source, bytes).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        let first = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        let expected = persistent_projection(serde_json::from_str(W0_LEGACY_EXPECTED).unwrap());
+        assert_eq!(first, expected);
+        let exported_path = {
+            let mut store = sink.store.lock().unwrap();
+            let lease = store.acquire_revision(2).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            store.release_revision(&lease).unwrap();
+            PathBuf::from(exported.path)
+        };
+        let second_job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
+        let second = sink.store.lock().unwrap().materialize(Some(3)).unwrap();
+        assert_eq!(canonical_hash(&second), canonical_hash(&first));
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -1416,10 +1497,9 @@ mod tests {
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
         restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
-        assert_eq!(
-            sink.store.lock().unwrap().materialize(Some(3)).unwrap(),
-            first
-        );
+        let second = sink.store.lock().unwrap().materialize(Some(3)).unwrap();
+        assert_eq!(canonical_hash(&second), canonical_hash(&first));
+        assert_eq!(second, first);
     }
 
     #[test]
@@ -1500,9 +1580,83 @@ mod tests {
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
         restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
-        assert_eq!(
-            sink.store.lock().unwrap().materialize(Some(3)).unwrap(),
-            first
+        let second = sink.store.lock().unwrap().materialize(Some(3)).unwrap();
+        assert_eq!(canonical_hash(&second), canonical_hash(&first));
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn strict_historical_prefixed_msgpackr_restore_preserves_parity_and_block_round_trip() {
+        use base64::Engine;
+
+        let parity = msgpackr_parity_fixture();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(parity["historicalPrefixedBase64"].as_str().unwrap())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("historical-prefixed.risudat");
+        fs::write(&source, bytes).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        let first = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        let expected = persistent_projection(parity["expectedProjection"].clone());
+        assert_eq!(first, expected);
+        let exported_path = {
+            let mut store = sink.store.lock().unwrap();
+            let lease = store.acquire_revision(2).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            store.release_revision(&lease).unwrap();
+            PathBuf::from(exported.path)
+        };
+        let second_job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
+        let second = sink.store.lock().unwrap().materialize(Some(3)).unwrap();
+        assert_eq!(canonical_hash(&second), canonical_hash(&first));
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn strict_legacy_format_selection_rejects_ambiguous_and_near_miss_inputs() {
+        use base64::Engine;
+
+        let parity = msgpackr_parity_fixture();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(parity["payloadBase64"].as_str().unwrap())
+            .unwrap();
+
+        assert_failed_general_restore_preserves_active(
+            &payload,
+            "unframed RisuSave input is unsupported",
+        );
+        assert_failed_general_restore_preserves_active(
+            &gzip(&payload),
+            "unframed RisuSave input is unsupported",
+        );
+
+        let mut near_miss = b"\0\0RISX".to_vec();
+        near_miss.extend_from_slice(&payload);
+        assert_failed_general_restore_preserves_active(
+            &near_miss,
+            "invalid historical RisuSave header",
+        );
+        assert_failed_general_restore_preserves_active(
+            &legacy_wire(10, &payload),
+            "unsupported legacy RisuSave kind 10",
+        );
+
+        let mut historical_with_trailing = b"\0\0RISU".to_vec();
+        historical_with_trailing.extend_from_slice(&payload);
+        historical_with_trailing.push(0);
+        assert_failed_general_restore_preserves_active(
+            &historical_with_trailing,
+            "trailing data after legacy MessagePack value",
         );
     }
 

@@ -89,9 +89,18 @@ pub(super) fn create(
     )?;
     root.remove("characters");
     root.remove("botPresets");
-    let modules = root.remove("modules");
-    let loadouts = root.remove("loadouts");
-    let plugins = root.remove("plugins");
+    let modules = root.get("modules").cloned();
+    let loadouts = root.get("loadouts").cloned();
+    let plugins = root.get("plugins").cloned();
+    if modules.is_some() {
+        root.insert("modules".to_owned(), Value::Null);
+    }
+    if loadouts.is_some() {
+        root.insert("loadouts".to_owned(), Value::Null);
+    }
+    if plugins.is_some() {
+        root.insert("plugins".to_owned(), Value::Null);
+    }
     root.remove("pluginCustomStorage");
     let plugin_storage = plugin_storage_value(connection, &target.generation)?;
     if omit_account {

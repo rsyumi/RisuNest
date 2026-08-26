@@ -2,14 +2,20 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import { Unpackr } from 'msgpackr/index-no-eval'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
+import { decodeRisuSave } from '../../../risuSave'
 import { canonicalSha256 } from '../canonicalCompatibility'
+
+vi.mock('../../../database.svelte', () => ({ presetTemplate: {} }))
+vi.mock('../../../../globalApi.svelte', () => ({ forageStorage: {} }))
+vi.mock('src/ts/platform', () => ({ isNodeServer: false, isTauri: false }))
 
 interface ParityFixture {
     msgpackrVersion: string
     expectedCanonicalSha256: string
     payloadBase64: string
+    historicalPrefixedBase64: string
     expectedProjection: Record<string, unknown>
     expectedObjectKeys: {
         root: string[]
@@ -55,5 +61,16 @@ describe('Roadmap 14 msgpackr cross-language fixture', () => {
 
         expect(() => decoder.decode(Buffer.from(fixture.unknownExtensionBase64, 'base64')))
             .toThrow(/Unknown extension(?: type)? 42/)
+    })
+
+    it('freezes the exact historical RISU-prefixed fallback', async () => {
+        const fixture = readFixture()
+        const decoded = await decodeRisuSave(
+            Buffer.from(fixture.historicalPrefixedBase64, 'base64'),
+        )
+        const projection = persistedProjection(decoded)
+
+        expect(projection).toEqual(fixture.expectedProjection)
+        expect(canonicalSha256(projection)).toBe(fixture.expectedCanonicalSha256)
     })
 })
