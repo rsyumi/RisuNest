@@ -68,6 +68,7 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
         "owner_kind, owner_locator, present, manifest_hash, entry_count",
     ),
     ("asset_repository_authority", "value"),
+    ("cold_payload_authority", "value"),
     ("cold_aliases", "key, object_hash, size, metadata"),
 ];
 
@@ -289,6 +290,63 @@ impl AssetRepositoryAuthorityState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "format",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum ColdPayloadAuthorityState {
+    Legacy,
+    Preparing {
+        migration_id: String,
+        source_revision: i64,
+    },
+    #[serde(rename = "v2")]
+    V2 {
+        migration_id: String,
+        compatibility_hash: String,
+    },
+}
+
+impl ColdPayloadAuthorityState {
+    fn validate(&self) -> StoreResult<()> {
+        let migration_id = match self {
+            Self::Legacy => return Ok(()),
+            Self::Preparing {
+                migration_id,
+                source_revision,
+            } => {
+                if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(source_revision) {
+                    return Err(StoreError::Validation {
+                        message: "Cold payload sourceRevision is invalid".to_owned(),
+                    });
+                }
+                migration_id
+            }
+            Self::V2 {
+                migration_id,
+                compatibility_hash,
+            } => {
+                validate_hash(compatibility_hash, "Cold payload compatibilityHash")?;
+                migration_id
+            }
+        };
+        if migration_id.is_empty()
+            || migration_id.len() > 64
+            || !migration_id
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-'))
+        {
+            return Err(StoreError::Validation {
+                message: "Cold payload migrationId is invalid".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AssetAlias {
     pub(crate) key: String,
@@ -493,6 +551,24 @@ pub(crate) struct ColdAlias {
     pub(crate) metadata: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ColdPayloadMigrationInput {
+    pub(crate) source_revision: i64,
+    pub(crate) migration_id: String,
+    pub(crate) compatibility_hash: String,
+    pub(crate) cold_aliases: Vec<ColdAlias>,
+}
+
+impl ColdPayloadMigrationInput {
+    fn authority(&self) -> ColdPayloadAuthorityState {
+        ColdPayloadAuthorityState::V2 {
+            migration_id: self.migration_id.clone(),
+            compatibility_hash: self.compatibility_hash.clone(),
+        }
+    }
+}
+
 impl ColdAlias {
     pub(super) fn validate(&self) -> StoreResult<()> {
         if self.key.is_empty() || self.key.contains('\0') {
@@ -539,6 +615,33 @@ fn validate_hash(hash: &str, subject: &str) -> StoreResult<()> {
     {
         return Err(StoreError::Validation {
             message: format!("{subject} must be 64 lowercase hexadecimal characters"),
+        });
+    }
+    Ok(())
+}
+
+fn verify_cold_alias_object(
+    cas: &crate::asset_repository::PayloadCas,
+    alias: &ColdAlias,
+) -> StoreResult<()> {
+    alias.validate()?;
+    let hash = alias
+        .object_hash
+        .as_deref()
+        .ok_or_else(|| StoreError::Validation {
+            message: "Cold payload v2 alias requires an objectHash".to_owned(),
+        })?;
+    let actual_size = cas
+        .stat_object(hash)?
+        .ok_or_else(|| StoreError::Validation {
+            message: format!("Cold payload CAS object {hash} is missing"),
+        })?;
+    if actual_size != alias.size as u64 {
+        return Err(StoreError::Validation {
+            message: format!(
+                "Cold payload alias size {} does not match CAS size {actual_size}",
+                alias.size
+            ),
         });
     }
     Ok(())
@@ -851,6 +954,10 @@ impl PersistentStore {
             "INSERT OR IGNORE INTO asset_repository_authority (generation, value) VALUES (?1, ?2)",
             params!["revision-0", r#"{"format":"legacy"}"#],
         )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO cold_payload_authority (generation, value) VALUES (?1, ?2)",
+            params!["revision-0", r#"{"format":"legacy"}"#],
+        )?;
         transaction.commit()?;
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
@@ -983,6 +1090,14 @@ impl PersistentStore {
         query::read_asset_repository_authority(connection, &target)
     }
 
+    pub(crate) fn read_cold_payload_authority(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<Versioned<ColdPayloadAuthorityState>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::read_cold_payload_authority(connection, &target)
+    }
+
     pub(crate) fn read_asset_owner_head(
         &self,
         owner: &AssetOwnerLocator,
@@ -1094,6 +1209,43 @@ impl PersistentStore {
         )
     }
 
+    pub(crate) fn commit_cold_alias(
+        &mut self,
+        alias: &ColdAlias,
+        expected_revision: i64,
+    ) -> StoreResult<RevisionResult> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        verify_cold_alias_object(&cas, alias)?;
+        let logical_cas = logical_index::logical_index_is_active(&self.connection)?.then_some(&cas);
+        commit::commit_cold_alias(&mut self.connection, logical_cas, alias, expected_revision)
+    }
+
+    pub(crate) fn delete_cold_alias(
+        &mut self,
+        key: &str,
+        expected_revision: i64,
+    ) -> StoreResult<RevisionResult> {
+        let maintain_logical_index = logical_index::logical_index_is_active(&self.connection)?;
+        commit::delete_cold_alias(
+            &mut self.connection,
+            maintain_logical_index,
+            key,
+            expected_revision,
+        )
+    }
+
+    pub(crate) fn activate_cold_payload_migration(
+        &mut self,
+        input: &ColdPayloadMigrationInput,
+    ) -> StoreResult<RevisionResult> {
+        let cas = crate::asset_repository::PayloadCas::new(&self.repository_root)?;
+        for alias in &input.cold_aliases {
+            verify_cold_alias_object(&cas, alias)?;
+        }
+        let logical_cas = logical_index::logical_index_is_active(&self.connection)?.then_some(&cas);
+        commit::activate_cold_payload_migration(&mut self.connection, logical_cas, input)
+    }
+
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {
         commit::replace_begin(&mut self.connection)
     }
@@ -1132,6 +1284,14 @@ impl PersistentStore {
         authority: &AssetRepositoryAuthorityState,
     ) -> StoreResult<()> {
         commit::replace_put_asset_repository_authority(&mut self.connection, staging_id, authority)
+    }
+
+    pub(crate) fn replace_put_cold_payload_authority(
+        &mut self,
+        staging_id: &str,
+        authority: &ColdPayloadAuthorityState,
+    ) -> StoreResult<()> {
+        commit::replace_put_cold_payload_authority(&mut self.connection, staging_id, authority)
     }
 
     pub(crate) fn replace_put_cold_aliases(

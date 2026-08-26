@@ -2,7 +2,7 @@ use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 10;
+pub(super) const SCHEMA_VERSION: u32 = 11;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -19,21 +19,25 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => create_v10(connection),
-        1 => migrate_v1(connection),
-        2 => migrate_v2(connection),
-        3 => migrate_v3(connection),
-        4 => migrate_v4(connection),
-        5 => migrate_v5(connection),
-        6 => migrate_v6_or_v7_to_v10(connection, true),
-        7 => migrate_v6_or_v7_to_v10(connection, false),
-        8 => migrate_v8_to_v10(connection),
-        9 => migrate_v9_to_v10(connection),
-        SCHEMA_VERSION => Ok(()),
-        _ => Err(StoreError::Store {
-            message: format!("unsupported persistent schema version {version}"),
-        }),
+        0 => create_v10(connection)?,
+        1 => migrate_v1(connection)?,
+        2 => migrate_v2(connection)?,
+        3 => migrate_v3(connection)?,
+        4 => migrate_v4(connection)?,
+        5 => migrate_v5(connection)?,
+        6 => migrate_v6_or_v7_to_v10(connection, true)?,
+        7 => migrate_v6_or_v7_to_v10(connection, false)?,
+        8 => migrate_v8_to_v10(connection)?,
+        9 => migrate_v9_to_v10(connection)?,
+        10 => {}
+        SCHEMA_VERSION => return Ok(()),
+        _ => {
+            return Err(StoreError::Store {
+                message: format!("unsupported persistent schema version {version}"),
+            });
+        }
     }
+    migrate_v10_to_v11(connection)
 }
 
 fn create_v10(connection: &mut Connection) -> StoreResult<()> {
@@ -212,7 +216,24 @@ fn finish_v10_migration(transaction: &Transaction<'_>) -> StoreResult<()> {
             message: error.to_string(),
         }
     })?;
+    transaction.pragma_update(None, "user_version", 10)?;
+    Ok(())
+}
+
+fn migrate_v10_to_v11(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "
+        CREATE TABLE cold_payload_authority (
+            generation TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO cold_payload_authority (generation, value)
+        SELECT generation, json_object('format', 'legacy') FROM root;
+        ",
+    )?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
     Ok(())
 }
 

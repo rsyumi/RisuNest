@@ -1,8 +1,9 @@
 use super::{
     AssetAlias, AssetAliasListQuery, AssetOwnerHead, AssetOwnerLocator,
-    AssetRepositoryAuthorityState, CharacterQuery, CheckpointMode, ColdAlias, ConversationMutation,
-    ConversationPage, ConversationQuery, ConversationWindowQuery, PersistentStore,
-    PluginStorageMutation, QueryOrder, StoreError, WorkingSetCommit,
+    AssetRepositoryAuthorityState, CharacterQuery, CheckpointMode, ColdAlias,
+    ColdPayloadAuthorityState, ColdPayloadMigrationInput, ConversationMutation, ConversationPage,
+    ConversationQuery, ConversationWindowQuery, PersistentStore, PluginStorageMutation, QueryOrder,
+    StoreError, WorkingSetCommit,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::{json, Value};
@@ -3521,6 +3522,10 @@ fn leased_family_canonical(store: &PersistentStore, lease: &str) -> Vec<u8> {
             .expect("list leased asset owner heads"),
         "assetOwnerHead": store.read_asset_owner_head(&owner, Some(lease))
             .expect("read leased asset owner head"),
+        "assetRepositoryAuthority": store.read_asset_repository_authority(Some(lease))
+            .expect("read leased asset repository authority"),
+        "coldPayloadAuthority": store.read_cold_payload_authority(Some(lease))
+            .expect("read leased cold payload authority"),
         "coldAliases": store.list_cold_aliases(Some(lease))
             .expect("list leased cold aliases"),
         "coldAlias": store.read_cold_alias("cold/lease", Some(lease))
@@ -3593,6 +3598,15 @@ fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
     store
         .replace_put_cold_aliases(&staging.staging_id, std::slice::from_ref(&cold))
         .expect("stage final-family cold alias");
+    store
+        .replace_put_cold_payload_authority(
+            &staging.staging_id,
+            &ColdPayloadAuthorityState::V2 {
+                migration_id: "lease-cold-migration".to_owned(),
+                compatibility_hash: "44".repeat(32),
+            },
+        )
+        .expect("stage final-family cold authority");
     let seeded = store
         .replace_commit(&staging.staging_id, Some(1))
         .expect("activate final-family staging");
@@ -5060,6 +5074,186 @@ fn assert_m4_v9_authority_schema(connection: &rusqlite::Connection, expected_row
     );
 }
 
+#[test]
+fn cold_authority_marker_rejects_preparing_and_activates_v2_with_the_generation() {
+    let directory = tempfile::tempdir().expect("create cold authority directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    assert_eq!(
+        store
+            .read_cold_payload_authority(None)
+            .expect("read initial cold authority")
+            .value,
+        ColdPayloadAuthorityState::Legacy
+    );
+
+    let staging = store.replace_begin().expect("begin preparing replacement");
+    store
+        .replace_put_cold_payload_authority(
+            &staging.staging_id,
+            &ColdPayloadAuthorityState::Preparing {
+                migration_id: "cold-migration".to_owned(),
+                source_revision: 0,
+            },
+        )
+        .expect("stage preparing cold authority");
+    assert!(store.replace_commit(&staging.staging_id, Some(0)).is_err());
+    assert_eq!(store.revision().expect("read unchanged revision"), 0);
+    assert_eq!(
+        store
+            .read_cold_payload_authority(None)
+            .expect("read unchanged cold authority")
+            .value,
+        ColdPayloadAuthorityState::Legacy
+    );
+
+    let authority = ColdPayloadAuthorityState::V2 {
+        migration_id: "cold-migration".to_owned(),
+        compatibility_hash: "9b".repeat(32),
+    };
+    store
+        .replace_put_cold_payload_authority(&staging.staging_id, &authority)
+        .expect("stage v2 cold authority");
+    let activated = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate v2 cold authority");
+    assert_eq!(
+        store
+            .read_cold_payload_authority(None)
+            .expect("read v2 cold authority"),
+        super::Versioned {
+            revision: activated.revision,
+            value: authority,
+        }
+    );
+}
+
+#[test]
+fn missing_cold_authority_marker_fails_closed() {
+    let directory = tempfile::tempdir().expect("create cold authority directory");
+    let store = PersistentStore::open(directory.path()).expect("open persistent store");
+    store
+        .connection
+        .execute(
+            "DELETE FROM cold_payload_authority WHERE generation = 'revision-0'",
+            [],
+        )
+        .expect("remove cold authority marker");
+
+    assert!(matches!(
+        store.read_cold_payload_authority(None),
+        Err(StoreError::Validation { .. })
+    ));
+}
+
+#[test]
+fn cold_payload_migration_and_mutations_are_revisioned_with_exact_cas_aliases() {
+    let directory = tempfile::tempdir().expect("create cold migration directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).expect("open CAS");
+    let first = cas
+        .prepare_bytes(b"first-cold")
+        .expect("prepare first cold object");
+    let first_alias = ColdAlias {
+        key: "cold/item".to_owned(),
+        object_hash: Some(first.content_hash),
+        size: first.byte_size as i64,
+        metadata: json!({ "source": "legacy" }),
+    };
+    let migrated = store
+        .activate_cold_payload_migration(&ColdPayloadMigrationInput {
+            source_revision: 0,
+            migration_id: "cold-migration".to_owned(),
+            compatibility_hash: "8c".repeat(32),
+            cold_aliases: vec![first_alias.clone()],
+        })
+        .expect("activate cold migration");
+    assert_eq!(migrated.revision, 1);
+    assert!(matches!(
+        store
+            .read_cold_payload_authority(None)
+            .expect("read migrated cold authority")
+            .value,
+        ColdPayloadAuthorityState::V2 { .. }
+    ));
+    assert_eq!(
+        store
+            .read_cold_alias(&first_alias.key, None)
+            .expect("read migrated alias")
+            .expect("migrated alias exists")
+            .value,
+        first_alias
+    );
+
+    let lease = store
+        .acquire_revision(1)
+        .expect("pin migrated cold revision");
+    let second = cas
+        .prepare_bytes(b"second-cold")
+        .expect("prepare second cold object");
+    let second_alias = ColdAlias {
+        key: "cold/item".to_owned(),
+        object_hash: Some(second.content_hash),
+        size: second.byte_size as i64,
+        metadata: json!({ "source": "updated" }),
+    };
+    let updated = store
+        .commit_cold_alias(&second_alias, 1)
+        .expect("commit updated cold alias");
+    assert_eq!(updated.revision, 2);
+    assert_eq!(
+        store
+            .read_cold_alias(&second_alias.key, Some(&lease.lease))
+            .expect("read pinned cold alias")
+            .expect("pinned cold alias exists")
+            .value,
+        first_alias
+    );
+    assert_eq!(
+        store
+            .read_cold_alias(&second_alias.key, None)
+            .expect("read current cold alias")
+            .expect("current cold alias exists")
+            .value,
+        second_alias
+    );
+
+    let deleted = store
+        .delete_cold_alias("cold/item", 2)
+        .expect("delete cold alias");
+    assert_eq!(deleted.revision, 3);
+    assert!(store
+        .read_cold_alias("cold/item", None)
+        .expect("read deleted cold alias")
+        .is_none());
+    assert!(matches!(
+        store.activate_cold_payload_migration(&ColdPayloadMigrationInput {
+            source_revision: 3,
+            migration_id: "second-migration".to_owned(),
+            compatibility_hash: "8d".repeat(32),
+            cold_aliases: vec![],
+        }),
+        Err(StoreError::Validation { .. })
+    ));
+}
+
+fn assert_cold_v11_authority_schema(connection: &rusqlite::Connection, expected_rows: i64) {
+    assert_eq!(
+        table_columns(connection, "cold_payload_authority"),
+        vec![
+            ("generation".to_owned(), "TEXT".to_owned(), false, None, 1),
+            ("value".to_owned(), "TEXT".to_owned(), true, None, 0),
+        ]
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM cold_payload_authority", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count cold authority rows"),
+        expected_rows
+    );
+}
+
 fn assert_empty_logical_schema(connection: &rusqlite::Connection) {
     const TABLES: &[&str] = &[
         "logical_generation_session_pins",
@@ -5286,19 +5480,20 @@ fn assert_logical_schema_fixture(connection: &rusqlite::Connection) {
 }
 
 #[test]
-fn fresh_schema_v10_contains_m4_authority_and_empty_p4_logical_tables() {
-    let directory = tempfile::tempdir().expect("create fresh v10 directory");
-    let store = PersistentStore::open(directory.path()).expect("open fresh v10 store");
+fn fresh_schema_v11_contains_dual_authority_and_empty_p4_logical_tables() {
+    let directory = tempfile::tempdir().expect("create fresh v11 directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v11 store");
 
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        10
+        11
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
+    assert_cold_v11_authority_schema(&store.connection, 1);
     assert_eq!(
         store
             .connection
@@ -5310,7 +5505,62 @@ fn fresh_schema_v10_contains_m4_authority_and_empty_p4_logical_tables() {
             .expect("read fresh legacy authority"),
         r#"{"format":"legacy"}"#
     );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT value FROM cold_payload_authority WHERE generation = 'revision-0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read fresh legacy cold authority"),
+        r#"{"format":"legacy"}"#
+    );
     assert_empty_logical_schema(&store.connection);
+}
+
+#[test]
+fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
+    let directory = tempfile::tempdir().expect("create v10 cold migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            r#"
+            INSERT INTO root (generation, value)
+                VALUES ('snapshot-v10-cold', '{"username":"leased"}');
+            INSERT INTO snapshot_leases (lease, generation, revision, created_at)
+                VALUES ('snapshot-v10-cold', 'snapshot-v10-cold', 0, 4102444800000);
+            DROP TABLE cold_payload_authority;
+            PRAGMA user_version = 10;
+            "#,
+        )
+        .expect("create v10 cold fixture");
+    drop(store);
+
+    let mut connection =
+        rusqlite::Connection::open(directory.path().join("persistent").join("persistent.db"))
+            .expect("reopen v10 cold fixture");
+    super::schema::initialize(&mut connection).expect("migrate v10 cold authority");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read migrated cold schema version"),
+        11
+    );
+    assert_cold_v11_authority_schema(&connection, 2);
+    for generation in ["revision-0", "snapshot-v10-cold"] {
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT value FROM cold_payload_authority WHERE generation = ?1",
+                    [generation],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read backfilled cold authority"),
+            r#"{"format":"legacy"}"#
+        );
+    }
 }
 
 #[test]
@@ -5363,6 +5613,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
+            DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
             PRAGMA user_version = 8;
             "#,
@@ -5511,6 +5762,7 @@ fn schema_v10_migration_collision_preserves_completed_m4_v9_and_v8_rows() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
+            DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 8;
@@ -5613,6 +5865,7 @@ fn schema_v10_migration_collision_rolls_back_v9_logical_ddl_only() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
+            DROP TABLE cold_payload_authority;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 9;
             "#,
@@ -5707,6 +5960,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
             "DROP TABLE asset_aliases;
              DROP TABLE asset_owner_heads;
              DROP TABLE cold_aliases;
+             DROP TABLE cold_payload_authority;
              DROP TABLE asset_repository_authority;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
@@ -5736,7 +5990,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -5752,7 +6006,8 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE asset_repository_authority;
+            "DROP TABLE cold_payload_authority;
+             DROP TABLE asset_repository_authority;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
              DROP TABLE logical_message_page_sources;
@@ -5770,7 +6025,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(
         store
             .read_asset_repository_authority(None)
@@ -5874,6 +6129,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
             DROP TABLE asset_owner_heads;
             DROP TABLE cold_aliases;
+            DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
@@ -5893,7 +6149,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -5963,6 +6219,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
                 '8383838383838383838383838383838383838383838383838383838383838383', 1
             );
             DROP TABLE cold_aliases;
+            DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
@@ -5993,7 +6250,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -6083,7 +6340,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 
     let snapshot_rows: i64 = store
         .connection
@@ -6293,7 +6550,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -6318,7 +6575,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -6456,7 +6713,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -6598,7 +6855,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -6744,7 +7001,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 10);
+    assert_eq!(integer_pragma("user_version"), 11);
 }
 
 #[test]
@@ -7544,7 +7801,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 11;")
+                .execute_batch("PRAGMA user_version = 12;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");

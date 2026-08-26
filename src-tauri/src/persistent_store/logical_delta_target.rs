@@ -60,6 +60,7 @@ const PDS_GENERATION_TABLES: &[(&str, &str)] = &[
         "owner_kind, owner_locator, present, manifest_hash, entry_count",
     ),
     ("asset_repository_authority", "value"),
+    ("cold_payload_authority", "value"),
     ("cold_aliases", "key, object_hash, size, metadata"),
 ];
 
@@ -3906,13 +3907,20 @@ mod tests {
     }
 
     #[test]
-    fn cloned_logical_target_preserves_asset_repository_authority() {
+    fn cloned_logical_target_preserves_dual_repository_authority() {
         let (_directory, store, _cas) = open_fixture();
         store
             .connection
             .execute(
                 "UPDATE asset_repository_authority SET value = ?1 WHERE generation = 'revision-0'",
                 [r#"{"format":"v2","migrationId":"migration-1","compatibilityHash":"abababababababababababababababababababababababababababababababab"}"#],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE cold_payload_authority SET value = ?1 WHERE generation = 'revision-0'",
+                [r#"{"format":"v2","migrationId":"migration-2","compatibilityHash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#],
             )
             .unwrap();
         let transaction = store.connection.unchecked_transaction().unwrap();
@@ -3930,6 +3938,18 @@ mod tests {
         assert_eq!(
             authority,
             r#"{"format":"v2","migrationId":"migration-1","compatibilityHash":"abababababababababababababababababababababababababababababababab"}"#
+        );
+        let cold_authority: String = transaction
+            .query_row(
+                "SELECT value FROM cold_payload_authority
+                 WHERE generation = 'staging-logical-authority'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cold_authority,
+            r#"{"format":"v2","migrationId":"migration-2","compatibilityHash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#
         );
     }
 

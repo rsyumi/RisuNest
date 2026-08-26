@@ -1137,6 +1137,52 @@ pub(super) fn maintain_incremental_asset_alias_deletion(
     )
 }
 
+pub(super) fn maintain_incremental_cold_alias(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    logical_key: &str,
+) -> StoreResult<()> {
+    let locator = LogicalRecordLocator::Cold {
+        logical_key: logical_key.to_owned(),
+    };
+    let key = encode_logical_record_key(&locator).map_err(codec_error)?;
+    delete_head(transaction, logical, &key)?;
+    project_cold_alias_by_key(transaction, cas, logical, logical_key)
+}
+
+pub(super) fn maintain_incremental_cold_alias_deletion(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    logical_key: &str,
+) -> StoreResult<()> {
+    delete_projection(
+        transaction,
+        logical,
+        encode_logical_record_key(&LogicalRecordLocator::Cold {
+            logical_key: logical_key.to_owned(),
+        })
+        .map_err(codec_error)?,
+        RECORD_KIND_COLD,
+    )
+}
+
+pub(super) fn maintain_incremental_cold_alias_replacement(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+) -> StoreResult<()> {
+    replace_kind_projection(transaction, logical, RECORD_KIND_COLD)?;
+    project_cold_aliases(
+        transaction,
+        cas,
+        &logical.library_id,
+        &logical.generation_id,
+        &logical.pds_generation,
+    )?;
+    restore_parent_tombstones_for_kind(transaction, logical, RECORD_KIND_COLD)
+}
+
 fn replace_root_projection(
     transaction: &Transaction<'_>,
     cas: &PayloadCas,
@@ -1942,6 +1988,39 @@ fn project_asset_alias_by_key(
         encode_logical_record_key(&locator).map_err(codec_error)?,
         record_kind,
         envelope,
+        dependencies,
+        &[],
+    )
+}
+
+fn project_cold_alias_by_key(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    logical: &IncrementalLogicalCommit,
+    logical_key: &str,
+) -> StoreResult<()> {
+    let (object_hash, raw_size, metadata): (Option<String>, i64, String) = transaction.query_row(
+        "SELECT object_hash, size, metadata FROM cold_aliases
+         WHERE generation = ?1 AND key = ?2",
+        params![logical.pds_generation, logical_key],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let size = nonnegative_u64(raw_size, "cold alias size")?;
+    let dependencies = payload_dependency(cas, object_hash.as_deref(), size)?;
+    insert_live_record(
+        transaction,
+        &logical.library_id,
+        &logical.generation_id,
+        encode_logical_record_key(&LogicalRecordLocator::Cold {
+            logical_key: logical_key.to_owned(),
+        })
+        .map_err(codec_error)?,
+        RECORD_KIND_COLD,
+        LogicalRecordEnvelope::Cold {
+            object_hash,
+            size,
+            metadata: serde_json::from_str(&metadata)?,
+        },
         dependencies,
         &[],
     )

@@ -2,9 +2,9 @@ use super::{
     active_generation, compare_plugin_storage_keys, current_revision, AssetAlias,
     AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
     AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
-    ConversationPage, ConversationQuery, ConversationSummary, ConversationWindow,
-    ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary, PresetCatalog,
-    PresetSummary, QueryOrder, ReadTarget, StoreError, StoreResult, Versioned,
+    ColdPayloadAuthorityState, ConversationPage, ConversationQuery, ConversationSummary,
+    ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary,
+    PresetCatalog, PresetSummary, QueryOrder, ReadTarget, StoreError, StoreResult, Versioned,
     CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -249,6 +249,31 @@ pub(super) fn read_asset_repository_authority(
         })?,
         None => AssetRepositoryAuthorityState::Legacy,
     };
+    value.validate()?;
+    Ok(Versioned {
+        revision: target.revision,
+        value,
+    })
+}
+
+pub(super) fn read_cold_payload_authority(
+    connection: &Connection,
+    target: &ReadTarget,
+) -> StoreResult<Versioned<ColdPayloadAuthorityState>> {
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM cold_payload_authority WHERE generation = ?1",
+            [&target.generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let stored = stored.ok_or_else(|| StoreError::Validation {
+        message: "Cold payload authority state is missing".to_owned(),
+    })?;
+    let value: ColdPayloadAuthorityState =
+        serde_json::from_str(&stored).map_err(|_| StoreError::Validation {
+            message: "Cold payload authority state is invalid".to_owned(),
+        })?;
     value.validate()?;
     Ok(Versioned {
         revision: target.revision,
