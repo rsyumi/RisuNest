@@ -4,6 +4,8 @@ pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
 #[allow(dead_code)]
+pub(crate) mod logical_delta_source;
+#[allow(dead_code)]
 mod logical_index;
 #[allow(dead_code)]
 mod logical_schema;
@@ -1520,5 +1522,7 @@ pub(super) fn generation_is_retained(
 }
 #[cfg(test)]
 mod benchmark;
+#[cfg(test)]
+mod logical_delta_source_tests;
 #[cfg(test)]
 mod tests;
