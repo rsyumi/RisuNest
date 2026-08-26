@@ -850,7 +850,7 @@ impl<R: Read> Read for DecodedLimitReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if self.job.is_cancel_requested() {
             return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::Other,
                 "restore cancelled while decoding block",
             ));
         }
@@ -936,7 +936,7 @@ impl<'a, R: Read> TrackedReader<'a, R> {
 
 fn native_error_to_io(error: NativeJobError) -> io::Error {
     let kind = match error.code.as_str() {
-        "cancelled" => io::ErrorKind::Interrupted,
+        "cancelled" => io::ErrorKind::Other,
         "truncated-input" => io::ErrorKind::UnexpectedEof,
         "corrupt-input" | "invalid-input" => io::ErrorKind::InvalidData,
         _ => io::ErrorKind::Other,
@@ -1850,6 +1850,31 @@ mod tests {
         };
 
         let error = restore_block_risu_save(&source, 1, &job, &cancelling).unwrap_err();
+
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn legacy_cancellation_after_replace_begin_aborts_staging() {
+        use base64::Engine;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(W0_RAW_FIXTURE.trim())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("legacy-cancel-after-begin.risudat");
+        fs::write(&source, bytes).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        let cancelling = CancelAfterBeginSink {
+            inner: &sink,
+            job: &job,
+        };
+
+        let error = restore_risu_save(&source, 1, &job, &cancelling).unwrap_err();
 
         assert_eq!(error.code, "cancelled");
         assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
