@@ -861,29 +861,7 @@ impl NativeFileJobState {
                     .and_then(|prepared| job.wait_for_content_abort(prepared));
             let cleanup =
                 cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id());
-            match (outcome, cleanup) {
-                (Err(error), Ok(())) if error.code == "cancelled" => {
-                    let _ = job.finish_cancelled();
-                }
-                (Err(error), Ok(())) => {
-                    let _ = job.finish_failure(&error.code, &error.message);
-                }
-                (Err(error), Err(cleanup)) => {
-                    let _ = job.finish_failure(
-                        "cleanup-failed",
-                        &format!("{}; cleanup failed: {cleanup}", error.message),
-                    );
-                }
-                (Ok(()), Ok(())) => {
-                    let _ = job.finish_failure(
-                        "store-error",
-                        "content preparation ended without an abort",
-                    );
-                }
-                (Ok(()), Err(cleanup)) => {
-                    let _ = job.finish_failure("cleanup-failed", &cleanup);
-                }
-            }
+            let _ = job.finish_content_job(outcome, cleanup);
             let _ = registry.prune();
         });
         Ok(NativeFileJobStarted {
@@ -1789,11 +1767,16 @@ impl JobControl {
         ) {
             return Ok(CancelOutcome::TooLate);
         }
+        let wait = self
+            .restore_finalized
+            .lock()
+            .map_err(|error| format!("native job wait mutex poisoned: {error}"))?;
         if self.cancel_requested.swap(true, Ordering::AcqRel) {
             return Ok(CancelOutcome::AlreadyRequested);
         }
         status.state = JobState::Cancelling;
         drop(status);
+        drop(wait);
         self.restore_finalization_changed.notify_all();
         Ok(CancelOutcome::Requested)
     }
@@ -2007,6 +1990,50 @@ impl JobControl {
         drop(status);
         self.mark_terminal()?;
         Ok(())
+    }
+
+    fn finish_content_job(
+        &self,
+        outcome: Result<(), NativeJobError>,
+        cleanup: Result<(), String>,
+    ) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.kind != JobKind::PrepareContentImport || status.state.is_terminal() {
+            return Err("native content job cannot finish from its current state".to_owned());
+        }
+        let failure = match (outcome, cleanup) {
+            (Err(error), Err(cleanup)) => Some(JobFailure {
+                code: "cleanup-failed".to_owned(),
+                message: bounded_message(&format!("{}; cleanup failed: {cleanup}", error.message)),
+            }),
+            (Ok(()), Err(cleanup)) => Some(JobFailure {
+                code: "cleanup-failed".to_owned(),
+                message: bounded_message(&cleanup),
+            }),
+            (_, Ok(())) if self.is_cancel_requested() => None,
+            (Err(error), Ok(())) => Some(JobFailure {
+                code: error.code,
+                message: error.message,
+            }),
+            (Ok(()), Ok(())) => Some(JobFailure {
+                code: "store-error".to_owned(),
+                message: "content preparation ended without an abort".to_owned(),
+            }),
+        };
+        status.state = if failure.is_some() {
+            JobState::Failed
+        } else {
+            JobState::Cancelled
+        };
+        status.phase = JobPhase::Complete;
+        status.result = None;
+        status.error = failure;
+        status.prepared_content = None;
+        drop(status);
+        self.mark_terminal()
     }
 
     pub(crate) fn finish_success(&self, mut result: JobResultSummary) -> Result<(), String> {
