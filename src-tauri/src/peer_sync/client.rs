@@ -24,6 +24,8 @@ use std::{
 };
 
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DownloadReport {
@@ -101,7 +103,7 @@ struct HttpCloneTransport {
 }
 
 impl HttpCloneTransport {
-    fn request(
+    fn authenticated_request(
         &self,
         request: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
@@ -109,6 +111,22 @@ impl HttpCloneTransport {
             Some(bearer) => request.bearer_auth(bearer),
             None => request,
         }
+    }
+
+    fn control_request(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        self.authenticated_request(request)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
+    }
+
+    fn range_request(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        self.authenticated_request(request)
+            .timeout(RANGE_REQUEST_TIMEOUT)
     }
 
     fn endpoint(&self, suffix: &str) -> Result<Url, PeerSyncError> {
@@ -134,7 +152,7 @@ impl LoopbackCloneClient {
         let ledger = load_ledger(&root.join("ledger.jsonl"))?;
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(5))
+            .timeout(RANGE_REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()
@@ -263,7 +281,7 @@ impl LoopbackCloneClient {
         }
         let response = self
             .transport
-            .request(
+            .control_request(
                 self.transport
                     .http
                     .get(self.transport.endpoint("manifest")?),
@@ -402,7 +420,7 @@ impl LoopbackCloneClient {
             let range_end = chunk.offset + chunk.size - 1;
             let mut response = self
                 .transport
-                .request(
+                .range_request(
                     self.transport
                         .http
                         .get(self.transport.endpoint(&format!("objects/{object_hash}"))?)
@@ -516,7 +534,7 @@ impl LoopbackCloneClient {
     fn verify_remote_object(&self, object_hash: &str, size: u64) -> Result<(), PeerSyncError> {
         let response = self
             .transport
-            .request(
+            .control_request(
                 self.transport
                     .http
                     .head(self.transport.endpoint(&format!("objects/{object_hash}"))?),
@@ -573,7 +591,7 @@ impl LoopbackCloneClient {
             })?;
         let response = self
             .transport
-            .request(
+            .control_request(
                 self.transport
                     .http
                     .post(self.transport.endpoint("progress")?)
@@ -983,4 +1001,35 @@ fn quoted(value: &str) -> String {
 
 fn transport_error(error: impl std::fmt::Display) -> PeerSyncError {
     PeerSyncError::Transport(error.to_string())
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn clone_http_requests_keep_control_calls_short_without_timing_out_valid_ranges() {
+        let transport = HttpCloneTransport {
+            session_url: Url::parse("http://127.0.0.1:1/v1/sessions/test").unwrap(),
+            http: Client::builder().no_proxy().build().unwrap(),
+            bearer: None,
+        };
+
+        let control = transport
+            .control_request(transport.http.get(transport.endpoint("manifest").unwrap()))
+            .build()
+            .unwrap();
+        let range = transport
+            .range_request(
+                transport
+                    .http
+                    .get(transport.endpoint("objects/test").unwrap()),
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(control.timeout(), Some(&CONTROL_REQUEST_TIMEOUT));
+        assert_eq!(range.timeout(), Some(&RANGE_REQUEST_TIMEOUT));
+        assert!(RANGE_REQUEST_TIMEOUT > CONTROL_REQUEST_TIMEOUT);
+    }
 }

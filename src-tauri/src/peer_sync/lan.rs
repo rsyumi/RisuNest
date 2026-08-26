@@ -27,7 +27,8 @@ const MAX_BODY_BYTES: usize = 1024;
 const MAX_CLAIM_RESPONSE_BYTES: usize = 1024;
 const MAX_REQUEST_LINE_BYTES: usize = MAX_URL_BYTES + 32;
 const MAX_REQUEST_HEAD_BYTES: usize = MAX_REQUEST_LINE_BYTES + 2 + MAX_HEADER_BYTES + 4;
-const CONNECTION_IO_TIMEOUT: Duration = Duration::from_millis(250);
+const CONNECTION_READ_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(2);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
@@ -626,13 +627,7 @@ fn serve(
             }
             Err(error) => return Err(transport(error)),
         };
-        stream.set_nonblocking(false).map_err(transport)?;
-        stream
-            .set_read_timeout(Some(CONNECTION_IO_TIMEOUT))
-            .map_err(transport)?;
-        stream
-            .set_write_timeout(Some(CONNECTION_IO_TIMEOUT))
-            .map_err(transport)?;
+        configure_connection(&stream)?;
         let shutdown_handle = stream.try_clone().map_err(transport)?;
         {
             let mut active = active_connection.lock().unwrap();
@@ -645,6 +640,17 @@ fn serve(
         let _ = handle_connection(stream, &shared, &stopped);
         active_connection.lock().unwrap().take();
     }
+    Ok(())
+}
+
+fn configure_connection(stream: &TcpStream) -> Result<(), PeerSyncError> {
+    stream.set_nonblocking(false).map_err(transport)?;
+    stream
+        .set_read_timeout(Some(CONNECTION_READ_POLL_TIMEOUT))
+        .map_err(transport)?;
+    stream
+        .set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))
+        .map_err(transport)?;
     Ok(())
 }
 
@@ -1384,4 +1390,29 @@ fn copy_exact_response(
         remaining -= read as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_connection_keeps_short_read_polls_and_allows_slow_response_progress() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        configure_connection(&server).unwrap();
+
+        assert_eq!(
+            server.read_timeout().unwrap(),
+            Some(CONNECTION_READ_POLL_TIMEOUT)
+        );
+        assert_eq!(
+            server.write_timeout().unwrap(),
+            Some(RESPONSE_WRITE_TIMEOUT)
+        );
+        assert!(RESPONSE_WRITE_TIMEOUT > CONNECTION_READ_POLL_TIMEOUT);
+        drop(client);
+    }
 }
