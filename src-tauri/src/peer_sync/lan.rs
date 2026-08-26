@@ -178,7 +178,7 @@ impl LanCloneClient {
         Self::from_persisted(persisted)
     }
 
-    pub(crate) fn into_resumable_parts(
+    pub(super) fn into_resumable_parts(
         self,
     ) -> Result<
         (
@@ -1447,6 +1447,13 @@ mod timeout_tests {
         }
     }
 
+    fn finish_response(stream: &mut TcpStream) {
+        let _ = stream.shutdown(Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let mut drain = [0_u8; 64];
+        while stream.read(&mut drain).is_ok_and(|read| read != 0) {}
+    }
+
     #[test]
     fn accepted_connection_keeps_short_read_polls_and_allows_slow_response_progress() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1509,6 +1516,7 @@ mod timeout_tests {
             )
             .unwrap();
             stream.write_all(body).unwrap();
+            finish_response(&mut stream);
         });
 
         let error = client.fetch_manifest(&manifest_id).unwrap_err();
@@ -1531,6 +1539,7 @@ mod timeout_tests {
                 "HTTP/1.1 201 Created\r\nContent-Length: 1\r\nAccept-Ranges: bytes\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
+            finish_response(&mut stream);
         });
 
         let error = client.head_object(&object).unwrap_err();
@@ -1553,12 +1562,13 @@ mod timeout_tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
+            finish_response(&mut stream);
         });
 
         let error = client.head_object(&object).unwrap_err();
         server.join().unwrap();
 
-        assert!(matches!(error, PeerSyncError::Protocol(_)));
+        assert!(matches!(error, PeerSyncError::Protocol(_)), "{error:?}");
     }
 
     #[test]
@@ -1576,6 +1586,7 @@ mod timeout_tests {
                     "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccept-Ranges: bytes\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
+                finish_response(&mut stream);
                 continue;
             }
             assert!(request.starts_with("GET "));
@@ -1584,12 +1595,13 @@ mod timeout_tests {
                 "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/3\r\nETag: {response_etag}\r\nConnection: close\r\n\r\nx"
             )
             .unwrap();
+            finish_response(&mut stream);
             break;
         });
 
         let error = client.fetch_chunk(&object, 0, 0).unwrap_err();
         server.join().unwrap();
 
-        assert!(matches!(error, PeerSyncError::Protocol(_)));
+        assert!(matches!(error, PeerSyncError::Protocol(_)), "{error:?}");
     }
 }

@@ -295,6 +295,13 @@ mod tests {
 
     const OBJECT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    fn finish_response(stream: &mut TcpStream) {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+        let mut drain = [0_u8; 64];
+        while stream.read(&mut drain).is_ok_and(|read| read != 0) {}
+    }
+
     fn range_server(
         size: u64,
         body: impl FnOnce(&mut TcpStream) + Send + 'static,
@@ -318,6 +325,7 @@ mod tests {
             .unwrap();
             stream.flush().unwrap();
             body(&mut stream);
+            finish_response(&mut stream);
         });
         (
             Url::parse(&format!("http://{address}/objects/{OBJECT}")).unwrap(),
@@ -491,7 +499,7 @@ mod tests {
     fn cancellation_is_observed_before_the_next_64_kib_callback() {
         let size = (RANGE_COPY_BUFFER_BYTES * 4) as u64;
         let (url, server) = range_server(size, move |stream| {
-            stream.write_all(&vec![3_u8; size as usize]).unwrap();
+            let _ = stream.write_all(&vec![3_u8; size as usize]);
         });
         let stream = HttpRangeStream::new(Duration::from_secs(1)).unwrap();
         let cancelled = AtomicBool::new(false);
