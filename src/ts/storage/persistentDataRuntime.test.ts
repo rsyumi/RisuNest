@@ -523,6 +523,19 @@ describe('stable working-set selection', () => {
 })
 
 describe('prepared persistent replacement', () => {
+    it('invalidates a resident session before publishing a cloned conversation', async () => {
+        const harness = await createActiveSessionRuntimeHarness()
+        const session = harness.runtime.getActiveConversationSession()!
+
+        harness.runtime.invalidateActiveConversationSession()
+
+        expect(session.isActive).toBe(false)
+        expect(harness.runtime.getActiveConversationSession()).toBeNull()
+        expect(() => session.append({ role: 'char', data: 'detached clone write' })).toThrow(
+            /inactive/,
+        )
+    })
+
     it('invalidates the resident session after explicit database replacement', async () => {
         const harness = await createActiveSessionRuntimeHarness()
         const session = harness.runtime.getActiveConversationSession()!

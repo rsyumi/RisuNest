@@ -258,6 +258,7 @@ export interface PersistentDataRuntime {
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
     getActiveConversationSession(): ActiveConversationSession | null
+    invalidateActiveConversationSession(): void
     deactivateActiveWorkingSet(): Promise<boolean>
     reconcileActiveCharacterIds(
         database: Database,
@@ -506,6 +507,7 @@ export function createPersistentDataRuntime(
         activateCharacter,
         activateConversation: (id) => workingSet.activateConversation(id),
         getActiveConversationSession: () => workingSet.activeConversationSession,
+        invalidateActiveConversationSession: () => workingSet.invalidateActiveConversationSession(),
         deactivateActiveWorkingSet: () => workingSet.deactivate(),
         reconcileActiveCharacterIds: (database, selectedCharacterId) =>
             workingSet.reconcileActiveCharacterIds(database, selectedCharacterId),
