@@ -341,6 +341,30 @@ function restoreMessage(target: Message, snapshot: Message): void {
     Object.assign(target, safeStructuredClone(snapshot))
 }
 
+type MessageRollbackEntry = {
+    message: Message
+    snapshot: Message
+}
+
+function captureMessageRollback(messages: readonly Message[]): MessageRollbackEntry[] {
+    return messages.map((message) => ({
+        message,
+        snapshot: safeStructuredClone(message),
+    }))
+}
+
+function restoreMessageRollback(
+    messages: Message[],
+    rollback: readonly MessageRollbackEntry[],
+): void {
+    messages.length = rollback.length
+    for (let index = 0; index < rollback.length; index++) {
+        const entry = rollback[index]
+        restoreMessage(entry.message, entry.snapshot)
+        messages[index] = entry.message
+    }
+}
+
 function createLocator(
     conversationId: string,
     messages: readonly Message[],
@@ -972,15 +996,21 @@ export class ActiveConversationSession {
             const previousVersion = this.sessionVersion
             const previousLocatorRegistry = this.locatorRegistry
             const nextLocatorRegistry = previousLocatorRegistry.fork()
-            const absoluteIndex = this.conversation.message.length
-            this.conversation.message.push(safeStructuredClone(message))
+            const previousMessages = this.conversation.message
+            const rollbackMessages = this.onMutation
+                ? captureMessageRollback(previousMessages)
+                : null
+            const absoluteIndex = previousMessages.length
+            previousMessages.push(safeStructuredClone(message))
             this.sessionVersion += 1
             this.locatorRegistry = nextLocatorRegistry
             try {
                 this.notifyMutation(previousVersion, ['append'])
                 previousLocatorRegistry.clear()
             } catch (error) {
-                this.conversation.message.pop()
+                if (rollbackMessages) restoreMessageRollback(previousMessages, rollbackMessages)
+                else previousMessages.pop()
+                this.conversation.message = previousMessages
                 this.sessionVersion = previousVersion
                 nextLocatorRegistry.clear()
                 this.locatorRegistry = previousLocatorRegistry
@@ -1007,15 +1037,21 @@ export class ActiveConversationSession {
             const previousVersion = this.sessionVersion
             const previousLocatorRegistry = this.locatorRegistry
             const nextLocatorRegistry = previousLocatorRegistry.fork()
-            const previousMessage = this.conversation.message[locator.absoluteIndex]
-            this.conversation.message[locator.absoluteIndex] = safeStructuredClone(message)
+            const previousMessages = this.conversation.message
+            const rollbackMessages = this.onMutation
+                ? captureMessageRollback(previousMessages)
+                : null
+            const previousMessage = previousMessages[locator.absoluteIndex]
+            previousMessages[locator.absoluteIndex] = safeStructuredClone(message)
             this.sessionVersion += 1
             this.locatorRegistry = nextLocatorRegistry
             try {
                 this.notifyMutation(previousVersion, ['edit'])
                 previousLocatorRegistry.clear()
             } catch (error) {
-                this.conversation.message[locator.absoluteIndex] = previousMessage
+                if (rollbackMessages) restoreMessageRollback(previousMessages, rollbackMessages)
+                else previousMessages[locator.absoluteIndex] = previousMessage
+                this.conversation.message = previousMessages
                 this.sessionVersion = previousVersion
                 nextLocatorRegistry.clear()
                 this.locatorRegistry = previousLocatorRegistry
@@ -1107,10 +1143,7 @@ export class ActiveConversationSession {
             if (completed.commands.length > 0) {
                 const previousMessages = this.conversation.message
                 const rollbackMessages = this.onMutation
-                    ? previousMessages.map((message) => ({
-                        message,
-                        snapshot: safeStructuredClone(message),
-                    }))
+                    ? captureMessageRollback(previousMessages)
                     : null
                 const previousBookmarks = this.conversation.bookmarks
                 const previousBookmarkNames = this.conversation.bookmarkNames
@@ -1133,12 +1166,7 @@ export class ActiveConversationSession {
                     previousLocatorRegistry.clear()
                 } catch (error) {
                     if (rollbackMessages) {
-                        previousMessages.length = rollbackMessages.length
-                        for (let index = 0; index < rollbackMessages.length; index++) {
-                            const rollback = rollbackMessages[index]
-                            restoreMessage(rollback.message, rollback.snapshot)
-                            previousMessages[index] = rollback.message
-                        }
+                        restoreMessageRollback(previousMessages, rollbackMessages)
                     }
                     this.conversation.message = previousMessages
                     if (completed.bookmarkMetadataChanged) {

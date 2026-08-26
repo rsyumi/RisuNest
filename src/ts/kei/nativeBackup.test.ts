@@ -21,6 +21,7 @@ function nativeRuntime() {
             readConversationWindow: vi.fn(),
             queryPluginStorage: vi.fn(),
             readPluginStorage: vi.fn(),
+            readAssetAlias: vi.fn(),
             release,
         }) as PersistentRevisionLease,
     )
@@ -109,6 +110,7 @@ describe('tryNativeKeiBackup', () => {
             readConversationWindow: vi.fn(),
             queryPluginStorage: vi.fn(),
             readPluginStorage: vi.fn(),
+            readAssetAlias: vi.fn(),
             release,
         })
         const invoke = vi.fn()
