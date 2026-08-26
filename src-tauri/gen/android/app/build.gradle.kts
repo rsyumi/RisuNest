@@ -16,6 +16,10 @@ val enableExperimentalSafFileJobs = providers
     .gradleProperty("risuEnableExperimentalSafFileJobs")
     .map { it.equals("true", ignoreCase = true) }
     .orElse(false)
+val enableExperimentalPeerCloneClient = providers
+    .gradleProperty("risuEnableExperimentalPeerCloneClient")
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
 
 android {
     compileSdk = 36
@@ -23,6 +27,8 @@ android {
     namespace = "co.aiclient.risu"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
+        manifestPlaceholders["enableExperimentalPeerCloneClient"] =
+            enableExperimentalPeerCloneClient.get().toString()
         applicationId = "co.aiclient.risu"
         minSdk = 24
         targetSdk = 36
@@ -32,6 +38,11 @@ android {
             "boolean",
             "ENABLE_EXPERIMENTAL_SAF_FILE_JOBS",
             enableExperimentalSafFileJobs.get().toString(),
+        )
+        buildConfigField(
+            "boolean",
+            "ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT",
+            enableExperimentalPeerCloneClient.get().toString(),
         )
     }
     buildTypes {
