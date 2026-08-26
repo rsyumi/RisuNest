@@ -7,6 +7,7 @@ export type ActiveConversationPinReason =
     | 'pending-save'
     | 'streaming'
     | 'transaction'
+    | 'prompt'
     | 'compatibility'
 
 declare const conversationSessionTokenBrand: unique symbol
@@ -869,6 +870,15 @@ export class ActiveConversationSession {
 
     get activePinReasons(): ActiveConversationPinReason[] {
         return [...this.pins.keys()]
+    }
+
+    matchesConversation(characterId: string, conversation: Chat): boolean {
+        return (
+            this.active &&
+            this.characterId === characterId &&
+            this.conversationId === conversation.id &&
+            this.conversation === conversation
+        )
     }
 
     locate(absoluteIndex: number): MessageLocator {

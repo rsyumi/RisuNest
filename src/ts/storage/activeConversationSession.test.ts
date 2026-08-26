@@ -86,6 +86,14 @@ describe('ActiveConversationSession', () => {
         expect(session.readMessage(edited).data).toBe('edited')
     })
 
+    it('checks backing conversation identity without exposing a compatibility array', () => {
+        const { conversation, session } = createSession()
+
+        expect(session.matchesConversation('character-a', conversation)).toBe(true)
+        expect(session.matchesConversation('character-b', conversation)).toBe(false)
+        expect(session.matchesConversation('character-a', chat(conversation.message))).toBe(false)
+    })
+
     it('rejects a missing full-array conversation distinctly from a missing locator', () => {
         expect(() => new ActiveConversationSession({
             characterId: 'character-a',
