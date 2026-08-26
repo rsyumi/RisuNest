@@ -47,7 +47,7 @@ const sameSignature = (
 ) => areChatRenderSignaturesEqual(left, right)
 
 describe('ChatRenderIdentityRegistry', () => {
-    it('keeps an assigned chat identity when a later append duplicates it', () => {
+    it('keeps an id-less identity when a chat ID is assigned later', () => {
         const registry = new ChatRenderIdentityRegistry()
         const original = message(undefined, 'first')
         const messages = [original]
@@ -56,13 +56,13 @@ describe('ChatRenderIdentityRegistry', () => {
         original.chatId = 'assigned-later'
         const assignedKey = registry.register('conversation-a', messages).keyAt(0)
 
-        expect(assignedKey).not.toBe(missingKey)
+        expect(assignedKey).toBe(missingKey)
 
         messages.push(message('assigned-later', 'second'))
         const duplicateKeys = registry.registerAppend('conversation-a', messages, 1).toArray()
 
         expect(new Set(duplicateKeys).size).toBe(2)
-        expect(duplicateKeys[0]).toBe(assignedKey)
+        expect(duplicateKeys[0]).toBe(missingKey)
     })
 
     it('registers a 10,000-message identity sequence once and resolves viewport rows without rescanning messages', () => {
@@ -188,6 +188,35 @@ describe('ChatRenderIdentityRegistry', () => {
         const reinsertedKeys = registry.register('conversation-a', messages).toArray()
         expect(reinsertedKeys[1]).toBe(insertedFallback)
         expect(reinsertedKeys[2]).toBe(anchor.key)
+    })
+
+    it('keeps a duplicate fallback identity after the original chat-key owner is deleted', () => {
+        const registry = new ChatRenderIdentityRegistry()
+        const original = message('duplicate', 'original')
+        const inserted = message('duplicate', 'inserted')
+        const messages = [message('x'), original, message('y')]
+        registry.register('conversation-a', messages)
+
+        messages.splice(1, 0, inserted)
+        const duplicateKeys = registry.register('conversation-a', messages).toArray()
+        const anchor = {
+            key: duplicateKeys[1],
+            indexHint: 1,
+            relativeOffset: 13,
+        }
+
+        messages.splice(2, 1)
+        const afterDeletion = registry.register('conversation-a', messages).toArray()
+        const viewport = buildChatViewport({
+            keys: afterDeletion,
+            budget: 3,
+            overscan: 1,
+            estimatedMessageHeight: 100,
+            anchor,
+        })
+
+        expect(afterDeletion[1]).toBe(anchor.key)
+        expect(viewport.anchor).toEqual(anchor)
     })
 
     it('reuses an id-less message identity after deletion and reinsertion', () => {

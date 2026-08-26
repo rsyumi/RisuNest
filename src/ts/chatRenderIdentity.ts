@@ -72,16 +72,23 @@ export class ChatRenderIdentityRegistry {
             for (let offset = 0; offset < suffixIds.length; offset++) {
                 const message = messages[previousLength + offset]
                 const chatId = suffixIds[offset]
-                if (chatId) {
+                const occurrence = objectOccurrences.get(message) ?? 0
+                const existingLegacyKey = this.existingLegacyKey(scope, message, occurrence)
+                if (chatId) this.registeredIdCounts.set(chatId, 1)
+                if (
+                    chatId
+                    && (
+                        this.issuedChatIdentity(scope, chatId, message) !== undefined
+                        || existingLegacyKey === undefined
+                    )
+                ) {
                     this.recordIssuedChatIdentity(scope, chatId, message)
                     nextKeys.push(scopedKey(scope, 'chat', chatId))
-                    this.registeredIdCounts.set(chatId, 1)
                     continue
                 }
 
-                const occurrence = objectOccurrences.get(message) ?? 0
                 objectOccurrences.set(message, occurrence + 1)
-                nextKeys.push(this.legacyKey(scope, message, occurrence))
+                nextKeys.push(existingLegacyKey ?? this.legacyKey(scope, message, occurrence))
             }
             this.setRegistration(scope, messages.length, nextKeys, objectOccurrences)
             return new ChatRenderIdentitySequence(nextKeys)
@@ -110,17 +117,26 @@ export class ChatRenderIdentityRegistry {
         }
         const keys = messages.map((message, index) => {
             const chatId = messageIds[index]
-            if (
+            const occurrence = objectOccurrences.get(message) ?? 0
+            const existingLegacyKey = this.existingLegacyKey(scope, message, occurrence)
+            const issuedChatIdentity = chatId
+                ? this.issuedChatIdentity(scope, chatId, message)
+                : undefined
+            const canUseChatIdentity = (
                 chatId
                 && (idCounts.get(chatId) === 1 || preferredChatIdentity.get(chatId)?.index === index)
+            )
+            if (
+                chatId
+                && canUseChatIdentity
+                && (issuedChatIdentity !== undefined || existingLegacyKey === undefined)
             ) {
                 this.recordIssuedChatIdentity(scope, chatId, message)
                 return scopedKey(scope, 'chat', chatId)
             }
 
-            const occurrence = objectOccurrences.get(message) ?? 0
             objectOccurrences.set(message, occurrence + 1)
-            return this.legacyKey(scope, message, occurrence)
+            return existingLegacyKey ?? this.legacyKey(scope, message, occurrence)
         })
         this.registeredIdCounts = idCounts
         this.setRegistration(scope, messages.length, keys, objectOccurrences)
@@ -139,6 +155,11 @@ export class ChatRenderIdentityRegistry {
         }
         const key = scopedKey(scope, 'chat', chatId)
         if (!identities.has(key)) identities.set(key, this.nextChatIdentity++)
+    }
+
+    private existingLegacyKey(scope: string, message: Message, occurrence: number): string | undefined {
+        const key = this.legacyKeys.get(message)?.[occurrence]
+        return key === undefined ? undefined : scopedKey(scope, 'legacy', key)
     }
 
     private legacyKey(scope: string, message: Message, occurrence: number): string {
