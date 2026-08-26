@@ -5765,6 +5765,136 @@ fn asset_gc_dry_run_keeps_leased_generation_roots_until_release() {
 }
 
 #[test]
+fn asset_gc_dry_run_keeps_detached_export_roots_until_reader_release() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let original_payload = cas.prepare_bytes(b"detached-original").unwrap();
+    let replacement_payload = cas.prepare_bytes(b"detached-replacement").unwrap();
+    let original = AssetAlias {
+        key: "assets/detached.bin".to_owned(),
+        object_hash: Some(original_payload.content_hash.clone()),
+        kind: "asset".to_owned(),
+        size: original_payload.byte_size as i64,
+        mime: "application/octet-stream".to_owned(),
+        name: "Detached".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let first = store.commit_asset_alias(&original, 0).unwrap();
+    let mut prepared = store.prepare_risu_save_export(first.revision).unwrap();
+    let replacement = AssetAlias {
+        object_hash: Some(replacement_payload.content_hash.clone()),
+        size: replacement_payload.byte_size as i64,
+        ..original
+    };
+    store
+        .commit_asset_alias(&replacement, first.revision)
+        .unwrap();
+    let candidates = [
+        crate::asset_repository::migration_gc::AssetGcCandidate {
+            object_hash: original_payload.content_hash.clone(),
+            byte_size: original_payload.byte_size,
+            created_at_ms: 0,
+        },
+        crate::asset_repository::migration_gc::AssetGcCandidate {
+            object_hash: replacement_payload.content_hash.clone(),
+            byte_size: replacement_payload.byte_size,
+            created_at_ms: 0,
+        },
+    ];
+
+    let detached = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    assert!(detached
+        .marked_hashes
+        .contains(&original_payload.content_hash));
+    assert!(detached
+        .marked_hashes
+        .contains(&replacement_payload.content_hash));
+    assert!(detached.potential_delete_hashes.is_empty());
+
+    let reader = prepared.take_reader().expect("take detached reader");
+    prepared.release(reader).expect("release detached reader");
+    let released = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    assert_eq!(
+        released.marked_hashes,
+        vec![replacement_payload.content_hash]
+    );
+    assert_eq!(
+        released.potential_delete_hashes,
+        vec![original_payload.content_hash]
+    );
+}
+
+#[test]
+fn detached_export_registry_keeps_exact_v8_roots_until_reader_release() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let generation = super::active_generation(&store.connection).expect("read generation");
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height, metadata
+             ) VALUES (?1, 'assets/detached.bin', ?2, 'asset', 1,
+                'application/octet-stream', 'Detached', 'bin', NULL, NULL, NULL, '{}')",
+            rusqlite::params![generation, "ab".repeat(32)],
+        )
+        .expect("insert detached asset alias root");
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+             ) VALUES (?1, 'root-module-assets', '0', 1, ?2, 1)",
+            rusqlite::params![generation, "cd".repeat(32)],
+        )
+        .expect("insert detached owner head root");
+    store
+        .connection
+        .execute(
+            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+             VALUES (?1, 'cold/detached', ?2, 1, '{}')",
+            rusqlite::params![generation, "ef".repeat(32)],
+        )
+        .expect("insert detached cold alias root");
+
+    let mut prepared = store
+        .prepare_risu_save_export(0)
+        .expect("prepare detached reader with v8 roots");
+    let roots = store
+        .active_readers
+        .detached_asset_roots()
+        .expect("read detached roots");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].manifest_hashes, ["cd".repeat(32)].into());
+    assert_eq!(
+        roots[0].object_hashes,
+        ["ab".repeat(32), "ef".repeat(32)].into()
+    );
+
+    let reader = prepared.take_reader().expect("take detached reader");
+    prepared.release(reader).expect("release detached reader");
+    assert!(store
+        .active_readers
+        .detached_asset_roots()
+        .expect("read roots after detached release")
+        .is_empty());
+}
+
+#[test]
+fn android_revision_reader_starts_writable_before_query_only_snapshot_pinning() {
+    let flags = super::snapshot::revision_reader_open_flags_for_target(true);
+
+    assert!(flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE));
+    assert!(!flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY));
+}
+
+#[test]
 fn checkpoints_accept_both_documented_modes() {
     let (_directory, store, _) = open_fixture();
 

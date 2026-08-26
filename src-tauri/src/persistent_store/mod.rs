@@ -1061,6 +1061,7 @@ impl PersistentStore {
             revision,
             Arc::clone(&self.active_readers),
         )?;
+        reader.publish_detached_asset_roots()?;
         Ok(PreparedRisuSaveExport {
             revision,
             lease,
@@ -1159,6 +1160,7 @@ impl PersistentStore {
         for reader in self.revision_leases.values() {
             roots.push(snapshot::collect_asset_roots(&reader.connection)?);
         }
+        roots.extend(self.active_readers.detached_asset_roots()?);
         for snapshot in snapshot::list(&self.snapshots_dir)? {
             roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
         }

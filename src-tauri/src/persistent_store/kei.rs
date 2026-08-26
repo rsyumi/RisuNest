@@ -145,6 +145,7 @@ pub(super) fn prepare_upload(
         let persistent_directory = snapshots_dir.parent().ok_or_else(|| StoreError::Store {
             message: "Persistent store directory is unavailable".to_owned(),
         })?;
+        reader.publish_detached_asset_roots()?;
         Ok((
             persistent_directory.join("persistent.db"),
             persistent_directory.join("kei-upload"),
@@ -638,8 +639,8 @@ fn write_stored_value(writer: &mut impl Write, serialized: &str) -> StoreResult<
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_upload, write_canonical_value};
-    use crate::persistent_store::{PersistentStore, WorkingSetCommit};
+    use super::write_canonical_value;
+    use crate::persistent_store::{AssetAlias, PersistentStore, WorkingSetCommit};
     use serde_json::json;
     use std::fs;
     use std::io::{Read, Write};
@@ -708,6 +709,24 @@ mod tests {
             .replace_add_characters(&staging.staging_id, &characters)
             .expect("stage characters");
         store
+            .replace_put_asset_aliases(
+                &staging.staging_id,
+                &[AssetAlias {
+                    key: "assets/kei-reader.bin".to_owned(),
+                    object_hash: Some("ab".repeat(32)),
+                    kind: "asset".to_owned(),
+                    size: 1,
+                    mime: "application/octet-stream".to_owned(),
+                    name: "kei-reader.bin".to_owned(),
+                    ext: "bin".to_owned(),
+                    inlay_type: None,
+                    width: None,
+                    height: None,
+                    metadata: json!({}),
+                }],
+            )
+            .expect("stage KEI reader asset root");
+        store
             .replace_commit(&staging.staging_id, Some(0))
             .expect("commit fixture");
         let lease = store.acquire_revision(1).expect("acquire lease").lease;
@@ -758,6 +777,33 @@ mod tests {
         assert_eq!(body, EXPECTED_PAYLOAD);
         drop(payload);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn transferred_reader_roots_remain_registered_until_prepared_upload_drops() {
+        let (_directory, mut store, lease) = open_store_with_fixture();
+        let prepared = store
+            .prepare_kei_upload(
+                &lease,
+                "http://127.0.0.1/autobackup/save",
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare transferred reader");
+
+        let roots = store
+            .active_readers
+            .detached_asset_roots()
+            .expect("read detached KEI roots");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].object_hashes, ["ab".repeat(32)].into());
+
+        drop(prepared);
+        assert!(store
+            .active_readers
+            .detached_asset_roots()
+            .expect("read detached roots after drop")
+            .is_empty());
     }
 
     #[test]
@@ -890,6 +936,7 @@ mod tests {
                 add_character: None,
                 conversations: None,
                 delete_character_id: None,
+                asset_owner_heads: None,
                 plugin_storage: None,
             })
             .expect("commit later revision");

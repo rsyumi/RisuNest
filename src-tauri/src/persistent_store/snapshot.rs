@@ -9,12 +9,12 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -33,6 +33,7 @@ struct PendingRestore {
 #[derive(Default)]
 pub(crate) struct ActiveReaderRegistry {
     count: AtomicUsize,
+    detached_asset_roots: Mutex<HashMap<String, AssetRootSet>>,
 }
 
 impl ActiveReaderRegistry {
@@ -48,11 +49,40 @@ impl ActiveReaderRegistry {
     pub(crate) fn active_count(&self) -> usize {
         self.count.load(Ordering::SeqCst)
     }
+
+    fn publish_detached_asset_roots(&self, lease: &str, roots: AssetRootSet) -> StoreResult<()> {
+        self.detached_asset_roots
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("active reader roots mutex poisoned: {error}"),
+            })?
+            .insert(lease.to_owned(), roots);
+        Ok(())
+    }
+
+    fn remove_detached_asset_roots(&self, lease: &str) {
+        if let Ok(mut roots) = self.detached_asset_roots.lock() {
+            roots.remove(lease);
+        }
+    }
+
+    pub(crate) fn detached_asset_roots(&self) -> StoreResult<Vec<AssetRootSet>> {
+        Ok(self
+            .detached_asset_roots
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("active reader roots mutex poisoned: {error}"),
+            })?
+            .values()
+            .cloned()
+            .collect())
+    }
 }
 
 pub(crate) struct RevisionReadLease {
     pub(crate) connection: Connection,
     pub(crate) target: ReadTarget,
+    lease: String,
     active_readers: Arc<ActiveReaderRegistry>,
     transaction_open: bool,
     #[cfg(test)]
@@ -63,6 +93,12 @@ impl RevisionReadLease {
     pub(crate) fn active_readers(&self) -> Arc<ActiveReaderRegistry> {
         Arc::clone(&self.active_readers)
     }
+
+    pub(crate) fn publish_detached_asset_roots(&self) -> StoreResult<()> {
+        let roots = collect_asset_roots(&self.connection)?;
+        self.active_readers
+            .publish_detached_asset_roots(&self.lease, roots)
+    }
 }
 
 impl Drop for RevisionReadLease {
@@ -70,6 +106,7 @@ impl Drop for RevisionReadLease {
         if self.transaction_open {
             let _ = self.connection.execute_batch("ROLLBACK");
         }
+        self.active_readers.remove_detached_asset_roots(&self.lease);
         self.active_readers.release();
     }
 }
@@ -228,10 +265,11 @@ pub(super) fn acquire_revision(
     let lease = format!("snapshot-{revision}-{}", Uuid::new_v4());
     active_readers.register();
     Ok((
-        lease,
+        lease.clone(),
         RevisionReadLease {
             connection,
             target,
+            lease,
             active_readers,
             transaction_open: true,
             #[cfg(test)]
@@ -241,14 +279,26 @@ pub(super) fn acquire_revision(
 }
 
 fn open_revision_reader(database_path: &Path) -> StoreResult<Connection> {
-    let read_only = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    match configure_revision_reader(database_path, read_only) {
+    let preferred = revision_reader_open_flags_for_target(cfg!(target_os = "android"));
+    if cfg!(target_os = "android") {
+        return configure_revision_reader(database_path, preferred);
+    }
+    match configure_revision_reader(database_path, preferred) {
         Ok(connection) => Ok(connection),
         Err(_) => configure_revision_reader(
             database_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ),
     }
+}
+
+pub(super) fn revision_reader_open_flags_for_target(is_android: bool) -> OpenFlags {
+    let access = if is_android {
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+    } else {
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+    };
+    access | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
 fn configure_revision_reader(database_path: &Path, flags: OpenFlags) -> StoreResult<Connection> {
