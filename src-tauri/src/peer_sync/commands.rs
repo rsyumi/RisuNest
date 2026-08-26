@@ -758,7 +758,7 @@ impl PeerCloneCommandState {
     }
 
     pub fn cancel_target(&self, request: &PeerCloneTargetRequest) -> Result<(), PeerSyncError> {
-        let (worker, fail_cleanup_after_commit) = {
+        let worker = {
             let mut runtime = self.lock_runtime()?;
             let target = require_target_request_mut(&mut runtime, request)?;
             if target.status.phase != PeerCloneTargetPhase::Downloading {
