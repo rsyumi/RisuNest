@@ -169,6 +169,23 @@ describe('generation conversation operation', () => {
         expect(harness.session?.pinCount('transaction')).toBe(0)
     })
 
+    it('invalidates an empty tail lease after a concurrent session append', () => {
+        const harness = createHarness([])
+        const operation = captureGenerationTailFallbackOperation({
+            session: harness.session,
+            getCurrentSession: () => harness.session,
+            chat: harness.chat,
+            getCurrentChat: () => harness.chat,
+        })
+
+        harness.session?.append(message('concurrent response', 'response-1'))
+
+        expect(operation.isOwned()).toBe(false)
+        expect(operation.refresh()).toBe(false)
+        operation.release()
+        expect(harness.session?.pinCount('transaction')).toBe(0)
+    })
+
     it('keeps a named full-array fallback without an active session', () => {
         const currentChat = chat([message('existing response', 'response-1')])
 

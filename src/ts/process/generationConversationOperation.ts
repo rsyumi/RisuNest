@@ -245,6 +245,8 @@ function captureEmptyTailFallbackOperation(
     const usesSession = canUseActiveSession(options)
     const session = usesSession ? options.session! : null
     const pin = session?.acquirePin('transaction')
+    const sessionVersion = session?.version
+    const messageCount = session?.totalMessages
     let released = false
     const ownerIsCurrent = () => {
         if (
@@ -255,6 +257,8 @@ function captureEmptyTailFallbackOperation(
         return session === null || (
             session.isActive
             && options.getCurrentSession() === session
+            && session.version === sessionVersion
+            && session.totalMessages === messageCount
             && session.materializeCompatibilityArray() === options.chat.message
         )
     }
