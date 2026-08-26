@@ -510,13 +510,20 @@ body {
   display: none;
 }
 
-.chat-message-container:first-of-type .dyna-icon {
+.chat-message-container.is-latest-chat-row .dyna-icon {
   display: block;
 }
 
 .chat-message-container.is-settled-history {
   content-visibility: auto;
   contain-intrinsic-size: auto 16rem;
+}
+
+.chat-viewport-gap {
+  width: 100%;
+  flex-shrink: 0;
+  contain: strict;
+  pointer-events: none;
 }
 
 .x-risu-tool-call {

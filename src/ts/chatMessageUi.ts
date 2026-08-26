@@ -4,6 +4,7 @@ import {
     type MessageLocator,
 } from './storage/activeConversationSession'
 import type { Chat, Database, Message } from './storage/database.svelte'
+import type { ChatViewportJumpOptions } from './chatViewport'
 
 export interface CurrentChatMessageTarget {
     character: Database['characters'][number]
@@ -50,6 +51,28 @@ export class LatestChatScrollRequestGuard {
     isCurrent(generation: number): boolean {
         return generation === this.generation
     }
+}
+
+export interface CapturedChatMessageViewport {
+    jumpTo(index: number, options?: ChatViewportJumpOptions): Promise<boolean>
+}
+
+export async function navigateCapturedChatMessage(options: {
+    target: CapturedChatMessageTarget
+    context: ChatMessageUiContext
+    guard: LatestChatScrollRequestGuard
+    requestGeneration: number
+    viewport: CapturedChatMessageViewport
+}): Promise<boolean> {
+    if (!options.guard.isCurrent(options.requestGeneration)) return false
+    const resolved = resolveChatMessageTarget(options.target, options.context)
+    if (!resolved) return false
+    const jumped = await options.viewport.jumpTo(resolved.absoluteIndex, {
+        align: 'start',
+        highlight: true,
+    })
+    if (!jumped || !options.guard.isCurrent(options.requestGeneration)) return false
+    return resolveChatMessageTarget(options.target, options.context) !== null
 }
 
 export function captureChatMessageTarget(

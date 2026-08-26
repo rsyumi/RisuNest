@@ -9,6 +9,12 @@ import { languageChineseTraditional } from '../../lang/zh-Hant'
 import { advancedSettingsItems } from './advancedSettingsData'
 
 describe('streaming display optimization setting', () => {
+    it('does not expose legacy monotonically growing chat page controls', () => {
+        const ids = advancedSettingsItems.map((item) => item.id)
+        expect(ids).not.toContain('adv.chatLoadInitial')
+        expect(ids).not.toContain('adv.chatLoadAdditional')
+    })
+
     it('is visible without enabling experimental settings', () => {
         const setting = advancedSettingsItems.find((item) => item.id === 'adv.streamingDisplayOpt')
 

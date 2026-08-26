@@ -11,6 +11,17 @@ export interface ChatViewportPin {
     reason: ChatViewportPinReason
 }
 
+export interface ChatViewportJumpOptions {
+    align?: 'start' | 'center'
+    highlight?: boolean
+}
+
+export interface ChatViewportHandle {
+    jumpTo(index: number, options?: ChatViewportJumpOptions): Promise<boolean>
+    jumpToLatestMessage(): Promise<void>
+    scrollToLatestMessage(): Promise<void>
+}
+
 export interface ChatViewportInput {
     keys: readonly string[]
     budget: number

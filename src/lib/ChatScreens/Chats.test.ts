@@ -24,9 +24,38 @@ const imageMocks = vi.hoisted(() => ({
     }),
 }))
 
+class TestResizeObserver {
+    static instances: TestResizeObserver[] = []
+    readonly observed = new Set<Element>()
+    disconnected = false
+
+    constructor(private readonly callback: ResizeObserverCallback) {
+        TestResizeObserver.instances.push(this)
+    }
+
+    observe(target: Element) {
+        this.observed.add(target)
+    }
+
+    unobserve(target: Element) {
+        this.observed.delete(target)
+    }
+
+    disconnect() {
+        this.disconnected = true
+        this.observed.clear()
+    }
+
+    emit(target: Element, height: number) {
+        this.callback([{
+            target,
+            contentRect: { height } as DOMRectReadOnly,
+        } as ResizeObserverEntry], this as unknown as ResizeObserver)
+    }
+}
+
 vi.mock('src/ts/characters', () => ({ getCharImage: imageMocks.getCharImage }))
 vi.mock('src/ts/globalApi.svelte', () => ({ chatFoldedStateMessageIndex: { index: -1 } }))
-vi.mock('src/ts/chatLoadPages', () => ({ shouldContainChatMessage: () => true }))
 vi.mock('src/ts/stores.svelte', async () => {
     const { writable } = await import('svelte/store')
     return {
@@ -52,8 +81,10 @@ vi.mock('src/ts/stores.svelte', async () => {
     }
 })
 vi.mock('./Chat.svelte', async () => ({ default: (await import('./ChatMountProbe.test.svelte')).default }))
+vi.mock('./CreatorQuote.svelte', async () => ({ default: (await import('./ChatMountProbe.test.svelte')).default }))
 
 import { ReloadGUIPointer } from 'src/ts/stores.svelte'
+import { setRuntimePerformanceProfile } from 'src/ts/runtimePerformanceProfile'
 import ChatsHarness from './ChatsHarness.test.svelte'
 import { chatMountProbe, resetChatMountProbe } from './chatMountProbe'
 
@@ -66,6 +97,8 @@ interface HarnessInstance {
     mutateScriptOutput(output: string): void
     setImage(image: string): void
     switchCharacter(character: character, messages: Message[]): void
+    jumpTo(index: number, options?: { align?: 'start' | 'center'; highlight?: boolean }): Promise<boolean>
+    jumpToLatestMessage(): Promise<void>
 }
 
 function makeMessage(index: number, overrides: Partial<Message> = {}): Message {
@@ -90,6 +123,10 @@ function makeCharacter(messages: Message[], isStreaming = false): character {
             isStreaming,
             activeStreamingDisplayOptimizationMode: 'balanced',
         }],
+        firstMessage: 'first greeting',
+        alternateGreetings: [],
+        creatorNotes: '',
+        removedQuotes: false,
         customscript: [],
         additionalAssets: [],
         emotionImages: [],
@@ -99,6 +136,11 @@ function makeCharacter(messages: Message[], isStreaming = false): character {
 
 function probeElements(target: HTMLElement): HTMLElement[] {
     return [...target.querySelectorAll<HTMLElement>('[data-chat-probe]')]
+        .filter((element) => element.dataset.index !== '-1')
+}
+
+function conversationStartProbe(target: HTMLElement): HTMLElement | null {
+    return target.querySelector<HTMLElement>('[data-chat-probe][data-index="-1"]')
 }
 
 function probeIdForMessage(target: HTMLElement, message: string): number {
@@ -117,6 +159,9 @@ describe('Chats imperative mount lifecycle', () => {
         imageMocks.staleReject = undefined
         imageMocks.pendingResolve = undefined
         imageMocks.getCharImage.mockClear()
+        setRuntimePerformanceProfile('normal')
+        TestResizeObserver.instances = []
+        vi.stubGlobal('ResizeObserver', TestResizeObserver)
         target = document.createElement('div')
         document.body.appendChild(target)
     })
@@ -125,6 +170,7 @@ describe('Chats imperative mount lifecycle', () => {
         if (mounted) await unmount(mounted)
         mounted = undefined
         document.body.replaceChildren()
+        vi.unstubAllGlobals()
     })
 
     test('keeps DOM order and settled component state, then cleans up a removed message', async () => {
@@ -349,5 +395,240 @@ describe('Chats imperative mount lifecycle', () => {
         await tick()
         await vi.waitFor(() => expect(probeIdForMessage(target, 'message-0')).not.toBe(initialInstance))
         expect(scan.reads).toBeGreaterThanOrEqual(initialReads + 10_000)
+    })
+
+    test('keeps 10,000 settled turns within the profile mount budget across direct jumps', async () => {
+        const messages = Array.from({ length: 10_000 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        expect(target.querySelectorAll('[data-chat-gap]')).toHaveLength(1)
+
+        for (const index of [100, 5_000, 0, 9_999, 4_321]) {
+            await expect((mounted as HarnessInstance).jumpTo(index)).resolves.toBe(true)
+            expect(probeElements(target).length).toBeLessThanOrEqual(64)
+            expect(probeElements(target).some((element) => element.dataset.message === `message-${index}`)).toBe(true)
+        }
+
+        expect(chatMountProbe.mounts.length - chatMountProbe.unmounts.length).toBeLessThanOrEqual(65)
+    })
+
+    test('replaces bounded rows while reverse-flex scrolling crosses measured gaps', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () => ({ top: 0, bottom: 500, height: 500 } as DOMRect)
+        let gaps = [...target.querySelectorAll<HTMLElement>('[data-chat-gap]')]
+        expect(gaps).toHaveLength(1)
+        gaps[0].getBoundingClientRect = () => ({ top: 0, bottom: 100, height: 100 } as DOMRect)
+
+        scrollParent.scrollTop = -100
+        scrollParent.dispatchEvent(new Event('scroll'))
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-135'),
+        ).toBe(true))
+        expect(probeElements(target)).toHaveLength(64)
+
+        gaps = [...target.querySelectorAll<HTMLElement>('[data-chat-gap]')]
+        expect(gaps).toHaveLength(2)
+        for (const gap of gaps) {
+            const isTrailing = Number(gap.dataset.chatGapStart) > 136
+            gap.getBoundingClientRect = () => isTrailing
+                ? ({ top: 300, bottom: 400, height: 100 } as DOMRect)
+                : ({ top: -1_000, bottom: -900, height: 100 } as DOMRect)
+        }
+
+        scrollParent.scrollTop = -50
+        scrollParent.dispatchEvent(new Event('scroll'))
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-191'),
+        ).toBe(true))
+        expect(probeElements(target)).toHaveLength(64)
+    })
+
+    test('uses the low-spec mounted-message budget', async () => {
+        setRuntimePerformanceProfile('low-spec')
+        const messages = Array.from({ length: 10_000 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(40))
+    })
+
+    test('mounts the measured conversation-start row only near the oldest turn', async () => {
+        const messages = Array.from({ length: 100 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        expect(conversationStartProbe(target)).toBeNull()
+
+        await expect((mounted as HarnessInstance).jumpTo(0)).resolves.toBe(true)
+        expect(conversationStartProbe(target)).not.toBeNull()
+        expect(probeElements(target).length).toBeLessThan(64)
+
+        await (mounted as HarnessInstance).jumpToLatestMessage()
+        expect(conversationStartProbe(target)).toBeNull()
+    })
+
+    test('pins a focused editor while navigation replaces settled rows, then releases it', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await (mounted as HarnessInstance).jumpTo(0)
+        const message = probeElements(target).find((element) => element.dataset.message === 'message-0')!
+        const editor = document.createElement('textarea')
+        message.append(editor)
+        editor.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+
+        await (mounted as HarnessInstance).jumpToLatestMessage()
+        expect(probeElements(target).some((element) => element.dataset.message === 'message-0')).toBe(true)
+        expect(probeElements(target).length).toBeLessThanOrEqual(64)
+
+        editor.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: null }))
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-0'),
+        ).toBe(false))
+    })
+
+    test('pins only actually playing media and releases it on pause', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await (mounted as HarnessInstance).jumpTo(0)
+        const message = probeElements(target).find((element) => element.dataset.message === 'message-0')!
+        const media = document.createElement('audio')
+        message.append(media)
+        media.dispatchEvent(new Event('play'))
+
+        await (mounted as HarnessInstance).jumpToLatestMessage()
+        expect(probeElements(target).some((element) => element.dataset.message === 'message-0')).toBe(true)
+
+        media.dispatchEvent(new Event('pause'))
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-0'),
+        ).toBe(false))
+    })
+
+    test('pins the newest streaming row during an old-history jump and releases it when settled', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        messages.at(-1)!.role = 'char'
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages, true) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+
+        await expect((mounted as HarnessInstance).jumpTo(0)).resolves.toBe(true)
+        expect(probeElements(target).some((element) => element.dataset.message === 'message-199')).toBe(true)
+        expect(probeElements(target).length).toBeLessThanOrEqual(64)
+
+        ;(mounted as HarnessInstance).setStreaming(false)
+        await tick()
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-199'),
+        ).toBe(false))
+    })
+
+    test('corrects the stable-key anchor after a measured height change', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await (mounted as HarnessInstance).jumpTo(100)
+
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        const wrappers = [...target.querySelectorAll<HTMLElement>('[data-chat-render-key]')]
+        const anchor = wrappers.find((element) => element.dataset.chatIndex === '100')!
+        let anchorTop = 120
+        scrollParent.getBoundingClientRect = () => ({
+            top: 0,
+            bottom: 500,
+            height: 500,
+        } as DOMRect)
+        scrollParent.scrollBy = vi.fn()
+        for (const wrapper of wrappers) {
+            wrapper.getBoundingClientRect = () => ({
+                top: wrapper === anchor ? anchorTop : 1_000,
+                bottom: wrapper === anchor ? anchorTop + 100 : 1_100,
+                height: 100,
+            } as DOMRect)
+        }
+
+        TestResizeObserver.instances[0].emit(anchor, 100)
+        anchorTop = 170
+
+        await vi.waitFor(() => expect(scrollParent.scrollBy).toHaveBeenCalledWith({
+            top: 50,
+            behavior: 'instant',
+        }))
+    })
+
+    test('disconnects the shared observer and releases mounted rows on teardown', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        const observer = TestResizeObserver.instances[0]
+        const activeInstances = probeElements(target).map((element) => Number(element.dataset.chatProbe))
+
+        await unmount(mounted)
+        mounted = undefined
+
+        expect(observer.disconnected).toBe(true)
+        expect(observer.observed.size).toBe(0)
+        expect(activeInstances.every((instance) => chatMountProbe.unmounts.includes(instance))).toBe(true)
+    })
+
+    test('settles an in-flight jump when teardown cancels its layout frame', async () => {
+        const pendingFrames = new Map<number, FrameRequestCallback>()
+        let nextFrame = 1
+        const cancelFrame = vi.fn((frame: number) => pendingFrames.delete(frame))
+        vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+            const frame = nextFrame++
+            pendingFrames.set(frame, callback)
+            return frame
+        }))
+        vi.stubGlobal('cancelAnimationFrame', cancelFrame)
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+
+        const jumping = (mounted as HarnessInstance).jumpTo(0)
+        await tick()
+        await Promise.resolve()
+        await unmount(mounted)
+        mounted = undefined
+
+        const result = await Promise.race([
+            jumping,
+            new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 50)),
+        ])
+        expect(result).toBe(false)
+        expect(cancelFrame).toHaveBeenCalled()
     })
 })

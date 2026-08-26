@@ -7,6 +7,7 @@ import {
     captureChatMessageTargetById,
     editCapturedChatMessage,
     LatestChatScrollRequestGuard,
+    navigateCapturedChatMessage,
     renameCapturedBookmark,
     resolveRetainedChatMessageTarget,
     resolveChatMessageTarget,
@@ -293,5 +294,36 @@ describe('chat message UI targets', () => {
         expect(guard.isCurrent(first)).toBe(false)
         expect(guard.isCurrent(second)).toBe(true)
         expect(applied).toEqual(['second'])
+    })
+
+    it('navigates a captured locator through the bounded viewport without retargeting it', async () => {
+        const target = fixture(Array.from({ length: 200 }, (_, index) => ({
+            role: index % 2 === 0 ? 'char' : 'user',
+            data: `message-${index}`,
+            chatId: `id-${index}`,
+        } as Message)))
+        const captured = capture(target, 17)
+        const guard = new LatestChatScrollRequestGuard()
+        const viewport = { jumpTo: vi.fn().mockResolvedValue(true) }
+
+        await expect(navigateCapturedChatMessage({
+            target: captured,
+            context: target,
+            guard,
+            requestGeneration: guard.begin(),
+            viewport,
+        })).resolves.toBe(true)
+        expect(viewport.jumpTo).toHaveBeenCalledWith(17, { align: 'start', highlight: true })
+
+        const stale = capture(target, 18)
+        target.session.edit(target.session.locate(18), { role: 'char', data: 'changed' })
+        await expect(navigateCapturedChatMessage({
+            target: stale,
+            context: target,
+            guard,
+            requestGeneration: guard.begin(),
+            viewport,
+        })).resolves.toBe(false)
+        expect(viewport.jumpTo).toHaveBeenCalledTimes(1)
     })
 })

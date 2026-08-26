@@ -1,6 +1,7 @@
 <script lang="ts">
     import type { character, Message } from 'src/ts/storage/database.svelte'
     import Chats from './Chats.svelte'
+    import type { ChatViewportHandle, ChatViewportJumpOptions } from 'src/ts/chatViewport'
 
     let {
         initialMessages,
@@ -12,6 +13,7 @@
 
     let messages = $state<Message[]>([])
     let currentCharacter = $state<character>(null as unknown as character)
+    let chats = $state<ChatViewportHandle>()
     const initialize = () => {
         messages = initialMessages
         currentCharacter = initialCharacter
@@ -51,16 +53,24 @@
         currentCharacter = character
         messages = nextMessages
     }
+
+    export function jumpTo(index: number, options?: ChatViewportJumpOptions) {
+        return chats?.jumpTo(index, options) ?? Promise.resolve(false)
+    }
+
+    export function jumpToLatestMessage() {
+        return chats?.jumpToLatestMessage() ?? Promise.resolve()
+    }
 </script>
 
 <div class="scroll-parent">
     <Chats
+        bind:this={chats}
         {messages}
         {currentCharacter}
         onReroll={() => {}}
         unReroll={() => {}}
         currentUsername="User"
         userIcon="user.png"
-        loadPages={Infinity}
     />
 </div>
