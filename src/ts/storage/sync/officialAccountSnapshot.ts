@@ -52,6 +52,10 @@ export interface OfficialAssociationRecord {
     syncedAt?: number
 }
 
+export interface OfficialRecoveredPublication extends OfficialAssociationRecord {
+    accountId: string
+}
+
 export interface OfficialAssociationMarkers {
     load(accountId: string): OfficialAssociationRecord | null
     save(accountId: string, record: OfficialAssociationRecord): void
@@ -490,6 +494,23 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         this.rememberAssociation(accountId, {
             revision,
             databaseFingerprint,
+            syncedAt: this.stampTime(),
+        })
+    }
+
+    async adoptPublishedRevision(publication: OfficialRecoveredPublication): Promise<void> {
+        const root = await this.dependencies.store.readRoot()
+        const activeAccountId = root.value.account?.id
+        if (activeAccountId !== publication.accountId) {
+            throw new Error('Recovered official publication account does not match the active account')
+        }
+        if (root.revision < publication.revision) {
+            throw new Error('Recovered official publication is newer than the local revision')
+        }
+        await this.dependencies.markPublished(publication.revision)
+        this.rememberAssociation(publication.accountId, {
+            revision: publication.revision,
+            databaseFingerprint: publication.databaseFingerprint,
             syncedAt: this.stampTime(),
         })
     }

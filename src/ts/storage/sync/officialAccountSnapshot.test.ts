@@ -236,6 +236,45 @@ async function makeHarness(options: HarnessOptions = {}) {
 }
 
 describe('OfficialAccountSnapshotAdapter publication', () => {
+    it('adopts a recovered receipt only for the active account and a non-future revision', async () => {
+        const association: OfficialAssociationMarkers = {
+            load: vi.fn(() => null),
+            save: vi.fn(),
+        }
+        const harness = await makeHarness({
+            accountId: 'account-1',
+            association,
+            now: () => 1234,
+        })
+        const fingerprint = 'c'.repeat(64)
+
+        await harness.adapter.adoptPublishedRevision({
+            accountId: 'account-1',
+            revision: harness.imported.revision,
+            databaseFingerprint: fingerprint,
+        })
+
+        expect(harness.markPublished).toHaveBeenCalledWith(harness.imported.revision)
+        expect(association.save).toHaveBeenCalledWith('account-1', {
+            revision: harness.imported.revision,
+            databaseFingerprint: fingerprint,
+            syncedAt: 1234,
+        })
+
+        await expect(harness.adapter.adoptPublishedRevision({
+            accountId: 'account-2',
+            revision: harness.imported.revision,
+            databaseFingerprint: fingerprint,
+        })).rejects.toThrow('account does not match')
+        await expect(harness.adapter.adoptPublishedRevision({
+            accountId: 'account-1',
+            revision: harness.imported.revision + 1,
+            databaseFingerprint: fingerprint,
+        })).rejects.toThrow('newer than the local revision')
+        expect(harness.markPublished).toHaveBeenCalledOnce()
+        expect(association.save).toHaveBeenCalledOnce()
+    })
+
     it('publishes the exact replacement projection natively and finalizes it durably in order', async () => {
         const events: string[] = []
         const fingerprint = 'a'.repeat(64)
