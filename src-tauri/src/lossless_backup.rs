@@ -14,8 +14,9 @@ use crate::{
         JobPhase, JobProgress,
     },
     persistent_store::{
-        materialized_asset_owner_entries, AssetAlias, AssetOwnerHead, AssetOwnerLocator, ColdAlias,
-        PersistentStore, RevisionResult, StagingResult, StoreError, StoreResult,
+        materialized_asset_owner_entries, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
+        AssetRepositoryAuthorityState, ColdAlias, PersistentStore, RevisionResult, StagingResult,
+        StoreError, StoreResult,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -299,6 +300,28 @@ pub(crate) fn project_asset_owner_heads(
         .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
         .map(parse_owner_head_entry)
         .collect()
+}
+
+fn asset_repository_authority_extension(
+    manifest: &LosslessManifest,
+) -> Result<Option<AssetRepositoryAuthorityState>, LosslessError> {
+    let Some(value) = manifest.extensions.get("assetRepositoryAuthority") else {
+        return Ok(None);
+    };
+    let authority: AssetRepositoryAuthorityState =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            invalid_manifest(format!(
+                "invalid lossless asset repository authority extension: {error}"
+            ))
+        })?;
+    if serde_json::to_value(&authority).map_err(|error| invalid_manifest(error.to_string()))?
+        != *value
+    {
+        return Err(invalid_manifest(
+            "lossless asset repository authority extension has unsupported fields",
+        ));
+    }
+    Ok(Some(authority))
 }
 
 fn parse_owner_head_entry(entry: &StagedLosslessEntry) -> Result<AssetOwnerHead, LosslessError> {
@@ -799,6 +822,7 @@ fn restore_lossless_package_v1_inner(
     cancellation: &dyn CancellationProbe,
 ) -> Result<LosslessRestoreReport, LosslessError> {
     let incoming = read_lossless_package_v1(reader, job_staging_root, cas, cancellation)?;
+    let asset_repository_authority = asset_repository_authority_extension(&incoming.manifest)?;
     let lease = store
         .acquire_revision(expected_revision)
         .map_err(store_error)?
@@ -831,6 +855,11 @@ fn restore_lossless_package_v1_inner(
         store
             .replace_put_asset_owner_heads(&staging_id, &owner_heads)
             .map_err(store_error)?;
+        if let Some(authority) = &asset_repository_authority {
+            store
+                .replace_put_asset_repository_authority(&staging_id, authority)
+                .map_err(store_error)?;
+        }
         check_cancelled(cancellation)?;
         let staged_database = store
             .materialize_staging(&staging_id)
@@ -1232,9 +1261,13 @@ fn create_and_verify_pre_replacement_backup(
         .list_asset_owner_heads(Some(lease))
         .map_err(store_error)?;
     let cold = store.list_cold_aliases(Some(lease)).map_err(store_error)?;
+    let asset_repository_authority = store
+        .read_asset_repository_authority(Some(lease))
+        .map_err(store_error)?;
     if assets.revision != expected_revision
         || owner_heads.revision != expected_revision
         || cold.revision != expected_revision
+        || asset_repository_authority.revision != expected_revision
     {
         return Err(LosslessError::new(
             LosslessErrorCode::RevisionConflict,
@@ -1283,7 +1316,10 @@ fn create_and_verify_pre_replacement_backup(
             compatibility,
             references,
             Vec::new(),
-            serde_json::json!({ "sourceRevision": expected_revision }),
+            serde_json::json!({
+                "sourceRevision": expected_revision,
+                "assetRepositoryAuthority": asset_repository_authority.value,
+            }),
             cancellation,
         )?;
         output_guard.sync()?;
@@ -3082,6 +3118,14 @@ mod tests {
 
         assert_eq!(exported, verified.archive_bytes);
         assert_eq!(verified.manifest.extensions["sourceRevision"], 1);
+        assert_eq!(
+            verified.manifest.extensions["assetRepositoryAuthority"],
+            json!({
+                "format": "v2",
+                "migrationId": "lossless-test-migration",
+                "compatibilityHash": "ab".repeat(32),
+            })
+        );
         for kind in [
             PayloadKind::Database,
             PayloadKind::Asset,
@@ -3521,6 +3565,16 @@ mod tests {
                 assert_eq!(result.unwrap().revision, 2);
                 assert_eq!(reopened.revision().unwrap(), 2);
                 assert_eq!(reopened.materialize(None).unwrap()["username"], "New");
+                assert_eq!(
+                    reopened
+                        .read_asset_repository_authority(None)
+                        .unwrap()
+                        .value,
+                    AssetRepositoryAuthorityState::V2 {
+                        migration_id: "lossless-test-migration".to_owned(),
+                        compatibility_hash: "ab".repeat(32),
+                    }
+                );
                 let asset = reopened
                     .read_asset_alias("asset", "shared", None)
                     .unwrap()
@@ -4733,7 +4787,14 @@ mod tests {
                 .map(lossless_reference)
                 .collect(),
             vec![],
-            json!({ "fixtureUnknown": { "preserved": true } }),
+            json!({
+                "fixtureUnknown": { "preserved": true },
+                "assetRepositoryAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-migration",
+                    "compatibilityHash": "ab".repeat(32),
+                }
+            }),
             &NeverCancelled,
         )
         .unwrap();
@@ -4846,6 +4907,15 @@ mod tests {
                         index: 0,
                     }),
                 ],
+            )
+            .unwrap();
+        store
+            .replace_put_asset_repository_authority(
+                &staging,
+                &AssetRepositoryAuthorityState::V2 {
+                    migration_id: "lossless-test-migration".to_owned(),
+                    compatibility_hash: "ab".repeat(32),
+                },
             )
             .unwrap();
         store.replace_commit(&staging, Some(0)).unwrap();
