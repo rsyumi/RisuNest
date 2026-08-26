@@ -328,6 +328,41 @@ describe('ActiveConversationSession', () => {
         expect(() => staleCase.session.delete(stale)).toThrow(ConversationSessionStaleError)
     })
 
+    it('keeps a same-version locator valid after reading the maximum range', () => {
+        const messages = Array.from({ length: 4_096 }, (_value, index) =>
+            message(`message-${index}`, `message ${index}`),
+        )
+        const { conversation, session } = createSession(chat(messages))
+        const first = session.locate(0)
+
+        session.readRange(0, 4_096)
+        session.edit(first, message('message-0', 'edited message 0'))
+
+        expect(conversation.message[0].data).toBe('edited message 0')
+    })
+
+    it('reuses locator tokens across large repeated reads in one version', () => {
+        const messages = Array.from({ length: 4_096 }, (_value, index) =>
+            message(`message-${index}`, `message ${index}`),
+        )
+        const { session } = createSession(chat(messages))
+        const observedTokens = new Set<string>()
+        let firstReadTokens: string[] | null = null
+
+        for (let read = 0; read < 8; read++) {
+            const tokens = session.readRange(0, 4_096).locators.map(
+                (locator) => locator.locatorToken,
+            )
+            for (const token of tokens) observedTokens.add(token)
+            firstReadTokens ??= tokens
+            expect(tokens.every(
+                (token, index) => token === firstReadTokens[index],
+            )).toBe(true)
+        }
+
+        expect(observedTokens.size).toBe(4_096)
+    })
+
     it('publishes a successful transaction once and rolls back the whole draft after any failure', () => {
         const { conversation, onMutation, session } = createSession()
         const original = structuredClone(conversation.message)

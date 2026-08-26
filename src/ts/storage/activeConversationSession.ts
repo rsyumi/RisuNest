@@ -127,13 +127,14 @@ interface ConversationPositionIdentity {
 
 type ConversationTokenIdentity = MessageLocatorIdentity | ConversationPositionIdentity
 
-const MAX_ACTIVE_CONVERSATION_TOKENS = CONVERSATION_RANGE_MAX_LIMIT
 let nextConversationSessionToken = 0
 let nextConversationLocatorToken = 0
 
 class ConversationLocatorRegistry {
     readonly sessionToken: ConversationSessionToken
     private readonly identities = new Map<string, ConversationTokenIdentity>()
+    private readonly messageTokens = new Map<number, MessageLocatorToken>()
+    private readonly positionTokens = new Map<number, ConversationPositionToken>()
 
     constructor(sessionToken?: ConversationSessionToken) {
         this.sessionToken = sessionToken ?? createConversationSessionToken()
@@ -149,8 +150,23 @@ class ConversationLocatorRegistry {
         sessionVersion: number,
         message: Message,
     ): MessageLocatorToken {
+        const currentToken = this.messageTokens.get(absoluteIndex)
+        const currentIdentity = currentToken === undefined
+            ? undefined
+            : this.identities.get(currentToken)
+        if (
+            currentToken !== undefined &&
+            currentIdentity?.type === 'message' &&
+            currentIdentity.absoluteIndex === absoluteIndex &&
+            currentIdentity.sessionVersion === sessionVersion &&
+            currentIdentity.messages === messages &&
+            currentIdentity.message === message
+        ) return currentToken
+
+        if (currentToken !== undefined) this.identities.delete(currentToken)
         const token = createMessageLocatorToken()
-        this.set(token, {
+        this.messageTokens.set(absoluteIndex, token)
+        this.identities.set(token, {
             type: 'message',
             absoluteIndex,
             sessionVersion,
@@ -165,8 +181,24 @@ class ConversationLocatorRegistry {
         absoluteIndex: number,
         sessionVersion: number,
     ): ConversationPositionToken {
+        const currentToken = this.positionTokens.get(absoluteIndex)
+        const currentIdentity = currentToken === undefined
+            ? undefined
+            : this.identities.get(currentToken)
+        if (
+            currentToken !== undefined &&
+            currentIdentity?.type === 'position' &&
+            currentIdentity.absoluteIndex === absoluteIndex &&
+            currentIdentity.sessionVersion === sessionVersion &&
+            currentIdentity.messages === messages &&
+            currentIdentity.before === messages[absoluteIndex - 1] &&
+            currentIdentity.after === messages[absoluteIndex]
+        ) return currentToken
+
+        if (currentToken !== undefined) this.identities.delete(currentToken)
         const token = createConversationPositionToken()
-        this.set(token, {
+        this.positionTokens.set(absoluteIndex, token)
+        this.identities.set(token, {
             type: 'position',
             absoluteIndex,
             sessionVersion,
@@ -203,14 +235,8 @@ class ConversationLocatorRegistry {
 
     clear(): void {
         this.identities.clear()
-    }
-
-    private set(token: string, identity: ConversationTokenIdentity): void {
-        if (this.identities.size >= MAX_ACTIVE_CONVERSATION_TOKENS) {
-            const oldestToken = this.identities.keys().next().value
-            if (oldestToken !== undefined) this.identities.delete(oldestToken)
-        }
-        this.identities.set(token, identity)
+        this.messageTokens.clear()
+        this.positionTokens.clear()
     }
 }
 
