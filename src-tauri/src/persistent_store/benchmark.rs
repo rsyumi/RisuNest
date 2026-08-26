@@ -139,10 +139,23 @@ struct BenchmarkResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PostLeaseMutationSample {
+    commit_us: u64,
+    wal_before_bytes: u64,
+    wal_after_bytes: u64,
+    wal_growth_bytes: u64,
+    active_lease_count: usize,
+    oldest_lease_age_us: u64,
+    release_us: u64,
+    wal_after_release_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PostLeaseCommitSample {
-    plugin_us: u64,
-    root_us: u64,
-    message_us: u64,
+    plugin: PostLeaseMutationSample,
+    root: PostLeaseMutationSample,
+    message: PostLeaseMutationSample,
 }
 
 #[derive(Serialize)]
@@ -794,12 +807,26 @@ fn run_one_gib_diagnostic() -> OneGibDiagnostic {
     }
 }
 
-fn post_lease_commit(store: &mut PersistentStore, input: WorkingSetCommit, label: &str) -> u64 {
+fn wal_bytes(store: &PersistentStore) -> u64 {
+    let path = std::path::PathBuf::from(format!("{}-wal", store.database_path.display()));
+    match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("read WAL size at {}: {error}", path.display()),
+    }
+}
+
+fn post_lease_commit(
+    store: &mut PersistentStore,
+    input: WorkingSetCommit,
+    label: &str,
+) -> PostLeaseMutationSample {
     let revision = store.revision().expect("read post-lease revision");
     assert_eq!(input.expected_revision, revision);
     let lease = store
         .acquire_revision(revision)
         .expect("acquire post-lease revision");
+    let wal_before_bytes = wal_bytes(store);
     let started = Instant::now();
     assert_eq!(
         store
@@ -808,11 +835,23 @@ fn post_lease_commit(store: &mut PersistentStore, input: WorkingSetCommit, label
             .revision,
         revision + 1
     );
-    let elapsed = elapsed_us(started);
+    let commit_us = elapsed_us(started);
+    let wal_after_bytes = wal_bytes(store);
+    let diagnostics = store.lease_diagnostics();
+    let release_started = Instant::now();
     store
         .release_revision(&lease.lease)
         .expect("release post-lease revision");
-    elapsed
+    PostLeaseMutationSample {
+        commit_us,
+        wal_before_bytes,
+        wal_after_bytes,
+        wal_growth_bytes: wal_after_bytes.saturating_sub(wal_before_bytes),
+        active_lease_count: diagnostics.active_count,
+        oldest_lease_age_us: diagnostics.oldest_age_us,
+        release_us: elapsed_us(release_started),
+        wal_after_release_bytes: wal_bytes(store),
+    }
 }
 
 fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSample> {
@@ -845,7 +884,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
     (0..POST_LEASE_RUNS)
         .map(|run| {
             let revision = store.revision().unwrap();
-            let plugin_us = post_lease_commit(
+            let plugin = post_lease_commit(
                 &mut store,
                 WorkingSetCommit {
                     expected_revision: revision,
@@ -869,7 +908,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
             let mut root = store.read_root(None).unwrap().value;
             root["postLeaseBenchmarkRun"] = json!(run);
             let revision = store.revision().unwrap();
-            let root_us = post_lease_commit(
+            let root = post_lease_commit(
                 &mut store,
                 WorkingSetCommit {
                     expected_revision: revision,
@@ -888,7 +927,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
             );
 
             let revision = store.revision().unwrap();
-            let message_us = post_lease_commit(
+            let message = post_lease_commit(
                 &mut store,
                 WorkingSetCommit {
                     expected_revision: revision,
@@ -915,9 +954,9 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
             );
 
             PostLeaseCommitSample {
-                plugin_us,
-                root_us,
-                message_us,
+                plugin,
+                root,
+                message,
             }
         })
         .collect()
@@ -952,7 +991,7 @@ fn first_post_lease_commit_measurements() {
     let mut samples = run_post_lease_commit_benchmark(&database);
     samples.remove(0);
     let result = PostLeaseCommitBenchmarkResult {
-        schema_version: 1,
+        schema_version: 2,
         benchmark: "first-post-lease-commit",
         source_revision: std::env::var("RISUNEST_POST_LEASE_BENCH_REVISION").ok(),
         discarded_warmup_runs: 1,
@@ -968,19 +1007,19 @@ fn first_post_lease_commit_measurements() {
             plugin_us: nearest_rank(
                 &samples
                     .iter()
-                    .map(|sample| sample.plugin_us)
+                    .map(|sample| sample.plugin.commit_us)
                     .collect::<Vec<_>>(),
             ),
             root_us: nearest_rank(
                 &samples
                     .iter()
-                    .map(|sample| sample.root_us)
+                    .map(|sample| sample.root.commit_us)
                     .collect::<Vec<_>>(),
             ),
             message_us: nearest_rank(
                 &samples
                     .iter()
-                    .map(|sample| sample.message_us)
+                    .map(|sample| sample.message.commit_us)
                     .collect::<Vec<_>>(),
             ),
         },
