@@ -1,8 +1,7 @@
-import type { Message } from '../storage/database.svelte'
+import type { Chat, Message } from '../storage/database.svelte'
 import type { ConversationHistoryOperation } from '../storage/conversationHistoryOperation'
 
 export const PROMPT_HISTORY_PAGE_SIZE = 128
-export const PROMPT_HISTORY_INTERACTION_PAGE_SIZE = 1
 
 export interface PromptHistorySelection {
     startIndex: number
@@ -18,13 +17,35 @@ export interface PromptHistoryEntry {
     message: Message
 }
 
-export function ensurePromptHistoryMessageIds(
+export function readLivePromptHistoryMessage(
     messages: Message[],
-    createId: () => string,
-): void {
-    for (const message of messages) {
-        message.chatId ??= createId()
+    entry: PromptHistoryEntry,
+): Message {
+    const message = messages[entry.absoluteIndex]
+    if (!message) {
+        throw new RangeError(`Prompt history message ${entry.absoluteIndex} is missing`)
     }
+    return message
+}
+
+export function ensurePromptHistoryEntryId(
+    messages: Message[],
+    entry: PromptHistoryEntry,
+    createId: () => string,
+): string {
+    const liveMessage = readLivePromptHistoryMessage(messages, entry)
+    const id = liveMessage.chatId || createId()
+    liveMessage.chatId = id
+    entry.message.chatId = id
+    return id
+}
+
+export function adoptTriggeredChat(target: Chat, replacement: Chat): Chat {
+    for (const key of Object.keys(target) as (keyof Chat)[]) {
+        if (!(key in replacement)) delete target[key]
+    }
+    Object.assign(target, replacement)
+    return target
 }
 
 export function selectPromptHistory(
@@ -74,7 +95,7 @@ export function selectPromptHistory(
 export function* iteratePromptHistory(
     history: ConversationHistoryOperation,
     selection: PromptHistorySelection,
-    pageSize = PROMPT_HISTORY_INTERACTION_PAGE_SIZE,
+    pageSize = PROMPT_HISTORY_PAGE_SIZE,
 ): Generator<PromptHistoryEntry> {
     let relativeIndex = 0
     for (let startIndex = selection.startIndex; startIndex < selection.endIndex;) {

@@ -4,8 +4,10 @@ import type { Chat, Message } from '../storage/database.svelte'
 import { ActiveConversationSession, ConversationSessionStaleError } from '../storage/activeConversationSession'
 import { beginPinnedConversationHistoryOperation } from '../storage/conversationHistoryOperation'
 import {
-    ensurePromptHistoryMessageIds,
+    adoptTriggeredChat,
+    ensurePromptHistoryEntryId,
     iteratePromptHistory,
+    readLivePromptHistoryMessage,
     selectPromptHistory,
 } from './promptHistory'
 
@@ -108,28 +110,94 @@ describe('prompt history paging', () => {
         operation.dispose()
     })
 
-    it('reads the next message after history-sensitive processing can update it', () => {
-        const conversationMessages = [message('first'), message('before-update')]
-        const session = sessionFor(conversationMessages)
+    it('binds each paged entry to the latest live message before processing it', () => {
+        const messages = [message('first'), message('before-update')]
+        const session = sessionFor(messages)
         const operation = beginPinnedConversationHistoryOperation(session)
         const selection = selectPromptHistory(operation)
         const iterator = iteratePromptHistory(operation, selection)
 
-        expect(iterator.next().value?.message.data).toBe('first')
-        conversationMessages[1].data = 'after-update'
+        const firstEntry = iterator.next().value!
+        ensurePromptHistoryEntryId(messages, firstEntry, vi.fn())
+        expect(readLivePromptHistoryMessage(messages, firstEntry).data).toBe('first')
+        messages[1].data = 'after-update'
+        const secondEntry = iterator.next().value!
+        ensurePromptHistoryEntryId(messages, secondEntry, vi.fn())
 
-        expect(iterator.next().value?.message.data).toBe('after-update')
+        expect(readLivePromptHistoryMessage(messages, secondEntry).data).toBe('after-update')
         operation.dispose()
     })
 
-    it('preserves existing IDs and assigns only missing prompt-history IDs', () => {
+    it('preserves existing IDs and assigns IDs only to selected active prompt messages', () => {
         const messages = [
+            { role: 'user', data: 'before-reset' },
+            { role: 'char', data: 'reset', disabled: 'allBefore' },
+            { role: 'user', data: 'disabled', disabled: true },
+            { role: 'char', data: 'empty-id', chatId: '' },
             { role: 'user', data: 'existing', chatId: 'existing-id' },
-            { role: 'char', data: 'missing' },
         ] satisfies Message[]
+        const session = sessionFor(messages)
+        const operation = beginPinnedConversationHistoryOperation(session)
+        const selection = selectPromptHistory(operation)
+        const generated = ['generated-empty']
 
-        ensurePromptHistoryMessageIds(messages, () => 'generated-id')
+        for (const entry of iteratePromptHistory(operation, selection)) {
+            ensurePromptHistoryEntryId(messages, entry, () => generated.shift()!)
+        }
 
-        expect(messages.map((value) => value.chatId)).toEqual(['existing-id', 'generated-id'])
+        expect(messages.map((value) => value.chatId)).toEqual([
+            undefined,
+            undefined,
+            undefined,
+            'generated-empty',
+            'existing-id',
+        ])
+        expect(generated).toEqual([])
+        operation.dispose()
+
+        const repeatedOperation = beginPinnedConversationHistoryOperation(session)
+        const repeatedSelection = selectPromptHistory(repeatedOperation)
+        const generateAgain = vi.fn(() => 'different-id')
+        for (const entry of iteratePromptHistory(repeatedOperation, repeatedSelection)) {
+            ensurePromptHistoryEntryId(messages, entry, generateAgain)
+        }
+
+        expect(generateAgain).not.toHaveBeenCalled()
+        expect(messages[3].chatId).toBe('generated-empty')
+        repeatedOperation.dispose()
+    })
+
+    it('adopts trigger results without replacing the active Chat identity', () => {
+        const target: Chat = {
+            id: 'conversation-a',
+            name: 'Before',
+            note: 'remove-me',
+            localLore: [],
+            message: [message('before')],
+            folderId: 'removed-by-trigger',
+        }
+        const replacement: Chat = {
+            id: 'conversation-a',
+            name: 'After',
+            note: '',
+            localLore: [],
+            message: [message('triggered')],
+            scriptstate: { triggered: true },
+        }
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation: target,
+            storeRevision: 12,
+        })
+
+        const adopted = adoptTriggeredChat(target, replacement)
+
+        expect(adopted).toBe(target)
+        expect(adopted).toEqual(replacement)
+        expect(session.matchesConversation('character-a', adopted)).toBe(true)
+        const operation = beginPinnedConversationHistoryOperation(session)
+        expect(operation.readLatest(1).messages[0].data).toBe('triggered')
+        operation.dispose()
     })
 })
