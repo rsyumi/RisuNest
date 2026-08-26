@@ -5,6 +5,8 @@ pub mod import_export_jobs;
 mod local_backup;
 mod native_file_jobs;
 mod native_media;
+#[cfg(desktop)]
+mod peer_sync;
 mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
