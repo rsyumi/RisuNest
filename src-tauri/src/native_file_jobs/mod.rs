@@ -1,10 +1,16 @@
 pub mod charx;
 
+use crate::import_export_jobs::{
+    classify_content, parse_json_card, ContentKind, FormatError, FormatErrorKind, ImportLimits,
+    JobStaging, ParsedJsonCard,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -105,6 +111,10 @@ pub(crate) enum NativeFileJobStartRequest {
         #[serde(default)]
         omit_account: bool,
     },
+    PrepareContentImport {
+        source: JobSource,
+        display_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -112,6 +122,28 @@ pub(crate) enum NativeFileJobStartRequest {
 pub(crate) struct NativeFileJobStarted {
     pub(crate) job_id: String,
     pub(crate) warning_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PreparedContentFormat {
+    JsonCard,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreparedContentAsset {
+    pub(crate) reference_key: String,
+    pub(crate) token: String,
+    pub(crate) byte_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PreparedContent {
+    pub(crate) format: PreparedContentFormat,
+    pub(crate) metadata: Value,
+    pub(crate) assets: Vec<PreparedContentAsset>,
 }
 
 #[derive(Debug)]
@@ -752,8 +784,120 @@ impl NativeFileJobState {
                     app,
                 }
             }
+            NativeFileJobStartRequest::PrepareContentImport { .. } => {
+                return Err(NativeJobError::new(
+                    "capability-unavailable",
+                    "native content import is not active",
+                ));
+            }
         };
         self.spawn(task, true)
+    }
+
+    #[allow(dead_code)]
+    fn start_content(
+        &self,
+        request: NativeFileJobStartRequest,
+    ) -> Result<NativeFileJobStarted, NativeJobError> {
+        if let Some(error) = &self.capability_error {
+            return Err(error.clone());
+        }
+        let NativeFileJobStartRequest::PrepareContentImport {
+            source,
+            display_name,
+        } = request
+        else {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "content preparation requires a content import request",
+            ));
+        };
+        if !is_bounded_content_display_name(&display_name) {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "content import display name is invalid",
+            ));
+        }
+        let opened_source = match &source {
+            JobSource::DesktopPath { .. } => open_job_source(&self.root, &source)?,
+            JobSource::AndroidSpool { .. } => {
+                return Err(NativeJobError::new(
+                    "invalid-input",
+                    "content preparation currently supports desktop sources only",
+                ));
+            }
+        };
+        let worker_permit =
+            WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
+        let warning_codes = self
+            .startup_warnings
+            .iter()
+            .map(|warning| warning.code.clone())
+            .collect::<Vec<_>>();
+        let job = self
+            .registry
+            .create_internal(
+                JobKind::PrepareContentImport,
+                None,
+                warning_codes.clone(),
+                false,
+            )
+            .map_err(|error| NativeJobError::new("store-error", error))?;
+        let job_id = job.id();
+        let owned_directory = match create_owned_directory(&self.root.join("jobs"), &job_id) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = job.finish_failure("capability-unavailable", &error);
+                let _ = self.registry.forget(&job_id);
+                return Err(NativeJobError::new("capability-unavailable", error));
+            }
+        };
+        let root = self.root.clone();
+        let registry = Arc::clone(&self.registry);
+        std::thread::spawn(move || {
+            let _worker_permit = worker_permit;
+            let outcome =
+                prepare_json_content(opened_source, &display_name, &owned_directory, &job)
+                    .and_then(|prepared| job.wait_for_content_abort(prepared));
+            let cleanup =
+                cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id());
+            match (outcome, cleanup) {
+                (Err(error), Ok(())) if error.code == "cancelled" => {
+                    let _ = job.finish_cancelled();
+                }
+                (Err(error), Ok(())) => {
+                    let _ = job.finish_failure(&error.code, &error.message);
+                }
+                (Err(error), Err(cleanup)) => {
+                    let _ = job.finish_failure(
+                        "cleanup-failed",
+                        &format!("{}; cleanup failed: {cleanup}", error.message),
+                    );
+                }
+                (Ok(()), Ok(())) => {
+                    let _ = job.finish_failure(
+                        "store-error",
+                        "content preparation ended without an abort",
+                    );
+                }
+                (Ok(()), Err(cleanup)) => {
+                    let _ = job.finish_failure("cleanup-failed", &cleanup);
+                }
+            }
+            let _ = registry.prune();
+        });
+        Ok(NativeFileJobStarted {
+            job_id,
+            warning_codes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_content_for_test(
+        &self,
+        request: NativeFileJobStartRequest,
+    ) -> Result<NativeFileJobStarted, NativeJobError> {
+        self.start_content(request)
     }
 
     #[cfg(test)]
@@ -971,6 +1115,118 @@ impl NativeFileJobState {
             .forget(job_id)
             .map_err(|error| NativeJobError::new("store-error", error))
     }
+}
+
+fn prepare_json_content(
+    mut source: OpenedJobSource,
+    display_name: &str,
+    owned_directory: &Path,
+    job: &JobControl,
+) -> Result<PreparedContent, NativeJobError> {
+    if job.is_cancel_requested() {
+        return Err(content_cancelled());
+    }
+    job.start(JobPhase::ReadingSource).map_err(|error| {
+        if job.is_cancel_requested() {
+            content_cancelled()
+        } else {
+            NativeJobError::new("store-error", error)
+        }
+    })?;
+    job.set_progress(JobProgress {
+        completed_bytes: 0,
+        total_bytes: Some(source.total_bytes),
+        completed_items: 0,
+        total_items: None,
+    })
+    .map_err(|error| NativeJobError::new("store-error", error))?;
+    let limits = content_import_limits();
+    let kind = classify_content(display_name, &mut source.file, &limits, &|| {
+        job.is_cancel_requested()
+    })
+    .map_err(native_format_error)?;
+    if kind != ContentKind::JsonCard {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "content preparation currently accepts JSON cards only",
+        ));
+    }
+    source
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
+    let staging = JobStaging::open(owned_directory).map_err(native_format_error)?;
+    let parsed = parse_json_card(&mut source.file, &staging, &limits, &|| {
+        job.is_cancel_requested()
+    })
+    .map_err(native_format_error)?;
+    let prepared = prepared_json_content(parsed)?;
+    job.set_progress(JobProgress {
+        completed_bytes: source.total_bytes,
+        total_bytes: Some(source.total_bytes),
+        completed_items: prepared.assets.len() as u64,
+        total_items: Some(prepared.assets.len() as u64),
+    })
+    .map_err(|error| NativeJobError::new("store-error", error))?;
+    Ok(prepared)
+}
+
+fn is_bounded_content_display_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 180
+        && !name.chars().any(|character| character.is_control())
+}
+
+fn content_import_limits() -> ImportLimits {
+    ImportLimits {
+        max_metadata_bytes: 8 * 1024 * 1024,
+        max_payload_bytes: 64 * 1024 * 1024,
+        max_aggregate_payload_bytes: 256 * 1024 * 1024,
+        max_payload_count: 256,
+        max_container_entries: 4096,
+        max_container_directory_bytes: 32 * 1024 * 1024,
+        charx_probe_metadata_bytes: 8 * 1024 * 1024,
+    }
+}
+
+fn prepared_json_content(parsed: ParsedJsonCard) -> Result<PreparedContent, NativeJobError> {
+    let assets = parsed
+        .payloads
+        .into_iter()
+        .map(|payload| {
+            let token = payload
+                .payload
+                .staged_name
+                .strip_suffix(".payload")
+                .filter(|token| Uuid::parse_str(token).is_ok())
+                .ok_or_else(|| {
+                    NativeJobError::new("store-error", "staged payload token is invalid")
+                })?;
+            Ok(PreparedContentAsset {
+                reference_key: payload.reference_key,
+                token: token.to_owned(),
+                byte_size: payload.payload.byte_size,
+            })
+        })
+        .collect::<Result<Vec<_>, NativeJobError>>()?;
+    Ok(PreparedContent {
+        format: PreparedContentFormat::JsonCard,
+        metadata: parsed.metadata,
+        assets,
+    })
+}
+
+fn native_format_error(error: FormatError) -> NativeJobError {
+    let code = match error.kind {
+        FormatErrorKind::Cancelled => "cancelled",
+        FormatErrorKind::InvalidFormat | FormatErrorKind::LimitExceeded => "invalid-input",
+        FormatErrorKind::Io => "invalid-source",
+    };
+    NativeJobError::new(code, error.message)
+}
+
+fn content_cancelled() -> NativeJobError {
+    NativeJobError::new("cancelled", "content preparation was cancelled")
 }
 
 enum RestoreJobSink {
@@ -1232,6 +1488,7 @@ pub(crate) fn native_file_job_forget(
 pub(crate) enum JobKind {
     RestoreBlockRisuSave,
     ExportBlockRisuSave,
+    PrepareContentImport,
 }
 
 #[allow(dead_code)]
@@ -1252,6 +1509,7 @@ pub(crate) enum JobState {
 pub(crate) enum JobPhase {
     Queued,
     ReadingSource,
+    AwaitingContentMapping,
     StagingDatabase,
     AwaitingActivation,
     ActivatingDatabase,
@@ -1285,6 +1543,8 @@ pub(crate) struct JobStatus {
     pub(crate) result: Option<JobResultSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<JobFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prepared_content: Option<PreparedContent>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1392,6 +1652,7 @@ impl JobRegistry {
                 warning_codes,
                 result: None,
                 error: None,
+                prepared_content: None,
             }),
         });
         self.jobs
@@ -1618,6 +1879,56 @@ impl JobControl {
         }
     }
 
+    fn wait_for_content_abort(
+        &self,
+        prepared_content: PreparedContent,
+    ) -> Result<(), NativeJobError> {
+        {
+            let mut status = self.status.lock().map_err(|error| {
+                NativeJobError::new(
+                    "store-error",
+                    format!("native job status mutex poisoned: {error}"),
+                )
+            })?;
+            if self.is_cancel_requested() {
+                return Err(content_cancelled());
+            }
+            if status.kind != JobKind::PrepareContentImport
+                || status.state != JobState::Running
+                || status.phase != JobPhase::ReadingSource
+            {
+                return Err(NativeJobError::new(
+                    "store-error",
+                    "content preparation cannot wait from its current state",
+                ));
+            }
+            status.state = JobState::WaitingForInput;
+            status.phase = JobPhase::AwaitingContentMapping;
+            status.prepared_content = Some(prepared_content);
+        }
+
+        let mut wait = self.restore_finalized.lock().map_err(|error| {
+            NativeJobError::new(
+                "store-error",
+                format!("native content wait mutex poisoned: {error}"),
+            )
+        })?;
+        loop {
+            if self.is_cancel_requested() {
+                return Err(content_cancelled());
+            }
+            wait = self
+                .restore_finalization_changed
+                .wait(wait)
+                .map_err(|error| {
+                    NativeJobError::new(
+                        "store-error",
+                        format!("native content wait mutex poisoned: {error}"),
+                    )
+                })?;
+        }
+    }
+
     pub(crate) fn start(&self, phase: JobPhase) -> Result<(), String> {
         let mut status = self
             .status
@@ -1626,6 +1937,7 @@ impl JobControl {
         let expected = match status.kind {
             JobKind::RestoreBlockRisuSave => JobPhase::ReadingSource,
             JobKind::ExportBlockRisuSave => JobPhase::WritingExport,
+            JobKind::PrepareContentImport => JobPhase::ReadingSource,
         };
         if status.state != JobState::Queued || phase != expected {
             return Err("native job can only start from queued".to_owned());
@@ -1691,6 +2003,7 @@ impl JobControl {
         }
         status.state = JobState::Cancelled;
         status.phase = JobPhase::Complete;
+        status.prepared_content = None;
         drop(status);
         self.mark_terminal()?;
         Ok(())
@@ -1717,6 +2030,7 @@ impl JobControl {
         status.phase = JobPhase::Complete;
         status.result = Some(result);
         status.error = None;
+        status.prepared_content = None;
         drop(status);
         self.mark_terminal()?;
         Ok(())
@@ -1740,6 +2054,7 @@ impl JobControl {
             code: code.to_owned(),
             message: bounded_message(message),
         });
+        status.prepared_content = None;
         drop(status);
         self.mark_terminal()?;
         Ok(())
@@ -1811,7 +2126,7 @@ impl JobPhase {
         match self {
             Self::Queued => 0,
             Self::ReadingSource | Self::WritingExport => 1,
-            Self::StagingDatabase | Self::PublishingDestination => 2,
+            Self::AwaitingContentMapping | Self::StagingDatabase | Self::PublishingDestination => 2,
             Self::AwaitingActivation | Self::FinalizingExport => 3,
             Self::ActivatingDatabase => 4,
             Self::Complete => 5,
@@ -2205,6 +2520,82 @@ mod tests {
             CancelOutcome::Requested
         );
         assert!(waited.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn content_prepare_exposes_only_bounded_metadata_tokens_until_abort() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("card.json");
+        fs::write(
+            &source,
+            br#"{"spec":"chara_card_v3","data":{"name":"Prepared","assets":[{"type":"icon","uri":"data:image/png;base64,AQIDBA==","name":"main","ext":"png"}]}}"#,
+        )
+        .unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = state
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::DesktopPath {
+                    path: source.to_string_lossy().into_owned(),
+                },
+                display_name: "card.json".to_owned(),
+            })
+            .expect("start content preparation");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let prepared = loop {
+            let status = state.status(&started.job_id).unwrap();
+            if status.state == JobState::WaitingForInput {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "content preparation timed out");
+            thread::yield_now();
+        };
+        assert_eq!(prepared.kind, JobKind::PrepareContentImport);
+        assert_eq!(prepared.phase, JobPhase::AwaitingContentMapping);
+        let content = prepared
+            .prepared_content
+            .as_ref()
+            .expect("prepared content metadata");
+        assert_eq!(content.format, PreparedContentFormat::JsonCard);
+        assert_eq!(content.assets.len(), 1);
+        assert_eq!(content.assets[0].byte_size, 4);
+        assert_eq!(content.assets[0].reference_key, "native-data-0");
+        assert!(content.assets[0].token.parse::<Uuid>().is_ok());
+        assert_eq!(
+            content
+                .metadata
+                .pointer("/data/name")
+                .and_then(Value::as_str),
+            Some("Prepared")
+        );
+        let encoded = serde_json::to_string(&prepared).unwrap();
+        assert!(!encoded.contains("stagedPath"));
+        assert!(!encoded.contains(".payload"));
+        assert!(directory
+            .path()
+            .join("native-file-jobs/jobs")
+            .join(&started.job_id)
+            .is_dir());
+
+        assert_eq!(
+            state.cancel(&started.job_id).unwrap(),
+            CancelOutcome::Requested
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = state.status(&started.job_id).unwrap();
+            if status.state == JobState::Cancelled {
+                assert!(status.prepared_content.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline, "content abort timed out");
+            thread::yield_now();
+        }
+        assert!(!directory
+            .path()
+            .join("native-file-jobs/jobs")
+            .join(&started.job_id)
+            .exists());
     }
 
     #[test]
