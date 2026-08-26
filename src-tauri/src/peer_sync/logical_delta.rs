@@ -66,6 +66,8 @@ pub struct LogicalOwnerHead {
     pub present: bool,
     pub manifest_hash: Option<String>,
     pub entry_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub property_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -133,10 +135,28 @@ impl LogicalOwnerHead {
             present: false,
             manifest_hash: None,
             entry_count: 0,
+            property_index: None,
         }
     }
 
     pub fn present(
+        owner: LogicalOwnerLocator,
+        manifest_hash: String,
+        entry_count: u64,
+        property_index: u64,
+    ) -> Result<Self, LogicalDeltaError> {
+        let head = Self {
+            owner,
+            present: true,
+            manifest_hash: Some(manifest_hash),
+            entry_count,
+            property_index: Some(property_index),
+        };
+        head.validate()?;
+        Ok(head)
+    }
+
+    pub(crate) fn unpositioned_present(
         owner: LogicalOwnerLocator,
         manifest_hash: String,
         entry_count: u64,
@@ -146,12 +166,27 @@ impl LogicalOwnerHead {
             present: true,
             manifest_hash: Some(manifest_hash),
             entry_count,
+            property_index: None,
         };
-        head.validate()?;
+        head.validate_identity()?;
         Ok(head)
     }
 
     fn validate(&self) -> Result<(), LogicalDeltaError> {
+        self.validate_identity()?;
+        if self.present {
+            validate_safe_integer(
+                self.property_index
+                    .ok_or_else(|| invalid("present owner head requires propertyIndex"))?,
+                "owner property index",
+            )?;
+        } else if self.property_index.is_some() {
+            return Err(invalid("absent owner head cannot contain propertyIndex"));
+        }
+        Ok(())
+    }
+
+    fn validate_identity(&self) -> Result<(), LogicalDeltaError> {
         match &self.owner {
             LogicalOwnerLocator::CharacterAdditional { character_id } => {
                 validate_component(character_id, "owner characterId", false)?;
@@ -1018,6 +1053,14 @@ fn validate_component(
     Ok(())
 }
 
+fn validate_cold_logical_key(value: &str) -> Result<(), LogicalDeltaError> {
+    validate_component(value, "logicalKey", false)?;
+    if value.contains('\0') {
+        return Err(invalid("logical cold record key cannot contain NUL"));
+    }
+    Ok(())
+}
+
 fn locator_parts(
     locator: &LogicalRecordLocator,
 ) -> Result<(&'static str, Vec<&str>), LogicalDeltaError> {
@@ -1055,7 +1098,7 @@ fn locator_parts(
             ("inlay", vec![logical_key.as_str()])
         }
         LogicalRecordLocator::Cold { logical_key } => {
-            validate_component(logical_key, "logicalKey", true)?;
+            validate_cold_logical_key(logical_key)?;
             ("cold", vec![logical_key.as_str()])
         }
     };
@@ -1201,6 +1244,13 @@ mod tests {
             character_id: String::new(),
         })
         .is_err());
+        for logical_key in [String::new(), "cold\0key".to_owned()] {
+            assert!(
+                encode_logical_record_key(&LogicalRecordLocator::Cold { logical_key }).is_err()
+            );
+        }
+        assert!(decode_logical_record_key("r1:cold:WyIiXQ").is_err());
+        assert!(decode_logical_record_key("r1:cold:WyJjb2xkXHUwMDAwa2V5Il0").is_err());
     }
 
     #[test]
@@ -1215,6 +1265,7 @@ mod tests {
                     LogicalOwnerLocator::RootModule { index: 0 },
                     manifest_hash.clone(),
                     2,
+                    1,
                 )
                 .unwrap()],
             },
@@ -1289,6 +1340,35 @@ mod tests {
             }
             assert_eq!(encoded.size, encoded.bytes.len() as u64);
             assert_eq!(decode_logical_record(&encoded.bytes).unwrap(), record);
+        }
+    }
+
+    #[test]
+    fn present_owner_heads_require_a_canonical_property_position() {
+        let manifest_hash = "2".repeat(64);
+        let canonical = format!(
+            "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"index\":0}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0,\"propertyIndex\":0}}]}}"
+        );
+        let decoded = decode_logical_record(canonical.as_bytes())
+            .expect("decode present owner head with a property position");
+        assert_eq!(
+            encode_logical_record(&decoded).unwrap().bytes,
+            canonical.as_bytes()
+        );
+
+        for invalid in [
+            format!(
+                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"index\":0}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0}}]}}"
+            ),
+            format!(
+                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"index\":0}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0,\"propertyIndex\":null}}]}}"
+            ),
+            format!(
+                "{{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{{}},\"ownerHeads\":[{{\"owner\":{{\"kind\":\"root-module-assets\",\"index\":0}},\"present\":true,\"manifestHash\":\"{manifest_hash}\",\"entryCount\":0,\"propertyIndex\":9007199254740992}}]}}"
+            ),
+            "{\"schema\":\"risunest.logical-record/v1\",\"kind\":\"root\",\"value\":{},\"ownerHeads\":[{\"owner\":{\"kind\":\"root-module-assets\",\"index\":0},\"present\":false,\"manifestHash\":null,\"entryCount\":0,\"propertyIndex\":0}]}".to_owned(),
+        ] {
+            assert!(decode_logical_record(invalid.as_bytes()).is_err());
         }
     }
 

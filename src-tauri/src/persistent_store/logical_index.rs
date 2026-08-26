@@ -1994,10 +1994,10 @@ fn project_root(
         [pds_generation],
         |row| row.get(0),
     )?;
-    let owner_heads =
+    let mut owner_heads =
         validate_owner_heads(cas, load_owner_heads(transaction, pds_generation, None)?)?;
     let mut value: Value = serde_json::from_str(&raw)?;
-    strip_root_owner_properties(&mut value, &owner_heads)?;
+    strip_root_owner_properties(&mut value, &mut owner_heads)?;
     let dependencies = owner_dependencies(&owner_heads)?;
     insert_live_record(
         transaction,
@@ -2096,12 +2096,12 @@ fn project_characters(
         let character_id: String = row.get(0)?;
         let configured_index = nonnegative_u64(row.get(1)?, "character configured index")?;
         let raw: String = row.get(2)?;
-        let owner_heads = validate_owner_heads(
+        let mut owner_heads = validate_owner_heads(
             cas,
             load_owner_heads(transaction, pds_generation, Some(&character_id))?,
         )?;
         let mut detail: Value = serde_json::from_str(&raw)?;
-        strip_character_owner_property(&mut detail, &character_id, &owner_heads)?;
+        strip_character_owner_property(&mut detail, &character_id, &mut owner_heads)?;
         let dependencies = owner_dependencies(&owner_heads)?;
         insert_live_record(
             transaction,
@@ -2402,7 +2402,7 @@ fn load_owner_heads(
             let hash = manifest_hash.ok_or_else(|| StoreError::Validation {
                 message: "present owner head has no manifest hash".to_owned(),
             })?;
-            LogicalOwnerHead::present(owner, hash, entry_count).map_err(codec_error)?
+            LogicalOwnerHead::unpositioned_present(owner, hash, entry_count).map_err(codec_error)?
         } else {
             if manifest_hash.is_some() || entry_count != 0 {
                 return validation("absent owner head contains manifest data");
@@ -2493,29 +2493,41 @@ fn owner_dependencies(heads: &[ValidatedOwnerHead]) -> StoreResult<Vec<LogicalMa
 fn strip_owner_property(
     parent: &mut serde_json::Map<String, Value>,
     property: &str,
-    head: &ValidatedOwnerHead,
+    head: &mut ValidatedOwnerHead,
 ) -> StoreResult<()> {
-    let present = parent.contains_key(property);
-    if present != head.head.present {
+    let property_index = parent.keys().position(|key| key == property);
+    if property_index.is_some() != head.head.present {
         return validation("owner head property presence does not match its parent record");
     }
     if let Some(expected) = &head.tuples {
         if parent.get(property) != Some(&Value::Array(expected.clone())) {
             return validation("owner manifest tuples do not match their parent record");
         }
-        parent.remove(property);
+        head.head.property_index = Some(
+            u64::try_from(property_index.expect("present owner property has an index")).map_err(
+                |_| StoreError::Validation {
+                    message: "owner property index exceeds the wire range".to_owned(),
+                },
+            )?,
+        );
+        parent.shift_remove(property);
+    } else {
+        head.head.property_index = None;
     }
     Ok(())
 }
 
-fn strip_root_owner_properties(value: &mut Value, heads: &[ValidatedOwnerHead]) -> StoreResult<()> {
+fn strip_root_owner_properties(
+    value: &mut Value,
+    heads: &mut [ValidatedOwnerHead],
+) -> StoreResult<()> {
     let root = value
         .as_object_mut()
         .ok_or_else(|| StoreError::Validation {
             message: "logical root projection requires an object".to_owned(),
         })?;
     let mut by_identity = BTreeMap::new();
-    for head in heads {
+    for (head_index, head) in heads.iter().enumerate() {
         let identity = match &head.head.owner {
             LogicalOwnerLocator::RootModule { index } => format!("module:{index}"),
             LogicalOwnerLocator::PersonaEmbeddedModule { index } => format!("persona:{index}"),
@@ -2523,7 +2535,7 @@ fn strip_root_owner_properties(value: &mut Value, heads: &[ValidatedOwnerHead]) 
                 return validation("root logical record contains a character owner head")
             }
         };
-        if by_identity.insert(identity, head).is_some() {
+        if by_identity.insert(identity, head_index).is_some() {
             return validation("root logical record contains duplicate owner heads");
         }
     }
@@ -2540,12 +2552,12 @@ fn strip_root_owner_properties(value: &mut Value, heads: &[ValidatedOwnerHead]) 
                 .ok_or_else(|| StoreError::Validation {
                     message: "root module must be an object".to_owned(),
                 })?;
-            let head = by_identity.get(&format!("module:{index}")).ok_or_else(|| {
+            let head_index = *by_identity.get(&format!("module:{index}")).ok_or_else(|| {
                 StoreError::Validation {
                     message: "root module owner head coverage is incomplete".to_owned(),
                 }
             })?;
-            strip_owner_property(module, "assets", head)?;
+            strip_owner_property(module, "assets", &mut heads[head_index])?;
             expected += 1;
         }
     }
@@ -2569,12 +2581,12 @@ fn strip_root_owner_properties(value: &mut Value, heads: &[ValidatedOwnerHead]) 
                 .ok_or_else(|| StoreError::Validation {
                     message: "persona embeddedModule must be an object".to_owned(),
                 })?;
-            let head = by_identity
+            let head_index = *by_identity
                 .get(&format!("persona:{index}"))
                 .ok_or_else(|| StoreError::Validation {
                     message: "persona embedded module owner head coverage is incomplete".to_owned(),
                 })?;
-            strip_owner_property(embedded, "assets", head)?;
+            strip_owner_property(embedded, "assets", &mut heads[head_index])?;
             expected += 1;
         }
     }
@@ -2587,7 +2599,7 @@ fn strip_root_owner_properties(value: &mut Value, heads: &[ValidatedOwnerHead]) 
 fn strip_character_owner_property(
     detail: &mut Value,
     character_id: &str,
-    heads: &[ValidatedOwnerHead],
+    heads: &mut [ValidatedOwnerHead],
 ) -> StoreResult<()> {
     let [head] = heads else {
         return validation("character owner head coverage must contain exactly one head");
@@ -2905,10 +2917,10 @@ fn reconstruct_record(
                 params![pds_generation],
                 "root record source is missing",
             )?;
-            let owner_heads =
+            let mut owner_heads =
                 validate_owner_heads(cas, load_owner_heads(connection, pds_generation, None)?)?;
             let mut value: Value = serde_json::from_str(&raw)?;
-            strip_root_owner_properties(&mut value, &owner_heads)?;
+            strip_root_owner_properties(&mut value, &mut owner_heads)?;
             LogicalRecordEnvelope::Root {
                 value,
                 owner_heads: logical_owner_heads(&owner_heads),
@@ -2954,12 +2966,12 @@ fn reconstruct_record(
                 )
                 .optional()?
                 .ok_or_else(|| missing_source("character"))?;
-            let owner_heads = validate_owner_heads(
+            let mut owner_heads = validate_owner_heads(
                 cas,
                 load_owner_heads(connection, pds_generation, Some(&character_id))?,
             )?;
             let mut detail: Value = serde_json::from_str(&raw)?;
-            strip_character_owner_property(&mut detail, &character_id, &owner_heads)?;
+            strip_character_owner_property(&mut detail, &character_id, &mut owner_heads)?;
             LogicalRecordEnvelope::Character {
                 configured_index: nonnegative_u64(configured_index, "character configured index")?,
                 detail,

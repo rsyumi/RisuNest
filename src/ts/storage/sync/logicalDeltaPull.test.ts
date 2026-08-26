@@ -235,6 +235,19 @@ describe('logical delta pull planner', () => {
         }
     })
 
+    it('treats different tombstone sequences as divergent record identities', async () => {
+        const base = manifest('generation-1', '1', [tombstone(keys.preset, '1')], 1)
+        const local = manifest('local-2', '2', [tombstone(keys.preset, '2')], 2)
+        const remote = manifest('generation-3', '3', [tombstone(keys.preset, '3')], 3)
+
+        const result = await plan({ base, local, remote })
+
+        expect(result.kind).toBe('conflict')
+        if (result.kind === 'conflict') {
+            expect(result.conflicts).toEqual([{ key: keys.preset, type: 'delete-edit' }])
+        }
+    })
+
     it('reports sorted live-live and delete-edit conflicts without a partial plan', async () => {
         const base = manifest('generation-1', '1', [
             live(keys.root, hashes.base),

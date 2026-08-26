@@ -71,6 +71,14 @@ function validateComponent(value: unknown, description: string, allowEmpty: bool
     return value
 }
 
+function validateColdLogicalKey(value: unknown): string {
+    const key = validateComponent(value, 'logicalKey', false)
+    if (key.includes('\0')) {
+        throw new TypeError('Logical record cold logicalKey cannot contain NUL')
+    }
+    return key
+}
+
 function locatorParts(locator: LogicalRecordLocator): { kind: string; components: string[] } {
     switch (locator.kind) {
         case 'root':
@@ -100,10 +108,14 @@ function locatorParts(locator: LogicalRecordLocator): { kind: string; components
             }
         case 'asset':
         case 'inlay':
-        case 'cold':
             return {
                 kind: locator.kind,
                 components: [validateComponent(locator.logicalKey, 'logicalKey', true)],
+            }
+        case 'cold':
+            return {
+                kind: locator.kind,
+                components: [validateColdLogicalKey(locator.logicalKey)],
             }
     }
 }
@@ -147,9 +159,13 @@ function locatorFromParts(kind: string, components: unknown[]): LogicalRecordLoc
             break
         case 'asset':
         case 'inlay':
-        case 'cold':
             if (components.length === 1) {
                 return { kind, logicalKey: validateComponent(components[0], 'logicalKey', true) }
+            }
+            break
+        case 'cold':
+            if (components.length === 1) {
+                return { kind, logicalKey: validateColdLogicalKey(components[0]) }
             }
             break
     }

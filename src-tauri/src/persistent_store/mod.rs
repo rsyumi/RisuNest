@@ -5,6 +5,9 @@ pub(crate) mod export;
 pub(crate) mod kei;
 #[allow(dead_code)]
 pub(crate) mod logical_delta_source;
+mod logical_delta_target;
+#[allow(unused_imports)]
+pub(crate) use logical_delta_target::establish_logical_common_base;
 #[allow(dead_code)]
 mod logical_index;
 #[allow(dead_code)]

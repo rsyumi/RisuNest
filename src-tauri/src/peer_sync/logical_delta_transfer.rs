@@ -81,6 +81,10 @@ pub trait LogicalDeltaStagedTarget {
 
     fn begin(&mut self, plan: &ReadyLogicalDeltaPlan) -> Result<Self::Stage, PeerSyncError>;
 
+    fn can_activate_without_transfer(&self, _stage: &Self::Stage) -> bool {
+        false
+    }
+
     fn stage_payload(
         &mut self,
         stage: &mut Self::Stage,
@@ -160,14 +164,23 @@ where
     S: LogicalDeltaObjectSource,
     T: LogicalDeltaStagedTarget,
 {
-    let selection = select_missing_logical_delta_objects(
-        plan,
-        local_manifest_object_hashes,
-        target_cas,
-        remote_object_sizes,
-    )?;
     let mut stage = target.begin(plan)?;
     let result = (|| {
+        if target.can_activate_without_transfer(&stage) {
+            return target.activate_database_and_base_if_current(
+                &mut stage,
+                plan.expected_local_revision,
+                &plan.expected_base_manifest_hash,
+                &plan.next_base_manifest_hash,
+                &plan.next_base_generation_sequence,
+            );
+        }
+        let selection = select_missing_logical_delta_objects(
+            plan,
+            local_manifest_object_hashes,
+            target_cas,
+            remote_object_sizes,
+        )?;
         for object in selection.missing_objects() {
             let mut source_reader = source.open_object(object)?;
             let mut verified_reader = VerifiedObjectReader::new(source_reader.as_mut());
@@ -750,6 +763,37 @@ mod tests {
         );
         assert_eq!(source.content_gets, 0);
         assert_eq!(target.events, ["begin", "database", "activate"]);
+    }
+
+    #[test]
+    fn selection_failure_after_begin_aborts_the_new_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload_hash = hash(b"remote-payload");
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+
+        assert!(matches!(
+            execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &BTreeMap::new(),
+                &mut source,
+                &mut target,
+            ),
+            Err(PeerSyncError::Validation(_))
+        ));
+        assert_eq!(source.content_gets, 0);
+        assert_eq!(target.aborts, 1);
+        assert_eq!(target.events, ["begin", "abort"]);
     }
 
     #[test]

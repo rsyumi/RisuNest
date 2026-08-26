@@ -14,8 +14,9 @@ describe('logical record key codec', () => {
         [{ kind: 'character', characterId: 'character-1' }, 'r1:character:WyJjaGFyYWN0ZXItMSJd'],
         [{ kind: 'conversation', characterId: 'character-1', conversationId: 'chat/1' }, 'r1:conversation:WyJjaGFyYWN0ZXItMSIsImNoYXQvMSJd'],
         [{ kind: 'asset', logicalKey: 'assets/한글 image.png' }, 'r1:asset:WyJhc3NldHMv7ZWc6riAIGltYWdlLnBuZyJd'],
+        [{ kind: 'asset', logicalKey: '' }, 'r1:asset:WyIiXQ'],
         [{ kind: 'inlay', logicalKey: 'inlay\u0000id' }, 'r1:inlay:WyJpbmxheVx1MDAwMGlkIl0'],
-        [{ kind: 'cold', logicalKey: '' }, 'r1:cold:WyIiXQ'],
+        [{ kind: 'cold', logicalKey: 'cold-key' }, 'r1:cold:WyJjb2xkLWtleSJd'],
     ] as const)('round-trips %o using one canonical encoded form', (locator, encoded) => {
         expect(encodeLogicalRecordKey(locator as LogicalRecordLocator)).toBe(encoded)
         expect(decodeLogicalRecordKey(encoded)).toEqual(locator)
@@ -30,6 +31,14 @@ describe('logical record key codec', () => {
         'r1:character:WyJcdTAwNjEiXQ',
         'r1:character:not+base64url',
     ])('rejects invalid or noncanonical input %s', (encoded) => {
+        expect(() => decodeLogicalRecordKey(encoded)).toThrow(TypeError)
+    })
+
+    it.each([
+        [{ kind: 'cold', logicalKey: '' }, 'r1:cold:WyIiXQ'],
+        [{ kind: 'cold', logicalKey: 'cold\u0000key' }, 'r1:cold:WyJjb2xkXHUwMDAwa2V5Il0'],
+    ] as const)('rejects invalid cold locator %o', (locator, encoded) => {
+        expect(() => encodeLogicalRecordKey(locator)).toThrow(TypeError)
         expect(() => decodeLogicalRecordKey(encoded)).toThrow(TypeError)
     })
 })
