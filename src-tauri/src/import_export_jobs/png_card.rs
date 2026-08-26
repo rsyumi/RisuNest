@@ -1126,8 +1126,10 @@ mod tests {
 
     #[test]
     fn enforces_metadata_asset_and_descriptor_limits() {
-        let mut limits = PngCardLimits::default();
-        limits.max_card_metadata_bytes = 3;
+        let limits = PngCardLimits {
+            max_card_metadata_bytes: 3,
+            ..PngCardLimits::default()
+        };
         let oversized_metadata = png_with([
             ihdr(),
             chunk(b"IDAT", &[1]),
@@ -1141,9 +1143,14 @@ mod tests {
 
         let first = encoded_card("One");
         let second = STANDARD.encode(r#"{"spec":"chara_card_v3","data":{"name":"Two"}}"#);
-        let mut limits = PngCardLimits::default();
-        limits.max_recognized_metadata_bytes =
-            ("chara\0".len() + first.len() + "ccv3\0".len() + second.len() - 1) as u64;
+        let limits = PngCardLimits {
+            max_recognized_metadata_bytes: ("chara\0".len()
+                + first.len()
+                + "ccv3\0".len()
+                + second.len()
+                - 1) as u64,
+            ..PngCardLimits::default()
+        };
         let aggregate_metadata = png_with([
             ihdr(),
             chunk(b"IDAT", &[1]),
@@ -1156,8 +1163,10 @@ mod tests {
             PngCardError::LimitExceeded(_)
         ));
 
-        let mut limits = PngCardLimits::default();
-        limits.max_embedded_asset_bytes = 3;
+        let limits = PngCardLimits {
+            max_embedded_asset_bytes: 3,
+            ..PngCardLimits::default()
+        };
         let per_asset = card_png([text_chunk(
             "chara-ext-asset_:1",
             &STANDARD.encode([1, 2, 3, 4]),
@@ -1167,9 +1176,11 @@ mod tests {
             PngCardError::LimitExceeded(_)
         ));
 
-        let mut limits = PngCardLimits::default();
-        limits.max_embedded_asset_bytes = 10;
-        limits.max_embedded_asset_total_bytes = 6;
+        let limits = PngCardLimits {
+            max_embedded_asset_bytes: 10,
+            max_embedded_asset_total_bytes: 6,
+            ..PngCardLimits::default()
+        };
         let aggregate_assets = card_png([
             text_chunk("chara-ext-asset_:1", &STANDARD.encode([1, 2, 3, 4])),
             text_chunk("chara-ext-asset_:2", &STANDARD.encode([5, 6, 7, 8])),
@@ -1179,8 +1190,10 @@ mod tests {
             PngCardError::LimitExceeded(_)
         ));
 
-        let mut limits = PngCardLimits::default();
-        limits.max_embedded_asset_count = 1;
+        let limits = PngCardLimits {
+            max_embedded_asset_count: 1,
+            ..PngCardLimits::default()
+        };
         let too_many_assets = card_png([
             text_chunk("chara-ext-asset_:1", &STANDARD.encode([1])),
             text_chunk("chara-ext-asset_:2", &STANDARD.encode([2])),
