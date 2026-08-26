@@ -195,15 +195,20 @@ pub(crate) fn establish_logical_common_base(
         );
     }
     let local_manifest = scan_compact_manifest(&transaction, library_id, local_generation_id, true)
-        .map_err(storage_error)?
-        .manifest;
-    if local_manifest.records != remote_manifest.records
-        || local_manifest.objects != remote_manifest.objects
+        .map_err(storage_error)?;
+    if local_manifest.manifest.records != remote_manifest.records
+        || local_manifest.manifest.objects != remote_manifest.objects
     {
         return validation(
             "logical common-base remote content differs from the active logical generation",
         );
     }
+    validate_same_generation_identity(
+        &local_manifest.manifest.generation,
+        &local_manifest.manifest_hash,
+        &remote_manifest.generation,
+        &remote_manifest_hash,
+    )?;
 
     let existing: Option<PeerBase> = transaction
         .query_row(
@@ -3480,6 +3485,50 @@ mod tests {
                 &equivalent_bytes,
             ),
             Err(PeerSyncError::ActivationConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .connection
+                .query_row::<i64, _, _>(
+                    "SELECT COUNT(*) FROM logical_peer_common_bases",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn first_common_base_rejects_a_local_generation_id_with_a_different_manifest_hash() {
+        let (_directory, mut store, cas) = open_fixture();
+        let local = store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "shared-generation".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .unwrap();
+        let mut remote = local.manifest;
+        remote.source_revision = 1;
+        let remote_bytes = encode_logical_manifest(&remote).unwrap();
+
+        assert!(matches!(
+            establish_logical_common_base(
+                &mut store,
+                &cas,
+                "peer",
+                "library",
+                "shared-generation",
+                0,
+                &remote_bytes,
+            ),
+            Err(PeerSyncError::Validation(_))
         ));
         assert_eq!(
             store
