@@ -31,10 +31,10 @@ function restoreStatus(
 }
 
 describe('native file job bootstrap reconciliation', () => {
-    it('reconciles persisted jobs on desktop and Android without widening to other targets', () => {
+    it('reconciles restore jobs only where desktop or Android SAF activation is supported', () => {
         expect(shouldReconcileNativeFileJobs(true, false, false)).toBe(true)
         expect(shouldReconcileNativeFileJobs(false, true, true)).toBe(true)
-        expect(shouldReconcileNativeFileJobs(false, true, false)).toBe(true)
+        expect(shouldReconcileNativeFileJobs(false, true, false)).toBe(false)
         expect(shouldReconcileNativeFileJobs(false, false, true)).toBe(false)
     })
 
