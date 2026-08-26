@@ -28,6 +28,7 @@ pub struct ReadyLogicalDeltaPlan {
     pub preserve_local_keys: Vec<String>,
     pub candidate_object_hashes: Vec<String>,
     pub next_base_manifest_hash: String,
+    pub next_base_generation_sequence: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,14 +94,16 @@ pub trait LogicalDeltaStagedTarget {
         plan: &ReadyLogicalDeltaPlan,
     ) -> Result<(), PeerSyncError>;
 
-    /// The expected revision and base checks, database activation, and base update must be one
-    /// atomic target transaction. An error must mean that transaction did not commit.
+    /// The expected revision and base checks, database activation, and common-base hash and
+    /// generation-sequence update must be one atomic target transaction. An error must mean that
+    /// transaction did not commit.
     fn activate_database_and_base_if_current(
         &mut self,
         stage: &mut Self::Stage,
         expected_local_revision: i64,
         expected_base_manifest_hash: &str,
         next_base_manifest_hash: &str,
+        next_base_generation_sequence: &str,
     ) -> Result<LogicalDeltaActivation, PeerSyncError>;
 
     fn abort(&mut self, stage: Self::Stage) -> Result<(), PeerSyncError>;
@@ -128,14 +131,15 @@ pub fn select_missing_logical_delta_objects(
             hash: hash.clone(),
             size,
         };
+        if local_manifest_object_hashes.contains(hash) {
+            selection.reused_from_local_manifest.push(object);
+            continue;
+        }
         match target_cas.stat_object(hash)? {
             Some(actual_size) if actual_size != size => {
                 return Err(PeerSyncError::Validation(format!(
                     "logical delta object size mismatch for {hash}: expected {size}, found {actual_size}"
                 )));
-            }
-            Some(_) if local_manifest_object_hashes.contains(hash) => {
-                selection.reused_from_local_manifest.push(object);
             }
             Some(_) => selection.reused_from_cas.push(object),
             None => selection.missing_objects.push(object),
@@ -176,6 +180,7 @@ where
             plan.expected_local_revision,
             &plan.expected_base_manifest_hash,
             &plan.next_base_manifest_hash,
+            &plan.next_base_generation_sequence,
         )
     })();
 
@@ -206,6 +211,7 @@ fn validate_ready_plan(plan: &ReadyLogicalDeltaPlan) -> Result<(), PeerSyncError
         &plan.next_base_manifest_hash,
         "logical delta next base manifest hash",
     )?;
+    validate_generation_sequence(&plan.next_base_generation_sequence)?;
     if plan.expected_remote_generation.is_empty() {
         return validation("logical delta expected remote generation must be nonempty");
     }
@@ -267,6 +273,20 @@ fn validate_hash(hash: &str, description: &str) -> Result<(), PeerSyncError> {
     validation(format!(
         "{description} must be 64 lowercase hexadecimal characters"
     ))
+}
+
+fn validate_generation_sequence(sequence: &str) -> Result<(), PeerSyncError> {
+    let canonical = sequence == "0"
+        || (sequence.len() <= 64
+            && sequence
+                .bytes()
+                .next()
+                .is_some_and(|byte| (b'1'..=b'9').contains(&byte))
+            && sequence.bytes().skip(1).all(|byte| byte.is_ascii_digit()));
+    if canonical {
+        return Ok(());
+    }
+    validation("logical delta next base generation sequence must be canonical unsigned decimal")
 }
 
 fn validation<T>(message: impl Into<String>) -> Result<T, PeerSyncError> {
@@ -347,6 +367,7 @@ mod tests {
             preserve_local_keys: Vec::new(),
             candidate_object_hashes,
             next_base_manifest_hash: "2".repeat(64),
+            next_base_generation_sequence: "8".to_owned(),
         }
     }
 
@@ -470,6 +491,8 @@ mod tests {
     struct FixtureTarget {
         active_revision: i64,
         active_base: String,
+        active_base_generation_sequence: String,
+        locally_resolvable: BTreeSet<String>,
         events: Vec<String>,
         aborts: usize,
         fail_database_stage: bool,
@@ -480,6 +503,8 @@ mod tests {
             Self {
                 active_revision: 7,
                 active_base: "1".repeat(64),
+                active_base_generation_sequence: "7".to_owned(),
+                locally_resolvable: BTreeSet::new(),
                 events: Vec::new(),
                 aborts: 0,
                 fail_database_stage: false,
@@ -511,11 +536,18 @@ mod tests {
         fn stage_database_changes(
             &mut self,
             stage: &mut Self::Stage,
-            _plan: &ReadyLogicalDeltaPlan,
+            plan: &ReadyLogicalDeltaPlan,
         ) -> Result<(), PeerSyncError> {
             self.events.push("database".to_owned());
             if self.fail_database_stage {
                 return Err(PeerSyncError::Storage("database staging failed".to_owned()));
+            }
+            if plan.candidate_object_hashes.iter().any(|hash| {
+                !stage.payloads.contains(hash) && !self.locally_resolvable.contains(hash)
+            }) {
+                return Err(PeerSyncError::Storage(
+                    "database staging could not resolve a logical object".to_owned(),
+                ));
             }
             stage.database_staged = true;
             Ok(())
@@ -527,6 +559,7 @@ mod tests {
             expected_local_revision: i64,
             expected_base_manifest_hash: &str,
             next_base_manifest_hash: &str,
+            next_base_generation_sequence: &str,
         ) -> Result<LogicalDeltaActivation, PeerSyncError> {
             self.events.push("activate".to_owned());
             if self.active_revision != expected_local_revision
@@ -540,6 +573,7 @@ mod tests {
             assert!(stage.database_staged);
             self.active_revision += 1;
             self.active_base = next_base_manifest_hash.to_owned();
+            self.active_base_generation_sequence = next_base_generation_sequence.to_owned();
             Ok(LogicalDeltaActivation::Activated {
                 revision: self.active_revision,
             })
@@ -578,6 +612,57 @@ mod tests {
             activation,
             LogicalDeltaActivation::Activated { revision: 8 }
         );
+        assert_eq!(target.events, ["begin", "database", "activate"]);
+    }
+
+    #[test]
+    fn next_common_base_generation_sequence_must_be_canonical() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut plan = ready_plan(vec![], vec![]);
+        plan.next_base_generation_sequence = "08".to_owned();
+
+        let error =
+            select_missing_logical_delta_objects(&plan, &BTreeSet::new(), &cas, &BTreeMap::new())
+                .unwrap_err();
+
+        assert!(
+            matches!(error, PeerSyncError::Validation(message) if message.contains("generation sequence"))
+        );
+    }
+
+    #[test]
+    fn local_manifest_object_without_cas_file_is_reconstructed_without_content_get() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local_record = b"pinned-pds-record".to_vec();
+        let local_record_hash = hash(&local_record);
+        let plan = ready_plan(
+            vec![put("r1:root", local_record_hash.clone(), vec![])],
+            vec![local_record_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(local_record_hash.clone(), local_record)]),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+        target.locally_resolvable.insert(local_record_hash.clone());
+
+        let activation = execute_logical_delta_pull(
+            &plan,
+            &BTreeSet::from([local_record_hash.clone()]),
+            &cas,
+            &BTreeMap::from([(local_record_hash.clone(), b"pinned-pds-record".len() as u64)]),
+            &mut source,
+            &mut target,
+        )
+        .unwrap();
+
+        assert_eq!(
+            activation,
+            LogicalDeltaActivation::Activated { revision: 8 }
+        );
+        assert_eq!(source.content_gets, 0);
         assert_eq!(target.events, ["begin", "database", "activate"]);
     }
 
@@ -623,6 +708,7 @@ mod tests {
         );
         assert_eq!(target.active_revision, 8);
         assert_eq!(target.active_base, "2".repeat(64));
+        assert_eq!(target.active_base_generation_sequence, "8");
         assert_eq!(target.aborts, 0);
     }
 
@@ -658,6 +744,7 @@ mod tests {
         ));
         assert_eq!(target.active_revision, 7);
         assert_eq!(target.active_base, "1".repeat(64));
+        assert_eq!(target.active_base_generation_sequence, "7");
         assert_eq!(target.aborts, 1);
         assert!(!target.events.iter().any(|event| event == "database"));
         assert_eq!(target.events.last().map(String::as_str), Some("abort"));
@@ -730,6 +817,7 @@ mod tests {
             );
             assert_eq!(target.active_revision, actual_revision);
             assert_eq!(target.active_base, actual_base);
+            assert_eq!(target.active_base_generation_sequence, "7");
             assert_eq!(target.aborts, 1);
             assert_eq!(target.events.last().map(String::as_str), Some("abort"));
         }
