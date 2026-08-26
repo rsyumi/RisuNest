@@ -28,6 +28,7 @@ use std::{
 
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const PERSISTED_MANIFEST_FILE: &str = "manifest.json";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DownloadReport {
@@ -300,6 +301,21 @@ impl LoopbackCloneClient {
         if self.manifest.is_some() {
             return Ok(());
         }
+        if let Some((manifest, manifest_id)) = load_persisted_manifest(
+            &self.root.join(PERSISTED_MANIFEST_FILE),
+            self.required_manifest_id.as_deref(),
+            self.ledger.manifest_id.as_deref(),
+        )? {
+            if self.ledger.manifest_id.is_none() {
+                self.append_event(&LedgerEvent::Manifest {
+                    manifest_id: manifest_id.clone(),
+                })?;
+                self.ledger.manifest_id = Some(manifest_id.clone());
+            }
+            self.manifest = Some(manifest);
+            self.manifest_id = Some(manifest_id);
+            return Ok(());
+        }
         let response = self
             .transport
             .control_request(
@@ -366,6 +382,7 @@ impl LoopbackCloneClient {
             })?;
             self.ledger.manifest_id = Some(manifest_id.clone());
         }
+        persist_manifest(&self.root.join(PERSISTED_MANIFEST_FILE), &bytes)?;
         self.manifest = Some(manifest);
         self.manifest_id = Some(manifest_id);
         Ok(())
@@ -840,6 +857,119 @@ fn transfer_order(manifest: &CloneManifest) -> Vec<String> {
         ordered.push(manifest.database.object.clone());
     }
     ordered
+}
+
+fn load_persisted_manifest(
+    path: &Path,
+    required_manifest_id: Option<&str>,
+    ledger_manifest_id: Option<&str>,
+) -> Result<Option<(CloneManifest, String)>, PeerSyncError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if file.metadata()?.len() > MAX_MANIFEST_BYTES as u64 {
+        return Err(PeerSyncError::Storage(
+            "persisted clone manifest exceeds the bounded v1 size".to_owned(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_MANIFEST_BYTES {
+        return Err(PeerSyncError::Storage(
+            "persisted clone manifest exceeds the bounded v1 size".to_owned(),
+        ));
+    }
+    let manifest: CloneManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        PeerSyncError::Storage(format!("invalid persisted clone manifest: {error}"))
+    })?;
+    manifest.validate().map_err(|error| {
+        PeerSyncError::Storage(format!("invalid persisted clone manifest: {error}"))
+    })?;
+    if manifest.canonical_bytes().map_err(|error| {
+        PeerSyncError::Storage(format!("invalid persisted clone manifest: {error}"))
+    })? != bytes
+    {
+        return Err(PeerSyncError::Storage(
+            "persisted clone manifest bytes are not canonical".to_owned(),
+        ));
+    }
+    let manifest_id = sha256_hex(&bytes);
+    for expected in [required_manifest_id, ledger_manifest_id]
+        .into_iter()
+        .flatten()
+    {
+        if expected != manifest_id {
+            return Err(PeerSyncError::StaleManifest {
+                expected: expected.to_owned(),
+                received: manifest_id,
+            });
+        }
+    }
+    if required_manifest_id.is_none() && ledger_manifest_id.is_none() {
+        return Err(PeerSyncError::Storage(
+            "persisted clone manifest has no checkpoint identity".to_owned(),
+        ));
+    }
+    Ok(Some((manifest, manifest_id)))
+}
+
+fn persist_manifest(path: &Path, bytes: &[u8]) -> Result<(), PeerSyncError> {
+    match File::open(path) {
+        Ok(mut file) => {
+            if file.metadata()?.len() > MAX_MANIFEST_BYTES as u64 {
+                return Err(PeerSyncError::Storage(
+                    "persisted clone manifest exceeds the bounded v1 size".to_owned(),
+                ));
+            }
+            let mut existing = Vec::new();
+            file.by_ref()
+                .take(MAX_MANIFEST_BYTES as u64 + 1)
+                .read_to_end(&mut existing)?;
+            if existing == bytes {
+                return Ok(());
+            }
+            return Err(PeerSyncError::Storage(
+                "persisted clone manifest changed within an immutable job".to_owned(),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path.parent().ok_or_else(|| {
+        PeerSyncError::Storage("persisted clone manifest path has no parent".to_owned())
+    })?;
+    let temporary = parent.join(format!(".manifest-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        sync_manifest_parent(parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_manifest_parent(path: &Path) -> Result<(), PeerSyncError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_manifest_parent(_path: &Path) -> Result<(), PeerSyncError> {
+    Ok(())
 }
 
 fn load_ledger(path: &Path) -> Result<LedgerState, PeerSyncError> {

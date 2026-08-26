@@ -673,6 +673,16 @@ impl PeerCloneCommandState {
                 }
             };
             update_target_progress(&runtime, &worker_request, verified_bytes, total_bytes);
+            if verified_bytes == total_bytes {
+                finish_target_worker(
+                    &runtime,
+                    &worker_request,
+                    client,
+                    Ok(()),
+                    Some((verified_bytes, total_bytes)),
+                );
+                return;
+            }
             let progress_runtime = Arc::clone(&runtime);
             let progress_request = worker_request.clone();
             let result = client.download_with_progress(&worker_cancellation, move |transferred| {
@@ -1416,6 +1426,13 @@ mod tests {
             target_store.read_root(None).unwrap().value["username"],
             "Target"
         );
+        drop(target);
+        source.stop_source(pairing.session_id.as_str()).unwrap();
+        let target = PeerCloneCommandState::default();
+        target
+            .resume_target_download(&target_root.path().join("peer-sync"), request.clone())
+            .unwrap();
+        wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
 
         let finalized = target
             .finalize_target(
@@ -1435,7 +1452,6 @@ mod tests {
             target_store.read_root(None).unwrap().value["username"],
             "Source"
         );
-        source.stop_source(pairing.session_id.as_str()).unwrap();
     }
 
     #[test]

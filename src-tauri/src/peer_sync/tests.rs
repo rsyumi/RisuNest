@@ -1829,6 +1829,94 @@ fn validates_staged_graph_and_hashes_before_one_atomic_activation() {
 }
 
 #[test]
+fn persisted_manifest_allows_offline_activation_after_client_restart() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[96 * 1024]);
+    let session = prepare(&source, session_root.path());
+    let manifest_id = session.manifest_id().to_owned();
+    let host = LoopbackCloneHost::start(session).unwrap();
+    let session_url = host.session_url().to_owned();
+    let mut client = LoopbackCloneClient::new(client_root.path(), &session_url).unwrap();
+    client.download(&TransferCancellation::new()).unwrap();
+    drop(client);
+    host.shutdown().unwrap();
+    let mut reopened = LoopbackCloneClient::new(client_root.path(), session_url).unwrap();
+    let mut target = FixtureTarget {
+        active_manifest: "old".to_owned(),
+        ..FixtureTarget::default()
+    };
+    let mut validator = |_manifest: &CloneManifest, _stage: &FixtureStage| Ok(());
+
+    activate_downloaded_clone(&mut reopened, &mut target, &mut validator).unwrap();
+
+    assert_eq!(target.active_manifest, manifest_id);
+    assert_eq!(target.activation_count, 1);
+}
+
+#[test]
+fn corrupt_or_mismatched_persisted_manifest_never_stages_activation() {
+    let source_a_root = tempfile::tempdir().unwrap();
+    let source_b_root = tempfile::tempdir().unwrap();
+    let session_a_root = tempfile::tempdir().unwrap();
+    let session_b_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source_a = fixture_source(source_a_root.path(), &[96 * 1024]);
+    let source_b = fixture_source(source_b_root.path(), &[96 * 1024 + 1]);
+    let session_a = prepare(&source_a, session_a_root.path());
+    let session_b = prepare(&source_b, session_b_root.path());
+    let manifest_a = session_a.manifest_id().to_owned();
+    let manifest_b = session_b.manifest_id().to_owned();
+    let manifest_b_bytes = session_b.manifest_bytes().to_vec();
+    let host = LoopbackCloneHost::start(session_a).unwrap();
+    let session_url = host.session_url().to_owned();
+    let mut client = LoopbackCloneClient::new(client_root.path(), &session_url).unwrap();
+    client.download(&TransferCancellation::new()).unwrap();
+    drop(client);
+    host.shutdown().unwrap();
+    let manifest_path = client_root.path().join("manifest.json");
+    let mut target = FixtureTarget {
+        active_manifest: "old".to_owned(),
+        ..FixtureTarget::default()
+    };
+    let mut validator = |_manifest: &CloneManifest, _stage: &FixtureStage| Ok(());
+
+    fs::write(&manifest_path, b"{").unwrap();
+    let mut corrupt = LoopbackCloneClient::new(client_root.path(), &session_url).unwrap();
+    assert!(matches!(
+        activate_downloaded_clone(&mut corrupt, &mut target, &mut validator),
+        Err(PeerSyncError::Storage(_))
+    ));
+    assert_eq!(target.active_manifest, "old");
+    assert_eq!(target.activation_count, 0);
+
+    File::create(&manifest_path)
+        .unwrap()
+        .set_len(super::protocol::MAX_MANIFEST_BYTES as u64 + 1)
+        .unwrap();
+    let mut oversized = LoopbackCloneClient::new(client_root.path(), &session_url).unwrap();
+    assert!(matches!(
+        activate_downloaded_clone(&mut oversized, &mut target, &mut validator),
+        Err(PeerSyncError::Storage(_))
+    ));
+    assert_eq!(target.active_manifest, "old");
+    assert_eq!(target.activation_count, 0);
+
+    fs::write(&manifest_path, manifest_b_bytes).unwrap();
+    let mut mismatched = LoopbackCloneClient::new(client_root.path(), session_url).unwrap();
+    assert_eq!(
+        activate_downloaded_clone(&mut mismatched, &mut target, &mut validator).unwrap_err(),
+        PeerSyncError::StaleManifest {
+            expected: manifest_a,
+            received: manifest_b,
+        }
+    );
+    assert_eq!(target.active_manifest, "old");
+    assert_eq!(target.activation_count, 0);
+}
+
+#[test]
 fn concurrent_clone_jobs_use_one_atomic_idempotent_manifest_activation() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
