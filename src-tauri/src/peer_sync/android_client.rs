@@ -6,6 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 const JOB_SCHEMA: &str = "risunest.android-peer-clone-job/v1";
@@ -13,6 +14,42 @@ const JOB_OWNERSHIP_SCHEMA: &str = "risunest.android-peer-clone-ownership/v1";
 const VERIFIED_SCHEMA: &str = "risunest.android-peer-clone-verified/v1";
 const CANCEL_REQUESTED_SCHEMA: &str = "risunest.android-peer-clone-cancel/v1";
 const MAX_JOB_RECORD_BYTES: u64 = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(super) enum AndroidCloneStopReason {
+    Running = 0,
+    Pause = 1,
+    Cancel = 2,
+}
+
+pub(super) struct AndroidCloneStopState(AtomicU8);
+
+impl AndroidCloneStopState {
+    pub(super) fn new() -> Self {
+        Self(AtomicU8::new(AndroidCloneStopReason::Running as u8))
+    }
+
+    pub(super) fn request_pause(&self) {
+        self.0
+            .fetch_max(AndroidCloneStopReason::Pause as u8, Ordering::SeqCst);
+    }
+
+    pub(super) fn request_cancel(&self) {
+        self.0
+            .store(AndroidCloneStopReason::Cancel as u8, Ordering::SeqCst);
+    }
+
+    pub(super) fn current(&self) -> AndroidCloneStopReason {
+        match self.0.load(Ordering::SeqCst) {
+            value if value == AndroidCloneStopReason::Pause as u8 => AndroidCloneStopReason::Pause,
+            value if value == AndroidCloneStopReason::Cancel as u8 => {
+                AndroidCloneStopReason::Cancel
+            }
+            _ => AndroidCloneStopReason::Running,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

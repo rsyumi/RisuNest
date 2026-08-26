@@ -27,7 +27,6 @@ import kotlinx.coroutines.launch
 
 internal const val PEER_CLONE_JOB_ID_EXTRA = "nativePeerCloneJobId"
 private const val PEER_CLONE_NOTIFICATION_CHANNEL = "risunest-peer-clone"
-private const val PEER_CLONE_NOTIFICATION_ID = 0x525043
 private const val PEER_CLONE_CANCEL_ACTION = "co.aiclient.risu.CANCEL_PEER_CLONE"
 
 internal enum class PeerCloneTransferMode {
@@ -57,11 +56,31 @@ internal inline fun startPeerCloneTransfer(
 }
 
 internal inline fun cancelPeerCloneTransfer(
-  cancelAndCleanupNative: () -> Unit,
-  cancelScheduledJob: () -> Unit,
+  cancelAndCleanupNative: () -> Boolean,
+): Boolean = cancelAndCleanupNative()
+
+internal fun interface PeerCloneNativeProgress {
+  fun onProgress(transferredBytes: Long)
+}
+
+internal fun runPeerCloneNativeTransfer(
+  resume: (PeerCloneNativeProgress) -> Int,
+  updateNotification: (Long) -> Unit,
+): Int = resume(PeerCloneNativeProgress(updateNotification))
+
+internal class PeerCloneNotificationProgress(
+  private val minimumStepBytes: Long = 4 * 1024 * 1024L,
 ) {
-  cancelAndCleanupNative()
-  cancelScheduledJob()
+  private var lastReportedBytes = 0L
+
+  fun shouldUpdate(transferredBytes: Long): Boolean {
+    if (transferredBytes <= lastReportedBytes) return false
+    if (lastReportedBytes != 0L && transferredBytes - lastReportedBytes < minimumStepBytes) {
+      return false
+    }
+    lastReportedBytes = transferredBytes
+    return true
+  }
 }
 
 internal enum class PeerCloneStopCause {
@@ -135,7 +154,11 @@ internal object PeerCloneNativeBridge {
     System.loadLibrary("risuai_lib")
   }
 
-  @JvmStatic external fun resume(jobId: String, filesRoot: String): Int
+  @JvmStatic external fun resume(
+    jobId: String,
+    filesRoot: String,
+    progress: PeerCloneNativeProgress,
+  ): Int
   @JvmStatic external fun pause(jobId: String): Boolean
   @JvmStatic external fun cancelAndCleanup(jobId: String, filesRoot: String): Boolean
   @JvmStatic external fun cleanupCompleted(jobId: String, filesRoot: String): Boolean
@@ -170,15 +193,12 @@ internal object PeerCloneTransferScheduler {
     if (!BuildConfig.ENABLE_EXPERIMENTAL_PEER_CLONE_CLIENT || !isCanonicalUuidV4(jobId)) {
       return false
     }
-    cancelPeerCloneTransfer(
+    return cancelPeerCloneTransfer(
       cancelAndCleanupNative = {
         runCatching { PeerCloneNativeBridge.cancelAndCleanup(jobId, context.filesDir.absolutePath) }
-      },
-      cancelScheduledJob = {
-        context.getSystemService(JobScheduler::class.java).cancel(peerCloneSchedulerId(jobId))
+          .getOrDefault(false)
       },
     )
-    return true
   }
 
   @RequiresApi(34)
@@ -230,7 +250,22 @@ class PeerCloneTransferJobService : JobService() {
       attachNotification = { attachTransferNotification(params, jobId) },
       launchNativeTransfer = {
         transferScope.launch {
-          val result = runCatching { PeerCloneNativeBridge.resume(jobId, filesDir.absolutePath) }
+          val notificationProgress = PeerCloneNotificationProgress()
+          val result = runCatching {
+            runPeerCloneNativeTransfer(
+              resume = { progress ->
+                PeerCloneNativeBridge.resume(jobId, filesDir.absolutePath, progress)
+              },
+              updateNotification = { transferredBytes ->
+                if (
+                  activeJobs[params.jobId] == jobId &&
+                  notificationProgress.shouldUpdate(transferredBytes)
+                ) {
+                  attachTransferNotification(params, jobId, transferredBytes)
+                }
+              },
+            )
+          }
             .fold(
               onSuccess = PeerCloneNativeResult::fromWireCode,
               onFailure = { PeerCloneNativeResult.RETRYABLE_INTERRUPTION },
@@ -268,7 +303,11 @@ class PeerCloneTransferJobService : JobService() {
   }
 
   @SuppressLint("MissingPermission")
-  private fun attachTransferNotification(params: JobParameters, jobId: String) {
+  private fun attachTransferNotification(
+    params: JobParameters,
+    jobId: String,
+    transferredBytes: Long? = null,
+  ) {
     if (Build.VERSION.SDK_INT < 34) return
     val manager = getSystemService(NotificationManager::class.java)
     manager.createNotificationChannel(
@@ -280,13 +319,13 @@ class PeerCloneTransferJobService : JobService() {
     )
     setNotification(
       params,
-      PEER_CLONE_NOTIFICATION_ID,
-      transferNotification(jobId),
+      peerCloneNotificationId(jobId),
+      transferNotification(jobId, transferredBytes),
       JOB_END_NOTIFICATION_POLICY_REMOVE,
     )
   }
 
-  private fun transferNotification(jobId: String): Notification {
+  private fun transferNotification(jobId: String, transferredBytes: Long?): Notification {
     val cancelIntent = Intent(this, PeerCloneCancelReceiver::class.java).apply {
       action = PEER_CLONE_CANCEL_ACTION
       putExtra(PEER_CLONE_JOB_ID_EXTRA, jobId)
@@ -297,10 +336,13 @@ class PeerCloneTransferJobService : JobService() {
       cancelIntent,
       PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
+    val status = transferredBytes?.let {
+      getString(R.string.peer_clone_notification_progress, it)
+    } ?: getString(R.string.peer_clone_notification_text)
     return NotificationCompat.Builder(this, PEER_CLONE_NOTIFICATION_CHANNEL)
       .setSmallIcon(android.R.drawable.stat_sys_download)
       .setContentTitle(getString(R.string.peer_clone_notification_title))
-      .setContentText(getString(R.string.peer_clone_notification_text))
+      .setContentText(status)
       .setOngoing(true)
       .setOnlyAlertOnce(true)
       .setProgress(0, 0, true)
@@ -339,3 +381,5 @@ class PeerCloneCancelReceiver : BroadcastReceiver() {
 
 private fun peerCloneSchedulerId(jobId: String): Int =
   UUID.fromString(jobId).hashCode() and Int.MAX_VALUE
+
+internal fun peerCloneNotificationId(jobId: String): Int = peerCloneSchedulerId(jobId)

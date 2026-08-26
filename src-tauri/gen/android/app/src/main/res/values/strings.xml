@@ -9,5 +9,6 @@
     <string name="peer_clone_notification_channel">Device transfer</string>
     <string name="peer_clone_notification_title">Copying RisuNest data</string>
     <string name="peer_clone_notification_text">Verified progress is saved automatically.</string>
+    <string name="peer_clone_notification_progress">Transferred %1$d bytes in this run.</string>
     <string name="peer_clone_notification_cancel">Cancel</string>
 </resources>

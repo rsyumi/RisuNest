@@ -78,15 +78,69 @@ class PeerCloneTransferTest {
   }
 
   @Test
-  fun `explicit cancel cleans the native job before cancelling its scheduler slot`() {
+  fun `explicit cancel retains scheduler ownership until native cleanup completes`() {
     val operations = mutableListOf<String>()
 
-    cancelPeerCloneTransfer(
-      cancelAndCleanupNative = { operations.add("native-cleanup") },
-      cancelScheduledJob = { operations.add("scheduler-cancel") },
+    val cancelled = cancelPeerCloneTransfer(
+      cancelAndCleanupNative = {
+        operations.add("native-cleanup")
+        true
+      },
     )
 
-    assertEquals(listOf("native-cleanup", "scheduler-cancel"), operations)
+    assertTrue(cancelled)
+    assertEquals(listOf("native-cleanup"), operations)
+  }
+
+  @Test
+  fun `failed native cleanup retains scheduler ownership for a later retry`() {
+    val operations = mutableListOf<String>()
+
+    val cancelled = cancelPeerCloneTransfer(
+      cancelAndCleanupNative = {
+        operations.add("native-cleanup")
+        false
+      },
+    )
+
+    assertFalse(cancelled)
+    assertEquals(listOf("native-cleanup"), operations)
+  }
+
+  @Test
+  fun `concurrent clone jobs use distinct notification identities`() {
+    val otherJobId = "22222222-2222-4222-8222-222222222222"
+
+    assertTrue(peerCloneNotificationId(jobId) >= 0)
+    assertTrue(peerCloneNotificationId(otherJobId) >= 0)
+    assertFalse(peerCloneNotificationId(jobId) == peerCloneNotificationId(otherJobId))
+  }
+
+  @Test
+  fun `native downloader progress reaches the notification updater`() {
+    val updates = mutableListOf<Long>()
+
+    val result = runPeerCloneNativeTransfer(
+      resume = { progress ->
+        progress.onProgress(64 * 1024L)
+        progress.onProgress(4 * 1024 * 1024L)
+        PeerCloneNativeResult.VERIFIED_AWAITING_ACTIVATION.wireCode
+      },
+      updateNotification = updates::add,
+    )
+
+    assertEquals(PeerCloneNativeResult.VERIFIED_AWAITING_ACTIVATION.wireCode, result)
+    assertEquals(listOf(64 * 1024L, 4 * 1024 * 1024L), updates)
+  }
+
+  @Test
+  fun `notification progress updates are bounded while preserving transfer status`() {
+    val gate = PeerCloneNotificationProgress()
+
+    assertTrue(gate.shouldUpdate(64 * 1024L))
+    assertFalse(gate.shouldUpdate(1024 * 1024L))
+    assertTrue(gate.shouldUpdate(4 * 1024 * 1024L + 64 * 1024L))
+    assertFalse(gate.shouldUpdate(4 * 1024 * 1024L))
   }
 
   @Test

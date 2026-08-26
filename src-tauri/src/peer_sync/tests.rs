@@ -958,6 +958,19 @@ fn android_clone_cancel_marker_survives_reopen_before_owned_cleanup() {
     host.stop().unwrap();
 }
 
+#[test]
+fn android_clone_cancel_cannot_be_downgraded_by_a_late_pause() {
+    let state = super::android_client::AndroidCloneStopState::new();
+
+    state.request_cancel();
+    state.request_pause();
+
+    assert_eq!(
+        state.current(),
+        super::android_client::AndroidCloneStopReason::Cancel
+    );
+}
+
 fn assert_lan_stop_is_bounded(mut host: LanCloneHost, stalled: TcpStream) {
     const STOP_DEADLINE: Duration = Duration::from_secs(1);
     let (result_tx, result_rx) = mpsc::channel();

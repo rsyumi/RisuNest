@@ -1,30 +1,28 @@
-use super::{AndroidResumableCloneJob, PeerSyncError, TransferCancellation};
+use super::{
+    android_client::{AndroidCloneStopReason, AndroidCloneStopState},
+    AndroidResumableCloneJob, PeerSyncError, TransferCancellation,
+};
 use jni::{
-    objects::{JClass, JString},
-    sys::{jboolean, jint, JNI_FALSE, JNI_TRUE},
+    objects::{JClass, JObject, JString, JValue},
+    sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE},
     JNIEnv,
 };
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     path::PathBuf,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        Mutex, OnceLock,
-    },
+    sync::{Mutex, OnceLock},
 };
 
 const RESULT_RETRYABLE_INTERRUPTION: jint = 1;
 const RESULT_VERIFIED_AWAITING_ACTIVATION: jint = 2;
 const RESULT_CANCELLED: jint = 3;
 const RESULT_TERMINAL_FAILURE: jint = 4;
-
-const STOP_RUNNING: u8 = 0;
-const STOP_PAUSE: u8 = 1;
-const STOP_CANCEL: u8 = 2;
+const NOTIFICATION_PROGRESS_STEP_BYTES: u64 = 4 * 1024 * 1024;
 
 struct ActiveAndroidClone {
     cancellation: TransferCancellation,
-    stop_reason: AtomicU8,
+    stop_reason: AndroidCloneStopState,
 }
 
 fn active_jobs() -> &'static Mutex<HashMap<String, ActiveAndroidClone>> {
@@ -63,7 +61,7 @@ fn resolve_job_root(files_root: &str, job_id: &str) -> Result<PathBuf, PeerSyncE
     }
 }
 
-fn resume_job(job_id: &str, files_root: &str) -> jint {
+fn resume_job(job_id: &str, files_root: &str, mut progress: impl FnMut(u64)) -> jint {
     let root = match resolve_job_root(files_root, job_id) {
         Ok(root) => root,
         Err(_) => return RESULT_TERMINAL_FAILURE,
@@ -80,7 +78,7 @@ fn resume_job(job_id: &str, files_root: &str) -> jint {
             job_id.to_owned(),
             ActiveAndroidClone {
                 cancellation: cancellation.clone(),
-                stop_reason: AtomicU8::new(STOP_RUNNING),
+                stop_reason: AndroidCloneStopState::new(),
             },
         );
     }
@@ -91,7 +89,7 @@ fn resume_job(job_id: &str, files_root: &str) -> jint {
             job.discard()?;
             return Ok(RESULT_CANCELLED);
         }
-        match job.download(&cancellation) {
+        match job.download_with_progress(&cancellation, &mut progress) {
             Ok(_) => Ok(RESULT_VERIFIED_AWAITING_ACTIVATION),
             Err(PeerSyncError::Cancelled) => Ok(RESULT_CANCELLED),
             Err(PeerSyncError::Transport(_)) => Ok(RESULT_RETRYABLE_INTERRUPTION),
@@ -103,14 +101,14 @@ fn resume_job(job_id: &str, files_root: &str) -> jint {
         .lock()
         .ok()
         .and_then(|mut active| active.remove(job_id))
-        .map(|active| active.stop_reason.load(Ordering::SeqCst))
-        .unwrap_or(STOP_RUNNING);
+        .map(|active| active.stop_reason.current())
+        .unwrap_or(AndroidCloneStopReason::Running);
     match (result, stop_reason) {
-        (_, STOP_CANCEL) => {
+        (_, AndroidCloneStopReason::Cancel) => {
             let _ = AndroidResumableCloneJob::discard_at(&root);
             RESULT_CANCELLED
         }
-        (Ok(RESULT_CANCELLED), STOP_PAUSE) => RESULT_RETRYABLE_INTERRUPTION,
+        (Ok(RESULT_CANCELLED), AndroidCloneStopReason::Pause) => RESULT_RETRYABLE_INTERRUPTION,
         (Ok(code), _) => code,
         (Err(_), _) => RESULT_TERMINAL_FAILURE,
     }
@@ -123,7 +121,7 @@ fn pause_job(job_id: &str) -> bool {
     let Some(job) = active.get(job_id) else {
         return false;
     };
-    job.stop_reason.store(STOP_PAUSE, Ordering::SeqCst);
+    job.stop_reason.request_pause();
     job.cancellation.cancel();
     true
 }
@@ -142,7 +140,7 @@ fn cancel_and_cleanup_job(job_id: &str, files_root: &str) -> bool {
         return false;
     };
     if let Some(job) = active.get(job_id) {
-        job.stop_reason.store(STOP_CANCEL, Ordering::SeqCst);
+        job.stop_reason.request_cancel();
         job.cancellation.cancel();
         true
     } else {
@@ -175,6 +173,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_resume(
     _class: JClass,
     job_id: JString,
     files_root: JString,
+    progress_listener: JObject,
 ) -> jint {
     let Some(job_id) = java_string(&mut environment, &job_id) else {
         return RESULT_TERMINAL_FAILURE;
@@ -182,7 +181,31 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_resume(
     let Some(files_root) = java_string(&mut environment, &files_root) else {
         return RESULT_TERMINAL_FAILURE;
     };
-    std::panic::catch_unwind(|| resume_job(&job_id, &files_root)).unwrap_or(RESULT_TERMINAL_FAILURE)
+    let mut last_reported = 0_u64;
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        resume_job(&job_id, &files_root, |transferred_bytes| {
+            if transferred_bytes <= last_reported
+                || (last_reported != 0
+                    && transferred_bytes - last_reported < NOTIFICATION_PROGRESS_STEP_BYTES)
+            {
+                return;
+            }
+            last_reported = transferred_bytes;
+            let transferred_bytes = transferred_bytes.min(i64::MAX as u64) as jlong;
+            if environment
+                .call_method(
+                    &progress_listener,
+                    "onProgress",
+                    "(J)V",
+                    &[JValue::Long(transferred_bytes)],
+                )
+                .is_err()
+            {
+                let _ = environment.exception_clear();
+            }
+        })
+    }))
+    .unwrap_or(RESULT_TERMINAL_FAILURE)
 }
 
 #[no_mangle]
