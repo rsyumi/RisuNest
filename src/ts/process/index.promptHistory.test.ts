@@ -484,7 +484,7 @@ describe('sendChat prompt history characterization', () => {
         expect(session.activePinReasons).toEqual([])
     })
 
-    it('rejects an active session for a different chat that aliases the same message array', async () => {
+    it('fails closed for an active session on another chat that aliases the same message array', async () => {
         setDatabaseLite(makeDatabase())
         const selectedCharacter = DBState.db.characters[0] as character
         const sharedMessages: Message[] = [
@@ -524,9 +524,7 @@ describe('sendChat prompt history characterization', () => {
         testState.activeSession = session
         testState.runTrigger.mockResolvedValue(null)
 
-        await expect(sendChat(-1, { preview: true })).rejects.toMatchObject({
-            name: 'ConversationSessionInactiveError',
-        })
+        await expect(sendChat(-1, { preview: true })).resolves.toBe(false)
 
         expect(sessionChat.scriptstate).toBeUndefined()
         expect(selectedChat.scriptstate).toBeUndefined()

@@ -326,6 +326,24 @@ describe('sendChat generation session integration', () => {
         })
     })
 
+    it('fails closed before assigning IDs when the active session owns another chat', async () => {
+        const source = makeChat([{ role: 'user', data: 'must remain unchanged' }])
+        const { currentCharacter } = installDatabase(source)
+        const otherChat = makeChat([{ role: 'user', data: 'other', chatId: 'other' }])
+        otherChat.id = 'chat-b'
+        mocks.session = new ActiveConversationSession({
+            characterId: currentCharacter.chaId,
+            conversationId: otherChat.id,
+            conversation: otherChat,
+            storeRevision: 1,
+        })
+
+        await expect(sendChat()).resolves.toBe(false)
+
+        expect(source.message).toEqual([{ role: 'user', data: 'must remain unchanged' }])
+        expect(mocks.modelRequestCount).toBe(0)
+    })
+
     it('publishes a trigger clone through a fresh fallback and preserves final action order', async () => {
         const { session } = installDatabase()
         DBState.db.igpPrompt = 'append emotion'

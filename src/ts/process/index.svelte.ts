@@ -313,12 +313,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     selectedChat = nowChatroom.chatPage
     const selectedConversation = nowChatroom.chats[selectedChat]
     const activeSession = getActiveConversationSession()
+    if (
+        activeSession &&
+        !activeSession.matchesConversation(nowChatroom.chaId, selectedConversation)
+    ) return false
     ensureCurrentConversationMessageIds(
         nowChatroom,
         selectedConversation,
-        activeSession?.matchesConversation(nowChatroom.chaId, selectedConversation)
-            ? activeSession
-            : null,
+        activeSession,
         v4,
     )
     
