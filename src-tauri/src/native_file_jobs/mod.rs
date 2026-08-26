@@ -4715,7 +4715,7 @@ mod tests {
             "replacements": { "local": "remote" },
             "session": "session-1",
             "saveDate": "save-date",
-            "credential": { "kind": "risuAuth", "token": "private-token" }
+            "credential": { "kind": "risu-auth", "token": "private-token" }
         }))
         .unwrap();
 
