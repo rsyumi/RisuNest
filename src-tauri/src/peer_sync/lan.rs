@@ -224,6 +224,7 @@ struct ClaimState {
 
 struct LanShared {
     session: PreparedCloneSession,
+    manifest_bytes: Arc<[u8]>,
     claim: Mutex<Option<ClaimState>>,
     devices: Mutex<BTreeMap<String, DeviceState>>,
 }
@@ -239,6 +240,7 @@ impl LanCloneHost {
     pub fn prepare(session: PreparedCloneSession) -> Self {
         Self {
             shared: Arc::new(LanShared {
+                manifest_bytes: Arc::from(session.manifest_bytes()),
                 session,
                 claim: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
@@ -388,7 +390,6 @@ fn handle_request(request: Request, shared: &LanShared) -> Result<(), PeerSyncEr
         if request.method() != &Method::Get {
             return respond_empty(request, 405);
         }
-        let file = std::fs::File::open(shared.session.root().join("manifest.json"))?;
         return request
             .respond(
                 Response::new(
@@ -397,7 +398,7 @@ fn handle_request(request: Request, shared: &LanShared) -> Result<(), PeerSyncEr
                         header("content-type", "application/json")?,
                         header("etag", &quoted(shared.session.manifest_id()))?,
                     ],
-                    file,
+                    io::Cursor::new(Arc::clone(&shared.manifest_bytes)),
                     Some(shared.session.manifest_bytes().len()),
                     None,
                 )

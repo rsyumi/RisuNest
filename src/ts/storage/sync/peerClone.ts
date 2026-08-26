@@ -119,6 +119,7 @@ export function reducePeerCloneState(state: PeerCloneState, event: PeerCloneEven
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const sha256Pattern = /^[0-9a-f]{64}$/
+const claimPattern = /^[0-9a-f]{64}$/
 const hostnamePattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/i
 const maximumPairingUriLength = 8192
 const maximumEndpointLength = 2048
@@ -209,7 +210,7 @@ export function parsePeerCloneUri(value: string): PeerClonePairing {
     } catch {
         return invalidPairingUri()
     }
-    if (claim.length === 0 || claim.length > maximumClaimLength) return invalidPairingUri()
+    if (claim.length > maximumClaimLength || !claimPattern.test(claim)) return invalidPairingUri()
     return {
         endpoint: endpointFor(sessionId, endpointValue),
         sessionId,
@@ -273,6 +274,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         },
         async prepare(request: Record<string, unknown> = {}): Promise<PeerCloneSourceStatus> {
             supported()
+            await requireSourceReady()
             const result = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_prepare', request)
             if (result.sessionId) state = reducePeerCloneState(state, { type: 'source-prepared', sessionId: result.sessionId })
             return result

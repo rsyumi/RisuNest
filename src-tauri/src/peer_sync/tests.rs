@@ -536,6 +536,11 @@ fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_re
     let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
     let client = LanCloneClient::claim(&endpoint, &pairing.session_id, &pairing.claim).unwrap();
     assert!(!client.session_url().contains(&pairing.claim));
+    fs::write(
+        session_root.path().join("manifest.json"),
+        b"mutated-after-start",
+    )
+    .unwrap();
     let manifest = client.fetch_manifest().unwrap();
     assert_eq!(manifest, host.manifest().canonical_bytes().unwrap());
     let object = host.manifest().payloads[0].object.clone();
