@@ -1003,6 +1003,19 @@ impl PersistentStore {
         })
     }
 
+    pub(crate) fn open_native_job_store(&self) -> StoreResult<Self> {
+        let mut connection = Connection::open(&self.database_path)?;
+        schema::initialize(&mut connection)?;
+        Ok(Self {
+            revision_leases: HashMap::new(),
+            active_readers: Arc::clone(&self.active_readers),
+            connection,
+            repository_root: self.repository_root.clone(),
+            database_path: self.database_path.clone(),
+            snapshots_dir: self.snapshots_dir.clone(),
+        })
+    }
+
     pub(crate) fn revision(&self) -> StoreResult<i64> {
         current_revision(&self.connection)
     }

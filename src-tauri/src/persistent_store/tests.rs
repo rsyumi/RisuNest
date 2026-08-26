@@ -3766,6 +3766,46 @@ fn two_revision_leases_remain_independent_until_each_is_released() {
 }
 
 #[test]
+fn native_job_store_uses_an_independent_connection_and_shared_reader_registry() {
+    let (_directory, mut store, _) = open_fixture();
+    let mut job_store = store
+        .open_native_job_store()
+        .expect("open native job store");
+    let lease = job_store
+        .acquire_revision(1)
+        .expect("acquire native job revision lease");
+
+    assert_eq!(store.lease_diagnostics().active_count, 1);
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Writer revision" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            asset_owner_heads: None,
+            plugin_storage: None,
+        })
+        .expect("advance live store while native job lease remains open");
+    assert_eq!(
+        job_store
+            .read_root(Some(&lease.lease))
+            .expect("read pinned root from native job connection")
+            .value["username"],
+        "Fixture User"
+    );
+
+    job_store
+        .release_revision(&lease.lease)
+        .expect("release native job revision lease");
+    assert_eq!(store.lease_diagnostics().active_count, 0);
+}
+
+#[test]
 fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
     let (_directory, mut store, database) = open_fixture();
     store
