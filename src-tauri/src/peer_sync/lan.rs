@@ -522,10 +522,24 @@ struct ClaimState {
 }
 
 #[cfg(desktop)]
+struct TunnelProbeState {
+    digest: [u8; 32],
+    expected_body: [u8; 32],
+}
+
+#[cfg(desktop)]
+pub(crate) struct TunnelOriginProbe {
+    pub(crate) path_prefix: String,
+    pub(crate) path: String,
+    pub(crate) expected_body: [u8; 32],
+}
+
+#[cfg(desktop)]
 struct LanShared {
     session: PreparedCloneSession,
     manifest_bytes: Arc<[u8]>,
     claim: Mutex<Option<ClaimState>>,
+    tunnel_probe: Mutex<Option<TunnelProbeState>>,
     devices: Mutex<BTreeMap<String, DeviceState>>,
 }
 
@@ -546,6 +560,7 @@ impl LanCloneHost {
                 manifest_bytes: Arc::from(session.manifest_bytes()),
                 session,
                 claim: Mutex::new(None),
+                tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
             }),
             address: None,
@@ -609,6 +624,39 @@ impl LanCloneHost {
         self.shared.session.manifest()
     }
 
+    pub(crate) fn issue_tunnel_probe(&self) -> Result<TunnelOriginProbe, PeerSyncError> {
+        let Some(address) = self.address else {
+            return Err(PeerSyncError::Protocol(
+                "tunnel origin is not running".to_owned(),
+            ));
+        };
+        if address.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) || address.port() == 0 {
+            return Err(PeerSyncError::Protocol(
+                "tunnel origin is not bound to IPv4 loopback".to_owned(),
+            ));
+        }
+        let secret = random_secret()?;
+        let expected_body = random_secret()?;
+        *self.shared.tunnel_probe.lock().unwrap() = Some(TunnelProbeState {
+            digest: digest(&secret),
+            expected_body,
+        });
+        let path_prefix = format!(
+            "/v1/sessions/{}/tunnel-check",
+            self.shared.session.manifest().session_id
+        );
+        let path = format!("{path_prefix}/{}", hex::encode(secret));
+        Ok(TunnelOriginProbe {
+            path_prefix,
+            path,
+            expected_body,
+        })
+    }
+
+    pub(crate) fn clear_tunnel_probe(&self) {
+        *self.shared.tunnel_probe.lock().unwrap() = None;
+    }
+
     pub fn devices(&self) -> Vec<LanDevice> {
         self.shared
             .devices
@@ -643,6 +691,7 @@ impl LanCloneHost {
                 .map_err(|_| PeerSyncError::Transport("LAN server thread panicked".to_owned()))??;
         }
         *self.shared.claim.lock().unwrap() = None;
+        self.clear_tunnel_probe();
         self.shared.devices.lock().unwrap().clear();
         self.address = None;
         self.stopped = None;
@@ -930,6 +979,14 @@ fn handle_request(
     stopped: &AtomicBool,
 ) -> Result<(), PeerSyncError> {
     let prefix = format!("/v1/sessions/{}", shared.session.manifest().session_id);
+    let tunnel_probe_prefix = format!("{prefix}/tunnel-check/");
+    if let Some(candidate) = request
+        .url
+        .strip_prefix(&tunnel_probe_prefix)
+        .map(str::to_owned)
+    {
+        return tunnel_probe(stream, request, shared, &candidate);
+    }
     if request.url == format!("{prefix}/claim") {
         return claim(stream, request, shared);
     }
@@ -969,6 +1026,45 @@ fn handle_request(
         "GET" => range(stream, &request, shared, &object, stopped),
         _ => respond_empty(stream, 405),
     }
+}
+
+#[cfg(desktop)]
+fn tunnel_probe(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+    candidate: &str,
+) -> Result<(), PeerSyncError> {
+    if request.method != "GET"
+        || request.authorization.is_some()
+        || request.range.is_some()
+        || request.range_count != 0
+        || !request.body.is_empty()
+        || candidate.len() != 64
+        || candidate.contains('/')
+    {
+        return respond_empty(stream, 404);
+    }
+    let Ok(secret) = hex::decode(candidate) else {
+        return respond_empty(stream, 404);
+    };
+    if secret.len() != 32 {
+        return respond_empty(stream, 404);
+    }
+    let mut probe = shared.tunnel_probe.lock().unwrap();
+    let Some(current) = probe.as_ref() else {
+        return respond_empty(stream, 404);
+    };
+    if !constant_time_eq(&current.digest, &digest(&secret)) {
+        return respond_empty(stream, 404);
+    }
+    let expected_body = probe.take().expect("checked tunnel probe").expected_body;
+    respond_bytes(
+        stream,
+        200,
+        &[("Content-Type", "application/octet-stream")],
+        &expected_body,
+    )
 }
 
 #[cfg(desktop)]

@@ -477,6 +477,72 @@ fn quick_tunnel_origin_host_binds_only_ipv4_loopback() {
 }
 
 #[test]
+fn named_tunnel_probe_requires_a_started_loopback_host_and_is_one_time() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+
+    assert!(host.issue_tunnel_probe().is_err());
+    host.start_quick_tunnel_origin().unwrap();
+    let address = host.address().unwrap();
+    let probe = host.issue_tunnel_probe().unwrap();
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{}", address.port());
+
+    assert_eq!(
+        client
+            .get(format!("{base}{}/wrong", probe.path_prefix))
+            .send()
+            .unwrap()
+            .status(),
+        404
+    );
+    let response = client.get(format!("{base}{}", probe.path)).send().unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().unwrap().as_ref(), probe.expected_body);
+    assert_eq!(
+        client
+            .get(format!("{base}{}", probe.path))
+            .send()
+            .unwrap()
+            .status(),
+        404
+    );
+    host.stop().unwrap();
+}
+
+#[test]
+fn named_tunnel_public_seam_refuses_to_launch_before_loopback_source_start() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+
+    let failure = match super::tunnel::start_named_desktop_tunnel(
+        host,
+        "eyJ-remotely-managed-tunnel-token".to_owned(),
+        "https://sync.example.com",
+    ) {
+        Ok(_) => panic!("named tunnel started before its source host"),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        failure.error_message(),
+        "tunnel origin must be 127.0.0.1 with a nonzero port"
+    );
+    let host = match failure.into_peer_session() {
+        Ok(host) => host,
+        Err(_) => panic!("source ownership was not recoverable"),
+    };
+    assert_eq!(host.address(), None);
+}
+
+#[test]
 fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();

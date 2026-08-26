@@ -8,12 +8,21 @@ use tempfile::tempdir;
 
 #[derive(Default)]
 struct FakeState {
-    launches: Vec<(PathBuf, Vec<OsString>, Vec<&'static str>)>,
+    launches: Vec<LaunchRecord>,
     readiness_calls: Vec<(Duration, usize)>,
+    named_origin_verifications: usize,
     stop_timeouts: Vec<Duration>,
     session_revokes: usize,
     process_drops: usize,
     peer_session_drops: usize,
+}
+
+struct LaunchRecord {
+    executable: PathBuf,
+    args: Vec<OsString>,
+    env_remove: Vec<&'static str>,
+    token_env_set: bool,
+    origin: String,
 }
 
 struct FakeDiscovery {
@@ -43,13 +52,15 @@ impl TunnelProcessLauncher for FakeLauncher {
     fn launch(
         &self,
         executable: &VerifiedExecutable,
-        launch: &LaunchSpec,
+        launch: LaunchSpec,
     ) -> Result<Self::Process, TunnelError> {
-        self.state.lock().unwrap().launches.push((
-            executable.as_path().to_owned(),
-            launch.args.clone(),
-            launch.env_remove.to_vec(),
-        ));
+        self.state.lock().unwrap().launches.push(LaunchRecord {
+            executable: executable.as_path().to_owned(),
+            args: launch.args,
+            env_remove: launch.env_remove.to_vec(),
+            token_env_set: launch.token_env.is_some(),
+            origin: launch.origin,
+        });
         if let Some(error) = &self.launch_error {
             return Err(TunnelError::Launch(error.clone()));
         }
@@ -101,12 +112,22 @@ struct FakePeerSession {
     id: u64,
     state: Arc<Mutex<FakeState>>,
     revoke_results: VecDeque<Result<(), String>>,
+    named_origin_verification: Result<(), String>,
 }
 
 impl PeerSession for FakePeerSession {
     fn revoke(&mut self) -> Result<(), String> {
         self.state.lock().unwrap().session_revokes += 1;
         self.revoke_results.pop_front().unwrap_or(Ok(()))
+    }
+
+    fn verify_named_origin(
+        &mut self,
+        _expected_public_base_url: &Url,
+        _timeout: Duration,
+    ) -> Result<(), String> {
+        self.state.lock().unwrap().named_origin_verifications += 1;
+        self.named_origin_verification.clone()
     }
 }
 
@@ -132,6 +153,7 @@ fn exit_status(code: i32) -> ExitStatus {
 fn ready() -> TunnelReady {
     TunnelReady {
         transport_url: Url::parse("https://example-id.trycloudflare.com").unwrap(),
+        verify_named_origin: false,
     }
 }
 
@@ -171,6 +193,7 @@ fn peer(state: &Arc<Mutex<FakeState>>, id: u64) -> FakePeerSession {
         id,
         state: Arc::clone(state),
         revoke_results: VecDeque::new(),
+        named_origin_verification: Ok(()),
     }
 }
 
@@ -230,6 +253,108 @@ fn quick_tunnel_has_only_loopback_transport_and_no_token_sources() {
     assert_eq!(launch.origin, "http://127.0.0.1:32145");
     assert_eq!(launch.env_remove, ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"]);
     assert!(!launch.args.iter().any(|arg| arg == "--token"));
+    assert!(launch.token_env.is_none());
+}
+
+#[test]
+fn named_tunnel_uses_only_child_environment_for_the_token() {
+    let secret = "eyJ-remotely-managed-tunnel-token";
+    let mode = TunnelMode::named(secret.to_owned(), "https://sync.example.com").unwrap();
+    let launch = mode.launch(loopback_origin()).unwrap();
+
+    assert_eq!(launch.args, ["tunnel", "--no-autoupdate", "run"]);
+    assert_eq!(launch.origin, "http://127.0.0.1:32145");
+    assert_eq!(launch.env_remove, ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"]);
+    assert!(launch.token_env.is_some());
+    assert!(!launch
+        .args
+        .iter()
+        .any(|argument| argument.to_string_lossy().contains(secret)));
+}
+
+#[test]
+fn named_tunnel_accepts_only_bounded_tokens_and_bare_public_https_urls() {
+    for (token, url) in [
+        ("short", "https://sync.example.com"),
+        (
+            "eyJ-remotely-managed-tunnel-token",
+            "http://sync.example.com",
+        ),
+        (
+            "eyJ-remotely-managed-tunnel-token",
+            "https://user@sync.example.com",
+        ),
+        (
+            "eyJ-remotely-managed-tunnel-token",
+            "https://sync.example.com/path",
+        ),
+        ("eyJ-remotely-managed-tunnel-token", "https://127.0.0.1"),
+    ] {
+        assert!(matches!(
+            TunnelMode::named(token.to_owned(), url),
+            Err(TunnelError::InvalidNamedConfiguration)
+        ));
+    }
+}
+
+#[test]
+fn named_tunnel_verifies_the_remote_route_before_becoming_ready() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let process = fake_process(
+        &state,
+        Ok(TunnelReady::named(
+            Url::parse("https://sync.example.com").unwrap(),
+        )),
+    );
+    let mut running = expect_running(
+        adapter(&state, process).start(
+            TunnelMode::named(
+                "eyJ-remotely-managed-tunnel-token".to_owned(),
+                "https://sync.example.com",
+            )
+            .unwrap(),
+            loopback_origin(),
+            peer(&state, 60),
+        ),
+    );
+
+    assert_eq!(state.lock().unwrap().named_origin_verifications, 1);
+    running.stop(DEFAULT_STOP_TIMEOUT).unwrap();
+}
+
+#[test]
+fn named_origin_mismatch_stops_the_process_without_exposing_probe_details() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let process = fake_process(
+        &state,
+        Ok(TunnelReady::named(
+            Url::parse("https://sync.example.com").unwrap(),
+        )),
+    );
+    let mut owned_peer = peer(&state, 61);
+    owned_peer.named_origin_verification =
+        Err("https://sync.example.com/v1/sessions/secret/tunnel-check/probe-secret".into());
+
+    let failure = expect_failure(
+        adapter(&state, process).start(
+            TunnelMode::named(
+                "eyJ-remotely-managed-tunnel-token".to_owned(),
+                "https://sync.example.com",
+            )
+            .unwrap(),
+            loopback_origin(),
+            owned_peer,
+        ),
+    );
+
+    assert_eq!(
+        failure.error.to_string(),
+        "cloudflared did not become ready: named tunnel origin verification failed"
+    );
+    assert!(!format!("{:?}", failure.error).contains("probe-secret"));
+    assert_eq!(state.lock().unwrap().stop_timeouts, [DEFAULT_STOP_TIMEOUT]);
+    drop(failure);
+    assert_eq!(state.lock().unwrap().session_revokes, 1);
 }
 
 #[test]
@@ -275,6 +400,30 @@ fn readiness_output_is_bounded_to_the_configured_tail() {
     output.push(b"6789abcdef");
 
     assert_eq!(output.text(), "89abcdef");
+}
+
+#[test]
+fn named_readiness_errors_never_return_process_output() {
+    let mut output = BoundedOutput::new(OUTPUT_LIMIT);
+    output.push(
+        b"token=eyJ-secret https://sync.example.com/v1/sessions/id/tunnel-check/probe-secret",
+    );
+
+    assert_eq!(
+        safe_readiness_error_output(
+            &ProcessReadiness::Named(Url::parse("https://sync.example.com").unwrap()),
+            &output,
+        ),
+        ""
+    );
+}
+
+#[test]
+fn named_readiness_requires_a_registered_connector_marker() {
+    assert!(!named_tunnel_registered("INF Starting tunnel"));
+    assert!(named_tunnel_registered(
+        "INF Registered tunnel connection connIndex=0 protocol=quic"
+    ));
 }
 
 #[test]
@@ -449,8 +598,8 @@ fn launch_failure_returns_peer_session_without_exposing_a_token() {
     let returned = expect_peer(failure);
 
     assert_eq!(returned.id, 42);
-    let launches = &state.lock().unwrap().launches;
-    assert!(!launches[0].1.iter().any(|arg| arg == "--token"));
+    let state = state.lock().unwrap();
+    assert!(!state.launches[0].args.iter().any(|arg| arg == "--token"));
 }
 
 #[test]

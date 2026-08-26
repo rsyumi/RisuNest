@@ -17,15 +17,22 @@ const SUPERVISOR_POLL: Duration = Duration::from_millis(25);
 const SYSTEM_POLL: Duration = Duration::from_millis(10);
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const DROP_CLEANUP_ATTEMPTS: usize = 3;
+const NAMED_ORIGIN_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
+const NAMED_ORIGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const NAMED_ORIGIN_RETRY: Duration = Duration::from_millis(100);
+const NAMED_TUNNEL_REGISTERED: &str = "Registered tunnel connection";
+const MIN_TUNNEL_TOKEN_BYTES: usize = 32;
+const MAX_TUNNEL_TOKEN_BYTES: usize = 8 * 1024;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum TunnelError {
+pub(crate) enum TunnelError {
     CloudflaredNotInstalled,
     UntrustedCloudflared,
     InvalidOrigin,
+    InvalidNamedConfiguration,
     Launch(String),
     Readiness {
         reason: String,
@@ -47,7 +54,10 @@ impl fmt::Display for TunnelError {
                 formatter.write_str("cloudflared is not in a trusted installed location")
             }
             Self::InvalidOrigin => {
-                formatter.write_str("quick tunnel origin must be 127.0.0.1 with a nonzero port")
+                formatter.write_str("tunnel origin must be 127.0.0.1 with a nonzero port")
+            }
+            Self::InvalidNamedConfiguration => {
+                formatter.write_str("invalid named tunnel configuration")
             }
             Self::Launch(error) => write!(formatter, "failed to launch cloudflared: {error}"),
             Self::Readiness { reason, .. } => {
@@ -217,18 +227,62 @@ impl CloudflaredDiscovery for PathCloudflaredDiscovery {
     }
 }
 
-enum TunnelMode {
+pub(crate) enum TunnelMode {
     Quick,
+    Named {
+        token: String,
+        expected_public_base_url: Url,
+    },
 }
 
 struct LaunchSpec {
     args: Vec<OsString>,
     env_remove: [&'static str; 2],
+    token_env: Option<String>,
     origin: String,
+    readiness: ProcessReadiness,
+}
+
+enum ProcessReadiness {
+    Quick,
+    Named(Url),
 }
 
 impl TunnelMode {
-    fn launch(&self, origin: SocketAddr) -> Result<LaunchSpec, TunnelError> {
+    pub(crate) fn named(
+        token: String,
+        expected_public_base_url: &str,
+    ) -> Result<Self, TunnelError> {
+        if token.len() < MIN_TUNNEL_TOKEN_BYTES
+            || token.len() > MAX_TUNNEL_TOKEN_BYTES
+            || !token.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(TunnelError::InvalidNamedConfiguration);
+        }
+        let expected_public_base_url = Url::parse(expected_public_base_url)
+            .map_err(|_| TunnelError::InvalidNamedConfiguration)?;
+        let is_public_domain = matches!(
+            expected_public_base_url.host(),
+            Some(url::Host::Domain(host)) if host.contains('.') && !host.eq_ignore_ascii_case("localhost")
+        );
+        if expected_public_base_url.scheme() != "https"
+            || !is_public_domain
+            || !expected_public_base_url.username().is_empty()
+            || expected_public_base_url.password().is_some()
+            || expected_public_base_url.port().is_some()
+            || !matches!(expected_public_base_url.path(), "" | "/")
+            || expected_public_base_url.query().is_some()
+            || expected_public_base_url.fragment().is_some()
+        {
+            return Err(TunnelError::InvalidNamedConfiguration);
+        }
+        Ok(Self::Named {
+            token,
+            expected_public_base_url,
+        })
+    }
+
+    fn launch(self, origin: SocketAddr) -> Result<LaunchSpec, TunnelError> {
         let SocketAddr::V4(origin) = origin else {
             return Err(TunnelError::InvalidOrigin);
         };
@@ -237,25 +291,53 @@ impl TunnelMode {
         }
         let origin = format!("http://{origin}");
 
+        let (args, token_env, readiness) = match self {
+            Self::Quick => (
+                vec![
+                    "tunnel".into(),
+                    "--no-autoupdate".into(),
+                    "--url".into(),
+                    origin.clone().into(),
+                ],
+                None,
+                ProcessReadiness::Quick,
+            ),
+            Self::Named {
+                token,
+                expected_public_base_url,
+            } => (
+                vec!["tunnel".into(), "--no-autoupdate".into(), "run".into()],
+                Some(token),
+                ProcessReadiness::Named(expected_public_base_url),
+            ),
+        };
+
         Ok(LaunchSpec {
-            args: vec![
-                "tunnel".into(),
-                "--no-autoupdate".into(),
-                "--url".into(),
-                origin.clone().into(),
-            ],
+            args,
             env_remove: ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"],
+            token_env,
             origin,
+            readiness,
         })
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct TunnelReady {
+pub(crate) struct TunnelReady {
     transport_url: Url,
+    verify_named_origin: bool,
 }
 
-trait TunnelProcess: Send + 'static {
+impl TunnelReady {
+    fn named(transport_url: Url) -> Self {
+        Self {
+            transport_url,
+            verify_named_origin: true,
+        }
+    }
+}
+
+pub(crate) trait TunnelProcess: Send + 'static {
     fn wait_ready(
         &mut self,
         timeout: Duration,
@@ -271,12 +353,17 @@ trait TunnelProcessLauncher {
     fn launch(
         &self,
         executable: &VerifiedExecutable,
-        launch: &LaunchSpec,
+        launch: LaunchSpec,
     ) -> Result<Self::Process, TunnelError>;
 }
 
-trait PeerSession: Send + 'static {
+pub(crate) trait PeerSession: Send + 'static {
     fn revoke(&mut self) -> Result<(), String>;
+    fn verify_named_origin(
+        &mut self,
+        expected_public_base_url: &Url,
+        timeout: Duration,
+    ) -> Result<(), String>;
 }
 
 struct BoundedOutput {
@@ -345,10 +432,22 @@ fn parse_quick_tunnel_url(output: &str) -> Option<Url> {
     None
 }
 
-struct SystemTunnelProcess {
+fn safe_readiness_error_output(readiness: &ProcessReadiness, output: &BoundedOutput) -> String {
+    match readiness {
+        ProcessReadiness::Quick => output.text(),
+        ProcessReadiness::Named(_) => String::new(),
+    }
+}
+
+fn named_tunnel_registered(output: &str) -> bool {
+    output.contains(NAMED_TUNNEL_REGISTERED)
+}
+
+pub(crate) struct SystemTunnelProcess {
     child: Child,
     output_rx: Receiver<Vec<u8>>,
     output: BoundedOutput,
+    readiness: ProcessReadiness,
 }
 
 impl SystemTunnelProcess {
@@ -361,8 +460,12 @@ impl SystemTunnelProcess {
     fn exited_error(&self, status: ExitStatus) -> TunnelError {
         TunnelError::Readiness {
             reason: format!("process exited with {}", exit_label(status)),
-            output: self.output.text(),
+            output: self.safe_error_output(),
         }
+    }
+
+    fn safe_error_output(&self) -> String {
+        safe_readiness_error_output(&self.readiness, &self.output)
     }
 }
 
@@ -382,20 +485,33 @@ impl TunnelProcess for SystemTunnelProcess {
                 .try_wait()
                 .map_err(|error| TunnelError::Readiness {
                     reason: error.to_string(),
-                    output: self.output.text(),
+                    output: self.safe_error_output(),
                 })?
             {
                 self.capture_output();
                 return Err(self.exited_error(status));
             }
-            if let Some(transport_url) = parse_quick_tunnel_url(&self.output.text()) {
-                return Ok(TunnelReady { transport_url });
+            match &self.readiness {
+                ProcessReadiness::Quick => {
+                    if let Some(transport_url) = parse_quick_tunnel_url(&self.output.text()) {
+                        return Ok(TunnelReady {
+                            transport_url,
+                            verify_named_origin: false,
+                        });
+                    }
+                }
+                ProcessReadiness::Named(expected_public_base_url)
+                    if named_tunnel_registered(&self.output.text()) =>
+                {
+                    return Ok(TunnelReady::named(expected_public_base_url.clone()));
+                }
+                ProcessReadiness::Named(_) => {}
             }
             let now = Instant::now();
             if now >= deadline {
                 return Err(TunnelError::Readiness {
                     reason: "startup timeout".into(),
-                    output: self.output.text(),
+                    output: self.safe_error_output(),
                 });
             }
             let wait = deadline.saturating_duration_since(now).min(SYSTEM_POLL);
@@ -503,16 +619,26 @@ impl TunnelProcessLauncher for SystemTunnelProcessLauncher {
     fn launch(
         &self,
         executable: &VerifiedExecutable,
-        launch: &LaunchSpec,
+        launch: LaunchSpec,
     ) -> Result<Self::Process, TunnelError> {
+        let LaunchSpec {
+            args,
+            env_remove,
+            token_env,
+            origin: _,
+            readiness,
+        } = launch;
         let mut command = Command::new(executable.as_path());
         command
-            .args(&launch.args)
-            .env_remove(launch.env_remove[0])
-            .env_remove(launch.env_remove[1])
+            .args(args)
+            .env_remove(env_remove[0])
+            .env_remove(env_remove[1])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(token) = token_env {
+            command.env("TUNNEL_TOKEN", token);
+        }
         configure_no_window(&mut command);
 
         let mut child = command
@@ -533,6 +659,7 @@ impl TunnelProcessLauncher for SystemTunnelProcessLauncher {
             child,
             output_rx,
             output: BoundedOutput::new(OUTPUT_LIMIT),
+            readiness,
         })
     }
 }
@@ -546,7 +673,7 @@ fn configure_no_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn configure_no_window(_command: &mut Command) {}
 
-struct TunnelStartFailure<P: TunnelProcess, S: PeerSession> {
+pub(crate) struct TunnelStartFailure<P: TunnelProcess, S: PeerSession> {
     error: TunnelError,
     process: Option<P>,
     peer_session: Option<S>,
@@ -554,7 +681,11 @@ struct TunnelStartFailure<P: TunnelProcess, S: PeerSession> {
 }
 
 impl<P: TunnelProcess, S: PeerSession> TunnelStartFailure<P, S> {
-    fn into_peer_session(mut self) -> Result<S, Self> {
+    pub(crate) fn error_message(&self) -> String {
+        self.error.to_string()
+    }
+
+    pub(crate) fn into_peer_session(mut self) -> Result<S, Self> {
         if self.process.is_none() {
             Ok(self.peer_session.take().expect("peer session is owned"))
         } else {
@@ -636,7 +767,7 @@ where
         &self,
         mode: TunnelMode,
         origin: SocketAddr,
-        peer_session: S,
+        mut peer_session: S,
     ) -> Result<RunningTunnel, TunnelStartFailure<L::Process, S>>
     where
         S: PeerSession,
@@ -663,7 +794,7 @@ where
                 });
             }
         };
-        let mut process = match self.launcher.launch(&executable, &launch) {
+        let mut process = match self.launcher.launch(&executable, launch) {
             Ok(process) => process,
             Err(error) => {
                 return Err(TunnelStartFailure {
@@ -687,6 +818,23 @@ where
             }
         };
 
+        if ready.verify_named_origin
+            && peer_session
+                .verify_named_origin(&ready.transport_url, NAMED_ORIGIN_VERIFY_TIMEOUT)
+                .is_err()
+        {
+            let process_cleanup_error = process.stop(self.startup_cleanup_timeout).err();
+            return Err(TunnelStartFailure {
+                error: TunnelError::Readiness {
+                    reason: "named tunnel origin verification failed".into(),
+                    output: String::new(),
+                },
+                process: process_cleanup_error.as_ref().map(|_| process),
+                peer_session: Some(peer_session),
+                process_cleanup_error,
+            });
+        }
+
         Ok(RunningTunnel::spawn(process, peer_session, ready))
     }
 }
@@ -698,6 +846,95 @@ impl TunnelAdapter<PathCloudflaredDiscovery, SystemTunnelProcessLauncher> {
             SystemTunnelProcessLauncher,
         )
     }
+}
+
+fn verify_named_route(
+    expected_public_base_url: &Url,
+    probe: &super::lan::TunnelOriginProbe,
+    timeout: Duration,
+) -> Result<(), String> {
+    let probe_url = expected_public_base_url
+        .join(probe.path.trim_start_matches('/'))
+        .map_err(|_| "named tunnel origin verification failed".to_owned())?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(NAMED_ORIGIN_REQUEST_TIMEOUT)
+        .timeout(NAMED_ORIGIN_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| "named tunnel origin verification failed".to_owned())?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Ok(response) = client
+            .get(probe_url.clone())
+            .timeout(NAMED_ORIGIN_REQUEST_TIMEOUT)
+            .send()
+        {
+            if response.status() == reqwest::StatusCode::OK {
+                let mut body = Vec::new();
+                if response
+                    .take(probe.expected_body.len() as u64 + 1)
+                    .read_to_end(&mut body)
+                    .is_ok()
+                    && body.as_slice() == probe.expected_body
+                {
+                    return Ok(());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("named tunnel origin verification failed".to_owned());
+        }
+        thread::sleep(NAMED_ORIGIN_RETRY.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+impl PeerSession for super::LanCloneHost {
+    fn revoke(&mut self) -> Result<(), String> {
+        self.stop()
+            .map_err(|_| "peer session cleanup failed".to_owned())
+    }
+
+    fn verify_named_origin(
+        &mut self,
+        expected_public_base_url: &Url,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let probe = self
+            .issue_tunnel_probe()
+            .map_err(|_| "named tunnel origin verification failed".to_owned())?;
+        let result = verify_named_route(expected_public_base_url, &probe, timeout);
+        self.clear_tunnel_probe();
+        result
+    }
+}
+
+pub(crate) fn start_named_desktop_tunnel(
+    peer_session: super::LanCloneHost,
+    token: String,
+    expected_public_base_url: &str,
+) -> Result<RunningTunnel, TunnelStartFailure<SystemTunnelProcess, super::LanCloneHost>> {
+    let mode = match TunnelMode::named(token, expected_public_base_url) {
+        Ok(mode) => mode,
+        Err(error) => {
+            return Err(TunnelStartFailure {
+                error,
+                process: None,
+                peer_session: Some(peer_session),
+                process_cleanup_error: None,
+            });
+        }
+    };
+    let Some(origin) = peer_session.address() else {
+        return Err(TunnelStartFailure {
+            error: TunnelError::InvalidOrigin,
+            process: None,
+            peer_session: Some(peer_session),
+            process_cleanup_error: None,
+        });
+    };
+    TunnelAdapter::system().start(mode, origin, peer_session)
 }
 
 enum SupervisorCommand {
@@ -739,7 +976,7 @@ impl TerminalReason {
     }
 }
 
-struct RunningTunnel {
+pub(crate) struct RunningTunnel {
     ready: TunnelReady,
     command_tx: Option<Sender<SupervisorCommand>>,
     terminal_rx: Receiver<TerminalReason>,
@@ -764,11 +1001,11 @@ impl RunningTunnel {
         }
     }
 
-    fn transport_url(&self) -> &Url {
+    pub(crate) fn transport_url(&self) -> &Url {
         &self.ready.transport_url
     }
 
-    fn stop(&mut self, timeout: Duration) -> Result<(), TunnelError> {
+    pub(crate) fn stop(&mut self, timeout: Duration) -> Result<(), TunnelError> {
         let (response, result) = mpsc::channel();
         self.command_tx
             .as_ref()
