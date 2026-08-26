@@ -472,6 +472,8 @@ pub fn run() {
                 app_data_dir.join("native-file-jobs"),
             );
             app.manage(state);
+            #[cfg(target_os = "windows")]
+            app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("risuasset", |context, request, responder| {
@@ -559,6 +561,8 @@ pub fn run() {
             persistent_store::commands::pds_remove_app_kv,
             #[cfg(target_os = "windows")]
             regex_shadow::regex_execute_batch,
+            #[cfg(target_os = "windows")]
+            regex_shadow::regex_cancel_batch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

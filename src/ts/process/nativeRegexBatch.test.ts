@@ -29,7 +29,10 @@ const safePlan: RegexSafePlan = {
 function dependencies(
     invoke: NativeRegexBatchDependencies['invoke'],
 ): NativeRegexBatchDependencies {
-    return { invoke }
+    return {
+        invoke,
+        createRequestId: () => '11111111-1111-4111-8111-111111111111',
+    }
 }
 
 describe('native regex batch adapter', () => {
@@ -39,6 +42,7 @@ describe('native regex batch adapter', () => {
         await expect(executeNativeRegexBatch(safePlan, 'aaa', {}, dependencies(invoke)))
             .resolves.toEqual({ data: 'bbb', errors: [] })
         expect(invoke).toHaveBeenCalledWith('regex_execute_batch', {
+            requestId: '11111111-1111-4111-8111-111111111111',
             plan: safePlan,
             input: 'aaa',
         })
@@ -103,6 +107,33 @@ describe('native regex batch adapter', () => {
         resolveInvoke({ data: 'bbb', errors: [] })
 
         await expect(pending).rejects.toThrow('cancelled during native regex')
+    })
+
+    it('dispatches cooperative native cancellation for the active request', async () => {
+        const controller = new AbortController()
+        const requestId = '11111111-1111-4111-8111-111111111111'
+        const invoke = vi.fn((command: string) => command === 'regex_execute_batch'
+            ? new Promise(() => {})
+            : Promise.resolve(undefined))
+        const pending = executeNativeRegexBatch(
+            safePlan,
+            'aaa',
+            { signal: controller.signal },
+            {
+                invoke,
+                createRequestId: () => requestId,
+            },
+        )
+
+        controller.abort(new Error('cancelled native execution'))
+
+        await expect(pending).rejects.toThrow('cancelled native execution')
+        expect(invoke).toHaveBeenNthCalledWith(1, 'regex_execute_batch', {
+            requestId,
+            plan: safePlan,
+            input: 'aaa',
+        })
+        expect(invoke).toHaveBeenNthCalledWith(2, 'regex_cancel_batch', { requestId })
     })
 
     it('routes only the measured 500-rule and 256 KiB Windows Tauri boundary', async () => {

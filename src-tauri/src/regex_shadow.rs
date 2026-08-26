@@ -2,7 +2,11 @@ use regex::{Captures, Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 const REGEX_IR_NEST_LIMIT: usize = 29;
@@ -107,6 +111,62 @@ struct RegexShadowEvidence {
 
 #[derive(Debug)]
 struct RegexShadowFailure(&'static str);
+
+#[derive(Default)]
+pub(crate) struct RegexCancellationRegistry {
+    active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+}
+
+struct RegexCancellationRegistration {
+    request_id: String,
+    cancelled: Arc<AtomicBool>,
+    active: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+}
+
+impl RegexCancellationRegistry {
+    fn register(&self, request_id: &str) -> Result<RegexCancellationRegistration, String> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| "regex_shadow_registry".to_string())?;
+        if active.contains_key(request_id) {
+            return Err("regex_shadow_request_active".to_string());
+        }
+        active.insert(request_id.to_string(), Arc::clone(&cancelled));
+        Ok(RegexCancellationRegistration {
+            request_id: request_id.to_string(),
+            cancelled,
+            active: Arc::clone(&self.active),
+        })
+    }
+
+    fn cancel(&self, request_id: &str) -> Result<bool, String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "regex_shadow_registry".to_string())?;
+        let Some(cancelled) = active.get(request_id) else {
+            return Ok(false);
+        };
+        cancelled.store(true, Ordering::Relaxed);
+        Ok(true)
+    }
+}
+
+impl Drop for RegexCancellationRegistration {
+    fn drop(&mut self) {
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+        if active
+            .get(&self.request_id)
+            .is_some_and(|cancelled| Arc::ptr_eq(cancelled, &self.cancelled))
+        {
+            active.remove(&self.request_id);
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ExecutionControl<'a> {
@@ -466,12 +526,13 @@ fn execute_plan(
 fn execute_batch(
     plan: RegexShadowPlan,
     input: String,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<RegexShadowResult, RegexShadowFailure> {
     execute_plan_with_control(
         plan,
         &input,
         ExecutionControl {
-            cancelled: None,
+            cancelled,
             deadline: Some(Instant::now() + Duration::from_secs(2)),
             after_rule_compiled: None,
         },
@@ -480,13 +541,28 @@ fn execute_batch(
 
 #[tauri::command(async)]
 pub(crate) async fn regex_execute_batch(
+    request_id: String,
     plan: RegexShadowPlan,
     input: String,
+    registry: tauri::State<'_, RegexCancellationRegistry>,
 ) -> Result<RegexShadowResult, String> {
-    tauri::async_runtime::spawn_blocking(move || execute_batch(plan, input))
-        .await
-        .map_err(|_| "regex_shadow_join".to_string())?
-        .map_err(|error| error.0.to_string())
+    let execution = registry.register(&request_id)?;
+    let cancelled = Arc::clone(&execution.cancelled);
+    let result =
+        tauri::async_runtime::spawn_blocking(move || execute_batch(plan, input, Some(&cancelled)))
+            .await
+            .map_err(|_| "regex_shadow_join".to_string())?
+            .map_err(|error| error.0.to_string());
+    drop(execution);
+    result
+}
+
+#[tauri::command]
+pub(crate) fn regex_cancel_batch(
+    request_id: String,
+    registry: tauri::State<'_, RegexCancellationRegistry>,
+) -> Result<bool, String> {
+    registry.cancel(&request_id)
 }
 
 fn execute_plan_with_control(
@@ -799,8 +875,8 @@ mod tests {
         alternative, compare_shadow, compile_plan, compile_plan_with_control, execute_batch,
         execute_compiled_plan, execute_json, execute_plan, execute_plan_with_control,
         generated_plan, CompiledRegexShadowEntry, CompiledRegexShadowPlan, ExecutionControl,
-        RegexShadowAlternative, RegexShadowAtom, RegexShadowEntry, RegexShadowPattern,
-        RegexShadowPlan, ReplacementToken,
+        RegexCancellationRegistry, RegexShadowAlternative, RegexShadowAtom, RegexShadowEntry,
+        RegexShadowPattern, RegexShadowPlan, ReplacementToken,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -843,10 +919,34 @@ mod tests {
 
     #[test]
     fn batch_command_core_returns_only_the_complete_ordered_result() {
-        let result = execute_batch(literal_plan("b".to_string()), "aa".to_string()).unwrap();
+        let result = execute_batch(literal_plan("b".to_string()), "aa".to_string(), None).unwrap();
 
         assert_eq!(result.data, "bb");
         assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn cancellation_registry_targets_only_the_matching_active_request() {
+        let registry = RegexCancellationRegistry::default();
+        let execution = registry.register("request-a").unwrap();
+
+        assert!(!registry.cancel("request-b").unwrap());
+        assert!(registry.cancel("request-a").unwrap());
+        assert!(execution
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancellation_registration_is_released_when_execution_finishes() {
+        let registry = RegexCancellationRegistry::default();
+        {
+            let _execution = registry.register("request-a").unwrap();
+            assert_eq!(registry.active.lock().unwrap().len(), 1);
+        }
+
+        assert!(registry.active.lock().unwrap().is_empty());
+        assert!(!registry.cancel("request-a").unwrap());
     }
 
     #[test]

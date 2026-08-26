@@ -25,6 +25,7 @@ export interface NativeRegexBatchDependencies {
         command: string,
         args: Record<string, unknown>,
     ): Promise<unknown>
+    createRequestId?(): string
 }
 
 export interface NativeRegexBatchRouteDependencies extends NativeRegexBatchDependencies {
@@ -33,6 +34,7 @@ export interface NativeRegexBatchRouteDependencies extends NativeRegexBatchDepen
 
 const productionDependencies: NativeRegexBatchDependencies = {
     invoke: (command, args) => invoke(command, args),
+    createRequestId: () => globalThis.crypto.randomUUID(),
 }
 
 const productionRouteDependencies: NativeRegexBatchRouteDependencies = {
@@ -75,14 +77,18 @@ export async function executeNativeRegexBatch(
         throw abortReason(options.signal)
     }
 
-    const invocation = dependencies.invoke('regex_execute_batch', { plan, input })
+    const requestId = dependencies.createRequestId?.() ?? globalThis.crypto.randomUUID()
+    const invocation = dependencies.invoke('regex_execute_batch', { requestId, plan, input })
     let abortListener: (() => void) | undefined
     const response = options.signal === undefined
         ? await invocation
         : await Promise.race([
             invocation,
             new Promise<never>((_resolve, reject) => {
-                abortListener = () => reject(abortReason(options.signal!))
+                abortListener = () => {
+                    void dependencies.invoke('regex_cancel_batch', { requestId }).catch(() => {})
+                    reject(abortReason(options.signal!))
+                }
                 options.signal!.addEventListener('abort', abortListener, { once: true })
                 if (options.signal!.aborted) {
                     abortListener()
