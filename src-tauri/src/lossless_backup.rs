@@ -3188,6 +3188,92 @@ mod tests {
     }
 
     #[test]
+    fn low_level_restore_keeps_v1_packages_without_asset_authority_compatible() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package_with_extensions(
+            directory.path(),
+            "New",
+            b"new",
+            json!({ "fixtureUnknown": { "preserved": true } }),
+        );
+        let backup_path = directory.path().join("pre-replacement.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+
+        let report = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(report.revision, 2);
+        assert_eq!(store.materialize(None).unwrap()["username"], "New");
+        assert_eq!(
+            store.read_asset_repository_authority(None).unwrap().value,
+            AssetRepositoryAuthorityState::Legacy
+        );
+    }
+
+    #[test]
+    fn unsupported_asset_authority_extension_fails_without_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package_with_extensions(
+            directory.path(),
+            "New",
+            b"new",
+            json!({
+                "assetRepositoryAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-migration",
+                    "compatibilityHash": "ab".repeat(32),
+                    "unsupported": true,
+                }
+            }),
+        );
+        let backup_path = directory.path().join("pre-replacement.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::InvalidManifest);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+        assert_eq!(
+            store.read_asset_repository_authority(None).unwrap().value,
+            AssetRepositoryAuthorityState::V2 {
+                migration_id: "lossless-test-migration".to_owned(),
+                compatibility_hash: "ab".repeat(32),
+            }
+        );
+        assert!(!backup_path.exists());
+    }
+
+    #[test]
     fn restore_commits_activation_marker_with_lossless_generation() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("job-staging");
@@ -4672,6 +4758,44 @@ mod tests {
         payload_prefix: &[u8],
         owner_manifest_override: Option<Vec<u8>>,
     ) -> Vec<u8> {
+        production_package_with_owner_manifest_and_extensions(
+            root,
+            username,
+            payload_prefix,
+            owner_manifest_override,
+            json!({
+                "fixtureUnknown": { "preserved": true },
+                "assetRepositoryAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-migration",
+                    "compatibilityHash": "ab".repeat(32),
+                }
+            }),
+        )
+    }
+
+    fn production_package_with_extensions(
+        root: &Path,
+        username: &str,
+        payload_prefix: &[u8],
+        extensions: Value,
+    ) -> Vec<u8> {
+        production_package_with_owner_manifest_and_extensions(
+            root,
+            username,
+            payload_prefix,
+            None,
+            extensions,
+        )
+    }
+
+    fn production_package_with_owner_manifest_and_extensions(
+        root: &Path,
+        username: &str,
+        payload_prefix: &[u8],
+        owner_manifest_override: Option<Vec<u8>>,
+        extensions: Value,
+    ) -> Vec<u8> {
         let database_root = root.join(format!("package-database-{username}"));
         fs::create_dir(&database_root).unwrap();
         let mut source_store = PersistentStore::open(&database_root).unwrap();
@@ -4787,14 +4911,7 @@ mod tests {
                 .map(lossless_reference)
                 .collect(),
             vec![],
-            json!({
-                "fixtureUnknown": { "preserved": true },
-                "assetRepositoryAuthority": {
-                    "format": "v2",
-                    "migrationId": "lossless-test-migration",
-                    "compatibilityHash": "ab".repeat(32),
-                }
-            }),
+            extensions,
             &NeverCancelled,
         )
         .unwrap();
