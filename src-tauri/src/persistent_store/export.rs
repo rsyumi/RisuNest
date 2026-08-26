@@ -1,4 +1,4 @@
-use super::{compare_plugin_storage_keys, read_target, StoreError, StoreResult};
+use super::{compare_plugin_storage_keys, ReadTarget, StoreError, StoreResult};
 use flate2::{Compression, GzBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -54,12 +54,14 @@ enum ManagedFileKind {
 pub(super) fn create(
     connection: &Connection,
     snapshots_dir: &Path,
+    target: &ReadTarget,
     lease: &str,
     omit_account: bool,
 ) -> StoreResult<ExportedRisuSave> {
     create_controlled(
         connection,
         snapshots_dir,
+        target,
         lease,
         omit_account,
         || false,
@@ -70,13 +72,13 @@ pub(super) fn create(
 pub(crate) fn create_controlled(
     connection: &Connection,
     snapshots_dir: &Path,
+    target: &ReadTarget,
     lease: &str,
     omit_account: bool,
     is_cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(u64, u64, u64),
 ) -> StoreResult<ExportedRisuSave> {
     check_export_cancelled(&is_cancelled)?;
-    let target = read_target(connection, Some(lease))?;
     let exports_dir = export_directory(snapshots_dir)?;
     fs::create_dir_all(&exports_dir)?;
     let id = Uuid::new_v4();
@@ -393,10 +395,9 @@ fn read_bounded_ownership(file: File, size_hint: u64) -> StoreResult<ExportOwner
 
 #[cfg(feature = "official-publication-upload-pilot")]
 pub(super) fn open_for_upload(
-    connection: &Connection,
     snapshots_dir: &Path,
     path: &Path,
-) -> StoreResult<(File, u64)> {
+) -> StoreResult<(File, u64, String)> {
     let exports_dir = export_directory(snapshots_dir)?;
     let Some((id, ManagedFileKind::Completed)) = managed_file(path) else {
         return Err(StoreError::Validation {
@@ -422,57 +423,27 @@ pub(super) fn open_for_upload(
             message: "Official publication source ownership does not match its export".to_owned(),
         });
     }
-    read_target(connection, Some(&ownership.lease))?;
-    Ok((source, source_len))
+    Ok((source, source_len, ownership.lease))
 }
 
-pub(super) fn sweep_abandoned(
-    connection: &mut Connection,
-    snapshots_dir: &Path,
-) -> StoreResult<()> {
+pub(super) fn sweep_abandoned(snapshots_dir: &Path) -> StoreResult<()> {
     let exports_dir = export_directory(snapshots_dir)?;
     if !exports_dir.is_dir() {
         return Ok(());
     }
 
     let mut managed_paths = Vec::new();
-    let mut ownership = Vec::new();
     for entry in fs::read_dir(&exports_dir)? {
         let entry = entry?;
         let path = entry.path();
-        let Some((id, kind)) = managed_file(&path) else {
+        let Some((_id, _kind)) = managed_file(&path) else {
             continue;
         };
-        managed_paths.push(path.clone());
-        if kind != ManagedFileKind::Ownership || !entry.file_type()?.is_file() {
-            continue;
-        }
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-        let Ok(marker) = serde_json::from_slice::<ExportOwnership>(&bytes) else {
-            continue;
-        };
-        if marker.export_id != id || read_target(connection, Some(&marker.lease)).is_err() {
-            continue;
-        }
-        ownership.push((path, marker.lease));
+        managed_paths.push(path);
     }
 
     let mut primary_error = None;
-    let mut retained_markers = Vec::new();
-    for (path, lease) in ownership {
-        if let Err(error) = super::snapshot::release_revision(connection, &lease) {
-            retained_markers.push(path);
-            if primary_error.is_none() {
-                primary_error = Some(error);
-            }
-        }
-    }
     for path in managed_paths {
-        if retained_markers.contains(&path) {
-            continue;
-        }
         if let Err(error) = remove_file_if_exists(&path) {
             if primary_error.is_none() {
                 primary_error = Some(error);
@@ -930,7 +901,7 @@ mod tests {
     fn exports_current_framing_and_configured_trash_order_from_a_lease() {
         let (_directory, store, _revision, lease) = fixture();
 
-        let exported = create(&store.connection, &store.snapshots_dir, &lease, true).unwrap();
+        let exported = store.export_risu_save(&lease, true).unwrap();
         let blocks = read_blocks(Path::new(&exported.path));
 
         assert_eq!(
@@ -1022,8 +993,8 @@ mod tests {
     fn exports_deterministic_bytes_and_cleans_only_managed_files() {
         let (directory, store, _revision, lease) = fixture();
 
-        let first = create(&store.connection, &store.snapshots_dir, &lease, false).unwrap();
-        let second = create(&store.connection, &store.snapshots_dir, &lease, false).unwrap();
+        let first = store.export_risu_save(&lease, false).unwrap();
+        let second = store.export_risu_save(&lease, false).unwrap();
         assert_eq!(
             fs::read(&first.path).unwrap(),
             fs::read(&second.path).unwrap()
@@ -1093,14 +1064,11 @@ mod tests {
     #[test]
     fn opens_only_a_managed_completed_export_with_its_live_lease() {
         let (directory, mut store, _revision, lease) = fixture();
-        let exported = create(&store.connection, &store.snapshots_dir, &lease, false).unwrap();
+        let exported = store.export_risu_save(&lease, false).unwrap();
 
-        let (mut source, bytes) = open_for_upload(
-            &store.connection,
-            &store.snapshots_dir,
-            Path::new(&exported.path),
-        )
-        .unwrap();
+        let (mut source, bytes) = store
+            .open_risu_save_export_for_upload(Path::new(&exported.path))
+            .unwrap();
         let mut body = Vec::new();
         source.read_to_end(&mut body).unwrap();
         assert_eq!(bytes, exported.bytes);
@@ -1110,15 +1078,12 @@ mod tests {
             .path()
             .join(Path::new(&exported.path).file_name().unwrap());
         fs::copy(&exported.path, &external).unwrap();
-        assert!(open_for_upload(&store.connection, &store.snapshots_dir, &external).is_err());
+        assert!(store.open_risu_save_export_for_upload(&external).is_err());
 
         store.release_revision(&lease).unwrap();
-        assert!(open_for_upload(
-            &store.connection,
-            &store.snapshots_dir,
-            Path::new(&exported.path),
-        )
-        .is_err());
+        assert!(store
+            .open_risu_save_export_for_upload(Path::new(&exported.path))
+            .is_err());
         cleanup(&store.snapshots_dir, Path::new(&exported.path)).unwrap();
     }
 
@@ -1175,7 +1140,7 @@ mod tests {
             .unwrap();
         let lease = store.acquire_revision(committed.revision).unwrap().lease;
 
-        let exported = create(&store.connection, &store.snapshots_dir, &lease, false).unwrap();
+        let exported = store.export_risu_save(&lease, false).unwrap();
         let plugin_storage = &read_blocks(Path::new(&exported.path))
             .into_iter()
             .find(|block| block.block_type == PLUGIN_STORAGE)
@@ -1204,10 +1169,9 @@ mod tests {
 
     #[test]
     fn removes_partial_output_when_export_fails() {
-        let (_directory, store, _revision, lease) = fixture();
-        let generation = read_target(&store.connection, Some(&lease))
-            .unwrap()
-            .generation;
+        let (_directory, mut store, revision, lease) = fixture();
+        store.release_revision(&lease).unwrap();
+        let generation = super::super::active_generation(&store.connection).unwrap();
         store
             .connection
             .execute(
@@ -1216,7 +1180,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(create(&store.connection, &store.snapshots_dir, &lease, false).is_err());
+        let lease = store.acquire_revision(revision).unwrap().lease;
+        assert!(store.export_risu_save(&lease, false).is_err());
+        store.release_revision(&lease).unwrap();
 
         let exports_dir = store.snapshots_dir.parent().unwrap().join("exports");
         let remaining = fs::read_dir(exports_dir)
@@ -1226,16 +1192,10 @@ mod tests {
     }
 
     #[test]
-    fn reopen_reclaims_export_owned_lease_but_preserves_unrelated_fresh_lease() {
+    fn reopen_reclaims_export_files_and_invalidates_every_runtime_lease() {
         let (directory, mut store, revision, export_lease) = fixture();
         let unrelated_lease = store.acquire_revision(revision).unwrap().lease;
-        let exported = create(
-            &store.connection,
-            &store.snapshots_dir,
-            &export_lease,
-            false,
-        )
-        .unwrap();
+        let exported = store.export_risu_save(&export_lease, false).unwrap();
         let exported_path = PathBuf::from(&exported.path);
         let ownership_path = exported_path.with_extension("lease");
         assert!(ownership_path.is_file());
@@ -1244,7 +1204,7 @@ mod tests {
             .contains(&export_lease));
 
         drop(store);
-        let mut reopened = PersistentStore::open(directory.path()).unwrap();
+        let reopened = PersistentStore::open(directory.path()).unwrap();
 
         assert!(!exported_path.exists());
         assert!(!ownership_path.exists());
@@ -1252,8 +1212,10 @@ mod tests {
             reopened.read_root(Some(&export_lease)),
             Err(StoreError::SnapshotReleased)
         ));
-        assert!(reopened.read_root(Some(&unrelated_lease)).is_ok());
-        reopened.release_revision(&unrelated_lease).unwrap();
+        assert!(matches!(
+            reopened.read_root(Some(&unrelated_lease)),
+            Err(StoreError::SnapshotReleased)
+        ));
     }
 
     #[test]

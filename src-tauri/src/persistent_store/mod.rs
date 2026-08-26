@@ -8,19 +8,25 @@ mod schema;
 mod snapshot;
 
 pub(crate) use commands::PersistentStoreState;
+pub(crate) use snapshot::RevisionReadLease;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 pub(super) type StoreResult<T> = Result<T, StoreError>;
 
 pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
 pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
-// Add every generation-scoped record family here so lease COW and cleanup cannot omit it.
+// Add every generation-scoped record family here so staged moves and cleanup cannot omit it.
 pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ("root", "value"),
     (
@@ -641,12 +647,15 @@ pub(crate) enum CheckpointMode {
     Truncate,
 }
 
+#[derive(Clone)]
 pub(super) struct ReadTarget {
     pub(super) revision: i64,
     pub(super) generation: String,
 }
 
 pub(crate) struct PersistentStore {
+    revision_leases: HashMap<String, snapshot::RevisionReadLease>,
+    active_readers: Arc<snapshot::ActiveReaderRegistry>,
     connection: Connection,
     database_path: PathBuf,
     snapshots_dir: PathBuf,
@@ -668,20 +677,21 @@ pub(crate) struct PreparedRisuSaveExport {
     pub(crate) revision: i64,
     pub(crate) lease: String,
     pub(crate) snapshots_dir: PathBuf,
-    connection: Option<Connection>,
+    database_path: PathBuf,
+    reader: Option<RevisionReadLease>,
 }
 
 impl PreparedRisuSaveExport {
-    pub(crate) fn take_connection(&mut self) -> StoreResult<Connection> {
-        self.connection
-            .take()
-            .ok_or_else(|| StoreError::Validation {
-                message: "native export connection has already been taken".to_owned(),
-            })
+    pub(crate) fn take_reader(&mut self) -> StoreResult<RevisionReadLease> {
+        self.reader.take().ok_or_else(|| StoreError::Validation {
+            message: "native export reader has already been taken".to_owned(),
+        })
     }
 
-    pub(crate) fn release(&self, connection: &mut Connection) -> StoreResult<()> {
-        snapshot::release_revision(connection, &self.lease)
+    pub(crate) fn release(&self, reader: RevisionReadLease) -> StoreResult<()> {
+        let active_readers = reader.active_readers();
+        snapshot::close_revision(reader)?;
+        checkpoint_after_detached_release(&self.database_path, &active_readers)
     }
 
     pub(crate) fn cleanup_file(&self, path: &Path) -> StoreResult<()> {
@@ -737,12 +747,16 @@ impl PersistentStore {
             params!["revision-0", "{}"],
         )?;
         transaction.commit()?;
-        export::sweep_abandoned(&mut connection, &snapshots_dir)?;
+        export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
         kei::sweep_abandoned(&snapshots_dir);
         snapshot::sweep_temporary_generations(&mut connection)?;
+        snapshot::checkpoint(&connection, CheckpointMode::Truncate)?;
 
+        let active_readers = Arc::new(snapshot::ActiveReaderRegistry::default());
         Ok(Self {
+            revision_leases: HashMap::new(),
+            active_readers,
             connection,
             database_path,
             snapshots_dir,
@@ -754,11 +768,13 @@ impl PersistentStore {
     }
 
     pub(crate) fn read_root(&self, lease: Option<&str>) -> StoreResult<Versioned<Value>> {
-        query::read_root(&self.connection, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_root(connection, &target)
     }
 
     pub(crate) fn query_presets(&self, lease: Option<&str>) -> StoreResult<PresetCatalog> {
-        query::query_presets(&self.connection, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::query_presets(connection, &target)
     }
 
     pub(crate) fn read_preset(
@@ -766,7 +782,8 @@ impl PersistentStore {
         id: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<Value>>> {
-        query::read_preset(&self.connection, id, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_preset(connection, id, &target)
     }
 
     pub(crate) fn query_characters(
@@ -774,7 +791,8 @@ impl PersistentStore {
         query: &CharacterQuery,
         lease: Option<&str>,
     ) -> StoreResult<CharacterPage> {
-        query::query_characters(&self.connection, query, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::query_characters(connection, query, &target)
     }
 
     pub(crate) fn read_character(
@@ -782,7 +800,8 @@ impl PersistentStore {
         id: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<Value>>> {
-        query::read_character(&self.connection, id, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_character(connection, id, &target)
     }
 
     pub(crate) fn query_conversations(
@@ -790,7 +809,8 @@ impl PersistentStore {
         query: &ConversationQuery,
         lease: Option<&str>,
     ) -> StoreResult<ConversationPage> {
-        query::query_conversations(&self.connection, query, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::query_conversations(connection, query, &target)
     }
 
     pub(crate) fn read_conversation(
@@ -799,7 +819,8 @@ impl PersistentStore {
         conversation_id: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<Value>>> {
-        query::read_conversation(&self.connection, character_id, conversation_id, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_conversation(connection, character_id, conversation_id, &target)
     }
 
     pub(crate) fn read_conversation_window(
@@ -807,14 +828,16 @@ impl PersistentStore {
         query: &ConversationWindowQuery,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<ConversationWindow>>> {
-        query::read_conversation_window(&self.connection, query, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_conversation_window(connection, query, &target)
     }
 
     pub(crate) fn query_plugin_storage(
         &self,
         lease: Option<&str>,
     ) -> StoreResult<PluginStorageCatalog> {
-        query::query_plugin_storage(&self.connection, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::query_plugin_storage(connection, &target)
     }
 
     pub(crate) fn read_plugin_storage(
@@ -822,7 +845,8 @@ impl PersistentStore {
         key: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<Value>>> {
-        query::read_plugin_storage(&self.connection, key, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_plugin_storage(connection, key, &target)
     }
 
     pub(crate) fn read_asset_alias(
@@ -831,7 +855,8 @@ impl PersistentStore {
         key: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<AssetAlias>>> {
-        query::read_asset_alias(&self.connection, kind, key, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_asset_alias(connection, kind, key, &target)
     }
 
     pub(crate) fn read_asset_owner_head(
@@ -839,7 +864,8 @@ impl PersistentStore {
         owner: &AssetOwnerLocator,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<AssetOwnerHead>>> {
-        query::read_asset_owner_head(&self.connection, owner, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_asset_owner_head(connection, owner, &target)
     }
 
     pub(crate) fn read_cold_alias(
@@ -847,28 +873,32 @@ impl PersistentStore {
         key: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<ColdAlias>>> {
-        query::read_cold_alias(&self.connection, key, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::read_cold_alias(connection, key, &target)
     }
 
     pub(crate) fn list_asset_aliases(
         &self,
         lease: Option<&str>,
     ) -> StoreResult<Versioned<Vec<AssetAlias>>> {
-        query::list_asset_aliases(&self.connection, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::list_asset_aliases(connection, &target)
     }
 
     pub(crate) fn list_asset_owner_heads(
         &self,
         lease: Option<&str>,
     ) -> StoreResult<Versioned<Vec<AssetOwnerHead>>> {
-        query::list_asset_owner_heads(&self.connection, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::list_asset_owner_heads(connection, &target)
     }
 
     pub(crate) fn list_cold_aliases(
         &self,
         lease: Option<&str>,
     ) -> StoreResult<Versioned<Vec<ColdAlias>>> {
-        query::list_cold_aliases(&self.connection, lease)
+        let (connection, target) = self.read_view(lease)?;
+        query::list_cold_aliases(connection, &target)
     }
 
     pub(crate) fn materialize(&self, revision: Option<i64>) -> StoreResult<Value> {
@@ -876,7 +906,8 @@ impl PersistentStore {
     }
 
     pub(crate) fn materialize_lease(&self, lease: &str) -> StoreResult<Value> {
-        query::materialize_lease(&self.connection, lease)
+        let (connection, target) = self.read_view(Some(lease))?;
+        query::materialize_target(connection, &target)
     }
 
     pub(crate) fn materialize_staging(&self, staging_id: &str) -> StoreResult<Value> {
@@ -985,11 +1016,25 @@ impl PersistentStore {
     }
 
     pub(crate) fn acquire_revision(&mut self, revision: i64) -> StoreResult<LeaseResult> {
-        snapshot::acquire_revision(&mut self.connection, revision)
+        let (lease, reader) = snapshot::acquire_revision(
+            &self.database_path,
+            revision,
+            Arc::clone(&self.active_readers),
+        )?;
+        self.revision_leases.insert(lease.clone(), reader);
+        Ok(LeaseResult { lease })
     }
 
     pub(crate) fn release_revision(&mut self, lease: &str) -> StoreResult<()> {
-        snapshot::release_revision(&mut self.connection, lease)
+        if !lease.starts_with("snapshot-") {
+            return Err(StoreError::Validation {
+                message: "revision lease must be a snapshot lease".to_owned(),
+            });
+        }
+        if let Some(reader) = self.revision_leases.remove(lease) {
+            snapshot::close_revision(reader)?;
+        }
+        self.checkpoint_after_release()
     }
 
     pub(crate) fn export_risu_save(
@@ -997,21 +1042,31 @@ impl PersistentStore {
         lease: &str,
         omit_account: bool,
     ) -> StoreResult<export::ExportedRisuSave> {
-        export::create(&self.connection, &self.snapshots_dir, lease, omit_account)
+        let (connection, target) = self.read_view(Some(lease))?;
+        export::create(
+            connection,
+            &self.snapshots_dir,
+            &target,
+            lease,
+            omit_account,
+        )
     }
 
     pub(crate) fn prepare_risu_save_export(
         &mut self,
         revision: i64,
     ) -> StoreResult<PreparedRisuSaveExport> {
-        let connection = Connection::open(&self.database_path)?;
-        connection.execute_batch("PRAGMA busy_timeout = 5000")?;
-        let lease = self.acquire_revision(revision)?.lease;
+        let (lease, reader) = snapshot::acquire_revision(
+            &self.database_path,
+            revision,
+            Arc::clone(&self.active_readers),
+        )?;
         Ok(PreparedRisuSaveExport {
             revision,
             lease,
             snapshots_dir: self.snapshots_dir.clone(),
-            connection: Some(connection),
+            database_path: self.database_path.clone(),
+            reader: Some(reader),
         })
     }
 
@@ -1024,21 +1079,46 @@ impl PersistentStore {
         &self,
         path: &Path,
     ) -> StoreResult<(std::fs::File, u64)> {
-        export::open_for_upload(&self.connection, &self.snapshots_dir, path)
+        let (source, bytes, lease) = export::open_for_upload(&self.snapshots_dir, path)?;
+        self.read_view(Some(&lease))?;
+        Ok((source, bytes))
     }
 
     #[cfg(feature = "native-kei-upload-pilot")]
     fn prepare_kei_upload(
-        &self,
+        &mut self,
         lease: &str,
         url: &str,
         expected_account_id: &str,
         token: &str,
     ) -> StoreResult<kei::PreparedKeiUpload> {
-        kei::prepare_upload(self, lease, url, expected_account_id, token)
+        let reader = self
+            .revision_leases
+            .remove(lease)
+            .ok_or(StoreError::SnapshotReleased)?;
+        match kei::prepare_upload(
+            &self.snapshots_dir,
+            lease,
+            reader,
+            url,
+            expected_account_id,
+            token,
+        ) {
+            Ok(prepared) => Ok(prepared),
+            Err((error, reader)) => {
+                self.revision_leases.insert(lease.to_owned(), reader);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> StoreResult<()> {
+        if mode == CheckpointMode::Truncate && self.active_readers.active_count() > 0 {
+            return Err(StoreError::Store {
+                message: "truncate checkpoint cannot run while an active read lease pins the WAL"
+                    .to_owned(),
+            });
+        }
         snapshot::checkpoint(&self.connection, mode)
     }
 
@@ -1076,6 +1156,9 @@ impl PersistentStore {
             message: "persistent directory has no repository root".to_owned(),
         })?;
         let mut roots = vec![snapshot::collect_asset_roots(&self.connection)?];
+        for reader in self.revision_leases.values() {
+            roots.push(snapshot::collect_asset_roots(&reader.connection)?);
+        }
         for snapshot in snapshot::list(&self.snapshots_dir)? {
             roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
         }
@@ -1116,6 +1199,84 @@ impl PersistentStore {
             .execute("DELETE FROM app_kv WHERE key = ?1", [key])?;
         Ok(())
     }
+
+    fn read_view(&self, lease: Option<&str>) -> StoreResult<(&Connection, ReadTarget)> {
+        match lease {
+            None => Ok((
+                &self.connection,
+                ReadTarget {
+                    revision: current_revision(&self.connection)?,
+                    generation: active_generation(&self.connection)?,
+                },
+            )),
+            Some(lease) => {
+                let reader = self
+                    .revision_leases
+                    .get(lease)
+                    .ok_or(StoreError::SnapshotReleased)?;
+                Ok((&reader.connection, reader.target.clone()))
+            }
+        }
+    }
+
+    fn checkpoint_after_release(&self) -> StoreResult<()> {
+        let mode = if self.active_readers.active_count() == 0 {
+            CheckpointMode::Truncate
+        } else {
+            CheckpointMode::Passive
+        };
+        match snapshot::checkpoint(&self.connection, mode) {
+            Err(error) if mode == CheckpointMode::Truncate && checkpoint_was_busy(&error) => {
+                snapshot::checkpoint(&self.connection, CheckpointMode::Passive)
+            }
+            result => result,
+        }
+    }
+
+    #[cfg(test)]
+    fn lease_diagnostics(&self) -> LeaseDiagnostics {
+        let now = Instant::now();
+        LeaseDiagnostics {
+            active_count: self.active_readers.active_count(),
+            oldest_age_us: self
+                .revision_leases
+                .values()
+                .map(|lease| now.duration_since(lease.acquired_at).as_micros() as u64)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+}
+
+#[cfg(test)]
+struct LeaseDiagnostics {
+    active_count: usize,
+    oldest_age_us: u64,
+}
+
+pub(super) fn checkpoint_after_detached_release(
+    database_path: &Path,
+    active_readers: &snapshot::ActiveReaderRegistry,
+) -> StoreResult<()> {
+    let connection = Connection::open(database_path)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    if active_readers.active_count() > 0 {
+        return snapshot::checkpoint(&connection, CheckpointMode::Passive);
+    }
+    match snapshot::checkpoint(&connection, CheckpointMode::Truncate) {
+        Err(error) if checkpoint_was_busy(&error) => {
+            snapshot::checkpoint(&connection, CheckpointMode::Passive)
+        }
+        result => result,
+    }
+}
+
+fn checkpoint_was_busy(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Store { message }
+            if message == "truncate checkpoint could not complete because the database is busy"
+    )
 }
 
 pub(super) fn current_revision(connection: &Connection) -> StoreResult<i64> {
@@ -1134,29 +1295,6 @@ pub(super) fn active_generation(connection: &Connection) -> StoreResult<String> 
         |row| row.get(0),
     )?;
     Ok(serde_json::from_str(&value)?)
-}
-
-pub(super) fn read_target(connection: &Connection, lease: Option<&str>) -> StoreResult<ReadTarget> {
-    match lease {
-        None => Ok(ReadTarget {
-            revision: current_revision(connection)?,
-            generation: active_generation(connection)?,
-        }),
-        Some(lease) => {
-            let target = connection
-                .query_row(
-                    "SELECT generation, revision FROM snapshot_leases WHERE lease = ?1",
-                    [lease],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()?
-                .ok_or(StoreError::SnapshotReleased)?;
-            Ok(ReadTarget {
-                generation: target.0,
-                revision: target.1,
-            })
-        }
-    }
 }
 
 #[cfg(test)]

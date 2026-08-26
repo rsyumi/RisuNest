@@ -1,19 +1,18 @@
 use super::{
-    active_generation, compare_plugin_storage_keys, current_revision, read_target, AssetAlias,
-    AssetOwnerHead, AssetOwnerLocator, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
+    active_generation, compare_plugin_storage_keys, current_revision, AssetAlias, AssetOwnerHead,
+    AssetOwnerLocator, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
     ConversationPage, ConversationQuery, ConversationSummary, ConversationWindow,
     ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary, PresetCatalog,
-    PresetSummary, QueryOrder, StoreError, StoreResult, Versioned, CONVERSATION_RANGE_MAX_LIMIT,
-    JAVASCRIPT_MAX_SAFE_INTEGER,
+    PresetSummary, QueryOrder, ReadTarget, StoreError, StoreResult, Versioned,
+    CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
 
 pub(super) fn read_root(
     connection: &Connection,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Versioned<Value>> {
-    let target = read_target(connection, lease)?;
     let value: Option<String> = connection
         .query_row(
             "SELECT value FROM root WHERE generation = ?1",
@@ -31,9 +30,8 @@ pub(super) fn read_root(
 
 pub(super) fn query_presets(
     connection: &Connection,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<PresetCatalog> {
-    let target = read_target(connection, lease)?;
     let mut statement = connection.prepare(
         "SELECT preset_id, name, image, configured_index FROM bot_presets
          WHERE generation = ?1 ORDER BY configured_index ASC",
@@ -57,9 +55,8 @@ pub(super) fn query_presets(
 pub(super) fn read_preset(
     connection: &Connection,
     id: &str,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<Value>>> {
-    let target = read_target(connection, lease)?;
     let value: Option<String> = connection
         .query_row(
             "SELECT value FROM bot_presets WHERE generation = ?1 AND preset_id = ?2",
@@ -79,9 +76,8 @@ pub(super) fn read_preset(
 
 pub(super) fn query_plugin_storage(
     connection: &Connection,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<PluginStorageCatalog> {
-    let target = read_target(connection, lease)?;
     let mut statement = connection.prepare(
         "SELECT storage_key, byte_size, ordinal FROM plugin_storage
          WHERE generation = ?1",
@@ -109,9 +105,8 @@ pub(super) fn query_plugin_storage(
 pub(super) fn read_plugin_storage(
     connection: &Connection,
     key: &str,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<Value>>> {
-    let target = read_target(connection, lease)?;
     let value: Option<String> = connection
         .query_row(
             "SELECT value FROM plugin_storage WHERE generation = ?1 AND storage_key = ?2",
@@ -133,10 +128,9 @@ pub(super) fn read_asset_alias(
     connection: &Connection,
     kind: &str,
     key: &str,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<AssetAlias>>> {
     validate_asset_kind(kind)?;
-    let target = read_target(connection, lease)?;
     let value = connection
         .query_row(
             "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata
@@ -160,10 +154,9 @@ pub(super) fn read_asset_alias(
 pub(super) fn read_asset_owner_head(
     connection: &Connection,
     owner: &AssetOwnerLocator,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<AssetOwnerHead>>> {
     owner.validate()?;
-    let target = read_target(connection, lease)?;
     let (owner_kind, owner_locator) = owner.storage_identity();
     let value = connection
         .query_row(
@@ -195,9 +188,8 @@ pub(super) fn read_asset_owner_head(
 pub(super) fn read_cold_alias(
     connection: &Connection,
     key: &str,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<ColdAlias>>> {
-    let target = read_target(connection, lease)?;
     let value = connection
         .query_row(
             "SELECT key, object_hash, size, metadata FROM cold_aliases
@@ -232,9 +224,8 @@ pub(super) fn read_cold_alias(
 
 pub(super) fn list_asset_aliases(
     connection: &Connection,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Versioned<Vec<AssetAlias>>> {
-    let target = read_target(connection, lease)?;
     let mut statement = connection.prepare(
         "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata
          FROM asset_aliases WHERE generation = ?1 ORDER BY kind ASC, logical_key ASC",
@@ -253,9 +244,8 @@ pub(super) fn list_asset_aliases(
 
 pub(super) fn list_asset_owner_heads(
     connection: &Connection,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Versioned<Vec<AssetOwnerHead>>> {
-    let target = read_target(connection, lease)?;
     let rows = {
         let mut statement = connection.prepare(
             "SELECT owner_kind, owner_locator, present, manifest_hash, entry_count
@@ -321,9 +311,8 @@ pub(super) fn list_asset_owner_heads(
 
 pub(super) fn list_cold_aliases(
     connection: &Connection,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Versioned<Vec<ColdAlias>>> {
-    let target = read_target(connection, lease)?;
     let rows = {
         let mut statement = connection.prepare(
             "SELECT key, object_hash, size, metadata FROM cold_aliases
@@ -395,9 +384,8 @@ fn validate_asset_kind(kind: &str) -> StoreResult<()> {
 pub(super) fn query_characters(
     connection: &Connection,
     query: &CharacterQuery,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<CharacterPage> {
-    let target = read_target(connection, lease)?;
     let (limit, offset) = page_input(query.limit, query.cursor.as_deref())?;
     let order = order_sql(query.order);
     let search = query
@@ -457,9 +445,8 @@ pub(super) fn query_characters(
 pub(super) fn read_character(
     connection: &Connection,
     id: &str,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<Value>>> {
-    let target = read_target(connection, lease)?;
     let detail: Option<String> = connection
         .query_row(
             "SELECT detail FROM characters WHERE generation = ?1 AND character_id = ?2",
@@ -480,9 +467,8 @@ pub(super) fn read_character(
 pub(super) fn query_conversations(
     connection: &Connection,
     query: &ConversationQuery,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<ConversationPage> {
-    let target = read_target(connection, lease)?;
     let (limit, offset) = page_input(query.limit, query.cursor.as_deref())?;
     let order = order_sql(query.order);
     let mut statement = connection.prepare(&format!(
@@ -532,9 +518,8 @@ pub(super) fn read_conversation(
     connection: &Connection,
     character_id: &str,
     conversation_id: &str,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<Value>>> {
-    let target = read_target(connection, lease)?;
     let detail: Option<String> = connection
         .query_row(
             "SELECT detail FROM conversations WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
@@ -560,7 +545,7 @@ pub(super) fn read_conversation(
 pub(super) fn read_conversation_window(
     connection: &Connection,
     query: &ConversationWindowQuery,
-    lease: Option<&str>,
+    target: &ReadTarget,
 ) -> StoreResult<Option<Versioned<ConversationWindow>>> {
     let absolute_range = match query.start_index {
         None => None,
@@ -592,7 +577,6 @@ pub(super) fn read_conversation_window(
             Some((start_index, limit))
         }
     };
-    let target = read_target(connection, lease)?;
     let total: Option<i64> = connection
         .query_row(
             "SELECT message_count FROM conversations WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
@@ -671,15 +655,15 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
     Ok(value)
 }
 
-pub(super) fn materialize_lease(connection: &Connection, lease: &str) -> StoreResult<Value> {
-    let transaction = connection.unchecked_transaction()?;
-    let target = read_target(&transaction, Some(lease))?;
-    let value = materialize_generation(&transaction, &target.generation)?.ok_or_else(|| {
+pub(super) fn materialize_target(
+    connection: &Connection,
+    target: &ReadTarget,
+) -> StoreResult<Value> {
+    let value = materialize_generation(connection, &target.generation)?.ok_or_else(|| {
         StoreError::Store {
             message: "Persistent lease generation is missing its root".to_owned(),
         }
     })?;
-    transaction.commit()?;
     Ok(value)
 }
 

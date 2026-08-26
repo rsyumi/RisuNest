@@ -1,22 +1,25 @@
 use super::{
-    active_generation, current_revision, CheckpointMode, LeaseResult, SnapshotCreated,
-    SnapshotInfo, StoreError, StoreResult, GENERATION_TABLES,
+    active_generation, current_revision, CheckpointMode, ReadTarget, SnapshotCreated, SnapshotInfo,
+    StoreError, StoreResult, GENERATION_TABLES,
 };
 use crate::asset_repository::migration_gc::{
     snapshot_asset_root_sidecar_path, write_snapshot_asset_root_sidecar, AssetRootSet,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
-const LEASE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const PENDING_RESTORE_FILE: &str = "pending-restore.json";
 const DATABASE_FILE: &str = "persistent.db";
 const MAX_SNAPSHOTS: usize = 8;
@@ -25,6 +28,50 @@ const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 #[derive(Deserialize, Serialize)]
 struct PendingRestore {
     path: PathBuf,
+}
+
+#[derive(Default)]
+pub(crate) struct ActiveReaderRegistry {
+    count: AtomicUsize,
+}
+
+impl ActiveReaderRegistry {
+    fn register(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        let previous = self.count.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous > 0, "active reader registry underflow");
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+pub(crate) struct RevisionReadLease {
+    pub(crate) connection: Connection,
+    pub(crate) target: ReadTarget,
+    active_readers: Arc<ActiveReaderRegistry>,
+    transaction_open: bool,
+    #[cfg(test)]
+    pub(crate) acquired_at: Instant,
+}
+
+impl RevisionReadLease {
+    pub(crate) fn active_readers(&self) -> Arc<ActiveReaderRegistry> {
+        Arc::clone(&self.active_readers)
+    }
+}
+
+impl Drop for RevisionReadLease {
+    fn drop(&mut self) {
+        if self.transaction_open {
+            let _ = self.connection.execute_batch("ROLLBACK");
+        }
+        self.active_readers.release();
+    }
 }
 
 pub(super) fn apply_pending_restore(
@@ -104,20 +151,15 @@ fn prepare_restore_candidate(persistent_dir: &Path, target: &Path) -> StoreResul
 }
 
 pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreResult<()> {
-    let cutoff = now_ms() - LEASE_TTL_MS;
     let transaction = connection.transaction()?;
-    let expired_generations = {
-        let mut statement =
-            transaction.prepare("SELECT generation FROM snapshot_leases WHERE created_at < ?1")?;
+    let legacy_generations = {
+        let mut statement = transaction.prepare("SELECT generation FROM snapshot_leases")?;
         let generations = statement
-            .query_map([cutoff], |row| row.get::<_, String>(0))?
+            .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         generations
     };
-    transaction.execute(
-        "DELETE FROM snapshot_leases WHERE created_at < ?1",
-        [cutoff],
-    )?;
+    transaction.execute("DELETE FROM snapshot_leases", [])?;
     let active = active_generation(&transaction)?;
     let mut statement = transaction.prepare(
         "SELECT generation FROM root
@@ -128,83 +170,109 @@ pub(super) fn sweep_temporary_generations(connection: &mut Connection) -> StoreR
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
-    stale.extend(expired_generations);
+    stale.extend(legacy_generations);
     stale.sort();
     stale.dedup();
     for generation in stale {
-        if generation != active && !generation_is_leased(&transaction, &generation)? {
+        if generation != active {
             delete_generation(&transaction, &generation)?;
         }
     }
-    transaction.execute(
-        "DELETE FROM snapshot_leases
-         WHERE generation NOT IN (SELECT generation FROM root)",
-        [],
-    )?;
     transaction.commit()?;
     Ok(())
 }
 
 pub(super) fn acquire_revision(
-    connection: &mut Connection,
+    database_path: &Path,
     revision: i64,
-) -> StoreResult<LeaseResult> {
-    let transaction = connection.transaction()?;
-    let actual = current_revision(&transaction)?;
-    if actual != revision {
-        return Err(StoreError::RevisionConflict {
-            expected: revision,
-            actual,
-        });
-    }
-
-    let source = active_generation(&transaction)?;
+    active_readers: Arc<ActiveReaderRegistry>,
+) -> StoreResult<(String, RevisionReadLease)> {
+    let connection = open_revision_reader(database_path)?;
+    #[cfg(test)]
+    let acquired_at = Instant::now();
+    let target = (|| -> StoreResult<ReadTarget> {
+        let actual = current_revision(&connection)?;
+        if actual != revision {
+            return Err(StoreError::RevisionConflict {
+                expected: revision,
+                actual,
+            });
+        }
+        let generation = active_generation(&connection)?;
+        let root_exists = connection
+            .query_row(
+                "SELECT 1 FROM root WHERE generation = ?1",
+                [&generation],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !root_exists {
+            return Err(StoreError::RevisionConflict {
+                expected: revision,
+                actual,
+            });
+        }
+        Ok(ReadTarget {
+            revision,
+            generation,
+        })
+    })();
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    };
     let lease = format!("snapshot-{revision}-{}", Uuid::new_v4());
-    let root_exists = transaction
-        .query_row(
-            "SELECT 1 FROM root WHERE generation = ?1",
-            [&source],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !root_exists {
-        return Err(StoreError::RevisionConflict {
-            expected: revision,
-            actual,
-        });
-    }
-
-    transaction.execute(
-        "INSERT INTO snapshot_leases (lease, generation, revision, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![lease, source, revision, now_ms()],
-    )?;
-    transaction.commit()?;
-    Ok(LeaseResult { lease })
+    active_readers.register();
+    Ok((
+        lease,
+        RevisionReadLease {
+            connection,
+            target,
+            active_readers,
+            transaction_open: true,
+            #[cfg(test)]
+            acquired_at,
+        },
+    ))
 }
 
-pub(super) fn release_revision(connection: &mut Connection, lease: &str) -> StoreResult<()> {
-    if !lease.starts_with("snapshot-") {
-        return Err(validation("revision lease must be a snapshot lease"));
+fn open_revision_reader(database_path: &Path) -> StoreResult<Connection> {
+    let read_only = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match configure_revision_reader(database_path, read_only) {
+        Ok(connection) => Ok(connection),
+        Err(_) => configure_revision_reader(
+            database_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
     }
-    let transaction = connection.transaction()?;
-    let generation = transaction
-        .query_row(
-            "SELECT generation FROM snapshot_leases WHERE lease = ?1",
-            [lease],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    transaction.execute("DELETE FROM snapshot_leases WHERE lease = ?1", [lease])?;
-    if let Some(generation) = generation {
-        let active = active_generation(&transaction)?;
-        if generation != active && !generation_is_leased(&transaction, &generation)? {
-            delete_generation(&transaction, &generation)?;
-        }
+}
+
+fn configure_revision_reader(database_path: &Path, flags: OpenFlags) -> StoreResult<Connection> {
+    let connection = Connection::open_with_flags(database_path, flags)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    connection.execute_batch(
+        "
+        PRAGMA query_only = ON;
+        PRAGMA cache_size = -2048;
+        BEGIN DEFERRED;
+        ",
+    )?;
+    Ok(connection)
+}
+
+pub(super) fn close_revision(mut lease: RevisionReadLease) -> StoreResult<()> {
+    let result = lease
+        .connection
+        .execute_batch("ROLLBACK")
+        .map_err(StoreError::from);
+    if result.is_ok() {
+        lease.transaction_open = false;
     }
-    transaction.commit()?;
-    Ok(())
+    result
 }
 
 pub(super) fn checkpoint(connection: &Connection, mode: CheckpointMode) -> StoreResult<()> {
@@ -309,20 +377,6 @@ fn delete_generation(transaction: &rusqlite::Transaction<'_>, generation: &str) 
         )?;
     }
     Ok(())
-}
-
-fn generation_is_leased(
-    transaction: &rusqlite::Transaction<'_>,
-    generation: &str,
-) -> StoreResult<bool> {
-    Ok(transaction
-        .query_row(
-            "SELECT 1 FROM snapshot_leases WHERE generation = ?1 LIMIT 1",
-            [generation],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
 }
 
 fn validate_snapshot_path(snapshots_dir: &Path, path: &Path) -> StoreResult<PathBuf> {
@@ -633,13 +687,6 @@ fn safe_name(reason: &str) -> String {
     } else {
         name
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn validation(message: impl Into<String>) -> StoreError {

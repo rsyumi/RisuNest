@@ -883,18 +883,6 @@ fn asset_alias_unknown_metadata_survives_activation_lease_and_reopen() {
     let second = store
         .commit_asset_alias(&replacement, first.revision)
         .expect("replace current alias metadata");
-    drop(store);
-
-    let store = PersistentStore::open(directory.path()).expect("reopen alias metadata store");
-    assert_eq!(
-        store
-            .read_asset_alias("asset", &original.key, None)
-            .expect("read current alias metadata"),
-        Some(super::Versioned {
-            revision: second.revision,
-            value: replacement.clone(),
-        })
-    );
     assert_eq!(
         store
             .read_asset_alias("asset", &original.key, Some(&lease.lease))
@@ -915,18 +903,38 @@ fn asset_alias_unknown_metadata_survives_activation_lease_and_reopen() {
     );
     assert_eq!(
         store
-            .list_asset_aliases(None)
-            .expect("list current alias metadata")
-            .value,
-        vec![replacement, original_inlay.clone()]
-    );
-    assert_eq!(
-        store
             .list_asset_aliases(Some(&lease.lease))
             .expect("list leased alias metadata")
             .value,
-        vec![original, original_inlay]
+        vec![original.clone(), original_inlay.clone()]
     );
+    drop(store);
+
+    let store = PersistentStore::open(directory.path()).expect("reopen alias metadata store");
+    assert_eq!(
+        store
+            .read_asset_alias("asset", &original.key, None)
+            .expect("read current alias metadata"),
+        Some(super::Versioned {
+            revision: second.revision,
+            value: replacement.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .list_asset_aliases(None)
+            .expect("list current alias metadata")
+            .value,
+        vec![replacement, original_inlay]
+    );
+    assert!(matches!(
+        store.read_asset_alias("asset", &original.key, Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    assert!(matches!(
+        store.list_asset_aliases(Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
 }
 
 #[test]
@@ -2955,7 +2963,7 @@ fn revision_leases_are_isolated_then_released() {
 }
 
 #[test]
-fn revision_acquire_reuses_generation_records() {
+fn ordinary_commit_during_a_lease_does_not_copy_any_generation_family() {
     let (_directory, mut store, _) = open_fixture();
     store
         .commit(&WorkingSetCommit {
@@ -2975,18 +2983,10 @@ fn revision_acquire_reuses_generation_records() {
             }]),
         })
         .expect("seed counted plugin record");
-    let tables = [
-        "root",
-        "bot_presets",
-        "characters",
-        "conversations",
-        "messages",
-        "plugin_storage",
-    ];
     let count_records = |store: &PersistentStore| {
-        tables
+        super::GENERATION_TABLES
             .iter()
-            .map(|table| {
+            .map(|(table, _)| {
                 store
                     .connection
                     .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -2997,10 +2997,38 @@ fn revision_acquire_reuses_generation_records() {
             .collect::<Vec<_>>()
     };
     let before = count_records(&store);
+    let generation_before =
+        super::active_generation(&store.connection).expect("read generation before leased commit");
 
     let lease = store.acquire_revision(2).expect("acquire revision lease");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 2,
+            root: Some(json!({ "username": "Changed without generation copy" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            asset_owner_heads: None,
+            plugin_storage: None,
+        })
+        .expect("commit root while lease is active");
 
     assert_eq!(count_records(&store), before);
+    assert_eq!(
+        super::active_generation(&store.connection).expect("read generation after leased commit"),
+        generation_before
+    );
+    assert_eq!(
+        store
+            .read_root(Some(&lease.lease))
+            .expect("read pinned root")
+            .value["username"],
+        "Fixture User"
+    );
     store.release_revision(&lease.lease).expect("release lease");
 }
 
@@ -3770,7 +3798,7 @@ fn revision_leases_isolate_conversation_reads() {
 }
 
 #[test]
-fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
+fn reopen_invalidates_runtime_and_legacy_leases_then_reclaims_inactive_generations() {
     let (directory, mut store, _) = open_fixture();
     store
         .commit(&WorkingSetCommit {
@@ -3806,42 +3834,37 @@ fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
             plugin_storage: None,
         })
         .expect("fork active generation");
-    drop(store);
-
-    let store = PersistentStore::open(directory.path()).expect("reopen with fresh lease");
-    assert_eq!(
-        store
-            .read_root(Some(&lease.lease))
-            .expect("fresh lease survives reopen")
-            .value["username"],
-        "Fixture User"
-    );
-    assert_eq!(
-        store
-            .read_plugin_storage("ttl-zero", Some(&lease.lease))
-            .expect("read fresh leased plugin value")
-            .expect("fresh leased plugin value exists")
-            .value,
-        json!(0)
-    );
     store
         .connection
-        .execute(
-            "UPDATE snapshot_leases SET created_at = created_at - 90000000",
-            [],
+        .execute_batch(
+            "
+            INSERT INTO root (generation, value)
+                VALUES ('revision-legacy', '{\"username\":\"Legacy pinned\"}');
+            INSERT INTO snapshot_leases (lease, generation, revision, created_at)
+                VALUES ('snapshot-legacy', 'revision-legacy', 2, 4102444800000);
+            ",
         )
-        .expect("age lease past the ttl");
+        .expect("seed rollback-compatible legacy lease");
     drop(store);
 
-    let store = PersistentStore::open(directory.path()).expect("reopen after expiry");
+    let store = PersistentStore::open(directory.path()).expect("reopen after runtime lease drop");
     assert!(matches!(
         store.read_root(Some(&lease.lease)),
         Err(StoreError::SnapshotReleased)
     ));
+    assert!(matches!(
+        store.read_root(Some("snapshot-legacy")),
+        Err(StoreError::SnapshotReleased)
+    ));
+    let persisted_leases: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM snapshot_leases", [], |row| row.get(0))
+        .expect("count abandoned persisted leases");
+    assert_eq!(persisted_leases, 0);
     let expired_generation_rows: i64 = store
         .connection
         .query_row(
-            "SELECT COUNT(*) FROM root WHERE generation = 'revision-1'",
+            "SELECT COUNT(*) FROM root WHERE generation = 'revision-legacy'",
             [],
             |row| row.get(0),
         )
@@ -4368,41 +4391,23 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database_with_lease(&database_path);
 
-    let mut store = PersistentStore::open(directory.path()).expect("migrate v2 store");
+    let store = PersistentStore::open(directory.path()).expect("migrate v2 store");
     assert_eq!(
         store
             .read_asset_alias("asset", "assets/not-backfilled.bin", None)
             .expect("query empty migrated alias table"),
         None
     );
-    assert_eq!(
-        store
-            .read_root(Some("snapshot-7-v2fixture"))
-            .expect("read migrated lease")
-            .value["username"],
-        "V2 leased"
-    );
-    assert_eq!(
-        store
-            .read_plugin_storage("leased-zero", Some("snapshot-7-v2fixture"))
-            .expect("read migrated leased plugin value")
-            .expect("leased plugin value exists")
-            .value,
-        json!(0)
-    );
+    assert!(matches!(
+        store.read_root(Some("snapshot-7-v2fixture")),
+        Err(StoreError::SnapshotReleased)
+    ));
     let version: i64 = store
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
     assert_eq!(version, 8);
 
-    store
-        .release_revision("snapshot-7-v2fixture")
-        .expect("release migrated lease");
-    assert!(matches!(
-        store.read_root(Some("snapshot-7-v2fixture")),
-        Err(StoreError::SnapshotReleased)
-    ));
     let snapshot_rows: i64 = store
         .connection
         .query_row(
@@ -4532,15 +4537,11 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
     let database_path = directory.path().join("persistent/persistent.db");
     create_snapshot_v3_database(&database_path);
 
-    let mut store = PersistentStore::open(directory.path()).expect("migrate snapshot v3 store");
-    assert_eq!(
-        store
-            .read_plugin_storage("v2-memory", Some("snapshot-v3fixture"))
-            .expect("read snapshot v3 migrated plugin value")
-            .expect("snapshot v3 plugin value exists")
-            .value,
-        json!({ "lossless": true })
-    );
+    let store = PersistentStore::open(directory.path()).expect("migrate snapshot v3 store");
+    assert!(matches!(
+        store.read_root(Some("snapshot-v3fixture")),
+        Err(StoreError::SnapshotReleased)
+    ));
     assert_eq!(
         store
             .connection
@@ -4548,9 +4549,6 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .expect("read snapshot v3 migrated version"),
         8
     );
-    store
-        .release_revision("snapshot-v3fixture")
-        .expect("release snapshot v3 lease");
     assert_eq!(
         store
             .read_plugin_storage("v2-memory", None)
@@ -4567,15 +4565,11 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
     let database_path = directory.path().join("persistent/persistent.db");
     create_task4_v4_database(&database_path);
 
-    let mut store = PersistentStore::open(directory.path()).expect("migrate Task 4 v4 store");
-    assert_eq!(
-        store
-            .read_plugin_storage("leased-zero", Some("snapshot-7-task4v4"))
-            .expect("read Task 4 v4 leased plugin value")
-            .expect("Task 4 v4 leased plugin value exists")
-            .value,
-        json!(0)
-    );
+    let store = PersistentStore::open(directory.path()).expect("migrate Task 4 v4 store");
+    assert!(matches!(
+        store.read_root(Some("snapshot-7-task4v4")),
+        Err(StoreError::SnapshotReleased)
+    ));
     assert_eq!(
         store
             .connection
@@ -4583,9 +4577,6 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .expect("read Task 4 v4 migrated version"),
         8
     );
-    store
-        .release_revision("snapshot-7-task4v4")
-        .expect("release Task 4 v4 lease");
     assert_eq!(
         store
             .connection
@@ -5325,6 +5316,157 @@ fn checkpoints_accept_both_documented_modes() {
     store
         .checkpoint(CheckpointMode::Truncate)
         .expect("truncate checkpoint");
+}
+
+#[test]
+fn active_lease_rejects_truncate_and_final_release_truncates_the_wal() {
+    let (directory, mut store, _) = open_fixture();
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .expect("disable automatic checkpoints");
+    let lease = store.acquire_revision(1).expect("acquire WAL reader");
+    store
+        .set_app_kv("after-lease", &json!(true))
+        .expect("append WAL frame after lease");
+    store
+        .checkpoint(CheckpointMode::Passive)
+        .expect("passive checkpoint with active lease");
+
+    let started = std::time::Instant::now();
+    let error = store
+        .checkpoint(CheckpointMode::Truncate)
+        .expect_err("truncate must reject an active lease");
+    assert!(started.elapsed() < Duration::from_millis(50));
+    assert!(matches!(
+        error,
+        StoreError::Store { message } if message.contains("active read lease")
+    ));
+
+    store
+        .release_revision(&lease.lease)
+        .expect("release final lease and truncate WAL");
+    let database_path = directory.path().join("persistent/persistent.db");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
+}
+
+#[test]
+fn detached_export_reader_rejects_truncate_until_it_is_released() {
+    let (directory, mut store, _) = open_fixture();
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .expect("disable automatic checkpoints");
+    let mut prepared = store
+        .prepare_risu_save_export(1)
+        .expect("prepare detached export reader");
+    store
+        .set_app_kv("after-detached-export", &json!(true))
+        .expect("append WAL frame after detached reader");
+
+    let started = std::time::Instant::now();
+    let error = store
+        .checkpoint(CheckpointMode::Truncate)
+        .expect_err("truncate must reject a detached export reader");
+    assert!(started.elapsed() < Duration::from_millis(50));
+    assert!(matches!(
+        error,
+        StoreError::Store { message } if message.contains("active read lease")
+    ));
+
+    let reader = prepared.take_reader().expect("take detached export reader");
+    prepared
+        .release(reader)
+        .expect("release detached export reader");
+    let database_path = directory.path().join("persistent/persistent.db");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
+}
+
+#[test]
+fn detached_export_release_stays_prompt_while_an_attached_reader_remains() {
+    let (directory, mut store, _) = open_fixture();
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .expect("disable automatic checkpoints");
+    let attached = store.acquire_revision(1).expect("acquire attached reader");
+    let mut prepared = store
+        .prepare_risu_save_export(1)
+        .expect("prepare detached export reader");
+    store
+        .set_app_kv("after-two-readers", &json!(true))
+        .expect("append WAL frame after both readers");
+
+    let reader = prepared.take_reader().expect("take detached export reader");
+    let started = std::time::Instant::now();
+    prepared
+        .release(reader)
+        .expect("release detached reader with attached reader remaining");
+    assert!(started.elapsed() < Duration::from_millis(50));
+    assert_eq!(
+        store
+            .read_root(Some(&attached.lease))
+            .expect("attached reader remains pinned")
+            .revision,
+        1
+    );
+    let database_path = directory.path().join("persistent/persistent.db");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    assert!(fs::metadata(&wal_path).expect("read pinned WAL").len() > 0);
+
+    store
+        .release_revision(&attached.lease)
+        .expect("release final attached reader");
+    assert_eq!(fs::metadata(wal_path).expect("read final WAL").len(), 0);
+}
+
+#[test]
+fn dropping_store_with_active_lease_reopens_latest_state_and_truncates_recovered_wal() {
+    let (directory, mut store, _) = open_fixture();
+    store
+        .connection
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .expect("disable automatic checkpoints");
+    let lease = store.acquire_revision(1).expect("acquire WAL reader");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Writer survives lease drop" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            asset_owner_heads: None,
+            plugin_storage: None,
+        })
+        .expect("append writer state while lease is active");
+    let database_path = directory.path().join("persistent/persistent.db");
+    let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+    assert!(fs::metadata(&wal_path).expect("read pinned WAL").len() > 0);
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen after active lease drop");
+    assert_eq!(reopened.revision().expect("read reopened revision"), 2);
+    assert_eq!(
+        reopened
+            .read_root(None)
+            .expect("read reopened writer state")
+            .value["username"],
+        "Writer survives lease drop"
+    );
+    assert!(matches!(
+        reopened.read_root(Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    assert_eq!(
+        fs::metadata(&wal_path).expect("read recovered WAL").len(),
+        0
+    );
 }
 
 fn snapshots_dir(directory: &tempfile::TempDir) -> PathBuf {

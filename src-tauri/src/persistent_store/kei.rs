@@ -1,14 +1,16 @@
-use super::{compare_plugin_storage_keys, read_target, PersistentStore, StoreError, StoreResult};
+use super::{
+    checkpoint_after_detached_release, compare_plugin_storage_keys, RevisionReadLease, StoreError,
+    StoreResult,
+};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Body, Url};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -70,8 +72,7 @@ fn write_canonical_value(writer: &mut impl Write, value: &Value) -> StoreResult<
 pub(super) struct PreparedKeiUpload {
     database_path: PathBuf,
     output_directory: PathBuf,
-    lease: String,
-    generation: String,
+    reader: RevisionReadLease,
     revision: i64,
     url: Url,
     token: String,
@@ -108,48 +109,59 @@ pub(crate) struct KeiUploadResult {
 }
 
 pub(super) fn prepare_upload(
-    store: &PersistentStore,
+    snapshots_dir: &Path,
     lease: &str,
+    reader: RevisionReadLease,
     url: &str,
     expected_account_id: &str,
     token: &str,
-) -> StoreResult<PreparedKeiUpload> {
-    let target = read_target(&store.connection, Some(lease))?;
-    let root: String = store
-        .connection
-        .query_row(
-            "SELECT value FROM root WHERE generation = ?1",
-            [&target.generation],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| StoreError::Validation {
-            message: "Pinned generation has no persistent root".to_owned(),
+) -> Result<PreparedKeiUpload, (StoreError, RevisionReadLease)> {
+    let result = (|| -> StoreResult<(PathBuf, PathBuf, Url)> {
+        if !lease.starts_with("snapshot-") {
+            return Err(StoreError::Validation {
+                message: "revision lease must be a snapshot lease".to_owned(),
+            });
+        }
+        let root: String = reader
+            .connection
+            .query_row(
+                "SELECT value FROM root WHERE generation = ?1",
+                [&reader.target.generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Validation {
+                message: "Pinned generation has no persistent root".to_owned(),
+            })?;
+        validate_account(&root, expected_account_id, token)?;
+        let url = Url::parse(url).map_err(|_| StoreError::Validation {
+            message: "KEI backup URL is invalid".to_owned(),
         })?;
-    validate_account(&root, expected_account_id, token)?;
-    let url = Url::parse(url).map_err(|_| StoreError::Validation {
-        message: "KEI backup URL is invalid".to_owned(),
-    })?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(StoreError::Validation {
-            message: "KEI backup URL must use HTTP or HTTPS".to_owned(),
-        });
-    }
-    let persistent_directory = store
-        .snapshots_dir
-        .parent()
-        .ok_or_else(|| StoreError::Store {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(StoreError::Validation {
+                message: "KEI backup URL must use HTTP or HTTPS".to_owned(),
+            });
+        }
+        let persistent_directory = snapshots_dir.parent().ok_or_else(|| StoreError::Store {
             message: "Persistent store directory is unavailable".to_owned(),
         })?;
-    Ok(PreparedKeiUpload {
-        database_path: persistent_directory.join("persistent.db"),
-        output_directory: persistent_directory.join("kei-upload"),
-        lease: lease.to_owned(),
-        generation: target.generation,
-        revision: target.revision,
-        url,
-        token: token.to_owned(),
-    })
+        Ok((
+            persistent_directory.join("persistent.db"),
+            persistent_directory.join("kei-upload"),
+            url,
+        ))
+    })();
+    match result {
+        Ok((database_path, output_directory, url)) => Ok(PreparedKeiUpload {
+            database_path,
+            output_directory,
+            revision: reader.target.revision,
+            reader,
+            url,
+            token: token.to_owned(),
+        }),
+        Err(error) => Err((error, reader)),
+    }
 }
 
 pub(super) fn sweep_abandoned(snapshots_dir: &Path) {
@@ -202,16 +214,6 @@ fn validate_account(root: &str, expected_account_id: &str, token: &str) -> Store
 impl PreparedKeiUpload {
     pub(super) fn create_payload(&self) -> StoreResult<KeiPayloadFile> {
         fs::create_dir_all(&self.output_directory)?;
-        let connection = Connection::open_with_flags(
-            &self.database_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        let target = read_target(&connection, Some(&self.lease))?;
-        if target.revision != self.revision || target.generation != self.generation {
-            return Err(StoreError::SnapshotReleased);
-        }
-
         let path = self
             .output_directory
             .join(format!("kei-{}.json.tmp", Uuid::new_v4()));
@@ -220,7 +222,12 @@ impl PreparedKeiUpload {
             .create_new(true)
             .open(&path)?;
         let mut guard = PayloadOutputGuard::new(path.clone());
-        write_payload(&connection, &self.generation, &self.token, &mut file)?;
+        write_payload(
+            &self.reader.connection,
+            &self.reader.target.generation,
+            &self.token,
+            &mut file,
+        )?;
         file.flush()?;
         file.sync_all()?;
         drop(file);
@@ -236,11 +243,20 @@ impl PreparedKeiUpload {
     pub(super) async fn upload(self) -> StoreResult<KeiUploadResult> {
         let revision = self.revision;
         let url = self.url.clone();
-        let payload = tokio::task::spawn_blocking(move || self.create_payload())
-            .await
-            .map_err(|_| StoreError::Store {
-                message: "KEI payload worker stopped unexpectedly".to_owned(),
-            })??;
+        let payload = tokio::task::spawn_blocking(move || {
+            let payload = self.create_payload();
+            let release =
+                checkpoint_after_detached_release_after_close(&self.database_path, self.reader);
+            match (payload, release) {
+                (Ok(payload), Ok(())) => Ok(payload),
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+            }
+        })
+        .await
+        .map_err(|_| StoreError::Store {
+            message: "KEI payload worker stopped unexpectedly".to_owned(),
+        })??;
         let bytes = payload.bytes;
         let upload = upload_payload(&url, &payload).await;
         let cleanup = payload.cleanup();
@@ -255,6 +271,15 @@ impl PreparedKeiUpload {
             status,
         })
     }
+}
+
+fn checkpoint_after_detached_release_after_close(
+    database_path: &Path,
+    reader: RevisionReadLease,
+) -> StoreResult<()> {
+    let active_readers = reader.active_readers();
+    super::snapshot::close_revision(reader)?;
+    checkpoint_after_detached_release(database_path, &active_readers)
 }
 
 async fn upload_payload(url: &Url, payload: &KeiPayloadFile) -> StoreResult<u16> {
@@ -715,15 +740,15 @@ mod tests {
 
     #[test]
     fn pinned_payload_matches_the_current_kei_json_shape_byte_for_byte() {
-        let (_directory, store, lease) = open_store_with_fixture();
-        let prepared = prepare_upload(
-            &store,
-            &lease,
-            "http://127.0.0.1/autobackup/save",
-            "account-1",
-            "secret-token",
-        )
-        .expect("prepare upload");
+        let (_directory, mut store, lease) = open_store_with_fixture();
+        let prepared = store
+            .prepare_kei_upload(
+                &lease,
+                "http://127.0.0.1/autobackup/save",
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare upload");
 
         let payload = prepared.create_payload().expect("create payload");
         let path = payload.path.clone();
@@ -737,7 +762,7 @@ mod tests {
 
     #[test]
     fn file_upload_preserves_body_headers_and_ignored_http_status_semantics() {
-        let (_directory, store, lease) = open_store_with_fixture();
+        let (_directory, mut store, lease) = open_store_with_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
         let address = listener.local_addr().expect("mock address");
         let (request_tx, request_rx) = mpsc::channel();
@@ -780,14 +805,14 @@ mod tests {
             stream.shutdown(Shutdown::Write).expect("finish response");
             while stream.read(&mut buffer).expect("drain client close") > 0 {}
         });
-        let prepared = prepare_upload(
-            &store,
-            &lease,
-            &format!("http://{address}/autobackup/save"),
-            "account-1",
-            "secret-token",
-        )
-        .expect("prepare upload");
+        let prepared = store
+            .prepare_kei_upload(
+                &lease,
+                &format!("http://{address}/autobackup/save"),
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare upload");
         let output_directory = prepared.output_directory.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -814,18 +839,18 @@ mod tests {
 
     #[test]
     fn failed_upload_removes_the_temporary_payload_without_exposing_the_token() {
-        let (_directory, store, lease) = open_store_with_fixture();
+        let (_directory, mut store, lease) = open_store_with_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").expect("reserve closed endpoint");
         let address = listener.local_addr().expect("closed endpoint address");
         drop(listener);
-        let prepared = prepare_upload(
-            &store,
-            &lease,
-            &format!("http://{address}/autobackup/save"),
-            "account-1",
-            "secret-token",
-        )
-        .expect("prepare upload");
+        let prepared = store
+            .prepare_kei_upload(
+                &lease,
+                &format!("http://{address}/autobackup/save"),
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare upload");
         let output_directory = prepared.output_directory.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -869,14 +894,14 @@ mod tests {
             })
             .expect("commit later revision");
 
-        let prepared = prepare_upload(
-            &store,
-            &lease,
-            "http://127.0.0.1/autobackup/save",
-            "account-1",
-            "secret-token",
-        )
-        .expect("prepare pinned upload");
+        let prepared = store
+            .prepare_kei_upload(
+                &lease,
+                "http://127.0.0.1/autobackup/save",
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare pinned upload");
         let payload = prepared.create_payload().expect("create pinned payload");
         let body = fs::read_to_string(&payload.path).expect("read pinned payload");
 
@@ -887,17 +912,17 @@ mod tests {
 
     #[test]
     fn account_mismatch_is_rejected_without_creating_a_payload() {
-        let (_directory, store, lease) = open_store_with_fixture();
+        let (_directory, mut store, lease) = open_store_with_fixture();
 
-        let error = prepare_upload(
-            &store,
-            &lease,
-            "http://127.0.0.1/autobackup/save",
-            "another-account",
-            "secret-token",
-        )
-        .err()
-        .expect("reject account mismatch");
+        let error = store
+            .prepare_kei_upload(
+                &lease,
+                "http://127.0.0.1/autobackup/save",
+                "another-account",
+                "secret-token",
+            )
+            .err()
+            .expect("reject account mismatch");
 
         assert_eq!(
             error.to_string(),
@@ -907,21 +932,22 @@ mod tests {
 
     #[test]
     fn startup_removes_only_abandoned_owned_payloads() {
-        let (directory, store, lease) = open_store_with_fixture();
-        let prepared = prepare_upload(
-            &store,
-            &lease,
-            "http://127.0.0.1/autobackup/save",
-            "account-1",
-            "secret-token",
-        )
-        .expect("prepare upload");
+        let (directory, mut store, lease) = open_store_with_fixture();
+        let prepared = store
+            .prepare_kei_upload(
+                &lease,
+                "http://127.0.0.1/autobackup/save",
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare upload");
         let output_directory = prepared.output_directory.clone();
         let payload = prepared.create_payload().expect("create payload");
         let payload_path = payload.path.clone();
         let unrelated = output_directory.join("keep-me.txt");
         fs::write(&unrelated, b"keep").expect("write unrelated file");
         std::mem::forget(payload);
+        drop(prepared);
         drop(store);
 
         let reopened = PersistentStore::open(directory.path()).expect("reopen store");

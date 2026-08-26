@@ -10,11 +10,11 @@ pub(crate) fn export_block_risu_save(
     omit_account: bool,
     job: &JobControl,
 ) -> Result<JobResultSummary, NativeJobError> {
-    let mut connection = prepared.take_connection().map_err(store_error)?;
+    let reader = prepared.take_reader().map_err(store_error)?;
     if job.is_cancel_requested() {
         return finish_with_cleanup_failure(
             cancelled("export cancelled before encoding"),
-            prepared.release(&mut connection),
+            prepared.release(reader),
         );
     }
     if let Err(error) = job.start(JobPhase::WritingExport) {
@@ -23,14 +23,15 @@ pub(crate) fn export_block_risu_save(
         } else {
             job_error(error)
         };
-        return finish_with_cleanup_failure(primary, prepared.release(&mut connection));
+        return finish_with_cleanup_failure(primary, prepared.release(reader));
     }
     let progress_failure = RefCell::new(None);
     let completed_items = Cell::new(0u64);
     let total_items = Cell::new(None);
     let encoded = export::create_controlled(
-        &connection,
+        &reader.connection,
         &prepared.snapshots_dir,
+        &reader.target,
         &prepared.lease,
         omit_account,
         || job.is_cancel_requested() || progress_failure.borrow().is_some(),
@@ -60,14 +61,14 @@ pub(crate) fn export_block_risu_save(
                 .into_inner()
                 .map(job_error)
                 .unwrap_or_else(|| store_error(error));
-            return finish_with_cleanup_failure(primary, prepared.release(&mut connection));
+            return finish_with_cleanup_failure(primary, prepared.release(reader));
         }
     };
     if let Some(error) = progress_failure.into_inner() {
         return finish_export_cleanup(
             Err(job_error(error)),
             &prepared,
-            &mut connection,
+            reader,
             Some(Path::new(&encoded.path)),
         );
     }
@@ -75,7 +76,7 @@ pub(crate) fn export_block_risu_save(
         return finish_export_cleanup(
             Err(cancelled("export cancelled before destination publication")),
             &prepared,
-            &mut connection,
+            reader,
             Some(Path::new(&encoded.path)),
         );
     }
@@ -88,7 +89,7 @@ pub(crate) fn export_block_risu_save(
         return finish_export_cleanup(
             Err(error),
             &prepared,
-            &mut connection,
+            reader,
             Some(Path::new(&encoded.path)),
         );
     }
@@ -100,7 +101,7 @@ pub(crate) fn export_block_risu_save(
                 "native export source directory is unavailable",
             )),
             &prepared,
-            &mut connection,
+            reader,
             Some(Path::new(&encoded.path)),
         );
     };
@@ -108,7 +109,7 @@ pub(crate) fn export_block_risu_save(
         return finish_export_cleanup(
             Err(invalid_destination("destination directory is unavailable")),
             &prepared,
-            &mut connection,
+            reader,
             Some(Path::new(&encoded.path)),
         );
     };
@@ -126,7 +127,7 @@ pub(crate) fn export_block_risu_save(
                 job_error(error)
             }),
             &prepared,
-            &mut connection,
+            reader,
             Some(Path::new(&encoded.path)),
         );
     }
@@ -182,21 +183,16 @@ pub(crate) fn export_block_risu_save(
             .map(job_error)
             .unwrap_or_else(|| destination_error(error))),
     };
-    finish_export_cleanup(
-        published,
-        &prepared,
-        &mut connection,
-        Some(Path::new(&encoded.path)),
-    )
+    finish_export_cleanup(published, &prepared, reader, Some(Path::new(&encoded.path)))
 }
 
 fn finish_export_cleanup(
     outcome: Result<JobResultSummary, NativeJobError>,
     prepared: &PreparedRisuSaveExport,
-    connection: &mut rusqlite::Connection,
+    reader: crate::persistent_store::RevisionReadLease,
     export_path: Option<&Path>,
 ) -> Result<JobResultSummary, NativeJobError> {
-    let cleanup_error = match prepared.release(connection) {
+    let cleanup_error = match prepared.release(reader) {
         Err(error) => Some(error),
         Ok(()) => export_path.and_then(|path| prepared.cleanup_file(path).err()),
     };

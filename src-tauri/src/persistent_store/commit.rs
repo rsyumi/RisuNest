@@ -509,9 +509,7 @@ pub(super) fn replace_commit(
     let active = active_generation(&transaction)?;
     let revision = actual_revision + 1;
     let generation = format!("revision-{revision}");
-    if !generation_is_leased(&transaction, &active)? {
-        delete_generation(&transaction, &active)?;
-    }
+    delete_generation(&transaction, &active)?;
     move_generation(&transaction, staging_id, &generation)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
@@ -1234,35 +1232,11 @@ fn move_generation(transaction: &Transaction<'_>, source: &str, target: &str) ->
 }
 
 fn writable_generation(
-    transaction: &Transaction<'_>,
+    _transaction: &Transaction<'_>,
     source: &str,
-    revision: i64,
+    _revision: i64,
 ) -> StoreResult<String> {
-    if !generation_is_leased(transaction, source)? {
-        return Ok(source.to_owned());
-    }
-    let target = format!("revision-{revision}");
-    for (table, columns) in GENERATION_TABLES {
-        transaction.execute(
-            &format!(
-                "INSERT INTO {table} (generation, {columns})
-                 SELECT ?1, {columns} FROM {table} WHERE generation = ?2"
-            ),
-            params![target, source],
-        )?;
-    }
-    Ok(target)
-}
-
-fn generation_is_leased(transaction: &Transaction<'_>, generation: &str) -> StoreResult<bool> {
-    Ok(transaction
-        .query_row(
-            "SELECT 1 FROM snapshot_leases WHERE generation = ?1 LIMIT 1",
-            [generation],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+    Ok(source.to_owned())
 }
 
 fn set_active(transaction: &Transaction<'_>, revision: i64, generation: &str) -> StoreResult<()> {

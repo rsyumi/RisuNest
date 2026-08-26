@@ -382,7 +382,7 @@ pub(crate) async fn pds_kei_backup_upload(
     expected_account_id: String,
     token: String,
 ) -> Result<KeiUploadResult, StoreError> {
-    let prepared = with_store(state, |store| {
+    let prepared = with_store_mut(state, |store| {
         store.prepare_kei_upload(&lease, &url, &expected_account_id, &token)
     })?;
     prepared.upload().await
