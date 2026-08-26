@@ -116,7 +116,8 @@ fn owner_entries<'a>(
                 .chain(input.add_character.iter());
             values
                 .filter_map(Value::as_object)
-                .find(|value| value.get("chaId").and_then(Value::as_str) == Some(character_id))
+                .filter(|value| value.get("chaId").and_then(Value::as_str) == Some(character_id))
+                .last()
                 .ok_or_else(|| {
                     validation("Character asset owner head requires its parent mutation")
                 })?

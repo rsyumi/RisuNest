@@ -364,6 +364,109 @@ fn character_parent_change_invalidates_omitted_owner_head() {
 }
 
 #[test]
+fn owner_head_validation_uses_the_final_character_parent_and_rejects_atomically() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut earlier_detail = store
+        .read_character("char-a", None)
+        .expect("read character")
+        .expect("character exists")
+        .value;
+    earlier_detail["additionalAssets"] = json!([["earlier", "assets/earlier.bin", "BIN"]]);
+    let mut final_character = database["characters"]
+        .as_array()
+        .expect("fixture characters")
+        .iter()
+        .find(|character| character["chaId"] == "char-a")
+        .expect("fixture character")
+        .clone();
+    final_character["additionalAssets"] = json!([
+        ["final-a", "assets/final-a.bin", "BIN"],
+        ["final-b", "assets/final-b.bin", "OddExt"]
+    ]);
+    let owner = AssetOwnerLocator::CharacterAdditionalAssets {
+        character_id: "char-a".to_owned(),
+    };
+    let final_head = AssetOwnerHead::present(owner.clone(), "66".repeat(32), 2);
+
+    let committed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: None,
+            replace_presets: None,
+            character: None,
+            character_details: Some(vec![earlier_detail.clone()]),
+            replace_character: Some(final_character.clone()),
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![final_head.clone()]),
+        })
+        .expect("validate against final character replacement");
+
+    let stored_character = store
+        .read_character("char-a", None)
+        .expect("read final character")
+        .expect("final character exists")
+        .value;
+    assert_eq!(
+        stored_character["additionalAssets"],
+        final_character["additionalAssets"]
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, None)
+            .expect("read final owner head")
+            .expect("final owner head exists")
+            .value,
+        final_head
+    );
+
+    let root_before = store.read_root(None).expect("read root before rejection");
+    let mut rejected_root = root_before.value.clone();
+    rejected_root["username"] = json!("must not commit");
+    let earlier_head = AssetOwnerHead::present(owner.clone(), "77".repeat(32), 1);
+
+    assert!(matches!(
+        store.commit(&WorkingSetCommit {
+            expected_revision: committed.revision,
+            root: Some(rejected_root),
+            replace_presets: None,
+            character: None,
+            character_details: Some(vec![earlier_detail]),
+            replace_character: Some(final_character),
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![earlier_head]),
+        }),
+        Err(StoreError::Validation { .. })
+    ));
+    assert_eq!(store.revision().expect("read revision"), committed.revision);
+    assert_eq!(
+        store.read_root(None).expect("read unchanged root"),
+        root_before
+    );
+    assert_eq!(
+        store
+            .read_character("char-a", None)
+            .expect("read unchanged character")
+            .expect("unchanged character exists")
+            .value,
+        stored_character
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, None)
+            .expect("read unchanged owner head")
+            .expect("unchanged owner head exists")
+            .value,
+        final_head
+    );
+}
+
+#[test]
 fn asset_alias_overwrite_isolated_by_revision_lease() {
     let (_directory, mut store, _) = open_fixture();
     let original = AssetAlias {

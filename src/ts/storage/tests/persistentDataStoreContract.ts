@@ -219,6 +219,67 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             )
         })
 
+        it('validates a character owner head against the final same-ID parent atomically', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            const imported = await store.replaceFromDatabase(database)
+            const earlierDetail = (await store.readCharacter('char-a'))!.value
+            earlierDetail.additionalAssets = [['earlier', 'assets/earlier.bin', 'BIN']]
+            const finalCharacter = structuredClone(
+                database.characters.find((character) => character.chaId === 'char-a')!,
+            )
+            finalCharacter.additionalAssets = [
+                ['final-a', 'assets/final-a.bin', 'BIN'],
+                ['final-b', 'assets/final-b.bin', 'OddExt'],
+            ]
+            const owner = {
+                kind: 'character-additional-assets' as const,
+                characterId: 'char-a',
+            }
+            const finalHead: AssetOwnerHead = {
+                owner,
+                present: true,
+                manifestHash: '66'.repeat(32),
+                entryCount: 2,
+            }
+            const committed = await store.commit({
+                expectedRevision: imported.revision,
+                characterDetails: [earlierDetail],
+                replaceCharacter: finalCharacter,
+                assetOwnerHeads: [finalHead],
+            })
+
+            const storedCharacter = await store.readCharacter('char-a')
+            expect(storedCharacter?.value.additionalAssets).toEqual(
+                finalCharacter.additionalAssets,
+            )
+            expect(await store.readAssetOwnerHead(owner)).toEqual({
+                revision: committed.revision,
+                value: finalHead,
+            })
+
+            const rootBefore = await store.readRoot()
+            const earlierHead: AssetOwnerHead = {
+                ...finalHead,
+                manifestHash: '77'.repeat(32),
+                entryCount: 1,
+            }
+            await expect(store.commit({
+                expectedRevision: committed.revision,
+                root: { ...rootBefore.value, username: 'must not commit' },
+                characterDetails: [earlierDetail],
+                replaceCharacter: finalCharacter,
+                assetOwnerHeads: [earlierHead],
+            })).rejects.toThrow('entryCount')
+
+            expect(await store.readRoot()).toEqual(rootBefore)
+            expect(await store.readCharacter('char-a')).toEqual(storedCharacter)
+            expect(await store.readAssetOwnerHead(owner)).toEqual({
+                revision: committed.revision,
+                value: finalHead,
+            })
+        })
+
         it('isolates exact asset alias metadata across a pinned overwrite', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
