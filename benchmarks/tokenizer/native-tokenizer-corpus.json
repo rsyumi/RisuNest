@@ -1,0 +1,2400 @@
+{
+  "schemaVersion": 1,
+  "oracle": {
+    "package": "@dqbd/tiktoken",
+    "version": "1.0.22"
+  },
+  "artifacts": {
+    "cl100k_base": {
+      "sha256": "49a4e05dea02c8fafbd50cc4725c4aab8f39386c0afedef118e0dfebc2fe523a",
+      "fingerprint": "cl100k_base:dqbd-1.0.22:49a4e05dea02c8fafbd50cc4725c4aab8f39386c0afedef118e0dfebc2fe523a:tiktoken-rs-0.12.0:contract-1"
+    },
+    "o200k_base": {
+      "sha256": "a2c363f80642c0f07d916716b3940ff030121f3b5cef72b2c5bd1d4f64c14fb8",
+      "fingerprint": "o200k_base:dqbd-1.0.22:a2c363f80642c0f07d916716b3940ff030121f3b5cef72b2c5bd1d4f64c14fb8:tiktoken-rs-0.12.0:contract-1"
+    }
+  },
+  "cases": [
+    {
+      "name": "cl100k_base:empty",
+      "tokenizerId": "cl100k_base",
+      "class": "empty",
+      "input": {
+        "kind": "text",
+        "value": ""
+      },
+      "ids": []
+    },
+    {
+      "name": "cl100k_base:ascii-word",
+      "tokenizerId": "cl100k_base",
+      "class": "ascii",
+      "input": {
+        "kind": "text",
+        "value": "hello"
+      },
+      "ids": [
+        15339
+      ]
+    },
+    {
+      "name": "cl100k_base:whitespace-boundaries",
+      "tokenizerId": "cl100k_base",
+      "class": "whitespace",
+      "input": {
+        "kind": "text",
+        "value": "  leading\tmiddle\nline\r\ntrailing  "
+      },
+      "ids": [
+        220,
+        6522,
+        2157,
+        3390,
+        198,
+        1074,
+        319,
+        376,
+        14612,
+        256
+      ]
+    },
+    {
+      "name": "cl100k_base:punctuation-regex-boundaries",
+      "tokenizerId": "cl100k_base",
+      "class": "punctuation",
+      "input": {
+        "kind": "text",
+        "value": "Hello?!\n/regex\\/path/; []{}()"
+      },
+      "ids": [
+        9906,
+        30,
+        4999,
+        14,
+        27485,
+        4844,
+        2398,
+        14,
+        26,
+        3132,
+        6390,
+        368
+      ]
+    },
+    {
+      "name": "cl100k_base:contractions-and-case",
+      "tokenizerId": "cl100k_base",
+      "class": "contractions",
+      "input": {
+        "kind": "text",
+        "value": "I'm I'M can't CAN'T we'd you're O'Reilly"
+      },
+      "ids": [
+        40,
+        2846,
+        358,
+        28703,
+        649,
+        956,
+        20076,
+        17773,
+        584,
+        4265,
+        499,
+        2351,
+        507,
+        50527,
+        14722
+      ]
+    },
+    {
+      "name": "cl100k_base:numeric-grouping-boundaries",
+      "tokenizerId": "cl100k_base",
+      "class": "numbers",
+      "input": {
+        "kind": "text",
+        "value": "1 12 123 1234 12345 0001 999999999"
+      },
+      "ids": [
+        16,
+        220,
+        717,
+        220,
+        4513,
+        220,
+        4513,
+        19,
+        220,
+        4513,
+        1774,
+        220,
+        931,
+        16,
+        220,
+        5500,
+        5500,
+        5500
+      ]
+    },
+    {
+      "name": "cl100k_base:source-code",
+      "tokenizerId": "cl100k_base",
+      "class": "source-code",
+      "input": {
+        "kind": "text",
+        "value": "const value = items.map((item) => item.id ?? 0);\n"
+      },
+      "ids": [
+        1040,
+        907,
+        284,
+        3673,
+        4875,
+        1209,
+        1224,
+        8,
+        591,
+        1537,
+        1801,
+        9602,
+        220,
+        15,
+        317
+      ]
+    },
+    {
+      "name": "cl100k_base:json",
+      "tokenizerId": "cl100k_base",
+      "class": "json",
+      "input": {
+        "kind": "text",
+        "value": "{\"name\":\"Risu\",\"enabled\":false,\"count\":0,\"items\":[]}"
+      },
+      "ids": [
+        5018,
+        609,
+        3332,
+        49,
+        63848,
+        2247,
+        16247,
+        794,
+        3934,
+        1359,
+        1868,
+        794,
+        15,
+        1359,
+        3699,
+        794,
+        67377
+      ]
+    },
+    {
+      "name": "cl100k_base:markdown",
+      "tokenizerId": "cl100k_base",
+      "class": "markdown",
+      "input": {
+        "kind": "text",
+        "value": "# Heading\n\n- **bold** and `code`\n\n> quote"
+      },
+      "ids": [
+        2,
+        52449,
+        271,
+        12,
+        3146,
+        15168,
+        334,
+        323,
+        1595,
+        1889,
+        19884,
+        29,
+        12929
+      ]
+    },
+    {
+      "name": "cl100k_base:url",
+      "tokenizerId": "cl100k_base",
+      "class": "url",
+      "input": {
+        "kind": "text",
+        "value": "https://example.test/a%20b?q=hello%2Fworld&empty=#fragment"
+      },
+      "ids": [
+        2485,
+        1129,
+        8858,
+        6085,
+        14520,
+        4,
+        508,
+        65,
+        44882,
+        28,
+        15339,
+        4,
+        17,
+        37,
+        14957,
+        5,
+        3274,
+        46231,
+        43302
+      ]
+    },
+    {
+      "name": "cl100k_base:base64-like",
+      "tokenizerId": "cl100k_base",
+      "class": "base64",
+      "input": {
+        "kind": "text",
+        "value": "VGhpcy1pc19hX2xvbmctYmFzZTY0X2xpa2Vfc3RyaW5nPT0="
+      },
+      "ids": [
+        47741,
+        71,
+        4080,
+        88,
+        16,
+        4080,
+        777,
+        71,
+        55,
+        17,
+        87,
+        85,
+        30407,
+        302,
+        56,
+        76,
+        37,
+        89,
+        57,
+        22875,
+        15,
+        55,
+        17,
+        87,
+        6733,
+        17,
+        53,
+        8480,
+        18,
+        49,
+        7911,
+        54,
+        20,
+        77,
+        2898,
+        15,
+        28
+      ]
+    },
+    {
+      "name": "cl100k_base:korean",
+      "tokenizerId": "cl100k_base",
+      "class": "korean",
+      "input": {
+        "kind": "text",
+        "value": "안녕하세요, 리수네스트입니다."
+      },
+      "ids": [
+        31495,
+        230,
+        75265,
+        243,
+        92245,
+        11,
+        58083,
+        24140,
+        76242,
+        97,
+        54289,
+        80052,
+        13
+      ]
+    },
+    {
+      "name": "cl100k_base:simplified-chinese",
+      "tokenizerId": "cl100k_base",
+      "class": "simplified-chinese",
+      "input": {
+        "kind": "text",
+        "value": "你好，世界。简体中文分词测试。"
+      },
+      "ids": [
+        57668,
+        53901,
+        3922,
+        3574,
+        244,
+        98220,
+        1811,
+        99337,
+        33014,
+        16325,
+        17161,
+        17620,
+        6744,
+        235,
+        82805,
+        1811
+      ]
+    },
+    {
+      "name": "cl100k_base:traditional-chinese",
+      "tokenizerId": "cl100k_base",
+      "class": "traditional-chinese",
+      "input": {
+        "kind": "text",
+        "value": "你好，世界。繁體中文分詞測試。"
+      },
+      "ids": [
+        57668,
+        53901,
+        3922,
+        3574,
+        244,
+        98220,
+        1811,
+        163,
+        117,
+        223,
+        165,
+        104,
+        242,
+        16325,
+        17161,
+        17620,
+        50520,
+        252,
+        35086,
+        105,
+        50520,
+        99,
+        1811
+      ]
+    },
+    {
+      "name": "cl100k_base:japanese",
+      "tokenizerId": "cl100k_base",
+      "class": "japanese",
+      "input": {
+        "kind": "text",
+        "value": "こんにちは世界。カタカナと漢字。"
+      },
+      "ids": [
+        90115,
+        3574,
+        244,
+        98220,
+        1811,
+        71493,
+        47307,
+        71493,
+        96452,
+        19732,
+        78256,
+        95,
+        19113,
+        1811
+      ]
+    },
+    {
+      "name": "cl100k_base:arabic-rtl",
+      "tokenizerId": "cl100k_base",
+      "class": "arabic-rtl",
+      "input": {
+        "kind": "text",
+        "value": "‏مرحبا بالعالم‎"
+      },
+      "ids": [
+        378,
+        237,
+        10386,
+        11318,
+        30925,
+        22071,
+        5821,
+        28946,
+        32482,
+        24102,
+        32482,
+        10386,
+        79338
+      ]
+    },
+    {
+      "name": "cl100k_base:cyrillic",
+      "tokenizerId": "cl100k_base",
+      "class": "cyrillic",
+      "input": {
+        "kind": "text",
+        "value": "Привет, мир. Проверка."
+      },
+      "ids": [
+        54745,
+        28089,
+        8341,
+        11,
+        11562,
+        78746,
+        13,
+        23227,
+        70059,
+        13433,
+        13
+      ]
+    },
+    {
+      "name": "cl100k_base:devanagari",
+      "tokenizerId": "cl100k_base",
+      "class": "devanagari",
+      "input": {
+        "kind": "text",
+        "value": "नमस्ते दुनिया। परीक्षण।"
+      },
+      "ids": [
+        61196,
+        88344,
+        79468,
+        31584,
+        97,
+        35470,
+        15272,
+        99,
+        73753,
+        61196,
+        43411,
+        107,
+        24810,
+        12906,
+        97,
+        84736,
+        45279,
+        44747,
+        65804,
+        31584,
+        115,
+        5619,
+        96,
+        12906,
+        97
+      ]
+    },
+    {
+      "name": "cl100k_base:unicode-nfc",
+      "tokenizerId": "cl100k_base",
+      "class": "unicode-normalization",
+      "input": {
+        "kind": "text",
+        "value": "café Å 가"
+      },
+      "ids": [
+        936,
+        59958,
+        80352,
+        36609
+      ]
+    },
+    {
+      "name": "cl100k_base:unicode-nfd",
+      "tokenizerId": "cl100k_base",
+      "class": "unicode-normalization",
+      "input": {
+        "kind": "text",
+        "value": "café Å 가"
+      },
+      "ids": [
+        936,
+        1897,
+        54939,
+        362,
+        136,
+        232,
+        87189,
+        226,
+        222,
+        157,
+        227,
+        94
+      ]
+    },
+    {
+      "name": "cl100k_base:emoji-zwj-variation-flags-skin",
+      "tokenizerId": "cl100k_base",
+      "class": "emoji",
+      "input": {
+        "kind": "text",
+        "value": "👨‍👩‍👧‍👦 ❤️ 🇰🇷 👍🏽 ✈️"
+      },
+      "ids": [
+        9468,
+        239,
+        101,
+        378,
+        235,
+        9468,
+        239,
+        102,
+        378,
+        235,
+        9468,
+        239,
+        100,
+        378,
+        235,
+        9468,
+        239,
+        99,
+        71570,
+        31643,
+        11410,
+        229,
+        108,
+        9468,
+        229,
+        115,
+        62904,
+        235,
+        9468,
+        237,
+        121,
+        26602,
+        230,
+        31643
+      ]
+    },
+    {
+      "name": "cl100k_base:nul-and-controls",
+      "tokenizerId": "cl100k_base",
+      "class": "control-characters",
+      "input": {
+        "kind": "text",
+        "value": "\u0000\u0001\b\u000b\u001f"
+      },
+      "ids": [
+        188,
+        189,
+        196,
+        199,
+        219
+      ]
+    },
+    {
+      "name": "cl100k_base:spacing-and-replacement-controls",
+      "tokenizerId": "cl100k_base",
+      "class": "control-characters",
+      "input": {
+        "kind": "text",
+        "value": "a b​c�"
+      },
+      "ids": [
+        64,
+        4194,
+        65,
+        16067,
+        66,
+        5809
+      ]
+    },
+    {
+      "name": "cl100k_base:lone-high-surrogate",
+      "tokenizerId": "cl100k_base",
+      "class": "utf16-boundary",
+      "input": {
+        "kind": "utf16-code-units",
+        "codeUnits": [
+          55296
+        ]
+      },
+      "ids": [
+        5809
+      ]
+    },
+    {
+      "name": "cl100k_base:lone-low-surrogate",
+      "tokenizerId": "cl100k_base",
+      "class": "utf16-boundary",
+      "input": {
+        "kind": "utf16-code-units",
+        "codeUnits": [
+          56320
+        ]
+      },
+      "ids": [
+        5809
+      ]
+    },
+    {
+      "name": "cl100k_base:mixed-surrogate-boundary",
+      "tokenizerId": "cl100k_base",
+      "class": "utf16-boundary",
+      "input": {
+        "kind": "utf16-code-units",
+        "codeUnits": [
+          65,
+          55296,
+          66,
+          55357,
+          56842,
+          56320,
+          67
+        ]
+      },
+      "ids": [
+        32,
+        5809,
+        33,
+        76460,
+        232,
+        5809,
+        34
+      ]
+    },
+    {
+      "name": "cl100k_base:synthetic-system-segment",
+      "tokenizerId": "cl100k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "System: Follow the character card and answer in Korean.\nSafety: preserve code fences."
+      },
+      "ids": [
+        2374,
+        25,
+        11359,
+        279,
+        3752,
+        3786,
+        323,
+        4320,
+        304,
+        16526,
+        627,
+        74137,
+        25,
+        21813,
+        2082,
+        70255,
+        13
+      ]
+    },
+    {
+      "name": "cl100k_base:synthetic-character-segment",
+      "tokenizerId": "cl100k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "Name: Mira\nPersonality: curious, concise\nScenario: a rain-soaked library"
+      },
+      "ids": [
+        678,
+        25,
+        386,
+        9008,
+        198,
+        10909,
+        2786,
+        25,
+        22999,
+        11,
+        64694,
+        198,
+        55131,
+        25,
+        264,
+        11422,
+        34119,
+        7897,
+        6875
+      ]
+    },
+    {
+      "name": "cl100k_base:synthetic-chat-segment",
+      "tokenizerId": "cl100k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "user: Can you explain this?\nassistant: 물론이죠. 첫 단계는 경계를 확인하는 것입니다."
+      },
+      "ids": [
+        882,
+        25,
+        3053,
+        499,
+        10552,
+        420,
+        5380,
+        78191,
+        25,
+        5251,
+        105,
+        120,
+        15291,
+        254,
+        13094,
+        168,
+        96,
+        254,
+        13,
+        49464,
+        104,
+        35243,
+        101,
+        22783,
+        226,
+        16969,
+        44215,
+        22783,
+        226,
+        18918,
+        74959,
+        44005,
+        72208,
+        80052,
+        13
+      ]
+    },
+    {
+      "name": "cl100k_base:synthetic-lorebook-segment",
+      "tokenizerId": "cl100k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "[Lore]\nkey: moon, archive\ncontent: The archive opens only at midnight."
+      },
+      "ids": [
+        50515,
+        461,
+        933,
+        798,
+        25,
+        18266,
+        11,
+        18624,
+        198,
+        1834,
+        25,
+        578,
+        18624,
+        16264,
+        1193,
+        520,
+        33433,
+        13
+      ]
+    },
+    {
+      "name": "cl100k_base:synthetic-code-block-segment",
+      "tokenizerId": "cl100k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "```ts\nconst answer: number = 42\nconsole.log(answer)\n```"
+      },
+      "ids": [
+        74694,
+        2641,
+        198,
+        1040,
+        4320,
+        25,
+        1396,
+        284,
+        220,
+        2983,
+        198,
+        5467,
+        1699,
+        40415,
+        340,
+        74694
+      ]
+    },
+    {
+      "name": "cl100k_base:synthetic-tool-call-segment",
+      "tokenizerId": "cl100k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "{\"name\":\"search\",\"arguments\":{\"query\":\"RisuNest tokenizer\",\"limit\":10}}"
+      },
+      "ids": [
+        5018,
+        609,
+        3332,
+        1874,
+        2247,
+        16774,
+        23118,
+        1663,
+        3332,
+        49,
+        63848,
+        45,
+        478,
+        47058,
+        2247,
+        9696,
+        794,
+        605,
+        3500
+      ]
+    },
+    {
+      "name": "cl100k_base:long-prompt-over-32-kib",
+      "tokenizerId": "cl100k_base",
+      "class": "long-input",
+      "input": {
+        "kind": "repeat",
+        "value": " ",
+        "count": 32768
+      },
+      "ids": [
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040
+      ]
+    },
+    {
+      "name": "cl100k_base:allocation-boundary",
+      "tokenizerId": "cl100k_base",
+      "class": "allocation-boundary",
+      "input": {
+        "kind": "repeat",
+        "value": " ",
+        "count": 4097
+      },
+      "ids": [
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        58040,
+        5351,
+        39271
+      ]
+    },
+    {
+      "name": "cl100k_base:special-<|endoftext|>-alone",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "<|endoftext|>"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endoftext|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|endoftext|>-embedded",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "before <|endoftext|> after"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endoftext|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|fim_prefix|>-alone",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "<|fim_prefix|>"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|fim_prefix|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|fim_prefix|>-embedded",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "before <|fim_prefix|> after"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|fim_prefix|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|fim_middle|>-alone",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "<|fim_middle|>"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|fim_middle|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|fim_middle|>-embedded",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "before <|fim_middle|> after"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|fim_middle|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|fim_suffix|>-alone",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "<|fim_suffix|>"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|fim_suffix|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|fim_suffix|>-embedded",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "before <|fim_suffix|> after"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|fim_suffix|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|endofprompt|>-alone",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "<|endofprompt|>"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endofprompt|>"
+      }
+    },
+    {
+      "name": "cl100k_base:special-<|endofprompt|>-embedded",
+      "tokenizerId": "cl100k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "before <|endofprompt|> after"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endofprompt|>"
+      }
+    },
+    {
+      "name": "o200k_base:empty",
+      "tokenizerId": "o200k_base",
+      "class": "empty",
+      "input": {
+        "kind": "text",
+        "value": ""
+      },
+      "ids": []
+    },
+    {
+      "name": "o200k_base:ascii-word",
+      "tokenizerId": "o200k_base",
+      "class": "ascii",
+      "input": {
+        "kind": "text",
+        "value": "hello"
+      },
+      "ids": [
+        24912
+      ]
+    },
+    {
+      "name": "o200k_base:whitespace-boundaries",
+      "tokenizerId": "o200k_base",
+      "class": "whitespace",
+      "input": {
+        "kind": "text",
+        "value": "  leading\tmiddle\nline\r\ntrailing  "
+      },
+      "ids": [
+        220,
+        8117,
+        4460,
+        5321,
+        198,
+        1137,
+        370,
+        371,
+        24408,
+        256
+      ]
+    },
+    {
+      "name": "o200k_base:punctuation-regex-boundaries",
+      "tokenizerId": "o200k_base",
+      "class": "punctuation",
+      "input": {
+        "kind": "text",
+        "value": "Hello?!\n/regex\\/path/; []{}()"
+      },
+      "ids": [
+        13225,
+        145948,
+        14,
+        63920,
+        9855,
+        4189,
+        14,
+        26,
+        6126,
+        12083,
+        416
+      ]
+    },
+    {
+      "name": "o200k_base:contractions-and-case",
+      "tokenizerId": "o200k_base",
+      "class": "contractions",
+      "input": {
+        "kind": "text",
+        "value": "I'm I'M can't CAN'T we'd you're O'Reilly"
+      },
+      "ids": [
+        15390,
+        3413,
+        44,
+        8535,
+        31937,
+        51532,
+        68530,
+        7163,
+        532,
+        146756,
+        21191
+      ]
+    },
+    {
+      "name": "o200k_base:numeric-grouping-boundaries",
+      "tokenizerId": "o200k_base",
+      "class": "numbers",
+      "input": {
+        "kind": "text",
+        "value": "1 12 123 1234 12345 0001 999999999"
+      },
+      "ids": [
+        16,
+        220,
+        899,
+        220,
+        7633,
+        220,
+        7633,
+        19,
+        220,
+        7633,
+        2548,
+        220,
+        1302,
+        16,
+        220,
+        9130,
+        9130,
+        9130
+      ]
+    },
+    {
+      "name": "o200k_base:source-code",
+      "tokenizerId": "o200k_base",
+      "class": "source-code",
+      "input": {
+        "kind": "text",
+        "value": "const value = items.map((item) => item.id ?? 0);\n"
+      },
+      "ids": [
+        1671,
+        1432,
+        314,
+        4732,
+        7975,
+        2054,
+        2057,
+        8,
+        871,
+        2169,
+        2858,
+        16605,
+        220,
+        15,
+        362
+      ]
+    },
+    {
+      "name": "o200k_base:json",
+      "tokenizerId": "o200k_base",
+      "class": "json",
+      "input": {
+        "kind": "text",
+        "value": "{\"name\":\"Risu\",\"enabled\":false,\"count\":0,\"items\":[]}"
+      },
+      "ids": [
+        10848,
+        897,
+        7534,
+        49,
+        20411,
+        4294,
+        42840,
+        1243,
+        7556,
+        3532,
+        5420,
+        1243,
+        15,
+        3532,
+        6918,
+        1243,
+        136008
+      ]
+    },
+    {
+      "name": "o200k_base:markdown",
+      "tokenizerId": "o200k_base",
+      "class": "markdown",
+      "input": {
+        "kind": "text",
+        "value": "# Heading\n\n- **bold** and `code`\n\n> quote"
+      },
+      "ids": [
+        2,
+        94343,
+        279,
+        12,
+        6240,
+        30322,
+        410,
+        326,
+        2700,
+        3056,
+        38193,
+        29,
+        16723
+      ]
+    },
+    {
+      "name": "o200k_base:url",
+      "tokenizerId": "o200k_base",
+      "class": "url",
+      "input": {
+        "kind": "text",
+        "value": "https://example.test/a%20b?q=hello%2Fworld&empty=#fragment"
+      },
+      "ids": [
+        4172,
+        1684,
+        18582,
+        9859,
+        23839,
+        4,
+        455,
+        65,
+        93569,
+        28,
+        24912,
+        4,
+        17,
+        37,
+        24169,
+        5,
+        6857,
+        120952,
+        74424
+      ]
+    },
+    {
+      "name": "o200k_base:base64-like",
+      "tokenizerId": "o200k_base",
+      "class": "base64",
+      "input": {
+        "kind": "text",
+        "value": "VGhpcy1pc19hX2xvbmctYmFzZTY0X2xpa2Vfc3RyaW5nPT0="
+      },
+      "ids": [
+        75856,
+        45478,
+        4523,
+        16,
+        6344,
+        858,
+        71,
+        55,
+        17,
+        87,
+        85,
+        52883,
+        308,
+        147186,
+        37,
+        89,
+        57,
+        41551,
+        15,
+        55,
+        17,
+        87,
+        3899,
+        17,
+        53,
+        14794,
+        18,
+        49,
+        2090,
+        54,
+        20,
+        77,
+        7296,
+        15,
+        28
+      ]
+    },
+    {
+      "name": "o200k_base:korean",
+      "tokenizerId": "o200k_base",
+      "class": "korean",
+      "input": {
+        "kind": "text",
+        "value": "안녕하세요, 리수네스트입니다."
+      },
+      "ids": [
+        14307,
+        171731,
+        11,
+        38970,
+        7820,
+        29323,
+        42321,
+        27001,
+        13
+      ]
+    },
+    {
+      "name": "o200k_base:simplified-chinese",
+      "tokenizerId": "o200k_base",
+      "class": "simplified-chinese",
+      "input": {
+        "kind": "text",
+        "value": "你好，世界。简体中文分词测试。"
+      },
+      "ids": [
+        177519,
+        979,
+        28428,
+        788,
+        27891,
+        7074,
+        10667,
+        2957,
+        31892,
+        82843,
+        788
+      ]
+    },
+    {
+      "name": "o200k_base:traditional-chinese",
+      "tokenizerId": "o200k_base",
+      "class": "traditional-chinese",
+      "input": {
+        "kind": "text",
+        "value": "你好，世界。繁體中文分詞測試。"
+      },
+      "ids": [
+        177519,
+        979,
+        28428,
+        788,
+        103441,
+        33078,
+        10667,
+        2957,
+        141855,
+        134925,
+        77641,
+        788
+      ]
+    },
+    {
+      "name": "o200k_base:japanese",
+      "tokenizerId": "o200k_base",
+      "class": "japanese",
+      "input": {
+        "kind": "text",
+        "value": "こんにちは世界。カタカナと漢字。"
+      },
+      "ids": [
+        95839,
+        28428,
+        788,
+        14214,
+        12288,
+        14214,
+        27354,
+        5330,
+        183591,
+        8134,
+        788
+      ]
+    },
+    {
+      "name": "o200k_base:arabic-rtl",
+      "tokenizerId": "o200k_base",
+      "class": "arabic-rtl",
+      "input": {
+        "kind": "text",
+        "value": "‏مرحبا بالعالم‎"
+      },
+      "ids": [
+        25526,
+        158894,
+        26537,
+        101462,
+        12773,
+        29917
+      ]
+    },
+    {
+      "name": "o200k_base:cyrillic",
+      "tokenizerId": "o200k_base",
+      "class": "cyrillic",
+      "input": {
+        "kind": "text",
+        "value": "Привет, мир. Проверка."
+      },
+      "ids": [
+        23881,
+        131903,
+        11,
+        37934,
+        13,
+        169667,
+        1599,
+        13
+      ]
+    },
+    {
+      "name": "o200k_base:devanagari",
+      "tokenizerId": "o200k_base",
+      "class": "devanagari",
+      "input": {
+        "kind": "text",
+        "value": "नमस्ते दुनिया। परीक्षण।"
+      },
+      "ids": [
+        998,
+        1637,
+        14681,
+        628,
+        64593,
+        1670,
+        129443,
+        1670
+      ]
+    },
+    {
+      "name": "o200k_base:unicode-nfc",
+      "tokenizerId": "o200k_base",
+      "class": "unicode-normalization",
+      "input": {
+        "kind": "text",
+        "value": "café Å 가"
+      },
+      "ids": [
+        66,
+        103112,
+        49805,
+        9919
+      ]
+    },
+    {
+      "name": "o200k_base:unicode-nfd",
+      "tokenizerId": "o200k_base",
+      "class": "unicode-normalization",
+      "input": {
+        "kind": "text",
+        "value": "café Å 가"
+      },
+      "ids": [
+        66,
+        6903,
+        13430,
+        355,
+        110718,
+        220,
+        157,
+        226,
+        222,
+        157,
+        227,
+        94
+      ]
+    },
+    {
+      "name": "o200k_base:emoji-zwj-variation-flags-skin",
+      "tokenizerId": "o200k_base",
+      "class": "emoji",
+      "input": {
+        "kind": "text",
+        "value": "👨‍👩‍👧‍👦 ❤️ 🇰🇷 👍🏽 ✈️"
+      },
+      "ids": [
+        28823,
+        101,
+        2524,
+        28823,
+        102,
+        2524,
+        28823,
+        100,
+        2524,
+        28823,
+        99,
+        122205,
+        173468,
+        108,
+        55506,
+        115,
+        160433,
+        52622,
+        121,
+        32367,
+        230,
+        15148
+      ]
+    },
+    {
+      "name": "o200k_base:nul-and-controls",
+      "tokenizerId": "o200k_base",
+      "class": "control-characters",
+      "input": {
+        "kind": "text",
+        "value": "\u0000\u0001\b\u000b\u001f"
+      },
+      "ids": [
+        188,
+        189,
+        196,
+        199,
+        219
+      ]
+    },
+    {
+      "name": "o200k_base:spacing-and-replacement-controls",
+      "tokenizerId": "o200k_base",
+      "class": "control-characters",
+      "input": {
+        "kind": "text",
+        "value": "a b​c�"
+      },
+      "ids": [
+        64,
+        5310,
+        65,
+        3310,
+        66,
+        3251
+      ]
+    },
+    {
+      "name": "o200k_base:lone-high-surrogate",
+      "tokenizerId": "o200k_base",
+      "class": "utf16-boundary",
+      "input": {
+        "kind": "utf16-code-units",
+        "codeUnits": [
+          55296
+        ]
+      },
+      "ids": [
+        3251
+      ]
+    },
+    {
+      "name": "o200k_base:lone-low-surrogate",
+      "tokenizerId": "o200k_base",
+      "class": "utf16-boundary",
+      "input": {
+        "kind": "utf16-code-units",
+        "codeUnits": [
+          56320
+        ]
+      },
+      "ids": [
+        3251
+      ]
+    },
+    {
+      "name": "o200k_base:mixed-surrogate-boundary",
+      "tokenizerId": "o200k_base",
+      "class": "utf16-boundary",
+      "input": {
+        "kind": "utf16-code-units",
+        "codeUnits": [
+          65,
+          55296,
+          66,
+          55357,
+          56842,
+          56320,
+          67
+        ]
+      },
+      "ids": [
+        32,
+        3251,
+        33,
+        102630,
+        3251,
+        34
+      ]
+    },
+    {
+      "name": "o200k_base:synthetic-system-segment",
+      "tokenizerId": "o200k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "System: Follow the character card and answer in Korean.\nSafety: preserve code fences."
+      },
+      "ids": [
+        3320,
+        25,
+        17547,
+        290,
+        5855,
+        4766,
+        326,
+        6052,
+        306,
+        34538,
+        558,
+        74598,
+        25,
+        33507,
+        3490,
+        121890,
+        13
+      ]
+    },
+    {
+      "name": "o200k_base:synthetic-character-segment",
+      "tokenizerId": "o200k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "Name: Mira\nPersonality: curious, concise\nScenario: a rain-soaked library"
+      },
+      "ids": [
+        864,
+        25,
+        132553,
+        198,
+        10863,
+        9443,
+        25,
+        33612,
+        11,
+        82463,
+        198,
+        65095,
+        25,
+        261,
+        13873,
+        48601,
+        19969,
+        11282
+      ]
+    },
+    {
+      "name": "o200k_base:synthetic-chat-segment",
+      "tokenizerId": "o200k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "user: Can you explain this?\nassistant: 물론이죠. 첫 단계는 경계를 확인하는 것입니다."
+      },
+      "ids": [
+        1428,
+        25,
+        4101,
+        481,
+        16644,
+        495,
+        3901,
+        173781,
+        25,
+        136737,
+        2186,
+        77715,
+        13,
+        84086,
+        188019,
+        2770,
+        17357,
+        173370,
+        54799,
+        14108,
+        86424,
+        13
+      ]
+    },
+    {
+      "name": "o200k_base:synthetic-lorebook-segment",
+      "tokenizerId": "o200k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "[Lore]\nkey: moon, archive\ncontent: The archive opens only at midnight."
+      },
+      "ids": [
+        112100,
+        510,
+        1592,
+        1898,
+        25,
+        28479,
+        11,
+        33542,
+        198,
+        3252,
+        25,
+        623,
+        33542,
+        24061,
+        1606,
+        540,
+        54213,
+        13
+      ]
+    },
+    {
+      "name": "o200k_base:synthetic-code-block-segment",
+      "tokenizerId": "o200k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "```ts\nconst answer: number = 42\nconsole.log(answer)\n```"
+      },
+      "ids": [
+        168394,
+        1561,
+        198,
+        1671,
+        6052,
+        25,
+        2086,
+        314,
+        220,
+        4689,
+        198,
+        9343,
+        2659,
+        78433,
+        446,
+        168394
+      ]
+    },
+    {
+      "name": "o200k_base:synthetic-tool-call-segment",
+      "tokenizerId": "o200k_base",
+      "class": "prompt-segment",
+      "input": {
+        "kind": "text",
+        "value": "{\"name\":\"search\",\"arguments\":{\"query\":\"RisuNest tokenizer\",\"limit\":10}}"
+      },
+      "ids": [
+        10848,
+        897,
+        7534,
+        2624,
+        4294,
+        34317,
+        70649,
+        2975,
+        7534,
+        49,
+        20411,
+        123672,
+        99665,
+        4294,
+        19698,
+        1243,
+        702,
+        6478
+      ]
+    },
+    {
+      "name": "o200k_base:long-prompt-over-32-kib",
+      "tokenizerId": "o200k_base",
+      "class": "long-input",
+      "input": {
+        "kind": "repeat",
+        "value": " ",
+        "count": 32768
+      },
+      "ids": [
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056
+      ]
+    },
+    {
+      "name": "o200k_base:allocation-boundary",
+      "tokenizerId": "o200k_base",
+      "class": "allocation-boundary",
+      "input": {
+        "kind": "repeat",
+        "value": " ",
+        "count": 4097
+      },
+      "ids": [
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        72056,
+        220
+      ]
+    },
+    {
+      "name": "o200k_base:special-<|endoftext|>-alone",
+      "tokenizerId": "o200k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "<|endoftext|>"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endoftext|>"
+      }
+    },
+    {
+      "name": "o200k_base:special-<|endoftext|>-embedded",
+      "tokenizerId": "o200k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "before <|endoftext|> after"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endoftext|>"
+      }
+    },
+    {
+      "name": "o200k_base:special-<|endofprompt|>-alone",
+      "tokenizerId": "o200k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "<|endofprompt|>"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endofprompt|>"
+      }
+    },
+    {
+      "name": "o200k_base:special-<|endofprompt|>-embedded",
+      "tokenizerId": "o200k_base",
+      "class": "special-token-error",
+      "input": {
+        "kind": "text",
+        "value": "before <|endofprompt|> after"
+      },
+      "error": {
+        "code": "disallowed_special_token",
+        "token": "<|endofprompt|>"
+      }
+    }
+  ]
+}
