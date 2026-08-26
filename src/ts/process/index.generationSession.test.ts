@@ -212,7 +212,11 @@ function makeCharacter(chat: Chat, id = 'character-a') {
     } as unknown as character
 }
 
-function installDatabase(chat = makeChat(), extraCharacters: character[] = []) {
+function installDatabase(
+    chat = makeChat(),
+    extraCharacters: character[] = [],
+    onMutation?: ConstructorParameters<typeof ActiveConversationSession>[0]['onMutation'],
+) {
     const installedCharacter = makeCharacter(chat)
     DBState.db = {
         characters: [installedCharacter, ...extraCharacters],
@@ -268,6 +272,7 @@ function installDatabase(chat = makeChat(), extraCharacters: character[] = []) {
         conversationId: residentChat.id!,
         conversation: residentChat,
         storeRevision: 1,
+        onMutation,
     })
     return {
         chat: residentChat,
@@ -302,6 +307,23 @@ describe('sendChat generation session integration', () => {
         mocks.tokenizeResult = null
         mocks.inlay = null
         mocks.listeners.clear()
+    })
+
+    it('records generation-start message ID assignment through the active session', async () => {
+        const onMutation = vi.fn()
+        const source = makeChat([
+            { role: 'user', data: 'missing ID' },
+            { role: 'char', data: 'kept empty ID', chatId: '' },
+        ])
+        installDatabase(source, [], onMutation)
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        expect(onMutation).toHaveBeenCalled()
+        expect(onMutation.mock.calls[0][0]).toMatchObject({
+            commands: ['edit'],
+            mutations: [{ start: 0, deleteCount: 1 }],
+        })
     })
 
     it('publishes a trigger clone through a fresh fallback and preserves final action order', async () => {

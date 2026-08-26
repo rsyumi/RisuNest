@@ -48,6 +48,7 @@ import {
     recaptureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
+import { ensureCurrentConversationMessageIds } from '../conversationMutations'
 import { requireCurrentConversationSession } from '../storage/activeConversationSession'
 import {
     beginPinnedConversationHistoryOperation,
@@ -310,10 +311,16 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     const nowChatroom = DBState.db.characters[selectedChar]
     nowChatroom.lastInteraction = Date.now()
     selectedChat = nowChatroom.chatPage
-    nowChatroom.chats[nowChatroom.chatPage].message = nowChatroom.chats[nowChatroom.chatPage].message.map((v) => {
-        v.chatId = v.chatId ?? v4()
-        return v
-    })
+    const selectedConversation = nowChatroom.chats[selectedChat]
+    const activeSession = getActiveConversationSession()
+    ensureCurrentConversationMessageIds(
+        nowChatroom,
+        selectedConversation,
+        activeSession?.matchesConversation(nowChatroom.chaId, selectedConversation)
+            ? activeSession
+            : null,
+        v4,
+    )
     
     let promptInfo: MessagePresetInfo = {}
     let initialPresetNameForPromptInfo = null

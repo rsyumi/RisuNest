@@ -9,6 +9,7 @@ import {
     appendConversationMessage,
     captureConversationMutationTarget,
     ConversationMutationTargetStaleError,
+    ensureCurrentConversationMessageIds,
     cutConversationMessages,
     isConversationMutationTargetCurrent,
     resetConversationWithMessage,
@@ -35,6 +36,34 @@ function createCharacter(conversation: Chat): Database['characters'][number] {
 }
 
 describe('conversation mutations', () => {
+    it('routes generation-start ID assignment through the matching session', () => {
+        const conversation = createConversation([
+            { role: 'user', data: 'missing' },
+            { role: 'char', data: 'empty', chatId: '' },
+        ])
+        const character = createCharacter(conversation)
+        const onMutation = vi.fn()
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+            onMutation,
+        })
+
+        expect(ensureCurrentConversationMessageIds(
+            character,
+            conversation,
+            session,
+            () => 'generated',
+        )).toBe(1)
+
+        expect(conversation.message.map((message) => message.chatId)).toEqual(['generated', ''])
+        expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
+            commands: ['edit'],
+        }))
+    })
+
     it('routes a current interactive append through the matching session', () => {
         const conversation = createConversation([{ role: 'user', data: 'before' }])
         const character = createCharacter(conversation)

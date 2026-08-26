@@ -120,6 +120,33 @@ export function appendCurrentConversationMessage(
     appendConversationMessage(target, message)
 }
 
+export function ensureCurrentConversationMessageIds(
+    character: ConversationCharacter,
+    conversation: Chat,
+    candidateSession: ActiveConversationSession | null,
+    createId: () => string,
+): number {
+    const target = captureConversationMutationTarget(
+        character,
+        conversation,
+        candidateSession,
+    )
+    if (candidateSession && target.session !== candidateSession) {
+        throw new ConversationMutationTargetStaleError()
+    }
+    if (target.session) return target.session.ensureNullishMessageIds(createId)
+
+    let assigned = 0
+    target.conversation.message = target.conversation.message.map((message) => {
+        if (message.chatId !== undefined && message.chatId !== null) return message
+        const id = createId()
+        if (!id) throw new Error('Message ID generator returned an empty ID')
+        assigned += 1
+        return { ...message, chatId: id }
+    })
+    return assigned
+}
+
 export function appendConversationComment(
     target: ConversationMutationTarget,
     addition: string,

@@ -735,7 +735,7 @@ describe('sendChat prompt history characterization', () => {
 
             expect(mutationApplied).toBe(true)
             expect(tokenizeCalls).toBe(1)
-            expect(session.version).toBe(2)
+            expect(session.version).toBe(3)
             expect(mutationTarget?.chatId).toBe('')
             if (mutation === 'edit') {
                 expect(liveChat.message[4].data).toBe(`ui-edited ${TAIL_TOKEN}`)
@@ -799,7 +799,7 @@ describe('sendChat prompt history characterization', () => {
             expect(liveChat.name).toBe('Before trigger')
             expect(selectedCharacter.chats[0]).toBe(liveChat)
             expect(session.matchesConversation(selectedCharacter.chaId, liveChat)).toBe(true)
-            expect(session.version).toBe(1)
+            expect(session.version).toBe(2)
             if (mutation === 'edit') {
                 expect(liveChat.message[4].data).toBe(`concurrent-ui-edit ${TAIL_TOKEN}`)
             } else {

@@ -735,6 +735,39 @@ export class ActiveConversationTransaction {
         )
     }
 
+    ensureNullishMessageIds(createId: () => string): number {
+        this.assertOpen()
+        let assigned = 0
+        let rangeStart = -1
+        let replacements: Message[] = []
+        const flushRange = () => {
+            if (rangeStart === -1) return
+            this.record('edit', rangeStart, replacements.length, replacements)
+            rangeStart = -1
+            replacements = []
+        }
+
+        for (let index = 0; index < this.currentMessages.length; index++) {
+            const message = this.currentMessages[index]
+            if (message.chatId !== undefined && message.chatId !== null) {
+                flushRange()
+                continue
+            }
+            const id = createId()
+            if (!id) throw new Error('Message ID generator returned an empty ID')
+            const replacement = {
+                ...safeStructuredClone(message),
+                chatId: id,
+            }
+            this.currentMessages[index] = replacement
+            if (rangeStart === -1) rangeStart = index
+            replacements.push(replacement)
+            assigned += 1
+        }
+        flushRange()
+        return assigned
+    }
+
     append(message: Message): MessageLocator {
         this.assertOpen()
         const absoluteIndex = this.currentMessages.length
@@ -1126,6 +1159,13 @@ export class ActiveConversationSession {
         message.chatId = id
         locator.expectedMessageId = id
         return message
+    }
+
+    ensureNullishMessageIds(createId: () => string): number {
+        this.assertActive()
+        return this.transaction((transaction) =>
+            transaction.ensureNullishMessageIds(createId),
+        )
     }
 
     locate(absoluteIndex: number): MessageLocator {

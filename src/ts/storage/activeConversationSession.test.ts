@@ -332,6 +332,41 @@ describe('ActiveConversationSession', () => {
         expect(() => session.resolveMessage(emptyLocator)).toThrow(ConversationSessionStaleError)
     })
 
+    it('assigns nullish message IDs as exact contiguous edit ranges', () => {
+        const first = message(undefined, 'first')
+        const empty = message('', 'empty remains compatible')
+        const existing = message('existing', 'existing')
+        const last = message(undefined, 'last')
+        const { conversation, onMutation, session } = createSession(chat([
+            first,
+            empty,
+            existing,
+            last,
+        ]))
+        const createId = vi.fn()
+            .mockReturnValueOnce('generated-first')
+            .mockReturnValueOnce('generated-last')
+
+        expect(session.ensureNullishMessageIds(createId)).toBe(2)
+
+        expect(conversation.message.map((entry) => entry.chatId)).toEqual([
+            'generated-first',
+            '',
+            'existing',
+            'generated-last',
+        ])
+        expect(conversation.message[1]).toBe(empty)
+        expect(conversation.message[2]).toBe(existing)
+        expect(session.version).toBe(2)
+        expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
+            commands: ['edit', 'edit'],
+            mutations: [
+                expect.objectContaining({ start: 0, deleteCount: 1, sessionVersion: 1 }),
+                expect.objectContaining({ start: 3, deleteCount: 1, sessionVersion: 2 }),
+            ],
+        }))
+    })
+
     it('adopts a trigger replacement only against the captured version and message array', () => {
         const { conversation, onMutation, session } = createSession()
         const expectedMessages = conversation.message
