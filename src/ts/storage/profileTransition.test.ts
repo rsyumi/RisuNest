@@ -193,6 +193,7 @@ function createReader(
         readPluginStorage: async (key) => Object.hasOwn(pluginCustomStorage, key)
             ? { revision, value: clone(pluginCustomStorage[key]) }
             : null,
+        readAssetAlias: async () => null,
         release: onRelease,
     }
     return reader

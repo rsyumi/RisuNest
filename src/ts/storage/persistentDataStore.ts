@@ -21,6 +21,56 @@ export interface PluginStorageCatalog {
     items: PluginStorageSummary[]
 }
 
+export type AssetAliasKind = 'asset' | 'inlay'
+export type AssetAliasInlayType = 'image' | 'video' | 'audio' | 'signature'
+
+export interface AssetAlias {
+    key: string
+    objectHash: string | null
+    kind: AssetAliasKind
+    size: number
+    mime: string
+    name: string
+    ext: string
+    inlayType?: AssetAliasInlayType
+    width?: number
+    height?: number
+}
+
+export function validateAssetAlias(alias: AssetAlias): void {
+    if (typeof alias.key !== 'string') throw new TypeError('Asset alias key must be a string')
+    if (alias.objectHash !== null && !/^[0-9a-f]{64}$/.test(alias.objectHash)) {
+        throw new TypeError('Asset alias objectHash must be null or 64 lowercase hexadecimal characters')
+    }
+    if (alias.kind !== 'asset' && alias.kind !== 'inlay') {
+        throw new TypeError('Asset alias kind must be asset or inlay')
+    }
+    if (!Number.isSafeInteger(alias.size) || alias.size < 0) {
+        throw new TypeError('Asset alias size must be a nonnegative safe integer')
+    }
+    for (const [field, value] of [
+        ['mime', alias.mime],
+        ['name', alias.name],
+        ['ext', alias.ext],
+    ] as const) {
+        if (typeof value !== 'string') throw new TypeError(`Asset alias ${field} must be a string`)
+    }
+    if (
+        alias.inlayType !== undefined
+        && !['image', 'video', 'audio', 'signature'].includes(alias.inlayType)
+    ) {
+        throw new TypeError('Asset alias inlayType is invalid')
+    }
+    for (const [field, value] of [
+        ['width', alias.width],
+        ['height', alias.height],
+    ] as const) {
+        if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+            throw new TypeError(`Asset alias ${field} must be a nonnegative safe integer`)
+        }
+    }
+}
+
 export type PluginStorageMutation =
     | { type: 'set'; key: string; value: unknown }
     | { type: 'delete'; key: string }
@@ -198,6 +248,7 @@ export interface PersistentRevisionReader {
     ): Promise<Versioned<ConversationWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
+    readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null>
 }
 
 export interface PersistentRevisionLease extends PersistentRevisionReader {
@@ -218,10 +269,13 @@ export interface PersistentDataStore {
     ): Promise<Versioned<ConversationWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
+    readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null>
+    commitAssetAlias(alias: AssetAlias, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
     replaceFromDatabase(
         database: Database,
         expectedRevision?: DataRevision,
+        assetAliases?: AssetAlias[],
     ): Promise<{ revision: DataRevision }>
     materializeDatabase(revision?: DataRevision): Promise<Database>
     acquireRevision(revision: DataRevision): Promise<PersistentRevisionLease>

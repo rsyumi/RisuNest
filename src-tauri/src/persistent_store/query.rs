@@ -1,9 +1,9 @@
 use super::{
-    active_generation, compare_plugin_storage_keys, current_revision, read_target, CharacterPage,
-    CharacterQuery, CharacterSummary, ConversationPage, ConversationQuery, ConversationSummary,
-    ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary,
-    PresetCatalog, PresetSummary, QueryOrder, StoreError, StoreResult, Versioned,
-    CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
+    active_generation, compare_plugin_storage_keys, current_revision, read_target, AssetAlias,
+    CharacterPage, CharacterQuery, CharacterSummary, ConversationPage, ConversationQuery,
+    ConversationSummary, ConversationWindow, ConversationWindowQuery, PluginStorageCatalog,
+    PluginStorageSummary, PresetCatalog, PresetSummary, QueryOrder, StoreError, StoreResult,
+    Versioned, CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
@@ -123,6 +123,44 @@ pub(super) fn read_plugin_storage(
             Ok(Versioned {
                 revision: target.revision,
                 value: serde_json::from_str(&value)?,
+            })
+        })
+        .transpose()
+}
+
+pub(super) fn read_asset_alias(
+    connection: &Connection,
+    key: &str,
+    lease: Option<&str>,
+) -> StoreResult<Option<Versioned<AssetAlias>>> {
+    let target = read_target(connection, lease)?;
+    let value = connection
+        .query_row(
+            "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height
+             FROM asset_aliases WHERE generation = ?1 AND logical_key = ?2",
+            params![target.generation, key],
+            |row| {
+                Ok(AssetAlias {
+                    key: row.get(0)?,
+                    object_hash: row.get(1)?,
+                    kind: row.get(2)?,
+                    size: row.get(3)?,
+                    mime: row.get(4)?,
+                    name: row.get(5)?,
+                    ext: row.get(6)?,
+                    inlay_type: row.get(7)?,
+                    width: row.get(8)?,
+                    height: row.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            value.validate()?;
+            Ok(Versioned {
+                revision: target.revision,
+                value,
             })
         })
         .transpose()

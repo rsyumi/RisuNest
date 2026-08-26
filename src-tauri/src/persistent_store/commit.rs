@@ -1,7 +1,30 @@
 use super::{
-    active_generation, current_revision, ConversationMutation, PluginStorageMutation,
+    active_generation, current_revision, AssetAlias, ConversationMutation, PluginStorageMutation,
     RevisionResult, StagingResult, StoreError, StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
+
+pub(super) fn commit_asset_alias(
+    connection: &mut Connection,
+    alias: &AssetAlias,
+    expected_revision: i64,
+) -> StoreResult<RevisionResult> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actual_revision = current_revision(&transaction)?;
+    if actual_revision != expected_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: expected_revision,
+            actual: actual_revision,
+        });
+    }
+    alias.validate()?;
+    let active = active_generation(&transaction)?;
+    let revision = actual_revision + 1;
+    let generation = writable_generation(&transaction, &active, revision)?;
+    put_asset_alias(&transaction, &generation, alias)?;
+    set_active(&transaction, revision, &generation)?;
+    transaction.commit()?;
+    Ok(RevisionResult { revision })
+}
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
 
@@ -137,6 +160,60 @@ pub(super) fn replace_put_presets(
     require_staging(&transaction, staging_id)?;
     replace_presets(&transaction, staging_id, presets)?;
     transaction.commit()?;
+    Ok(())
+}
+
+pub(super) fn replace_put_asset_aliases(
+    connection: &mut Connection,
+    staging_id: &str,
+    aliases: &[AssetAlias],
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    for alias in aliases {
+        alias.validate()?;
+    }
+    for alias in aliases {
+        put_asset_alias(&transaction, staging_id, alias)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn put_asset_alias(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    alias: &AssetAlias,
+) -> StoreResult<()> {
+    transaction.execute(
+        "INSERT INTO asset_aliases (
+            generation, logical_key, object_hash, kind, size, mime, name, ext,
+            inlay_type, width, height
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(generation, logical_key) DO UPDATE SET
+            object_hash = excluded.object_hash,
+            kind = excluded.kind,
+            size = excluded.size,
+            mime = excluded.mime,
+            name = excluded.name,
+            ext = excluded.ext,
+            inlay_type = excluded.inlay_type,
+            width = excluded.width,
+            height = excluded.height",
+        params![
+            generation,
+            alias.key,
+            alias.object_hash,
+            alias.kind,
+            alias.size,
+            alias.mime,
+            alias.name,
+            alias.ext,
+            alias.inlay_type,
+            alias.width,
+            alias.height,
+        ],
+    )?;
     Ok(())
 }
 

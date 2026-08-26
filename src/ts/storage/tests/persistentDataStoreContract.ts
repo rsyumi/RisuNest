@@ -11,6 +11,128 @@ export interface PersistentDataStoreHarness {
 
 export function persistentDataStoreContract(createHarness: () => Promise<PersistentDataStoreHarness>): void {
     describe('PersistentDataStore contract', () => {
+        it('isolates exact asset alias metadata across a pinned overwrite', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const original = {
+                key: 'assets/shared.bin',
+                objectHash: '11'.repeat(32),
+                kind: 'asset' as const,
+                size: 3,
+                mime: 'application/octet-stream',
+                name: 'Shared Original',
+                ext: 'BIN',
+            }
+            const first = await store.commitAssetAlias(original, imported.revision)
+            const lease = await store.acquireRevision(first.revision)
+            const replacement = {
+                key: original.key,
+                objectHash: '22'.repeat(32),
+                kind: 'inlay' as const,
+                size: 7,
+                mime: 'image/webp',
+                name: 'Shared Replacement',
+                ext: 'WebP',
+                inlayType: 'image' as const,
+                width: 320,
+                height: 180,
+            }
+
+            const second = await store.commitAssetAlias(replacement, first.revision)
+
+            expect(await store.readAssetAlias(original.key)).toEqual({
+                revision: second.revision,
+                value: replacement,
+            })
+            expect(await lease.readAssetAlias(original.key)).toEqual({
+                revision: first.revision,
+                value: original,
+            })
+            await lease.release()
+        })
+
+        it('activates staged zero-byte and missing-payload aliases across reopen', async () => {
+            const { store, reopen } = await createHarness()
+            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const zeroByte = {
+                key: 'assets/empty.bin',
+                objectHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+                kind: 'asset' as const,
+                size: 0,
+                mime: 'application/octet-stream',
+                name: '',
+                ext: '',
+            }
+            const missingPayload = {
+                key: 'inlay/missing',
+                objectHash: null,
+                kind: 'inlay' as const,
+                size: 0,
+                mime: 'image/png',
+                name: 'Missing payload',
+                ext: 'PNG',
+                inlayType: 'image' as const,
+                width: 0,
+                height: 0,
+            }
+            const duplicateBytesAlias = {
+                ...zeroByte,
+                key: 'assets/empty-copy.dat',
+                name: 'Empty Copy',
+                ext: 'DAT',
+            }
+
+            const replaced = await store.replaceFromDatabase(
+                structuredClone(fixtureDatabase),
+                initial.revision,
+                [zeroByte, duplicateBytesAlias, missingPayload],
+            )
+            const reopened = await reopen()
+
+            expect(await reopened.readAssetAlias('assets/not-present.bin')).toBeNull()
+            expect(await reopened.readAssetAlias(zeroByte.key)).toEqual({
+                revision: replaced.revision,
+                value: zeroByte,
+            })
+            expect(await reopened.readAssetAlias(missingPayload.key)).toEqual({
+                revision: replaced.revision,
+                value: missingPayload,
+            })
+            expect(await reopened.readAssetAlias(duplicateBytesAlias.key)).toEqual({
+                revision: replaced.revision,
+                value: duplicateBytesAlias,
+            })
+        })
+
+        it('rejects an invalid alias batch without exposing a partial alias or revision', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const valid = {
+                key: 'assets/prepared.bin',
+                objectHash: '33'.repeat(32),
+                kind: 'asset' as const,
+                size: 1,
+                mime: 'application/octet-stream',
+                name: 'Prepared',
+                ext: 'bin',
+            }
+            const invalid = {
+                ...valid,
+                key: 'assets/invalid.bin',
+                objectHash: 'INVALID',
+            }
+
+            await expect(store.replaceFromDatabase(
+                structuredClone(fixtureDatabase),
+                imported.revision,
+                [valid, invalid],
+            )).rejects.toThrow('objectHash')
+
+            expect((await store.readRoot()).revision).toBe(imported.revision)
+            expect(await store.readAssetAlias(valid.key)).toBeNull()
+            expect(await store.readAssetAlias(invalid.key)).toBeNull()
+        })
+
         it('stores plugin values outside root and materializes the legacy object losslessly', async () => {
             const { store } = await createHarness()
             const database = structuredClone(fixtureDatabase)

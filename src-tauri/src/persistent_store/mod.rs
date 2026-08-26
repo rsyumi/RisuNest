@@ -41,6 +41,10 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
         "plugin_storage",
         "storage_key, byte_size, ordinal, value",
     ),
+    (
+        "asset_aliases",
+        "logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height",
+    ),
 ];
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -182,6 +186,73 @@ pub(crate) struct PluginStorageSummary {
 pub(crate) struct PluginStorageCatalog {
     pub(crate) revision: i64,
     pub(crate) items: Vec<PluginStorageSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetAlias {
+    pub(crate) key: String,
+    pub(crate) object_hash: Option<String>,
+    pub(crate) kind: String,
+    pub(crate) size: i64,
+    pub(crate) mime: String,
+    pub(crate) name: String,
+    pub(crate) ext: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) inlay_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) width: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) height: Option<i64>,
+}
+
+impl AssetAlias {
+    pub(super) fn validate(&self) -> StoreResult<()> {
+        if let Some(hash) = &self.object_hash {
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(StoreError::Validation {
+                    message:
+                        "Asset alias objectHash must be null or 64 lowercase hexadecimal characters"
+                            .to_owned(),
+                });
+            }
+        }
+        if !matches!(self.kind.as_str(), "asset" | "inlay") {
+            return Err(StoreError::Validation {
+                message: "Asset alias kind must be asset or inlay".to_owned(),
+            });
+        }
+        if self.size < 0 {
+            return Err(StoreError::Validation {
+                message: "Asset alias size must be nonnegative".to_owned(),
+            });
+        }
+        if let Some(inlay_type) = &self.inlay_type {
+            if !matches!(
+                inlay_type.as_str(),
+                "image" | "video" | "audio" | "signature"
+            ) {
+                return Err(StoreError::Validation {
+                    message: "Asset alias inlayType is invalid".to_owned(),
+                });
+            }
+        }
+        if self.width.is_some_and(|value| value < 0) {
+            return Err(StoreError::Validation {
+                message: "Asset alias width must be nonnegative".to_owned(),
+            });
+        }
+        if self.height.is_some_and(|value| value < 0) {
+            return Err(StoreError::Validation {
+                message: "Asset alias height must be nonnegative".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn plugin_storage_array_index(key: &str) -> Option<u32> {
@@ -535,12 +606,28 @@ impl PersistentStore {
         query::read_plugin_storage(&self.connection, key, lease)
     }
 
+    pub(crate) fn read_asset_alias(
+        &self,
+        key: &str,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<Versioned<AssetAlias>>> {
+        query::read_asset_alias(&self.connection, key, lease)
+    }
+
     pub(crate) fn materialize(&self, revision: Option<i64>) -> StoreResult<Value> {
         query::materialize(&self.connection, revision)
     }
 
     pub(crate) fn commit(&mut self, commit: &WorkingSetCommit) -> StoreResult<RevisionResult> {
         commit::commit(&mut self.connection, commit)
+    }
+
+    pub(crate) fn commit_asset_alias(
+        &mut self,
+        alias: &AssetAlias,
+        expected_revision: i64,
+    ) -> StoreResult<RevisionResult> {
+        commit::commit_asset_alias(&mut self.connection, alias, expected_revision)
     }
 
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {
@@ -557,6 +644,14 @@ impl PersistentStore {
         presets: &[Value],
     ) -> StoreResult<()> {
         commit::replace_put_presets(&mut self.connection, staging_id, presets)
+    }
+
+    pub(crate) fn replace_put_asset_aliases(
+        &mut self,
+        staging_id: &str,
+        aliases: &[AssetAlias],
+    ) -> StoreResult<()> {
+        commit::replace_put_asset_aliases(&mut self.connection, staging_id, aliases)
     }
 
     pub(crate) fn replace_add_characters(

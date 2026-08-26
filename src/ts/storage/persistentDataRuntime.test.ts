@@ -173,6 +173,7 @@ function makeDatabaseLease(database: Database, revision: number): PersistentRevi
         readPluginStorage: vi.fn(async (key) => Object.hasOwn(pluginCustomStorage, key)
             ? { revision, value: structuredClone(pluginCustomStorage[key]) }
             : null),
+        readAssetAlias: vi.fn(async () => null),
         release: vi.fn(async () => undefined),
     }
 }

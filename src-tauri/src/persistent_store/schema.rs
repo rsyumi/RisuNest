@@ -2,7 +2,7 @@ use super::{StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -19,11 +19,12 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => create_v5(connection),
+        0 => create_v6(connection),
         1 => migrate_v1(connection),
         2 => migrate_v2(connection),
         3 => migrate_v3(connection),
         4 => migrate_v4(connection),
+        5 => migrate_v5(connection),
         SCHEMA_VERSION => Ok(()),
         _ => Err(StoreError::Store {
             message: format!("unsupported persistent schema version {version}"),
@@ -31,7 +32,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     }
 }
 
-fn create_v5(connection: &mut Connection) -> StoreResult<()> {
+fn create_v6(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
         "
         BEGIN IMMEDIATE;
@@ -106,8 +107,68 @@ fn create_v5(connection: &mut Connection) -> StoreResult<()> {
         );
         CREATE INDEX messages_by_id
             ON messages (generation, character_id, conversation_id, message_id);
-        PRAGMA user_version = 5;
+        CREATE TABLE asset_aliases (
+            generation TEXT NOT NULL,
+            logical_key TEXT NOT NULL,
+            object_hash TEXT CHECK (
+                object_hash IS NULL OR (
+                    length(object_hash) = 64
+                    AND object_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            kind TEXT NOT NULL CHECK (kind IN ('asset', 'inlay')),
+            size INTEGER NOT NULL CHECK (size >= 0),
+            mime TEXT NOT NULL,
+            name TEXT NOT NULL,
+            ext TEXT NOT NULL,
+            inlay_type TEXT CHECK (
+                inlay_type IS NULL OR inlay_type IN ('image', 'video', 'audio', 'signature')
+            ),
+            width INTEGER CHECK (width IS NULL OR width >= 0),
+            height INTEGER CHECK (height IS NULL OR height >= 0),
+            PRIMARY KEY (generation, logical_key)
+        );
+        CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
+        PRAGMA user_version = 6;
         COMMIT;
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v5(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    create_asset_aliases(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn create_asset_aliases(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        "
+        CREATE TABLE asset_aliases (
+            generation TEXT NOT NULL,
+            logical_key TEXT NOT NULL,
+            object_hash TEXT CHECK (
+                object_hash IS NULL OR (
+                    length(object_hash) = 64
+                    AND object_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            kind TEXT NOT NULL CHECK (kind IN ('asset', 'inlay')),
+            size INTEGER NOT NULL CHECK (size >= 0),
+            mime TEXT NOT NULL,
+            name TEXT NOT NULL,
+            ext TEXT NOT NULL,
+            inlay_type TEXT CHECK (
+                inlay_type IS NULL OR inlay_type IN ('image', 'video', 'audio', 'signature')
+            ),
+            width INTEGER CHECK (width IS NULL OR width >= 0),
+            height INTEGER CHECK (height IS NULL OR height >= 0),
+            PRIMARY KEY (generation, logical_key)
+        );
+        CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
         ",
     )?;
     Ok(())
@@ -143,6 +204,7 @@ fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     migrate_roots(&transaction)?;
     backfill_characters(&transaction)?;
     migrate_snapshot_leases(&transaction)?;
+    create_asset_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -164,6 +226,7 @@ fn migrate_v2(connection: &mut Connection) -> StoreResult<()> {
     )?;
     migrate_plugin_storage(&transaction)?;
     migrate_snapshot_leases(&transaction)?;
+    create_asset_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -173,6 +236,7 @@ fn migrate_v3(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     ensure_plugin_storage(&transaction)?;
     ensure_snapshot_leases(&transaction)?;
+    create_asset_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -182,6 +246,7 @@ fn migrate_v4(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     ensure_plugin_storage(&transaction)?;
     ensure_snapshot_leases(&transaction)?;
+    create_asset_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

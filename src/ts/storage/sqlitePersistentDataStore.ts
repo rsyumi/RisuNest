@@ -9,6 +9,7 @@ import {
     RevisionConflictError,
     SnapshotReleasedError,
     validateConversationWindowQuery,
+    type AssetAlias,
     type CharacterDetail,
     type CharacterPage,
     type CharacterQuery,
@@ -147,6 +148,17 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_read_plugin_storage', { key })
     }
 
+    readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null> {
+        return invokeStore('pds_read_asset_alias', { key })
+    }
+
+    commitAssetAlias(
+        alias: AssetAlias,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        return invokeStore('pds_commit_asset_alias', { alias, expectedRevision })
+    }
+
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
         return invokeStore('pds_commit', { commit: input })
     }
@@ -154,6 +166,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     async replaceFromDatabase(
         database: Database,
         expectedRevision?: DataRevision,
+        assetAliases: AssetAlias[] = [],
     ): Promise<{ revision: DataRevision }> {
         const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
         try {
@@ -167,6 +180,12 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                 await invokeStore<void>('pds_replace_add_characters', {
                     stagingId,
                     characters: batch,
+                })
+            }
+            if (assetAliases.length > 0) {
+                await invokeStore<void>('pds_replace_put_asset_aliases', {
+                    stagingId,
+                    aliases: assetAliases,
                 })
             }
             return await invokeStore('pds_replace_commit', {
@@ -244,6 +263,10 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             readPluginStorage: async (key) => {
                 assertActive()
                 return invokeStore('pds_read_plugin_storage', { key, lease })
+            },
+            readAssetAlias: async (key) => {
+                assertActive()
+                return invokeStore('pds_read_asset_alias', { key, lease })
             },
             release: () => {
                 if (releasePromise) return releasePromise

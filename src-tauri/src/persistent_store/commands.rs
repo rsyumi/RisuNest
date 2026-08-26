@@ -1,6 +1,6 @@
 use super::export::ExportedRisuSave;
 use super::{
-    CharacterPage, CharacterQuery, CheckpointMode, ConversationPage, ConversationQuery,
+    AssetAlias, CharacterPage, CharacterQuery, CheckpointMode, ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore,
     PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated, SnapshotInfo,
     StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
@@ -200,6 +200,28 @@ pub(crate) fn pds_read_plugin_storage(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_read_asset_alias(
+    state: State<'_, PersistentStoreState>,
+    key: String,
+    lease: Option<String>,
+) -> Result<Option<Versioned<AssetAlias>>, StoreError> {
+    with_store(state, |store| {
+        store.read_asset_alias(&key, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_commit_asset_alias(
+    state: State<'_, PersistentStoreState>,
+    alias: AssetAlias,
+    expected_revision: i64,
+) -> Result<RevisionResult, StoreError> {
+    with_store_mut(state, |store| {
+        store.commit_asset_alias(&alias, expected_revision)
+    })
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_commit(
     state: State<'_, PersistentStoreState>,
     commit: WorkingSetCommit,
@@ -242,6 +264,17 @@ pub(crate) fn pds_replace_put_presets(
 ) -> Result<(), StoreError> {
     with_store_mut(state, |store| {
         store.replace_put_presets(&staging_id, &presets)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_replace_put_asset_aliases(
+    state: State<'_, PersistentStoreState>,
+    staging_id: String,
+    aliases: Vec<AssetAlias>,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store.replace_put_asset_aliases(&staging_id, &aliases)
     })
 }
 

@@ -67,6 +67,7 @@ async function countPersistentDataRecords(
         'messagePages',
         'pluginStorage',
         'pluginStorageMetadata',
+        'assetAliases',
     ]
     const database = await openDatabase(indexedDB, databaseName)
     const transaction = database.transaction(storeNames, 'readonly')
@@ -300,6 +301,22 @@ async function createVersion6PluginSnapshotDatabase(
     database.close()
 }
 
+async function createVersion7Database(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    await createVersion6PluginSnapshotDatabase(indexedDB, databaseName)
+    const openRequest = indexedDB.open(databaseName, 7)
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        openRequest.onsuccess = () => resolve(openRequest.result)
+        openRequest.onerror = () => reject(openRequest.error)
+    })
+    const transaction = database.transaction('meta', 'readwrite')
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 7 })
+    await completeTransaction(transaction)
+    database.close()
+}
+
 persistentDataStoreContract(async () => {
     const indexedDB = new IDBFactory()
     const databaseName = `persistent-store-contract-${databaseSequence++}`
@@ -332,6 +349,43 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 : original.call(this, query, count)
         })
     }
+
+    it('upgrades version 7 by creating only the empty asset alias store and index', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-7-asset-alias-schema-${databaseSequence++}`
+        await createVersion7Database(indexedDB, databaseName)
+        const originalOpenCursor = IDBObjectStore.prototype.openCursor
+        const cursorSpy = vi.spyOn(IDBObjectStore.prototype, 'openCursor')
+            .mockImplementation(function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore['openCursor']>
+            ) {
+                if (this.name !== 'meta') {
+                    throw new Error('version 7 alias schema upgrade must not scan records')
+                }
+                return originalOpenCursor.apply(this, args)
+            })
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        try {
+            await store.open()
+        } finally {
+            cursorSpy.mockRestore()
+        }
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(8)
+        const transaction = database.transaction('assetAliases', 'readonly')
+        const aliases = transaction.objectStore('assetAliases')
+        expect(aliases.indexNames.contains('byGeneration')).toBe(true)
+        await expect(new Promise<number>((resolve, reject) => {
+            const request = aliases.count()
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })).resolves.toBe(0)
+        await completeTransaction(transaction)
+        database.close()
+    })
 
     it('boots the plugin catalog without scanning large plugin payload rows', async () => {
         const indexedDB = new IDBFactory()
@@ -409,6 +463,60 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         expect(openSpy).toHaveBeenCalledTimes(1)
         openSpy.mockRestore()
         expect((await store.readRoot()).revision).toBe(0)
+    })
+
+    it('sweeps asset aliases from an abandoned staging generation on reopen', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `asset-alias-staging-sweep-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const generation = 'staging-abandoned-alias'
+        const aliasKey = `${generation}:asset-alias:assets/abandoned.bin`
+        await writeRawRecords(indexedDB, databaseName, 'root', [{
+            key: generation,
+            generation,
+            value: {},
+        }])
+        await writeRawRecords(indexedDB, databaseName, 'assetAliases', [{
+            key: aliasKey,
+            generation,
+            value: {
+                key: 'assets/abandoned.bin',
+                objectHash: '77'.repeat(32),
+                kind: 'asset',
+                size: 7,
+                mime: 'application/octet-stream',
+                name: 'Abandoned',
+                ext: 'bin',
+            },
+        }])
+
+        const reopened = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await reopened.open()
+
+        expect(await readRawRecord(indexedDB, databaseName, 'assetAliases', aliasKey)).toBeUndefined()
+    })
+
+    it('rejects a corrupt persisted asset alias during direct lookup', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `asset-alias-integrity-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        await writeRawRecords(indexedDB, databaseName, 'assetAliases', [{
+            key: 'revision-0:asset-alias:assets/corrupt.bin',
+            generation: 'revision-0',
+            value: {
+                key: 'assets/corrupt.bin',
+                objectHash: 'CORRUPT',
+                kind: 'asset',
+                size: 1,
+                mime: 'application/octet-stream',
+                name: 'Corrupt',
+                ext: 'bin',
+            },
+        }])
+
+        await expect(store.readAssetAlias('assets/corrupt.bin')).rejects.toThrow('objectHash')
     })
 
     it('acquires a revision by reference without copying persistent records', async () => {

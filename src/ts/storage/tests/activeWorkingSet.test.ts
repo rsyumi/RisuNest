@@ -93,6 +93,7 @@ function makeLease(input: {
         readConversationWindow: vi.fn(),
         queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
         readPluginStorage: vi.fn(async () => null),
+        readAssetAlias: vi.fn(async () => null),
         release: vi.fn(async () => undefined),
     }
 }
@@ -1663,6 +1664,7 @@ describe('maximum compatibility working set installation', () => {
             readPluginStorage: vi.fn(async (key) => Object.hasOwn(pluginCustomStorage, key)
                 ? { revision, value: structuredClone(pluginCustomStorage[key]) }
                 : null),
+            readAssetAlias: vi.fn(async () => null),
             release: vi.fn(async () => undefined),
         }
     }

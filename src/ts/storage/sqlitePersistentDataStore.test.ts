@@ -45,6 +45,15 @@ describe('SqlitePersistentDataStore', () => {
             deleteCharacterId: 'char-c',
             characterDetails: [characterDetail],
         }
+        const alias = {
+            key: 'assets/native.bin',
+            objectHash: '44'.repeat(32),
+            kind: 'asset' as const,
+            size: 4,
+            mime: 'application/octet-stream',
+            name: 'Native',
+            ext: 'bin',
+        }
 
         await store.open()
         await store.readRoot()
@@ -57,6 +66,8 @@ describe('SqlitePersistentDataStore', () => {
         await store.readConversationWindow(windowQuery)
         await store.queryPluginStorage()
         await store.readPluginStorage('memory')
+        await store.readAssetAlias(alias.key)
+        await store.commitAssetAlias(alias, 8)
         await store.commit(commit)
         await store.materializeDatabase(9)
 
@@ -75,6 +86,8 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_read_conversation_window', { query: windowQuery }],
             ['pds_query_plugin_storage', {}],
             ['pds_read_plugin_storage', { key: 'memory' }],
+            ['pds_read_asset_alias', { key: alias.key }],
+            ['pds_commit_asset_alias', { alias, expectedRevision: 8 }],
             ['pds_commit', { commit }],
             ['pds_materialize', { revision: 9 }],
         ])
@@ -150,6 +163,7 @@ describe('SqlitePersistentDataStore', () => {
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce(undefined)
+            .mockResolvedValueOnce(undefined)
             .mockResolvedValueOnce({ revision: 4 })
         const database = structuredClone(fixtureDatabase)
         database.characters = Array.from({ length: 17 }, (_, index) => ({
@@ -158,9 +172,18 @@ describe('SqlitePersistentDataStore', () => {
             name: `Character ${index}`,
         }))
         const { characters, botPresets, ...root } = database
+        const aliases = [{
+            key: 'assets/staged.bin',
+            objectHash: '55'.repeat(32),
+            kind: 'asset' as const,
+            size: 5,
+            mime: 'application/octet-stream',
+            name: 'Staged',
+            ext: 'bin',
+        }]
         const store = new SqlitePersistentDataStore()
 
-        await expect(store.replaceFromDatabase(database, 3)).resolves.toEqual({ revision: 4 })
+        await expect(store.replaceFromDatabase(database, 3, aliases)).resolves.toEqual({ revision: 4 })
 
         expect(mocks.invoke.mock.calls).toEqual([
             ['pds_replace_begin'],
@@ -174,6 +197,7 @@ describe('SqlitePersistentDataStore', () => {
                 'pds_replace_add_characters',
                 { stagingId: 'staging-1', characters: characters.slice(16) },
             ],
+            ['pds_replace_put_asset_aliases', { stagingId: 'staging-1', aliases }],
             ['pds_replace_commit', { stagingId: 'staging-1', expectedRevision: 3 }],
         ])
     })
@@ -251,6 +275,7 @@ describe('SqlitePersistentDataStore', () => {
         })
         await lease.queryPluginStorage()
         await lease.readPluginStorage('memory')
+        await lease.readAssetAlias('assets/pinned.bin')
         await lease.release()
         await lease.release()
 
@@ -284,10 +309,11 @@ describe('SqlitePersistentDataStore', () => {
             ],
             ['pds_query_plugin_storage', { lease: 'lease-7' }],
             ['pds_read_plugin_storage', { key: 'memory', lease: 'lease-7' }],
+            ['pds_read_asset_alias', { key: 'assets/pinned.bin', lease: 'lease-7' }],
             ['pds_release_revision', { lease: 'lease-7' }],
         ])
         await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
-        expect(mocks.invoke).toHaveBeenCalledTimes(12)
+        expect(mocks.invoke).toHaveBeenCalledTimes(13)
     })
 
     it('keeps a lease active and retries native cleanup after release fails', async () => {

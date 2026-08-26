@@ -46,6 +46,8 @@ function createStore(input?: {
         readConversationWindow: vi.fn(),
         queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
         readPluginStorage: vi.fn(async () => null),
+        readAssetAlias: vi.fn(async () => null),
+        commitAssetAlias: vi.fn(),
         commit: vi.fn(),
         acquireRevision: vi.fn(),
     }
