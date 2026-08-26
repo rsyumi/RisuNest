@@ -78,6 +78,9 @@ export type matcherArg = {
     currentTime?: number
     getNested?: () => string[]
     setNestedRoot?: (val:string) => void
+    selectedCharacterId?: string
+    getChatVar?: (key: string) => string
+    setChatVar?: (key: string, value: string) => void
 }
 "a".toLowerCase().split('::')
 
@@ -135,15 +138,15 @@ export function registerCBS(arg:CBSRegisterArg) {
         safeStructuredClone, 
         parseArray, 
         parseDict, 
-        getChatVar, 
-        setChatVar, 
+        getChatVar: getDefaultChatVar,
+        setChatVar: setDefaultChatVar,
         getGlobalChatVar, 
         calcString, 
         dateTimeFormat, 
         getModules, 
         getModuleLorebooks, 
         pickHashRand, 
-        getSelectedCharID, 
+        getSelectedCharID: getDefaultSelectedCharID,
         isTauri, 
         isNodeServer, 
         isMobile, 
@@ -156,8 +159,24 @@ export function registerCBS(arg:CBSRegisterArg) {
     const projectedHistoryIndex = (matcherArg: matcherArg, absoluteIndex: number) => (
         absoluteIndex - (matcherArg.historyOffset ?? 0)
     )
-    let currentMatcherDatabase: Database | null = null
-    const getDatabase = (): Database => currentMatcherDatabase ?? getDefaultDatabase()
+    let currentMatcher: matcherArg | null = null
+    const getDatabase = (): Database => currentMatcher?.db ?? getDefaultDatabase()
+    const getSelectedCharID = (): number => {
+        const selectedCharacterId = currentMatcher?.selectedCharacterId
+        if (selectedCharacterId !== undefined) {
+            const capturedIndex = getDatabase().characters.findIndex(
+                (character) => character.chaId === selectedCharacterId,
+            )
+            if (capturedIndex !== -1) return capturedIndex
+        }
+        return currentMatcher?.selectedCharID ?? getDefaultSelectedCharID()
+    }
+    const getChatVar = (key: string): string =>
+        currentMatcher?.getChatVar?.(key) ?? getDefaultChatVar(key)
+    const setChatVar = (key: string, value: string): void => {
+        if (currentMatcher?.setChatVar) currentMatcher.setChatVar(key, value)
+        else setDefaultChatVar(key, value)
+    }
     const registerFunction: CBSRegisterArg['registerFunction'] = (definition) => {
         if (definition.callback === 'doc_only') {
             return registerFunctionRaw(definition)
@@ -166,12 +185,12 @@ export function registerCBS(arg:CBSRegisterArg) {
         return registerFunctionRaw({
             ...definition,
             callback: (str, matcherArg, args, vars) => {
-                const previousDatabase = currentMatcherDatabase
-                currentMatcherDatabase = matcherArg.db
+                const previousMatcher = currentMatcher
+                currentMatcher = matcherArg
                 try {
                     return callback(str, matcherArg, args, vars)
                 } finally {
-                    currentMatcherDatabase = previousDatabase
+                    currentMatcher = previousMatcher
                 }
             },
         })

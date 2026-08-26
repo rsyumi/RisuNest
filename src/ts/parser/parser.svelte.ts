@@ -1645,6 +1645,9 @@ export function risuChatParser(da:string, arg:{
     chatVariables?: Record<string, string>
     globalChatVariables?: Record<string, string>
     currentTime?: number
+    selectedCharacterId?: string
+    getChatVar?: (key: string) => string
+    setChatVar?: (key: string, value: string) => void
 } = {}):string{
     const chatID = arg.chatID ?? -1
     const db = arg.db ?? DBState.db
@@ -1734,7 +1737,10 @@ export function risuChatParser(da:string, arg:{
         },
         setNestedRoot: (val:string) => {
             nested[0] = val
-        }
+        },
+        selectedCharacterId: arg.selectedCharacterId,
+        getChatVar: arg.getChatVar,
+        setChatVar: arg.setChatVar,
     }
 
     da = da.replace(/\<(user|char|bot)\>/gi, '{{$1}}')

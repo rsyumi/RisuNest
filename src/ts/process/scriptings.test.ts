@@ -6,12 +6,14 @@ import { beforeAll, expect, test, vi } from 'vitest'
 import { setRuntimePerformanceProfile } from '../runtimePerformanceProfile'
 import { requestChatData } from './request/request'
 import { readImage } from '../globalApi.svelte'
-import { getDatabase } from '../storage/database.svelte'
+import { getCurrentCharacter, getDatabase } from '../storage/database.svelte'
 import { asBuffer } from '../util'
 import { writeInlayImage } from './files/inlays'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import { createConversationOperationContext } from './conversationOperationContext'
 import type { Chat } from '../storage/database.svelte'
+
+const scriptingSelectionState = vi.hoisted(() => ({ index: 0 }))
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -47,7 +49,12 @@ vi.mock('../stores.svelte', () => ({
   DBState: { db: {} },
   ReloadChatPointer: { update: vi.fn() },
   ReloadGUIPointer: { update: vi.fn() },
-  selectedCharID: { subscribe: (run: (value: number) => void) => (run(0), () => undefined) },
+  selectedCharID: {
+    subscribe: (run: (value: number) => void) => (
+      run(scriptingSelectionState.index),
+      () => undefined
+    ),
+  },
 }))
 
 vi.mock('./modules', () => ({
@@ -677,6 +684,70 @@ test('keeps the eager Lua mutation in the operation batch after a handler error'
   finally {
     consoleError.mockRestore()
   }
+})
+
+test('Lua history and chat variables stay bound to the captured character', async () => {
+  const originalChat = {
+    id: 'lua-captured-chat',
+    message: [{ role: 'user', data: 'user-only', chatId: 'message-0' }],
+    scriptstate: {},
+  } as Chat
+  const replacementChat = {
+    id: 'lua-global-chat',
+    message: [],
+    scriptstate: {},
+  } as Chat
+  const originalCharacter = {
+    type: 'character',
+    chaId: 'lua-captured-character',
+    chatPage: 0,
+    chats: [originalChat],
+    firstMessage: 'captured-first-message',
+    alternateGreetings: [],
+    defaultVariables: '',
+  }
+  const replacementCharacter = {
+    type: 'character',
+    chaId: 'lua-global-character',
+    chatPage: 0,
+    chats: [replacementChat],
+    firstMessage: 'global-first-message',
+    alternateGreetings: [],
+    defaultVariables: '',
+  }
+  const database = {
+    characters: [originalCharacter, replacementCharacter],
+    templateDefaultVariables: '',
+  }
+  const session = new ActiveConversationSession({
+    characterId: originalCharacter.chaId,
+    conversationId: originalChat.id!,
+    conversation: originalChat,
+    storeRevision: 13,
+  })
+  const operationContext = createConversationOperationContext(session, originalChat)
+  scriptingSelectionState.index = 1
+  vi.mocked(getDatabase).mockReturnValue(database as never)
+  vi.mocked(getCurrentCharacter).mockReturnValue(replacementCharacter as never)
+
+  const result = await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      setChatVar(id, 'operation_key', '')
+      return getCharacterLastMessage(id)
+    end)
+  `, {
+    char: originalCharacter as never,
+    mode: 'editInput',
+    operationContext,
+  })
+
+  expect(result.res).toBe('captured-first-message')
+  expect(operationContext.chat.scriptstate).toEqual({ '$operation_key': '' })
+  expect(replacementChat.scriptstate).toEqual({})
+
+  operationContext.commit(session)
+  expect(originalChat.scriptstate).toEqual({ '$operation_key': '' })
+  scriptingSelectionState.index = 0
 })
 
 test('records absolute and negative chat reads plus recent and length semantics', async () => {

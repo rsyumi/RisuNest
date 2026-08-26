@@ -1,6 +1,6 @@
 import { parseChatML } from "../parser/chatML";
 import { risuChatParser as risuChatParserGlobal } from "../parser/parser.svelte";
-import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type Chat, type character } from "../storage/database.svelte";
+import { getCurrentCharacter, getDatabase, setCurrentCharacter, setDatabase, type Chat, type character } from "../storage/database.svelte";
 import { tokenize } from "../tokenizer";
 import { getModuleTriggers } from "./modules";
 import { get } from "svelte/store";
@@ -1078,7 +1078,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     let stopSending = arg.stopSending ?? false
     const CharacterlowLevelAccess = char.lowLevelAccess ?? false
     let sendAIprompt = false
-    const currentChat = getCurrentChat()
     let additonalSysPrompt:additonalSysPrompt = arg.additonalSysPrompt ?? {
         start:'',
         historyend: '',
@@ -1121,14 +1120,22 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     const conversationOperation = arg.conversationOperation ?? ownedConversationOperation
     if (conversationOperation) chat = conversationOperation.chat
     const operationDatabase = conversationOperation?.createDatabaseView(db) ?? db
+    let operationGetChatVar: ((key: string) => string) | undefined
+    let operationSetChatVar: ((key: string, value: string) => void) | undefined
     const risuChatParser = (
         value: string,
         parserArgument: Parameters<typeof risuChatParserGlobal>[1] = {},
     ) => risuChatParserGlobal(value, {
         ...parserArgument,
         db: parserArgument.db ?? operationDatabase,
+        selectedCharacterId: parserArgument.selectedCharacterId ??
+            conversationOperation?.characterId,
+        getChatVar: parserArgument.getChatVar ??
+            operationGetChatVar,
+        setChatVar: parserArgument.setChatVar ??
+            operationSetChatVar,
     })
-    let conversationOperationCommitted = false
+    let conversationOperationClosed = false
 
     try {
 
@@ -1247,9 +1254,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
             return setLocalVar(key, value, currentIndent)
         }
         
-        const selectedCharId = get(selectedCharID)
-        const currentCharacter = getCurrentCharacter()
-        const db = getDatabase()
         chat.scriptstate ??= {}
         const stateKey = '$' + key
         if(chat.scriptstate[stateKey] === value){
@@ -1258,10 +1262,12 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
 
         varChanged = true
         chat.scriptstate[stateKey] = value
-        currentChat.scriptstate = chat.scriptstate
-        currentCharacter.chats[currentCharacter.chatPage].scriptstate = chat.scriptstate
-        db.characters[selectedCharId].chats[currentCharacter.chatPage].scriptstate = chat.scriptstate
+        if (!conversationOperation) arg.chat.scriptstate = chat.scriptstate
         return true
+    }
+    if (conversationOperation) {
+        operationGetChatVar = getVar
+        operationSetChatVar = setVar
     }
     
     
@@ -2662,15 +2668,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 case 'v2SetAuthorNote':{
                     const value = effect.valueType === 'value' ? risuChatParser(effect.value,{chara:char}) : getVar(risuChatParser(effect.value,{chara:char}))
                     chat.note = value
-                    
-                    if(!arg.displayMode){
-                        const selectedCharId = get(selectedCharID)
-                        const currentCharacter = getCurrentCharacter()
-                        const db = getDatabase()
-                        currentCharacter.chats[currentCharacter.chatPage].note = value
-                        db.characters[selectedCharId].chats[currentCharacter.chatPage].note = value
-                        setCurrentCharacter(currentCharacter)
-                    }
+                    if (!conversationOperation && !arg.displayMode) arg.chat.note = value
                     break
                 }
                 case 'v2MakeDictVar':{
@@ -2855,30 +2853,29 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     if(additonalSysPrompt.promptend){
         caculatedTokens += await tokenize(additonalSysPrompt.promptend)
     }
-    if(varChanged){
-        const currentChat = getCurrentChat()
-        currentChat.scriptstate = chat.scriptstate
-        ReloadGUIPointer.set(get(ReloadGUIPointer) + 1)
-    }
-
     if (shouldSetTriggerId && mode !== 'manual') {
         CurrentTriggerIdStore.set(previousTriggerId)
     }
 
     if (ownedConversationOperation) {
         const activeSession = peekActiveConversationSession()
+        conversationOperationClosed = true
         ownedConversationOperation.commit(activeSession)
-        conversationOperationCommitted = true
-        const committedMessages = activeSession?.materializeCompatibilityArray()
-        Object.assign(arg.chat, chat)
-        if (committedMessages) arg.chat.message = committedMessages
         chat = arg.chat
+    }
+    if(varChanged){
+        ReloadGUIPointer.set(get(ReloadGUIPointer) + 1)
     }
     
     return {additonalSysPrompt, chat, tokens:caculatedTokens, stopSending, sendAIprompt, displayData: arg.displayData, tempVars: arg.tempVars}
     } finally {
-        if (ownedConversationOperation && !conversationOperationCommitted) {
-            ownedConversationOperation.release()
+        if (ownedConversationOperation && !conversationOperationClosed) {
+            conversationOperationClosed = true
+            if (ownedConversationOperation.hasPendingMetadataMutations()) {
+                ownedConversationOperation.commitMetadata(peekActiveConversationSession())
+            } else {
+                ownedConversationOperation.release()
+            }
         }
     }
 }

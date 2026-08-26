@@ -1,7 +1,39 @@
 import { get } from 'svelte/store'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { parseKeyValue } from '../util'
-import { getCurrentCharacter, getCurrentChat } from '../storage/database.svelte'
+import { getCurrentChat } from '../storage/database.svelte'
+import type { Chat, Database } from '../storage/database.svelte'
+
+export function getChatVarFromConversation(
+    database: Database,
+    characterId: string,
+    chat: Chat,
+    key: string,
+): string {
+    const char = database.characters.find((candidate) => candidate.chaId === characterId)
+    if (!char) return 'null'
+    chat.scriptstate ??= {}
+    const state = chat.scriptstate['$' + key]
+    if (state === undefined || state === null) {
+        const defaultVariables = parseKeyValue(char.defaultVariables).concat(
+            parseKeyValue(database.templateDefaultVariables),
+        )
+        return defaultVariables.find(([name]) => name === key)?.[1] ?? 'null'
+    }
+    return state.toString()
+}
+
+export function setChatVarOnConversation(
+    chat: Chat,
+    key: string,
+    value: string,
+): boolean {
+    chat.scriptstate ??= {}
+    const stateKey = '$' + key
+    if (chat.scriptstate[stateKey] === value) return false
+    chat.scriptstate[stateKey] = value
+    return true
+}
 
 export function getChatVar(key:string): string {
     const selectedChar = get(selectedCharID)
@@ -10,33 +42,13 @@ export function getChatVar(key:string): string {
         return 'null'
     }
     const chat = char.chats[char.chatPage]
-    chat.scriptstate ??= {}
-    const state = (chat.scriptstate['$' + key])
-    if(state === undefined || state === null){
-        const defaultVariables = parseKeyValue(char.defaultVariables).concat(parseKeyValue(DBState.db.templateDefaultVariables))
-        const findResult = defaultVariables.find((f) => {
-            return f[0] === key
-        })
-        if(findResult){
-            return findResult[1]
-        }
-        return 'null'
-    }
-    return state.toString()
+    return getChatVarFromConversation(DBState.db, char.chaId, chat, key)
 }
 
 export function setChatVar(key:string, value:string): boolean {
     const selectedChar = get(selectedCharID)
     const chat = DBState.db.characters[selectedChar].chats[DBState.db.characters[selectedChar].chatPage]
-    chat.scriptstate ??= {}
-
-    const stateKey = '$' + key
-    if(chat.scriptstate[stateKey] === value){
-        return false
-    }
-
-    chat.scriptstate[stateKey] = value
-    return true
+    return setChatVarOnConversation(chat, key, value)
 }
 
 export function getGLChatVar(key:string): string {

@@ -50,3 +50,49 @@ test('history CBS callbacks read the operation database carried by matcherArg', 
 
     expect(result).toBe('pinned-operation-value')
 })
+
+test('history CBS callbacks resolve the captured character instead of global selection', () => {
+    const callbacks = new Map<string, RegisterCallback>()
+    const operationDatabase = {
+        characters: [
+            {
+                chaId: 'character-a',
+                chatPage: 0,
+                chats: [{
+                    fmIndex: -1,
+                    message: [{ role: 'char', data: 'captured-character-value' }],
+                }],
+                firstMessage: 'captured-first',
+            },
+            {
+                chaId: 'character-b',
+                chatPage: 0,
+                chats: [{
+                    fmIndex: -1,
+                    message: [{ role: 'char', data: 'global-selection-value' }],
+                }],
+                firstMessage: 'global-first',
+            },
+        ],
+    } as Database
+    registerCBS({
+        ...defaultCBSRegisterArg,
+        getDatabase: () => operationDatabase,
+        getSelectedCharID: () => 1,
+        registerFunction: ({ name, callback, alias }) => {
+            if (callback === 'doc_only') return
+            for (const key of [name, ...alias]) callbacks.set(key, callback)
+        },
+    })
+
+    const result = callbacks.get('previouscharchat')!('', {
+        chatID: -1,
+        db: operationDatabase,
+        chara: operationDatabase.characters[0],
+        selectedCharacterId: 'character-a',
+        rmVar: false,
+        cbsConditions: {},
+    } as matcherArg, [], null)
+
+    expect(result).toBe('captured-character-value')
+})

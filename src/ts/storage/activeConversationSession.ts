@@ -94,6 +94,7 @@ export type ActiveConversationCommandName =
     | 'delete'
     | 'truncate'
     | 'replace-range'
+    | 'update-metadata'
     | 'replace-tail'
     | 'reroll'
     | 'bookmark'
@@ -103,6 +104,21 @@ export interface SetConversationBookmarkOptions {
     bookmarked: boolean
     messageId?: string
     name?: string
+}
+
+export type ConversationMetadata = Record<string, unknown>
+
+export interface ActiveConversationOperationRange {
+    position: ConversationPosition
+    deleteCount: number
+    messages: readonly Message[]
+}
+
+export interface ActiveConversationOperationCommit {
+    expectedVersion: number
+    expectedMetadata: ConversationMetadata
+    metadata: ConversationMetadata
+    range?: ActiveConversationOperationRange
 }
 
 export interface ActiveConversationPin {
@@ -366,6 +382,55 @@ function restoreMessageRollback(
         restoreMessage(entry.message, entry.snapshot)
         messages[index] = entry.message
     }
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+    if (Object.is(left, right)) return true
+    if (typeof left !== typeof right || left === null || right === null) return false
+    if (Array.isArray(left) || Array.isArray(right)) {
+        if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+            return false
+        }
+        return left.every((value, index) => valuesEqual(value, right[index]))
+    }
+    if (typeof left !== 'object') return false
+    const leftRecord = left as Record<string, unknown>
+    const rightRecord = right as Record<string, unknown>
+    const leftKeys = Object.keys(leftRecord)
+    const rightKeys = Object.keys(rightRecord)
+    if (leftKeys.length !== rightKeys.length) return false
+    return leftKeys.every((key) =>
+        Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+        valuesEqual(leftRecord[key], rightRecord[key]),
+    )
+}
+
+export function cloneConversationMetadata(chat: Chat): ConversationMetadata {
+    const metadata: ConversationMetadata = {}
+    for (const [key, value] of Object.entries(chat)) {
+        if (key !== 'message') metadata[key] = value
+    }
+    return safeStructuredClone(metadata)
+}
+
+export function conversationMetadataEqual(
+    left: ConversationMetadata,
+    right: ConversationMetadata,
+): boolean {
+    return valuesEqual(left, right)
+}
+
+export function replaceConversationMetadata(
+    chat: Chat,
+    metadata: ConversationMetadata,
+): void {
+    const chatRecord = chat as unknown as Record<string, unknown>
+    for (const key of Object.keys(chatRecord)) {
+        if (key !== 'message' && !Object.prototype.hasOwnProperty.call(metadata, key)) {
+            delete chatRecord[key]
+        }
+    }
+    Object.assign(chatRecord, safeStructuredClone(metadata))
 }
 
 function createLocator(
@@ -1155,6 +1220,103 @@ export class ActiveConversationSession {
         this.transaction((transaction) =>
             transaction.replaceRange(position, deleteCount, messages),
         )
+    }
+
+    applyOperation(commit: ActiveConversationOperationCommit): void {
+        this.assertActive()
+        if (this.transactionActive) {
+            throw new Error('Nested conversation session transactions are not supported')
+        }
+        if (commit.expectedVersion !== this.sessionVersion) {
+            throw new ConversationSessionStaleError(
+                commit.expectedVersion,
+                this.sessionVersion,
+            )
+        }
+
+        this.transactionActive = true
+        try {
+            const currentMetadata = cloneConversationMetadata(this.conversation)
+            if (!conversationMetadataEqual(commit.expectedMetadata, currentMetadata)) {
+                throw new MessageLocatorMismatchError(
+                    'Conversation operation metadata baseline changed',
+                )
+            }
+
+            const metadataChanged = !conversationMetadataEqual(
+                commit.expectedMetadata,
+                commit.metadata,
+            )
+            if (commit.range === undefined && !metadataChanged) return
+
+            const previousVersion = this.sessionVersion
+            const previousMessages = this.conversation.message
+            const previousMetadata = currentMetadata
+            const previousLocatorRegistry = this.locatorRegistry
+            let nextMessages = previousMessages
+            const commands: ActiveConversationCommandName[] = []
+
+            if (commit.range !== undefined) {
+                validatePosition(
+                    this.conversationId,
+                    previousMessages,
+                    previousVersion,
+                    commit.range.position,
+                    previousLocatorRegistry,
+                )
+                validateIndex(
+                    commit.range.deleteCount,
+                    'Conversation replace-range deleteCount',
+                )
+                if (
+                    commit.range.deleteCount >
+                    previousMessages.length - commit.range.position.absoluteIndex
+                ) {
+                    throw new RangeError(
+                        'Conversation replace-range exceeds the current message count',
+                    )
+                }
+                nextMessages = [
+                    ...previousMessages.slice(0, commit.range.position.absoluteIndex),
+                    ...safeStructuredClone(commit.range.messages),
+                    ...previousMessages.slice(
+                        commit.range.position.absoluteIndex + commit.range.deleteCount,
+                    ),
+                ]
+                commands.push('replace-range')
+            }
+            if (metadataChanged) commands.push('update-metadata')
+
+            const nextLocatorRegistry = previousLocatorRegistry.fork()
+            nextLocatorRegistry.clear()
+            this.conversation.message = nextMessages
+            if (metadataChanged) {
+                replaceConversationMetadata(this.conversation, commit.metadata)
+            }
+            this.sessionVersion = previousVersion + 1
+            this.locatorRegistry = nextLocatorRegistry
+            try {
+                this.onMutation?.({
+                    characterId: this.characterId,
+                    conversationId: this.conversationId,
+                    previousVersion,
+                    sessionVersion: this.sessionVersion,
+                    commands,
+                })
+                previousLocatorRegistry.clear()
+            } catch (error) {
+                this.conversation.message = previousMessages
+                if (metadataChanged) {
+                    replaceConversationMetadata(this.conversation, previousMetadata)
+                }
+                this.sessionVersion = previousVersion
+                nextLocatorRegistry.clear()
+                this.locatorRegistry = previousLocatorRegistry
+                throw error
+            }
+        } finally {
+            this.transactionActive = false
+        }
     }
 
     replaceTail(position: ConversationPosition, messages: readonly Message[]): void {

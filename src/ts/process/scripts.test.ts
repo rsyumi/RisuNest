@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => {
         workerData: 'worker-output',
         currentChat: null as Chat | null,
         session: null as ActiveConversationSession | null,
+        selectedCharIndex: 0,
     }
     const charEmotionStore = {
         set(value: Record<string, [string, string, number][]>) {
@@ -44,7 +45,11 @@ const moduleMocks = vi.hoisted(() => ({
 }))
 
 vi.mock('svelte/store', () => ({
-    get: (store: unknown) => store === mocks.charEmotionStore ? mocks.state.emotions : 0,
+    get: (store: unknown) => {
+        if (store === mocks.charEmotionStore) return mocks.state.emotions
+        if (store === mocks.selectedCharStore) return mocks.state.selectedCharIndex
+        return 0
+    },
 }))
 vi.mock('src/ts/stores.svelte', () => ({
     CharEmotion: mocks.charEmotionStore,
@@ -178,6 +183,7 @@ describe('processScriptFull result caching', () => {
         mocks.state.workerData = 'worker-output'
         mocks.state.currentChat = null
         mocks.state.session = null
+        mocks.state.selectedCharIndex = 0
         mocks.database.dynamicAssets = false
         mocks.database.characters = [] as never[]
         for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
@@ -368,6 +374,7 @@ describe('history-sensitive regex conversation operations', () => {
         resetScriptCache()
         mocks.state.currentChat = null
         mocks.state.session = null
+        mocks.state.selectedCharIndex = 0
         mocks.database.dynamicAssets = false
         mocks.database.characters = [] as never[]
         for (const callbacks of Object.values(mocks.pluginV2)) callbacks.clear()
@@ -401,6 +408,59 @@ describe('history-sensitive regex conversation operations', () => {
         expect(chat.message[0].data).toBe('x')
         expect(session.version).toBe(1)
         expect(session.activePinReasons).toEqual([])
+    })
+
+    it('does not clone history for a no-script or pure-regex cache-hit path', async () => {
+        const messages = Array.from({ length: 256 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `message-${index}`,
+            chatId: `message-${index}`,
+        })) as Chat['message']
+        const chat = { id: 'pure-chat', message: messages } as Chat
+        const noScriptCharacter = makeCharacter([])
+        noScriptCharacter.chaId = 'pure-character'
+        noScriptCharacter.chats = [chat]
+        noScriptCharacter.chatPage = 0
+        const pureRegexCharacter = makeCharacter([makeScript('plain', 'result')])
+        pureRegexCharacter.chaId = noScriptCharacter.chaId
+        pureRegexCharacter.chats = [chat]
+        pureRegexCharacter.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: noScriptCharacter.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 24,
+        })
+        mocks.database.characters = [noScriptCharacter] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        const structuredCloneSpy = vi.spyOn(globalThis, 'structuredClone')
+
+        try {
+            await processScriptFull(noScriptCharacter, 'plain', 'editoutput', -1, {}, {
+                regexWorker: false,
+            })
+            await processScriptFull(pureRegexCharacter, 'plain', 'editoutput', -1, {}, {
+                regexWorker: false,
+            })
+            structuredCloneSpy.mockClear()
+
+            const cached = await processScriptFull(
+                pureRegexCharacter,
+                'plain',
+                'editoutput',
+                -1,
+                {},
+                { regexWorker: false },
+            )
+
+            expect(cached.data).toBe('result')
+            expect(structuredCloneSpy).not.toHaveBeenCalled()
+            expect(session.version).toBe(0)
+            expect(session.activePinReasons).toEqual([])
+        } finally {
+            structuredCloneSpy.mockRestore()
+        }
     })
 
     it('pins an unsupported plugin callback to the explicit full-array compatibility path', async () => {
@@ -437,6 +497,67 @@ describe('history-sensitive regex conversation operations', () => {
         expect(session.activePinReasons).toEqual([])
         expect(chat.message[0].data).toBe('input-plugin')
         expect(session.version).toBe(1)
+    })
+
+    it('does not retarget a post-plugin history action after navigation', async () => {
+        const originalChat = {
+            id: 'plugin-original-chat',
+            message: [{ role: 'user', data: 'original', chatId: 'original-message' }],
+        } as Chat
+        const replacementChat = {
+            id: 'plugin-replacement-chat',
+            message: [{ role: 'user', data: 'replacement', chatId: 'replacement-message' }],
+        } as Chat
+        const originalCharacter = makeCharacter([makeScript('input-plugin', '@@inject')])
+        originalCharacter.chaId = 'plugin-original-character'
+        originalCharacter.chats = [originalChat]
+        originalCharacter.chatPage = 0
+        const replacementCharacter = makeCharacter([])
+        replacementCharacter.chaId = 'plugin-replacement-character'
+        replacementCharacter.chats = [replacementChat]
+        replacementCharacter.chatPage = 0
+        const originalSession = new ActiveConversationSession({
+            characterId: originalCharacter.chaId,
+            conversationId: originalChat.id!,
+            conversation: originalChat,
+            storeRevision: 25,
+        })
+        const replacementSession = new ActiveConversationSession({
+            characterId: replacementCharacter.chaId,
+            conversationId: replacementChat.id!,
+            conversation: replacementChat,
+            storeRevision: 26,
+        })
+        let releasePlugin: (() => void) | null = null
+        mocks.pluginV2.editoutput.add(async (data) => {
+            await new Promise<void>((resolve) => {
+                releasePlugin = resolve
+            })
+            return `${data}-plugin`
+        })
+        mocks.database.characters = [originalCharacter, replacementCharacter] as never
+        mocks.state.currentChat = originalChat
+        mocks.state.session = originalSession
+
+        const pending = processScriptFull(
+            originalCharacter,
+            'input',
+            'editoutput',
+            0,
+            {},
+            { cache: 'bypass', regexWorker: false },
+        )
+        await vi.waitFor(() => expect(releasePlugin).not.toBeNull())
+        mocks.state.selectedCharIndex = 1
+        mocks.state.currentChat = replacementChat
+        mocks.state.session = replacementSession
+        releasePlugin!()
+
+        await expect(pending).rejects.toThrow(/inactive|ownership/i)
+        expect(originalChat.message[0].data).toBe('original')
+        expect(replacementChat.message[0].data).toBe('replacement')
+        expect(originalSession.activePinReasons).toEqual([])
+        expect(replacementSession.activePinReasons).toEqual([])
     })
 
     it('commits an eager inject mutation before a later processing error', async () => {

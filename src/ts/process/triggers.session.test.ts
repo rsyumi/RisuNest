@@ -2,6 +2,7 @@ import { beforeEach, expect, test, vi } from 'vitest'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import type { Chat, character } from '../storage/database.svelte'
 import { DBState, selectedCharID } from '../stores.svelte'
+import { processMultiCommand } from './command'
 
 const runtime = vi.hoisted(() => ({
     session: null as ActiveConversationSession | null,
@@ -92,6 +93,53 @@ test('CAS-applies ordered trigger mutations and preserves an empty string value'
     expect(session.activePinReasons).toEqual([])
 })
 
+test('CAS-applies Trigger chat variables and note metadata', async () => {
+    const { chat, char, session } = fixture()
+    char.triggerscript[0].effect = [
+        { type: 'setvar', var: 'state', value: '', operator: '=' },
+        { type: 'v2SetAuthorNote', value: 'operation note', valueType: 'value' },
+    ] as never
+    runtime.session = session
+    DBState.db = {
+        characters: [char],
+        templateDefaultVariables: '',
+    } as never
+
+    await runTrigger(char, 'manual', {
+        chat,
+        manualName: 'ordered',
+    })
+
+    expect(chat.scriptstate).toEqual({ '$state': '' })
+    expect(chat.note).toBe('operation note')
+    expect(session.version).toBe(1)
+})
+
+test('keeps eager Trigger metadata on its original owner after a later error', async () => {
+    const { chat, char, session } = fixture()
+    char.triggerscript[0].effect = [
+        { type: 'setvar', var: 'state', value: '', operator: '=' },
+        { type: 'v2SetAuthorNote', value: 'partial note', valueType: 'value' },
+        { type: 'v2Command', value: 'fail', valueType: 'value' },
+    ] as never
+    runtime.session = session
+    DBState.db = {
+        characters: [char],
+        templateDefaultVariables: '',
+    } as never
+    vi.mocked(processMultiCommand).mockRejectedValueOnce(new Error('command failed'))
+
+    await expect(runTrigger(char, 'manual', {
+        chat,
+        manualName: 'ordered',
+    })).rejects.toThrow('command failed')
+
+    expect(chat.scriptstate).toEqual({ '$state': '' })
+    expect(chat.note).toBe('partial note')
+    expect(session.version).toBe(1)
+    expect(session.activePinReasons).toEqual([])
+})
+
 test('rejects an awaited trigger batch after the active conversation advances', async () => {
     const { chat, char, session } = fixture()
     char.triggerscript[0].effect = [
@@ -129,6 +177,57 @@ test('rejects an awaited trigger batch after the active conversation advances', 
         expect(session.activePinReasons).toEqual([])
     }
     finally {
+        vi.useRealTimers()
+    }
+})
+
+test('does not publish Trigger metadata to either conversation after navigation', async () => {
+    const original = fixture()
+    original.chat.note = 'original note'
+    original.char.triggerscript[0].effect = [
+        { type: 'setvar', var: 'state', value: 'operation value', operator: '=' },
+        { type: 'v2SetAuthorNote', value: 'operation note', valueType: 'value' },
+        { type: 'v2Wait', value: '0.001', valueType: 'value' },
+    ] as never
+    const replacement = fixture()
+    replacement.char.chaId = 'character-2'
+    replacement.chat.id = 'conversation-2'
+    replacement.chat.note = 'replacement note'
+    const replacementSession = new ActiveConversationSession({
+        characterId: replacement.char.chaId,
+        conversationId: replacement.chat.id!,
+        conversation: replacement.chat,
+        storeRevision: 20,
+    })
+    runtime.session = original.session
+    DBState.db = {
+        characters: [original.char, replacement.char],
+        templateDefaultVariables: '',
+    } as never
+    vi.useFakeTimers()
+
+    try {
+        const pending = runTrigger(original.char, 'manual', {
+            chat: original.chat,
+            manualName: 'ordered',
+        })
+        const settled = pending.then(
+            () => null,
+            (error: unknown) => error,
+        )
+        await vi.advanceTimersByTimeAsync(0)
+        selectedCharID.set(1)
+        runtime.session = replacementSession
+        await vi.advanceTimersByTimeAsync(1)
+
+        expect(await settled).toEqual(expect.objectContaining({
+            message: expect.stringMatching(/inactive/i),
+        }))
+        expect(original.chat.note).toBe('original note')
+        expect(original.chat.scriptstate).toEqual({})
+        expect(replacement.chat.note).toBe('replacement note')
+        expect(replacement.chat.scriptstate).toEqual({})
+    } finally {
         vi.useRealTimers()
     }
 })

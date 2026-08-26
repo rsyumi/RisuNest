@@ -1,6 +1,6 @@
 import { get } from "svelte/store";
 import { CharEmotion, selectedCharID } from "../stores.svelte";
-import { type character, type customscript, type groupChat, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
+import { type Chat, type character, type customscript, type groupChat, getDatabase, getCurrentCharacter, getCurrentChat } from "../storage/database.svelte";
 import { downloadFile } from "../globalApi.svelte";
 import { alertError, alertNormal } from "../alert";
 import { language } from "src/lang";
@@ -17,6 +17,16 @@ import { RegexExecutionTimeoutError, getSharedRegexWorkerClient, isRegexWorkerAv
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "../runtimePerformanceProfile";
 import { createConversationOperationContext, type ConversationOperationContext } from "./conversationOperationContext";
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
+import {
+    ConversationSessionInactiveError,
+    ConversationSessionStaleError,
+    requireCurrentConversationSession,
+    type ActiveConversationSession,
+} from "../storage/activeConversationSession";
+import {
+    getChatVarFromConversation,
+    setChatVarOnConversation,
+} from "../parser/chatVar.svelte";
 
 export type ScriptMode = 'editinput'|'editoutput'|'editprocess'|'editdisplay'
 
@@ -115,6 +125,101 @@ export function resetScriptCache(){
     processScriptCache = createScriptCache()
 }
 
+const HISTORY_SENSITIVE_CBS_NAMES = new Set([
+    'previouscharchat', 'lastcharmessage', 'previoususerchat', 'lastusermessage',
+    'lorebook', 'worldinfo', 'userhistory', 'usermessages', 'user_history',
+    'charhistory', 'charmessages', 'char_history', 'authornote', 'author_note',
+    'firstmsgindex', 'firstmessageindex', 'first_msg_index', 'messagetime',
+    'message_time', 'messagedate', 'message_date', 'messageunixtimearray',
+    'message_unixtime_array', 'messageidleduration', 'message_idle_duration',
+    'idleduration', 'idle_duration', 'role', 'lastmessage', 'lastmessageid',
+    'lastmessageindex', 'previouschatlog', 'previous_chat_log', 'history',
+    'messages', 'pick', 'getvar', 'addvar', 'setvar', 'setdefaultvar',
+    'personality', 'description', 'scenario', 'exampledialogue', 'examplemessage',
+    'example_dialogue', 'persona', 'userpersona', 'mainprompt', 'systemprompt',
+    'main_prompt', 'jb', 'jailbreak', 'globalnote', 'systemnote', 'ujb',
+])
+
+interface ScriptConversationOwner {
+    session: ActiveConversationSession | null
+    chat: Chat | null
+    version: number | null
+    selectedCharacterId: string
+}
+
+function captureScriptConversationOwner(
+    char: character | groupChat | simpleCharacterArgument,
+): ScriptConversationOwner {
+    const db = getDatabase()
+    const selectedCharacterId = db.characters[get(selectedCharID)]?.chaId ?? char.chaId
+    const session = peekActiveConversationSession()
+    let chat: Chat | null = null
+    try {
+        chat = getCurrentChat() ?? null
+    } catch {
+        chat = null
+    }
+    if (
+        session?.isActive &&
+        chat &&
+        session.materializeCompatibilityArray() === chat.message
+    ) {
+        return {
+            session,
+            chat,
+            version: session.version,
+            selectedCharacterId: session.characterId,
+        }
+    }
+    return {
+        session: null,
+        chat,
+        version: null,
+        selectedCharacterId,
+    }
+}
+
+function requireScriptConversationOwner(owner: ScriptConversationOwner): void {
+    if (owner.session) {
+        requireCurrentConversationSession(owner.session, peekActiveConversationSession())
+        if (owner.session.version !== owner.version) {
+            throw new ConversationSessionStaleError(owner.version!, owner.session.version)
+        }
+        if (owner.chat !== getCurrentChat()) throw new ConversationSessionInactiveError()
+        return
+    }
+    const db = getDatabase()
+    const currentCharacterId = db.characters[get(selectedCharID)]?.chaId
+    if (
+        currentCharacterId !== owner.selectedCharacterId ||
+        (owner.chat !== null && owner.chat !== getCurrentChat())
+    ) {
+        throw new ConversationSessionInactiveError()
+    }
+}
+
+function containsHistorySensitiveCbs(value: string): boolean {
+    for (const match of value.matchAll(/(?:{{|<)\s*#?\/?\s*([^}:|>\s]+)/gi)) {
+        if (HISTORY_SENSITIVE_CBS_NAMES.has(match[1].toLowerCase())) return true
+    }
+    return false
+}
+
+function requiresConversationOperation(
+    plan: ReturnType<typeof getRegexExecutionPlan>,
+    data: string,
+): boolean {
+    if (containsHistorySensitiveCbs(data)) return true
+    return plan.entries.some((entry) =>
+        entry.actions.includes('inject') ||
+        entry.actions.includes('repeat_back') ||
+        entry.replacement.startsWith('@@inject') ||
+        entry.replacement.startsWith('@@repeat_back') ||
+        containsHistorySensitiveCbs(entry.pattern) ||
+        containsHistorySensitiveCbs(entry.replacement),
+    )
+}
+
 export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     let db = getDatabase()
     let emoChanged = false
@@ -140,13 +245,10 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
     }
 
+    const conversationOwner = captureScriptConversationOwner(char)
     if(pluginV2[mode].size > 0){
-        const activeSession = peekActiveConversationSession()
-        const currentChat = activeSession?.isActive ? getCurrentChat() : null
-        const compatibilityPin = activeSession?.isActive &&
-            currentChat &&
-            activeSession.materializeCompatibilityArray() === currentChat.message
-                ? activeSession.acquirePin('compatibility')
+        const compatibilityPin = conversationOwner.session
+                ? conversationOwner.session.acquirePin('compatibility')
                 : null
         try {
             for(const plugin of pluginV2[mode]){
@@ -160,26 +262,46 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
     }
 
+    const scripts = (db.presetRegex ?? []).concat(char.customscript).concat(getModuleRegexScripts())
+    const plan = getRegexExecutionPlan(scripts, mode)
     let conversationOperation: ConversationOperationContext | null = null
-    const activeSession = peekActiveConversationSession()
-    const currentChat = activeSession?.isActive ? getCurrentChat() : null
-    if (
-        activeSession?.isActive &&
-        currentChat &&
-        activeSession.materializeCompatibilityArray() === currentChat.message
-    ) {
+    const needsConversationOperation = requiresConversationOperation(plan, data)
+    if (needsConversationOperation) {
+        requireScriptConversationOwner(conversationOwner)
+    }
+    if (needsConversationOperation && conversationOwner.session && conversationOwner.chat) {
         conversationOperation = createConversationOperationContext(
-            activeSession,
-            currentChat,
+            conversationOwner.session,
+            conversationOwner.chat,
         )
     }
     const operationDatabase = conversationOperation?.createDatabaseView(db) ?? db
+    const operationChat = conversationOperation?.chat ?? conversationOwner.chat
     const risuChatParser = (
         value: string,
         parserArgument: Parameters<typeof risuChatParserOrg>[1] = {},
     ) => risuChatParserOrg(value, {
         ...parserArgument,
         db: parserArgument.db ?? operationDatabase,
+        selectedCharacterId: parserArgument.selectedCharacterId ??
+            conversationOwner.selectedCharacterId,
+        getChatVar: parserArgument.getChatVar ?? (
+            needsConversationOperation && operationChat
+                ? (key: string) => getChatVarFromConversation(
+                    operationDatabase,
+                    conversationOwner.selectedCharacterId,
+                    operationChat,
+                    key,
+                )
+                : undefined
+        ),
+        setChatVar: parserArgument.setChatVar ?? (
+            needsConversationOperation && operationChat
+                ? (key: string, value: string) => {
+                    setChatVarOnConversation(operationChat, key, value)
+                }
+                : undefined
+        ),
     })
     let conversationOperationCommitted = false
     const finish = <T>(result: T): T => {
@@ -192,7 +314,6 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
 
     try {
     data = risuChatParser(data, { chatID: chatID, cbsConditions })
-    const scripts = (db.presetRegex ?? []).concat(char.customscript).concat(getModuleRegexScripts())
     const useResultCache = options.cache !== 'bypass'
     const hash = useResultCache
         ? generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions, risuChatParser)
@@ -218,7 +339,6 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         return finish({data, emoChanged})
     }
 
-    const plan = getRegexExecutionPlan(scripts, mode)
     const parse = (value: string) => risuChatParser(value, { chatID: chatID, cbsConditions })
 
     function executeScript(entry:RegexExecutionPlanEntry){
@@ -271,7 +391,10 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                         }
                     }
                     else if((outScript.startsWith('@@inject') || entry.actions.includes('inject')) && chatID !== -1){
-                        const selchar = operationDatabase.characters[get(selectedCharID)]
+                        const selchar = operationDatabase.characters.find(
+                            (candidate) => candidate.chaId === conversationOwner.selectedCharacterId,
+                        )
+                        if (!selchar) throw new ConversationSessionInactiveError()
                         selchar.chats[selchar.chatPage].message[chatID].data = data
                         reg.lastIndex = 0
                         data = data.replace(reg, "")
@@ -321,7 +444,10 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                 else{
                     if((outScript.startsWith('@@repeat_back') || entry.actions.includes('repeat_back'))  && chatID !== -1){
                         const v = outScript.split(' ', 2)[1]
-                        const selchar = operationDatabase.characters[get(selectedCharID)]
+                        const selchar = operationDatabase.characters.find(
+                            (candidate) => candidate.chaId === conversationOwner.selectedCharacterId,
+                        )
+                        if (!selchar) throw new ConversationSessionInactiveError()
                         const chat = selchar.chats[selchar.chatPage]
                         let lastChat = chat.fmIndex === -1 ? selchar.firstMessage : selchar.alternateGreetings[chat.fmIndex]
                         let pointer = chatID - 1

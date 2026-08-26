@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest'
+import { expect, test, vi } from 'vitest'
 import {
     ActiveConversationSession,
     ConversationSessionStaleError,
@@ -67,6 +67,37 @@ test('marks an oversized full-history consumer as an explicit compatibility snap
     expect(session.pinCount('compatibility')).toBe(0)
 })
 
+test('uses compatibility mode when a small message count exceeds the prefetch byte cap', () => {
+    const conversation = chat([
+        message('x'.repeat(3 * 1024 * 1024), 'large-message'),
+    ])
+    const session = createSession(conversation)
+
+    const operation = createConversationOperationContext(session, conversation)
+
+    expect(operation.mode).toBe('compatibility')
+    expect(session.pinCount('compatibility')).toBe(1)
+    expect(session.pinCount('transaction')).toBe(0)
+
+    operation.release()
+})
+
+test('does not deep-clone source messages again while cloning chat metadata', () => {
+    const conversation = chat([message('zero', 'message-0')])
+    conversation.note = 'metadata'
+    const session = createSession(conversation)
+    const structuredCloneSpy = vi.spyOn(globalThis, 'structuredClone')
+
+    try {
+        const operation = createConversationOperationContext(session, conversation)
+
+        expect(structuredCloneSpy.mock.calls.some(([value]) => value === conversation)).toBe(false)
+        operation.release()
+    } finally {
+        structuredCloneSpy.mockRestore()
+    }
+})
+
 test('CAS-applies the final ordered mutation result through a stable replace-range position', () => {
     const conversation = chat([
         message('zero', 'message-0'),
@@ -103,6 +134,67 @@ test('CAS-applies the final ordered mutation result through a stable replace-ran
     ])
     expect(session.version).toBe(1)
     expect(session.pinCount('transaction')).toBe(0)
+})
+
+test('CAS-applies chat variables and metadata with the same original owner', () => {
+    const conversation = chat([message('zero', 'message-0')])
+    conversation.note = 'before'
+    conversation.scriptstate = { '$before': 'value' }
+    const session = createSession(conversation)
+    const operation = createConversationOperationContext(session, conversation)
+
+    operation.chat.note = 'after'
+    operation.chat.scriptstate = {
+        '$before': 'value',
+        '$new': '',
+    }
+    operation.commit(session)
+
+    expect(conversation.note).toBe('after')
+    expect(conversation.scriptstate).toEqual({
+        '$before': 'value',
+        '$new': '',
+    })
+    expect(session.version).toBe(1)
+    expect(session.activePinReasons).toEqual([])
+})
+
+test('rejects concurrent metadata changes without overwriting them', () => {
+    const conversation = chat([message('zero', 'message-0')])
+    conversation.note = 'before'
+    const session = createSession(conversation)
+    const operation = createConversationOperationContext(session, conversation)
+    operation.chat.note = 'operation note'
+
+    conversation.note = 'concurrent note'
+
+    expect(() => operation.commit(session)).toThrow(/metadata baseline changed/i)
+    expect(conversation.note).toBe('concurrent note')
+    expect(session.version).toBe(0)
+    expect(session.activePinReasons).toEqual([])
+})
+
+test('rolls back message and metadata together when mutation publication fails', () => {
+    const conversation = chat([message('zero', 'message-0')])
+    conversation.note = 'before'
+    const session = new ActiveConversationSession({
+        characterId: 'character-1',
+        conversationId: 'conversation-1',
+        conversation,
+        storeRevision: 7,
+        onMutation: () => {
+            throw new Error('publication failed')
+        },
+    })
+    const operation = createConversationOperationContext(session, conversation)
+    operation.chat.message[0].data = 'after'
+    operation.chat.note = 'after'
+
+    expect(() => operation.commit(session)).toThrow('publication failed')
+    expect(conversation.message[0].data).toBe('zero')
+    expect(conversation.note).toBe('before')
+    expect(session.version).toBe(0)
+    expect(session.activePinReasons).toEqual([])
 })
 
 test('a stale operation cannot touch a concurrently replaced conversation', () => {
