@@ -3316,6 +3316,48 @@ fn replacements_snapshot_only_nonzero_revisions_and_abort_on_snapshot_failure() 
 }
 
 #[test]
+fn prepared_replacement_rechecks_revision_after_snapshot_before_activation() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let seed = stage_root(&mut store, "Seed");
+    store
+        .replace_commit(&seed, Some(0))
+        .expect("activate revision one");
+    let replacement = stage_root(&mut store, "Prepared replacement");
+
+    let prepared = store
+        .prepare_replace_commit(&replacement, Some(1))
+        .expect("prepare replacement");
+    let authorized = prepared
+        .create_snapshot()
+        .expect("create snapshot on dedicated connection");
+
+    let competing = stage_root(&mut store, "Competing revision");
+    store
+        .replace_commit(&competing, Some(1))
+        .expect("activate competing revision");
+    let error = store
+        .finish_prepared_replace(authorized)
+        .expect_err("prepared replacement must recheck revision");
+
+    assert!(matches!(
+        error,
+        StoreError::RevisionConflict {
+            expected: 1,
+            actual: 2
+        }
+    ));
+    assert_eq!(store.revision().expect("read current revision"), 2);
+    assert_eq!(
+        store.read_root(None).expect("read current root").value["username"],
+        "Competing revision"
+    );
+    store
+        .replace_abort(&replacement)
+        .expect("prepared staging remains abortable");
+}
+
+#[test]
 fn checkpoint_truncate_reports_busy_and_truncates_when_unblocked() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let store = PersistentStore::open(directory.path()).expect("open persistent store");

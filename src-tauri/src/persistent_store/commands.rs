@@ -12,12 +12,14 @@ use tauri::{AppHandle, Manager, State};
 
 pub(crate) struct PersistentStoreState {
     store: Mutex<Option<PersistentStore>>,
+    snapshot_operations: Mutex<()>,
 }
 
 impl Default for PersistentStoreState {
     fn default() -> Self {
         Self {
             store: Mutex::new(None),
+            snapshot_operations: Mutex::new(()),
         }
     }
 }
@@ -46,6 +48,29 @@ pub(crate) fn with_store_mut<T>(
         message: "persistent store has not been opened".to_owned(),
     })?;
     operation(store)
+}
+
+pub(crate) fn replace_commit_with_snapshot(
+    app: &AppHandle,
+    staging_id: &str,
+    expected_revision: Option<i64>,
+) -> StoreResult<RevisionResult> {
+    let prepared = with_store_mut(app.state(), |store| {
+        store.prepare_replace_commit(staging_id, expected_revision)
+    })?;
+    let state = app.state::<PersistentStoreState>();
+    let snapshot_operation =
+        state
+            .snapshot_operations
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("persistent snapshot mutex poisoned: {error}"),
+            })?;
+    let authorized = prepared.create_snapshot()?;
+    drop(snapshot_operation);
+    with_store_mut(app.state(), |store| {
+        store.finish_prepared_replace(authorized)
+    })
 }
 
 #[tauri::command(async)]
@@ -222,13 +247,11 @@ pub(crate) fn pds_replace_put_presets(
 
 #[tauri::command(async)]
 pub(crate) fn pds_replace_commit(
-    state: State<'_, PersistentStoreState>,
+    app: AppHandle,
     staging_id: String,
     expected_revision: Option<i64>,
 ) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| {
-        store.replace_commit(&staging_id, expected_revision)
-    })
+    replace_commit_with_snapshot(&app, &staging_id, expected_revision)
 }
 
 #[tauri::command(async)]
@@ -295,7 +318,22 @@ pub(crate) fn pds_snapshot_create(
     state: State<'_, PersistentStoreState>,
     reason: String,
 ) -> Result<SnapshotCreated, StoreError> {
-    with_store(state, |store| store.snapshot_create(&reason))
+    let snapshot_operation =
+        state
+            .snapshot_operations
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("persistent snapshot mutex poisoned: {error}"),
+            })?;
+    let store = state.store.lock().map_err(|error| StoreError::Store {
+        message: format!("persistent store mutex poisoned: {error}"),
+    })?;
+    let store = store.as_ref().ok_or_else(|| StoreError::Validation {
+        message: "persistent store has not been opened".to_owned(),
+    })?;
+    let result = store.snapshot_create(&reason);
+    drop(snapshot_operation);
+    result
 }
 
 #[tauri::command(async)]

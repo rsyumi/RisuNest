@@ -381,7 +381,43 @@ pub(super) struct ReadTarget {
 
 pub(crate) struct PersistentStore {
     connection: Connection,
+    database_path: PathBuf,
     snapshots_dir: PathBuf,
+}
+
+pub(crate) struct PreparedReplaceCommit {
+    staging_id: String,
+    revision: i64,
+    database_path: PathBuf,
+    snapshots_dir: PathBuf,
+}
+
+pub(crate) struct SnapshotAuthorizedReplaceCommit {
+    staging_id: String,
+    revision: i64,
+}
+
+impl PreparedReplaceCommit {
+    pub(crate) fn create_snapshot(self) -> StoreResult<SnapshotAuthorizedReplaceCommit> {
+        if self.revision > 0 {
+            let connection = Connection::open(&self.database_path)?;
+            connection.execute_batch("PRAGMA busy_timeout = 5000")?;
+            let created = snapshot::create(&connection, &self.snapshots_dir, "pre-replace")?;
+            drop(connection);
+            let snapshot_connection = Connection::open(&created.path)?;
+            let snapshot_revision = current_revision(&snapshot_connection)?;
+            if snapshot_revision != self.revision {
+                return Err(StoreError::RevisionConflict {
+                    expected: self.revision,
+                    actual: snapshot_revision,
+                });
+            }
+        }
+        Ok(SnapshotAuthorizedReplaceCommit {
+            staging_id: self.staging_id,
+            revision: self.revision,
+        })
+    }
 }
 
 impl PersistentStore {
@@ -414,6 +450,7 @@ impl PersistentStore {
 
         Ok(Self {
             connection,
+            database_path,
             snapshots_dir,
         })
     }
@@ -526,17 +563,41 @@ impl PersistentStore {
         commit::replace_add_characters(&mut self.connection, staging_id, characters)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn replace_commit(
         &mut self,
         staging_id: &str,
         expected_revision: Option<i64>,
     ) -> StoreResult<RevisionResult> {
+        let prepared = self.prepare_replace_commit(staging_id, expected_revision)?;
+        let authorized = prepared.create_snapshot()?;
+        self.finish_prepared_replace(authorized)
+    }
+
+    pub(crate) fn prepare_replace_commit(
+        &self,
+        staging_id: &str,
+        expected_revision: Option<i64>,
+    ) -> StoreResult<PreparedReplaceCommit> {
         let revision =
             commit::validate_replace_commit(&self.connection, staging_id, expected_revision)?;
-        if revision > 0 {
-            snapshot::create(&self.connection, &self.snapshots_dir, "pre-replace")?;
-        }
-        commit::replace_commit(&mut self.connection, staging_id, expected_revision)
+        Ok(PreparedReplaceCommit {
+            staging_id: staging_id.to_owned(),
+            revision,
+            database_path: self.database_path.clone(),
+            snapshots_dir: self.snapshots_dir.clone(),
+        })
+    }
+
+    pub(crate) fn finish_prepared_replace(
+        &mut self,
+        prepared: SnapshotAuthorizedReplaceCommit,
+    ) -> StoreResult<RevisionResult> {
+        commit::replace_commit(
+            &mut self.connection,
+            &prepared.staging_id,
+            Some(prepared.revision),
+        )
     }
 
     pub(crate) fn replace_abort(&mut self, staging_id: &str) -> StoreResult<()> {
