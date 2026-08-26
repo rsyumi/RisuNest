@@ -1021,6 +1021,77 @@ fn lan_server_tolerates_read_poll_timeouts_within_the_overall_deadline() {
 }
 
 #[test]
+fn lan_server_rejects_a_header_completed_after_the_overall_deadline() {
+    let (mut reader, elapsed) = scripted_request_reader(vec![(
+        b"GET /manifest HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+        Duration::from_secs(2),
+    )]);
+
+    assert_eq!(
+        super::lan::read_request_with_elapsed_for_test(
+            &mut reader,
+            &AtomicBool::new(false),
+            || *elapsed.lock().unwrap(),
+        ),
+        Err(408)
+    );
+}
+
+#[test]
+fn lan_server_rejects_a_body_completed_after_the_overall_deadline() {
+    let (mut reader, elapsed) = scripted_request_reader(vec![
+        (
+            b"POST /claim HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n".as_slice(),
+            Duration::ZERO,
+        ),
+        (b"{}".as_slice(), Duration::from_secs(2)),
+    ]);
+
+    assert_eq!(
+        super::lan::read_request_with_elapsed_for_test(
+            &mut reader,
+            &AtomicBool::new(false),
+            || *elapsed.lock().unwrap(),
+        ),
+        Err(408)
+    );
+}
+
+struct ScriptedRequestReader {
+    reads: std::vec::IntoIter<(Vec<u8>, Duration)>,
+    elapsed: Arc<Mutex<Duration>>,
+}
+
+impl Read for ScriptedRequestReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let Some((bytes, elapsed)) = self.reads.next() else {
+            return Ok(0);
+        };
+        assert!(bytes.len() <= buffer.len());
+        buffer[..bytes.len()].copy_from_slice(&bytes);
+        *self.elapsed.lock().unwrap() = elapsed;
+        Ok(bytes.len())
+    }
+}
+
+fn scripted_request_reader(
+    reads: Vec<(&[u8], Duration)>,
+) -> (ScriptedRequestReader, Arc<Mutex<Duration>>) {
+    let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+    (
+        ScriptedRequestReader {
+            reads: reads
+                .into_iter()
+                .map(|(bytes, elapsed)| (bytes.to_vec(), elapsed))
+                .collect::<Vec<_>>()
+                .into_iter(),
+            elapsed: Arc::clone(&elapsed),
+        },
+        elapsed,
+    )
+}
+
+#[test]
 fn lan_client_bounds_an_incomplete_oversized_claim_response() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();

@@ -676,18 +676,33 @@ fn read_request(
     stream: &mut TcpStream,
     stopped: &AtomicBool,
 ) -> Result<HttpRequest, RequestReadError> {
-    let request_started = Instant::now();
+    read_request_started(stream, stopped, Instant::now())
+}
+
+fn read_request_started(
+    stream: &mut TcpStream,
+    stopped: &AtomicBool,
+    request_started: Instant,
+) -> Result<HttpRequest, RequestReadError> {
+    read_request_with_elapsed(stream, stopped, || request_started.elapsed())
+}
+
+fn read_request_with_elapsed(
+    stream: &mut impl Read,
+    stopped: &AtomicBool,
+    elapsed: impl Fn() -> Duration,
+) -> Result<HttpRequest, RequestReadError> {
     let mut head = [0_u8; MAX_REQUEST_HEAD_BYTES];
     let mut head_len = 0_usize;
     let head_end = loop {
         if stopped.load(Ordering::SeqCst) {
             return Err(RequestReadError::Stopped);
         }
+        if elapsed() >= REQUEST_READ_DEADLINE {
+            return Err(RequestReadError::Http(408));
+        }
         if let Some(position) = find_bytes(&head[..head_len], b"\r\n\r\n") {
             break position;
-        }
-        if request_started.elapsed() >= REQUEST_READ_DEADLINE {
-            return Err(RequestReadError::Http(408));
         }
         if let Some(line_end) = find_bytes(&head[..head_len], b"\r\n") {
             if line_end > MAX_REQUEST_LINE_BYTES
@@ -708,7 +723,7 @@ fn read_request(
                 if stopped.load(Ordering::SeqCst) {
                     return Err(RequestReadError::Stopped);
                 }
-                if request_started.elapsed() >= REQUEST_READ_DEADLINE {
+                if elapsed() >= REQUEST_READ_DEADLINE {
                     return Err(RequestReadError::Http(408));
                 }
             }
@@ -785,19 +800,24 @@ fn read_request(
         if stopped.load(Ordering::SeqCst) {
             return Err(RequestReadError::Stopped);
         }
-        if request_started.elapsed() >= REQUEST_READ_DEADLINE {
+        if elapsed() >= REQUEST_READ_DEADLINE {
             return Err(RequestReadError::Http(408));
         }
         let remaining = content_length - body.len();
         let mut buffer = [0_u8; MAX_BODY_BYTES];
         match stream.read(&mut buffer[..remaining]) {
             Ok(0) => return Err(RequestReadError::Http(400)),
-            Ok(read) => body.extend_from_slice(&buffer[..read]),
+            Ok(read) => {
+                body.extend_from_slice(&buffer[..read]);
+                if elapsed() >= REQUEST_READ_DEADLINE {
+                    return Err(RequestReadError::Http(408));
+                }
+            }
             Err(error) if is_timeout(&error) => {
                 if stopped.load(Ordering::SeqCst) {
                     return Err(RequestReadError::Stopped);
                 }
-                if request_started.elapsed() >= REQUEST_READ_DEADLINE {
+                if elapsed() >= REQUEST_READ_DEADLINE {
                     return Err(RequestReadError::Http(408));
                 }
             }
@@ -812,6 +832,19 @@ fn read_request(
         range_count,
         body,
     })
+}
+
+#[cfg(test)]
+pub(super) fn read_request_with_elapsed_for_test(
+    stream: &mut impl Read,
+    stopped: &AtomicBool,
+    elapsed: impl Fn() -> Duration,
+) -> Result<(), u16> {
+    match read_request_with_elapsed(stream, stopped, elapsed) {
+        Ok(_) => Ok(()),
+        Err(RequestReadError::Http(status)) => Err(status),
+        Err(RequestReadError::Io(_) | RequestReadError::Stopped) => Err(0),
+    }
 }
 
 fn handle_request(
