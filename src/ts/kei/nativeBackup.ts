@@ -23,12 +23,14 @@ export interface NativeKeiBackupDependencies {
     isTauri(): boolean
     invoke(command: string, args: Record<string, unknown>): Promise<unknown>
     wait?(milliseconds: number): Promise<void>
+    warn?(warningCode: string): void
 }
 
 const productionDependencies: NativeKeiBackupDependencies = {
     isTauri: () => isTauri,
     invoke: (command, args) => invoke(command, args),
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    warn: (warningCode) => console.warn(`Native KEI backup warning: ${warningCode}`),
 }
 
 export interface NativeKeiBackupJobOptions {
@@ -142,7 +144,12 @@ export async function runNativeKeiBackupJob(
             )
         }
 
-        if (terminal.state === 'succeeded') return true
+        if (terminal.state === 'succeeded') {
+            for (const warningCode of terminal.result?.warningCodes ?? []) {
+                dependencies.warn?.(warningCode)
+            }
+            return true
+        }
         if (terminal.state === 'cancelled') throw abortError()
         throw new NativeKeiBackupJobError(
             terminal.error?.code ?? 'kei-backup-failed',

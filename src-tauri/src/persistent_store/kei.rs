@@ -5,6 +5,7 @@ use super::{
 use crate::native_file_jobs::{
     JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError,
 };
+use futures::future::{select, Either};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Body, Url};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -13,15 +14,19 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+
+const KEI_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const KEI_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn javascript_array_index(key: &str) -> Option<u32> {
     let value = key.parse::<u32>().ok()?;
@@ -86,6 +91,7 @@ pub(crate) struct PreparedKeiUpload {
     url: Url,
     expected_account_id: String,
     token: String,
+    account_validated: bool,
 }
 
 pub(super) struct KeiPayloadFile {
@@ -227,6 +233,7 @@ fn prepare_upload_inner(
             url,
             expected_account_id: expected_account_id.to_owned(),
             token: token.to_owned(),
+            account_validated: validate_root,
         }),
         Err(error) => Err((error, reader)),
     }
@@ -262,6 +269,10 @@ pub(super) fn sweep_abandoned(snapshots_dir: &Path) {
 
 fn validate_account(root: &str, expected_account_id: &str, token: &str) -> StoreResult<()> {
     let root: Value = serde_json::from_str(root)?;
+    validate_account_value(&root, expected_account_id, token)
+}
+
+fn validate_account_value(root: &Value, expected_account_id: &str, token: &str) -> StoreResult<()> {
     let account = root
         .get("account")
         .and_then(Value::as_object)
@@ -294,18 +305,6 @@ impl PreparedKeiUpload {
     ) -> StoreResult<KeiPayloadFile> {
         fs::create_dir_all(&self.output_directory)?;
         let reader = self.reader.as_ref().ok_or(StoreError::SnapshotReleased)?;
-        let root: String = reader
-            .connection
-            .query_row(
-                "SELECT value FROM root WHERE generation = ?1",
-                [&reader.target.generation],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::Validation {
-                message: "Pinned generation has no persistent root".to_owned(),
-            })?;
-        validate_account(&root, &self.expected_account_id, &self.token)?;
         let character_count =
             record_count(&reader.connection, "characters", &reader.target.generation)?;
         let preset_count =
@@ -326,6 +325,7 @@ impl PreparedKeiUpload {
             &reader.connection,
             &reader.target.generation,
             &self.token,
+            (!self.account_validated).then_some(self.expected_account_id.as_str()),
             &mut writer,
         )?;
         let (bytes, sha256) = writer.finish();
@@ -442,7 +442,8 @@ pub(crate) fn run_job(
         &prepared.url,
         &payload,
         Arc::clone(&job),
-        Duration::from_secs(120),
+        KEI_CONNECT_TIMEOUT,
+        KEI_IDLE_TIMEOUT,
     ));
     let outcome = match upload {
         Ok(_) => {
@@ -533,7 +534,8 @@ async fn upload_payload_for_job(
     url: &Url,
     payload: &KeiPayloadFile,
     job: Arc<JobControl>,
-    timeout: Duration,
+    connect_timeout: Duration,
+    idle_timeout: Duration,
 ) -> StoreResult<u16> {
     let file = tokio::fs::File::open(&payload.path).await?;
     let body = Body::wrap_stream(ReaderStream::new(JobPayloadReader {
@@ -543,20 +545,76 @@ async fn upload_payload_for_job(
         total: payload.bytes,
     }));
     let client = reqwest::Client::builder()
-        .timeout(timeout)
+        .connect_timeout(connect_timeout)
         .build()
         .map_err(|_| StoreError::Store {
             message: "KEI backup HTTP client could not be created".to_owned(),
         })?;
-    let response = client
+    let request = client
         .post(url.clone())
         .header(CONTENT_TYPE, "application/json")
         .header(CONTENT_LENGTH, payload.bytes)
         .body(body)
-        .send()
-        .await
-        .map_err(sanitized_upload_error)?;
+        .send();
+    let response = match await_upload_with_job_control(request, &job, idle_timeout).await {
+        Ok(response) => response,
+        Err(ControlledUploadError::Request(error)) => {
+            return Err(sanitized_upload_error(error));
+        }
+        Err(ControlledUploadError::Cancelled) => {
+            return Err(StoreError::Store {
+                message: "KEI backup upload cancelled".to_owned(),
+            });
+        }
+        Err(ControlledUploadError::IdleTimeout) => {
+            return Err(StoreError::Store {
+                message: "KEI backup upload made no progress before timeout".to_owned(),
+            });
+        }
+    };
     Ok(response.status().as_u16())
+}
+
+#[derive(Debug)]
+enum ControlledUploadError<E> {
+    Request(E),
+    Cancelled,
+    IdleTimeout,
+}
+
+async fn await_upload_with_job_control<F, T, E>(
+    future: F,
+    job: &JobControl,
+    idle_timeout: Duration,
+) -> Result<T, ControlledUploadError<E>>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let poll_interval = idle_timeout
+        .min(Duration::from_millis(50))
+        .max(Duration::from_millis(1));
+    let mut future = Box::pin(future);
+    let mut completed_bytes = job.status().progress.completed_bytes;
+    let mut last_progress = Instant::now();
+    loop {
+        let timer = Box::pin(tokio::time::sleep(poll_interval));
+        match select(future, timer).await {
+            Either::Left((result, _)) => {
+                return result.map_err(ControlledUploadError::Request);
+            }
+            Either::Right((_, pending)) => future = pending,
+        }
+        if job.is_cancel_requested() {
+            return Err(ControlledUploadError::Cancelled);
+        }
+        let current_bytes = job.status().progress.completed_bytes;
+        if current_bytes != completed_bytes {
+            completed_bytes = current_bytes;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= idle_timeout {
+            return Err(ControlledUploadError::IdleTimeout);
+        }
+    }
 }
 
 fn sanitized_upload_error(error: reqwest::Error) -> StoreError {
@@ -766,12 +824,13 @@ fn write_payload(
     connection: &Connection,
     generation: &str,
     token: &str,
+    expected_account_id: Option<&str>,
     writer: &mut impl Write,
 ) -> StoreResult<()> {
     writer.write_all(b"{\"token\":")?;
     serde_json::to_writer(&mut *writer, token)?;
     writer.write_all(b",\"database\":")?;
-    write_database(connection, generation, writer)?;
+    write_database(connection, generation, expected_account_id, token, writer)?;
     writer.write_all(b"}")?;
     Ok(())
 }
@@ -797,9 +856,11 @@ impl DatabaseField<'_> {
 fn write_database(
     connection: &Connection,
     generation: &str,
+    expected_account_id: Option<&str>,
+    token: &str,
     writer: &mut impl Write,
 ) -> StoreResult<()> {
-    let root: String = connection
+    let root_json: String = connection
         .query_row(
             "SELECT value FROM root WHERE generation = ?1",
             [generation],
@@ -809,7 +870,11 @@ fn write_database(
         .ok_or_else(|| StoreError::Validation {
             message: "Pinned generation has no persistent root".to_owned(),
         })?;
-    let root: Value = serde_json::from_str(&root)?;
+    let root: Value = serde_json::from_str(&root_json)?;
+    drop(root_json);
+    if let Some(expected_account_id) = expected_account_id {
+        validate_account_value(&root, expected_account_id, token)?;
+    }
     let root = root.as_object().ok_or_else(|| StoreError::Validation {
         message: "Persistent root must be an object".to_owned(),
     })?;
@@ -1068,7 +1133,10 @@ fn write_stored_value(writer: &mut impl Write, serialized: &str) -> StoreResult<
 
 #[cfg(test)]
 mod tests {
-    use super::{run_job, set_job_phase, set_job_progress, write_canonical_value};
+    use super::{
+        await_upload_with_job_control, run_job, set_job_phase, set_job_progress,
+        write_canonical_value, ControlledUploadError,
+    };
     use crate::native_file_jobs::{JobKind, JobPhase, JobProgress, JobRegistry};
     use crate::persistent_store::{AssetAlias, PersistentStore, WorkingSetCommit};
     use serde_json::json;
@@ -1077,6 +1145,7 @@ mod tests {
     use std::net::{Shutdown, TcpListener};
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     const EXPECTED_PAYLOAD: &str = "{\"token\":\"secret-token\",\"database\":{\"account\":{\"data\":{},\"id\":\"account-1\",\"kei\":true,\"token\":\"secret-token\"},\"botPresets\":[{\"a\":1,\"name\":\"preset\",\"z\":2}],\"characters\":[{\"a\":1,\"chaId\":\"char-1\",\"chats\":[{\"id\":\"chat-1\",\"message\":[{\"chatId\":\"message-1\",\"data\":\"hello\",\"role\":\"user\"}],\"name\":\"Chat\",\"note\":\"\"}],\"name\":\"Char\",\"type\":\"character\",\"z\":2}],\"pluginCustomStorage\":{\"2\":\"index\",\"beta\":{\"a\":1,\"z\":2},\"alpha\":\"first\"},\"z\":{\"2\":\"two\",\"10\":\"ten\",\"a\":\"line\\n\",\"b\":2}}}";
 
@@ -1441,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn native_job_releases_its_reader_before_waiting_for_upload() {
+    fn native_job_releases_its_reader_and_cancels_while_waiting_for_response() {
         let (_directory, mut store, source_lease) = open_store_with_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
         let address = listener.local_addr().expect("mock address");
@@ -1477,9 +1546,8 @@ mod tests {
                 .send(request[header_end..header_end + content_length].to_vec())
                 .expect("send request body");
             respond_rx.recv().expect("wait to release response");
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("write response");
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         });
         let prepared = store
             .prepare_kei_job_upload(
@@ -1529,21 +1597,19 @@ mod tests {
             .detached_asset_roots()
             .expect("read detached roots")
             .is_empty());
+        registry
+            .cancel(&job.id())
+            .expect("cancel job after body EOF");
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation must interrupt response wait")
+            .expect_err("cancelled KEI job must fail");
         respond_tx.send(()).expect("release response");
-        let result = result_rx
-            .recv()
-            .expect("receive job result")
-            .expect("run KEI job");
         worker.join().expect("join job worker");
         server.join().expect("join server");
 
         assert_eq!(body, EXPECTED_PAYLOAD.as_bytes());
-        assert_eq!(result.revision, 1);
-        assert_eq!(result.source_bytes, body.len() as u64);
-        assert_eq!(result.source_sha256.len(), 64);
-        assert_eq!(result.character_count, 1);
-        assert_eq!(result.preset_count, 1);
-        assert_eq!(job.status().phase, JobPhase::FinalizingExport);
+        assert_eq!(error.code, "cancelled");
     }
 
     #[test]
@@ -1654,6 +1720,59 @@ mod tests {
         .expect_err("accepted cancellation must reject the progress transition");
 
         assert_eq!(progress_error.code, "cancelled");
+    }
+
+    #[test]
+    fn upload_idle_policy_allows_continuous_progress_beyond_one_idle_window() {
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::KeiBackupUpload)
+            .expect("create progress job");
+        job.start(JobPhase::PublishingDestination)
+            .expect("start progress job");
+        let progress_job = job.clone();
+
+        let result = tauri::async_runtime::block_on(await_upload_with_job_control(
+            async move {
+                for step in 1..=8 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    progress_job
+                        .set_progress(JobProgress {
+                            completed_bytes: step,
+                            total_bytes: Some(8),
+                            completed_items: 1,
+                            total_items: Some(2),
+                        })
+                        .expect("advance upload progress");
+                }
+                Ok::<_, ()>(())
+            },
+            &job,
+            Duration::from_millis(15),
+        ));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn upload_idle_policy_times_out_only_after_progress_stops() {
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::KeiBackupUpload)
+            .expect("create idle job");
+        job.start(JobPhase::PublishingDestination)
+            .expect("start idle job");
+
+        let result = tauri::async_runtime::block_on(await_upload_with_job_control(
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok::<_, ()>(())
+            },
+            &job,
+            Duration::from_millis(10),
+        ));
+
+        assert!(matches!(result, Err(ControlledUploadError::IdleTimeout)));
     }
 
     #[test]

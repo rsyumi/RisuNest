@@ -165,6 +165,7 @@ describe('tryNativeKeiBackup', () => {
 describe('runNativeKeiBackupJob', () => {
     it('starts a lease-owned job, releases the handoff lease, and waits for success', async () => {
         const harness = nativeRuntime()
+        const warn = vi.fn()
         const invoke = vi.fn()
             .mockResolvedValueOnce({ jobId: 'kei-job-1', warningCodes: [] })
             .mockResolvedValueOnce({
@@ -194,7 +195,7 @@ describe('runNativeKeiBackupJob', () => {
                     sourceSha256: 'a'.repeat(64),
                     characterCount: 1,
                     presetCount: 2,
-                    warningCodes: [],
+                    warningCodes: ['cleanup-failed'],
                 },
             })
             .mockResolvedValueOnce(true)
@@ -207,7 +208,7 @@ describe('runNativeKeiBackupJob', () => {
                 accountId: 'account-1',
                 token: 'secret-token',
             },
-            { isTauri: () => true, invoke, wait },
+            { isTauri: () => true, invoke, wait, warn },
         )).resolves.toBe(true)
 
         expect(harness.flushPendingData).toHaveBeenCalledWith('kei-auto-backup')
@@ -228,6 +229,7 @@ describe('runNativeKeiBackupJob', () => {
         ])
         expect(harness.release).toHaveBeenCalledOnce()
         expect(wait).toHaveBeenCalledOnce()
+        expect(warn).toHaveBeenCalledWith('cleanup-failed')
     })
 
     it('falls back only when native capability is unavailable before a job is accepted', async () => {
@@ -246,6 +248,29 @@ describe('runNativeKeiBackupJob', () => {
             },
             { isTauri: () => true, invoke, wait: vi.fn() },
         )).resolves.toBe(false)
+
+        expect(harness.release).toHaveBeenCalledOnce()
+    })
+
+    it('does not materialize the JavaScript fallback when native workers are busy', async () => {
+        const harness = nativeRuntime()
+        const invoke = vi.fn().mockRejectedValueOnce({
+            code: 'job-capacity',
+            message: 'native file job concurrency limit reached',
+        })
+
+        await expect(runNativeKeiBackupJob(
+            {
+                runtime: harness.runtime,
+                url: 'https://kei.example/autobackup/save',
+                accountId: 'account-1',
+                token: 'secret-token',
+            },
+            { isTauri: () => true, invoke, wait: vi.fn() },
+        )).rejects.toMatchObject({
+            name: 'NativeKeiBackupJobError',
+            code: 'job-capacity',
+        })
 
         expect(harness.release).toHaveBeenCalledOnce()
     })

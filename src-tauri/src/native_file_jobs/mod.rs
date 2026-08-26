@@ -1323,7 +1323,7 @@ impl WorkerPermit {
         });
         if reserved.is_err() {
             return Err(NativeJobError::new(
-                "capability-unavailable",
+                "job-capacity",
                 "native file job concurrency limit reached",
             ));
         }
@@ -3081,7 +3081,7 @@ mod tests {
 
         let error = WorkerPermit::acquire(Arc::clone(&active), 1).unwrap_err();
 
-        assert_eq!(error.code, "capability-unavailable");
+        assert_eq!(error.code, "job-capacity");
         assert_eq!(active.load(Ordering::Acquire), 1);
         drop(first);
         assert!(WorkerPermit::acquire(Arc::clone(&active), 1).is_ok());
