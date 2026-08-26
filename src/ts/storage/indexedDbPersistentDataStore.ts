@@ -2280,21 +2280,27 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     private migrateAssetAliasKeys(transaction: IDBTransaction): void {
         const aliases = transaction.objectStore('assetAliases')
+        const records: StoredRecord<AssetAlias>[] = []
         const request = aliases.openCursor()
         request.onsuccess = () => {
             const cursor = request.result
-            if (!cursor) return
+            if (!cursor) {
+                for (const record of records) {
+                    aliases.put({
+                        ...record,
+                        key: this.assetAliasKey(
+                            record.generation,
+                            record.value.kind,
+                            record.value.key,
+                        ),
+                    })
+                }
+                return
+            }
             const record = cursor.value as StoredRecord<AssetAlias>
             validateAssetAlias(record.value)
-            const key = this.assetAliasKey(
-                record.generation,
-                record.value.kind,
-                record.value.key,
-            )
-            if (record.key !== key) {
-                cursor.delete()
-                aliases.put({ ...record, key })
-            }
+            records.push(record)
+            cursor.delete()
             cursor.continue()
         }
     }

@@ -371,6 +371,33 @@ async function createVersion9AliasDatabase(
             ext: 'bin',
         },
     })
+    transaction.objectStore('assetAliases').put({
+        key: 'revision-5:asset-alias:0',
+        generation: 'revision-5',
+        value: {
+            key: '0',
+            objectHash: '62'.repeat(32),
+            kind: 'asset',
+            size: 1,
+            mime: 'application/octet-stream',
+            name: 'Collision asset',
+            ext: 'bin',
+        },
+    })
+    transaction.objectStore('assetAliases').put({
+        key: 'revision-5:asset-alias:asset:0',
+        generation: 'revision-5',
+        value: {
+            key: 'asset:0',
+            objectHash: '63'.repeat(32),
+            kind: 'inlay',
+            size: 1,
+            mime: 'image/webp',
+            name: 'Collision inlay',
+            ext: 'webp',
+            inlayType: 'image',
+        },
+    })
     await completeTransaction(transaction)
     database.close()
 }
@@ -651,6 +678,20 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             revision: committed.revision,
             value: inlay,
         })
+    })
+
+    it('migrates version 9 aliases without typed-key collisions', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-9-alias-key-collision-${databaseSequence++}`
+        await createVersion9AliasDatabase(indexedDB, databaseName)
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        await store.open()
+
+        expect((await store.readAssetAlias({ kind: 'asset', key: '0' }))?.value)
+            .toMatchObject({ kind: 'asset', key: '0', name: 'Collision asset' })
+        expect((await store.readAssetAlias({ kind: 'inlay', key: 'asset:0' }))?.value)
+            .toMatchObject({ kind: 'inlay', key: 'asset:0', name: 'Collision inlay' })
     })
 
     it('boots the plugin catalog without scanning large plugin payload rows', async () => {
