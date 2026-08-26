@@ -1283,6 +1283,8 @@ interface PluginConversationMessageQuery {
     characterId: string;
     /** Stable conversation ID. */
     conversationId: string;
+    /** Zero-based absolute start for range mode. Requires limit and cannot use anchor options. */
+    startIndex?: number;
     /** Latest-window size, defaults to 128 and is clamped to 128. */
     limit?: number;
     /** Stable message ID for anchored mode. Missing anchored data returns null. */
@@ -1552,9 +1554,10 @@ interface RisuaiPluginAPI {
     queryConversations(input: PluginConversationQuery): Promise<PluginConversationPage | null>;
 
     /**
-     * Reads a bounded latest or anchored message window. Omit anchorMessageId, before,
-     * and after for latest mode. Returns null when permission is denied or anchored data
-     * does not exist.
+     * Reads a bounded latest, absolute-range, or anchored message window. Use startIndex
+     * with limit for absolute range mode. Omit startIndex, anchorMessageId, before, and
+     * after for latest mode. Returns null when permission is denied or anchored data does
+     * not exist.
      */
     queryConversationMessages(
         input: PluginConversationMessageQuery,

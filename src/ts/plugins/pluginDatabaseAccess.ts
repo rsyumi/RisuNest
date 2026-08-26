@@ -44,6 +44,7 @@ export interface PluginConversationQuery {
 export interface PluginConversationMessageQuery {
     characterId: string
     conversationId: string
+    startIndex?: number
     limit?: number
     anchorMessageId?: string
     before?: number
@@ -315,9 +316,36 @@ export function createPluginDatabaseAccess(
             requiredId(input.characterId, 'characterId')
             requiredId(input.conversationId, 'conversationId')
 
+            const ranged = input.startIndex !== undefined
             const anchored = input.anchorMessageId !== undefined
             let query
-            if (anchored) {
+            if (ranged) {
+                if (!Number.isSafeInteger(input.startIndex) || input.startIndex! < 0) {
+                    throw new RangeError(
+                        'Message range startIndex must be a nonnegative safe integer',
+                    )
+                }
+                if (input.limit === undefined) {
+                    throw new RangeError('Absolute message ranges require limit')
+                }
+                if (
+                    anchored ||
+                    input.before !== undefined ||
+                    input.after !== undefined
+                ) {
+                    throw new RangeError('Absolute message ranges cannot include anchor options')
+                }
+                query = {
+                    characterId: input.characterId,
+                    conversationId: input.conversationId,
+                    startIndex: input.startIndex,
+                    limit: positiveLimit(
+                        input.limit,
+                        PLUGIN_MESSAGE_QUERY_DEFAULT_LIMIT,
+                        PLUGIN_MESSAGE_QUERY_MAX_LIMIT,
+                    ),
+                }
+            } else if (anchored) {
                 requiredId(input.anchorMessageId!, 'anchorMessageId')
                 if (input.limit !== undefined) {
                     throw new RangeError('Anchored message queries cannot include limit')

@@ -456,6 +456,45 @@ describe('plugin database access', () => {
         ).toBeNull()
     })
 
+    it('passes a bounded absolute message range without materializing a conversation', async () => {
+        const harness = createHarness()
+
+        await harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            startIndex: 4_096,
+            limit: 500,
+        })
+
+        expect(harness.store.readConversationWindow).toHaveBeenCalledWith({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            startIndex: 4_096,
+            limit: 128,
+        })
+        expect(harness.store.readConversation).not.toHaveBeenCalled()
+        expect(harness.store.materializeDatabase).not.toHaveBeenCalled()
+    })
+
+    it.each([
+        { startIndex: -1, limit: 1 },
+        { startIndex: 1.5, limit: 1 },
+        { startIndex: 0 },
+        { startIndex: 0, limit: 1, anchorMessageId: 'message-a' },
+        { startIndex: 0, limit: 1, before: 1 },
+        { startIndex: 0, limit: 1, after: 1 },
+    ])('rejects invalid absolute message range %# before persistence access', async (range) => {
+        const harness = createHarness()
+
+        await expect(harness.access.queryConversationMessages({
+            characterId: 'char-a',
+            conversationId: 'conv-a',
+            ...range,
+        })).rejects.toBeInstanceOf(RangeError)
+        expect(harness.flushPendingData).not.toHaveBeenCalled()
+        expect(harness.store.readConversationWindow).not.toHaveBeenCalled()
+    })
+
     it('snapshots root-only compatibility keys without opening persistence', async () => {
         const harness = createHarness()
 
