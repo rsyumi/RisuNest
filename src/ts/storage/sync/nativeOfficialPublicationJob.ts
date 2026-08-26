@@ -1,9 +1,13 @@
 import type { AccountStorage } from '../accountStorage'
 import {
+    cancelNativeOfficialPublication,
+    continueNativeOfficialPublication,
     runNativeOfficialPublicationAttempt,
     type NativeFileJobOptions,
     type NativeOfficialPublicationReceipt,
     type NativeOfficialPublicationRequest,
+    type NativeOfficialPublicationRetryRequest,
+    type NativeOfficialPublicationRunResult,
 } from '../nativeFileJobs'
 import {
     hasNativePersistentRevisionLease,
@@ -20,7 +24,17 @@ export interface NativeOfficialPublicationJobDependencies {
     runAttempt?(
         request: NativeOfficialPublicationRequest,
         options?: NativeFileJobOptions,
-    ): Promise<NativeOfficialPublicationReceipt | null>
+    ): Promise<NativeOfficialPublicationRunResult | null>
+    continueAttempt?(
+        jobId: string,
+        request: NativeOfficialPublicationRetryRequest,
+        expected: {
+            revision: number
+            accountId: string
+        },
+        options?: NativeFileJobOptions,
+    ): Promise<NativeOfficialPublicationRunResult>
+    cancelAttempt?(jobId: string): Promise<NativeOfficialPublicationReceipt | null>
     reconcilePendingPublications?(input: {
         accountId: string
         revision: number
@@ -31,6 +45,8 @@ export function createNativeOfficialPublicationJobPublisher(
     dependencies: NativeOfficialPublicationJobDependencies,
 ): OfficialNativeDatabasePublisher {
     const runAttempt = dependencies.runAttempt ?? runNativeOfficialPublicationAttempt
+    const continueAttempt = dependencies.continueAttempt ?? continueNativeOfficialPublication
+    const cancelAttempt = dependencies.cancelAttempt ?? cancelNativeOfficialPublication
     return async (input) => {
         const recovered = await dependencies.reconcilePendingPublications?.({
             accountId: input.accountId,
@@ -44,43 +60,83 @@ export function createNativeOfficialPublicationJobPublisher(
             }
         }
         if (!hasNativePersistentRevisionLease(input.lease)) return null
-        const result = await dependencies.account.writeOfficialDatabaseFromNative(
-            async (context) => {
-                const receipt = await runAttempt({
-                    expectedRevision: input.revision,
-                    lease: input.lease[nativePersistentRevisionLease],
-                    accountId: input.accountId,
-                    baseUrl: dependencies.baseUrl,
-                    replacements: input.resourceReplacements,
-                    session: context.session,
-                    saveDate: context.saveDate,
-                    credential: context.credential,
-                }, { signal: context.signal })
-                if (!receipt) return null
-                const publication = receipt.result.publication
-                if (
-                    publication.kind === 'auth-warning'
-                    || publication.kind === 'reauthentication-needed'
-                ) {
-                    await receipt.acknowledge()
+        let pendingJobId: string | null = null
+        let result
+        try {
+            result = await dependencies.account.writeOfficialDatabaseFromNative(
+                async (context) => {
+                    const outcome = pendingJobId
+                        ? await continueAttempt(
+                            pendingJobId,
+                            {
+                                accountId: input.accountId,
+                                session: context.session,
+                                saveDate: context.saveDate,
+                                credential: context.credential,
+                            },
+                            {
+                                revision: input.revision,
+                                accountId: input.accountId,
+                            },
+                            { signal: context.signal },
+                        )
+                        : await runAttempt({
+                            expectedRevision: input.revision,
+                            lease: input.lease[nativePersistentRevisionLease],
+                            accountId: input.accountId,
+                            baseUrl: dependencies.baseUrl,
+                            replacements: input.resourceReplacements,
+                            session: context.session,
+                            saveDate: context.saveDate,
+                            credential: context.credential,
+                        }, { signal: context.signal })
+                    if (outcome === null) return null
+                    if (outcome.kind === 'waiting-for-reauthentication') {
+                        pendingJobId = outcome.jobId
+                        return {
+                            kind: 'reauthentication-needed',
+                            session: outcome.session,
+                        }
+                    }
+                    pendingJobId = null
+                    const receipt = outcome.receipt
+                    const publication = receipt.result.publication
+                    if (publication.kind === 'auth-warning') {
+                        await receipt.acknowledge()
+                        return {
+                            kind: 'auth-warning',
+                            session: publication.session,
+                        }
+                    }
+                    if (publication.kind === 'reauthentication-needed') {
+                        await receipt.acknowledge()
+                        throw new Error(
+                            'Native official publication ended before reauthentication retry',
+                        )
+                    }
                     return {
                         kind: publication.kind,
                         session: publication.session,
+                        replacementKey: publication.replacementKey,
+                        warning: publication.kind === 'written' ? publication.warning : null,
+                        reloadSession: publication.kind === 'written'
+                            ? publication.reloadSession
+                            : false,
+                        receipt,
                     }
+                },
+                { signal: input.signal },
+            )
+        }
+        catch (error) {
+            if (pendingJobId !== null) {
+                try {
+                    await cancelAttempt(pendingJobId)
                 }
-                return {
-                    kind: publication.kind,
-                    session: publication.session,
-                    replacementKey: publication.replacementKey,
-                    warning: publication.kind === 'written' ? publication.warning : null,
-                    reloadSession: publication.kind === 'written'
-                        ? publication.reloadSession
-                        : false,
-                    receipt,
-                }
-            },
-            { signal: input.signal },
-        )
+                catch {}
+            }
+            throw error
+        }
         if (result === null) return null
         if (result.kind === 'auth-warning') {
             throw new Error('Official account authorization warning while writing database/database.bin')
