@@ -17,6 +17,8 @@ struct HostShared {
     session: PreparedCloneSession,
     faults: Mutex<Vec<RangeFault>>,
     range_requests: Mutex<BTreeMap<(String, u64), usize>>,
+    #[cfg(test)]
+    manifest_redirect: Mutex<Option<String>>,
 }
 
 enum RangeFault {
@@ -54,6 +56,8 @@ impl LoopbackCloneHost {
             session,
             faults: Mutex::new(Vec::new()),
             range_requests: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            manifest_redirect: Mutex::new(None),
         });
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
@@ -106,6 +110,11 @@ impl LoopbackCloneHost {
                 object: object.to_owned(),
                 offset,
             });
+    }
+
+    #[cfg(test)]
+    pub fn redirect_manifest_once_for_test(&self, location: String) {
+        *self.shared.manifest_redirect.lock().unwrap() = Some(location);
     }
 
     #[cfg(test)]
@@ -178,6 +187,14 @@ fn handle_request(request: Request, shared: &HostShared) -> Result<(), PeerSyncE
     if request.url() == format!("{session_prefix}/manifest") {
         if request.method() != &Method::Get {
             return respond_empty(request, 405);
+        }
+        #[cfg(test)]
+        if let Some(location) = shared.manifest_redirect.lock().unwrap().take() {
+            return request
+                .respond(
+                    Response::empty(StatusCode(302)).with_header(header("location", &location)?),
+                )
+                .map_err(|error| PeerSyncError::Transport(error.to_string()));
         }
         let headers = vec![
             header("content-type", "application/json")?,

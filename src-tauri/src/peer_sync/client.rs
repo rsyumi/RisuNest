@@ -87,6 +87,8 @@ pub struct LoopbackCloneClient {
     manifest: Option<CloneManifest>,
     manifest_id: Option<String>,
     ledger: LedgerState,
+    #[cfg(test)]
+    fail_after_cas_promotion: bool,
 }
 
 impl LoopbackCloneClient {
@@ -101,6 +103,7 @@ impl LoopbackCloneClient {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(transport_error)?;
         Ok(Self {
@@ -110,6 +113,8 @@ impl LoopbackCloneClient {
             manifest: None,
             manifest_id: None,
             ledger,
+            #[cfg(test)]
+            fail_after_cas_promotion: false,
         })
     }
 
@@ -163,6 +168,11 @@ impl LoopbackCloneClient {
             .get(object)
             .filter(|progress| progress.verified)
             .map(|_| self.object_path(object))
+    }
+
+    #[cfg(test)]
+    pub fn fail_after_cas_promotion_once_for_test(&mut self) {
+        self.fail_after_cas_promotion = true;
     }
 
     fn fetch_manifest(&mut self) -> Result<(), PeerSyncError> {
@@ -243,19 +253,23 @@ impl LoopbackCloneClient {
             .get(object_hash)
             .cloned()
             .unwrap_or_default();
-        if current.verified {
-            if self.verify_local_object(object_hash, descriptor.size)? {
-                return Ok(());
+        let download_directory = self.root.join("downloads");
+        let part_path = download_directory.join(format!("{object_hash}.part"));
+        if self.verify_local_object(object_hash, descriptor.size)? {
+            if !current.verified {
+                self.record_object_progress(object_hash, descriptor.chunks.len(), true)?;
             }
+            remove_file_if_exists(&part_path)?;
+            return Ok(());
+        }
+        if current.verified {
             self.record_object_progress(object_hash, 0, false)?;
         }
         if cancellation.is_cancelled() {
             return Err(PeerSyncError::Cancelled);
         }
         self.verify_remote_object(object_hash, descriptor.size)?;
-        let download_directory = self.root.join("downloads");
         fs::create_dir_all(&download_directory)?;
-        let part_path = download_directory.join(format!("{object_hash}.part"));
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -375,12 +389,14 @@ impl LoopbackCloneClient {
                 object: object_hash.to_owned(),
             });
         }
-        drop(file);
-        match fs::remove_file(&part_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_after_cas_promotion) {
+            return Err(PeerSyncError::Storage(
+                "injected crash after CAS promotion".to_owned(),
+            ));
         }
+        drop(file);
+        remove_file_if_exists(&part_path)?;
         self.record_object_progress(object_hash, descriptor.chunks.len(), true)
     }
 
@@ -487,20 +503,34 @@ impl LoopbackCloneClient {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneActivation {
+    Activated,
+    AlreadyActive,
+    Conflict { actual: Option<String> },
+}
+
 pub trait CloneTargetAdapter {
     type Stage;
 
-    fn is_active(&self, manifest_id: &str) -> Result<bool, PeerSyncError>;
+    fn active_manifest_id(&self) -> Result<Option<String>, PeerSyncError>;
     fn begin(&mut self, manifest_id: &str) -> Result<Self::Stage, PeerSyncError>;
     fn stage_object(
         &mut self,
         stage: &mut Self::Stage,
         kind: CloneObjectKind,
         logical_key: &str,
+        metadata: &serde_json::Value,
         reader: &mut dyn Read,
     ) -> Result<(), PeerSyncError>;
     fn abort(&mut self, stage: Self::Stage) -> Result<(), PeerSyncError>;
-    fn activate(&mut self, stage: &mut Self::Stage) -> Result<(), PeerSyncError>;
+    /// The comparison and activation must be one atomic target transaction.
+    fn activate_if_current(
+        &mut self,
+        stage: &mut Self::Stage,
+        expected_manifest_id: Option<&str>,
+        new_manifest_id: &str,
+    ) -> Result<CloneActivation, PeerSyncError>;
 }
 
 pub trait CloneValidator<S> {
@@ -528,7 +558,8 @@ where
     client.fetch_manifest()?;
     let manifest = client.manifest.as_ref().unwrap().clone();
     let manifest_id = client.manifest_id.as_ref().unwrap().clone();
-    if target.is_active(&manifest_id)? {
+    let expected_manifest_id = target.active_manifest_id()?;
+    if expected_manifest_id.as_deref() == Some(&manifest_id) {
         if !client.ledger.activated {
             client.record_activation()?;
         }
@@ -550,36 +581,62 @@ where
         }
     }
 
-    let mut stage = Some(target.begin(&manifest_id)?);
-    let operation = (|| {
+    let mut stage = target.begin(&manifest_id)?;
+    let staging = (|| {
         for payload in &manifest.payloads {
             let mut reader = client.open_verified_object(&payload.object)?;
             target.stage_object(
-                stage.as_mut().unwrap(),
+                &mut stage,
                 payload.kind,
                 &payload.logical_key,
+                &payload.metadata,
                 &mut reader,
             )?;
         }
         let mut database = client.open_verified_object(&manifest.database)?;
         target.stage_object(
-            stage.as_mut().unwrap(),
+            &mut stage,
             CloneObjectKind::Database,
             "database",
+            &serde_json::Value::Null,
             &mut database,
         )?;
-        validator.validate(&manifest, stage.as_ref().unwrap())?;
-        target.activate(stage.as_mut().unwrap())?;
-        drop(stage.take());
-        client.record_activation()
+        validator.validate(&manifest, &stage)
     })();
-    if let Err(error) = operation {
-        if let Some(stage) = stage {
-            let _ = target.abort(stage);
-        }
+    if let Err(error) = staging {
+        let _ = target.abort(stage);
         return Err(error);
     }
-    Ok(())
+
+    let activation =
+        match target.activate_if_current(&mut stage, expected_manifest_id.as_deref(), &manifest_id)
+        {
+            Ok(activation) => activation,
+            Err(error) => {
+                let _ = target.abort(stage);
+                return Err(error);
+            }
+        };
+    match activation {
+        CloneActivation::Activated => {
+            drop(stage);
+            client.record_activation()
+        }
+        CloneActivation::AlreadyActive => {
+            let _ = target.abort(stage);
+            if !client.ledger.activated {
+                client.record_activation()?;
+            }
+            Err(PeerSyncError::AlreadyActivated)
+        }
+        CloneActivation::Conflict { actual } => {
+            let _ = target.abort(stage);
+            Err(PeerSyncError::ActivationConflict {
+                expected: expected_manifest_id,
+                actual,
+            })
+        }
+    }
 }
 
 impl LoopbackCloneClient {
@@ -755,6 +812,14 @@ fn hash_reader(reader: &mut impl Read) -> Result<String, PeerSyncError> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), PeerSyncError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn quoted(value: &str) -> String {

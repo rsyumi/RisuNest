@@ -9,8 +9,9 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Barrier, Mutex,
     },
+    thread,
 };
 
 struct FixtureSource {
@@ -65,14 +66,24 @@ struct FixtureTarget {
 #[derive(Default)]
 struct FixtureStage {
     manifest_id: String,
-    staged: Vec<(CloneObjectKind, String, Vec<u8>)>,
+    staged: Vec<StagedFixtureObject>,
+    maximum_buffer_bytes: usize,
+}
+
+#[derive(Clone)]
+struct StagedFixtureObject {
+    kind: CloneObjectKind,
+    logical_key: String,
+    metadata: Value,
+    sha256: String,
+    byte_size: u64,
 }
 
 impl CloneTargetAdapter for FixtureTarget {
     type Stage = FixtureStage;
 
-    fn is_active(&self, manifest_id: &str) -> Result<bool, PeerSyncError> {
-        Ok(self.active_manifest == manifest_id)
+    fn active_manifest_id(&self) -> Result<Option<String>, PeerSyncError> {
+        Ok((!self.active_manifest.is_empty()).then(|| self.active_manifest.clone()))
     }
 
     fn begin(&mut self, manifest_id: &str) -> Result<Self::Stage, PeerSyncError> {
@@ -80,6 +91,7 @@ impl CloneTargetAdapter for FixtureTarget {
         Ok(FixtureStage {
             manifest_id: manifest_id.to_owned(),
             staged: Vec::new(),
+            maximum_buffer_bytes: 0,
         })
     }
 
@@ -88,11 +100,28 @@ impl CloneTargetAdapter for FixtureTarget {
         stage: &mut Self::Stage,
         kind: CloneObjectKind,
         logical_key: &str,
+        metadata: &Value,
         reader: &mut dyn Read,
     ) -> Result<(), PeerSyncError> {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        stage.staged.push((kind, logical_key.to_owned(), bytes));
+        let mut hasher = Sha256::new();
+        let mut byte_size = 0_u64;
+        let mut buffer = [0_u8; 32 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            stage.maximum_buffer_bytes = stage.maximum_buffer_bytes.max(buffer.len());
+            hasher.update(&buffer[..read]);
+            byte_size += read as u64;
+        }
+        stage.staged.push(StagedFixtureObject {
+            kind,
+            logical_key: logical_key.to_owned(),
+            metadata: metadata.clone(),
+            sha256: hex::encode(hasher.finalize()),
+            byte_size,
+        });
         Ok(())
     }
 
@@ -101,11 +130,118 @@ impl CloneTargetAdapter for FixtureTarget {
         Ok(())
     }
 
-    fn activate(&mut self, stage: &mut Self::Stage) -> Result<(), PeerSyncError> {
-        assert_eq!(self.active_manifest, "old");
+    fn activate_if_current(
+        &mut self,
+        stage: &mut Self::Stage,
+        expected_manifest_id: Option<&str>,
+        new_manifest_id: &str,
+    ) -> Result<CloneActivation, PeerSyncError> {
+        if self.active_manifest == new_manifest_id {
+            return Ok(CloneActivation::AlreadyActive);
+        }
+        let actual = (!self.active_manifest.is_empty()).then(|| self.active_manifest.clone());
+        if actual.as_deref() != expected_manifest_id {
+            return Ok(CloneActivation::Conflict { actual });
+        }
+        assert_eq!(stage.manifest_id, new_manifest_id);
         self.active_manifest = stage.manifest_id.clone();
         self.activation_count += 1;
+        Ok(CloneActivation::Activated)
+    }
+}
+
+#[derive(Clone)]
+struct ConcurrentFixtureTarget {
+    state: Arc<Mutex<ConcurrentFixtureTargetState>>,
+}
+
+struct ConcurrentFixtureTargetState {
+    active_manifest: Option<String>,
+    activation_count: usize,
+    abort_count: usize,
+}
+
+impl ConcurrentFixtureTarget {
+    fn new(active_manifest: &str) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ConcurrentFixtureTargetState {
+                active_manifest: Some(active_manifest.to_owned()),
+                activation_count: 0,
+                abort_count: 0,
+            })),
+        }
+    }
+}
+
+impl CloneTargetAdapter for ConcurrentFixtureTarget {
+    type Stage = FixtureStage;
+
+    fn active_manifest_id(&self) -> Result<Option<String>, PeerSyncError> {
+        Ok(self.state.lock().unwrap().active_manifest.clone())
+    }
+
+    fn begin(&mut self, manifest_id: &str) -> Result<Self::Stage, PeerSyncError> {
+        Ok(FixtureStage {
+            manifest_id: manifest_id.to_owned(),
+            staged: Vec::new(),
+            maximum_buffer_bytes: 0,
+        })
+    }
+
+    fn stage_object(
+        &mut self,
+        stage: &mut Self::Stage,
+        kind: CloneObjectKind,
+        logical_key: &str,
+        metadata: &Value,
+        reader: &mut dyn Read,
+    ) -> Result<(), PeerSyncError> {
+        let mut hasher = Sha256::new();
+        let mut byte_size = 0_u64;
+        let mut buffer = [0_u8; 32 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            stage.maximum_buffer_bytes = stage.maximum_buffer_bytes.max(buffer.len());
+            hasher.update(&buffer[..read]);
+            byte_size += read as u64;
+        }
+        stage.staged.push(StagedFixtureObject {
+            kind,
+            logical_key: logical_key.to_owned(),
+            metadata: metadata.clone(),
+            sha256: hex::encode(hasher.finalize()),
+            byte_size,
+        });
         Ok(())
+    }
+
+    fn abort(&mut self, _stage: Self::Stage) -> Result<(), PeerSyncError> {
+        self.state.lock().unwrap().abort_count += 1;
+        Ok(())
+    }
+
+    fn activate_if_current(
+        &mut self,
+        stage: &mut Self::Stage,
+        expected_manifest_id: Option<&str>,
+        new_manifest_id: &str,
+    ) -> Result<CloneActivation, PeerSyncError> {
+        assert_eq!(stage.manifest_id, new_manifest_id);
+        let mut state = self.state.lock().unwrap();
+        if state.active_manifest.as_deref() == Some(new_manifest_id) {
+            return Ok(CloneActivation::AlreadyActive);
+        }
+        if state.active_manifest.as_deref() != expected_manifest_id {
+            return Ok(CloneActivation::Conflict {
+                actual: state.active_manifest.clone(),
+            });
+        }
+        state.active_manifest = Some(new_manifest_id.to_owned());
+        state.activation_count += 1;
+        Ok(CloneActivation::Activated)
     }
 }
 
@@ -242,6 +378,34 @@ fn serves_head_and_only_exact_single_chunk_ranges_on_loopback() {
 }
 
 #[test]
+fn refuses_nonloopback_session_urls_and_never_follows_http_redirects() {
+    let staging_root = tempfile::tempdir().unwrap();
+    for url in [
+        "http://localhost:1234/v1/sessions/test",
+        "http://192.0.2.1:1234/v1/sessions/test",
+    ] {
+        assert!(matches!(
+            LoopbackCloneClient::new(staging_root.path(), url),
+            Err(PeerSyncError::Protocol(_))
+        ));
+    }
+
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64 * 1024]);
+    let session = prepare(&source, session_root.path());
+    let host = LoopbackCloneHost::start(session).unwrap();
+    host.redirect_manifest_once_for_test(format!("http://{}/redirect-target", host.address()));
+    let mut client = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
+
+    assert!(matches!(
+        client.download(&TransferCancellation::new()),
+        Err(PeerSyncError::Transport(message)) if message.contains("302")
+    ));
+}
+
+#[test]
 fn resumes_from_persisted_verified_offsets_after_disconnect_without_redownload() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
@@ -298,6 +462,32 @@ fn never_requests_an_already_verified_object_after_process_style_restart() {
     let mut restarted = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
     restarted.download(&TransferCancellation::new()).unwrap();
     assert_eq!(host.total_range_requests(&first_hash), first_requests);
+}
+
+#[test]
+fn reopens_promoted_cas_object_without_redownload_before_verified_ledger_record() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[128 * 1024]);
+    let session = prepare(&source, session_root.path());
+    let hash = payload_hash(&session, 0);
+    let host = LoopbackCloneHost::start(session).unwrap();
+    let mut interrupted = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
+    interrupted.fail_after_cas_promotion_once_for_test();
+
+    assert!(matches!(
+        interrupted.download(&TransferCancellation::new()),
+        Err(PeerSyncError::Storage(message))
+            if message == "injected crash after CAS promotion"
+    ));
+    assert_eq!(host.total_range_requests(&hash), 1);
+    drop(interrupted);
+
+    let mut reopened = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
+    reopened.download(&TransferCancellation::new()).unwrap();
+    assert_eq!(host.total_range_requests(&hash), 1);
+    assert_file_hash(&reopened.verified_object_path(&hash).unwrap(), &hash);
 }
 
 #[test]
@@ -418,7 +608,7 @@ fn validates_staged_graph_and_hashes_before_one_atomic_activation() {
     let failing_calls = Arc::clone(&validation_calls);
     let mut failing_validator = move |_manifest: &CloneManifest, stage: &FixtureStage| {
         failing_calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(stage.staged.last().unwrap().0, CloneObjectKind::Database);
+        assert_eq!(stage.staged.last().unwrap().kind, CloneObjectKind::Database);
         Err(PeerSyncError::Validation(
             "injected graph mismatch".to_owned(),
         ))
@@ -435,19 +625,25 @@ fn validates_staged_graph_and_hashes_before_one_atomic_activation() {
 
     let mut validator = |manifest: &CloneManifest, stage: &FixtureStage| {
         assert_eq!(stage.staged.len(), manifest.payloads.len() + 1);
-        for (kind, logical_key, bytes) in &stage.staged {
-            let expected = if *kind == CloneObjectKind::Database {
-                assert_eq!(logical_key, "database");
+        for staged in &stage.staged {
+            let expected = if staged.kind == CloneObjectKind::Database {
+                assert_eq!(staged.logical_key, "database");
                 &manifest.database
             } else {
                 &manifest
                     .payloads
                     .iter()
-                    .find(|payload| payload.kind == *kind && payload.logical_key == *logical_key)
+                    .find(|payload| {
+                        payload.kind == staged.kind && payload.logical_key == staged.logical_key
+                    })
                     .unwrap()
                     .object
             };
-            assert_eq!(hex::encode(Sha256::digest(bytes)), *expected);
+            assert_eq!(staged.sha256, *expected);
+            assert_eq!(
+                staged.byte_size, manifest.objects[expected].size,
+                "bounded target sink must consume the complete object"
+            );
         }
         Ok(())
     };
@@ -459,6 +655,113 @@ fn validates_staged_graph_and_hashes_before_one_atomic_activation() {
         PeerSyncError::AlreadyActivated
     );
     assert_eq!(target.activation_count, 1);
+}
+
+#[test]
+fn concurrent_clone_jobs_use_one_atomic_idempotent_manifest_activation() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_a_root = tempfile::tempdir().unwrap();
+    let client_b_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[96 * 1024]);
+    let session = prepare(&source, session_root.path());
+    let manifest_id = session.manifest_id().to_owned();
+    let host = LoopbackCloneHost::start(session).unwrap();
+    let mut client_a = LoopbackCloneClient::new(client_a_root.path(), host.session_url()).unwrap();
+    let mut client_b = LoopbackCloneClient::new(client_b_root.path(), host.session_url()).unwrap();
+    client_a.download(&TransferCancellation::new()).unwrap();
+    client_b.download(&TransferCancellation::new()).unwrap();
+
+    let target = ConcurrentFixtureTarget::new("old");
+    let barrier = Arc::new(Barrier::new(2));
+    let spawn_job = |mut client: LoopbackCloneClient,
+                     mut target: ConcurrentFixtureTarget,
+                     barrier: Arc<Barrier>| {
+        thread::spawn(move || {
+            let mut validator = move |_manifest: &CloneManifest, _stage: &FixtureStage| {
+                barrier.wait();
+                Ok(())
+            };
+            activate_downloaded_clone(&mut client, &mut target, &mut validator)
+        })
+    };
+    let job_a = spawn_job(client_a, target.clone(), Arc::clone(&barrier));
+    let job_b = spawn_job(client_b, target.clone(), Arc::clone(&barrier));
+    let results = [job_a.join().unwrap(), job_b.join().unwrap()];
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(PeerSyncError::AlreadyActivated)))
+            .count(),
+        1
+    );
+    let state = target.state.lock().unwrap();
+    assert_eq!(state.active_manifest.as_deref(), Some(manifest_id.as_str()));
+    assert_eq!(state.activation_count, 1);
+    assert_eq!(state.abort_count, 1);
+}
+
+#[test]
+fn preserves_asset_inlay_and_cold_metadata_in_the_validated_bounded_stage() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let mut source = fixture_source(source_root.path(), &[96 * 1024]);
+    source.objects[1].metadata = json!({
+        "mime": "image/png",
+        "nested": { "width": 4096, "flags": [true, false, null] }
+    });
+    let inlay = source_root.path().join("inlay.webp");
+    let cold = source_root.path().join("cold.bin");
+    write_pattern_file(&inlay, 80 * 1024, 51);
+    write_pattern_file(&cold, 72 * 1024, 73);
+    source.objects.push(PinnedSourceObject::payload(
+        CloneObjectKind::Inlay,
+        "inlays/original.webp",
+        json!({ "mime": "image/webp", "animated": false, "quality": 91 }),
+        inlay,
+    ));
+    source.objects.push(PinnedSourceObject::payload(
+        CloneObjectKind::Cold,
+        "cold/plugin-state",
+        json!({ "owner": "plugin:test", "version": 7, "tags": ["a", "b"] }),
+        cold,
+    ));
+    let session = prepare(&source, session_root.path());
+    let host = LoopbackCloneHost::start(session).unwrap();
+    let mut client = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
+    client.download(&TransferCancellation::new()).unwrap();
+    let mut target = FixtureTarget {
+        active_manifest: "old".to_owned(),
+        ..FixtureTarget::default()
+    };
+    let validated = Arc::new(AtomicBool::new(false));
+    let validated_view = Arc::clone(&validated);
+    let mut validator = move |manifest: &CloneManifest, stage: &FixtureStage| {
+        assert_eq!(stage.maximum_buffer_bytes, 32 * 1024);
+        assert_eq!(stage.staged.len(), 4);
+        for payload in &manifest.payloads {
+            let staged = stage
+                .staged
+                .iter()
+                .find(|staged| {
+                    staged.kind == payload.kind && staged.logical_key == payload.logical_key
+                })
+                .unwrap();
+            assert_eq!(staged.metadata, payload.metadata);
+            assert_eq!(staged.sha256, payload.object);
+        }
+        let database = stage.staged.last().unwrap();
+        assert_eq!(database.kind, CloneObjectKind::Database);
+        assert_eq!(database.metadata, Value::Null);
+        validated_view.store(true, Ordering::SeqCst);
+        Ok(())
+    };
+
+    activate_downloaded_clone(&mut client, &mut target, &mut validator).unwrap();
+    assert!(validated.load(Ordering::SeqCst));
 }
 
 #[test]

@@ -11,7 +11,7 @@ mod tunnel;
 mod tests;
 
 pub use client::{
-    activate_downloaded_clone, CloneTargetAdapter, CloneValidator, DownloadReport,
+    activate_downloaded_clone, CloneActivation, CloneTargetAdapter, CloneValidator, DownloadReport,
     LoopbackCloneClient, TransferCancellation,
 };
 pub use host::LoopbackCloneHost;
@@ -26,9 +26,21 @@ pub use session::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerSyncError {
     Cancelled,
-    ChunkHashMismatch { object: String, offset: u64 },
-    WholeObjectHashMismatch { object: String },
-    StaleManifest { expected: String, received: String },
+    ChunkHashMismatch {
+        object: String,
+        offset: u64,
+    },
+    WholeObjectHashMismatch {
+        object: String,
+    },
+    StaleManifest {
+        expected: String,
+        received: String,
+    },
+    ActivationConflict {
+        expected: Option<String>,
+        actual: Option<String>,
+    },
     AlreadyActivated,
     Protocol(String),
     Storage(String),
