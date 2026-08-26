@@ -1,6 +1,7 @@
 import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
     AssetAlias,
+    AssetAliasIdentity,
     AssetOwnerHead,
     AssetOwnerLocator,
     CharacterDetail,
@@ -28,12 +29,13 @@ import {
     RevisionConflictError,
     SnapshotReleasedError,
     validateAssetAlias,
+    validateAssetAliasIdentity,
     assetOwnerLocatorKey,
     validateConversationWindowQuery,
     validateAssetOwnerHead,
 } from './persistentDataStore'
 
-const DATABASE_VERSION = 9
+const DATABASE_VERSION = 10
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
@@ -362,6 +364,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 this.migrateRootRows(transaction)
                 this.backfillPluginStorageMetadata(transaction)
             }
+            if (event.oldVersion >= 8 && event.oldVersion < 10) {
+                this.migrateAssetAliasKeys(transaction)
+            }
         }
         this.database = await requestResult(request)
         this.database.onversionchange = () => {
@@ -465,10 +470,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.readPluginStorageFromTransaction(transaction, revision, generation, key)
     }
 
-    async readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null> {
+    async readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null> {
+        validateAssetAliasIdentity(identity)
         const transaction = this.requireDatabase().transaction(['meta', 'assetAliases'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
-        return this.readAssetAliasFromTransaction(transaction, revision, generation, key)
+        return this.readAssetAliasFromTransaction(transaction, revision, generation, identity)
     }
 
     async readAssetOwnerHead(
@@ -500,7 +506,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 revision,
             )
             transaction.objectStore('assetAliases').put({
-                key: this.assetAliasKey(generation, alias.key),
+                key: this.assetAliasKey(generation, alias.kind, alias.key),
                 generation,
                 value: structuredClone(alias),
             } satisfies StoredRecord<AssetAlias>)
@@ -872,8 +878,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     key,
                 )
             },
-            readAssetAlias: async (key) => {
+            readAssetAlias: async (identity) => {
                 assertActive()
+                validateAssetAliasIdentity(identity)
                 const transaction = this.requireDatabase().transaction(
                     ['meta', 'assetAliases'],
                     'readonly',
@@ -883,7 +890,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     transaction,
                     revision,
                     generation,
-                    key,
+                    identity,
                 )
             },
             readAssetOwnerHead: async (owner) => {
@@ -948,17 +955,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         transaction: IDBTransaction,
         revision: DataRevision,
         generation: string,
-        key: string,
+        identity: AssetAliasIdentity,
     ): Promise<Versioned<AssetAlias> | null> {
         const record = (await requestResult(
-            transaction.objectStore('assetAliases').get(this.assetAliasKey(generation, key)),
+            transaction.objectStore('assetAliases').get(
+                this.assetAliasKey(generation, identity.kind, identity.key),
+            ),
         )) as StoredRecord<AssetAlias> | undefined
         await transactionDone(transaction)
         if (!record) return null
         if (record.generation !== generation) {
             throw new TypeError('Asset alias stored generation does not match its lookup key')
         }
-        if (record.value.key !== key) {
+        if (record.value.kind !== identity.kind) {
+            throw new TypeError('Asset alias stored kind does not match its lookup key')
+        }
+        if (record.value.key !== identity.key) {
             throw new TypeError('Asset alias stored logical key does not match its lookup key')
         }
         validateAssetAlias(record.value)
@@ -1339,7 +1351,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         this.writePluginStorageRows(transaction, generation, pluginCustomStorage ?? {})
         for (const alias of assetAliases) {
             transaction.objectStore('assetAliases').put({
-                key: this.assetAliasKey(generation, alias.key),
+                key: this.assetAliasKey(generation, alias.kind, alias.key),
                 generation,
                 value: structuredClone(alias),
             } satisfies StoredRecord<AssetAlias>)
@@ -2266,6 +2278,27 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         if (!store.indexNames.contains(name)) store.createIndex(name, keyPath)
     }
 
+    private migrateAssetAliasKeys(transaction: IDBTransaction): void {
+        const aliases = transaction.objectStore('assetAliases')
+        const request = aliases.openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) return
+            const record = cursor.value as StoredRecord<AssetAlias>
+            validateAssetAlias(record.value)
+            const key = this.assetAliasKey(
+                record.generation,
+                record.value.kind,
+                record.value.key,
+            )
+            if (record.key !== key) {
+                cursor.delete()
+                aliases.put({ ...record, key })
+            }
+            cursor.continue()
+        }
+    }
+
     private backfillOrderKeys<T>(
         store: IDBObjectStore,
         summaryFrom: (record: StoredRecord<T>) => { configuredIndex: number; recentAt: number },
@@ -2415,8 +2448,8 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return `${generation}:plugin-storage:${key}`
     }
 
-    private assetAliasKey(generation: string, key: string): string {
-        return `${generation}:asset-alias:${key}`
+    private assetAliasKey(generation: string, kind: AssetAlias['kind'], key: string): string {
+        return `${generation}:asset-alias:${kind}:${key}`
     }
 
     private assetOwnerHeadKey(generation: string, ownerKey: string): string {

@@ -5,6 +5,7 @@ import { createImmutablePayloadCas, type ImmutablePayloadCas } from './payloadCa
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import type {
     AssetAlias,
+    AssetAliasIdentity,
     PersistentDataStore,
     PersistentRevisionReader,
 } from './persistentDataStore'
@@ -232,8 +233,8 @@ describe('AssetRepository BlobStore facade', () => {
             aliases: Record<string, AssetAlias>,
         ) => ({
             revision,
-            readAssetAlias: vi.fn(async (logicalKey: string) => {
-                const value = aliases[logicalKey]
+            readAssetAlias: vi.fn(async ({ key }: AssetAliasIdentity) => {
+                const value = aliases[key]
                 return value ? { revision, value: structuredClone(value) } : null
             }),
         }) as unknown as PersistentRevisionReader
@@ -318,7 +319,7 @@ describe('AssetRepository BlobStore facade', () => {
         }
         aliases[corruptKey] = { ...aliases[corruptKey], size: 1 }
         const reader = {
-            readAssetAlias: vi.fn(async (key: string) => {
+            readAssetAlias: vi.fn(async ({ key }: AssetAliasIdentity) => {
                 const value = aliases[key]
                 return value ? { revision: 4, value } : null
             }),

@@ -24,6 +24,11 @@ export interface PluginStorageCatalog {
 export type AssetAliasKind = 'asset' | 'inlay'
 export type AssetAliasInlayType = 'image' | 'video' | 'audio' | 'signature'
 
+export interface AssetAliasIdentity {
+    kind: AssetAliasKind
+    key: string
+}
+
 interface AssetAliasBase {
     key: string
     objectHash: string | null
@@ -157,6 +162,15 @@ export function validateAssetAlias(alias: AssetAlias): void {
         ) {
             throw new TypeError(`Asset alias ${field} must be a nonnegative safe integer`)
         }
+    }
+}
+
+export function validateAssetAliasIdentity(identity: AssetAliasIdentity): void {
+    if (identity.kind !== 'asset' && identity.kind !== 'inlay') {
+        throw new TypeError('Asset alias identity kind must be asset or inlay')
+    }
+    if (typeof identity.key !== 'string') {
+        throw new TypeError('Asset alias identity key must be a string')
     }
 }
 
@@ -338,7 +352,7 @@ export interface PersistentRevisionReader {
     ): Promise<Versioned<ConversationWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
-    readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null>
+    readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
 }
 
@@ -360,7 +374,7 @@ export interface PersistentDataStore {
     ): Promise<Versioned<ConversationWindow> | null>
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
-    readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null>
+    readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
     commitAssetAlias(alias: AssetAlias, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>

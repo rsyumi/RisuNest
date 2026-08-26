@@ -297,25 +297,80 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             const replacement = {
                 key: original.key,
                 objectHash: '22'.repeat(32),
-                kind: 'inlay' as const,
+                kind: 'asset' as const,
                 size: 7,
-                mime: 'image/webp',
+                mime: 'application/octet-stream',
                 name: 'Shared Replacement',
-                ext: 'WebP',
-                inlayType: 'image' as const,
-                width: 320,
-                height: 180,
+                ext: 'BIN',
             }
 
             const second = await store.commitAssetAlias(replacement, first.revision)
 
-            expect(await store.readAssetAlias(original.key)).toEqual({
+            expect(await store.readAssetAlias({ kind: original.kind, key: original.key })).toEqual({
                 revision: second.revision,
                 value: replacement,
             })
-            expect(await lease.readAssetAlias(original.key)).toEqual({
+            expect(await lease.readAssetAlias({ kind: original.kind, key: original.key })).toEqual({
                 revision: first.revision,
                 value: original,
+            })
+            await lease.release()
+        })
+
+        it('keeps asset and inlay aliases with the same logical key independent', async () => {
+            const { store } = await createHarness()
+            const sharedKey = 'shared/same-key.bin'
+            const asset = {
+                key: sharedKey,
+                objectHash: '31'.repeat(32),
+                kind: 'asset' as const,
+                size: 3,
+                mime: 'application/octet-stream',
+                name: 'Shared asset',
+                ext: 'bin',
+            }
+            const inlay = {
+                key: sharedKey,
+                objectHash: '41'.repeat(32),
+                kind: 'inlay' as const,
+                size: 4,
+                mime: 'image/webp',
+                name: 'Shared inlay',
+                ext: 'webp',
+                inlayType: 'image' as const,
+                width: 16,
+                height: 9,
+            }
+            const imported = await store.replaceFromDatabase(
+                structuredClone(fixtureDatabase),
+                undefined,
+                [asset, inlay],
+            )
+            const lease = await store.acquireRevision(imported.revision)
+            const updatedAsset = {
+                ...asset,
+                objectHash: '51'.repeat(32),
+                size: 5,
+                name: 'Updated shared asset',
+            }
+
+            const committed = await store.commitAssetAlias(updatedAsset, imported.revision)
+
+            expect(await store.readAssetAlias({ kind: 'asset', key: sharedKey })).toEqual({
+                revision: committed.revision,
+                value: updatedAsset,
+            })
+            expect(await store.readAssetAlias({ kind: 'inlay', key: sharedKey })).toEqual({
+                revision: committed.revision,
+                value: inlay,
+            })
+            expect(await lease.readAssetAlias({ kind: 'asset', key: sharedKey })).toEqual({
+                revision: imported.revision,
+                value: asset,
+            })
+            expect(await lease.readAssetAlias({ kind: 'inlay', key: sharedKey })).toEqual({
+                revision: imported.revision,
+                value: inlay,
             })
             await lease.release()
         })
@@ -358,16 +413,25 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             )
             const reopened = await reopen()
 
-            expect(await reopened.readAssetAlias('assets/not-present.bin')).toBeNull()
-            expect(await reopened.readAssetAlias(zeroByte.key)).toEqual({
+            expect(await reopened.readAssetAlias({
+                kind: 'asset',
+                key: 'assets/not-present.bin',
+            })).toBeNull()
+            expect(await reopened.readAssetAlias({ kind: zeroByte.kind, key: zeroByte.key })).toEqual({
                 revision: replaced.revision,
                 value: zeroByte,
             })
-            expect(await reopened.readAssetAlias(missingPayload.key)).toEqual({
+            expect(await reopened.readAssetAlias({
+                kind: missingPayload.kind,
+                key: missingPayload.key,
+            })).toEqual({
                 revision: replaced.revision,
                 value: missingPayload,
             })
-            expect(await reopened.readAssetAlias(duplicateBytesAlias.key)).toEqual({
+            expect(await reopened.readAssetAlias({
+                kind: duplicateBytesAlias.kind,
+                key: duplicateBytesAlias.key,
+            })).toEqual({
                 revision: replaced.revision,
                 value: duplicateBytesAlias,
             })
@@ -398,8 +462,8 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             )).rejects.toThrow('objectHash')
 
             expect((await store.readRoot()).revision).toBe(imported.revision)
-            expect(await store.readAssetAlias(valid.key)).toBeNull()
-            expect(await store.readAssetAlias(invalid.key)).toBeNull()
+            expect(await store.readAssetAlias({ kind: valid.kind, key: valid.key })).toBeNull()
+            expect(await store.readAssetAlias({ kind: invalid.kind, key: invalid.key })).toBeNull()
         })
 
         it('rejects aliases whose metadata does not match their kind', async () => {
@@ -432,7 +496,7 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             )).rejects.toThrow('Inlay metadata')
 
             expect((await store.readRoot()).revision).toBe(imported.revision)
-            expect(await store.readAssetAlias(base.key)).toBeNull()
+            expect(await store.readAssetAlias({ kind: 'asset', key: base.key })).toBeNull()
         })
 
         it('stores plugin values outside root and materializes the legacy object losslessly', async () => {

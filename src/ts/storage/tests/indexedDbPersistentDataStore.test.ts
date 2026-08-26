@@ -342,6 +342,39 @@ async function createVersion8Database(
     database.close()
 }
 
+async function createVersion9AliasDatabase(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    await createVersion8Database(indexedDB, databaseName)
+    const openRequest = indexedDB.open(databaseName, 9)
+    openRequest.onupgradeneeded = () => {
+        const heads = openRequest.result.createObjectStore('assetOwnerHeads', { keyPath: 'key' })
+        heads.createIndex('byGeneration', 'generation')
+    }
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        openRequest.onsuccess = () => resolve(openRequest.result)
+        openRequest.onerror = () => reject(openRequest.error)
+    })
+    const transaction = database.transaction(['meta', 'assetAliases'], 'readwrite')
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 9 })
+    transaction.objectStore('assetAliases').put({
+        key: 'revision-5:asset-alias:shared/migrated.bin',
+        generation: 'revision-5',
+        value: {
+            key: 'shared/migrated.bin',
+            objectHash: '61'.repeat(32),
+            kind: 'asset',
+            size: 6,
+            mime: 'application/octet-stream',
+            name: 'Migrated asset',
+            ext: 'bin',
+        },
+    })
+    await completeTransaction(transaction)
+    database.close()
+}
+
 persistentDataStoreContract(async () => {
     const indexedDB = new IDBFactory()
     const databaseName = `persistent-store-contract-${databaseSequence++}`
@@ -526,7 +559,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(9)
+        expect(database.version).toBe(10)
         const transaction = database.transaction(['assetAliases', 'assetOwnerHeads'], 'readonly')
         const aliases = transaction.objectStore('assetAliases')
         expect(aliases.indexNames.contains('byGeneration')).toBe(true)
@@ -546,7 +579,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         database.close()
     })
 
-    it('upgrades version 8 by creating only the empty owner-head store and index', async () => {
+    it('upgrades version 8 with an owner-head store and kind-aware alias migration', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `version-8-owner-head-schema-${databaseSequence++}`
         await createVersion8Database(indexedDB, databaseName)
@@ -556,8 +589,8 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 this: IDBObjectStore,
                 ...args: Parameters<IDBObjectStore['openCursor']>
             ) {
-                if (this.name !== 'meta') {
-                    throw new Error('version 8 owner-head schema upgrade must not scan records')
+                if (this.name !== 'meta' && this.name !== 'assetAliases') {
+                    throw new Error('version 8 upgrade must scan only aliases that need new keys')
                 }
                 return originalOpenCursor.apply(this, args)
             })
@@ -570,7 +603,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(9)
+        expect(database.version).toBe(10)
         const transaction = database.transaction('assetOwnerHeads', 'readonly')
         const heads = transaction.objectStore('assetOwnerHeads')
         expect(heads.indexNames.contains('byGeneration')).toBe(true)
@@ -581,6 +614,43 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         })).resolves.toBe(0)
         await completeTransaction(transaction)
         database.close()
+    })
+
+    it('migrates version 9 aliases to kind-aware keys without losing same-key siblings', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-9-kind-aware-alias-${databaseSequence++}`
+        await createVersion9AliasDatabase(indexedDB, databaseName)
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const key = 'shared/migrated.bin'
+        const inlay = {
+            key,
+            objectHash: '71'.repeat(32),
+            kind: 'inlay' as const,
+            size: 7,
+            mime: 'image/webp',
+            name: 'Sibling inlay',
+            ext: 'webp',
+            inlayType: 'image' as const,
+        }
+
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'assetAliases',
+            'revision-5:asset-alias:shared/migrated.bin',
+        )).toBeUndefined()
+        expect((await store.readAssetAlias({ kind: 'asset', key }))?.value)
+            .toMatchObject({ kind: 'asset', key, name: 'Migrated asset' })
+
+        const committed = await store.commitAssetAlias(inlay, 5)
+
+        expect((await store.readAssetAlias({ kind: 'asset', key }))?.value)
+            .toMatchObject({ kind: 'asset', key, name: 'Migrated asset' })
+        expect(await store.readAssetAlias({ kind: 'inlay', key })).toEqual({
+            revision: committed.revision,
+            value: inlay,
+        })
     })
 
     it('boots the plugin catalog without scanning large plugin payload rows', async () => {
@@ -667,7 +737,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
         await store.open()
         const generation = 'staging-abandoned-alias'
-        const aliasKey = `${generation}:asset-alias:assets/abandoned.bin`
+        const aliasKey = `${generation}:asset-alias:asset:assets/abandoned.bin`
         await writeRawRecords(indexedDB, databaseName, 'root', [{
             key: generation,
             generation,
@@ -699,7 +769,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
         await store.open()
         await writeRawRecords(indexedDB, databaseName, 'assetAliases', [{
-            key: 'revision-0:asset-alias:assets/corrupt.bin',
+            key: 'revision-0:asset-alias:asset:assets/corrupt.bin',
             generation: 'revision-0',
             value: {
                 key: 'assets/corrupt.bin',
@@ -712,7 +782,10 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             },
         }])
 
-        await expect(store.readAssetAlias('assets/corrupt.bin')).rejects.toThrow('objectHash')
+        await expect(store.readAssetAlias({
+            kind: 'asset',
+            key: 'assets/corrupt.bin',
+        })).rejects.toThrow('objectHash')
     })
 
     it('fails closed when a persisted alias row identity does not match its lookup key', async () => {
@@ -721,7 +794,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
         await store.open()
         const requestedKey = 'assets/requested.bin'
-        const recordKey = `revision-0:asset-alias:${requestedKey}`
+        const recordKey = `revision-0:asset-alias:asset:${requestedKey}`
         const value = {
             key: requestedKey,
             objectHash: '88'.repeat(32),
@@ -737,14 +810,16 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             value,
         }])
 
-        await expect(store.readAssetAlias(requestedKey)).rejects.toThrow('generation')
+        await expect(store.readAssetAlias({ kind: 'asset', key: requestedKey }))
+            .rejects.toThrow('generation')
 
         await writeRawRecords(indexedDB, databaseName, 'assetAliases', [{
             key: recordKey,
             generation: 'revision-0',
             value: { ...value, key: 'assets/other.bin' },
         }])
-        await expect(store.readAssetAlias(requestedKey)).rejects.toThrow('logical key')
+        await expect(store.readAssetAlias({ kind: 'asset', key: requestedKey }))
+            .rejects.toThrow('logical key')
     })
 
     it('acquires a revision by reference without copying persistent records', async () => {

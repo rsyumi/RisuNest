@@ -67,7 +67,7 @@ describe('SqlitePersistentDataStore', () => {
         await store.readConversationWindow(windowQuery)
         await store.queryPluginStorage()
         await store.readPluginStorage('memory')
-        await store.readAssetAlias(alias.key)
+        await store.readAssetAlias({ kind: alias.kind, key: alias.key })
         await store.readAssetOwnerHead(owner)
         await store.commitAssetAlias(alias, 8)
         await store.commit(commit)
@@ -93,6 +93,26 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_commit_asset_alias', { alias, expectedRevision: 8 }],
             ['pds_commit', { commit }],
             ['pds_materialize', { revision: 9 }],
+        ])
+    })
+
+    it('forwards asset alias kind for current and leased reads', async () => {
+        mocks.invoke.mockResolvedValueOnce({ lease: 'lease-alias-kind' }).mockResolvedValue(null)
+        const store = new SqlitePersistentDataStore()
+        const lease = await store.acquireRevision(9)
+        const key = 'shared/same-key.bin'
+
+        await store.readAssetAlias({ kind: 'asset', key })
+        await store.readAssetAlias({ kind: 'inlay', key })
+        await lease.readAssetAlias({ kind: 'asset', key })
+        await lease.readAssetAlias({ kind: 'inlay', key })
+
+        expect(mocks.invoke.mock.calls).toEqual([
+            ['pds_acquire_revision', { revision: 9 }],
+            ['pds_read_asset_alias', { kind: 'asset', key }],
+            ['pds_read_asset_alias', { kind: 'inlay', key }],
+            ['pds_read_asset_alias', { kind: 'asset', key, lease: 'lease-alias-kind' }],
+            ['pds_read_asset_alias', { kind: 'inlay', key, lease: 'lease-alias-kind' }],
         ])
     })
 
@@ -278,7 +298,7 @@ describe('SqlitePersistentDataStore', () => {
         })
         await lease.queryPluginStorage()
         await lease.readPluginStorage('memory')
-        await lease.readAssetAlias('assets/pinned.bin')
+        await lease.readAssetAlias({ kind: 'asset', key: 'assets/pinned.bin' })
         await lease.readAssetOwnerHead({ kind: 'root-module-assets', index: 0 })
         await lease.release()
         await lease.release()

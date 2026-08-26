@@ -79,7 +79,7 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
     return {
         async read(key, range) {
             if (range) validateBlobReadRange(range)
-            const versioned = await reader.readAssetAlias(key)
+            const versioned = await reader.readAssetAlias({ kind: 'asset', key })
             if (!versioned) return null
             const alias = versioned.value
             validateAssetAlias(alias)
@@ -119,7 +119,7 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
             }
         },
         async stat(key) {
-            const versioned = await reader.readAssetAlias(key)
+            const versioned = await reader.readAssetAlias({ kind: 'asset', key })
             if (!versioned) return null
             const alias = versioned.value
             validateAssetAlias(alias)
