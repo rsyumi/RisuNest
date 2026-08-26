@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+    NativeFileJobActivationCommittedError,
     runNativeBlockRisuSaveRestore,
     type NativeFileJobStatus,
 } from './nativeFileJobs'
@@ -56,7 +57,9 @@ describe('native file jobs', () => {
                 isTauri: () => true,
                 invoke: async (command, args) => {
                     calls.push([command, args])
-                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_start') {
+                        return { jobId: 'job-1', warningCodes: ['cleanup-failed'] }
+                    }
                     if (command === 'native_file_job_status') return statuses.shift()
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
@@ -66,6 +69,7 @@ describe('native file jobs', () => {
         )
 
         expect(result.revision).toBe(4)
+        expect(result.warningCodes).toEqual(['cleanup-failed'])
         expect(refreshed).toEqual([4])
         expect(calls).toEqual([
             ['flush:native-block-risu-save-restore', undefined],
@@ -125,5 +129,127 @@ describe('native file jobs', () => {
             'native_file_job_status',
             'native_file_job_forget',
         ])
+    })
+
+    it('does not start a native job when cancellation arrives during the flush', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+
+        await expect(runNativeBlockRisuSaveRestore(
+            {
+                revision: 2,
+                flushPendingData: async () => controller.abort(),
+                refreshActiveWorkingSet: async () => undefined,
+            },
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({ name: 'AbortError' })
+        expect(commands).toEqual([])
+    })
+
+    it('forgets a committed job and exposes recovery state when refreshing fails', async () => {
+        const commands: string[] = []
+        const committed = {
+            revision: 9,
+            sourceBytes: 128,
+            sourceSha256: 'b'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+        }
+
+        const promise = runNativeBlockRisuSaveRestore(
+            {
+                revision: 8,
+                flushPendingData: async () => undefined,
+                refreshActiveWorkingSet: async () => {
+                    throw new Error('refresh unavailable')
+                },
+            },
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            undefined,
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') return status('succeeded', committed)
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        await expect(promise).rejects.toEqual(expect.objectContaining({
+            name: 'NativeFileJobActivationCommittedError',
+            code: 'activation-committed-refresh-failed',
+            committedRevision: 9,
+            recoveryRequired: true,
+        } satisfies Partial<NativeFileJobActivationCommittedError>))
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+    })
+
+    it('acknowledges terminal failure even when translating it to an exception', async () => {
+        const commands: string[] = []
+        const failed = status('failed')
+        failed.error = { code: 'corrupt-input', message: 'invalid gzip data' }
+
+        await expect(runNativeBlockRisuSaveRestore(
+            {
+                revision: 3,
+                flushPendingData: async () => undefined,
+                refreshActiveWorkingSet: async () => undefined,
+            },
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            undefined,
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') return failed
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({ code: 'corrupt-input' })
+        expect(commands.at(-1)).toBe('native_file_job_forget')
+    })
+
+    it('preserves structured native command errors at the facade boundary', async () => {
+        await expect(runNativeBlockRisuSaveRestore(
+            {
+                revision: 1,
+                flushPendingData: async () => undefined,
+                refreshActiveWorkingSet: async () => undefined,
+            },
+            { type: 'desktopPath', path: 'C:\\missing\\backup.risudat' },
+            undefined,
+            {
+                isTauri: () => true,
+                invoke: async () => {
+                    throw { code: 'invalid-source', message: 'desktop source is unavailable' }
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({
+            name: 'NativeFileJobError',
+            code: 'invalid-source',
+            message: 'desktop source is unavailable',
+        })
     })
 })
