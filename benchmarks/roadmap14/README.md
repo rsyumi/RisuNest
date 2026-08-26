@@ -87,6 +87,10 @@ its little-endian 64-bit byte length, in traversal order. It is not the input
 fixture hash. Raw artifact hashes are calculated from the files and cannot be
 overridden.
 
+The `export-materialize-and-traversal-total` latency series maps to Rust
+`exportTotalUs`. The framed traversal digest and fragment byte count describe
+the traversal portion of that measured total.
+
 The other three descriptors are ready for their workstream-specific release
 measurement adapters. They must use the same result schema. No Windows result is
 included in this directory unless the release measurement actually ran.

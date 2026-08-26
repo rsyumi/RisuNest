@@ -540,7 +540,7 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
     assert.deepEqual(result.latency.samples, [
         { name: 'staged-replace-import', valuesMs: [2, 2.5] },
         { name: 'append-commit', valuesMs: [1, 1.5] },
-        { name: 'export-traversal', valuesMs: [3, 3.5] },
+        { name: 'export-materialize-and-traversal-total', valuesMs: [3, 3.5] },
         { name: 'snapshot-create', valuesMs: [4, 4.5] },
     ])
     assert.deepEqual(result.memory.heapUsedBytes, [10, 30])

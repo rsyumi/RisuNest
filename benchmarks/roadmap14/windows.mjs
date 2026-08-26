@@ -121,7 +121,7 @@ export function convertExistingWindowsMeasurements({
                     valuesMs: phase3.samples.map((sample) => sample.appendCommitUs / 1000),
                 },
                 {
-                    name: 'export-traversal',
+                    name: 'export-materialize-and-traversal-total',
                     valuesMs: phase3.samples.map((sample) => sample.exportTotalUs / 1000),
                 },
                 {
@@ -146,7 +146,7 @@ export function convertExistingWindowsMeasurements({
             measurements: [
                 'persistent-store-staged-replace-import',
                 'persistent-store-append-commit',
-                'persistent-store-framed-export-traversal',
+                'persistent-store-export-materialize-and-framed-traversal-total',
                 'persistent-store-snapshot-create',
                 'tauri-save-large-staged-import-memory',
                 'tauri-post-stage-shell-ui',
