@@ -674,6 +674,65 @@ describe('ActiveConversationSession', () => {
         expect(session.version).toBe(0)
     })
 
+    it('rejects observer reentry during append and rolls the outer append back', () => {
+        const conversation = chat()
+        const originalArray = conversation.message
+        const original = structuredClone(originalArray)
+        let session!: ActiveConversationSession
+        let reenter = true
+        session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            onMutation: () => {
+                if (!reenter) return
+                reenter = false
+                session.edit(session.locate(0), message('duplicate', 'observer edit'))
+            },
+        })
+
+        expect(() => session.append(message('append', 'outer append'))).toThrow(
+            /Nested conversation session transactions/,
+        )
+        expect(conversation.message).toBe(originalArray)
+        expect(conversation.message).toEqual(original)
+        expect(session.version).toBe(0)
+
+        const appended = session.append(message('append', 'after rollback'))
+        expect(session.readMessage(appended).data).toBe('after rollback')
+    })
+
+    it('rejects observer reentry during edit and rolls the outer edit back', () => {
+        const conversation = chat()
+        const originalArray = conversation.message
+        const original = structuredClone(originalArray)
+        let session!: ActiveConversationSession
+        let reenter = true
+        session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            onMutation: () => {
+                if (!reenter) return
+                reenter = false
+                session.append(message('observer', 'observer append'))
+            },
+        })
+
+        expect(() => session.edit(
+            session.locate(0),
+            message('duplicate', 'outer edit'),
+        )).toThrow(/Nested conversation session transactions/)
+        expect(conversation.message).toBe(originalArray)
+        expect(conversation.message).toEqual(original)
+        expect(session.version).toBe(0)
+
+        const edited = session.edit(session.locate(0), message('duplicate', 'after rollback'))
+        expect(session.readMessage(edited).data).toBe('after rollback')
+    })
+
     it('requires an awaited consumer to reacquire the same active session', () => {
         const expected = createSession().session
         const replacement = createSession().session
