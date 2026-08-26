@@ -8,9 +8,10 @@ use futures::future::{select, Either};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Client, Response, Url};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::future::Future;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -240,13 +241,14 @@ async fn upload_attempt(
         Some(session) if !session.is_empty() => Some(session),
         _ => Some(acquire_session(client, base_url, credential, Arc::clone(&job)).await?),
     };
-    let (file, bytes) = payload.open().map_err(store_error)?;
+    let (mut file, bytes) = payload.open().map_err(store_error)?;
     if bytes != payload.bytes {
         return Err(NativeJobError::new(
             "invalid-source",
             "official publication payload length changed",
         ));
     }
+    verify_and_rewind_payload(&mut file, &payload.sha256, &job)?;
     let activity = Arc::new(AtomicU64::new(0));
     let file = tokio::fs::File::from_std(file);
     let body = reqwest::Body::wrap_stream(ReaderStream::new(PublicationPayloadReader {
@@ -318,6 +320,45 @@ async fn upload_attempt(
         session,
         save_date,
     )
+}
+
+fn verify_and_rewind_payload(
+    file: &mut std::fs::File,
+    expected_sha256: &str,
+    job: &JobControl,
+) -> Result<(), NativeJobError> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    loop {
+        if job.is_cancel_requested() {
+            return Err(cancelled(
+                "official publication payload verification was cancelled",
+            ));
+        }
+        let read = file.read(&mut buffer).map_err(|_| {
+            NativeJobError::new(
+                "invalid-source",
+                "official publication payload could not be verified",
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hex::encode(hasher.finalize()) != expected_sha256 {
+        return Err(NativeJobError::new(
+            "invalid-source",
+            "official publication payload content changed",
+        ));
+    }
+    file.seek(SeekFrom::Start(0)).map_err(|_| {
+        NativeJobError::new(
+            "invalid-source",
+            "official publication payload could not be verified",
+        )
+    })?;
+    Ok(())
 }
 
 async fn acquire_session(
