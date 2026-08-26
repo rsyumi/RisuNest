@@ -202,6 +202,20 @@ describe('logical delta pull planner', () => {
         await expect(plan({ base, local, remote })).rejects.toThrow('generation ID')
     })
 
+    it.each(['local', 'remote'] as const)(
+        'rejects a common-base generation ID reused at a different sequence by %s',
+        async (side) => {
+            const records = [live(keys.root, hashes.base)]
+            const base = manifest('shared-generation', '1', records, 1)
+            const local = manifest('local-2', '2', records, 2)
+            const remote = manifest('remote-2', '2', records, 8)
+            if (side === 'local') local.generation = base.generation
+            else remote.generation = base.generation
+
+            await expect(plan({ base, local, remote })).rejects.toThrow('generation ID')
+        },
+    )
+
     it('transfers an absent zero-byte object instead of classifying it as a no-op', async () => {
         const base = manifest('generation-1', '1', [], 1)
         const local = manifest('local-2', '2', [], 2)

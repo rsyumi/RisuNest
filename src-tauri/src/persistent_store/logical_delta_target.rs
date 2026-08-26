@@ -207,8 +207,10 @@ pub(crate) fn establish_logical_common_base(
     validate_same_generation_identity(
         &local_manifest.manifest.generation,
         &local_manifest.manifest_hash,
+        &local_manifest.manifest.generation_sequence,
         &remote_manifest.generation,
         &remote_manifest_hash,
+        &remote_manifest.generation_sequence,
     )?;
 
     let existing: Option<PeerBase> = transaction
@@ -466,20 +468,26 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         validate_same_generation_identity(
             &base.generation,
             &plan.expected_base_manifest_hash,
+            &base.generation_sequence,
             &local.generation,
             &local_manifest_hash,
+            &local.generation_sequence,
         )?;
         validate_same_generation_identity(
             &base.generation,
             &plan.expected_base_manifest_hash,
+            &base.generation_sequence,
             &self.remote_manifest.generation,
             &self.remote_manifest_hash,
+            &self.remote_manifest.generation_sequence,
         )?;
         validate_same_generation_identity(
             &local.generation,
             &local_manifest_hash,
+            &local.generation_sequence,
             &self.remote_manifest.generation,
             &self.remote_manifest_hash,
+            &self.remote_manifest.generation_sequence,
         )?;
         if compare_generation_sequences(
             &self.remote_manifest.generation_sequence,
@@ -1447,6 +1455,20 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                         "logical delta complete index did not follow PDS activation",
                     );
                 }
+                let moved_head = transaction
+                    .execute(
+                        "UPDATE logical_library_head SET generation_id = ?3
+                         WHERE singleton = 1 AND library_id = ?1 AND generation_id = ?2",
+                        params![
+                            self.library_id,
+                            self.local_generation_id,
+                            logical_generation_id.as_str(),
+                        ],
+                    )
+                    .map_err(sql_error)?;
+                if moved_head != 1 {
+                    return validation("logical delta library head changed before PDS activation");
+                }
                 set_active(&transaction, next_revision, &active_generation)?;
                 update_common_base(
                     &transaction,
@@ -1501,11 +1523,17 @@ fn compare_generation_sequences(left: &str, right: &str) -> std::cmp::Ordering {
 fn validate_same_generation_identity(
     left_generation: &str,
     left_hash: &str,
+    left_sequence: &str,
     right_generation: &str,
     right_hash: &str,
+    right_sequence: &str,
 ) -> Result<(), PeerSyncError> {
-    if left_generation == right_generation && left_hash != right_hash {
-        return validation("logical generation ID is bound to different manifest hashes");
+    if left_generation == right_generation
+        && (left_hash != right_hash || left_sequence != right_sequence)
+    {
+        return validation(
+            "logical generation ID is bound to different manifest hashes or sequences",
+        );
     }
     Ok(())
 }
@@ -3046,7 +3074,9 @@ mod tests {
             LogicalDeltaActivation, LogicalDeltaApplyOperation, LogicalDeltaObject,
             LogicalDeltaObjectSource, ReadyLogicalDeltaPlan,
         },
-        persistent_store::{logical_index::LogicalIndexBuildRequest, snapshot, PersistentStore},
+        persistent_store::{
+            logical_index::LogicalIndexBuildRequest, snapshot, PersistentStore, WorkingSetCommit,
+        },
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -3275,6 +3305,16 @@ mod tests {
             derive_exact_three_way_plan(&base, &local, &remote),
             Err(PeerSyncError::Validation(_))
         ));
+
+        let mut local = base.clone();
+        local.generation = "local".to_owned();
+        local.generation_sequence = "2".to_owned();
+        local.records.clear();
+        let remote = base.clone();
+        assert!(matches!(
+            derive_exact_three_way_plan(&base, &local, &remote),
+            Err(PeerSyncError::Validation(_))
+        ));
     }
 
     #[test]
@@ -3325,16 +3365,36 @@ mod tests {
     }
 
     #[test]
-    fn generation_identity_rejects_the_same_id_with_a_different_hash() {
+    fn generation_identity_binds_the_same_id_to_hash_and_sequence() {
         assert!(matches!(
-            validate_same_generation_identity("shared", &"a".repeat(64), "shared", &"b".repeat(64)),
+            validate_same_generation_identity(
+                "shared",
+                &"a".repeat(64),
+                "1",
+                "shared",
+                &"b".repeat(64),
+                "1",
+            ),
+            Err(PeerSyncError::Validation(_))
+        ));
+        assert!(matches!(
+            validate_same_generation_identity(
+                "shared",
+                &"a".repeat(64),
+                "1",
+                "shared",
+                &"a".repeat(64),
+                "2",
+            ),
             Err(PeerSyncError::Validation(_))
         ));
         assert!(validate_same_generation_identity(
             "left",
             &"a".repeat(64),
+            "1",
             "right",
             &"b".repeat(64),
+            "2",
         )
         .is_ok());
     }
@@ -4763,6 +4823,24 @@ mod tests {
             activation,
             LogicalDeltaActivation::Activated { revision: 1 }
         );
+        let activated_logical_head = store
+            .connection
+            .query_row::<(String, String, i64, String), _, _>(
+                "SELECT generation.generation_id, generation.pds_generation,
+                        generation.source_revision, generation.state
+                 FROM logical_library_head AS head
+                 JOIN logical_sync_generations AS generation
+                   ON generation.library_id = head.library_id
+                  AND generation.generation_id = head.generation_id
+                 WHERE head.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_ne!(activated_logical_head.0, "local-0");
+        assert_eq!(activated_logical_head.1, "revision-1");
+        assert_eq!(activated_logical_head.2, 1);
+        assert_eq!(activated_logical_head.3, "complete");
         assert!(source.content_gets > 0);
         let root = store.read_root(None).unwrap().value;
         assert_eq!(root["theme"], "remote");
@@ -4963,6 +5041,44 @@ mod tests {
         drop(retry_target);
         assert_eq!(retry_source.content_gets, 0);
         assert!(!staging_root.exists() || staging_root.read_dir().unwrap().next().is_none());
+
+        let mut next_root = root.clone();
+        next_root["postActivationCommit"] = json!(true);
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root: Some(next_root),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .expect("ordinary commit follows logical target activation");
+        let next_manifest = store
+            .seal_active_logical_generation(&cas)
+            .expect("seal logical child after ordinary commit");
+        assert_eq!(next_manifest.manifest.source_revision, 2);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<(String, String), _, _>(
+                    "SELECT generation.generation_id, generation.pds_generation
+                     FROM logical_library_head AS head
+                     JOIN logical_sync_generations AS generation
+                       ON generation.library_id = head.library_id
+                      AND generation.generation_id = head.generation_id
+                     WHERE head.singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap(),
+            (next_manifest.manifest.generation, "revision-2".to_owned())
+        );
 
         store
             .connection

@@ -162,15 +162,24 @@ export async function planLogicalDeltaPull(input: {
     if (
         (
             local.generation === base.generation
-            && localManifestHash !== actualBaseManifestHash
+            && (
+                localManifestHash !== actualBaseManifestHash
+                || local.generationSequence !== base.generationSequence
+            )
         )
         || (
             remote.generation === base.generation
-            && remoteManifestHash !== actualBaseManifestHash
+            && (
+                remoteManifestHash !== actualBaseManifestHash
+                || remote.generationSequence !== base.generationSequence
+            )
         )
         || (
             remote.generation === local.generation
-            && remoteManifestHash !== localManifestHash
+            && (
+                remoteManifestHash !== localManifestHash
+                || remote.generationSequence !== local.generationSequence
+            )
         )
     ) {
         throw new TypeError('Logical delta generation ID reuses different content')
