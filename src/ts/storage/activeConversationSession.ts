@@ -83,9 +83,19 @@ export interface ActiveConversationBackwardScan {
 export interface ActiveConversationMutationEvent {
     characterId: string
     conversationId: string
+    sessionToken: ConversationSessionToken
     previousVersion: number
     sessionVersion: number
     commands: readonly ActiveConversationCommandName[]
+    mutations: readonly ActiveConversationMutationRange[]
+    conversation: ConversationMetadata
+}
+
+export interface ActiveConversationMutationRange {
+    start: number
+    deleteCount: number
+    messages: Message[]
+    sessionVersion: number
 }
 
 export type ActiveConversationCommandName =
@@ -291,6 +301,7 @@ interface CompletedConversationTransaction {
     bookmarkMetadataChanged: boolean
     version: number
     commands: readonly ActiveConversationCommandName[]
+    mutations: readonly ActiveConversationMutationRange[]
     locatorRegistry: ConversationLocatorRegistry
 }
 
@@ -600,6 +611,7 @@ export class ActiveConversationTransaction {
     private currentVersion: number
     private readonly locatorRegistry: ConversationLocatorRegistry
     private readonly commandNames: ActiveConversationCommandName[] = []
+    private readonly mutationRanges: ActiveConversationMutationRange[] = []
     private closed = false
 
     constructor(
@@ -671,8 +683,9 @@ export class ActiveConversationTransaction {
     append(message: Message): MessageLocator {
         this.assertOpen()
         const absoluteIndex = this.currentMessages.length
-        this.currentMessages = [...this.currentMessages, safeStructuredClone(message)]
-        this.record('append')
+        const replacement = safeStructuredClone(message)
+        this.currentMessages = [...this.currentMessages, replacement]
+        this.record('append', absoluteIndex, 0, [replacement])
         return this.locate(absoluteIndex)
     }
 
@@ -688,9 +701,10 @@ export class ActiveConversationTransaction {
             this.sourceLocatorRegistry,
         )
         const nextMessages = this.currentMessages.slice()
-        nextMessages[locator.absoluteIndex] = safeStructuredClone(message)
+        const replacement = safeStructuredClone(message)
+        nextMessages[locator.absoluteIndex] = replacement
         this.currentMessages = nextMessages
-        this.record('edit')
+        this.record('edit', locator.absoluteIndex, 1, [replacement])
         return this.locate(locator.absoluteIndex)
     }
 
@@ -716,13 +730,15 @@ export class ActiveConversationTransaction {
             throw new Error('A bookmark requires a message ID')
         }
 
+        let replacement: Message | undefined
         if (options.bookmarked) {
             if (message.chatId === undefined) {
                 const nextMessages = this.currentMessages.slice()
-                nextMessages[locator.absoluteIndex] = {
+                replacement = {
                     ...safeStructuredClone(message),
                     chatId: messageId,
                 }
+                nextMessages[locator.absoluteIndex] = replacement
                 this.currentMessages = nextMessages
             }
             this.currentBookmarks ??= []
@@ -740,7 +756,12 @@ export class ActiveConversationTransaction {
         }
 
         this.bookmarkMetadataChanged = true
-        this.record('bookmark')
+        this.record(
+            'bookmark',
+            replacement === undefined ? undefined : locator.absoluteIndex,
+            replacement === undefined ? undefined : 1,
+            replacement === undefined ? undefined : [replacement],
+        )
         return this.locate(locator.absoluteIndex)
     }
 
@@ -780,7 +801,7 @@ export class ActiveConversationTransaction {
             ...this.currentMessages.slice(0, locator.absoluteIndex),
             ...this.currentMessages.slice(locator.absoluteIndex + 1),
         ]
-        this.record('delete')
+        this.record('delete', locator.absoluteIndex, 1, [])
     }
 
     truncate(locator: MessageLocator): void {
@@ -794,8 +815,9 @@ export class ActiveConversationTransaction {
             this.sourceMessages,
             this.sourceLocatorRegistry,
         )
+        const deleteCount = this.currentMessages.length - locator.absoluteIndex
         this.currentMessages = this.currentMessages.slice(0, locator.absoluteIndex)
-        this.record('truncate')
+        this.record('truncate', locator.absoluteIndex, deleteCount, [])
     }
 
     replaceRange(
@@ -817,12 +839,13 @@ export class ActiveConversationTransaction {
         if (deleteCount > this.currentMessages.length - position.absoluteIndex) {
             throw new RangeError('Conversation replace-range exceeds the current message count')
         }
+        const replacement = safeStructuredClone(messages)
         this.currentMessages = [
             ...this.currentMessages.slice(0, position.absoluteIndex),
-            ...safeStructuredClone(messages),
+            ...replacement,
             ...this.currentMessages.slice(position.absoluteIndex + deleteCount),
         ]
-        this.record('replace-range')
+        this.record('replace-range', position.absoluteIndex, deleteCount, replacement)
     }
 
     replaceTail(position: ConversationPosition, messages: readonly Message[]): void {
@@ -884,6 +907,7 @@ export class ActiveConversationTransaction {
             bookmarkMetadataChanged: this.bookmarkMetadataChanged,
             version: this.currentVersion,
             commands: this.commandNames.slice(),
+            mutations: safeStructuredClone(this.mutationRanges),
             locatorRegistry: this.locatorRegistry,
         }
     }
@@ -906,17 +930,30 @@ export class ActiveConversationTransaction {
             this.sourceMessages,
             this.sourceLocatorRegistry,
         )
+        const deleteCount = this.currentMessages.length - position.absoluteIndex
+        const replacement = safeStructuredClone(messages)
         this.currentMessages = [
             ...this.currentMessages.slice(0, position.absoluteIndex),
-            ...safeStructuredClone(messages),
+            ...replacement,
         ]
-        this.record(command)
+        this.record(command, position.absoluteIndex, deleteCount, replacement)
     }
 
-    private record(command: ActiveConversationCommandName): void {
+    private record(
+        command: ActiveConversationCommandName,
+        start?: number,
+        deleteCount?: number,
+        messages?: readonly Message[],
+    ): void {
         this.currentVersion += 1
         this.locatorRegistry.clear()
         this.commandNames.push(command)
+        this.mutationRanges.push({
+            start: start ?? this.currentMessages.length,
+            deleteCount: deleteCount ?? 0,
+            messages: safeStructuredClone([...(messages ?? [])]),
+            sessionVersion: this.currentVersion,
+        })
     }
 
     private assertOpen(): void {
@@ -927,7 +964,6 @@ export class ActiveConversationTransaction {
 export class ActiveConversationSession {
     readonly characterId: string
     readonly conversationId: string
-    readonly storeRevision: DataRevision
     readonly evictionEnabled = false
 
     private readonly conversation: Chat
@@ -935,6 +971,8 @@ export class ActiveConversationSession {
     private readonly pins = new Map<ActiveConversationPinReason, number>()
     private locatorRegistry = new ConversationLocatorRegistry()
     private sessionVersion = 0
+    private persistedSessionVersion = 0
+    private currentStoreRevision: DataRevision
     private transactionActive = false
     private active = true
 
@@ -945,12 +983,20 @@ export class ActiveConversationSession {
         this.characterId = options.characterId
         this.conversationId = options.conversationId
         this.conversation = options.conversation
-        this.storeRevision = options.storeRevision
+        this.currentStoreRevision = options.storeRevision
         this.onMutation = options.onMutation
+    }
+
+    get storeRevision(): DataRevision {
+        return this.currentStoreRevision
     }
 
     get version(): number {
         return this.sessionVersion
+    }
+
+    get persistedVersion(): number {
+        return this.persistedSessionVersion
     }
 
     get isActive(): boolean {
@@ -1130,7 +1176,12 @@ export class ActiveConversationSession {
             this.sessionVersion += 1
             this.locatorRegistry = nextLocatorRegistry
             try {
-                this.notifyMutation(previousVersion, ['append'])
+                this.notifyMutation(previousVersion, ['append'], [{
+                    start: absoluteIndex,
+                    deleteCount: 0,
+                    messages: [previousMessages[absoluteIndex]],
+                    sessionVersion: this.sessionVersion,
+                }])
                 previousLocatorRegistry.clear()
             } catch (error) {
                 if (rollbackMessages) restoreMessageRollback(previousMessages, rollbackMessages)
@@ -1171,7 +1222,12 @@ export class ActiveConversationSession {
             this.sessionVersion += 1
             this.locatorRegistry = nextLocatorRegistry
             try {
-                this.notifyMutation(previousVersion, ['edit'])
+                this.notifyMutation(previousVersion, ['edit'], [{
+                    start: locator.absoluteIndex,
+                    deleteCount: 1,
+                    messages: [previousMessages[locator.absoluteIndex]],
+                    sessionVersion: this.sessionVersion,
+                }])
                 previousLocatorRegistry.clear()
             } catch (error) {
                 if (rollbackMessages) restoreMessageRollback(previousMessages, rollbackMessages)
@@ -1296,13 +1352,16 @@ export class ActiveConversationSession {
             this.sessionVersion = previousVersion + 1
             this.locatorRegistry = nextLocatorRegistry
             try {
-                this.onMutation?.({
-                    characterId: this.characterId,
-                    conversationId: this.conversationId,
+                this.notifyMutation(
                     previousVersion,
-                    sessionVersion: this.sessionVersion,
                     commands,
-                })
+                    [{
+                        start: commit.range?.position.absoluteIndex ?? nextMessages.length,
+                        deleteCount: commit.range?.deleteCount ?? 0,
+                        messages: safeStructuredClone([...(commit.range?.messages ?? [])]),
+                        sessionVersion: this.sessionVersion,
+                    }],
+                )
                 previousLocatorRegistry.clear()
             } catch (error) {
                 this.conversation.message = previousMessages
@@ -1384,13 +1443,12 @@ export class ActiveConversationSession {
             }
             this.sessionVersion = previousVersion + 1
             this.locatorRegistry = nextLocatorRegistry
-            this.onMutation?.({
-                characterId: this.characterId,
-                conversationId: this.conversationId,
-                previousVersion,
+            this.notifyMutation(previousVersion, ['replace-conversation'], [{
+                start: 0,
+                deleteCount: previousState.message.length,
+                messages: replacement.message,
                 sessionVersion: this.sessionVersion,
-                commands: ['replace-conversation'],
-            })
+            }])
             previousLocatorRegistry.clear()
             return this.conversation
         } catch (error) {
@@ -1448,13 +1506,11 @@ export class ActiveConversationSession {
                 this.sessionVersion = completed.version
                 this.locatorRegistry = completed.locatorRegistry
                 try {
-                    this.onMutation?.({
-                        characterId: this.characterId,
-                        conversationId: this.conversationId,
+                    this.notifyMutation(
                         previousVersion,
-                        sessionVersion: this.sessionVersion,
-                        commands: completed.commands,
-                    })
+                        completed.commands,
+                        completed.mutations,
+                    )
                     previousLocatorRegistry.clear()
                 } catch (error) {
                     if (rollbackMessages) {
@@ -1498,6 +1554,36 @@ export class ActiveConversationSession {
         return this.pins.get(reason) ?? 0
     }
 
+    ownsSessionToken(sessionToken: ConversationSessionToken): boolean {
+        return this.active && sessionToken === this.locatorRegistry.sessionToken
+    }
+
+    acknowledgePersisted(
+        sessionToken: ConversationSessionToken,
+        sessionVersion: number,
+        revision: DataRevision,
+    ): boolean {
+        this.assertActive()
+        if (sessionToken !== this.locatorRegistry.sessionToken) {
+            throw new MessageLocatorMismatchError('Conversation persistence belongs to another session')
+        }
+        validateIndex(sessionVersion, 'Conversation persisted session version')
+        validateIndex(revision, 'Conversation persisted data revision')
+        if (sessionVersion <= this.persistedSessionVersion) return false
+        if (sessionVersion > this.sessionVersion) {
+            throw new ConversationSessionStaleError(sessionVersion, this.sessionVersion)
+        }
+        if (
+            revision < this.currentStoreRevision ||
+            (revision === this.currentStoreRevision && this.persistedSessionVersion === 0)
+        ) {
+            throw new RangeError('Conversation persisted data revision did not advance')
+        }
+        this.persistedSessionVersion = sessionVersion
+        this.currentStoreRevision = revision
+        return true
+    }
+
     materializeCompatibilityArray(): Message[] {
         this.assertActive()
         return this.conversation.message
@@ -1517,13 +1603,17 @@ export class ActiveConversationSession {
     private notifyMutation(
         previousVersion: number,
         commands: readonly ActiveConversationCommandName[],
+        mutations: readonly ActiveConversationMutationRange[] = [],
     ): void {
         this.onMutation?.({
             characterId: this.characterId,
             conversationId: this.conversationId,
+            sessionToken: this.locatorRegistry.sessionToken,
             previousVersion,
             sessionVersion: this.sessionVersion,
-            commands,
+            commands: [...commands],
+            mutations: safeStructuredClone(mutations),
+            conversation: cloneConversationMetadata(this.conversation),
         })
     }
 }

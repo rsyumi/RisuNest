@@ -9,6 +9,7 @@ import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
 import { createPluginStorageStore } from '../plugins/pluginStorageStore'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
+import { ActiveConversationSession } from './activeConversationSession'
 
 function makeDatabase(): Database {
     return {
@@ -3003,6 +3004,275 @@ describe('SaveCoordinator', () => {
         ]
         return database
     }
+
+    it('commits session-owned replacement ranges in order and acknowledges the exact version', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersisted: onPersisted,
+        })
+        coordinator.initialize(2)
+        const session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation: database.characters[0].chats[1],
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        session.transaction((transaction) => {
+            transaction.edit(
+                transaction.locate(0),
+                { role: 'user', data: 'session edit' },
+            )
+            transaction.append({ role: 'char', data: 'session append' })
+        })
+        await coordinator.flushPendingData('session-ranges')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0].conversations).toEqual([
+            {
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'two',
+                start: 0,
+                deleteCount: 1,
+                messages: [{ role: 'user', data: 'session edit' }],
+                conversation: { id: 'two', name: 'Two', localLore: [], note: '' },
+            },
+            {
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'two',
+                start: 2,
+                deleteCount: 0,
+                messages: [{ role: 'char', data: 'session append' }],
+                conversation: { id: 'two', name: 'Two', localLore: [], note: '' },
+            },
+        ])
+        expect(onPersisted).toHaveBeenCalledOnce()
+        expect(onPersisted).toHaveBeenCalledWith(expect.objectContaining({
+            characterId: 'char-a',
+            conversationId: 'two',
+            sessionVersion: 2,
+            revision: 3,
+        }))
+    })
+
+    it('commits and acknowledges an ordered session command whose final value is unchanged', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        let session!: ActiveConversationSession
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersisted: (event) => {
+                session.acknowledgePersisted(
+                    event.sessionToken,
+                    event.sessionVersion,
+                    event.revision,
+                )
+            },
+        })
+        coordinator.initialize(2)
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation: database.characters[0].chats[1],
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        session.edit(session.locate(0), { role: 'user', data: 'hello two' })
+        await coordinator.flushPendingData('unchanged-session-command')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0].conversations).toEqual([{
+            type: 'replace-range',
+            characterId: 'char-a',
+            conversationId: 'two',
+            start: 0,
+            deleteCount: 1,
+            messages: [{ role: 'user', data: 'hello two' }],
+            conversation: { id: 'two', name: 'Two', localLore: [], note: '' },
+        }])
+        expect(session.persistedVersion).toBe(1)
+        expect(session.storeRevision).toBe(3)
+    })
+
+    it('retains a session-owned range without acknowledgement until a failed save retries', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn()
+            .mockRejectedValueOnce(new Error('range write failed'))
+            .mockImplementation(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        let session!: ActiveConversationSession
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersisted: (event) => {
+                session.acknowledgePersisted(
+                    event.sessionToken,
+                    event.sessionVersion,
+                    event.revision,
+                )
+            },
+        })
+        coordinator.initialize(2)
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation: database.characters[0].chats[1],
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        session.append({ role: 'user', data: 'retry exact range' })
+        await expect(coordinator.flushPendingData('first-attempt')).rejects.toThrow(
+            'range write failed',
+        )
+        expect(session.persistedVersion).toBe(0)
+        expect(coordinator.pendingBytes).toBeGreaterThanOrEqual(0)
+
+        await coordinator.flushPendingData('retry-attempt')
+
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit.mock.calls[1][0].conversations).toEqual(
+            commit.mock.calls[0][0].conversations,
+        )
+        expect(session.persistedVersion).toBe(1)
+        expect(session.storeRevision).toBe(3)
+    })
+
+    it('keeps strict replacement evidence across a session-token rollover before flush', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersisted: onPersisted,
+        })
+        coordinator.initialize(2)
+        const conversation = database.characters[0].chats[1]
+        const makeSession = () => new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation,
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        makeSession().append({ role: 'user', data: 'first session' })
+        makeSession().append({ role: 'char', data: 'replacement session' })
+        await coordinator.flushPendingData('session-token-rollover')
+
+        expect(commit.mock.calls[0][0].conversations).toEqual([
+            expect.objectContaining({
+                type: 'replace-range',
+                start: 2,
+                deleteCount: 0,
+                messages: [{ role: 'user', data: 'first session' }],
+            }),
+            expect.objectContaining({
+                type: 'replace-range',
+                start: 3,
+                deleteCount: 0,
+                messages: [{ role: 'char', data: 'replacement session' }],
+            }),
+        ])
+        expect(onPersisted).toHaveBeenCalledTimes(2)
+    })
+
+    it('does not acknowledge pending evidence for a character omitted from the commit', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersisted: onPersisted,
+        })
+        coordinator.initialize(2)
+        const detachedConversation: Chat = {
+            id: 'detached-chat',
+            name: 'Detached',
+            message: [],
+            localLore: [],
+            note: '',
+        }
+        const detachedSession = new ActiveConversationSession({
+            characterId: 'char-b',
+            conversationId: 'detached-chat',
+            conversation: detachedConversation,
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        detachedSession.append({ role: 'user', data: 'not in selected capture' })
+        database.characters[0].name = 'Committed selected character'
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('other-character')
+
+        expect(commit.mock.calls[0][0].replaceCharacter).toMatchObject({
+            chaId: 'char-a',
+            name: 'Committed selected character',
+        })
+        expect(onPersisted).not.toHaveBeenCalled()
+        expect(detachedSession.persistedVersion).toBe(0)
+    })
+
+    it('does not acknowledge same-character evidence omitted from a fallback conversation commit', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const onPersisted = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersisted: onPersisted,
+        })
+        coordinator.initialize(2)
+        const detachedSession = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'detached-chat',
+            conversation: {
+                id: 'detached-chat',
+                name: 'Detached',
+                message: [],
+                localLore: [],
+                note: '',
+            },
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        detachedSession.append({ role: 'user', data: 'not in captured character' })
+        database.characters[0].chats[0].message[0].data = 'captured fallback edit'
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('same-character-fallback')
+
+        expect(commit.mock.calls[0][0].conversations).toEqual([
+            expect.objectContaining({
+                characterId: 'char-a',
+                conversationId: 'one',
+            }),
+        ])
+        expect(onPersisted).not.toHaveBeenCalled()
+    })
 
     it.each([
         {

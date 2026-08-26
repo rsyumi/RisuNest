@@ -115,6 +115,7 @@ function makeHarness(
         flushPendingData: vi.fn(() => Promise.resolve()),
         replacePersistentDatabase: vi.fn(async () => undefined),
         adoptHydratedCharacter: vi.fn(() => true),
+        recordActiveConversationMutation: vi.fn(),
     }
     const store = {
         open: vi.fn(async () => undefined),
@@ -1028,18 +1029,20 @@ describe('ActiveWorkingSet', () => {
         } as Chat
         let resident = makeCharacter('char-a', [chatA, makeChat('chat-b')])
         resident.chatPage = 0
+        const coordinator = {
+            revision: 1,
+            mutationGeneration: 0,
+            initialize: vi.fn(),
+            flushPendingData: vi.fn(async () => undefined),
+            replacePersistentDatabase: vi.fn(async () => undefined),
+            adoptHydratedCharacter: vi.fn(() => true),
+            recordActiveConversationMutation: vi.fn(),
+        }
         const workingSet = new ActiveWorkingSet({
             store: {
                 readConversation: vi.fn(async () => ({ revision: 1, value: chatB })),
             } as unknown as PersistentDataStore,
-            coordinator: {
-                revision: 1,
-                mutationGeneration: 0,
-                initialize: vi.fn(),
-                flushPendingData: vi.fn(async () => undefined),
-                replacePersistentDatabase: vi.fn(async () => undefined),
-                adoptHydratedCharacter: vi.fn(() => true),
-            },
+            coordinator,
             getSelectedCharacterId: () => 'char-a',
             getResidentCharacter: () => resident,
             publishCharacter: vi.fn(),
@@ -1059,6 +1062,22 @@ describe('ActiveWorkingSet', () => {
             data: 'session append',
             chatId: 'session-append',
         })
+        expect(coordinator.recordActiveConversationMutation).toHaveBeenCalledWith(
+            expect.objectContaining({
+                characterId: 'char-a',
+                conversationId: 'chat-b',
+                sessionVersion: 1,
+            }),
+        )
+        const mutation = coordinator.recordActiveConversationMutation.mock.calls[0][0]
+        expect(workingSet.acknowledgeConversationMutationPersisted({
+            characterId: 'char-a',
+            conversationId: 'chat-b',
+            sessionToken: mutation.sessionToken,
+            sessionVersion: 1,
+            revision: 2,
+        })).toBe(true)
+        expect(session.persistedVersion).toBe(1)
         const edited = session.edit(appended, {
             role: 'char',
             data: 'session edit',
@@ -1083,25 +1102,31 @@ describe('ActiveWorkingSet', () => {
         )
     })
 
-    it('keeps the previous body resident when its pending save fails', async () => {
+    it('keeps the session command body resident when its pending save fails before eviction', async () => {
         const previous = {
             ...makeChat('chat-a'),
             message: [{ role: 'user', data: 'unsaved' }],
         } as Chat
         const resident = makeCharacter('char-a', [previous, makeChat('chat-b')])
         resident.chatPage = 0
+        const database = {
+            username: 'Fixture',
+            characters: [resident],
+        } as unknown as Database
         const readConversation = vi.fn()
         const publishConversation = vi.fn()
+        const coordinator = {
+            revision: 1,
+            mutationGeneration: 1,
+            initialize: vi.fn(),
+            flushPendingData: vi.fn(async () => { throw new Error('commit failed') }),
+            replacePersistentDatabase: vi.fn(async () => undefined),
+            adoptHydratedCharacter: vi.fn(() => true),
+            recordActiveConversationMutation: vi.fn(),
+        }
         const workingSet = new ActiveWorkingSet({
             store: { readConversation } as unknown as PersistentDataStore,
-            coordinator: {
-                revision: 1,
-                mutationGeneration: 1,
-                initialize: vi.fn(),
-                flushPendingData: vi.fn(async () => { throw new Error('commit failed') }),
-                replacePersistentDatabase: vi.fn(async () => undefined),
-                adoptHydratedCharacter: vi.fn(() => true),
-            },
+            coordinator,
             getSelectedCharacterId: () => 'char-a',
             getResidentCharacter: () => resident,
             canReleaseConversation: () => true,
@@ -1109,11 +1134,21 @@ describe('ActiveWorkingSet', () => {
             publishCharacterSet: vi.fn(),
             publishConversation,
         })
+        workingSet.installCommittedWorkingSet(database, 1)
+        const session = workingSet.activeConversationSession!
+        session.append({ role: 'char', data: 'pending command' })
 
         await expect(workingSet.activateConversation('chat-b')).rejects.toThrow('commit failed')
+        expect(coordinator.recordActiveConversationMutation).toHaveBeenCalledOnce()
+        expect(session.persistedVersion).toBe(0)
+        expect(workingSet.activeConversationSession).toBe(session)
         expect(readConversation).not.toHaveBeenCalled()
         expect(publishConversation).not.toHaveBeenCalled()
         expect(resident.chats[0]).toBe(previous)
+        expect(resident.chats[0].message).toEqual([
+            { role: 'user', data: 'unsaved' },
+            { role: 'char', data: 'pending command' },
+        ])
     })
 
     it('keeps a streaming previous body pinned while selecting the hydrated target', async () => {
@@ -1237,9 +1272,11 @@ describe('ActiveWorkingSet', () => {
             { role: 'char', data: 'saved before release' },
         ])
 
-        database.characters[0].chats[1].message.push({ role: 'user', data: 'later save' })
-        runtime.markPersistentDataDirty(32)
+        const activeSession = runtime.getActiveConversationSession()!
+        activeSession.append({ role: 'user', data: 'later save' })
         await runtime.flushPendingData('conversation-residency-test')
+        expect(activeSession.persistedVersion).toBe(1)
+        expect(activeSession.storeRevision).toBe(imported.revision + 2)
 
         expect((await store.readConversation('char-a', 'chat-a'))?.value.message).toEqual([
             { role: 'user', data: 'first' },

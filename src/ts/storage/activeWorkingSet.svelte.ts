@@ -1,5 +1,8 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
-import { ActiveConversationSession } from './activeConversationSession'
+import {
+    ActiveConversationSession,
+    type ActiveConversationMutationEvent,
+} from './activeConversationSession'
 import type {
     CharacterDetail,
     ConversationSummary,
@@ -10,6 +13,7 @@ import {
     createConversationSummaryStub,
     createConversationSummaryStubFromChat,
 } from './conversationResidency'
+import type { PersistedConversationMutationEvent } from './saveCoordinator'
 
 type CompleteCharacter = character | groupChat
 
@@ -30,6 +34,7 @@ export interface WorkingSetCoordinator {
         mutationGeneration: number,
         character: CompleteCharacter,
     ): boolean
+    recordActiveConversationMutation?(event: ActiveConversationMutationEvent): void
 }
 
 export interface CharacterActivationOptions {
@@ -81,6 +86,24 @@ export class ActiveWorkingSet {
 
     get activeConversationSession(): ActiveConversationSession | null {
         return this.activeSession
+    }
+
+    acknowledgeConversationMutationPersisted(
+        event: PersistedConversationMutationEvent,
+    ): boolean {
+        const session = this.activeSession
+        if (
+            !session ||
+            !session.isActive ||
+            session.characterId !== event.characterId ||
+            session.conversationId !== event.conversationId ||
+            !session.ownsSessionToken(event.sessionToken)
+        ) return false
+        return session.acknowledgePersisted(
+            event.sessionToken,
+            event.sessionVersion,
+            event.revision,
+        )
     }
 
     reconcileActiveCharacterIds(
@@ -373,6 +396,9 @@ export class ActiveWorkingSet {
             conversationId,
             conversation,
             storeRevision,
+            onMutation: this.dependencies.coordinator.recordActiveConversationMutation === undefined
+                ? undefined
+                : (event) => this.dependencies.coordinator.recordActiveConversationMutation!(event),
         })
     }
 

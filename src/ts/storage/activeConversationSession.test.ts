@@ -573,6 +573,92 @@ describe('ActiveConversationSession', () => {
         }))
     })
 
+    it('publishes detached strict replacement evidence for every committed command version', () => {
+        const { conversation, onMutation, session } = createSession()
+
+        session.transaction((transaction) => {
+            transaction.edit(transaction.locate(0), message('duplicate', 'edited zero'))
+            transaction.append(message('append', 'four'))
+        })
+
+        const event = onMutation.mock.calls[0][0]
+        expect(event).toMatchObject({
+            previousVersion: 0,
+            sessionVersion: 2,
+            commands: ['edit', 'append'],
+            mutations: [
+                {
+                    start: 0,
+                    deleteCount: 1,
+                    messages: [message('duplicate', 'edited zero')],
+                    sessionVersion: 1,
+                },
+                {
+                    start: 4,
+                    deleteCount: 0,
+                    messages: [message('append', 'four')],
+                    sessionVersion: 2,
+                },
+            ],
+            conversation: {
+                id: 'conversation-a',
+                name: 'Conversation A',
+                note: '',
+                localLore: [],
+            },
+        })
+        expect(event.sessionToken).toBeTruthy()
+
+        event.mutations[0].messages[0].data = 'retained event mutation'
+        event.conversation.name = 'retained metadata mutation'
+        expect(conversation.message[0].data).toBe('edited zero')
+        expect(conversation.name).toBe('Conversation A')
+    })
+
+    it('advances persisted revision only through an owned monotonic acknowledgement', () => {
+        const { onMutation, session } = createSession()
+        session.append(message('append', 'four'))
+        const event = onMutation.mock.calls[0][0]
+
+        expect(session.persistedVersion).toBe(0)
+        expect(session.acknowledgePersisted(event.sessionToken, 1, 8)).toBe(true)
+        expect(session.persistedVersion).toBe(1)
+        expect(session.storeRevision).toBe(8)
+        expect(session.acknowledgePersisted(event.sessionToken, 1, 8)).toBe(false)
+
+        const other = createSession().session
+        other.append(message('other', 'other'))
+        const otherToken = other.locate(0).sessionToken
+        expect(() => session.acknowledgePersisted(otherToken, 1, 9)).toThrow(/session/i)
+        expect(() => session.acknowledgePersisted(event.sessionToken, 2, 9)).toThrow(/version/i)
+        expect(() => session.acknowledgePersisted(event.sessionToken, 1, 7)).not.toThrow()
+        expect(session.storeRevision).toBe(8)
+    })
+
+    it('represents metadata-only versions with a strict no-op tail range', () => {
+        const conversation = chat()
+        conversation.bookmarks = ['tail']
+        conversation.bookmarkNames = { tail: 'Before' }
+        const { onMutation, session } = createSession(conversation)
+
+        session.renameBookmark(session.locate(3), 'After')
+
+        expect(onMutation.mock.calls[0][0]).toMatchObject({
+            previousVersion: 0,
+            sessionVersion: 1,
+            mutations: [{
+                start: 4,
+                deleteCount: 0,
+                messages: [],
+                sessionVersion: 1,
+            }],
+            conversation: {
+                bookmarks: ['tail'],
+                bookmarkNames: { tail: 'After' },
+            },
+        })
+    })
+
     it('preserves untouched legacy message identities across edits and appends', () => {
         const originalMessages = [
             message(undefined, 'zero'),

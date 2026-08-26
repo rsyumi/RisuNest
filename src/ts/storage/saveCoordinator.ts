@@ -13,6 +13,11 @@ import { appendCharacterIdToOrder, removeCharacterIdFromOrder } from './characte
 import { isConversationSummaryStub } from './conversationResidency'
 import { defineOwnEnumerableProperty } from './ownEnumerableProperty'
 import { withPersistentRevisionLease } from './persistentRecordIterator'
+import type {
+    ActiveConversationMutationEvent,
+    ConversationSessionToken,
+} from './activeConversationSession'
+import { safeStructuredClone } from '../polyfill'
 
 const SAVE_DEBOUNCE_MS = 500
 const PENDING_BYTE_LIMIT = 1_048_576
@@ -58,8 +63,17 @@ export interface SaveCoordinatorDependencies {
     clock?: SaveCoordinatorClock
     now?(): number
     onLocalRevision?(revision: DataRevision): void
+    onConversationMutationPersisted?(event: PersistedConversationMutationEvent): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
+}
+
+export interface PersistedConversationMutationEvent {
+    characterId: string
+    conversationId: string
+    sessionToken: ConversationSessionToken
+    sessionVersion: number
+    revision: DataRevision
 }
 
 interface CapturedState {
@@ -94,6 +108,10 @@ interface PendingCharacterAddition {
 
 interface PendingResidentCompensation {
     characterId: string
+}
+
+interface PendingConversationMutation {
+    event: ActiveConversationMutationEvent
 }
 
 function canonicalize(value: unknown): unknown {
@@ -662,6 +680,7 @@ export class SaveCoordinator {
     private pendingCharacterAddition: PendingCharacterAddition | null = null
     private reservedCharacterAddition: ReservedCharacterAddition | null = null
     private pendingResidentCompensations: PendingResidentCompensation[] = []
+    private pendingConversationMutations: PendingConversationMutation[] = []
     private lastBackgroundErrorMessage: string | null = null
     private destructiveReplacementFence: {
         owner: symbol
@@ -710,6 +729,7 @@ export class SaveCoordinator {
         this.pendingCharacterAddition = null
         this.reservedCharacterAddition = null
         this.pendingResidentCompensations = []
+        this.pendingConversationMutations = []
         this.lastBackgroundErrorMessage = null
         if (this.destructiveReplacementFence?.state === 'held') {
             this.destructiveReplacementFence.acceptsPostPublicationDirty = true
@@ -776,6 +796,63 @@ export class SaveCoordinator {
             return
         }
         if (!this.flushPromise) this.armDebounce()
+    }
+
+    recordActiveConversationMutation(
+        event: ActiveConversationMutationEvent,
+        estimatedBytes = 0,
+    ): void {
+        this.assertInitialized()
+        if (!event.characterId || !event.conversationId || !event.sessionToken) {
+            throw new Error('Conversation mutation ownership evidence is incomplete')
+        }
+        if (
+            !Number.isSafeInteger(event.previousVersion) ||
+            event.previousVersion < 0 ||
+            !Number.isSafeInteger(event.sessionVersion) ||
+            event.sessionVersion <= event.previousVersion
+        ) {
+            throw new RangeError('Conversation mutation versions are invalid')
+        }
+        if (event.mutations.length === 0) {
+            throw new RangeError('Conversation mutation has no replacement evidence')
+        }
+        let previousMutationVersion = event.previousVersion
+        for (const mutation of event.mutations) {
+            if (
+                !Number.isSafeInteger(mutation.start) || mutation.start < 0 ||
+                !Number.isSafeInteger(mutation.deleteCount) || mutation.deleteCount < 0 ||
+                !Number.isSafeInteger(mutation.sessionVersion) ||
+                mutation.sessionVersion !== previousMutationVersion + 1 ||
+                mutation.sessionVersion > event.sessionVersion
+            ) {
+                throw new RangeError('Conversation replacement evidence is invalid')
+            }
+            previousMutationVersion = mutation.sessionVersion
+        }
+        if (previousMutationVersion !== event.sessionVersion) {
+            throw new RangeError('Conversation replacement evidence does not reach its session version')
+        }
+        const previous = this.pendingConversationMutations.findLast(
+            (pending) =>
+                pending.event.characterId === event.characterId &&
+                pending.event.conversationId === event.conversationId,
+        )
+        if (previous) {
+            const continuesSession =
+                previous.event.sessionToken === event.sessionToken &&
+                previous.event.sessionVersion === event.previousVersion
+            const startsReplacementSession =
+                previous.event.sessionToken !== event.sessionToken &&
+                event.previousVersion === 0
+            if (!continuesSession && !startsReplacementSession) {
+                throw new Error('Conversation mutation session sequence changed before persistence')
+            }
+        }
+
+        const detached = safeStructuredClone(event)
+        this.markPersistentDataDirty(estimatedBytes)
+        this.pendingConversationMutations.push({ event: detached })
     }
 
     flushPendingData(reason: string): Promise<void> {
@@ -1772,6 +1849,7 @@ export class SaveCoordinator {
         while (true) {
             const generation = this.dirtyGeneration
             const captured = this.capture()
+            const pendingConversationMutations = [...this.pendingConversationMutations]
             const selectionSwitched =
                 captured.character !== null &&
                 this.characterBaselineId !== null &&
@@ -1779,6 +1857,10 @@ export class SaveCoordinator {
             const detached =
                 !captured.character || selectionSwitched ? this.captureDetachedCharacter() : null
             const addition = this.capturePendingAddition()
+            const recordedConversations = this.recordedConversationMutations(
+                captured,
+                pendingConversationMutations,
+            )
             const commit: WorkingSetCommit = { expectedRevision: this.revision }
             if (captured.rootCanonical !== this.rootBaseline) commit.root = captured.root
             if (
@@ -1800,9 +1882,12 @@ export class SaveCoordinator {
                 commit.replaceCharacter = detached.character
             } else if (
                 captured.character &&
-                captured.characterCanonical !== this.characterBaseline
+                (
+                    captured.characterCanonical !== this.characterBaseline ||
+                    recordedConversations !== null
+                )
             ) {
-                const conversations = this.diffSelectedConversations(captured)
+                const conversations = recordedConversations ?? this.diffSelectedConversations(captured)
                 if (conversations) commit.conversations = conversations
                 else commit.replaceCharacter = captured.conversationStubIds.size > 0
                     ? await this.reconstructCapturedCharacter(captured)
@@ -1859,6 +1944,20 @@ export class SaveCoordinator {
                     if (addition && captured.character.chaId === addition.pending.characterId) {
                         addition.pending.baseline = captured.characterCanonical!
                     }
+                }
+                const persistedConversationMutations =
+                    recordedConversations !== null &&
+                    commit.conversations === recordedConversations &&
+                    captured.character
+                        ? pendingConversationMutations.filter(
+                            ({ event }) => event.characterId === captured.character!.chaId,
+                        )
+                        : []
+                if (persistedConversationMutations.length > 0) {
+                    this.acknowledgeConversationMutations(
+                        persistedConversationMutations,
+                        committed.revision,
+                    )
                 }
                 if (replacementIsAddition && addition) {
                     addition.pending.baseline = addition.canonical
@@ -2338,6 +2437,99 @@ export class SaveCoordinator {
     private setCharacterBaseline(captured: CapturedState): void {
         this.characterBaseline = captured.characterCanonical
         this.characterBaselineId = captured.character?.chaId ?? null
+    }
+
+    private recordedConversationMutations(
+        captured: CapturedState,
+        pending: readonly PendingConversationMutation[],
+    ): ConversationMutation[] | null {
+        if (
+            pending.length === 0 ||
+            !captured.character ||
+            this.characterBaseline === null ||
+            this.characterBaselineId !== captured.character.chaId
+        ) return null
+
+        const projected = JSON.parse(this.characterBaseline) as CompleteCharacter
+        const mutations: ConversationMutation[] = []
+        const sessionVersions = new Map<string, {
+            sessionToken: ConversationSessionToken
+            sessionVersion: number
+        }>()
+        for (const { event } of pending) {
+            if (event.characterId !== projected.chaId) continue
+            const conversation = projected.chats.find(
+                (candidate) => candidate.id === event.conversationId,
+            )
+            if (!conversation || !Array.isArray(conversation.message)) return null
+            const previous = sessionVersions.get(event.conversationId)
+            if (previous) {
+                const continuesSession =
+                    previous.sessionToken === event.sessionToken &&
+                    previous.sessionVersion === event.previousVersion
+                const startsReplacementSession =
+                    previous.sessionToken !== event.sessionToken &&
+                    event.previousVersion === 0
+                if (!continuesSession && !startsReplacementSession) return null
+            }
+            sessionVersions.set(event.conversationId, {
+                sessionToken: event.sessionToken,
+                sessionVersion: event.sessionVersion,
+            })
+
+            const conversationMetadata = safeStructuredClone(event.conversation) as Omit<Chat, 'message'>
+            for (const range of event.mutations) {
+                if (
+                    range.start > conversation.message.length ||
+                    range.deleteCount > conversation.message.length - range.start
+                ) return null
+                const messages = safeStructuredClone(range.messages)
+                conversation.message.splice(range.start, range.deleteCount, ...messages)
+                mutations.push({
+                    type: 'replace-range',
+                    characterId: event.characterId,
+                    conversationId: event.conversationId,
+                    start: range.start,
+                    deleteCount: range.deleteCount,
+                    messages,
+                    conversation: safeStructuredClone(conversationMetadata),
+                })
+            }
+            const target = conversation as unknown as Record<string, unknown>
+            const metadata = event.conversation as Record<string, unknown>
+            for (const key of Object.keys(target)) {
+                if (key !== 'message' && !Object.hasOwn(metadata, key)) delete target[key]
+            }
+            for (const [key, value] of Object.entries(metadata)) {
+                if (key !== 'message') target[key] = safeStructuredClone(value)
+            }
+        }
+        return mutations.length > 0 && canonicalJson(projected) === captured.characterCanonical
+            ? mutations
+            : null
+    }
+
+    private acknowledgeConversationMutations(
+        persisted: readonly PendingConversationMutation[],
+        revision: DataRevision,
+    ): void {
+        const persistedSet = new Set(persisted)
+        this.pendingConversationMutations = this.pendingConversationMutations.filter(
+            (pending) => !persistedSet.has(pending),
+        )
+        for (const pending of persisted) {
+            try {
+                this.dependencies.onConversationMutationPersisted?.({
+                    characterId: pending.event.characterId,
+                    conversationId: pending.event.conversationId,
+                    sessionToken: pending.event.sessionToken,
+                    sessionVersion: pending.event.sessionVersion,
+                    revision,
+                })
+            } catch (error) {
+                this.reportBackgroundError(error)
+            }
+        }
     }
 
     /**
