@@ -1,5 +1,6 @@
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import { ActiveWorkingSet, type CharacterActivationOptions } from './activeWorkingSet.svelte'
+import type { ActiveConversationSession } from './activeConversationSession'
 import type {
     CharacterDetail,
     DataRevision,
@@ -256,6 +257,7 @@ export interface PersistentDataRuntime {
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void>
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
+    getActiveConversationSession(): ActiveConversationSession | null
     deactivateActiveWorkingSet(): Promise<boolean>
     reconcileActiveCharacterIds(
         database: Database,
@@ -502,6 +504,7 @@ export function createPersistentDataRuntime(
             coordinator.commitCharacterAddition(request, reason),
         activateCharacter,
         activateConversation: (id) => workingSet.activateConversation(id),
+        getActiveConversationSession: () => workingSet.activeConversationSession,
         deactivateActiveWorkingSet: () => workingSet.deactivate(),
         reconcileActiveCharacterIds: (database, selectedCharacterId) =>
             workingSet.reconcileActiveCharacterIds(database, selectedCharacterId),

@@ -1018,6 +1018,55 @@ describe('ActiveWorkingSet', () => {
         ])
     })
 
+    it('publishes a full-array session for the live conversation after navigation', async () => {
+        const chatA = makeChat('chat-a')
+        const chatB = {
+            ...makeChat('chat-b'),
+            message: [{ role: 'user', data: 'authoritative body', chatId: 'message-b' }],
+        } as Chat
+        let resident = makeCharacter('char-a', [chatA, makeChat('chat-b')])
+        resident.chatPage = 0
+        const workingSet = new ActiveWorkingSet({
+            store: {
+                readConversation: vi.fn(async () => ({ revision: 1, value: chatB })),
+            } as unknown as PersistentDataStore,
+            coordinator: {
+                revision: 1,
+                mutationGeneration: 0,
+                initialize: vi.fn(),
+                flushPendingData: vi.fn(async () => undefined),
+                replacePersistentDatabase: vi.fn(async () => undefined),
+                adoptHydratedCharacter: vi.fn(() => true),
+            },
+            getSelectedCharacterId: () => 'char-a',
+            getResidentCharacter: () => resident,
+            publishCharacter: vi.fn(),
+            publishCharacterSet: vi.fn(),
+            publishConversation: (_characterId, _conversation, nextCharacter) => {
+                resident = nextCharacter as character
+            },
+        })
+
+        await expect(workingSet.activateConversation('chat-b')).resolves.toBe(true)
+
+        const session = workingSet.activeConversationSession!
+        expect(session.storeRevision).toBe(1)
+        expect(session.materializeCompatibilityArray()).toBe(resident.chats[1].message)
+        const appended = session.append({
+            role: 'char',
+            data: 'session append',
+            chatId: 'session-append',
+        })
+        const edited = session.edit(appended, {
+            role: 'char',
+            data: 'session edit',
+            chatId: 'session-append',
+        })
+        expect(resident.chats[1].message.at(-1)?.data).toBe('session edit')
+        session.delete(edited)
+        expect(resident.chats[1].message).toEqual(chatB.message)
+    })
+
     it('keeps the previous body resident when its pending save fails', async () => {
         const previous = {
             ...makeChat('chat-a'),
@@ -1161,6 +1210,11 @@ describe('ActiveWorkingSet', () => {
         database.characters[0].chats[0].message.push({ role: 'char', data: 'saved before release' })
         runtime.markPersistentDataDirty(64)
         expect(await runtime.activateConversation('chat-b')).toBe(true)
+        expect(runtime.getActiveConversationSession()).toMatchObject({
+            characterId: 'char-a',
+            conversationId: 'chat-b',
+            storeRevision: imported.revision + 1,
+        })
         expect(database.characters[0].chats[0].message).toEqual([])
         expect((await store.readConversation('char-a', 'chat-a'))?.value.message).toEqual([
             { role: 'user', data: 'first' },

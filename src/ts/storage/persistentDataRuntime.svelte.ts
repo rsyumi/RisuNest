@@ -1,6 +1,7 @@
 import { get } from 'svelte/store'
 import { doingChat } from '../process/generationState'
 import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
+import type { ActiveConversationSession } from './activeConversationSession'
 import type { Chat, Database, character, groupChat } from './database.svelte'
 import { getDatabase, setDatabase } from './database.svelte'
 import { prepareDatabaseForPersistence } from './databasePreparation'
@@ -306,6 +307,8 @@ export const activateCharacter = (
 ): Promise<boolean> => getPersistentDataRuntime().activateCharacter(id, options)
 export const activateConversation = (id: string): Promise<boolean> =>
     getPersistentDataRuntime().activateConversation(id)
+export const getActiveConversationSession = (): ActiveConversationSession | null =>
+    getPersistentDataRuntime().getActiveConversationSession()
 export const deactivateActiveWorkingSet = (): Promise<boolean> =>
     getPersistentDataRuntime().deactivateActiveWorkingSet()
 export const reconcilePersistentActiveCharacterIds = (

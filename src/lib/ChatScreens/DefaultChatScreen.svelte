@@ -32,6 +32,7 @@
     import Button from '../UI/GUI/Button.svelte';
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
+    import { getActiveConversationSession } from '../../ts/storage/persistentDataRuntime.svelte';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -690,11 +691,24 @@
                     </button>
                 {:else}
                     <div onclick={(e) => {
-                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.push({
+                        const character = DBState.db.characters[$selectedCharID]
+                        const chat = character.chats[character.chatPage]
+                        const message = {
                             role: 'char',
                             data: ''
-                        })
-                        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage] = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage]
+                        } as Message
+                        const session = getActiveConversationSession()
+                        if (
+                            session?.characterId === character.chaId &&
+                            session.conversationId === chat.id &&
+                            session.materializeCompatibilityArray() === chat.message
+                        ) {
+                            session.append(message)
+                        }
+                        else {
+                            chat.message.push(message)
+                            character.chats[character.chatPage] = chat
+                        }
                     }}
                          class="peer-focus:border-textcolor mr-2 flex border-y border-r border-darkborderc justify-center items-center text-textcolor p-3 rounded-r-md hover:bg-blue-500 hover:text-white transition-colors"
                          style:height={inputHeight}

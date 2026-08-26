@@ -1,4 +1,5 @@
 import type { Chat, Database, character, groupChat } from './database.svelte'
+import { ActiveConversationSession } from './activeConversationSession'
 import type {
     CharacterDetail,
     ConversationSummary,
@@ -66,6 +67,7 @@ export class ActiveWorkingSet {
         string,
         { generation: number; promise: Promise<boolean> }
     >()
+    private activeSession: ActiveConversationSession | null = null
 
     constructor(private readonly dependencies: ActiveWorkingSetDependencies) {}
 
@@ -75,6 +77,10 @@ export class ActiveWorkingSet {
 
     get activeCharacterIds(): ReadonlySet<string> {
         return new Set(this.activeIds)
+    }
+
+    get activeConversationSession(): ActiveConversationSession | null {
+        return this.activeSession
     }
 
     reconcileActiveCharacterIds(
@@ -100,6 +106,7 @@ export class ActiveWorkingSet {
 
     invalidateNavigation(): void {
         this.navigationGeneration++
+        this.activeSession = null
     }
 
     async deactivate(): Promise<boolean> {
@@ -119,6 +126,7 @@ export class ActiveWorkingSet {
             (id) => this.dependencies.canDeactivateCharacter?.(id) === false,
         )) return false
         this.activeIds = new Set()
+        this.activeSession = null
         for (const id of activeIds) this.dependencies.releaseInactiveCharacter?.(id)
         return true
     }
@@ -129,6 +137,14 @@ export class ActiveWorkingSet {
         this.dependencies.coordinator.initialize(root.revision, database)
         const selectedId = this.dependencies.getSelectedCharacterId()
         this.activeIds = selectedId ? new Set([selectedId]) : new Set()
+        const selected = selectedId
+            ? database.characters.find((character) => character.chaId === selectedId)
+            : undefined
+        const conversation = selected?.chats[selected.chatPage ?? 0]
+        this.activeSession = null
+        if (selected && conversation) {
+            this.publishActiveConversationSession(selected.chaId, conversation, root.revision)
+        }
     }
 
     async activateCharacter(
@@ -239,6 +255,10 @@ export class ActiveWorkingSet {
         } else {
             this.dependencies.publishCharacter(characterValue)
         }
+        const selectedConversation = characterValue.chats[characterValue.chatPage ?? 0]
+        if (selectedConversation) {
+            this.publishActiveConversationSession(id, selectedConversation, revision)
+        } else this.activeSession = null
         const nextActiveIds = new Set([id, ...relatedIds])
         this.activeIds = nextActiveIds
         for (const previousId of previousActiveIds) {
@@ -324,7 +344,27 @@ export class ActiveWorkingSet {
             )) return false
         }
         this.dependencies.publishConversation(characterId, conversation.value, nextCharacter)
+        this.publishActiveConversationSession(characterId, conversation.value, revision)
         return true
+    }
+
+    private publishActiveConversationSession(
+        characterId: string,
+        fallbackConversation: Chat,
+        storeRevision: DataRevision,
+    ): void {
+        const resident = this.dependencies.getResidentCharacter?.(characterId)
+        const conversation = resident?.chats.find(
+            (candidate) => candidate.id === fallbackConversation.id,
+        ) ?? fallbackConversation
+        const conversationId = conversation.id ?? fallbackConversation.id
+        if (!conversationId) return
+        this.activeSession = new ActiveConversationSession({
+            characterId,
+            conversationId,
+            conversation,
+            storeRevision,
+        })
     }
 
     private async hydrateCharacter(

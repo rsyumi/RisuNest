@@ -27,6 +27,7 @@
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
     import { DeferredInlayMarkerRegistry, withResolvedDeferredInlaySources } from "src/ts/process/files/inlayRenderSource"
     import { copyImageSourceToDataUrl } from "src/ts/process/files/chatCopyInlays"
+    import { getActiveConversationSession } from "../../ts/storage/persistentDataRuntime.svelte"
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -99,11 +100,34 @@
         rawStreamingText = state.rawStreamingText
     }
 
+    function currentConversationSession() {
+        const currentCharacter = DBState.db.characters[selIdState.selId]
+        const currentChat = currentCharacter?.chats[currentCharacter.chatPage]
+        const session = getActiveConversationSession()
+        return session?.characterId === currentCharacter?.chaId &&
+            session.conversationId === currentChat?.id &&
+            session.materializeCompatibilityArray() === currentChat.message
+            ? session
+            : null
+    }
+
     async function rm(e:MouseEvent, rec?:boolean){
+        const chat = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]
+        const session = currentConversationSession()
+        const locator = session?.locate(idx)
+        const truncate = () => {
+            if (session && locator) session.truncate(locator)
+            else chat.message = chat.message.slice(0, idx)
+        }
+        const remove = () => {
+            if (session && locator) session.delete(locator)
+            else {
+                chat.message.splice(idx, 1)
+                chat.message = chat.message
+            }
+        }
         if(e.shiftKey){
-            let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
-            msg = msg.slice(0, idx)
-            DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message = msg
+            truncate()
             return
         }
 
@@ -111,31 +135,33 @@
         if(rm){
             if(DBState.db.instantRemove || rec){
                 const r = await alertConfirm(language.instantRemoveConfirm)
-                let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
                 if(!r){
-                    msg = msg.slice(0, idx)
+                    truncate()
                 }
                 else{
-                    msg.splice(idx, 1)
+                    remove()
                 }
-                DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message = msg
             }
             else{
-                let msg = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message
-                msg.splice(idx, 1)
-                DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message = msg
+                remove()
             }
         }
     }
 
     async function edit(){
-        DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].data = message
+        const currentMessage = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
+        const session = currentConversationSession()
+        if (session) session.edit(session.locate(idx), { ...currentMessage, data: message })
+        else currentMessage.data = message
     }
 
     function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
         if (idx >= 0) {
             message = e.detail.newData
-            DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].data = e.detail.newData
+            const currentMessage = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
+            const session = currentConversationSession()
+            if (session) session.edit(session.locate(idx), { ...currentMessage, data: e.detail.newData })
+            else currentMessage.data = e.detail.newData
             displaya(e.detail.newData)
         }
     }
