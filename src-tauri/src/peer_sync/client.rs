@@ -996,7 +996,7 @@ fn load_persisted_manifest(
         ));
     }
     let mut bytes = Vec::new();
-    file.by_ref()
+    std::io::Read::by_ref(&mut file)
         .take(MAX_MANIFEST_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_MANIFEST_BYTES {
@@ -1050,7 +1050,7 @@ fn persist_manifest(path: &Path, bytes: &[u8]) -> Result<(), PeerSyncError> {
                 ));
             }
             let mut existing = Vec::new();
-            file.by_ref()
+            std::io::Read::by_ref(&mut file)
                 .take(MAX_MANIFEST_BYTES as u64 + 1)
                 .read_to_end(&mut existing)?;
             if existing == bytes {
