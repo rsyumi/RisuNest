@@ -3,6 +3,7 @@ import {
     type BlobReadRange,
     type BlobMetadata,
     type BlobStore,
+    type InlayBlobMetadata,
 } from './blobStore'
 import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
 import {
@@ -66,8 +67,9 @@ export interface AssetAliasCatalog {
 }
 
 export interface AssetAliasLegacyReader {
-    read(identity: AssetAliasIdentity): Promise<Uint8Array | null>
+    read(identity: AssetAliasIdentity, range?: BlobReadRange): Promise<Uint8Array | null>
     stat(identity: AssetAliasIdentity): Promise<BlobMetadata | null>
+    resolveUrl?(identity: AssetAliasIdentity): Promise<string | null>
 }
 
 export interface TypedAssetRepository {
@@ -96,7 +98,7 @@ interface TypedAssetRepositoryReaderOptions {
     reader: Pick<AssetAliasCatalog, 'readAssetAlias'>
     cas: ImmutablePayloadCas
     legacy: AssetAliasLegacyReader
-    legacyFallback: boolean
+    legacyFallback: boolean | 'null-hash-only'
 }
 
 function blobRange(data: Uint8Array, range?: BlobReadRange): Uint8Array {
@@ -187,10 +189,23 @@ function createTypedAssetRepositoryReader(
                     }
                 }
             }
-            if (options.legacyFallback) {
-                const data = await legacy.read(identity)
+            if (
+                options.legacyFallback
+                && (alias.objectHash === null || options.legacyFallback === true)
+            ) {
+                const boundedNullHashRead = alias.objectHash === null ? range : undefined
+                const data = boundedNullHashRead
+                    ? await legacy.read(identity, boundedNullHashRead)
+                    : await legacy.read(identity)
                 if (data !== null) {
-                    if (data.byteLength !== alias.size) {
+                    const expectedSize = boundedNullHashRead
+                        ? Math.max(
+                            0,
+                            Math.min(boundedNullHashRead.endExclusive, alias.size)
+                            - Math.min(boundedNullHashRead.start, alias.size),
+                        )
+                        : alias.size
+                    if (data.byteLength !== expectedSize) {
                         throw new Error(`Asset alias legacy size mismatch for ${key}`)
                     }
                     if (
@@ -201,7 +216,11 @@ function createTypedAssetRepositoryReader(
                     }
                     return {
                         revision: versioned.revision,
-                        value: { alias, data: blobRange(data, range), source: 'legacy' },
+                        value: {
+                            alias,
+                            data: boundedNullHashRead ? data : blobRange(data, range),
+                            source: 'legacy',
+                        },
                     }
                 }
             }
@@ -232,7 +251,10 @@ function createTypedAssetRepositoryReader(
                     }
                 }
             }
-            if (options.legacyFallback) {
+            if (
+                options.legacyFallback
+                && (alias.objectHash === null || options.legacyFallback === true)
+            ) {
                 const metadata = await legacy.stat(identity)
                 if (metadata !== null) {
                     if (metadata.kind !== identity.kind || metadata.key !== identity.key) {
@@ -260,7 +282,7 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
         reader: options.reader,
         cas: options.cas,
         legacy: {
-            read: (identity) => options.legacy.read(identity.key),
+            read: (identity, range) => options.legacy.read(identity.key, range),
             stat: (identity) => options.legacy.stat(identity.key),
         },
         legacyFallback: options.legacyFallback,
@@ -291,6 +313,252 @@ export function createTypedAssetRepository(
             validateAssetAliasIdentity(identity)
             return options.catalog.deleteAssetAlias(identity, expectedRevision)
         },
+    }
+}
+
+export interface CompleteAssetAliasStore extends AssetAliasCatalog,
+    Pick<PersistentDataStore, 'readRoot' | 'commitAssetAlias'> {}
+
+export interface AssetObjectUrlResolver {
+    resolveObjectUrl(input: {
+        contentHash: string
+        mime: string
+        size: number
+    }): Promise<string | null>
+}
+
+export interface NewInlayImageEncoding {
+    data: Uint8Array
+    metadata: Omit<InlayBlobMetadata, 'key' | 'size'>
+}
+
+export interface NewInlayImageEncoder {
+    encodeNewInlayImage(
+        key: string,
+        data: Uint8Array,
+        input: { name: string },
+    ): Promise<NewInlayImageEncoding>
+}
+
+export interface CompleteAssetRepositoryBlobStoreOptions {
+    store: CompleteAssetAliasStore
+    cas: ImmutablePayloadCas
+    legacy: AssetAliasLegacyReader
+    legacyFallback: boolean
+    objectUrls: AssetObjectUrlResolver
+    newInlayImages: NewInlayImageEncoder
+    listPageSize?: number
+}
+
+export type CompleteAssetRepositoryBlobStore = BlobStore &
+    Required<Pick<BlobStore, 'putNewInlayImage'>>
+
+export interface CompleteTypedAssetRepository {
+    put(
+        identity: AssetAliasIdentity,
+        data: Uint8Array,
+        metadata: Parameters<BlobStore['put']>[2],
+    ): Promise<BlobMetadata>
+    putNewInlayImage(
+        identity: AssetAliasIdentity,
+        data: Uint8Array,
+        input: { name: string },
+    ): Promise<InlayBlobMetadata>
+    read(identity: AssetAliasIdentity, range?: BlobReadRange): Promise<Uint8Array | null>
+    stat(identity: AssetAliasIdentity): Promise<BlobMetadata | null>
+    list(query?: Parameters<BlobStore['list']>[0]): Promise<BlobMetadata[]>
+    remove(identity: AssetAliasIdentity): Promise<void>
+    resolveUrl(identity: AssetAliasIdentity): Promise<string | null>
+}
+
+function blobIdentity(key: string): AssetAliasIdentity {
+    return {
+        kind: key.startsWith('assets/') ? 'asset' : 'inlay',
+        key,
+    }
+}
+
+async function readValidatedAlias(
+    store: Pick<AssetAliasCatalog, 'readAssetAlias'>,
+    identity: AssetAliasIdentity,
+): Promise<Versioned<AssetAlias> | null> {
+    const versioned = await store.readAssetAlias(identity)
+    if (!versioned) return null
+    validateAssetAlias(versioned.value)
+    if (
+        versioned.value.kind !== identity.kind
+        || versioned.value.key !== identity.key
+    ) {
+        throw new TypeError('Asset alias does not match its requested identity')
+    }
+    return versioned
+}
+
+export function createCompleteTypedAssetRepository(
+    options: CompleteAssetRepositoryBlobStoreOptions,
+): CompleteTypedAssetRepository {
+    const pageSize = options.listPageSize ?? 512
+    if (!Number.isSafeInteger(pageSize) || pageSize <= 0) {
+        throw new RangeError('Asset alias list page size must be a positive safe integer')
+    }
+    const repository = createTypedAssetRepositoryReader({
+        reader: options.store,
+        cas: options.cas,
+        legacy: options.legacy,
+        legacyFallback: options.legacyFallback ? 'null-hash-only' : false,
+    })
+
+    const publish = async (
+        identity: AssetAliasIdentity,
+        data: Uint8Array,
+        metadata: Parameters<BlobStore['put']>[2],
+    ): Promise<BlobMetadata> => {
+        validateAssetAliasIdentity(identity)
+        if (metadata.kind !== identity.kind) {
+            throw new TypeError('Asset alias metadata kind does not match its identity')
+        }
+        const ownedData = data.slice()
+        const pendingAlias = {
+            ...metadata,
+            key: identity.key,
+            objectHash: null,
+            size: ownedData.byteLength,
+        } as AssetAlias
+        validateAssetAlias(pendingAlias)
+        const prepared = await options.cas.prepare(ownedData)
+        const alias = { ...pendingAlias, objectHash: prepared.contentHash } as AssetAlias
+        validateAssetAlias(alias)
+        const { revision } = await options.store.readRoot()
+        await options.store.commitAssetAlias(alias, revision)
+        return aliasBlobMetadata(alias)
+    }
+
+    return {
+        put: publish,
+        async putNewInlayImage(identity, data, input) {
+            validateAssetAliasIdentity(identity)
+            if (identity.kind !== 'inlay') {
+                throw new TypeError('New Inlay image requires an Inlay identity')
+            }
+            const encoded = await options.newInlayImages.encodeNewInlayImage(
+                identity.key,
+                data.slice(),
+                { ...input },
+            )
+            if (!(encoded.data instanceof Uint8Array)) {
+                throw new TypeError('New Inlay image encoder must return Uint8Array bytes')
+            }
+            if (encoded.metadata.kind !== 'inlay') {
+                throw new TypeError('New Inlay image encoder must return Inlay metadata')
+            }
+            return await publish(identity, encoded.data, encoded.metadata) as InlayBlobMetadata
+        },
+        async read(identity, range) {
+            return (await repository.read(identity, range))?.value.data ?? null
+        },
+        async stat(identity) {
+            const result = await repository.stat(identity)
+            if (!result || result.value.source === 'missing') return null
+            return aliasBlobMetadata(result.value.alias)
+        },
+        async list(query = {}) {
+            const output: BlobMetadata[] = []
+            const seenCursors = new Set<string>()
+            let cursor: string | undefined
+            let revision: DataRevision | undefined
+            do {
+                const page = await options.store.listAssetAliases({
+                    ...(query.kind === undefined ? {} : { kind: query.kind }),
+                    limit: pageSize,
+                    ...(cursor === undefined ? {} : { cursor }),
+                })
+                if (revision !== undefined && revision !== page.revision) {
+                    throw new Error('Asset alias revision changed while listing')
+                }
+                revision = page.revision
+                for (const alias of page.items) {
+                    validateAssetAlias(alias)
+                    if (query.kind !== undefined && alias.kind !== query.kind) {
+                        throw new TypeError('Asset alias list returned the wrong kind')
+                    }
+                    output.push(aliasBlobMetadata(alias))
+                }
+                cursor = page.nextCursor
+                if (cursor !== undefined && seenCursors.has(cursor)) {
+                    throw new Error('Asset alias list cursor did not advance')
+                }
+                if (cursor !== undefined) seenCursors.add(cursor)
+            } while (cursor !== undefined)
+            return output
+        },
+        async remove(identity) {
+            validateAssetAliasIdentity(identity)
+            const versioned = await readValidatedAlias(options.store, identity)
+            if (!versioned) return
+            await options.store.deleteAssetAlias(identity, versioned.revision)
+        },
+        async resolveUrl(identity) {
+            validateAssetAliasIdentity(identity)
+            const versioned = await readValidatedAlias(options.store, identity)
+            if (!versioned) return null
+            const alias = versioned.value
+            if (alias.objectHash === null) {
+                if (!options.legacyFallback) return null
+                return await options.legacy.resolveUrl?.(identity) ?? null
+            }
+            const size = await options.cas.statObject(alias.objectHash)
+            if (size === null) return null
+            if (size !== alias.size) {
+                throw new Error(`Asset alias size mismatch for ${identity.key}`)
+            }
+            return options.objectUrls.resolveObjectUrl({
+                contentHash: alias.objectHash,
+                mime: alias.mime,
+                size: alias.size,
+            })
+        },
+    }
+}
+
+function requireNamespacedBlobIdentity(
+    key: string,
+    kind?: AssetAliasKind,
+): AssetAliasIdentity {
+    const identity = blobIdentity(key)
+    if (kind !== undefined && identity.kind !== kind) {
+        throw new TypeError('BlobStore key namespace does not match its metadata kind')
+    }
+    return identity
+}
+
+export function createCompleteAssetRepositoryBlobStore(
+    options: CompleteAssetRepositoryBlobStoreOptions,
+): CompleteAssetRepositoryBlobStore {
+    const repository = createCompleteTypedAssetRepository(options)
+    return {
+        async put(key, data, metadata) {
+            return await repository.put(
+                requireNamespacedBlobIdentity(key, metadata.kind),
+                data,
+                metadata,
+            )
+        },
+        async putNewInlayImage(key, data, input) {
+            return await repository.putNewInlayImage(
+                requireNamespacedBlobIdentity(key, 'inlay'),
+                data,
+                input,
+            )
+        },
+        read: (key, range) => repository.read(requireNamespacedBlobIdentity(key), range),
+        stat: (key) => repository.stat(requireNamespacedBlobIdentity(key)),
+        async list(query) {
+            const items = await repository.list(query)
+            for (const item of items) requireNamespacedBlobIdentity(item.key, item.kind)
+            return items
+        },
+        remove: (key) => repository.remove(requireNamespacedBlobIdentity(key)),
+        resolveUrl: (key) => repository.resolveUrl(requireNamespacedBlobIdentity(key)),
     }
 }
 

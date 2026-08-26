@@ -13,6 +13,7 @@ import {
     type BlobStore,
 } from './blobStore'
 import type { StorageMutationGate } from './storageMutationGate'
+import { objectPhysicalKey } from './payloadCas'
 
 function logicalKeyHex(key: string): string {
     return Buffer.from(key, 'utf-8').toString('hex')
@@ -32,6 +33,23 @@ export function createTauriNativeMediaUrl(
     converter: (path: string, protocol?: string) => string = convertFileSrc,
 ): string {
     return converter(logicalKeyHex(physicalKey), 'risuasset')
+}
+
+export function createTauriCasObjectUrl(
+    input: { contentHash: string; mime: string; size: number },
+    converter: (path: string, protocol?: string) => string = convertFileSrc,
+): string {
+    if (!Number.isSafeInteger(input.size) || input.size < 0) {
+        throw new RangeError('CAS object size must be a nonnegative safe integer')
+    }
+    if (input.mime.length === 0 || !/^[\x20-\x7e]+$/.test(input.mime)) {
+        throw new TypeError('CAS object MIME must be a nonempty header value')
+    }
+    const query = new URLSearchParams({
+        mime: input.mime,
+        size: input.size.toString(),
+    })
+    return `${createTauriNativeMediaUrl(objectPhysicalKey(input.contentHash), converter)}?${query}`
 }
 
 const blobKeyMapper: BlobPhysicalKeyMapper = {

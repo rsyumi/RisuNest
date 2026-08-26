@@ -1,0 +1,351 @@
+import { describe, expect, it, vi } from 'vitest'
+import type { BlobMetadata } from './blobStore'
+import {
+    createCompleteAssetRepositoryBlobStore,
+    createCompleteTypedAssetRepository,
+    type CompleteAssetAliasStore,
+} from './assetRepository'
+import type { ImmutablePayloadCas } from './payloadCas'
+import type { AssetAlias, AssetAliasIdentity } from './persistentDataStore'
+
+const assetHash = 'a'.repeat(64)
+const inlayHash = 'b'.repeat(64)
+
+function assetAlias(overrides: Partial<AssetAlias> = {}): AssetAlias {
+    return {
+        kind: 'asset',
+        key: 'assets/photo.bin',
+        objectHash: assetHash,
+        size: 4,
+        mime: 'application/octet-stream',
+        name: 'photo.bin',
+        ext: 'bin',
+        ...overrides,
+    } as AssetAlias
+}
+
+function createCas(overrides: Partial<ImmutablePayloadCas> = {}): ImmutablePayloadCas {
+    return {
+        prepare: vi.fn(async (data: Uint8Array) => ({
+            contentHash: assetHash,
+            byteSize: data.byteLength,
+            physicalKey: `assets-v2/objects/aa/${'a'.repeat(62)}`,
+            deduplicated: false,
+        })),
+        readObject: vi.fn(async () => null),
+        readObjectRange: vi.fn(async () => null),
+        statObject: vi.fn(async () => null),
+        ...overrides,
+    }
+}
+
+function createStore(overrides: Partial<CompleteAssetAliasStore> = {}): CompleteAssetAliasStore {
+    return {
+        readRoot: vi.fn(async () => ({ revision: 10, value: {} as never })),
+        readAssetAlias: vi.fn(async () => null),
+        commitAssetAlias: vi.fn(async () => ({ revision: 11 })),
+        listAssetAliases: vi.fn(async () => ({ revision: 10, items: [] })),
+        deleteAssetAlias: vi.fn(async () => ({ revision: 11 })),
+        ...overrides,
+    }
+}
+
+function createLegacy() {
+    return {
+        read: vi.fn(async (_identity: AssetAliasIdentity) => null as Uint8Array | null),
+        stat: vi.fn(async (_identity: AssetAliasIdentity) => null as BlobMetadata | null),
+        resolveUrl: vi.fn(async (_identity: AssetAliasIdentity) => null as string | null),
+    }
+}
+
+function createFacade(input: {
+    store?: CompleteAssetAliasStore
+    cas?: ImmutablePayloadCas
+    legacyFallback?: boolean
+    legacy?: ReturnType<typeof createLegacy>
+} = {}) {
+    const store = input.store ?? createStore()
+    const cas = input.cas ?? createCas()
+    const legacy = input.legacy ?? createLegacy()
+    const resolveObjectUrl = vi.fn(async () => 'risuasset://cas-object')
+    const encodeNewInlayImage = vi.fn(async () => ({
+        data: new Uint8Array([8, 6, 7]),
+        metadata: {
+            kind: 'inlay' as const,
+            mime: 'image/webp',
+            name: 'fresh.webp',
+            ext: 'webp',
+            inlayType: 'image' as const,
+            width: 19,
+            height: 23,
+        },
+    }))
+    const options = {
+        store,
+        cas,
+        legacy,
+        legacyFallback: input.legacyFallback ?? true,
+        objectUrls: { resolveObjectUrl },
+        newInlayImages: { encodeNewInlayImage },
+        listPageSize: 2,
+    }
+    return {
+        store,
+        cas,
+        legacy,
+        resolveObjectUrl,
+        encodeNewInlayImage,
+        facade: createCompleteAssetRepositoryBlobStore(options),
+        typed: createCompleteTypedAssetRepository(options),
+    }
+}
+
+describe('complete AssetRepository BlobStore facade', () => {
+    it('keeps same-key opposite-kind aliases independently reachable through the typed core', async () => {
+        const key = 'shared-key'
+        const asset = assetAlias({ key, size: 1 })
+        const inlay: AssetAlias = {
+            kind: 'inlay',
+            key,
+            objectHash: inlayHash,
+            size: 1,
+            mime: 'audio/ogg',
+            name: 'shared.ogg',
+            ext: 'ogg',
+            inlayType: 'audio',
+        }
+        const readAssetAlias = vi.fn(async (identity: AssetAliasIdentity) => ({
+            revision: 12,
+            value: identity.kind === 'asset' ? asset : inlay,
+        }))
+        const deleteAssetAlias = vi.fn(async () => ({ revision: 13 }))
+        const cas = createCas({
+            readObject: vi.fn(async (hash) => new Uint8Array([
+                hash === assetHash ? 1 : 2,
+            ])),
+        })
+        const { typed } = createFacade({
+            store: createStore({ readAssetAlias, deleteAssetAlias }),
+            cas,
+        })
+
+        await expect(typed.read({ kind: 'asset', key })).resolves.toEqual(new Uint8Array([1]))
+        await expect(typed.read({ kind: 'inlay', key })).resolves.toEqual(new Uint8Array([2]))
+        await typed.remove({ kind: 'asset', key })
+
+        expect(deleteAssetAlias).toHaveBeenCalledWith({ kind: 'asset', key }, 12)
+    })
+
+    it('rejects key and kind mismatches at the key-only BlobStore boundary', async () => {
+        const { facade, cas } = createFacade()
+
+        await expect(facade.put('assets/inlay.webp', new Uint8Array([1]), {
+            kind: 'inlay',
+            mime: 'image/webp',
+            name: 'inlay.webp',
+            ext: 'webp',
+            inlayType: 'image',
+        })).rejects.toThrow('namespace does not match')
+        await expect(facade.putNewInlayImage(
+            'assets/inlay.webp',
+            new Uint8Array([1]),
+            { name: 'inlay.webp' },
+        )).rejects.toThrow('namespace does not match')
+        expect(cas.prepare).not.toHaveBeenCalled()
+    })
+
+    it('publishes ordinary asset bytes exactly before committing a typed alias', async () => {
+        const { facade, cas, store } = createFacade()
+        const input = new Uint8Array([0, 255, 7, 42])
+
+        const metadata = await facade.put('assets/photo.bin', input, {
+            kind: 'asset',
+            mime: 'application/x-exact',
+            name: 'photo.bin',
+            ext: 'bin',
+        })
+        input.fill(1)
+
+        expect(cas.prepare).toHaveBeenCalledWith(new Uint8Array([0, 255, 7, 42]))
+        expect(store.commitAssetAlias).toHaveBeenCalledWith({
+            kind: 'asset',
+            key: 'assets/photo.bin',
+            objectHash: assetHash,
+            size: 4,
+            mime: 'application/x-exact',
+            name: 'photo.bin',
+            ext: 'bin',
+        }, 10)
+        expect(metadata).toEqual({
+            kind: 'asset',
+            key: 'assets/photo.bin',
+            size: 4,
+            mime: 'application/x-exact',
+            name: 'photo.bin',
+            ext: 'bin',
+        })
+    })
+
+    it('uses bounded CAS reads and never falls back for a non-null object hash', async () => {
+        const alias = assetAlias()
+        const store = createStore({
+            readAssetAlias: vi.fn(async () => ({ revision: 4, value: alias })),
+        })
+        const cas = createCas({
+            statObject: vi.fn(async () => 4),
+            readObjectRange: vi.fn(async () => new Uint8Array([2, 3])),
+        })
+        const legacy = createLegacy()
+        legacy.read.mockResolvedValue(new Uint8Array([9, 9, 9, 9]))
+        const { facade } = createFacade({ store, cas, legacy })
+
+        await expect(facade.read('assets/photo.bin', { start: 1, endExclusive: 3 }))
+            .resolves.toEqual(new Uint8Array([2, 3]))
+        expect(cas.readObjectRange).toHaveBeenCalledWith(assetHash, {
+            start: 1,
+            endExclusive: 3,
+        })
+        expect(legacy.read).not.toHaveBeenCalled()
+
+        vi.mocked(cas.readObjectRange).mockResolvedValueOnce(null)
+        await expect(facade.read('assets/photo.bin', { start: 1, endExclusive: 3 }))
+            .resolves.toBeNull()
+        expect(legacy.read).not.toHaveBeenCalled()
+    })
+
+    it('allows legacy fallback only for an explicit null-hash alias', async () => {
+        const alias = assetAlias({ objectHash: null })
+        const store = createStore({
+            readAssetAlias: vi.fn(async () => ({ revision: 4, value: alias })),
+        })
+        const legacy = createLegacy()
+        legacy.read.mockResolvedValue(new Uint8Array([1, 2, 3, 4]))
+        legacy.resolveUrl.mockResolvedValue('risuasset://legacy')
+        const { facade } = createFacade({ store, legacy })
+
+        await expect(facade.read('assets/photo.bin')).resolves.toEqual(new Uint8Array([1, 2, 3, 4]))
+        await expect(facade.resolveUrl('assets/photo.bin')).resolves.toBe('risuasset://legacy')
+        expect(legacy.read).toHaveBeenCalledWith({ kind: 'asset', key: 'assets/photo.bin' })
+        expect(legacy.resolveUrl).toHaveBeenCalledWith({ kind: 'asset', key: 'assets/photo.bin' })
+    })
+
+    it('keeps explicit null-hash legacy Range reads bounded', async () => {
+        const alias = assetAlias({ objectHash: null })
+        const store = createStore({
+            readAssetAlias: vi.fn(async () => ({ revision: 4, value: alias })),
+        })
+        const legacy = createLegacy()
+        legacy.read.mockResolvedValue(new Uint8Array([2, 3]))
+        const { facade } = createFacade({ store, legacy })
+
+        await expect(facade.read('assets/photo.bin', { start: 1, endExclusive: 3 }))
+            .resolves.toEqual(new Uint8Array([2, 3]))
+        expect(legacy.read).toHaveBeenCalledWith(
+            { kind: 'asset', key: 'assets/photo.bin' },
+            { start: 1, endExclusive: 3 },
+        )
+    })
+
+    it('pages the typed alias catalog without enumerating CAS objects', async () => {
+        const first = assetAlias({ key: 'assets/a' })
+        const second = assetAlias({ key: 'assets/b' })
+        const listAssetAliases = vi.fn(async ({ cursor }: { cursor?: string }) => cursor
+            ? { revision: 8, items: [second] }
+            : { revision: 8, items: [first], nextCursor: 'page-2' })
+        const store = createStore({ listAssetAliases })
+        const { facade } = createFacade({ store })
+
+        await expect(facade.list({ kind: 'asset' })).resolves.toEqual([
+            expect.objectContaining({ kind: 'asset', key: 'assets/a' }),
+            expect.objectContaining({ kind: 'asset', key: 'assets/b' }),
+        ])
+        expect(listAssetAliases).toHaveBeenNthCalledWith(1, { kind: 'asset', limit: 2 })
+        expect(listAssetAliases).toHaveBeenNthCalledWith(2, {
+            kind: 'asset',
+            limit: 2,
+            cursor: 'page-2',
+        })
+    })
+
+    it('fails closed if the catalog revision changes while paging', async () => {
+        const listAssetAliases = vi.fn(async ({ cursor }: { cursor?: string }) => cursor
+            ? { revision: 9, items: [] }
+            : { revision: 8, items: [], nextCursor: 'page-2' })
+        const { facade } = createFacade({ store: createStore({ listAssetAliases }) })
+
+        await expect(facade.list()).rejects.toThrow('revision changed while listing')
+    })
+
+    it('deletes only the typed alias and never deletes physical CAS bytes', async () => {
+        const alias = assetAlias()
+        const readAssetAlias = vi.fn(async () => ({ revision: 15, value: alias }))
+        const deleteAssetAlias = vi.fn(async () => ({ revision: 16 }))
+        const store = createStore({ readAssetAlias, deleteAssetAlias })
+        const { facade } = createFacade({ store })
+
+        await facade.remove('assets/photo.bin')
+
+        expect(readAssetAlias).toHaveBeenCalledWith({ kind: 'asset', key: 'assets/photo.bin' })
+        expect(deleteAssetAlias).toHaveBeenCalledWith({ kind: 'asset', key: 'assets/photo.bin' }, 15)
+    })
+
+    it('resolves a validated CAS object descriptor and does not fall back when the object is missing', async () => {
+        const alias = assetAlias()
+        const store = createStore({
+            readAssetAlias: vi.fn(async () => ({ revision: 3, value: alias })),
+        })
+        const cas = createCas({ statObject: vi.fn(async () => 4) })
+        const legacy = createLegacy()
+        legacy.resolveUrl.mockResolvedValue('risuasset://legacy')
+        const { facade, resolveObjectUrl } = createFacade({ store, cas, legacy })
+
+        await expect(facade.resolveUrl('assets/photo.bin')).resolves.toBe('risuasset://cas-object')
+        expect(resolveObjectUrl).toHaveBeenCalledWith({
+            contentHash: assetHash,
+            mime: 'application/octet-stream',
+            size: 4,
+        })
+
+        vi.mocked(cas.statObject).mockResolvedValueOnce(null)
+        await expect(facade.resolveUrl('assets/photo.bin')).resolves.toBeNull()
+        expect(legacy.resolveUrl).not.toHaveBeenCalled()
+    })
+
+    it('encodes a new Inlay once and publishes the returned encoded bytes without another transform', async () => {
+        const cas = createCas({
+            prepare: vi.fn(async (data) => ({
+                contentHash: inlayHash,
+                byteSize: data.byteLength,
+                physicalKey: `assets-v2/objects/bb/${'b'.repeat(62)}`,
+                deduplicated: false,
+            })),
+        })
+        const { facade, encodeNewInlayImage, store } = createFacade({ cas })
+        const source = new Uint8Array([1, 2, 3, 4])
+
+        const metadata = await facade.putNewInlayImage('inlay-key', source, { name: 'fresh.png' })
+
+        expect(encodeNewInlayImage).toHaveBeenCalledTimes(1)
+        expect(encodeNewInlayImage).toHaveBeenCalledWith('inlay-key', source, { name: 'fresh.png' })
+        expect(cas.prepare).toHaveBeenCalledWith(new Uint8Array([8, 6, 7]))
+        expect(store.commitAssetAlias).toHaveBeenCalledWith({
+            kind: 'inlay',
+            key: 'inlay-key',
+            objectHash: inlayHash,
+            size: 3,
+            mime: 'image/webp',
+            name: 'fresh.webp',
+            ext: 'webp',
+            inlayType: 'image',
+            width: 19,
+            height: 23,
+        }, 10)
+        expect(metadata).toEqual(expect.objectContaining({
+            kind: 'inlay',
+            key: 'inlay-key',
+            size: 3,
+            width: 19,
+            height: 23,
+        }))
+    })
+})

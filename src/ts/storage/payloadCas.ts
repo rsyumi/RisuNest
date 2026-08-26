@@ -43,7 +43,7 @@ export async function hashPayloadBytes(bytes: Uint8Array): Promise<string> {
     return Buffer.from(digest).toString('hex')
 }
 
-function objectPhysicalKey(contentHash: string): string {
+export function objectPhysicalKey(contentHash: string): string {
     if (!/^[0-9a-f]{64}$/.test(contentHash)) {
         throw new TypeError('Content hash must be 64 lowercase hexadecimal characters')
     }

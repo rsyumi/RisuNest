@@ -6,6 +6,7 @@ import {
     createOpfsBlobBackend,
     createStorageBlobStore,
     createTauriBlobBackend,
+    createTauriCasObjectUrl,
     createTauriBlobStore,
     createTauriNativeMediaUrl,
     physicalBlobKeys,
@@ -41,6 +42,25 @@ describe('platform BlobStore', () => {
             'risuasset://6173736574732f666f6c6465722f70686f746f2e6a7067',
         )
         expect(convert).toHaveBeenCalledWith('6173736574732f666f6c6465722f70686f746f2e6a7067', 'risuasset')
+    })
+
+    test('builds an exact native CAS URL from the alias hash, MIME, and size', () => {
+        const convert = vi.fn((path: string, protocol?: string) => `${protocol}://localhost/${path}`)
+        const hash = 'ab'.repeat(32)
+
+        expect(createTauriCasObjectUrl({
+            contentHash: hash,
+            mime: 'image/custom; profile=exact',
+            size: 42,
+        }, convert)).toBe(
+            `risuasset://localhost/${Buffer.from(`assets-v2/objects/ab/${hash.slice(2)}`).toString('hex')}`
+            + '?mime=image%2Fcustom%3B+profile%3Dexact&size=42',
+        )
+        expect(() => createTauriCasObjectUrl({
+            contentHash: hash,
+            mime: 'image/png\0text/html',
+            size: 42,
+        }, convert)).toThrow('MIME')
     })
 
     test('Tauri BlobStore mutates original payloads without native cleanup commands', async () => {

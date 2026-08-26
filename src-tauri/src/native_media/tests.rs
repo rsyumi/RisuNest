@@ -24,6 +24,31 @@ fn request(method: Method, physical_key: &str) -> Request<Vec<u8>> {
         .unwrap()
 }
 
+fn cas_request(method: Method, physical_key: &str, mime: &str, size: u64) -> Request<Vec<u8>> {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("mime", mime)
+        .append_pair("size", &size.to_string())
+        .finish();
+    Request::builder()
+        .method(method)
+        .uri(format!(
+            "http://risuasset.localhost/{}?{}",
+            hex(physical_key),
+            query
+        ))
+        .body(Vec::new())
+        .unwrap()
+}
+
+fn write_cas_object(root: &Path, bytes: &[u8]) -> (String, String) {
+    let hash = sha256_hex(bytes);
+    let physical_key = format!("assets-v2/objects/{}/{}", &hash[..2], &hash[2..]);
+    let payload = root.join(physical_key.replace('/', std::path::MAIN_SEPARATOR_STR));
+    fs::create_dir_all(payload.parent().unwrap()).unwrap();
+    fs::write(payload, bytes).unwrap();
+    (hash, physical_key)
+}
+
 fn write_blob(root: &Path, logical_key: &str, bytes: &[u8], mime: &str) {
     let physical_key = if logical_key.starts_with("assets/") {
         logical_key.to_owned()
@@ -103,6 +128,154 @@ fn maps_only_supported_physical_keys_without_traversal() {
         )),
         None
     );
+}
+
+#[test]
+fn maps_only_exact_lowercase_cas_object_paths() {
+    let hash = "ab".repeat(32);
+    let physical_key = format!("assets-v2/objects/ab/{}", &hash[2..]);
+    assert_eq!(
+        decode_physical_key(&format!(
+            "http://risuasset.localhost/{}?mime=image%2Fpng&size=1",
+            hex(&physical_key)
+        )),
+        Some(physical_key)
+    );
+
+    for invalid in [
+        format!("assets-v2/objects/a/{}", &hash[2..]),
+        format!("assets-v2/objects/AB/{}", &hash[2..]),
+        format!("assets-v2/objects/ab/{}", &hash[3..]),
+        format!("assets-v2/objects/ab/{}/extra", &hash[2..]),
+    ] {
+        assert_eq!(
+            decode_physical_key(&format!("http://risuasset.localhost/{}", hex(&invalid))),
+            None,
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn serves_cas_get_head_and_range_with_alias_descriptor_and_strong_hash_etag() {
+    let temp = TempDir::new().unwrap();
+    let bytes = b"0123456789";
+    let (hash, physical_key) = write_cas_object(temp.path(), bytes);
+
+    let get = respond(
+        temp.path(),
+        cas_request(
+            Method::GET,
+            &physical_key,
+            "application/x-exact",
+            bytes.len() as u64,
+        ),
+    );
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(get.body(), bytes);
+    assert_eq!(get.headers()[header::CONTENT_TYPE], "application/x-exact");
+    assert_eq!(
+        get.headers()[header::ETAG].to_str().unwrap(),
+        format!("\"{hash}\"")
+    );
+
+    let head = respond(
+        temp.path(),
+        cas_request(
+            Method::HEAD,
+            &physical_key,
+            "application/x-exact",
+            bytes.len() as u64,
+        ),
+    );
+    assert_eq!(head.status(), StatusCode::OK);
+    assert!(head.body().is_empty());
+    assert_eq!(head.headers()[header::CONTENT_LENGTH], "10");
+    assert_eq!(
+        head.headers()[header::ETAG].to_str().unwrap(),
+        format!("\"{hash}\"")
+    );
+
+    let mut ranged = cas_request(
+        Method::GET,
+        &physical_key,
+        "application/x-exact",
+        bytes.len() as u64,
+    );
+    ranged
+        .headers_mut()
+        .insert(header::RANGE, "bytes=3-6".parse().unwrap());
+    let ranged = respond(temp.path(), ranged);
+    assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(ranged.body(), b"3456");
+    assert_eq!(ranged.headers()[header::CONTENT_RANGE], "bytes 3-6/10");
+
+    let mut conditional = cas_request(
+        Method::GET,
+        &physical_key,
+        "application/x-exact",
+        bytes.len() as u64,
+    );
+    conditional.headers_mut().insert(
+        header::IF_NONE_MATCH,
+        format!("\"{hash}\"").parse().unwrap(),
+    );
+    assert_eq!(
+        respond(temp.path(), conditional).status(),
+        StatusCode::NOT_MODIFIED
+    );
+}
+
+#[test]
+fn rejects_missing_or_corrupt_cas_descriptors_and_preserves_zero_byte_behavior() {
+    let temp = TempDir::new().unwrap();
+    let (_, physical_key) = write_cas_object(temp.path(), b"abc");
+
+    let missing_hash = "cd".repeat(32);
+    let missing_key = format!("assets-v2/objects/cd/{}", &missing_hash[2..]);
+    assert_eq!(
+        respond(
+            temp.path(),
+            cas_request(Method::GET, &missing_key, "application/octet-stream", 0),
+        )
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    assert_eq!(
+        respond(temp.path(), request(Method::GET, &physical_key)).status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let duplicate_mime = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "http://risuasset.localhost/{}?mime=text%2Fplain&mime=text%2Fhtml&size=3",
+            hex(&physical_key)
+        ))
+        .body(Vec::new())
+        .unwrap();
+    assert_eq!(
+        respond(temp.path(), duplicate_mime).status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        respond(
+            temp.path(),
+            cas_request(Method::GET, &physical_key, "application/octet-stream", 4),
+        )
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let (_, empty_key) = write_cas_object(temp.path(), b"");
+    let empty = respond(
+        temp.path(),
+        cas_request(Method::GET, &empty_key, "application/octet-stream", 0),
+    );
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert!(empty.body().is_empty());
+    assert_eq!(empty.headers()[header::CONTENT_LENGTH], "0");
 }
 
 #[test]

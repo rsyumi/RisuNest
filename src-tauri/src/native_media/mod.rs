@@ -1,3 +1,4 @@
+use crate::asset_repository::PayloadCas;
 use image::codecs::png::PngDecoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
@@ -68,7 +69,8 @@ struct ResolvedBlob {
     payload_path: PathBuf,
     mime: String,
     size: u64,
-    modified: SystemTime,
+    validator: String,
+    cache_control: &'static str,
 }
 
 enum RequestedRange {
@@ -99,6 +101,9 @@ pub(crate) fn decode_physical_key(uri: &str) -> Option<String> {
 }
 
 fn valid_physical_key(key: &str) -> bool {
+    if cas_content_hash(key).is_some() {
+        return true;
+    }
     if let Some(rest) = key.strip_prefix("assets/") {
         return !rest.is_empty() && rest.split('/').all(safe_segment);
     }
@@ -113,6 +118,20 @@ fn valid_physical_key(key: &str) -> bool {
         && encoded
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn cas_content_hash(key: &str) -> Option<String> {
+    let (shard, suffix) = key.strip_prefix("assets-v2/objects/")?.split_once('/')?;
+    if shard.len() != 2
+        || suffix.len() != 62
+        || !shard
+            .bytes()
+            .chain(suffix.bytes())
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(format!("{shard}{suffix}"))
 }
 
 fn safe_segment(segment: &str) -> bool {
@@ -135,7 +154,43 @@ fn logical_key(physical_key: &str) -> Option<(String, &'static str)> {
     Some((String::from_utf8(hex::decode(encoded).ok()?).ok()?, "inlay"))
 }
 
-fn resolve_blob(root: &Path, physical_key: String) -> Option<ResolvedBlob> {
+fn cas_descriptor(uri: &str) -> Option<(String, u64)> {
+    let parsed = url::Url::parse(uri).ok()?;
+    let mut mime = None;
+    let mut size = None;
+    for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+            "mime" if mime.is_none() => mime = Some(value.into_owned()),
+            "size" if size.is_none() => size = Some(value.parse::<u64>().ok()?),
+            _ => return None,
+        }
+    }
+    let mime = mime?;
+    if mime.is_empty() || HeaderValue::from_str(&mime).is_err() {
+        return None;
+    }
+    Some((mime, size?))
+}
+
+fn resolve_blob(root: &Path, uri: &str, physical_key: String) -> Option<ResolvedBlob> {
+    if let Some(content_hash) = cas_content_hash(&physical_key) {
+        let (mime, expected_size) = cas_descriptor(uri)?;
+        let payload_path = PayloadCas::new(root)
+            .ok()?
+            .object_path(&content_hash)
+            .ok()??;
+        let file_metadata = fs::metadata(&payload_path).ok()?;
+        if !file_metadata.is_file() || file_metadata.len() != expected_size {
+            return None;
+        }
+        return Some(ResolvedBlob {
+            payload_path,
+            mime,
+            size: expected_size,
+            validator: format!("\"{content_hash}\""),
+            cache_control: "public, max-age=31536000, immutable",
+        });
+    }
     let (logical_key, expected_kind) = logical_key(&physical_key)?;
     let metadata_path = root
         .join("blobstore")
@@ -155,11 +210,13 @@ fn resolve_blob(root: &Path, physical_key: String) -> Option<ResolvedBlob> {
     {
         return None;
     }
+    let modified = file_metadata.modified().ok()?;
     Some(ResolvedBlob {
         payload_path,
         mime: blob_metadata.mime,
         size: file_metadata.len(),
-        modified: file_metadata.modified().ok()?,
+        validator: etag(modified, file_metadata.len()),
+        cache_control: "no-cache",
     })
 }
 
@@ -952,13 +1009,14 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
             .body(Vec::new())
             .unwrap();
     }
-    let Some(physical_key) = decode_physical_key(&request.uri().to_string()) else {
+    let uri = request.uri().to_string();
+    let Some(physical_key) = decode_physical_key(&uri) else {
         return not_found();
     };
-    let Some(blob) = resolve_blob(root, physical_key) else {
+    let Some(blob) = resolve_blob(root, &uri, physical_key) else {
         return not_found();
     };
-    let validator = etag(blob.modified, blob.size);
+    let validator = blob.validator.clone();
     if request
         .headers()
         .get(header::IF_NONE_MATCH)
@@ -967,7 +1025,7 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
     {
         return base_response(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, validator)
-            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CACHE_CONTROL, blob.cache_control)
             .body(Vec::new())
             .unwrap();
     }
@@ -976,7 +1034,7 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
         return base_response(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{}", blob.size))
             .header(header::ETAG, validator)
-            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CACHE_CONTROL, blob.cache_control)
             .body(Vec::new())
             .unwrap();
     };
@@ -989,7 +1047,7 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
         .header(header::CONTENT_TYPE, blob.mime)
         .header(header::CONTENT_LENGTH, length.to_string())
         .header(header::ETAG, validator)
-        .header(header::CACHE_CONTROL, "no-cache");
+        .header(header::CACHE_CONTROL, blob.cache_control);
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(
             header::CONTENT_RANGE,
