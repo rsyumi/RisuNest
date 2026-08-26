@@ -1,6 +1,6 @@
 #[allow(dead_code)]
 pub(crate) mod png_card;
-mod classifier;
+pub(crate) mod classifier;
 mod error;
 mod json_card;
 mod risum;

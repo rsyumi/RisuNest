@@ -1,3 +1,6 @@
+use crate::import_export_jobs::classifier::{preflight_zip, ArchiveView, ZipPreflight};
+use crate::import_export_jobs::{FormatError, FormatErrorKind};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crc32fast::Hasher as Crc32Hasher;
 use serde::Serialize;
 use serde_json::Value;
@@ -9,18 +12,16 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use zip::ZipArchive;
+use url::Url;
+use zip::{ZipArchive, SUPPORTED_COMPRESSION_METHODS};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const CANCELLED_IO_MESSAGE: &str = "CharX parsing was cancelled";
 const CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const CENTRAL_DIRECTORY_HEADER_BYTES: usize = 46;
-const END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0605_4b50;
-const ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0606_4b50;
-const ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE: u32 = 0x0706_4b50;
-const END_OF_CENTRAL_DIRECTORY_BYTES: usize = 22;
-const MAX_ZIP_COMMENT_BYTES: usize = u16::MAX as usize;
-const MAX_ZIP64_END_RECORD_BYTES: usize = 64 * 1024;
+const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
+const LOCAL_FILE_HEADER_BYTES: usize = 30;
+const DATA_DESCRIPTOR_SIGNATURE: u32 = 0x0807_4b50;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CharXLimits {
@@ -169,11 +170,20 @@ struct EntryMetadata {
     is_directory: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ArchiveDirectorySummary {
-    entry_count: u64,
-    directory_offset: u64,
-    directory_bytes: u64,
+#[derive(Clone, Copy, Debug)]
+struct EntryLayout {
+    local_start: u64,
+    local_end: u64,
+    central_start: u64,
+    central_end: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DataDescriptorExpected {
+    crc32: u32,
+    compressed: u64,
+    decoded: u64,
+    uses_zip64: bool,
 }
 
 struct OwnedStagingDirectory {
@@ -204,13 +214,17 @@ where
     }
 
     fn check(&self) -> Result<(), CharXParseError> {
-        if (self.callback.borrow_mut())() {
+        if self.is_cancelled() {
             return Err(CharXParseError::new(
                 CharXParseErrorCode::Cancelled,
                 CANCELLED_IO_MESSAGE,
             ));
         }
         Ok(())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        (self.callback.borrow_mut())()
     }
 
     fn check_io(&self) -> io::Result<()> {
@@ -296,169 +310,158 @@ where
         .len();
     let extension = extension_of(original_name);
     let normalized_extension = extension.as_ref().map(|value| value.to_ascii_lowercase());
-    let jpeg_name = matches!(normalized_extension.as_deref(), Some("jpg" | "jpeg"));
     let jpeg_signature = has_jpeg_signature(source_path, &cancellation)?;
 
-    if jpeg_name && !jpeg_signature {
-        return Err(CharXParseError::new(
+    match inspect_card_container(
+        source_path,
+        staging_root,
+        limits,
+        jpeg_signature,
+        &cancellation,
+    ) {
+        Ok(card) => Ok(CharXInspection::Card(card)),
+        Err(error)
+            if jpeg_signature
+                && !matches!(
+                    error.code(),
+                    CharXParseErrorCode::Cancelled | CharXParseErrorCode::Io
+                ) =>
+        {
+            cancellation.check()?;
+            Ok(ordinary_jpeg_descriptor(
+                original_name,
+                &extension,
+                &normalized_extension,
+                source_length,
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn inspect_card_container<F>(
+    source_path: &Path,
+    staging_root: &Path,
+    limits: CharXLimits,
+    jpeg_signature: bool,
+    cancellation: &Cancellation<F>,
+) -> Result<ParsedCharXDescriptor, CharXParseError>
+where
+    F: FnMut() -> bool,
+{
+    let file = File::open(source_path).map_err(|error| io_error("open CharX source", error))?;
+    let mut source = CancellableReader::new(file, cancellation.clone());
+    let preflight = preflight_zip(&mut source, usize::MAX, u64::MAX, &|| {
+        cancellation.is_cancelled()
+    })
+    .map_err(format_error)?
+    .ok_or_else(|| {
+        CharXParseError::new(
             CharXParseErrorCode::InvalidArchive,
-            "JPEG input does not have a JPEG signature",
-        ));
-    }
+            "source has no valid bounded ZIP footer",
+        )
+    })?;
 
-    let directory = match read_archive_directory_summary(source_path, &cancellation) {
-        Ok(directory) => directory,
-        Err(error) if jpeg_name && error.code() != CharXParseErrorCode::Cancelled => {
-            return Ok(ordinary_jpeg_descriptor(
-                original_name,
-                &extension,
-                &normalized_extension,
-                source_length,
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    let directory_over_limit = directory.entry_count > limits.max_entries as u64
-        || directory.directory_bytes > limits.max_directory_bytes;
-    if jpeg_name && directory_over_limit {
-        return Ok(ordinary_jpeg_descriptor(
-            original_name,
-            &extension,
-            &normalized_extension,
-            source_length,
-        ));
-    }
-    validate_directory_limits(directory, limits)?;
-    if let Err(error) = validate_central_directory_layout(source_path, directory, &cancellation) {
-        if jpeg_name && error.code() != CharXParseErrorCode::Cancelled {
-            return Ok(ordinary_jpeg_descriptor(
-                original_name,
-                &extension,
-                &normalized_extension,
-                source_length,
-            ));
-        }
-        return Err(error);
-    }
-
-    let archive_file = File::open(source_path)
-        .map(|file| CancellableReader::new(file, cancellation.clone()))
-        .map_err(|error| io_error("open CharX source", error))?;
-    let mut archive = match ZipArchive::new(archive_file) {
-        Ok(archive) => archive,
-        Err(_error) if jpeg_name && jpeg_signature => {
-            return Ok(ordinary_jpeg_descriptor(
-                original_name,
-                &extension,
-                &normalized_extension,
-                source_length,
-            ));
-        }
-        Err(error) => return Err(zip_error("open CharX archive", error)),
-    };
-
-    cancellation.check()?;
-    if archive.len() as u64 != directory.entry_count {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::InvalidArchive,
-            "CharX entry count differs between footer and parsed directory",
-        ));
-    }
-    let archive_offset = archive.offset();
-    let has_card_entry = archive_has_card_entry(&archive, &cancellation)?;
-    if jpeg_name && (!has_card_entry || archive_offset == 0) {
-        return Ok(ordinary_jpeg_descriptor(
-            original_name,
-            &extension,
-            &normalized_extension,
-            source_length,
-        ));
-    }
-
-    let container_kind = if archive_offset == 0 {
-        CharXContainerKind::CharX
-    } else {
-        if !jpeg_signature
-            || !jpeg_prefix_has_end_marker(source_path, archive_offset, &cancellation)?
+    validate_preflight_limits(preflight, limits)?;
+    let container_kind = if jpeg_signature {
+        if preflight.archive_start == 0
+            || !jpeg_prefix_ends_at_archive(source_path, preflight.archive_start, cancellation)?
         {
             return Err(CharXParseError::new(
                 CharXParseErrorCode::InvalidArchive,
-                "data before the CharX archive is not a complete JPEG prefix",
+                "JPEG prefix does not end immediately before the CharX archive",
             ));
         }
         CharXContainerKind::AppendedCharXJpeg
+    } else {
+        if preflight.archive_start != 0 {
+            return Err(CharXParseError::new(
+                CharXParseErrorCode::InvalidArchive,
+                "non-JPEG data precedes the CharX archive",
+            ));
+        }
+        CharXContainerKind::CharX
     };
 
-    if !has_card_entry {
+    let view = ArchiveView::new(&mut source, preflight.archive_start, preflight.archive_end)
+        .map_err(format_error)?;
+    let mut archive =
+        ZipArchive::new(view).map_err(|error| structural_zip_error("open CharX archive", error))?;
+    cancellation.check()?;
+    if archive.offset() != 0 || archive.len() != preflight.entry_count {
         return Err(CharXParseError::new(
-            CharXParseErrorCode::MissingCardMetadata,
-            "CharX archive has no root card.json entry",
+            CharXParseErrorCode::InvalidArchive,
+            "CharX footer and bounded archive view disagree",
         ));
     }
 
-    if archive.len() > limits.max_entries {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::TooManyEntries,
-            format!(
-                "CharX has {} entries, limit is {}",
-                archive.len(),
-                limits.max_entries
-            ),
-        ));
+    match archive
+        .file_names()
+        .filter(|name| *name == "card.json")
+        .count()
+    {
+        0 => {
+            return Err(CharXParseError::new(
+                CharXParseErrorCode::MissingCardMetadata,
+                "CharX archive has no root card.json entry",
+            ))
+        }
+        1 => {}
+        _ => {
+            return Err(CharXParseError::new(
+                CharXParseErrorCode::DuplicatePath,
+                "CharX archive has duplicate root card.json entries",
+            ))
+        }
     }
 
-    let entries = inspect_entries(source_path, &mut archive, limits, &cancellation)?;
-    let staging = OwnedStagingDirectory::create(staging_root)?;
+    let entries = inspect_entries(source_path, preflight, &mut archive, limits, cancellation)?;
+    let card_entry = entries
+        .iter()
+        .find(|entry| entry.normalized_name == "card.json")
+        .ok_or_else(|| {
+            CharXParseError::new(
+                CharXParseErrorCode::MissingCardMetadata,
+                "CharX archive has no readable root card.json entry",
+            )
+        })?;
     let mut total_actual_decoded = 0_u64;
-    let mut card_json = None;
-    let mut payloads = Vec::new();
+    let card_bytes = read_entry_to_memory(
+        &mut archive,
+        card_entry,
+        limits.max_metadata_bytes,
+        &mut total_actual_decoded,
+        limits.max_total_decoded_bytes,
+        cancellation,
+    )?;
+    let card_json = String::from_utf8(card_bytes).map_err(|_| {
+        CharXParseError::new(
+            CharXParseErrorCode::InvalidCardMetadata,
+            "card.json is not valid UTF-8",
+        )
+    })?;
+    let asset_references = validate_card_metadata(&card_json, &entries)?;
 
+    let staging = OwnedStagingDirectory::create(staging_root)?;
+    let mut payloads = Vec::new();
     for entry in &entries {
         cancellation.check()?;
-        if entry.is_directory {
+        if entry.is_directory || entry.normalized_name == "card.json" {
             continue;
         }
-
-        if entry.normalized_name == "card.json" {
-            let bytes = read_entry_to_memory(
-                &mut archive,
-                entry,
-                limits.max_metadata_bytes,
-                &mut total_actual_decoded,
-                limits.max_total_decoded_bytes,
-                &cancellation,
-            )?;
-            let text = String::from_utf8(bytes).map_err(|_| {
-                CharXParseError::new(
-                    CharXParseErrorCode::InvalidCardMetadata,
-                    "card.json is not valid UTF-8",
-                )
-            })?;
-            card_json = Some(text);
-            continue;
-        }
-
         let staged_path = staging
             .path
             .join(format!("{}.payload", uuid::Uuid::new_v4()));
-        let payload = stage_entry(
+        payloads.push(stage_entry(
             &mut archive,
             entry,
             &staged_path,
             &mut total_actual_decoded,
             limits.max_total_decoded_bytes,
-            &cancellation,
-        )?;
-        payloads.push(payload);
+            cancellation,
+        )?);
     }
 
-    let card_json = card_json.ok_or_else(|| {
-        CharXParseError::new(
-            CharXParseErrorCode::MissingCardMetadata,
-            "CharX archive has no readable card.json entry",
-        )
-    })?;
-    let asset_references = validate_card_metadata(&card_json, &payloads)?;
     let mut types_by_name: HashMap<&str, Vec<String>> = HashMap::new();
     for reference in &asset_references {
         types_by_name
@@ -472,17 +475,18 @@ where
             .unwrap_or_default();
     }
 
+    cancellation.check()?;
     let staging_directory = staging.preserve();
-    Ok(CharXInspection::Card(ParsedCharXDescriptor {
+    Ok(ParsedCharXDescriptor {
         container_kind,
-        archive_offset,
+        archive_offset: preflight.archive_start,
         entry_count: entries.len(),
         total_decoded_bytes: total_actual_decoded,
         card_json,
         staging_directory,
         payloads,
         asset_references,
-    }))
+    })
 }
 
 fn validate_limits(limits: CharXLimits) -> Result<(), CharXParseError> {
@@ -501,20 +505,20 @@ fn validate_limits(limits: CharXLimits) -> Result<(), CharXParseError> {
     Ok(())
 }
 
-fn validate_directory_limits(
-    directory: ArchiveDirectorySummary,
+fn validate_preflight_limits(
+    preflight: ZipPreflight,
     limits: CharXLimits,
 ) -> Result<(), CharXParseError> {
-    if directory.entry_count > limits.max_entries as u64 {
+    if preflight.entry_count > limits.max_entries {
         return Err(CharXParseError::new(
             CharXParseErrorCode::TooManyEntries,
             format!(
                 "CharX has {} entries, limit is {}",
-                directory.entry_count, limits.max_entries
+                preflight.entry_count, limits.max_entries
             ),
         ));
     }
-    if directory.directory_bytes > limits.max_directory_bytes {
+    if preflight.directory_size > limits.max_directory_bytes {
         return Err(CharXParseError::new(
             CharXParseErrorCode::MetadataTooLarge,
             "CharX central directory exceeds its byte limit",
@@ -523,203 +527,15 @@ fn validate_directory_limits(
     Ok(())
 }
 
-fn read_archive_directory_summary<F>(
-    source_path: &Path,
-    cancellation: &Cancellation<F>,
-) -> Result<ArchiveDirectorySummary, CharXParseError>
-where
-    F: FnMut() -> bool,
-{
-    let source_length = fs::metadata(source_path)
-        .map_err(|error| io_error("read ZIP footer source metadata", error))?
-        .len();
-    if source_length < END_OF_CENTRAL_DIRECTORY_BYTES as u64 {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::InvalidArchive,
-            "CharX source is shorter than a ZIP footer",
-        ));
-    }
-
-    let tail_bytes =
-        source_length.min((END_OF_CENTRAL_DIRECTORY_BYTES + MAX_ZIP_COMMENT_BYTES) as u64) as usize;
-    let tail_offset = source_length - tail_bytes as u64;
-    let mut source = File::open(source_path)
-        .map(|file| CancellableReader::new(file, cancellation.clone()))
-        .map_err(|error| io_error("open ZIP footer", error))?;
-    source
-        .seek(SeekFrom::Start(tail_offset))
-        .map_err(|error| io_error("seek ZIP footer", error))?;
-    let mut tail = vec![0_u8; tail_bytes];
-    source
-        .read_exact(&mut tail)
-        .map_err(|error| io_error("read ZIP footer", error))?;
-
-    let footer_index = (0..=tail.len() - END_OF_CENTRAL_DIRECTORY_BYTES)
-        .rev()
-        .find(|&index| {
-            read_u32(&tail, index) == Some(END_OF_CENTRAL_DIRECTORY_SIGNATURE)
-                && read_u16(&tail, index + 20).is_some_and(|comment_bytes| {
-                    index + END_OF_CENTRAL_DIRECTORY_BYTES + comment_bytes as usize == tail.len()
-                })
-        })
-        .ok_or_else(|| {
-            CharXParseError::new(
-                CharXParseErrorCode::InvalidArchive,
-                "CharX source has no valid ZIP footer",
-            )
-        })?;
-    let footer_offset = tail_offset + footer_index as u64;
-    let entry_count = read_u16(&tail, footer_index + 10).unwrap() as u64;
-    let directory_bytes = read_u32(&tail, footer_index + 12).unwrap() as u64;
-    let directory_relative_offset = read_u32(&tail, footer_index + 16).unwrap() as u64;
-
-    if entry_count != u16::MAX as u64
-        && directory_bytes != u32::MAX as u64
-        && directory_relative_offset != u32::MAX as u64
-    {
-        let directory_offset = footer_offset.checked_sub(directory_bytes).ok_or_else(|| {
-            CharXParseError::new(
-                CharXParseErrorCode::InvalidArchive,
-                "CharX central directory begins before the source",
-            )
-        })?;
-        return Ok(ArchiveDirectorySummary {
-            entry_count,
-            directory_offset,
-            directory_bytes,
-        });
-    }
-
-    let locator_offset = footer_offset.checked_sub(20).ok_or_else(|| {
-        CharXParseError::new(
-            CharXParseErrorCode::InvalidArchive,
-            "ZIP64 footer has no locator",
-        )
-    })?;
-    source
-        .seek(SeekFrom::Start(locator_offset))
-        .map_err(|error| io_error("seek ZIP64 locator", error))?;
-    let mut locator = [0_u8; 20];
-    source
-        .read_exact(&mut locator)
-        .map_err(|error| io_error("read ZIP64 locator", error))?;
-    if read_u32(&locator, 0) != Some(ZIP64_END_OF_CENTRAL_DIRECTORY_LOCATOR_SIGNATURE) {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::InvalidArchive,
-            "ZIP64 footer has an invalid locator",
-        ));
-    }
-
-    let search_bytes = locator_offset.min(MAX_ZIP64_END_RECORD_BYTES as u64) as usize;
-    let search_offset = locator_offset - search_bytes as u64;
-    source
-        .seek(SeekFrom::Start(search_offset))
-        .map_err(|error| io_error("seek ZIP64 end record", error))?;
-    let mut search = vec![0_u8; search_bytes];
-    source
-        .read_exact(&mut search)
-        .map_err(|error| io_error("read ZIP64 end record", error))?;
-    let zip64_index = (0..search.len().saturating_sub(56) + 1)
-        .rev()
-        .find(|&index| {
-            if read_u32(&search, index) != Some(ZIP64_END_OF_CENTRAL_DIRECTORY_SIGNATURE) {
-                return false;
-            }
-            read_u64(&search, index + 4).is_some_and(|record_bytes| {
-                record_bytes >= 44
-                    && (index as u64)
-                        .checked_add(record_bytes)
-                        .and_then(|value| value.checked_add(12))
-                        == Some(search.len() as u64)
-            })
-        })
-        .ok_or_else(|| {
-            CharXParseError::new(
-                CharXParseErrorCode::InvalidArchive,
-                "ZIP64 end record is missing or too large",
-            )
-        })?;
-    let zip64_offset = search_offset + zip64_index as u64;
-    let entry_count = read_u64(&search, zip64_index + 32).unwrap();
-    let directory_bytes = read_u64(&search, zip64_index + 40).unwrap();
-    let directory_offset = zip64_offset.checked_sub(directory_bytes).ok_or_else(|| {
-        CharXParseError::new(
-            CharXParseErrorCode::InvalidArchive,
-            "ZIP64 central directory begins before the source",
-        )
-    })?;
-    Ok(ArchiveDirectorySummary {
-        entry_count,
-        directory_offset,
-        directory_bytes,
-    })
-}
-
-fn validate_central_directory_layout<F>(
-    source_path: &Path,
-    directory: ArchiveDirectorySummary,
-    cancellation: &Cancellation<F>,
-) -> Result<(), CharXParseError>
-where
-    F: FnMut() -> bool,
-{
-    let directory_end = directory
-        .directory_offset
-        .checked_add(directory.directory_bytes)
-        .ok_or_else(|| {
-            CharXParseError::new(
-                CharXParseErrorCode::InvalidArchive,
-                "CharX central directory offset overflowed",
-            )
-        })?;
-    let mut source = File::open(source_path)
-        .map(|file| CancellableReader::new(file, cancellation.clone()))
-        .map_err(|error| io_error("open CharX central directory", error))?;
-    source
-        .seek(SeekFrom::Start(directory.directory_offset))
-        .map_err(|error| io_error("seek CharX central directory", error))?;
-    let mut position = directory.directory_offset;
-    let mut fixed = [0_u8; CENTRAL_DIRECTORY_HEADER_BYTES];
-
-    for _ in 0..directory.entry_count {
-        source
-            .read_exact(&mut fixed)
-            .map_err(|error| io_error("read CharX central directory header", error))?;
-        if read_u32(&fixed, 0) != Some(CENTRAL_DIRECTORY_SIGNATURE) {
-            return Err(CharXParseError::new(
-                CharXParseErrorCode::InvalidArchive,
-                "CharX central directory has an invalid entry signature",
-            ));
+fn format_error(error: FormatError) -> CharXParseError {
+    let code = match error.kind {
+        FormatErrorKind::Cancelled => CharXParseErrorCode::Cancelled,
+        FormatErrorKind::Io => CharXParseErrorCode::Io,
+        FormatErrorKind::InvalidFormat | FormatErrorKind::LimitExceeded => {
+            CharXParseErrorCode::InvalidArchive
         }
-        let variable_bytes = u64::from(read_u16(&fixed, 28).unwrap())
-            + u64::from(read_u16(&fixed, 30).unwrap())
-            + u64::from(read_u16(&fixed, 32).unwrap());
-        position = position
-            .checked_add(CENTRAL_DIRECTORY_HEADER_BYTES as u64)
-            .and_then(|value| value.checked_add(variable_bytes))
-            .ok_or_else(|| {
-                CharXParseError::new(
-                    CharXParseErrorCode::InvalidArchive,
-                    "CharX central directory entry length overflowed",
-                )
-            })?;
-        if position > directory_end {
-            return Err(CharXParseError::new(
-                CharXParseErrorCode::InvalidArchive,
-                "CharX central directory entry exceeds its declared size",
-            ));
-        }
-        source
-            .seek(SeekFrom::Start(position))
-            .map_err(|error| io_error("skip CharX central directory entry", error))?;
-    }
-    if position != directory_end {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::InvalidArchive,
-            "CharX central directory size does not match its entries",
-        ));
-    }
-    Ok(())
+    };
+    CharXParseError::new(code, error.to_string())
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -752,25 +568,9 @@ fn ordinary_jpeg_descriptor(
     })
 }
 
-fn archive_has_card_entry<R, F>(
-    archive: &ZipArchive<R>,
-    cancellation: &Cancellation<F>,
-) -> Result<bool, CharXParseError>
-where
-    R: Read + Seek,
-    F: FnMut() -> bool,
-{
-    for name in archive.file_names() {
-        cancellation.check()?;
-        if name == "card.json" {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn inspect_entries<R, F>(
     source_path: &Path,
+    preflight: ZipPreflight,
     archive: &mut ZipArchive<R>,
     limits: CharXLimits,
     cancellation: &Cancellation<F>,
@@ -794,20 +594,26 @@ where
     let mut sanitized_names = HashMap::with_capacity(archive.len());
     let mut total_decoded = 0_u64;
     let mut entries = Vec::with_capacity(archive.len());
+    let mut layouts = Vec::with_capacity(archive.len());
 
     for index in 0..archive.len() {
         cancellation.check()?;
         let entry = archive
-            .by_index(index)
-            .map_err(|error| zip_error("inspect CharX entry", error))?;
-        let raw_name = entry.name_raw();
-        let local_name = read_local_entry_name(source_path, entry.header_start(), cancellation)?;
-        if raw_name != local_name.as_slice() {
-            return Err(CharXParseError::new(
-                CharXParseErrorCode::InvalidPath,
-                "CharX local and central entry names differ",
-            ));
+            .by_index_raw(index)
+            .map_err(|error| structural_zip_error("inspect CharX entry", error))?;
+        if !SUPPORTED_COMPRESSION_METHODS.contains(&entry.compression()) {
+            return Err(invalid_archive(format!(
+                "unsupported CharX compression method: {}",
+                entry.compression()
+            )));
         }
+        let raw_name = entry.name_raw();
+        layouts.push(inspect_entry_layout(
+            source_path,
+            preflight,
+            &entry,
+            cancellation,
+        )?);
         let original_name = std::str::from_utf8(raw_name)
             .map_err(|_| {
                 CharXParseError::new(
@@ -885,6 +691,34 @@ where
         });
     }
 
+    layouts.sort_unstable_by_key(|layout| layout.local_start);
+    for pair in layouts.windows(2) {
+        if pair[0].local_end > pair[1].local_start {
+            return Err(CharXParseError::new(
+                CharXParseErrorCode::InvalidArchive,
+                "CharX local entry data extents overlap",
+            ));
+        }
+    }
+    layouts.sort_unstable_by_key(|layout| layout.central_start);
+    let directory_relative_start = preflight
+        .directory_start
+        .checked_sub(preflight.archive_start)
+        .ok_or_else(|| invalid_archive("CharX directory precedes its archive view"))?;
+    let directory_relative_end = directory_relative_start
+        .checked_add(preflight.directory_size)
+        .ok_or_else(|| invalid_archive("CharX directory extent overflowed"))?;
+    if layouts.first().map(|layout| layout.central_start) != Some(directory_relative_start)
+        || layouts.last().map(|layout| layout.central_end) != Some(directory_relative_end)
+        || layouts
+            .windows(2)
+            .any(|pair| pair[0].central_end != pair[1].central_start)
+    {
+        return Err(invalid_archive(
+            "CharX central directory extent does not exactly match its entries",
+        ));
+    }
+
     Ok(entries)
 }
 
@@ -954,36 +788,316 @@ fn has_drive_prefix(name: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
-fn read_local_entry_name<F>(
+fn inspect_entry_layout<F>(
     source_path: &Path,
-    header_start: u64,
+    preflight: ZipPreflight,
+    entry: &zip::read::ZipFile<'_>,
     cancellation: &Cancellation<F>,
+) -> Result<EntryLayout, CharXParseError>
+where
+    F: FnMut() -> bool,
+{
+    if entry
+        .unix_mode()
+        .is_some_and(|mode| mode & 0o170000 == 0o120000)
+    {
+        return Err(CharXParseError::new(
+            CharXParseErrorCode::InvalidArchive,
+            "CharX archive contains a symbolic-link entry",
+        ));
+    }
+
+    let archive_directory_start = preflight
+        .directory_start
+        .checked_sub(preflight.archive_start)
+        .ok_or_else(|| invalid_archive("CharX directory precedes its archive view"))?;
+    let directory_relative_end = archive_directory_start
+        .checked_add(preflight.directory_size)
+        .ok_or_else(|| invalid_archive("CharX directory extent overflowed"))?;
+    let central_relative_start = entry.central_header_start();
+    if central_relative_start < archive_directory_start
+        || central_relative_start
+            .checked_add(CENTRAL_DIRECTORY_HEADER_BYTES as u64)
+            .is_none_or(|end| end > directory_relative_end)
+    {
+        return Err(invalid_archive(
+            "CharX central header exceeds the declared directory",
+        ));
+    }
+    let central_start = preflight
+        .archive_start
+        .checked_add(central_relative_start)
+        .ok_or_else(|| invalid_archive("CharX central header offset overflowed"))?;
+    let central = read_exact_at::<CENTRAL_DIRECTORY_HEADER_BYTES, _>(
+        source_path,
+        central_start,
+        cancellation,
+        "central ZIP header",
+    )?;
+    if read_u32(&central, 0) != Some(CENTRAL_DIRECTORY_SIGNATURE) {
+        return Err(invalid_archive("invalid central ZIP header signature"));
+    }
+    let central_flags = read_u16(&central, 8).unwrap();
+    let central_method = read_u16(&central, 10).unwrap();
+    let central_disk = read_u16(&central, 34).unwrap();
+    if central_disk != 0 {
+        return Err(invalid_archive("CharX entry belongs to another ZIP disk"));
+    }
+
+    let local_relative_start = entry.header_start();
+    if local_relative_start
+        .checked_add(LOCAL_FILE_HEADER_BYTES as u64)
+        .is_none_or(|end| end > archive_directory_start)
+    {
+        return Err(invalid_archive(
+            "CharX local header enters the central directory",
+        ));
+    }
+    let local_start = preflight
+        .archive_start
+        .checked_add(local_relative_start)
+        .ok_or_else(|| invalid_archive("CharX local header offset overflowed"))?;
+    let local = read_exact_at::<LOCAL_FILE_HEADER_BYTES, _>(
+        source_path,
+        local_start,
+        cancellation,
+        "local ZIP header",
+    )?;
+    if read_u32(&local, 0) != Some(LOCAL_FILE_HEADER_SIGNATURE) {
+        return Err(invalid_archive("invalid local ZIP header signature"));
+    }
+    let local_flags = read_u16(&local, 6).unwrap();
+    let local_method = read_u16(&local, 8).unwrap();
+    if local_flags != central_flags {
+        return Err(invalid_archive(
+            "CharX local and central general-purpose flags differ",
+        ));
+    }
+    if local_method != central_method {
+        return Err(invalid_archive(
+            "CharX local and central compression methods differ",
+        ));
+    }
+    if central_flags & 1 != 0 {
+        return Err(invalid_archive("encrypted CharX entries are unsupported"));
+    }
+    const SUPPORTED_FLAGS: u16 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 11);
+    if central_flags & !SUPPORTED_FLAGS != 0 {
+        return Err(invalid_archive(
+            "CharX entry uses unsupported general-purpose flags",
+        ));
+    }
+
+    let name_length = u64::from(read_u16(&local, 26).unwrap());
+    let extra_length = u64::from(read_u16(&local, 28).unwrap());
+    let data_start = local_relative_start
+        .checked_add(LOCAL_FILE_HEADER_BYTES as u64)
+        .and_then(|value| value.checked_add(name_length))
+        .and_then(|value| value.checked_add(extra_length))
+        .ok_or_else(|| invalid_archive("CharX local header length overflowed"))?;
+    if data_start > archive_directory_start {
+        return Err(invalid_archive(
+            "CharX local name or extra data enters the central directory",
+        ));
+    }
+    let name_start = local_start
+        .checked_add(LOCAL_FILE_HEADER_BYTES as u64)
+        .ok_or_else(|| invalid_archive("CharX local name offset overflowed"))?;
+    let local_name = read_bytes_at(
+        source_path,
+        name_start,
+        usize::from(read_u16(&local, 26).unwrap()),
+        cancellation,
+        "local ZIP entry name",
+    )?;
+    if entry.name_raw() != local_name.as_slice() {
+        return Err(CharXParseError::new(
+            CharXParseErrorCode::InvalidPath,
+            "CharX local and central entry names differ",
+        ));
+    }
+
+    let data_end = data_start
+        .checked_add(entry.compressed_size())
+        .ok_or_else(|| invalid_archive("CharX compressed data extent overflowed"))?;
+    let local_crc = read_u32(&local, 14).unwrap();
+    let local_compressed = read_u32(&local, 18).unwrap();
+    let local_decoded = read_u32(&local, 22).unwrap();
+    let central_compressed = read_u32(&central, 20).unwrap();
+    let central_decoded = read_u32(&central, 24).unwrap();
+    let descriptor_uses_zip64 = local_compressed == u32::MAX
+        || local_decoded == u32::MAX
+        || central_compressed == u32::MAX
+        || central_decoded == u32::MAX
+        || entry.compressed_size() > u64::from(u32::MAX)
+        || entry.size() > u64::from(u32::MAX);
+    let extent_end = if central_flags & (1 << 3) != 0 {
+        if !descriptor_placeholder_matches(local_crc, entry.crc32())
+            || !descriptor_size_placeholder_matches(local_compressed, entry.compressed_size())
+            || !descriptor_size_placeholder_matches(local_decoded, entry.size())
+        {
+            return Err(invalid_archive(
+                "CharX local data-descriptor placeholders are inconsistent",
+            ));
+        }
+        validate_data_descriptor(
+            source_path,
+            preflight,
+            data_end,
+            DataDescriptorExpected {
+                crc32: entry.crc32(),
+                compressed: entry.compressed_size(),
+                decoded: entry.size(),
+                uses_zip64: descriptor_uses_zip64,
+            },
+            cancellation,
+        )?
+    } else {
+        if local_crc != entry.crc32()
+            || (local_compressed != u32::MAX
+                && u64::from(local_compressed) != entry.compressed_size())
+            || (local_decoded != u32::MAX && u64::from(local_decoded) != entry.size())
+        {
+            return Err(invalid_archive(
+                "CharX local and central CRC or sizes differ",
+            ));
+        }
+        data_end
+    };
+
+    if local_relative_start >= archive_directory_start || extent_end > archive_directory_start {
+        return Err(invalid_archive(
+            "CharX local entry data enters the central directory",
+        ));
+    }
+    let central_end = central_relative_start
+        .checked_add(CENTRAL_DIRECTORY_HEADER_BYTES as u64)
+        .and_then(|value| value.checked_add(u64::from(read_u16(&central, 28).unwrap())))
+        .and_then(|value| value.checked_add(u64::from(read_u16(&central, 30).unwrap())))
+        .and_then(|value| value.checked_add(u64::from(read_u16(&central, 32).unwrap())))
+        .ok_or_else(|| invalid_archive("CharX central entry extent overflowed"))?;
+    if central_relative_start < archive_directory_start || central_end > directory_relative_end {
+        return Err(invalid_archive(
+            "CharX central entry exceeds the declared directory",
+        ));
+    }
+    Ok(EntryLayout {
+        local_start: local_relative_start,
+        local_end: extent_end,
+        central_start: central_relative_start,
+        central_end,
+    })
+}
+
+fn descriptor_placeholder_matches(value: u32, expected: u32) -> bool {
+    value == 0 || value == expected
+}
+
+fn descriptor_size_placeholder_matches(value: u32, expected: u64) -> bool {
+    value == 0 || value == u32::MAX || u64::from(value) == expected
+}
+
+fn validate_data_descriptor<F>(
+    source_path: &Path,
+    preflight: ZipPreflight,
+    data_end: u64,
+    expected: DataDescriptorExpected,
+    cancellation: &Cancellation<F>,
+) -> Result<u64, CharXParseError>
+where
+    F: FnMut() -> bool,
+{
+    let directory_start = preflight
+        .directory_start
+        .checked_sub(preflight.archive_start)
+        .ok_or_else(|| invalid_archive("CharX directory precedes its archive view"))?;
+    let available = directory_start
+        .checked_sub(data_end)
+        .ok_or_else(|| invalid_archive("CharX data descriptor enters the central directory"))?
+        .min(24);
+    if available < 12 {
+        return Err(invalid_archive("CharX data descriptor is truncated"));
+    }
+    let descriptor_start = preflight
+        .archive_start
+        .checked_add(data_end)
+        .ok_or_else(|| invalid_archive("CharX data descriptor offset overflowed"))?;
+    let bytes = read_bytes_at(
+        source_path,
+        descriptor_start,
+        available as usize,
+        cancellation,
+        "ZIP data descriptor",
+    )?;
+
+    let mut offsets = [None, None];
+    offsets[0] = Some(0_usize);
+    if read_u32(&bytes, 0) == Some(DATA_DESCRIPTOR_SIGNATURE) {
+        offsets[1] = Some(4);
+    }
+    for offset in offsets.into_iter().flatten() {
+        let payload_bytes = if expected.uses_zip64 { 20 } else { 12 };
+        let matches = if expected.uses_zip64 {
+            bytes.len() >= offset + payload_bytes
+                && read_u32(&bytes, offset) == Some(expected.crc32)
+                && read_u64(&bytes, offset + 4) == Some(expected.compressed)
+                && read_u64(&bytes, offset + 12) == Some(expected.decoded)
+        } else {
+            bytes.len() >= offset + payload_bytes
+                && read_u32(&bytes, offset) == Some(expected.crc32)
+                && read_u32(&bytes, offset + 4).map(u64::from) == Some(expected.compressed)
+                && read_u32(&bytes, offset + 8).map(u64::from) == Some(expected.decoded)
+        };
+        if matches {
+            return data_end
+                .checked_add((offset + payload_bytes) as u64)
+                .ok_or_else(|| invalid_archive("CharX data descriptor extent overflowed"));
+        }
+    }
+
+    Err(invalid_archive(
+        "CharX data descriptor differs from the central directory",
+    ))
+}
+
+fn read_exact_at<const N: usize, F>(
+    source_path: &Path,
+    offset: u64,
+    cancellation: &Cancellation<F>,
+    label: &str,
+) -> Result<[u8; N], CharXParseError>
+where
+    F: FnMut() -> bool,
+{
+    let bytes = read_bytes_at(source_path, offset, N, cancellation, label)?;
+    Ok(bytes.try_into().expect("read exact fixed-size buffer"))
+}
+
+fn read_bytes_at<F>(
+    source_path: &Path,
+    offset: u64,
+    length: usize,
+    cancellation: &Cancellation<F>,
+    label: &str,
 ) -> Result<Vec<u8>, CharXParseError>
 where
     F: FnMut() -> bool,
 {
     let mut source = File::open(source_path)
         .map(|file| CancellableReader::new(file, cancellation.clone()))
-        .map_err(|error| io_error("open local ZIP header", error))?;
+        .map_err(|error| io_error(&format!("open {label}"), error))?;
     source
-        .seek(SeekFrom::Start(header_start))
-        .map_err(|error| io_error("seek local ZIP header", error))?;
-    let mut fixed = [0_u8; 30];
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| io_error(&format!("seek {label}"), error))?;
+    let mut bytes = vec![0_u8; length];
     source
-        .read_exact(&mut fixed)
-        .map_err(|error| io_error("read local ZIP header", error))?;
-    if fixed[0..4] != [0x50, 0x4b, 0x03, 0x04] {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::InvalidArchive,
-            "invalid local ZIP header signature",
-        ));
-    }
-    let name_length = u16::from_le_bytes([fixed[26], fixed[27]]) as usize;
-    let mut name = vec![0_u8; name_length];
-    source
-        .read_exact(&mut name)
-        .map_err(|error| io_error("read local ZIP entry name", error))?;
-    Ok(name)
+        .read_exact(&mut bytes)
+        .map_err(|error| io_error(&format!("read {label}"), error))?;
+    Ok(bytes)
+}
+
+fn invalid_archive(message: impl Into<String>) -> CharXParseError {
+    CharXParseError::new(CharXParseErrorCode::InvalidArchive, message)
 }
 
 fn read_entry_to_memory<R, F>(
@@ -1175,7 +1289,7 @@ where
 
 fn validate_card_metadata(
     card_json: &str,
-    payloads: &[StagedPayloadDescriptor],
+    entries: &[EntryMetadata],
 ) -> Result<Vec<CharXAssetReference>, CharXParseError> {
     let card: Value = serde_json::from_str(card_json).map_err(|error| {
         CharXParseError::new(
@@ -1183,40 +1297,67 @@ fn validate_card_metadata(
             format!("card.json is invalid JSON: {error}"),
         )
     })?;
-    if card.get("spec").and_then(Value::as_str) != Some("chara_card_v3")
-        || !card.get("data").is_some_and(Value::is_object)
-    {
+    if card.get("spec").and_then(Value::as_str) != Some("chara_card_v3") {
         return Err(CharXParseError::new(
             CharXParseErrorCode::InvalidCardMetadata,
             "card.json is not a Character Card V3 object",
         ));
     }
+    let data = card
+        .get("data")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_card("card.json data must be an object"))?;
+    let extensions = data
+        .get("extensions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_card("card.json data.extensions must be an object"))?;
+    if extensions
+        .get("risuai")
+        .is_some_and(|risuai| !risuai.is_object())
+    {
+        return Err(invalid_card(
+            "card.json data.extensions.risuai must be an object when present",
+        ));
+    }
 
-    let payload_names: HashSet<&str> = payloads
+    let payload_names: HashSet<&str> = entries
         .iter()
-        .map(|payload| payload.normalized_name.as_str())
+        .filter(|entry| !entry.is_directory && entry.normalized_name != "card.json")
+        .map(|entry| entry.normalized_name.as_str())
         .collect();
     let mut references = Vec::new();
-    let Some(assets) = card
-        .get("data")
-        .and_then(|data| data.get("assets"))
-        .and_then(Value::as_array)
-    else {
-        return Ok(references);
+    let assets = match data.get("assets") {
+        None => return Ok(references),
+        Some(assets) => assets
+            .as_array()
+            .ok_or_else(|| invalid_card("card.json data.assets must be an array"))?,
     };
 
     for (order, asset) in assets.iter().enumerate() {
-        let Some(uri) = asset.get("uri").and_then(Value::as_str) else {
+        let asset = asset
+            .as_object()
+            .ok_or_else(|| invalid_card(format!("card.json asset {order} must be an object")))?;
+        let asset_type = required_asset_string(asset, "type", order)?;
+        let uri = required_asset_string(asset, "uri", order)?;
+        let display_name = required_asset_string(asset, "name", order)?;
+        let declared_extension = required_asset_string(asset, "ext", order)?;
+
+        let referenced_name = uri
+            .strip_prefix("embeded://")
+            .or_else(|| uri.strip_prefix("__asset:"));
+        let Some(original_name) = referenced_name else {
+            validate_non_archive_asset_uri(uri, order)?;
             continue;
         };
-        let Some(original_name) = uri.strip_prefix("embeded://") else {
-            continue;
-        };
+        if original_name.is_empty() {
+            return Err(invalid_card(format!(
+                "card.json asset {order} has an empty archive reference"
+            )));
+        }
         let (normalized_name, _) = validate_archive_name(original_name, false).map_err(|_| {
-            CharXParseError::new(
-                CharXParseErrorCode::InvalidCardMetadata,
-                format!("card.json contains an unsafe embedded asset URI: {uri}"),
-            )
+            invalid_card(format!(
+                "card.json contains an unsafe archive asset URI: {uri}"
+            ))
         })?;
         if !payload_names.contains(normalized_name.as_str()) {
             return Err(CharXParseError::new(
@@ -1229,16 +1370,78 @@ fn validate_card_metadata(
             uri: uri.to_owned(),
             original_name: original_name.to_owned(),
             normalized_name,
-            asset_type: asset
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("asset")
-                .to_owned(),
-            display_name: asset.get("name").and_then(Value::as_str).map(str::to_owned),
-            declared_extension: asset.get("ext").and_then(Value::as_str).map(str::to_owned),
+            asset_type: asset_type.to_owned(),
+            display_name: Some(display_name.to_owned()),
+            declared_extension: Some(declared_extension.to_owned()),
         });
     }
     Ok(references)
+}
+
+fn required_asset_string<'a>(
+    asset: &'a serde_json::Map<String, Value>,
+    field: &str,
+    order: usize,
+) -> Result<&'a str, CharXParseError> {
+    asset.get(field).and_then(Value::as_str).ok_or_else(|| {
+        invalid_card(format!(
+            "card.json asset {order} field {field} must be a string"
+        ))
+    })
+}
+
+fn validate_non_archive_asset_uri(uri: &str, order: usize) -> Result<(), CharXParseError> {
+    if uri == "ccdefault:" {
+        return Ok(());
+    }
+    if uri.starts_with("ccdefault:") || uri.starts_with("embeded:") || uri.starts_with("__asset:") {
+        return Err(invalid_card(format!(
+            "card.json asset {order} has a malformed built-in URI"
+        )));
+    }
+    if uri.starts_with("data:") {
+        return validate_data_uri(uri, order);
+    }
+    Url::parse(uri)
+        .ok()
+        .filter(|parsed| !parsed.scheme().is_empty())
+        .ok_or_else(|| invalid_card(format!("card.json asset {order} has an invalid URI")))
+        .map(|_| ())
+}
+
+fn validate_data_uri(uri: &str, order: usize) -> Result<(), CharXParseError> {
+    let (metadata, payload) = uri
+        .strip_prefix("data:")
+        .and_then(|value| value.split_once(','))
+        .ok_or_else(|| invalid_card(format!("card.json asset {order} has an invalid data URI")))?;
+    let mut fields = metadata.split(';');
+    let media_type = fields.next().unwrap_or_default();
+    let parameters: Vec<&str> = fields.collect();
+    if !valid_media_type(media_type)
+        || parameters.last().copied() != Some("base64")
+        || BASE64_STANDARD.decode(payload).is_err()
+    {
+        return Err(invalid_card(format!(
+            "card.json asset {order} has an invalid base64 data URI"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_media_type(media_type: &str) -> bool {
+    let Some((major, minor)) = media_type.split_once('/') else {
+        return false;
+    };
+    !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().chain(minor.bytes()).all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'!' | b'#'..=b'+' | b'-' | b'.' | b'^'..=b'~')
+        })
+}
+
+fn invalid_card(message: impl Into<String>) -> CharXParseError {
+    CharXParseError::new(CharXParseErrorCode::InvalidCardMetadata, message)
 }
 
 fn extension_of(name: &str) -> Option<String> {
@@ -1268,7 +1471,7 @@ where
     }
 }
 
-fn jpeg_prefix_has_end_marker<F>(
+fn jpeg_prefix_ends_at_archive<F>(
     path: &Path,
     archive_offset: u64,
     cancellation: &Cancellation<F>,
@@ -1276,29 +1479,17 @@ fn jpeg_prefix_has_end_marker<F>(
 where
     F: FnMut() -> bool,
 {
-    let mut file = File::open(path)
-        .map(|file| CancellableReader::new(file, cancellation.clone()))
-        .map_err(|error| io_error("open appended JPEG", error))?;
-    let mut remaining = archive_offset;
-    let mut previous = None;
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    while remaining > 0 {
-        let requested = remaining.min(COPY_BUFFER_BYTES as u64) as usize;
-        let count = file
-            .read(&mut buffer[..requested])
-            .map_err(|error| io_error("read appended JPEG prefix", error))?;
-        if count == 0 {
-            return Ok(false);
-        }
-        for &byte in &buffer[..count] {
-            if previous == Some(0xff) && byte == 0xd9 {
-                return Ok(true);
-            }
-            previous = Some(byte);
-        }
-        remaining -= count as u64;
+    if archive_offset < 2 {
+        return Ok(false);
     }
-    Ok(false)
+    let marker = read_bytes_at(
+        path,
+        archive_offset - 2,
+        2,
+        cancellation,
+        "appended JPEG end marker",
+    )?;
+    Ok(marker == [0xff, 0xd9])
 }
 
 fn detect_mime(prefix: &[u8], extension: Option<&str>) -> &'static str {
@@ -1368,67 +1559,65 @@ fn zip_error(context: &str, error: zip::result::ZipError) -> CharXParseError {
     }
 }
 
+fn structural_zip_error(context: &str, error: zip::result::ZipError) -> CharXParseError {
+    match error {
+        zip::result::ZipError::Io(error) if error.to_string() == CANCELLED_IO_MESSAGE => {
+            CharXParseError::new(CharXParseErrorCode::Cancelled, CANCELLED_IO_MESSAGE)
+        }
+        zip::result::ZipError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            invalid_archive(format!("{context}: {error}"))
+        }
+        error => zip_error(context, error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{read_archive_directory_summary, Cancellation};
+    use super::{
+        validate_data_descriptor, Cancellation, DataDescriptorExpected, ZipPreflight,
+        DATA_DESCRIPTOR_SIGNATURE,
+    };
     use std::fs;
-    use std::io::{Cursor, Write};
     use tempfile::TempDir;
-    use zip::write::FileOptions;
-    use zip::ZipWriter;
 
     #[test]
-    fn directory_preflight_reads_standard_and_zip64_counts_without_loading_entries() {
+    fn unsigned_descriptor_crc_that_equals_the_optional_signature_is_not_misclassified() {
         let directory = TempDir::new().expect("temporary directory");
-        let standard_path = directory.path().join("standard.charx");
-        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        for name in ["one", "two", "three"] {
-            writer
-                .start_file(name, FileOptions::default())
-                .expect("start entry");
-            writer.write_all(b"x").expect("write entry");
-        }
-        fs::write(
-            &standard_path,
-            writer.finish().expect("finish ZIP").into_inner(),
-        )
-        .expect("write standard ZIP");
+        let source = directory.path().join("descriptor.bin");
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(&DATA_DESCRIPTOR_SIGNATURE.to_le_bytes());
+        descriptor.extend_from_slice(&7_u32.to_le_bytes());
+        descriptor.extend_from_slice(&9_u32.to_le_bytes());
+        fs::write(&source, descriptor).expect("write descriptor fixture");
         let cancellation = Cancellation::new(|| false);
+        let preflight = ZipPreflight {
+            entry_count: 1,
+            archive_start: 0,
+            archive_end: 12,
+            directory_start: 12,
+            directory_size: 0,
+        };
 
-        let standard = read_archive_directory_summary(&standard_path, &cancellation)
-            .expect("read standard footer");
-        assert_eq!(standard.entry_count, 3);
-        assert!(standard.directory_bytes >= 3 * 46);
-
-        let zip64_path = directory.path().join("zip64.charx");
-        let mut bytes = vec![0_u8; 123];
-        bytes.extend_from_slice(&0x0606_4b50_u32.to_le_bytes());
-        bytes.extend_from_slice(&44_u64.to_le_bytes());
-        bytes.extend_from_slice(&45_u16.to_le_bytes());
-        bytes.extend_from_slice(&45_u16.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&70_000_u64.to_le_bytes());
-        bytes.extend_from_slice(&70_000_u64.to_le_bytes());
-        bytes.extend_from_slice(&123_u64.to_le_bytes());
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
-        bytes.extend_from_slice(&0x0706_4b50_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&123_u64.to_le_bytes());
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
-        bytes.extend_from_slice(&u16::MAX.to_le_bytes());
-        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
-        bytes.extend_from_slice(&0_u16.to_le_bytes());
-        fs::write(&zip64_path, bytes).expect("write ZIP64 footer fixture");
-
-        let zip64 =
-            read_archive_directory_summary(&zip64_path, &cancellation).expect("read ZIP64 footer");
-        assert_eq!(zip64.entry_count, 70_000);
-        assert_eq!(zip64.directory_bytes, 123);
+        assert_eq!(
+            validate_data_descriptor(
+                &source,
+                preflight,
+                0,
+                DataDescriptorExpected {
+                    crc32: DATA_DESCRIPTOR_SIGNATURE,
+                    compressed: 7,
+                    decoded: 9,
+                    uses_zip64: false,
+                },
+                &cancellation,
+            )
+            .expect("unsigned descriptor must match at offset zero"),
+            12
+        );
     }
 }

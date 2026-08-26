@@ -116,10 +116,8 @@ fn probe_charx(
             Ok(entry) => entry,
             Err(_) => return Ok(false),
         };
-        if entry.name() == "card.json" {
-            if card_index.replace(index).is_some() {
-                return Ok(false);
-            }
+        if entry.name() == "card.json" && card_index.replace(index).is_some() {
+            return Ok(false);
         }
     }
     let Some(card_index) = card_index else {
@@ -174,13 +172,15 @@ fn probe_charx(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ZipPreflight {
-    entry_count: usize,
-    archive_start: u64,
-    archive_end: u64,
+pub(crate) struct ZipPreflight {
+    pub(crate) entry_count: usize,
+    pub(crate) archive_start: u64,
+    pub(crate) archive_end: u64,
+    pub(crate) directory_start: u64,
+    pub(crate) directory_size: u64,
 }
 
-fn preflight_zip(
+pub(crate) fn preflight_zip(
     reader: &mut (impl Read + Seek),
     max_entries: usize,
     max_directory_bytes: u64,
@@ -253,7 +253,7 @@ fn preflight_zip(
     if entry_count > max_entries || directory_size as u64 > max_directory_bytes {
         return Ok(None);
     }
-    let Some(archive_start) = validate_directory_bounds(
+    let Some((archive_start, directory_start)) = validate_directory_bounds(
         reader,
         eocd_absolute,
         directory_size as u64,
@@ -268,9 +268,12 @@ fn preflight_zip(
         entry_count,
         archive_start,
         archive_end,
+        directory_start,
+        directory_size: directory_size as u64,
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn preflight_zip64(
     reader: &mut (impl Read + Seek),
     tail: &[u8],
@@ -353,6 +356,8 @@ fn preflight_zip64(
         entry_count,
         archive_start,
         archive_end,
+        directory_start,
+        directory_size,
     }))
 }
 
@@ -363,7 +368,7 @@ fn validate_directory_bounds(
     directory_offset: u64,
     entry_count: usize,
     cancelled: &impl Fn() -> bool,
-) -> Result<Option<u64>, FormatError> {
+) -> Result<Option<(u64, u64)>, FormatError> {
     let Some(directory_start) = directory_end.checked_sub(directory_size) else {
         return Ok(None);
     };
@@ -372,11 +377,11 @@ fn validate_directory_bounds(
     };
     Ok(
         validate_directory_signature(reader, directory_start, entry_count, cancelled)?
-            .then_some(archive_start),
+            .then_some((archive_start, directory_start)),
     )
 }
 
-struct ArchiveView<'a, R> {
+pub(crate) struct ArchiveView<'a, R> {
     reader: &'a mut R,
     start: u64,
     length: u64,
@@ -384,7 +389,7 @@ struct ArchiveView<'a, R> {
 }
 
 impl<'a, R: Read + Seek> ArchiveView<'a, R> {
-    fn new(reader: &'a mut R, start: u64, end: u64) -> Result<Self, FormatError> {
+    pub(crate) fn new(reader: &'a mut R, start: u64, end: u64) -> Result<Self, FormatError> {
         let length = end
             .checked_sub(start)
             .ok_or_else(|| FormatError::invalid("ZIP archive bounds are reversed"))?;
@@ -425,6 +430,12 @@ impl<R: Seek> Seek for ArchiveView<'_, R> {
         };
         let target = u64::try_from(target)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid ZIP seek"))?;
+        if target > self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ZIP seek exceeds bounded archive",
+            ));
+        }
         let absolute = self
             .start
             .checked_add(target)

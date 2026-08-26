@@ -1,3 +1,4 @@
+use crc32fast::hash as crc32;
 use risuai_lib::native_file_jobs::charx::{
     inspect_charx_file, CharXContainerKind, CharXInspection, CharXLimits, CharXParseErrorCode,
 };
@@ -31,6 +32,142 @@ fn zip_bytes(entries: &[(&str, &[u8], CompressionMethod)], zip64: bool) -> Vec<u
         .into_inner()
 }
 
+fn promote_classic_zip_to_zip64(mut archive: Vec<u8>) -> Vec<u8> {
+    let eocd = archive.len() - 22;
+    assert_eq!(&archive[eocd..eocd + 4], b"PK\x05\x06");
+    let entries = u16::from_le_bytes(archive[eocd + 10..eocd + 12].try_into().unwrap()) as u64;
+    let directory_size =
+        u32::from_le_bytes(archive[eocd + 12..eocd + 16].try_into().unwrap()) as u64;
+    let directory_offset =
+        u32::from_le_bytes(archive[eocd + 16..eocd + 20].try_into().unwrap()) as u64;
+    archive.truncate(eocd);
+
+    archive.extend_from_slice(b"PK\x06\x06");
+    archive.extend_from_slice(&44_u64.to_le_bytes());
+    archive.extend_from_slice(&45_u16.to_le_bytes());
+    archive.extend_from_slice(&45_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&entries.to_le_bytes());
+    archive.extend_from_slice(&entries.to_le_bytes());
+    archive.extend_from_slice(&directory_size.to_le_bytes());
+    archive.extend_from_slice(&directory_offset.to_le_bytes());
+
+    archive.extend_from_slice(b"PK\x06\x07");
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&(eocd as u64).to_le_bytes());
+    archive.extend_from_slice(&1_u32.to_le_bytes());
+
+    archive.extend_from_slice(b"PK\x05\x06");
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&u16::MAX.to_le_bytes());
+    archive.extend_from_slice(&u16::MAX.to_le_bytes());
+    archive.extend_from_slice(&u32::MAX.to_le_bytes());
+    archive.extend_from_slice(&u32::MAX.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive
+}
+
+fn set_classic_zip_comment(mut archive: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+    let eocd = archive.len() - 22;
+    assert_eq!(&archive[eocd..eocd + 4], b"PK\x05\x06");
+    archive[eocd + 20..eocd + 22]
+        .copy_from_slice(&u16::try_from(comment.len()).unwrap().to_le_bytes());
+    archive.extend_from_slice(comment);
+    archive
+}
+
+fn classic_eocd(entry_count: u16, directory_size: u32, directory_offset: u32) -> Vec<u8> {
+    let mut footer = Vec::with_capacity(22);
+    footer.extend_from_slice(b"PK\x05\x06");
+    footer.extend_from_slice(&0_u16.to_le_bytes());
+    footer.extend_from_slice(&0_u16.to_le_bytes());
+    footer.extend_from_slice(&entry_count.to_le_bytes());
+    footer.extend_from_slice(&entry_count.to_le_bytes());
+    footer.extend_from_slice(&directory_size.to_le_bytes());
+    footer.extend_from_slice(&directory_offset.to_le_bytes());
+    footer.extend_from_slice(&0_u16.to_le_bytes());
+    footer
+}
+
+fn central_entry_offsets(archive: &[u8]) -> Vec<usize> {
+    archive
+        .windows(4)
+        .enumerate()
+        .filter_map(|(index, bytes)| (bytes == b"PK\x01\x02").then_some(index))
+        .collect()
+}
+
+fn local_offset(archive: &[u8], central_offset: usize) -> usize {
+    u32::from_le_bytes(
+        archive[central_offset + 42..central_offset + 46]
+            .try_into()
+            .unwrap(),
+    ) as usize
+}
+
+fn card_json_with_data(data: &str) -> String {
+    format!(r#"{{"spec":"chara_card_v3","spec_version":"3.0","data":{data}}}"#)
+}
+
+fn stored_zip_with_data_descriptors(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    let mut central_entries = Vec::new();
+    for (name, data) in entries {
+        let local_offset = u32::try_from(archive.len()).unwrap();
+        let crc = crc32(data);
+        let size = u32::try_from(data.len()).unwrap();
+        let name_bytes = name.as_bytes();
+        let name_length = u16::try_from(name_bytes.len()).unwrap();
+
+        archive.extend_from_slice(b"PK\x03\x04");
+        archive.extend_from_slice(&20_u16.to_le_bytes());
+        archive.extend_from_slice(&0x000c_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u32.to_le_bytes());
+        archive.extend_from_slice(&0_u32.to_le_bytes());
+        archive.extend_from_slice(&0_u32.to_le_bytes());
+        archive.extend_from_slice(&name_length.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(name_bytes);
+        archive.extend_from_slice(data);
+        archive.extend_from_slice(b"PK\x07\x08");
+        archive.extend_from_slice(&crc.to_le_bytes());
+        archive.extend_from_slice(&size.to_le_bytes());
+        archive.extend_from_slice(&size.to_le_bytes());
+        central_entries.push((name_bytes, crc, size, local_offset));
+    }
+
+    let directory_offset = u32::try_from(archive.len()).unwrap();
+    for (name, crc, size, local_offset) in central_entries {
+        archive.extend_from_slice(b"PK\x01\x02");
+        archive.extend_from_slice(&20_u16.to_le_bytes());
+        archive.extend_from_slice(&20_u16.to_le_bytes());
+        archive.extend_from_slice(&0x000c_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&crc.to_le_bytes());
+        archive.extend_from_slice(&size.to_le_bytes());
+        archive.extend_from_slice(&size.to_le_bytes());
+        archive.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u16.to_le_bytes());
+        archive.extend_from_slice(&0_u32.to_le_bytes());
+        archive.extend_from_slice(&local_offset.to_le_bytes());
+        archive.extend_from_slice(name);
+    }
+    let directory_size = u32::try_from(archive.len()).unwrap() - directory_offset;
+    let count = u16::try_from(entries.len()).unwrap();
+    archive.extend_from_slice(&classic_eocd(count, directory_size, directory_offset));
+    archive
+}
+
 fn write_source(directory: &TempDir, name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let path = directory.path().join(name);
     fs::write(&path, bytes).expect("write source fixture");
@@ -62,7 +199,7 @@ fn expect_error(
     let source = write_source(&directory, source_name, bytes);
     let error = inspect_charx_file(&source, source_name, &staging, limits, || false)
         .expect_err("fixture must fail");
-    assert_eq!(error.code(), expected);
+    assert_eq!(error.code(), expected, "{source_name}: {error}");
     assert_eq!(
         fs::read_dir(staging).expect("read staging root").count(),
         0,
@@ -163,6 +300,33 @@ fn detects_appended_charx_jpeg_but_keeps_an_ordinary_jpeg_as_an_asset() {
     assert_eq!(asset.extension.as_deref(), Some("jpg"));
     assert_eq!(asset.mime_type, "image/jpeg");
     assert_eq!(asset.byte_length, ordinary.len() as u64);
+}
+
+#[test]
+fn valid_non_jpeg_charx_content_wins_over_a_jpeg_filename() {
+    let archive = zip_bytes(&valid_entries(), false);
+    let (_directory, inspection) = parse_card("misleading.jpeg", &archive, CharXLimits::default())
+        .expect("valid CharX bytes must parse independent of filename");
+
+    assert!(matches!(inspection, CharXInspection::Card(_)));
+}
+
+#[test]
+fn accepts_signed_data_descriptors_emitted_by_streaming_zip_writers() {
+    let card = card_json_with_data(
+        r#"{"name":"descriptor","extensions":{},"assets":[{"type":"x-risu-asset","uri":"embeded://assets/payload.bin","name":"payload","ext":"bin"}]}"#,
+    );
+    let archive = stored_zip_with_data_descriptors(&[
+        ("assets/payload.bin", b"payload"),
+        ("card.json", card.as_bytes()),
+    ]);
+
+    let (_directory, inspection) = parse_card("streamed.charx", &archive, CharXLimits::default())
+        .expect("parse a streaming-writer CharX with data descriptors");
+    let CharXInspection::Card(card) = inspection else {
+        panic!("descriptor fixture must parse as CharX")
+    };
+    assert_eq!(card.payloads.len(), 1);
 }
 
 #[test]
@@ -340,10 +504,13 @@ fn enforces_entry_aggregate_ratio_count_and_metadata_limits() {
 #[test]
 fn verifies_crc_and_removes_owned_staging_on_failure() {
     let asset = b"unique-asset-crc-payload";
+    let card = card_json_with_data(
+        r#"{"name":"crc","extensions":{},"assets":[{"type":"x-risu-asset","uri":"embeded://assets/payload.bin","name":"payload","ext":"bin"}]}"#,
+    );
     let mut bytes = zip_bytes(
         &[
             ("assets/payload.bin", asset, CompressionMethod::Stored),
-            ("card.json", CARD_JSON.as_bytes(), CompressionMethod::Stored),
+            ("card.json", card.as_bytes(), CompressionMethod::Stored),
         ],
         false,
     );
@@ -488,4 +655,410 @@ fn staging_paths_never_derive_from_archive_names() {
                 .unwrap()
         ));
     }
+}
+
+#[test]
+fn jpeg_content_is_the_ordinary_asset_default_independent_of_filename() {
+    let plain = b"\xff\xd8\xff\xe0plain jpeg\xff\xd9";
+    let (_directory, inspection) = parse_card("misleading.charx", plain, CharXLimits::default())
+        .expect("JPEG content must remain an ordinary asset");
+    assert!(matches!(inspection, CharXInspection::OrdinaryJpegAsset(_)));
+
+    let invalid_card = zip_bytes(
+        &[(
+            "card.json",
+            br#"{"spec":"chara_card_v3","data":{"name":"missing extensions"}}"#,
+            CompressionMethod::Stored,
+        )],
+        false,
+    );
+    let mut appended = b"\xff\xd8\xff\xe0jpeg\xff\xd9".to_vec();
+    appended.extend_from_slice(&invalid_card);
+    let (_directory, inspection) = parse_card("misleading.bin", &appended, CharXLimits::default())
+        .expect("invalid appended container must remain an ordinary JPEG");
+    assert!(matches!(inspection, CharXInspection::OrdinaryJpegAsset(_)));
+}
+
+#[test]
+fn uses_zip_0_6_6_last_eocd_selection_for_a_false_signature_in_the_comment() {
+    let mut comment = classic_eocd(2_000, 0, 0);
+    comment.extend_from_slice(b"ignored trailing comment bytes");
+    let archive = set_classic_zip_comment(zip_bytes(&valid_entries(), false), &comment);
+    let mut appended = b"\xff\xd8\xff\xe0jpeg\xff\xd9".to_vec();
+    appended.extend_from_slice(&archive);
+
+    let (_directory, inspection) =
+        parse_card("false-footer.charx", &appended, CharXLimits::default())
+            .expect("last false EOCD makes the JPEG container invalid, not a CharX error");
+
+    assert!(matches!(inspection, CharXInspection::OrdinaryJpegAsset(_)));
+}
+
+#[test]
+fn parses_an_actual_zip64_footer_after_a_large_jpeg_prefix_with_false_signatures() {
+    let archive = promote_classic_zip_to_zip64(zip_bytes(&valid_entries(), false));
+    let eocd = archive.len() - 22;
+    let locator = eocd - 20;
+    let record = locator - 56;
+    let nominal_record = usize::try_from(u64::from_le_bytes(
+        archive[locator + 8..locator + 16].try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut jpeg = vec![0xaa; 256 * 1024];
+    jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+    jpeg[32 * 1024..32 * 1024 + 4].copy_from_slice(b"PK\x05\x06");
+    jpeg[nominal_record..nominal_record + 56].copy_from_slice(&archive[record..record + 56]);
+    let jpeg_length = jpeg.len();
+    jpeg[jpeg_length - 2..].copy_from_slice(&[0xff, 0xd9]);
+    jpeg.extend_from_slice(&archive);
+
+    let (_directory, inspection) = parse_card("large-prefix.data", &jpeg, CharXLimits::default())
+        .expect("parse actual appended ZIP64 through the bounded archive view");
+    let CharXInspection::Card(card) = inspection else {
+        panic!("valid appended ZIP64 must be a card")
+    };
+    assert_eq!(card.container_kind, CharXContainerKind::AppendedCharXJpeg);
+    assert_eq!(card.archive_offset, jpeg_length as u64);
+}
+
+#[test]
+fn zip64_locator_is_authoritative_and_invalid_offsets_do_not_escape_the_archive_view() {
+    let mut authoritative = promote_classic_zip_to_zip64(zip_bytes(&valid_entries(), false));
+    let eocd = authoritative.len() - 22;
+    let locator = eocd - 20;
+    let record = locator - 56;
+    authoritative[eocd + 8..eocd + 10].copy_from_slice(&1_u16.to_le_bytes());
+    authoritative[eocd + 10..eocd + 12].copy_from_slice(&1_u16.to_le_bytes());
+    authoritative[record + 24..record + 32].copy_from_slice(&2_000_u64.to_le_bytes());
+    authoritative[record + 32..record + 40].copy_from_slice(&2_000_u64.to_le_bytes());
+    expect_error(
+        "authoritative.charx",
+        &authoritative,
+        CharXLimits {
+            max_entries: 100,
+            ..CharXLimits::default()
+        },
+        CharXParseErrorCode::TooManyEntries,
+    );
+
+    let mut corrupt = promote_classic_zip_to_zip64(zip_bytes(&valid_entries(), false));
+    let locator = corrupt.len() - 22 - 20;
+    let offset = u64::from_le_bytes(corrupt[locator + 8..locator + 16].try_into().unwrap());
+    corrupt[locator + 8..locator + 16].copy_from_slice(&(offset + 1).to_le_bytes());
+    expect_error(
+        "corrupt-locator.charx",
+        &corrupt,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    let mut jpeg = b"\xff\xd8\xff\xe0jpeg\xff\xd9".to_vec();
+    jpeg.extend_from_slice(&corrupt);
+    let (_directory, inspection) =
+        parse_card("corrupt-locator.jpeg", &jpeg, CharXLimits::default())
+            .expect("invalid appended ZIP64 must remain an ordinary JPEG");
+    assert!(matches!(inspection, CharXInspection::OrdinaryJpegAsset(_)));
+}
+
+#[test]
+fn rejects_classic_and_zip64_multi_disk_fields() {
+    let classic = zip_bytes(&valid_entries(), false);
+    let eocd = classic.len() - 22;
+    for (name, offset) in [("classic-disk", 4), ("classic-central-disk", 6)] {
+        let mut mutated = classic.clone();
+        mutated[eocd + offset..eocd + offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+        expect_error(
+            &format!("{name}.charx"),
+            &mutated,
+            CharXLimits::default(),
+            CharXParseErrorCode::InvalidArchive,
+        );
+    }
+    let mut mismatched_count = classic;
+    mismatched_count[eocd + 8..eocd + 10].copy_from_slice(&1_u16.to_le_bytes());
+    expect_error(
+        "classic-disk-count.charx",
+        &mismatched_count,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    let zip64 = promote_classic_zip_to_zip64(zip_bytes(&valid_entries(), false));
+    let locator = zip64.len() - 22 - 20;
+    let record = locator - 56;
+    for (name, offset, width) in [
+        ("zip64-locator-disk", locator + 4, 4_usize),
+        ("zip64-locator-count", locator + 16, 4),
+        ("zip64-record-disk", record + 16, 4),
+        ("zip64-record-central-disk", record + 20, 4),
+        ("zip64-record-disk-count", record + 24, 8),
+    ] {
+        let mut mutated = zip64.clone();
+        if width == 4 {
+            mutated[offset..offset + 4].copy_from_slice(&2_u32.to_le_bytes());
+        } else {
+            mutated[offset..offset + 8].copy_from_slice(&2_u64.to_le_bytes());
+        }
+        expect_error(
+            &format!("{name}.charx"),
+            &mutated,
+            CharXLimits::default(),
+            CharXParseErrorCode::InvalidArchive,
+        );
+    }
+}
+
+#[test]
+fn rejects_central_disk_symlink_and_local_header_disagreements() {
+    let archive = zip_bytes(&valid_entries(), false);
+    let central = central_entry_offsets(&archive)[0];
+    let local = local_offset(&archive, central);
+
+    let mut wrong_disk = archive.clone();
+    wrong_disk[central + 34..central + 36].copy_from_slice(&1_u16.to_le_bytes());
+    expect_error(
+        "disk.charx",
+        &wrong_disk,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    let mut symlink = archive.clone();
+    symlink[central + 5] = 3;
+    symlink[central + 38..central + 42].copy_from_slice(&(0o120777_u32 << 16).to_le_bytes());
+    expect_error(
+        "symlink.charx",
+        &symlink,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    for (name, offset, mask) in [
+        ("encryption", local + 6, 1_u16),
+        ("descriptor", local + 6, 1_u16 << 3),
+        ("compression-flags", local + 6, 1_u16 << 1),
+    ] {
+        let mut mismatched = archive.clone();
+        let flags = u16::from_le_bytes(mismatched[offset..offset + 2].try_into().unwrap());
+        mismatched[offset..offset + 2].copy_from_slice(&(flags ^ mask).to_le_bytes());
+        expect_error(
+            &format!("{name}.charx"),
+            &mismatched,
+            CharXLimits::default(),
+            CharXParseErrorCode::InvalidArchive,
+        );
+    }
+
+    let mut wrong_method = archive;
+    wrong_method[local + 8..local + 10].copy_from_slice(&8_u16.to_le_bytes());
+    expect_error(
+        "method.charx",
+        &wrong_method,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    let archive = zip_bytes(&valid_entries(), false);
+    let central = central_entry_offsets(&archive)[0];
+    let local = local_offset(&archive, central);
+    for (name, flag) in [("encrypted", 1_u16), ("unsupported-flag", 1_u16 << 6)] {
+        let mut mutated = archive.clone();
+        mutated[central + 8..central + 10].copy_from_slice(&flag.to_le_bytes());
+        mutated[local + 6..local + 8].copy_from_slice(&flag.to_le_bytes());
+        expect_error(
+            &format!("{name}.charx"),
+            &mutated,
+            CharXLimits::default(),
+            CharXParseErrorCode::InvalidArchive,
+        );
+    }
+
+    let mut unsupported_method = archive;
+    unsupported_method[central + 10..central + 12].copy_from_slice(&99_u16.to_le_bytes());
+    unsupported_method[local + 8..local + 10].copy_from_slice(&99_u16.to_le_bytes());
+    expect_error(
+        "unsupported-method.charx",
+        &unsupported_method,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+}
+
+#[test]
+fn rejects_local_data_extents_that_overlap_or_enter_the_central_directory() {
+    let mut archive = zip_bytes(&valid_entries(), false);
+    let central = central_entry_offsets(&archive)[0];
+    archive[central + 20..central + 24].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    expect_error(
+        "overlap.charx",
+        &archive,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    let mut overlap = zip_bytes(&valid_entries(), false);
+    let central_entries = central_entry_offsets(&overlap);
+    let first_local = local_offset(&overlap, central_entries[0]);
+    let compressed = u32::from_le_bytes(
+        overlap[central_entries[0] + 20..central_entries[0] + 24]
+            .try_into()
+            .unwrap(),
+    ) + 1;
+    overlap[central_entries[0] + 20..central_entries[0] + 24]
+        .copy_from_slice(&compressed.to_le_bytes());
+    overlap[first_local + 18..first_local + 22].copy_from_slice(&compressed.to_le_bytes());
+    expect_error(
+        "local-overlap.charx",
+        &overlap,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    let mut extra_intrusion = zip_bytes(&valid_entries(), false);
+    let last_central = *central_entry_offsets(&extra_intrusion).last().unwrap();
+    let last_local = local_offset(&extra_intrusion, last_central);
+    extra_intrusion[last_local + 28..last_local + 30].copy_from_slice(&u16::MAX.to_le_bytes());
+    expect_error(
+        "local-extra-intrusion.charx",
+        &extra_intrusion,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+}
+
+#[test]
+fn validates_card_schema_and_every_asset_before_staging_payloads() {
+    for malformed_data in [
+        r#"{"name":"no extensions","assets":[]}"#,
+        r#"{"name":"bad risuai","extensions":{"risuai":7},"assets":[]}"#,
+        r#"{"name":"bad assets","extensions":{"risuai":{}},"assets":{}}"#,
+        r#"{"name":"bad asset","extensions":{"risuai":{}},"assets":[null]}"#,
+        r#"{"name":"bad uri","extensions":{"risuai":{}},"assets":[{"type":"icon","uri":7,"name":"x","ext":"png"}]}"#,
+        r#"{"name":"bad scheme","extensions":{"risuai":{}},"assets":[{"type":"icon","uri":"not a URI","name":"x","ext":"png"}]}"#,
+        r#"{"name":"bad type","extensions":{"risuai":{}},"assets":[{"type":7,"uri":"ccdefault:","name":"x","ext":"png"}]}"#,
+        r#"{"name":"bad name","extensions":{"risuai":{}},"assets":[{"type":"icon","uri":"ccdefault:","name":7,"ext":"png"}]}"#,
+        r#"{"name":"bad ext","extensions":{"risuai":{}},"assets":[{"type":"icon","uri":"ccdefault:","name":"x","ext":7}]}"#,
+        r#"{"name":"bad default","extensions":{},"assets":[{"type":"icon","uri":"ccdefault:extra","name":"x","ext":"png"}]}"#,
+        r#"{"name":"bad embedded","extensions":{},"assets":[{"type":"icon","uri":"embeded://../escape","name":"x","ext":"png"}]}"#,
+        r#"{"name":"bad data","extensions":{},"assets":[{"type":"icon","uri":"data:image/png;base64,%%%","name":"x","ext":"png"}]}"#,
+    ] {
+        let card = card_json_with_data(malformed_data);
+        let archive = zip_bytes(
+            &[
+                ("assets/payload.bin", b"payload", CompressionMethod::Stored),
+                ("card.json", card.as_bytes(), CompressionMethod::Stored),
+            ],
+            false,
+        );
+        expect_error(
+            "malformed-card.charx",
+            &archive,
+            CharXLimits::default(),
+            CharXParseErrorCode::InvalidCardMetadata,
+        );
+    }
+
+    let invalid = card_json_with_data(r#"{"name":"invalid first","assets":[]}"#);
+    let asset = b"corrupt-before-card";
+    let mut archive = zip_bytes(
+        &[
+            ("assets/payload.bin", asset, CompressionMethod::Stored),
+            ("card.json", invalid.as_bytes(), CompressionMethod::Stored),
+        ],
+        false,
+    );
+    let payload = archive
+        .windows(asset.len())
+        .position(|candidate| candidate == asset)
+        .unwrap();
+    archive[payload] ^= 0xff;
+    expect_error(
+        "metadata-first.charx",
+        &archive,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidCardMetadata,
+    );
+}
+
+#[test]
+fn accepts_mapper_compatible_optional_and_external_asset_uris_without_fetching_them() {
+    for data in [
+        r#"{"name":"no assets","extensions":{}}"#,
+        r#"{"name":"default","extensions":{},"assets":[{"type":"icon","uri":"ccdefault:","name":"default","ext":"png"}]}"#,
+        r#"{"name":"data","extensions":{"risuai":{}},"assets":[{"type":"custom","uri":"data:application/octet-stream;base64,cGF5bG9hZA==","name":"data","ext":"bin"}]}"#,
+        r#"{"name":"external","extensions":{},"assets":[{"type":"future-type","uri":"https://example.test/asset.png","name":"external","ext":"png"}]}"#,
+    ] {
+        let card = card_json_with_data(data);
+        let archive = zip_bytes(
+            &[("card.json", card.as_bytes(), CompressionMethod::Stored)],
+            false,
+        );
+        let (_directory, inspection) =
+            parse_card("compatible.charx", &archive, CharXLimits::default())
+                .expect("mapper-compatible asset URI must validate without network access");
+        assert!(matches!(inspection, CharXInspection::Card(_)));
+    }
+}
+
+#[test]
+fn cancellation_is_checked_after_validation_before_staging_is_preserved() {
+    let archive = zip_bytes(
+        &[
+            ("card.json", CARD_JSON.as_bytes(), CompressionMethod::Stored),
+            (
+                "assets/Portrait.JPEG",
+                b"\xff\xd8\xff\xe0portrait",
+                CompressionMethod::Stored,
+            ),
+            (
+                "assets/config.JSON",
+                br#"{"enabled":true}"#,
+                CompressionMethod::Stored,
+            ),
+        ],
+        false,
+    );
+    let baseline_checks = AtomicUsize::new(0);
+    let (directory, inspection) =
+        parse_card("count-checks.charx", &archive, CharXLimits::default()).unwrap();
+    let CharXInspection::Card(card) = inspection else {
+        panic!("baseline must parse")
+    };
+    fs::remove_dir_all(card.staging_directory).unwrap();
+    drop(directory);
+
+    let directory = TempDir::new().unwrap();
+    let staging = directory.path().join("jobs");
+    fs::create_dir(&staging).unwrap();
+    let source = write_source(&directory, "final-cancel.charx", &archive);
+    let first_pass = inspect_charx_file(
+        &source,
+        "count-checks.charx",
+        &staging,
+        CharXLimits::default(),
+        || {
+            baseline_checks.fetch_add(1, Ordering::Relaxed);
+            false
+        },
+    )
+    .unwrap();
+    let CharXInspection::Card(first_card) = first_pass else {
+        panic!("counting pass must parse")
+    };
+    fs::remove_dir_all(first_card.staging_directory).unwrap();
+    let cancel_at = baseline_checks.load(Ordering::Relaxed);
+    let checks = AtomicUsize::new(0);
+
+    let error = inspect_charx_file(
+        &source,
+        "final-cancel.charx",
+        &staging,
+        CharXLimits::default(),
+        || checks.fetch_add(1, Ordering::Relaxed) + 1 >= cancel_at,
+    )
+    .expect_err("the final cancellation checkpoint must win before preserve");
+
+    assert_eq!(error.code(), CharXParseErrorCode::Cancelled);
+    assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
 }
