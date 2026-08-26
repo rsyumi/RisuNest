@@ -5,7 +5,10 @@ const mocks = vi.hoisted(() => ({
     database: { dynamicAssets: false, presetRegex: [] as never[], characters: [] as never[] },
 }))
 
-vi.mock("svelte/store", () => ({ get: vi.fn() }))
+vi.mock("svelte/store", () => ({
+    get: vi.fn(),
+    writable: vi.fn(() => ({ subscribe: vi.fn(), set: vi.fn(), update: vi.fn() })),
+}))
 vi.mock("src/ts/stores.svelte", () => ({ CharEmotion: {}, selectedCharID: {} }))
 vi.mock("src/ts/storage/database.svelte", () => ({
     getDatabase: () => mocks.database,
