@@ -226,8 +226,10 @@ fn enforces_entry_aggregate_ratio_count_and_metadata_limits() {
     let entries = valid_entries();
     let bytes = zip_bytes(&entries, false);
 
-    let mut limits = CharXLimits::default();
-    limits.max_entries = 2;
+    let limits = CharXLimits {
+        max_entries: 2,
+        ..CharXLimits::default()
+    };
     expect_error(
         "count.charx",
         &bytes,
@@ -235,8 +237,10 @@ fn enforces_entry_aggregate_ratio_count_and_metadata_limits() {
         CharXParseErrorCode::TooManyEntries,
     );
 
-    let mut limits = CharXLimits::default();
-    limits.max_entry_decoded_bytes = 8;
+    let limits = CharXLimits {
+        max_entry_decoded_bytes: 8,
+        ..CharXLimits::default()
+    };
     expect_error(
         "entry.charx",
         &bytes,
@@ -244,8 +248,10 @@ fn enforces_entry_aggregate_ratio_count_and_metadata_limits() {
         CharXParseErrorCode::EntryTooLarge,
     );
 
-    let mut limits = CharXLimits::default();
-    limits.max_total_decoded_bytes = 32;
+    let limits = CharXLimits {
+        max_total_decoded_bytes: 32,
+        ..CharXLimits::default()
+    };
     expect_error(
         "aggregate.charx",
         &bytes,
@@ -265,8 +271,10 @@ fn enforces_entry_aggregate_ratio_count_and_metadata_limits() {
         ],
         false,
     );
-    let mut limits = CharXLimits::default();
-    limits.max_compression_ratio = 2;
+    let limits = CharXLimits {
+        max_compression_ratio: 2,
+        ..CharXLimits::default()
+    };
     expect_error(
         "ratio.charx",
         &ratio_archive,
@@ -274,8 +282,10 @@ fn enforces_entry_aggregate_ratio_count_and_metadata_limits() {
         CharXParseErrorCode::CompressionRatioExceeded,
     );
 
-    let mut limits = CharXLimits::default();
-    limits.max_metadata_bytes = 32;
+    let limits = CharXLimits {
+        max_metadata_bytes: 32,
+        ..CharXLimits::default()
+    };
     expect_error(
         "metadata.charx",
         &bytes,
