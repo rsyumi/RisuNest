@@ -46,6 +46,7 @@ import {
     captureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
+import { requireCurrentConversationSession } from '../storage/activeConversationSession'
 import {
     beginPinnedConversationHistoryOperation,
     createCompatibilityConversationHistorySnapshot,
@@ -905,12 +906,29 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
     
     const triggerSession = getActiveConversationSession()
-    const preserveTriggerChatIdentity = triggerSession?.matchesConversation(nowChatroom.chaId, currentChat) === true
+    const triggerSessionSnapshot = triggerSession?.matchesConversation(nowChatroom.chaId, currentChat) === true
+        ? {
+            session: triggerSession,
+            version: triggerSession.version,
+            messages: currentChat.message,
+        }
+        : null
     const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat})
     if(triggerResult){
-        currentChat = preserveTriggerChatIdentity
-            ? adoptTriggeredChat(currentChat, triggerResult.chat)
-            : triggerResult.chat
+        if (triggerSessionSnapshot) {
+            requireCurrentConversationSession(
+                triggerSessionSnapshot.session,
+                getActiveConversationSession(),
+            )
+            currentChat = adoptTriggeredChat(
+                triggerSessionSnapshot.session,
+                triggerSessionSnapshot.version,
+                triggerSessionSnapshot.messages,
+                triggerResult.chat,
+            )
+        } else {
+            currentChat = triggerResult.chat
+        }
         setCurrentChat(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
@@ -932,12 +950,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         : iteratePromptHistory(promptHistory, promptHistorySelection)
     for(const entry of promptHistoryEntries){
         const { relativeIndex: index } = entry
+        let msg: Message
         if (requiresLivePromptCompatibility) {
             ensurePromptHistoryMessageId(entry.message, v4)
+            msg = entry.message
         } else {
-            ensurePromptHistoryEntryId(currentChat.message, entry, v4)
+            msg = ensurePromptHistoryEntryId(promptHistory, entry, v4)
         }
-        const msg = entry.message
         let formatedChat = (await processScriptFull(nowChatroom,risuChatParser(msg.data, {chara: currentChar, role: msg.role}), 'editprocess', index, {
             chatRole: msg.role,
         })).data

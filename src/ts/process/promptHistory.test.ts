@@ -8,7 +8,6 @@ import {
     createLivePromptHistoryCompatibilitySnapshot,
     ensurePromptHistoryEntryId,
     iteratePromptHistory,
-    readLivePromptHistoryMessage,
     selectPromptHistory,
 } from './promptHistory'
 
@@ -119,13 +118,13 @@ describe('prompt history paging', () => {
         const iterator = iteratePromptHistory(operation, selection)
 
         const firstEntry = iterator.next().value!
-        ensurePromptHistoryEntryId(messages, firstEntry, vi.fn())
-        expect(readLivePromptHistoryMessage(messages, firstEntry).data).toBe('first')
+        const first = ensurePromptHistoryEntryId(operation, firstEntry, vi.fn())
+        expect(first.data).toBe('first')
         messages[1].data = 'after-update'
         const secondEntry = iterator.next().value!
-        ensurePromptHistoryEntryId(messages, secondEntry, vi.fn())
+        const second = ensurePromptHistoryEntryId(operation, secondEntry, vi.fn())
 
-        expect(readLivePromptHistoryMessage(messages, secondEntry).data).toBe('after-update')
+        expect(second.data).toBe('after-update')
         operation.dispose()
     })
 
@@ -143,7 +142,7 @@ describe('prompt history paging', () => {
         const generated = ['generated-empty']
 
         for (const entry of iteratePromptHistory(operation, selection)) {
-            ensurePromptHistoryEntryId(messages, entry, () => generated.shift()!)
+            ensurePromptHistoryEntryId(operation, entry, () => generated.shift()!)
         }
 
         expect(messages.map((value) => value.chatId)).toEqual([
@@ -160,7 +159,7 @@ describe('prompt history paging', () => {
         const repeatedSelection = selectPromptHistory(repeatedOperation)
         const generateAgain = vi.fn(() => 'different-id')
         for (const entry of iteratePromptHistory(repeatedOperation, repeatedSelection)) {
-            ensurePromptHistoryEntryId(messages, entry, generateAgain)
+            ensurePromptHistoryEntryId(repeatedOperation, entry, generateAgain)
         }
 
         expect(generateAgain).not.toHaveBeenCalled()
@@ -192,11 +191,17 @@ describe('prompt history paging', () => {
             storeRevision: 12,
         })
 
-        const adopted = adoptTriggeredChat(target, replacement)
+        const adopted = adoptTriggeredChat(
+            session,
+            session.version,
+            target.message,
+            replacement,
+        )
 
         expect(adopted).toBe(target)
         expect(adopted).toEqual(replacement)
         expect(session.matchesConversation('character-a', adopted)).toBe(true)
+        expect(session.version).toBe(1)
         const operation = beginPinnedConversationHistoryOperation(session)
         expect(operation.readLatest(1).messages[0].data).toBe('triggered')
         operation.dispose()

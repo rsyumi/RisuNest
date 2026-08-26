@@ -96,6 +96,7 @@ export type ActiveConversationCommandName =
     | 'replace-tail'
     | 'reroll'
     | 'bookmark'
+    | 'replace-conversation'
 
 export interface SetConversationBookmarkOptions {
     bookmarked: boolean
@@ -881,6 +882,27 @@ export class ActiveConversationSession {
         )
     }
 
+    resolveMessage(locator: MessageLocator): Message {
+        this.assertActive()
+        return validateLocator(
+            this.conversationId,
+            this.conversation.message,
+            this.sessionVersion,
+            locator,
+            this.locatorRegistry,
+        )
+    }
+
+    ensureMessageId(locator: MessageLocator, createId: () => string): Message {
+        const message = this.resolveMessage(locator)
+        if (message.chatId) return message
+        const id = createId()
+        if (!id) throw new Error('Message ID generator returned an empty ID')
+        message.chatId = id
+        locator.expectedMessageId = id
+        return message
+    }
+
     locate(absoluteIndex: number): MessageLocator {
         this.assertActive()
         return createLocator(
@@ -1125,6 +1147,65 @@ export class ActiveConversationSession {
             totalMessages: this.totalMessages,
             storeRevision: this.storeRevision,
             sessionVersion: this.sessionVersion,
+        }
+    }
+
+    adoptConversationReplacement(
+        expectedVersion: number,
+        expectedMessages: readonly Message[],
+        replacement: Chat,
+    ): Chat {
+        this.assertActive()
+        if (this.transactionActive) {
+            throw new Error('Nested conversation session transactions are not supported')
+        }
+        if (this.sessionVersion !== expectedVersion) {
+            throw new ConversationSessionStaleError(expectedVersion, this.sessionVersion)
+        }
+        if (this.conversation.message !== expectedMessages) {
+            throw new MessageLocatorMismatchError('Conversation message array identity changed')
+        }
+
+        const previousVersion = this.sessionVersion
+        const previousState = { ...this.conversation } as Chat
+        const previousLocatorRegistry = this.locatorRegistry
+        const nextLocatorRegistry = previousLocatorRegistry.fork()
+        const target = this.conversation as unknown as Record<string, unknown>
+        const source = replacement as unknown as Record<string, unknown>
+
+        this.transactionActive = true
+        try {
+            for (const key of Object.keys(target)) {
+                if (!(key in source)) delete target[key]
+            }
+            for (const [key, value] of Object.entries(source)) {
+                target[key] = value
+            }
+            this.sessionVersion = previousVersion + 1
+            this.locatorRegistry = nextLocatorRegistry
+            this.onMutation?.({
+                characterId: this.characterId,
+                conversationId: this.conversationId,
+                previousVersion,
+                sessionVersion: this.sessionVersion,
+                commands: ['replace-conversation'],
+            })
+            previousLocatorRegistry.clear()
+            return this.conversation
+        } catch (error) {
+            const previous = previousState as unknown as Record<string, unknown>
+            for (const key of Object.keys(target)) {
+                if (!(key in previous)) delete target[key]
+            }
+            for (const [key, value] of Object.entries(previous)) {
+                target[key] = value
+            }
+            this.sessionVersion = previousVersion
+            nextLocatorRegistry.clear()
+            this.locatorRegistry = previousLocatorRegistry
+            throw error
+        } finally {
+            this.transactionActive = false
         }
     }
 

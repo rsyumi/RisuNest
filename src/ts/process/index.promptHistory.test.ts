@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const testState = vi.hoisted(() => ({
     activeSession: null as unknown,
     runTrigger: vi.fn(),
+    onTokenizeChat: null as null | (() => void | Promise<void>),
     cbsCallbacks: new Map<string, (...args: any[]) => any>(),
     pluginV2: {
         providers: new Map(),
@@ -57,6 +58,7 @@ vi.mock('./triggers', () => ({
 vi.mock('../tokenizer', () => ({
     ChatTokenizer: class {
         async tokenizeChat(): Promise<number> {
+            await testState.onTokenizeChat?.()
             return 1
         }
     },
@@ -254,6 +256,7 @@ describe('sendChat prompt history characterization', () => {
         doingChat.set(false)
         testState.activeSession = null
         testState.runTrigger.mockReset()
+        testState.onTokenizeChat = null
         testState.pluginV2.editprocess.clear()
         resetScriptCache()
     })
@@ -261,6 +264,7 @@ describe('sendChat prompt history characterization', () => {
     afterEach(() => {
         doingChat.set(false)
         testState.activeSession = null
+        testState.onTokenizeChat = null
         testState.pluginV2.editprocess.clear()
     })
 
@@ -348,4 +352,119 @@ describe('sendChat prompt history characterization', () => {
         expect(previewFormated[ACTIVE_MESSAGE_COUNT - 1].content).toBe('CBS_REGEX|PLUGIN')
         expect(previewFormated.some((message) => message.memo === 'replacement')).toBe(false)
     })
+
+    it.each(['edit', 'delete'] as const)(
+        'fails closed before formatting another cached page entry after a same-page session %s',
+        async (mutation) => {
+            setDatabaseLite(makeDatabase())
+            const selectedCharacter = DBState.db.characters[0] as character
+            const liveChat = selectedCharacter.chats[0]
+            const session = new ActiveConversationSession({
+                characterId: selectedCharacter.chaId,
+                conversationId: liveChat.id!,
+                conversation: liveChat,
+                storeRevision: 43,
+            })
+            testState.activeSession = session
+            mockTriggerClone()
+            liveChat.message[4].chatId = ''
+
+            let mutationApplied = false
+            let tokenizeCalls = 0
+            let mutationTarget: Message | undefined
+            testState.onTokenizeChat = () => {
+                tokenizeCalls += 1
+                if (mutationApplied) return
+                mutationApplied = true
+                const locator = session.locate(4)
+                mutationTarget = liveChat.message[4]
+                if (mutation === 'edit') {
+                    session.edit(locator, {
+                        ...liveChat.message[4],
+                        data: `ui-edited ${TAIL_TOKEN}`,
+                    })
+                } else {
+                    session.delete(locator)
+                }
+            }
+
+            await expect(sendChat(-1, { preview: true })).rejects.toMatchObject({
+                name: 'ConversationSessionStaleError',
+            })
+
+            expect(mutationApplied).toBe(true)
+            expect(tokenizeCalls).toBe(1)
+            expect(session.version).toBe(2)
+            expect(mutationTarget?.chatId).toBe('')
+            if (mutation === 'edit') {
+                expect(liveChat.message[4].data).toBe(`ui-edited ${TAIL_TOKEN}`)
+                expect(liveChat.message[4].chatId).toBe('')
+            } else {
+                expect(liveChat.message[4].data).toBe(`entry-002 ${TAIL_TOKEN}`)
+            }
+            expect(session.activePinReasons).toEqual([])
+        },
+    )
+
+    it.each(['edit', 'delete'] as const)(
+        'rejects a deferred trigger clone when a concurrent UI %s wins the session CAS',
+        async (mutation) => {
+            setDatabaseLite(makeDatabase())
+            const selectedCharacter = DBState.db.characters[0] as character
+            const liveChat = selectedCharacter.chats[0]
+            const session = new ActiveConversationSession({
+                characterId: selectedCharacter.chaId,
+                conversationId: liveChat.id!,
+                conversation: liveChat,
+                storeRevision: 44,
+            })
+            testState.activeSession = session
+
+            let releaseTrigger: (() => void) | undefined
+            testState.runTrigger.mockImplementation((_char, mode, { chat: triggerChat }) => {
+                expect(mode).toBe('start')
+                const staleTriggerChat: Chat = {
+                    ...triggerChat,
+                    name: 'Stale trigger clone',
+                    message: triggerChat.message.map((message) => ({ ...message })),
+                }
+                return new Promise((resolve) => {
+                    releaseTrigger = () => resolve({
+                        additonalSysPrompt: { start: '', historyend: '', promptend: '' },
+                        chat: staleTriggerChat,
+                        tokens: 0,
+                        stopSending: false,
+                        sendAIprompt: false,
+                    })
+                })
+            })
+
+            const pendingSend = sendChat(-1, { preview: true })
+            await vi.waitFor(() => expect(releaseTrigger).toBeTypeOf('function'))
+            const locator = session.locate(4)
+            if (mutation === 'edit') {
+                session.edit(locator, {
+                    ...liveChat.message[4],
+                    data: `concurrent-ui-edit ${TAIL_TOKEN}`,
+                })
+            } else {
+                session.delete(locator)
+            }
+            releaseTrigger!()
+
+            await expect(pendingSend).rejects.toMatchObject({
+                name: 'ConversationSessionStaleError',
+            })
+            expect(liveChat.name).toBe('Before trigger')
+            expect(selectedCharacter.chats[0]).toBe(liveChat)
+            expect(session.matchesConversation(selectedCharacter.chaId, liveChat)).toBe(true)
+            expect(session.version).toBe(1)
+            if (mutation === 'edit') {
+                expect(liveChat.message[4].data).toBe(`concurrent-ui-edit ${TAIL_TOKEN}`)
+            } else {
+                expect(liveChat.message[4].data).toBe(`entry-002 ${TAIL_TOKEN}`)
+            }
+            expect(session.activePinReasons).toEqual([])
+        },
+    )
 })

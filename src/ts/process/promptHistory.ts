@@ -1,4 +1,8 @@
 import type { Chat, Message } from '../storage/database.svelte'
+import type {
+    ActiveConversationSession,
+    MessageLocator,
+} from '../storage/activeConversationSession'
 import type { ConversationHistoryOperation } from '../storage/conversationHistoryOperation'
 
 export const PROMPT_HISTORY_PAGE_SIZE = 128
@@ -15,6 +19,7 @@ export interface PromptHistoryEntry {
     absoluteIndex: number
     relativeIndex: number
     message: Message
+    locator?: MessageLocator
 }
 
 export interface PromptHistoryCompatibilitySnapshot {
@@ -22,26 +27,15 @@ export interface PromptHistoryCompatibilitySnapshot {
     dispose(): void
 }
 
-export function readLivePromptHistoryMessage(
-    messages: Message[],
-    entry: PromptHistoryEntry,
-): Message {
-    const message = messages[entry.absoluteIndex]
-    if (!message) {
-        throw new RangeError(`Prompt history message ${entry.absoluteIndex} is missing`)
-    }
-    return message
-}
-
 export function ensurePromptHistoryEntryId(
-    messages: Message[],
+    history: ConversationHistoryOperation,
     entry: PromptHistoryEntry,
     createId: () => string,
-): string {
-    const liveMessage = readLivePromptHistoryMessage(messages, entry)
-    const id = ensurePromptHistoryMessageId(liveMessage, createId)
-    entry.message.chatId = id
-    return id
+): Message {
+    if (!entry.locator) {
+        throw new Error(`Prompt history message ${entry.absoluteIndex} has no locator`)
+    }
+    return history.ensureMessageId(entry.locator, createId)
 }
 
 export function ensurePromptHistoryMessageId(
@@ -82,12 +76,17 @@ export function createLivePromptHistoryCompatibilitySnapshot(
     }
 }
 
-export function adoptTriggeredChat(target: Chat, replacement: Chat): Chat {
-    for (const key of Object.keys(target) as (keyof Chat)[]) {
-        if (!(key in replacement)) delete target[key]
-    }
-    Object.assign(target, replacement)
-    return target
+export function adoptTriggeredChat(
+    session: ActiveConversationSession,
+    expectedVersion: number,
+    expectedMessages: readonly Message[],
+    replacement: Chat,
+): Chat {
+    return session.adoptConversationReplacement(
+        expectedVersion,
+        expectedMessages,
+        replacement,
+    )
 }
 
 export function selectPromptHistory(
@@ -153,6 +152,7 @@ export function* iteratePromptHistory(
                 absoluteIndex: page.startIndex + offset,
                 relativeIndex,
                 message,
+                locator: page.locators[offset],
             }
             relativeIndex += 1
         }

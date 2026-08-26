@@ -311,6 +311,61 @@ describe('ActiveConversationSession', () => {
         expect(conversation.bookmarkNames).toBe(originalBookmarkNames)
     })
 
+    it('resolves exact live locators and assigns a missing ID only once through that locator', () => {
+        const { conversation, session } = createSession(chat([
+            message('', 'empty-id'),
+            message('existing', 'existing-id'),
+        ]))
+        const emptyLocator = session.locate(0)
+        const createId = vi.fn(() => 'generated-id')
+
+        const first = session.ensureMessageId(emptyLocator, createId)
+        const second = session.ensureMessageId(emptyLocator, createId)
+
+        expect(first).toBe(conversation.message[0])
+        expect(second).toBe(first)
+        expect(first.chatId).toBe('generated-id')
+        expect(createId).toHaveBeenCalledOnce()
+        expect(session.version).toBe(0)
+
+        session.edit(session.locate(1), message('existing', 'changed elsewhere'))
+        expect(() => session.resolveMessage(emptyLocator)).toThrow(ConversationSessionStaleError)
+    })
+
+    it('adopts a trigger replacement only against the captured version and message array', () => {
+        const { conversation, onMutation, session } = createSession()
+        const expectedMessages = conversation.message
+        const replacementMessages = [message('triggered', 'triggered')]
+        const replacement: Chat = {
+            id: 'conversation-a',
+            name: 'Triggered',
+            note: '',
+            localLore: [],
+            message: replacementMessages,
+        }
+        const staleLocator = session.locate(0)
+
+        const adopted = session.adoptConversationReplacement(0, expectedMessages, replacement)
+
+        expect(adopted).toBe(conversation)
+        expect(conversation).toEqual(replacement)
+        expect(conversation.message).toBe(replacementMessages)
+        expect(session.version).toBe(1)
+        expect(() => session.resolveMessage(staleLocator)).toThrow(ConversationSessionStaleError)
+        expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
+            previousVersion: 0,
+            sessionVersion: 1,
+            commands: ['replace-conversation'],
+        }))
+
+        const currentMessages = conversation.message
+        session.edit(session.locate(0), message('triggered', 'concurrent edit'))
+        expect(() => session.adoptConversationReplacement(1, currentMessages, replacement))
+            .toThrow(ConversationSessionStaleError)
+        expect(conversation.message[0].data).toBe('concurrent edit')
+        expect(conversation.name).toBe('Triggered')
+    })
+
     it('replaces tails for reroll and exposes an inclusive branch source without cloning the chat shape', () => {
         const { conversation, session } = createSession()
 

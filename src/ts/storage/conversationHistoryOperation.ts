@@ -6,6 +6,7 @@ import {
     type ActiveConversationBackwardScan,
     type ActiveConversationPin,
     type ActiveConversationWindow,
+    type MessageLocator,
 } from './activeConversationSession'
 import type { DataRevision } from './persistentDataStore'
 import { safeStructuredClone } from '../polyfill'
@@ -22,6 +23,8 @@ export interface ConversationHistoryOperation {
     readLatest(limit: number): ActiveConversationWindow
     readRange(startIndex: number, limit: number): ActiveConversationWindow
     scanBackward(startIndexExclusive?: number, limit?: number): ActiveConversationBackwardScan
+    resolveMessage(locator: MessageLocator): Message
+    ensureMessageId(locator: MessageLocator, createId: () => string): Message
     assertCurrent(): void
     dispose(): void
 }
@@ -81,6 +84,14 @@ class SessionConversationHistoryOperation implements ConversationHistoryOperatio
             : session.scanBackward(startIndexExclusive, limit)
         this.assertResultVersion(result.sessionVersion)
         return result
+    }
+
+    resolveMessage(locator: MessageLocator): Message {
+        return this.requireCurrentSession().resolveMessage(locator)
+    }
+
+    ensureMessageId(locator: MessageLocator, createId: () => string): Message {
+        return this.requireCurrentSession().ensureMessageId(locator, createId)
     }
 
     assertCurrent(): void {
