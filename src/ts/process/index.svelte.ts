@@ -296,6 +296,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             return false
         }
     }
+    const generationSetupSession = getActiveConversationSession()
     if (hasMismatchedActiveConversationSession()) return false
 
     await activatePresetChainForRequest(
@@ -319,7 +320,10 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         chatProcessStage.set(0)
     }
 
-    if (hasMismatchedActiveConversationSession()) return false
+    if (
+        (generationSetupSession && getActiveConversationSession() !== generationSetupSession)
+        || hasMismatchedActiveConversationSession()
+    ) return false
 
     DBState.db.statics.messages += 1
     selectedChar = get(selectedCharID)

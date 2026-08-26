@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
     modelRequestCount: 0,
     modelRequests: [] as any[],
     presetActivationCount: 0,
+    presetActivation: null as null | (() => Promise<void> | void),
     outputTrigger: null as null | ((chat: any) => Promise<any> | any),
     tokenizeResult: null as Promise<number> | null,
     inlay: null as null | ((data: string) => { text: string, promise?: Promise<string> }),
@@ -153,6 +154,7 @@ vi.mock('../plugins/plugins.svelte', () => ({
 vi.mock('./presetChain', () => ({
     activatePresetChainForRequest: vi.fn(async () => {
         mocks.presetActivationCount += 1
+        await mocks.presetActivation?.()
     }),
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
@@ -309,6 +311,7 @@ describe('sendChat generation session integration', () => {
         mocks.modelRequestCount = 0
         mocks.modelRequests.length = 0
         mocks.presetActivationCount = 0
+        mocks.presetActivation = null
         mocks.outputTrigger = null
         mocks.tokenizeResult = null
         mocks.inlay = null
@@ -349,6 +352,24 @@ describe('sendChat generation session integration', () => {
 
         expect(source.message).toEqual([{ role: 'user', data: 'must remain unchanged' }])
         expect(mocks.presetActivationCount).toBe(0)
+        expect(mocks.modelRequestCount).toBe(0)
+        expect(DBState.db.statics.messages).toBe(0)
+        expect(currentCharacter.lastInteraction).toBe(123)
+    })
+
+    it('fails closed when the matching session disappears during preset activation', async () => {
+        const source = makeChat([{ role: 'user', data: 'must remain unchanged' }])
+        const { currentCharacter } = installDatabase(source)
+        currentCharacter.lastInteraction = 123
+        mocks.presetActivation = () => {
+            mocks.session?.invalidate()
+            mocks.session = null
+        }
+
+        await expect(sendChat()).resolves.toBe(false)
+
+        expect(source.message).toEqual([{ role: 'user', data: 'must remain unchanged' }])
+        expect(mocks.presetActivationCount).toBe(1)
         expect(mocks.modelRequestCount).toBe(0)
         expect(DBState.db.statics.messages).toBe(0)
         expect(currentCharacter.lastInteraction).toBe(123)
