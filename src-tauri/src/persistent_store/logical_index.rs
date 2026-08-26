@@ -896,6 +896,26 @@ fn scan_compact_manifest(
     if require_complete && metadata.state != "complete" {
         return validation("logical generation index is not complete");
     }
+    let mut dependencies_by_record = BTreeMap::<String, Vec<LogicalManifestObject>>::new();
+    let mut dependency_statement = connection.prepare(
+        "SELECT record_key, object_hash, object_size
+         FROM logical_record_dependencies
+         WHERE library_id = ?1 AND generation_id = ?2
+         ORDER BY record_key ASC, object_hash ASC",
+    )?;
+    let mut dependency_rows = dependency_statement.query(params![library_id, generation_id])?;
+    while let Some(row) = dependency_rows.next()? {
+        dependencies_by_record
+            .entry(row.get(0)?)
+            .or_default()
+            .push(LogicalManifestObject {
+                hash: row.get(1)?,
+                size: nonnegative_u64(row.get(2)?, "indexed logical dependency size")?,
+            });
+    }
+    drop(dependency_rows);
+    drop(dependency_statement);
+
     let mut statement = connection.prepare(
         "SELECT record_key, state, object_hash, object_size, deleted_generation_sequence
          FROM logical_record_heads
@@ -909,29 +929,7 @@ fn scan_compact_manifest(
         if state == "live" {
             let hash: String = row.get(2)?;
             let size = nonnegative_u64(row.get(3)?, "indexed logical object size")?;
-            let mut dependency_statement = connection.prepare(
-                "SELECT object_hash, object_size FROM logical_record_dependencies
-                 WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
-                 ORDER BY object_hash ASC",
-            )?;
-            let dependencies = dependency_statement
-                .query_map(params![library_id, generation_id, key], |dependency| {
-                    Ok(LogicalManifestObject {
-                        hash: dependency.get(0)?,
-                        size: nonnegative_u64(
-                            dependency.get(1)?,
-                            "indexed logical dependency size",
-                        )
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                rusqlite::types::Type::Integer,
-                                Box::new(error),
-                            )
-                        })?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
+            let dependencies = dependencies_by_record.remove(&key).unwrap_or_default();
             records.push(IndexedLogicalRecord::live(
                 key,
                 LogicalManifestObject { hash, size },
@@ -942,6 +940,9 @@ fn scan_compact_manifest(
         } else {
             return validation("logical record head state is invalid");
         }
+    }
+    if !dependencies_by_record.is_empty() {
+        return validation("logical dependencies reference missing record heads");
     }
     let built = build_indexed_logical_manifest(IndexedLogicalManifestBuilderInput {
         library_id: metadata.library_id,
