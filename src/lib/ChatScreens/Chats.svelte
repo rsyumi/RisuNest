@@ -94,6 +94,9 @@
     let navigationGeneration = 0
     let suppressScroll = false
     const identityRegistry = new ChatRenderIdentityRegistry()
+    const ownerSessionIds = new WeakMap<object, number>()
+    const conversationSessionIds = new WeakMap<object, number>()
+    let nextScopeIdentity = 1
 
     let resolvedCharacterImage = $state<string | null>(null)
     let resolvedUserImage = $state<string | null>(null)
@@ -133,11 +136,28 @@
     function currentChatScope(): string {
         const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
         const selectedCharacterIndex = get(selectedCharID)
-        const characterId = currentCharacter.type === 'group'
+        const ownerId = currentCharacter.type === 'group'
             ? `group:${selectedCharacterIndex}`
-            : currentCharacter.chaId
-        return currentChat?.id
-            ?? `${selectedCharacterIndex}:${characterId}:${currentCharacter.chatPage}`
+            : `character:${selectedCharacterIndex}:${currentCharacter.chaId}`
+        const ownerSessionId = objectScopeIdentity(ownerSessionIds, currentCharacter)
+        const conversationId = currentChat?.id ?? `page:${currentCharacter.chatPage}`
+        const conversationSessionId = currentChat
+            ? objectScopeIdentity(conversationSessionIds, currentChat)
+            : 0
+        return [
+            ownerId,
+            String(ownerSessionId),
+            conversationId,
+            String(conversationSessionId),
+        ].map((part) => `${part.length}:${part}`).join('|')
+    }
+
+    function objectScopeIdentity(identities: WeakMap<object, number>, value: object): number {
+        const existing = identities.get(value)
+        if (existing !== undefined) return existing
+        const identity = nextScopeIdentity++
+        identities.set(value, identity)
+        return identity
     }
 
     function hasConversationStart(): boolean {
@@ -345,6 +365,7 @@
             })
             const previousSignature = renderSignatures.get(key)
             if (!areChatRenderSignaturesEqual(previousSignature, renderSignature)) {
+                releaseRowRuntimeState(key)
                 unmountInstance(key)
                 element.replaceChildren()
                 const instance = mount(Chat, {
@@ -391,8 +412,24 @@
         for (const key of renderKeys) {
             if (!currentRenderKeys.has(key)) removeMountedRow(key)
         }
-        chatBody.replaceChildren(...orderedElements)
+        reconcileChatBodyChildren(orderedElements)
         renderKeys = currentRenderKeys
+    }
+
+    function reconcileChatBodyChildren(orderedElements: readonly HTMLElement[]): void {
+        const retained = new Set<Node>(orderedElements)
+        for (const child of [...chatBody.childNodes]) {
+            if (!retained.has(child)) child.remove()
+        }
+
+        let cursor = chatBody.firstChild
+        for (const element of orderedElements) {
+            if (cursor === element) {
+                cursor = cursor.nextSibling
+                continue
+            }
+            chatBody.insertBefore(element, cursor)
+        }
     }
 
     function ensureElement(key: string, viewportIndex: number): HTMLElement {
@@ -449,6 +486,7 @@
     }
 
     function removeMountedRow(key: string): void {
+        releaseRowRuntimeState(key)
         unmountInstance(key)
         const element = mountedElements.get(key)
         if (element) {
@@ -457,8 +495,20 @@
             mountedElements.delete(key)
         }
         renderSignatures.delete(key)
-        pinReasons.delete(key)
+    }
+
+    function releaseRowRuntimeState(key: string): void {
+        const media = playingMedia.get(key)
         playingMedia.delete(key)
+        pinReasons.delete(key)
+        for (const target of media ?? []) {
+            if (!(target instanceof HTMLMediaElement)) continue
+            try {
+                target.pause()
+            } catch {
+                // The component teardown below remains the resource owner.
+            }
+        }
     }
 
     function clearMountedRows(): void {
@@ -675,16 +725,15 @@
     }
 
     let previousLength = 0
-    let previousChatRoomId: string | null = null
+    let previousConversationScope: string | null = null
 
     $effect(() => {
         void $ReloadChatPointer
         if (!imagesReady && !hasRenderedChat) return
         const wasAtBottom = checkIfAtBottom()
         reconcileViewport()
-        const currentChatRoomId = currentCharacter.chats?.[currentCharacter.chatPage]?.id
-            ?? `${get(selectedCharID)}:${currentCharacter.chatPage}`
-        const isSameChat = currentChatRoomId === previousChatRoomId
+        const conversationScope = currentChatScope()
+        const isSameChat = conversationScope === previousConversationScope
         if (isSameChat && messages.length > previousLength) {
             const lastMessage = messages.at(-1)
             if (lastMessage?.role === 'char' && DBState.db.autoScrollToNewMessage) {
@@ -700,7 +749,7 @@
             }
         }
         previousLength = messages.length
-        previousChatRoomId = currentChatRoomId
+        previousConversationScope = conversationScope
     })
 
     onMount(() => {

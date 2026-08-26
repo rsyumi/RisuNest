@@ -505,6 +505,37 @@ describe('Chats imperative mount lifecycle', () => {
         ).toBe(false))
     })
 
+    test('keeps actual editor focus without detaching its retained row during navigation', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await (mounted as HarnessInstance).jumpTo(0)
+
+        const message = probeElements(target).find((element) => element.dataset.message === 'message-0')!
+        const row = message.closest<HTMLElement>('[data-chat-render-key]')!
+        const editor = document.createElement('textarea')
+        message.append(editor)
+        editor.focus()
+        expect(document.activeElement).toBe(editor)
+
+        const removedRows: Node[] = []
+        const observer = new MutationObserver((records) => {
+            for (const record of records) removedRows.push(...record.removedNodes)
+        })
+        observer.observe(row.parentElement!, { childList: true })
+
+        await (mounted as HarnessInstance).jumpToLatestMessage()
+        await Promise.resolve()
+        observer.disconnect()
+
+        expect(document.activeElement).toBe(editor)
+        expect(removedRows).not.toContain(row)
+        expect(row.isConnected).toBe(true)
+    })
+
     test('pins only actually playing media and releases it on pause', async () => {
         const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
         mounted = mount(ChatsHarness, {
@@ -514,14 +545,50 @@ describe('Chats imperative mount lifecycle', () => {
         await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
         await (mounted as HarnessInstance).jumpTo(0)
         const message = probeElements(target).find((element) => element.dataset.message === 'message-0')!
+        const row = message.closest<HTMLElement>('[data-chat-render-key]')!
+        const media = document.createElement('audio')
+        message.append(media)
+        media.dispatchEvent(new Event('play'))
+        const removedRows: Node[] = []
+        const observer = new MutationObserver((records) => {
+            for (const record of records) removedRows.push(...record.removedNodes)
+        })
+        observer.observe(row.parentElement!, { childList: true })
+
+        await (mounted as HarnessInstance).jumpToLatestMessage()
+        await Promise.resolve()
+        observer.disconnect()
+        expect(probeElements(target).some((element) => element.dataset.message === 'message-0')).toBe(true)
+        expect(media.isConnected).toBe(true)
+        expect(removedRows).not.toContain(row)
+
+        media.dispatchEvent(new Event('pause'))
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-0'),
+        ).toBe(false))
+    })
+
+    test('drops stale playing-media state when a row remounts', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await (mounted as HarnessInstance).jumpTo(0)
+
+        const message = probeElements(target).find((element) => element.dataset.message === 'message-0')!
+        const originalInstance = Number(message.dataset.chatProbe)
         const media = document.createElement('audio')
         message.append(media)
         media.dispatchEvent(new Event('play'))
 
-        await (mounted as HarnessInstance).jumpToLatestMessage()
-        expect(probeElements(target).some((element) => element.dataset.message === 'message-0')).toBe(true)
+        ReloadGUIPointer.update((value) => value + 1)
+        await vi.waitFor(() => expect(probeIdForMessage(target, 'message-0')).not.toBe(originalInstance))
+        expect(media.isConnected).toBe(false)
+        expect(chatMountProbe.unmounts).toContain(originalInstance)
 
-        media.dispatchEvent(new Event('pause'))
+        await (mounted as HarnessInstance).jumpToLatestMessage()
         await vi.waitFor(() => expect(
             probeElements(target).some((element) => element.dataset.message === 'message-0'),
         ).toBe(false))
@@ -592,12 +659,17 @@ describe('Chats imperative mount lifecycle', () => {
         await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
         const observer = TestResizeObserver.instances[0]
         const activeInstances = probeElements(target).map((element) => Number(element.dataset.chatProbe))
+        const media = document.createElement('audio')
+        media.pause = vi.fn()
+        probeElements(target)[0].append(media)
+        media.dispatchEvent(new Event('play'))
 
         await unmount(mounted)
         mounted = undefined
 
         expect(observer.disconnected).toBe(true)
         expect(observer.observed.size).toBe(0)
+        expect(media.pause).toHaveBeenCalledOnce()
         expect(activeInstances.every((instance) => chatMountProbe.unmounts.includes(instance))).toBe(true)
     })
 
@@ -630,5 +702,41 @@ describe('Chats imperative mount lifecycle', () => {
         ])
         expect(result).toBe(false)
         expect(cancelFrame).toHaveBeenCalled()
+    })
+
+    test('rejects a pending jump after switching owners with the same imported chat ID', async () => {
+        const pendingFrames = new Map<number, FrameRequestCallback>()
+        let nextFrame = 1
+        vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
+            const frame = nextFrame++
+            pendingFrames.set(frame, callback)
+            return frame
+        }))
+        vi.stubGlobal('cancelAnimationFrame', vi.fn((frame: number) => pendingFrames.delete(frame)))
+        const oldMessages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: oldMessages, initialCharacter: makeCharacter(oldMessages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+
+        const jumping = (mounted as HarnessInstance).jumpTo(0)
+        await tick()
+        const newMessages = Array.from({ length: 200 }, (_, index) => makeMessage(index, {
+            data: `new-owner-message-${index}`,
+        }))
+        const newCharacter = makeCharacter(newMessages)
+        newCharacter.chaId = 'new-owner-id'
+        ;(mounted as HarnessInstance).switchCharacter(newCharacter, newMessages)
+        await tick()
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message?.startsWith('new-owner-message-')),
+        ).toBe(true))
+
+        for (const [frame, callback] of [...pendingFrames]) {
+            pendingFrames.delete(frame)
+            callback(0)
+        }
+        await expect(jumping).resolves.toBe(false)
     })
 })
