@@ -18,6 +18,10 @@ interface SchedulerClock {
     clearTimeout(timer: ReturnType<typeof setTimeout>): void
 }
 
+interface SchedulerFailure {
+    error: unknown
+}
+
 export interface LeadingEdgeSchedulerOptions<T> {
     process(
         snapshot: ScheduledSnapshot<T>,
@@ -62,7 +66,7 @@ export function createLeadingEdgeScheduler<T = string>(
     let timer: ReturnType<typeof setTimeout> | null = null
     let lastStartedAt: number | null = null
     let lastCompletedSequence = 0
-    let failure: unknown = null
+    let failure: SchedulerFailure | null = null
 
     const clearTimer = () => {
         if (timer === null) return
@@ -74,7 +78,7 @@ export function createLeadingEdgeScheduler<T = string>(
 
     const fail = (error: unknown) => {
         if (status === 'aborted' || status === 'failed') return
-        failure = error
+        failure = { error }
         status = 'failed'
         pending = null
         clearTimer()
@@ -128,7 +132,7 @@ export function createLeadingEdgeScheduler<T = string>(
     }
 
     const throwFailure = () => {
-        if (failure !== null) throw failure
+        if (failure !== null) throw failure.error
     }
 
     return {
@@ -268,7 +272,7 @@ function createExactController<T>(
         resolve(): void
         reject(error: unknown): void
     }> = []
-    let failure: unknown = null
+    let failure: SchedulerFailure | null = null
 
     const context: StreamingDisplayProcessContext = {
         signal: abortController.signal,
@@ -285,12 +289,17 @@ function createExactController<T>(
                 item.resolve()
             })
             .catch((error) => {
-                failure = error
+                failure = { error }
                 status = 'failed'
                 abortController.abort()
-                options.onError?.(error)
                 item.reject(error)
                 for (const waiting of queued.splice(0)) waiting.reject(error)
+                try {
+                    options.onError?.(error)
+                }
+                catch {
+                    // The processor error remains authoritative.
+                }
             })
             .finally(() => {
                 if (active === running) active = null
@@ -312,13 +321,13 @@ function createExactController<T>(
         },
         async finish() {
             if (status === 'closed' || status === 'aborted') return
-            if (failure !== null) throw failure
+            if (failure !== null) throw failure.error
             status = 'closing'
             while (active || queued.length > 0) {
                 startNext()
                 if (active) await active
             }
-            if (failure !== null) throw failure
+            if (failure !== null) throw failure.error
             status = 'closed'
         },
         async abort() {

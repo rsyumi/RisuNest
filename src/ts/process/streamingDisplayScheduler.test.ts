@@ -232,6 +232,27 @@ describe('leading-edge streaming display scheduler', () => {
         expect(scheduler.inspect()).toMatchObject({ status: 'failed', activeCount: 0, pendingCount: 0, timerCount: 0 })
     })
 
+    it('treats a null processor rejection as a failure instead of an empty sentinel', async () => {
+        vi.useFakeTimers()
+        const reported: unknown[] = []
+        const scheduler = createLeadingEdgeScheduler({
+            process: async () => Promise.reject(null),
+            onError: (error) => reported.push(error),
+        })
+
+        scheduler.submit('a')
+        await settle()
+
+        await expect(scheduler.finish()).rejects.toBeNull()
+        expect(reported).toEqual([null])
+        expect(scheduler.inspect()).toMatchObject({
+            status: 'failed',
+            activeCount: 0,
+            pendingCount: 0,
+            timerCount: 0,
+        })
+    })
+
     it('uses the mode pinned when the generation controller is created', async () => {
         vi.useFakeTimers()
         let configuredMode: 'off' | 'balanced' = 'balanced'
@@ -342,5 +363,35 @@ describe('pinned streaming display modes', () => {
 
         expect(actions).toEqual([`${mode === 'strong' ? 'preview' : 'semantic'}:a`])
         expect(commits).toEqual([])
+    })
+
+    it('keeps the exact submit rejection authoritative when cleanup also throws', async () => {
+        vi.useFakeTimers()
+        const processorFailure = new Error('processor failed')
+        const controller = createStreamingDisplayController({
+            mode: 'off',
+            processSemantic: async () => {
+                throw processorFailure
+            },
+            processPreview: async () => {},
+            onError: () => {
+                throw new Error('cleanup failed')
+            },
+        })
+        let outcome: unknown = 'pending'
+
+        void controller.submit('a').then(
+            () => { outcome = 'resolved' },
+            (error) => { outcome = error },
+        )
+        await settle()
+
+        expect(outcome).toBe(processorFailure)
+        await expect(controller.finish()).rejects.toBe(processorFailure)
+        expect(controller.inspect()).toMatchObject({
+            status: 'failed',
+            activeCount: 0,
+            pendingCount: 0,
+        })
     })
 })

@@ -73,6 +73,13 @@ const { processScriptFull, resetScriptCache } = await import('./scripts')
 
 type StreamingMode = 'off' | 'balanced' | 'strong'
 type FixtureName = 'ordinary' | 'stateful-emotion'
+type ReplayProfileName = 'steady' | 'burst' | 'sparse' | 'slow-pass'
+
+interface ReplayProfile {
+    name: ReplayProfileName
+    processingMs: number
+    arrivalAt(index: number): number
+}
 
 interface ReplayRun {
     finalHash: string
@@ -100,6 +107,8 @@ interface ReplayMeasurement {
     chunkCount: number
     fixture: FixtureName
     mode: StreamingMode
+    profile: ReplayProfileName
+    simulatedProcessingMs: number
     finalHash: string
     sideEffectCount: number
     luaActionCount: number
@@ -122,6 +131,28 @@ const STREAMING_DISPLAY_FLUSH_DELAY_MS = 125
 const CHUNK_INTERVAL_MS = 10
 const LONG_TASK_THRESHOLD_MS = 50
 const MEASUREMENT_RUNS = 11
+const replayProfiles: Record<ReplayProfileName, ReplayProfile> = {
+    steady: {
+        name: 'steady',
+        processingMs: 0,
+        arrivalAt: (index) => index * CHUNK_INTERVAL_MS,
+    },
+    burst: {
+        name: 'burst',
+        processingMs: 0,
+        arrivalAt: (index) => Math.floor(index / 20) * 25,
+    },
+    sparse: {
+        name: 'sparse',
+        processingMs: 0,
+        arrivalAt: (index) => index * 200,
+    },
+    'slow-pass': {
+        name: 'slow-pass',
+        processingMs: 175,
+        arrivalAt: (index) => index * CHUNK_INTERVAL_MS,
+    },
+}
 
 const regexFixture = makeRegexFixture(100)
 const snapshotsByCount = new Map<number, string[]>()
@@ -157,6 +188,7 @@ class ReplayClock {
     }
 
     async advanceTo(targetMs: number) {
+        targetMs = Math.max(targetMs, this.nowMs)
         while(true){
             const due = [...this.timers.entries()]
                 .filter(([, timer]) => timer.at <= targetMs)
@@ -168,6 +200,26 @@ class ReplayClock {
             await settleScheduler()
         }
         this.nowMs = targetMs
+    }
+
+    elapse(durationMs: number) {
+        this.nowMs += durationMs
+    }
+
+    wait(durationMs: number): Promise<void> {
+        return new Promise((resolve) => {
+            this.clock.setTimeout(resolve, durationMs)
+        })
+    }
+
+    async runAll() {
+        while(true){
+            await settleScheduler()
+            const next = [...this.timers.values()]
+                .sort((left, right) => left.at - right.at)[0]
+            if(!next) return
+            await this.advanceTo(next.at)
+        }
     }
 }
 
@@ -194,7 +246,12 @@ function makeCharacter(fixture: FixtureName): character {
     } as character
 }
 
-async function runReplay(chunkCount: number, fixture: FixtureName, mode: StreamingMode): Promise<ReplayRun> {
+async function runReplay(
+    chunkCount: number,
+    fixture: FixtureName,
+    mode: StreamingMode,
+    profile: ReplayProfile,
+): Promise<ReplayRun> {
     const snapshots = makeSnapshots(chunkCount)
     const character = makeCharacter(fixture)
     const taskDurations: number[] = []
@@ -233,6 +290,10 @@ async function runReplay(chunkCount: number, fixture: FixtureName, mode: Streami
                 { cache: 'bypass', regexWorker: false },
             )
             taskDurations.push(performance.now() - startedAt)
+            if(profile.processingMs > 0){
+                if(mode === 'balanced') await clock.wait(profile.processingMs)
+                else clock.elapse(profile.processingMs)
+            }
             finalData = result.data
             displayUpdateCount += 1
             firstDisplayMs = Math.min(firstDisplayMs, clock.nowMs)
@@ -260,7 +321,7 @@ async function runReplay(chunkCount: number, fixture: FixtureName, mode: Streami
     })
 
     for(let index = 0; index < snapshots.length; index++){
-        await clock.advanceTo(index * CHUNK_INTERVAL_MS)
+        await clock.advanceTo(profile.arrivalAt(index))
         await controller.submit(snapshots[index])
         await settleScheduler()
         const state = controller.inspect()
@@ -268,7 +329,9 @@ async function runReplay(chunkCount: number, fixture: FixtureName, mode: Streami
         pendingMaximum = Math.max(pendingMaximum, state.pendingCount)
     }
     const startsBeforeFinish = scheduledStartCount
-    await controller.finish()
+    const finishing = controller.finish()
+    await clock.runAll()
+    await finishing
     await settleScheduler()
     const finalFlushCount = scheduledStartCount - startsBeforeFinish
 
@@ -314,10 +377,15 @@ function formatSideEffectOrder(order: number[], chunkCount: number, mode: Stream
     return `[${order.join(',')}]`
 }
 
-async function measureReplay(chunkCount: number, fixture: FixtureName, mode: StreamingMode): Promise<ReplayMeasurement> {
+async function measureReplay(
+    chunkCount: number,
+    fixture: FixtureName,
+    mode: StreamingMode,
+    profile: ReplayProfile,
+): Promise<ReplayMeasurement> {
     const runs: ReplayRun[] = []
     for(let run = 0; run < MEASUREMENT_RUNS; run++){
-        runs.push(await runReplay(chunkCount, fixture, mode))
+        runs.push(await runReplay(chunkCount, fixture, mode, profile))
     }
     const measuredRuns = runs.slice(1)
     const reference = measuredRuns[0]
@@ -332,6 +400,8 @@ async function measureReplay(chunkCount: number, fixture: FixtureName, mode: Str
         chunkCount,
         fixture,
         mode,
+        profile: profile.name,
+        simulatedProcessingMs: profile.processingMs,
         finalHash: reference.finalHash,
         sideEffectCount: reference.sideEffectOrder.length,
         luaActionCount: reference.luaActionCount,
@@ -352,22 +422,39 @@ async function measureReplay(chunkCount: number, fixture: FixtureName, mode: Str
 }
 
 const measurements: ReplayMeasurement[] = []
-for(const chunkCount of [20, 100, 500]){
+const measurementCases = [
+    ...[20, 100, 500].map((chunkCount) => ({ chunkCount, profile: replayProfiles.steady })),
+    ...(['burst', 'sparse', 'slow-pass'] as const).map((profile) => ({
+        chunkCount: 100,
+        profile: replayProfiles[profile],
+    })),
+]
+for(const { chunkCount, profile } of measurementCases){
     for(const fixture of ['ordinary', 'stateful-emotion'] as const){
         for(const mode of ['off', 'balanced', 'strong'] as const){
-            measurements.push(await measureReplay(chunkCount, fixture, mode))
+            measurements.push(await measureReplay(chunkCount, fixture, mode, profile))
         }
     }
 }
 
-for(const chunkCount of [20, 100, 500]){
-    const ordinary = measurements.filter((measurement) => measurement.chunkCount === chunkCount && measurement.fixture === 'ordinary')
+for(const { chunkCount, profile } of measurementCases){
+    const caseMeasurements = measurements.filter((measurement) =>
+        measurement.chunkCount === chunkCount && measurement.profile === profile.name)
+    const ordinary = caseMeasurements.filter((measurement) => measurement.fixture === 'ordinary')
     expect(new Set(ordinary.map((measurement) => measurement.finalHash))).toEqual(new Set([regexFixture.expectedHash]))
 
-    const stateful = measurements.filter((measurement) => measurement.chunkCount === chunkCount && measurement.fixture === 'stateful-emotion')
+    const stateful = caseMeasurements.filter((measurement) => measurement.fixture === 'stateful-emotion')
     expect(new Set(stateful.map((measurement) => measurement.finalHash))).toEqual(new Set([regexFixture.expectedHash]))
-    expect(stateful.find((measurement) => measurement.mode === 'balanced')?.sideEffectCount)
-        .not.toBe(stateful.find((measurement) => measurement.mode === 'off')?.sideEffectCount)
+    const exactCount = stateful.find((measurement) => measurement.mode === 'off')?.sideEffectCount
+    const balanced = stateful.find((measurement) => measurement.mode === 'balanced')!
+    const balancedCount = balanced.sideEffectCount
+    if(profile.name === 'sparse') expect(balancedCount).toBe(exactCount)
+    else expect(balancedCount).not.toBe(exactCount)
+    if(profile.name === 'burst') expect(balancedCount).toBe(2)
+    if(profile.name === 'slow-pass'){
+        expect(balanced.firstWorkStartMs.median).toBe(0)
+        expect(balanced.firstDisplayMs.median).toBe(profile.processingMs)
+    }
     for(const measurement of stateful){
         expect(measurement.luaActionCount).toBe(measurement.sideEffectCount)
         expect(measurement.pluginActionCount).toBe(measurement.sideEffectCount)
@@ -380,9 +467,12 @@ console.log(`STREAMING_DISPLAY_MEASUREMENTS ${JSON.stringify({
     method: {
         responseBytes: regexFixture.input.length,
         regexRuleCount: regexFixture.scripts.length,
-        chunkIntervalMs: CHUNK_INTERVAL_MS,
         flushDelayMs: STREAMING_DISPLAY_FLUSH_DELAY_MS,
         scheduler: 'production-leading-edge',
+        profiles: Object.values(replayProfiles).map((profile) => ({
+            name: profile.name,
+            processingMs: profile.processingMs,
+        })),
         warmRuns: MEASUREMENT_RUNS,
         discardedRuns: 1,
         longTaskThresholdMs: LONG_TASK_THRESHOLD_MS,
@@ -391,5 +481,5 @@ console.log(`STREAMING_DISPLAY_MEASUREMENTS ${JSON.stringify({
 }, null, 2)}`)
 
 bench('streaming display replay measurement gate is deterministic', () => {
-    expect(measurements).toHaveLength(18)
+    expect(measurements).toHaveLength(36)
 })

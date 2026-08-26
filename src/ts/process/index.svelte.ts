@@ -1,5 +1,5 @@
 import { get, writable } from "svelte/store";
-import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
+import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -35,7 +35,10 @@ import { readImage } from "../globalApi.svelte";
 import { pluginV2 } from "../plugins/plugins.svelte";
 import { activatePresetChainForRequest } from "./presetChain";
 import { doingChat } from './generationState'
-import { createStreamingDisplayController } from './streamingDisplayScheduler'
+import {
+    captureStreamingMessageTarget,
+    consumeStreamingDisplayStream,
+} from './streamingDisplayStream'
 
 export { doingChat } from './generationState'
 
@@ -1603,110 +1606,71 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         const outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId
         const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'off'
-        const targetCharacter = DBState.db.characters[selectedChar]
-        const targetChat = targetCharacter.chats[selectedChat]
+        const streamingTarget = captureStreamingMessageTarget<character | groupChat, Chat, Message>(
+            () => DBState.db.characters,
+            selectedChar,
+            selectedChat,
+            msgIndex,
+        )
+        const targetCharacter = streamingTarget.character
+        const targetChat = streamingTarget.chat
+        const targetMessage = streamingTarget.message
         targetChat.isStreaming = true
         targetChat.activeStreamingDisplayOptimizationMode = performanceMode
         targetCharacter.reloadKeys += 1
         let lastResponseChunk:{[key:string]:string} = {}
-        let streamAborted:boolean = abortSignal.aborted
-        const targetCharacterId = currentChar.chaId
-        const targetChatId = targetChat.id
-        const targetMessage = targetChat.message[msgIndex]
-        const ownsStreamingMessage = () => {
-            const character = DBState.db.characters[selectedChar]
-            const chat = character?.chats[selectedChat]
-            return character === targetCharacter
-                && character.chaId === targetCharacterId
-                && chat === targetChat
-                && chat?.id === targetChatId
-                && chat?.message[msgIndex] === targetMessage
-        }
         const processStreamingSnapshot = async (snapshot:string, cache:'normal'|'bypass', signal:AbortSignal) => {
             try {
                 return await processScriptFull(nowChatroom, reformatContent(prefix + snapshot), 'editoutput', msgIndex, {}, { cache, signal, regexWorker: true })
             }
             catch(error){
-                if(signal.aborted || streamAborted){
+                if(signal.aborted){
                     return null
                 }
                 throw error
             }
         }
-        const streamingController = createStreamingDisplayController({
-            mode: performanceMode,
-            processSemantic: async ({ value }, context) => {
-                const cache = performanceMode === 'strong' ? 'normal' : 'bypass'
-                const result2 = await processStreamingSnapshot(value, cache, context.signal)
-                if(result2 === null || !context.canCommit() || !ownsStreamingMessage()) return
-                targetMessage.data = result2.data
-                emoChanged = result2.emoChanged
-                targetCharacter.reloadKeys += 1
-            },
-            processPreview: async ({ value }, context) => {
-                if(!context.canCommit() || !ownsStreamingMessage()) return
-                targetMessage.data = reformatContent(prefix + value)
-                targetCharacter.reloadKeys += 1
-            },
-            onError: () => {
-                void reader.cancel().catch(() => {})
-            },
-        })
-        const abortReader = () => {
-            streamAborted = true
-            void streamingController.abort()
-            void reader.cancel().catch(() => {})
-        }
-        abortSignal.addEventListener('abort', abortReader, { once: true })
-        if(abortSignal.aborted) abortReader()
-        let normalEof = false
+        let streamCompleted = false
         try {
-            while(streamAborted === false){
-                let readed: ReadableStreamReadResult<{ [key: string]: string }>
-                try {
-                    readed = await reader.read()
-                }
-                catch(error){
-                    if(abortSignal.aborted || streamAborted){
-                        streamAborted = true
-                        break
-                    }
-                    await streamingController.abort()
-                    throw error
-                }
-                if(readed.value){
-                    lastResponseChunk = readed.value
-                    const firstChunkKey = Object.keys(lastResponseChunk)[0]
-                    result = lastResponseChunk[firstChunkKey]
-                    if(!result){
-                        result = ''
-                    }
-                    if(DBState.db.removeIncompleteResponse){
-                        result = trimUntilPunctuation(result)
-                    }
-                    await streamingController.submit(result)
-                }
-                if(readed.done){
-                    normalEof = true
-                    break
-                }
-            }
+            const streamResult = await consumeStreamingDisplayStream({
+                mode: performanceMode,
+                reader,
+                abortSignal,
+                isOwned: streamingTarget.isOwned,
+                getSnapshot: (value) => {
+                    const firstChunkKey = Object.keys(value)[0]
+                    const snapshot = value[firstChunkKey] || ''
+                    return DBState.db.removeIncompleteResponse
+                        ? trimUntilPunctuation(snapshot)
+                        : snapshot
+                },
+                onValue: (value, snapshot) => {
+                    lastResponseChunk = value
+                    result = snapshot
+                },
+                processSemantic: async ({ value }, context) => {
+                    const cache = performanceMode === 'strong' ? 'normal' : 'bypass'
+                    const result2 = await processStreamingSnapshot(value, cache, context.signal)
+                    if(result2 === null || !context.canCommit()) return
+                    targetMessage.data = result2.data
+                    emoChanged = result2.emoChanged
+                    targetCharacter.reloadKeys += 1
+                },
+                processPreview: async ({ value }, context) => {
+                    if(!context.canCommit()) return
+                    targetMessage.data = reformatContent(prefix + value)
+                    targetCharacter.reloadKeys += 1
+                },
+            })
+            streamCompleted = streamResult.completed
         }
         finally {
-            try {
-                if(normalEof && !streamAborted && !abortSignal.aborted) await streamingController.finish()
-                else await streamingController.abort()
-            }
-            finally {
-                abortSignal.removeEventListener('abort', abortReader)
-                targetChat.isStreaming = false
-                targetChat.activeStreamingDisplayOptimizationMode = undefined
-                targetCharacter.reloadKeys += 1
-                void reader.cancel().catch(() => {})
-            }
+            targetChat.isStreaming = false
+            targetChat.activeStreamingDisplayOptimizationMode = undefined
+            targetCharacter.reloadKeys += 1
         }
 
-        if(streamAborted || abortSignal.aborted || !ownsStreamingMessage()){
+        if(!streamCompleted){
             return false
         }
 
