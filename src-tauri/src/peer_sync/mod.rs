@@ -8,6 +8,7 @@ pub(crate) mod commands;
 mod host;
 mod http_stream;
 mod lan;
+pub(crate) mod logical_delta;
 mod logical_delta_transfer;
 #[cfg(desktop)]
 mod production;
