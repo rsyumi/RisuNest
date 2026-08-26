@@ -1,5 +1,5 @@
 use super::{compare_plugin_storage_keys, read_target, StoreError, StoreResult};
-use flate2::{write::GzEncoder, Compression, GzBuilder};
+use flate2::{Compression, GzBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[allow(dead_code)]
-mod destination;
+pub(crate) mod destination;
+
+pub(crate) const EXPORT_CANCELLED_MESSAGE: &str = "native RisuSave export cancelled";
 
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 
@@ -31,6 +33,8 @@ const MAX_EXPORT_OWNERSHIP_BYTES: u64 = 4096;
 pub(crate) struct ExportedRisuSave {
     pub(crate) path: String,
     pub(crate) bytes: u64,
+    pub(crate) character_count: u64,
+    pub(crate) preset_count: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -53,6 +57,25 @@ pub(super) fn create(
     lease: &str,
     omit_account: bool,
 ) -> StoreResult<ExportedRisuSave> {
+    create_controlled(
+        connection,
+        snapshots_dir,
+        lease,
+        omit_account,
+        || false,
+        |_, _, _| {},
+    )
+}
+
+pub(crate) fn create_controlled(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    lease: &str,
+    omit_account: bool,
+    is_cancelled: impl Fn() -> bool,
+    mut on_progress: impl FnMut(u64, u64, u64),
+) -> StoreResult<ExportedRisuSave> {
+    check_export_cancelled(&is_cancelled)?;
     let target = read_target(connection, Some(lease))?;
     let exports_dir = export_directory(snapshots_dir)?;
     fs::create_dir_all(&exports_dir)?;
@@ -99,6 +122,9 @@ pub(super) fn create(
     }
 
     let character_ids = character_ids(connection, &target.generation)?;
+    let preset_count = preset_count(connection, &target.generation)?;
+    let total_items = character_ids.len() as u64 + 7;
+    let mut completed_items = 0u64;
     let mut directory = vec![
         Value::String("preset".to_owned()),
         Value::String("modules".to_owned()),
@@ -112,30 +138,119 @@ pub(super) fn create(
 
     let mut file = File::create(&temporary_path)?;
     file.write_all(RISU_SAVE_HEADER)?;
-    write_block(&mut file, ROOT, "root", |writer| {
+    on_progress(file.stream_position()?, completed_items, total_items);
+    check_export_cancelled(&is_cancelled)?;
+    write_block(&mut file, ROOT, "root", &is_cancelled, |writer| {
         serde_json::to_writer(writer, &root).map_err(StoreError::from)
     })?;
-    write_block(&mut file, BOT_PRESET, "preset", |writer| {
-        write_preset_array(connection, &target.generation, writer)
+    report_export_progress(
+        &mut file,
+        &mut completed_items,
+        total_items,
+        &mut on_progress,
+    )?;
+    check_export_cancelled(&is_cancelled)?;
+    write_block(&mut file, BOT_PRESET, "preset", &is_cancelled, |writer| {
+        write_preset_array(connection, &target.generation, writer, &is_cancelled)
     })?;
-    write_optional_value_block(&mut file, MODULES, "modules", modules.as_ref())?;
-    write_optional_value_block(&mut file, LOADOUTS, "loadouts", loadouts.as_ref())?;
-    write_optional_value_block(&mut file, PLUGINS, "plugins", plugins.as_ref())?;
+    report_export_progress(
+        &mut file,
+        &mut completed_items,
+        total_items,
+        &mut on_progress,
+    )?;
+    check_export_cancelled(&is_cancelled)?;
+    write_optional_value_block(
+        &mut file,
+        MODULES,
+        "modules",
+        modules.as_ref(),
+        &is_cancelled,
+    )?;
+    report_export_progress(
+        &mut file,
+        &mut completed_items,
+        total_items,
+        &mut on_progress,
+    )?;
+    check_export_cancelled(&is_cancelled)?;
+    write_optional_value_block(
+        &mut file,
+        LOADOUTS,
+        "loadouts",
+        loadouts.as_ref(),
+        &is_cancelled,
+    )?;
+    report_export_progress(
+        &mut file,
+        &mut completed_items,
+        total_items,
+        &mut on_progress,
+    )?;
+    check_export_cancelled(&is_cancelled)?;
+    write_optional_value_block(
+        &mut file,
+        PLUGINS,
+        "plugins",
+        plugins.as_ref(),
+        &is_cancelled,
+    )?;
+    report_export_progress(
+        &mut file,
+        &mut completed_items,
+        total_items,
+        &mut on_progress,
+    )?;
+    check_export_cancelled(&is_cancelled)?;
     write_optional_value_block(
         &mut file,
         PLUGIN_STORAGE,
         "pluginStorage",
         Some(&plugin_storage),
+        &is_cancelled,
+    )?;
+    report_export_progress(
+        &mut file,
+        &mut completed_items,
+        total_items,
+        &mut on_progress,
     )?;
     for character_id in &character_ids {
-        write_block(&mut file, CHARACTER_WITH_CHAT, character_id, |writer| {
-            write_character(connection, &target.generation, character_id, writer)
-        })?;
+        check_export_cancelled(&is_cancelled)?;
+        write_block(
+            &mut file,
+            CHARACTER_WITH_CHAT,
+            character_id,
+            &is_cancelled,
+            |writer| {
+                write_character(
+                    connection,
+                    &target.generation,
+                    character_id,
+                    writer,
+                    &is_cancelled,
+                )
+            },
+        )?;
+        report_export_progress(
+            &mut file,
+            &mut completed_items,
+            total_items,
+            &mut on_progress,
+        )?;
     }
-    write_block(&mut file, CONFIG, "config", |writer| {
+    check_export_cancelled(&is_cancelled)?;
+    write_block(&mut file, CONFIG, "config", &is_cancelled, |writer| {
         serde_json::to_writer(writer, &serde_json::json!({ "version": 1 }))
             .map_err(StoreError::from)
     })?;
+    report_export_progress(
+        &mut file,
+        &mut completed_items,
+        total_items,
+        &mut on_progress,
+    )?;
+    check_export_cancelled(&is_cancelled)?;
     file.flush()?;
     file.sync_all()?;
     drop(file);
@@ -146,6 +261,41 @@ pub(super) fn create(
     Ok(ExportedRisuSave {
         path: final_path.to_string_lossy().into_owned(),
         bytes,
+        character_count: character_ids.len() as u64,
+        preset_count,
+    })
+}
+
+fn check_export_cancelled(is_cancelled: &impl Fn() -> bool) -> StoreResult<()> {
+    if is_cancelled() {
+        Err(StoreError::Validation {
+            message: EXPORT_CANCELLED_MESSAGE.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn report_export_progress(
+    file: &mut File,
+    completed_items: &mut u64,
+    total_items: u64,
+    on_progress: &mut impl FnMut(u64, u64, u64),
+) -> StoreResult<()> {
+    let bytes = file.stream_position()?;
+    *completed_items += 1;
+    on_progress(bytes, *completed_items, total_items);
+    Ok(())
+}
+
+fn preset_count(connection: &Connection, generation: &str) -> StoreResult<u64> {
+    let count = connection.query_row(
+        "SELECT COUNT(*) FROM bot_presets WHERE generation = ?1",
+        [generation],
+        |row| row.get::<_, i64>(0),
+    )?;
+    u64::try_from(count).map_err(|_| StoreError::Validation {
+        message: "Pinned preset count is invalid".to_owned(),
     })
 }
 
@@ -416,6 +566,7 @@ fn write_block(
     file: &mut File,
     block_type: u8,
     name: &str,
+    is_cancelled: &impl Fn() -> bool,
     write_json: impl FnOnce(&mut dyn Write) -> StoreResult<()>,
 ) -> StoreResult<()> {
     let name = name.as_bytes();
@@ -428,11 +579,21 @@ fn write_block(
     file.write_all(&0u32.to_le_bytes())?;
     let data_position = file.stream_position()?;
     {
-        let mut encoder: GzEncoder<&mut File> = GzBuilder::new()
+        let checked = CancellationAwareWriter {
+            file: &mut *file,
+            is_cancelled,
+        };
+        let mut encoder = GzBuilder::new()
             .mtime(0)
-            .write(file, Compression::default());
-        write_json(&mut encoder)?;
-        encoder.try_finish()?;
+            .write(checked, Compression::default());
+        if let Err(error) = write_json(&mut encoder) {
+            check_export_cancelled(is_cancelled)?;
+            return Err(error);
+        }
+        if let Err(error) = encoder.try_finish() {
+            check_export_cancelled(is_cancelled)?;
+            return Err(error.into());
+        }
     }
     let end_position = file.stream_position()?;
     let length =
@@ -450,11 +611,39 @@ fn write_optional_value_block(
     block_type: u8,
     name: &str,
     value: Option<&Value>,
+    is_cancelled: &impl Fn() -> bool,
 ) -> StoreResult<()> {
-    write_block(file, block_type, name, |writer| match value {
+    write_block(file, block_type, name, is_cancelled, |writer| match value {
         Some(value) => serde_json::to_writer(writer, value).map_err(StoreError::from),
         None => Ok(()),
     })
+}
+
+struct CancellationAwareWriter<'a, F: Fn() -> bool> {
+    file: &'a mut File,
+    is_cancelled: &'a F,
+}
+
+impl<F: Fn() -> bool> Write for CancellationAwareWriter<'_, F> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if (self.is_cancelled)() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                EXPORT_CANCELLED_MESSAGE,
+            ));
+        }
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if (self.is_cancelled)() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                EXPORT_CANCELLED_MESSAGE,
+            ));
+        }
+        self.file.flush()
+    }
 }
 
 fn character_ids(connection: &Connection, generation: &str) -> StoreResult<Vec<String>> {
@@ -473,6 +662,7 @@ fn write_preset_array(
     connection: &Connection,
     generation: &str,
     writer: &mut dyn Write,
+    is_cancelled: &impl Fn() -> bool,
 ) -> StoreResult<()> {
     writer.write_all(b"[")?;
     let mut statement = connection.prepare(
@@ -482,6 +672,7 @@ fn write_preset_array(
     let mut rows = statement.query([generation])?;
     let mut first = true;
     while let Some(row) = rows.next()? {
+        check_export_cancelled(is_cancelled)?;
         if !first {
             writer.write_all(b",")?;
         }
@@ -499,6 +690,7 @@ fn write_character(
     generation: &str,
     character_id: &str,
     writer: &mut dyn Write,
+    is_cancelled: &impl Fn() -> bool,
 ) -> StoreResult<()> {
     let detail: String = connection
         .query_row(
@@ -516,7 +708,7 @@ fn write_character(
     )?;
     character.remove("chats");
     write_object_with_array(writer, character, "chats", |writer| {
-        write_conversations(connection, generation, character_id, writer)
+        write_conversations(connection, generation, character_id, writer, is_cancelled)
     })
 }
 
@@ -525,6 +717,7 @@ fn write_conversations(
     generation: &str,
     character_id: &str,
     writer: &mut dyn Write,
+    is_cancelled: &impl Fn() -> bool,
 ) -> StoreResult<()> {
     let mut statement = connection.prepare(
         "SELECT conversation_id, detail FROM conversations
@@ -533,6 +726,7 @@ fn write_conversations(
     let mut rows = statement.query(params![generation, character_id])?;
     let mut first = true;
     while let Some(row) = rows.next()? {
+        check_export_cancelled(is_cancelled)?;
         if !first {
             writer.write_all(b",")?;
         }
@@ -551,6 +745,7 @@ fn write_conversations(
                 character_id,
                 &conversation_id,
                 writer,
+                is_cancelled,
             )
         })?;
     }
@@ -563,6 +758,7 @@ fn write_messages(
     character_id: &str,
     conversation_id: &str,
     writer: &mut dyn Write,
+    is_cancelled: &impl Fn() -> bool,
 ) -> StoreResult<()> {
     let mut statement = connection.prepare(
         "SELECT value FROM messages
@@ -572,6 +768,7 @@ fn write_messages(
     let mut rows = statement.query(params![generation, character_id, conversation_id])?;
     let mut first = true;
     while let Some(row) = rows.next()? {
+        check_export_cancelled(is_cancelled)?;
         if !first {
             writer.write_all(b",")?;
         }

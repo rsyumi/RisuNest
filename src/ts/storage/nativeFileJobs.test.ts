@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
     NativeFileJobActivationCommittedError,
     runNativeBlockRisuSaveRestore,
+    runNativeBlockRisuSaveExport,
     type NativeFileJobStatus,
 } from './nativeFileJobs'
 
@@ -296,5 +297,195 @@ describe('native file jobs', () => {
             code: 'invalid-source',
             message: 'desktop source is unavailable',
         })
+    })
+
+    it('exports a pinned revision to a native destination without file chunks in IPC', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const observed: NativeFileJobStatus[] = []
+        let revision = 11
+        const runtime = {
+            get revision() { return revision },
+            flushPendingData: async (reason: string) => {
+                calls.push([`flush:${reason}`, undefined])
+                revision = 12
+            },
+        }
+        const running: NativeFileJobStatus = {
+            jobId: 'export-1',
+            kind: 'export-block-risu-save',
+            state: 'running',
+            phase: 'writing-export',
+            progress: {
+                completedBytes: 64,
+                completedItems: 2,
+            },
+        }
+        const succeeded: NativeFileJobStatus = {
+            jobId: 'export-1',
+            kind: 'export-block-risu-save',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: {
+                completedBytes: 512,
+                totalBytes: 512,
+                completedItems: 4,
+                totalItems: 4,
+            },
+            result: {
+                revision: 12,
+                sourceBytes: 256,
+                sourceSha256: 'd'.repeat(64),
+                characterCount: 2,
+                presetCount: 1,
+                warningCodes: [],
+            },
+        }
+        const statuses = [running, succeeded]
+
+        const result = await runNativeBlockRisuSaveExport(
+            runtime,
+            'C:\\chosen\\backup.risudat',
+            { omitAccount: true, onStatus: (value) => observed.push(value) },
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'export-1' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result).toEqual(succeeded.result)
+        expect(observed).toEqual([running, succeeded])
+        expect(calls).toEqual([
+            ['flush:native-block-risu-save-export', undefined],
+            ['native_file_job_start', {
+                request: {
+                    kind: 'export-block-risu-save',
+                    destination: 'C:\\chosen\\backup.risudat',
+                    expectedRevision: 12,
+                    omitAccount: true,
+                },
+            }],
+            ['native_file_job_status', { jobId: 'export-1' }],
+            ['native_file_job_status', { jobId: 'export-1' }],
+            ['native_file_job_forget', { jobId: 'export-1' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
+    it('keeps the JavaScript facade bounded when native reports a 10 GiB export', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const collectGarbage = (globalThis as typeof globalThis & { gc?: () => void }).gc
+        collectGarbage?.()
+        const heapBefore = process.memoryUsage().heapUsed
+        const tenGiB = 10 * 1024 * 1024 * 1024
+        const terminal: NativeFileJobStatus = {
+            jobId: 'large-export',
+            kind: 'export-block-risu-save',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: {
+                completedBytes: tenGiB * 2,
+                totalBytes: tenGiB * 2,
+                completedItems: 50_007,
+                totalItems: 50_007,
+            },
+            result: {
+                revision: 15,
+                sourceBytes: tenGiB,
+                sourceSha256: 'e'.repeat(64),
+                characterCount: 50_000,
+                presetCount: 7,
+                warningCodes: [],
+            },
+        }
+
+        const result = await runNativeBlockRisuSaveExport(
+            {
+                revision: 15,
+                flushPendingData: async () => undefined,
+            },
+            'C:\\chosen\\ten-gib.risudat',
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') {
+                        return { jobId: 'large-export' }
+                    }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        collectGarbage?.()
+        const heapDelta = Math.max(0, process.memoryUsage().heapUsed - heapBefore)
+        console.info(`[native-file-job-heap] declared=10GiB heapDelta=${heapDelta}`)
+        expect(result.sourceBytes).toBe(tenGiB)
+        expect(JSON.stringify(calls).length).toBeLessThan(512)
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+        if (collectGarbage) expect(heapDelta).toBeLessThan(16 * 1024 * 1024)
+    })
+
+    it('cancels a native export without acknowledging it before terminal cleanup', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        let statusCount = 0
+
+        const promise = runNativeBlockRisuSaveExport(
+            {
+                revision: 6,
+                flushPendingData: async () => undefined,
+            },
+            'C:\\chosen\\backup.risudat',
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'export-1' }
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        return statusCount === 1
+                            ? {
+                                  jobId: 'export-1',
+                                  kind: 'export-block-risu-save',
+                                  state: 'running',
+                                  phase: 'writing-export',
+                                  progress: { completedBytes: 1, completedItems: 0 },
+                              }
+                            : {
+                                  jobId: 'export-1',
+                                  kind: 'export-block-risu-save',
+                                  state: 'cancelled',
+                                  phase: 'complete',
+                                  progress: { completedBytes: 1, completedItems: 0 },
+                              }
+                    }
+                    if (command === 'native_file_job_cancel') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => controller.abort(),
+            },
+        )
+
+        await expect(promise).rejects.toMatchObject({ name: 'AbortError' })
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
     })
 })

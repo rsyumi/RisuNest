@@ -297,6 +297,8 @@ export function getPersistentDataRuntime(): PersistentDataRuntime {
 
 export const initializeActiveWorkingSet = (database: Database): Promise<void> =>
     getPersistentDataRuntime().initializeActiveWorkingSet(database)
+export const refreshActiveWorkingSetFromStore = (revision: DataRevision): Promise<void> =>
+    getPersistentDataRuntime().refreshActiveWorkingSetFromStore(revision)
 export const markPersistentDataDirty = (estimatedBytes: number): void =>
     getPersistentDataRuntime().markPersistentDataDirty(estimatedBytes)
 export const flushPendingData = (reason: string): Promise<void> =>

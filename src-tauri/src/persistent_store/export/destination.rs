@@ -1,4 +1,5 @@
 use super::{managed_file, ManagedFileKind};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,18 +8,19 @@ use uuid::Uuid;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DestinationProgress {
-    pub(super) copied_bytes: u64,
-    pub(super) total_bytes: u64,
+pub(crate) struct DestinationProgress {
+    pub(crate) copied_bytes: u64,
+    pub(crate) total_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct DestinationWriteResult {
-    pub(super) bytes: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DestinationWriteResult {
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug)]
-pub(super) enum DestinationWriteError {
+pub(crate) enum DestinationWriteError {
     InvalidSource,
     InvalidDestination,
     Cancelled,
@@ -28,7 +30,7 @@ pub(super) enum DestinationWriteError {
     },
 }
 
-pub(super) fn write_desktop_destination(
+pub(crate) fn write_desktop_destination(
     source_root: &Path,
     source: &Path,
     destination_root: &Path,
@@ -44,6 +46,27 @@ pub(super) fn write_desktop_destination(
         destination,
         is_cancelled,
         on_progress,
+    )
+}
+
+pub(crate) fn write_desktop_destination_controlled(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(DestinationProgress),
+    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
+) -> Result<DestinationWriteResult, DestinationWriteError> {
+    write_desktop_destination_with_commit(
+        &RealFileSystem,
+        source_root,
+        source,
+        destination_root,
+        destination,
+        is_cancelled,
+        on_progress,
+        before_replace,
     )
 }
 
@@ -111,7 +134,29 @@ fn write_desktop_destination_with<F: DestinationFileSystem>(
     destination_root: &Path,
     destination: &Path,
     is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(DestinationProgress),
+) -> Result<DestinationWriteResult, DestinationWriteError> {
+    write_desktop_destination_with_commit(
+        file_system,
+        source_root,
+        source,
+        destination_root,
+        destination,
+        is_cancelled,
+        on_progress,
+        || Ok(()),
+    )
+}
+
+fn write_desktop_destination_with_commit<F: DestinationFileSystem>(
+    file_system: &F,
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    is_cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(DestinationProgress),
+    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
 ) -> Result<DestinationWriteResult, DestinationWriteError> {
     let source = validated_source(source_root, source)?;
     let destination = validated_destination(destination_root, destination)?;
@@ -135,6 +180,7 @@ fn write_desktop_destination_with<F: DestinationFileSystem>(
     let mut temporary_guard = TemporaryGuard::new(temporary.clone());
     let mut buffer = vec![0; COPY_BUFFER_BYTES];
     let mut copied_bytes = 0u64;
+    let mut hasher = Sha256::new();
     on_progress(DestinationProgress {
         copied_bytes,
         total_bytes,
@@ -186,6 +232,7 @@ fn write_desktop_destination_with<F: DestinationFileSystem>(
             ));
         }
         copied_bytes += bytes_read as u64;
+        hasher.update(&buffer[..bytes_read]);
         on_progress(DestinationProgress {
             copied_bytes,
             total_bytes,
@@ -215,6 +262,11 @@ fn write_desktop_destination_with<F: DestinationFileSystem>(
         primary_error = Some(DestinationWriteError::Cancelled);
     }
     if primary_error.is_none() {
+        if let Err(error) = before_replace() {
+            primary_error = Some(error);
+        }
+    }
+    if primary_error.is_none() {
         if let Err(source) = file_system.replace(&temporary, &destination) {
             primary_error = Some(io_error("replace destination", source));
         } else {
@@ -228,6 +280,7 @@ fn write_desktop_destination_with<F: DestinationFileSystem>(
 
     Ok(DestinationWriteResult {
         bytes: copied_bytes,
+        sha256: hex::encode(hasher.finalize()),
     })
 }
 
@@ -598,6 +651,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.bytes, bytes.len() as u64);
+        assert_eq!(
+            result.sha256,
+            "e24bc62381f1224fbbb74688663f8f9743b9680b193edd666835e97b06e730eb"
+        );
         assert_eq!(fs::read(destination).unwrap(), bytes);
         assert_eq!(progress.first().unwrap().copied_bytes, 0);
         assert_eq!(progress.last().unwrap().copied_bytes, bytes.len() as u64);
@@ -757,6 +814,77 @@ mod tests {
                     cancelled.set(true);
                 }
             },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DestinationWriteError::Cancelled));
+        assert_eq!(fs::read(&destination).unwrap(), b"previous export");
+        assert!(sibling_temporary_files(&destination_root).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn large_sparse_export_disk_full_preserves_the_previous_windows_destination() {
+        let directory = TempDir::new().unwrap();
+        let source_root = directory.path().join("exports");
+        let destination_root = directory.path().join("chosen");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        let source = source_path(&source_root);
+        let destination = destination_root.join("large-backup.risudat");
+        File::create(&source)
+            .unwrap()
+            .set_len(65 * 1024 * 1024 + 1)
+            .unwrap();
+        fs::write(&destination, b"previous large export").unwrap();
+        let file_system = ChunkedFileSystem {
+            maximum_read: COPY_BUFFER_BYTES,
+            maximum_write: COPY_BUFFER_BYTES,
+            fault: Some(Fault::DiskFull),
+        };
+
+        let error = write_desktop_destination_with(
+            &file_system,
+            &source_root,
+            &source,
+            &destination_root,
+            &destination,
+            || false,
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DestinationWriteError::Io {
+                operation: "write destination temporary file",
+                ..
+            }
+        ));
+        assert_eq!(fs::read(destination).unwrap(), b"previous large export");
+        assert!(sibling_temporary_files(&destination_root).is_empty());
+    }
+
+    #[test]
+    fn cancellation_winning_the_finalization_race_preserves_the_existing_destination() {
+        let directory = TempDir::new().unwrap();
+        let source_root = directory.path().join("exports");
+        let destination_root = directory.path().join("chosen");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        let source = source_path(&source_root);
+        let destination = destination_root.join("backup.risudat");
+        fs::write(&source, vec![13; COPY_BUFFER_BYTES * 2]).unwrap();
+        fs::write(&destination, b"previous export").unwrap();
+
+        let error = write_desktop_destination_controlled(
+            &source_root,
+            &source,
+            &destination_root,
+            &destination,
+            || false,
+            |_| {},
+            || Err(DestinationWriteError::Cancelled),
         )
         .unwrap_err();
 

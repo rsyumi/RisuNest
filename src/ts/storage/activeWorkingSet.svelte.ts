@@ -138,7 +138,11 @@ export class ActiveWorkingSet {
     async initializeActiveWorkingSet(database: Database): Promise<void> {
         await this.dependencies.store.open()
         const root = await this.dependencies.store.readRoot()
-        this.dependencies.coordinator.initialize(root.revision, database)
+        this.installCommittedWorkingSet(database, root.revision)
+    }
+
+    installCommittedWorkingSet(database: Database, revision: DataRevision): void {
+        this.dependencies.coordinator.initialize(revision, database)
         const selectedId = this.dependencies.getSelectedCharacterId()
         this.activeIds = selectedId ? new Set([selectedId]) : new Set()
         const selected = selectedId
@@ -147,7 +151,7 @@ export class ActiveWorkingSet {
         const conversation = selected?.chats[selected.chatPage ?? 0]
         this.clearActiveConversationSession()
         if (selected && conversation) {
-            this.publishActiveConversationSession(selected.chaId, conversation, root.revision)
+            this.publishActiveConversationSession(selected.chaId, conversation, revision)
         }
     }
 

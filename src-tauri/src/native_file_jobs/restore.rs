@@ -2160,9 +2160,8 @@ mod tests {
         let sink = Arc::new(sink);
 
         let started = state
-            .start(
-                NativeFileJobStartRequest {
-                    kind: JobKind::RestoreBlockRisuSave,
+            .start_with_sink(
+                NativeFileJobStartRequest::RestoreBlockRisuSave {
                     source: JobSource::DesktopPath {
                         path: source.to_string_lossy().into_owned(),
                     },
@@ -2244,9 +2243,8 @@ mod tests {
             released: Arc::clone(&released),
         });
         let started = state
-            .start(
-                NativeFileJobStartRequest {
-                    kind: JobKind::RestoreBlockRisuSave,
+            .start_with_sink(
+                NativeFileJobStartRequest::RestoreBlockRisuSave {
                     source: JobSource::DesktopPath {
                         path: source.to_string_lossy().into_owned(),
                     },

@@ -73,11 +73,22 @@ struct JobOwnership {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct NativeFileJobStartRequest {
-    pub(crate) kind: JobKind,
-    pub(crate) source: JobSource,
-    pub(crate) expected_revision: i64,
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum NativeFileJobStartRequest {
+    RestoreBlockRisuSave {
+        source: JobSource,
+        expected_revision: i64,
+    },
+    ExportBlockRisuSave {
+        destination: String,
+        expected_revision: i64,
+        #[serde(default)]
+        omit_account: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -413,17 +424,85 @@ impl NativeFileJobState {
     pub(crate) fn start(
         &self,
         request: NativeFileJobStartRequest,
-        sink: Arc<dyn restore::ReplacementSink>,
+        app: AppHandle,
     ) -> Result<NativeFileJobStarted, NativeJobError> {
         if let Some(error) = &self.capability_error {
             return Err(error.clone());
         }
-        let source_path = resolve_source(&self.root, &request.source)?;
+        let task = match request {
+            NativeFileJobStartRequest::RestoreBlockRisuSave {
+                source,
+                expected_revision,
+            } => {
+                let source_path = resolve_source(&self.root, &source)?;
+                NativeFileJobTask::Restore {
+                    source_path,
+                    source,
+                    expected_revision,
+                    sink: RestoreJobSink::Persistent(app),
+                }
+            }
+            NativeFileJobStartRequest::ExportBlockRisuSave {
+                destination,
+                expected_revision,
+                omit_account,
+            } => {
+                let destination = PathBuf::from(destination);
+                if !destination.is_absolute()
+                    || destination.file_name().is_none()
+                    || destination
+                        .parent()
+                        .and_then(|parent| parent.canonicalize().ok())
+                        .is_none()
+                {
+                    return Err(NativeJobError::new(
+                        "invalid-destination",
+                        "desktop export destination must have an available absolute parent directory",
+                    ));
+                }
+                NativeFileJobTask::Export {
+                    destination,
+                    expected_revision,
+                    omit_account,
+                    app,
+                }
+            }
+        };
+        self.spawn(task)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_sink(
+        &self,
+        request: NativeFileJobStartRequest,
+        sink: Arc<dyn restore::ReplacementSink>,
+    ) -> Result<NativeFileJobStarted, NativeJobError> {
+        let NativeFileJobStartRequest::RestoreBlockRisuSave {
+            source,
+            expected_revision,
+        } = request
+        else {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "test replacement sink only supports restore jobs",
+            ));
+        };
+        let source_path = resolve_source(&self.root, &source)?;
+        self.spawn(NativeFileJobTask::Restore {
+            source_path,
+            source,
+            expected_revision,
+            sink: RestoreJobSink::Test(sink),
+        })
+    }
+
+    fn spawn(&self, task: NativeFileJobTask) -> Result<NativeFileJobStarted, NativeJobError> {
         let worker_permit =
             WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
+        let kind = task.kind();
         let job = self
             .registry
-            .create(request.kind)
+            .create(kind)
             .map_err(|error| NativeJobError::new("store-error", error))?;
         let job_id = job.id();
         let owned_directory = match create_owned_directory(&self.root.join("jobs"), &job_id) {
@@ -435,17 +514,43 @@ impl NativeFileJobState {
             }
         };
         let root = self.root.clone();
-        let source = request.source.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
             let _worker_permit = worker_permit;
-            let outcome = match request.kind {
-                JobKind::RestoreBlockRisuSave => restore::restore_block_risu_save(
-                    &source_path,
-                    request.expected_revision,
-                    &job,
-                    sink.as_ref(),
-                ),
+            let cleanup_source = task.cleanup_source();
+            let outcome = match task {
+                NativeFileJobTask::Restore {
+                    source_path,
+                    expected_revision,
+                    sink,
+                    ..
+                } => match sink {
+                    RestoreJobSink::Persistent(app) => restore::restore_block_risu_save(
+                        &source_path,
+                        expected_revision,
+                        &job,
+                        &PersistentReplacementSink { app },
+                    ),
+                    #[cfg(test)]
+                    RestoreJobSink::Test(sink) => restore::restore_block_risu_save(
+                        &source_path,
+                        expected_revision,
+                        &job,
+                        sink.as_ref(),
+                    ),
+                },
+                NativeFileJobTask::Export {
+                    destination,
+                    expected_revision,
+                    omit_account,
+                    app,
+                } => crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                    store.prepare_risu_save_export(expected_revision)
+                })
+                .map_err(native_store_error)
+                .and_then(|prepared| {
+                    export::export_block_risu_save(prepared, &destination, omit_account, &job)
+                }),
             };
             let mut cleanup_errors = Vec::new();
             if let Err(error) =
@@ -453,7 +558,7 @@ impl NativeFileJobState {
             {
                 cleanup_errors.push(error);
             }
-            if let JobSource::AndroidSpool { token } = source {
+            if let Some(JobSource::AndroidSpool { token }) = cleanup_source {
                 if let Err(error) = cleanup_one_spool_directory(&root.join("sources"), &token) {
                     cleanup_errors.push(error);
                 }
@@ -463,7 +568,13 @@ impl NativeFileJobState {
                     let _ = job.finish_success(result);
                 }
                 (Ok(mut result), false) => {
-                    result.warning_codes.push("cleanup-failed".to_owned());
+                    if !result
+                        .warning_codes
+                        .iter()
+                        .any(|code| code == "cleanup-failed")
+                    {
+                        result.warning_codes.push("cleanup-failed".to_owned());
+                    }
                     let _ = job.finish_success(result);
                 }
                 (Err(error), false) => {
@@ -509,6 +620,53 @@ impl NativeFileJobState {
             .forget(job_id)
             .map_err(|error| NativeJobError::new("store-error", error))
     }
+}
+
+enum RestoreJobSink {
+    Persistent(AppHandle),
+    #[cfg(test)]
+    Test(Arc<dyn restore::ReplacementSink>),
+}
+
+enum NativeFileJobTask {
+    Restore {
+        source_path: PathBuf,
+        source: JobSource,
+        expected_revision: i64,
+        sink: RestoreJobSink,
+    },
+    Export {
+        destination: PathBuf,
+        expected_revision: i64,
+        omit_account: bool,
+        app: AppHandle,
+    },
+}
+
+impl NativeFileJobTask {
+    fn kind(&self) -> JobKind {
+        match self {
+            Self::Restore { .. } => JobKind::RestoreBlockRisuSave,
+            Self::Export { .. } => JobKind::ExportBlockRisuSave,
+        }
+    }
+
+    fn cleanup_source(&self) -> Option<JobSource> {
+        match self {
+            Self::Restore { source, .. } => Some(source.clone()),
+            Self::Export { .. } => None,
+        }
+    }
+}
+
+fn native_store_error(error: crate::persistent_store::StoreError) -> NativeJobError {
+    let code = match error {
+        crate::persistent_store::StoreError::RevisionConflict { .. } => "revision-conflict",
+        crate::persistent_store::StoreError::Validation { .. } => "invalid-input",
+        crate::persistent_store::StoreError::SnapshotReleased
+        | crate::persistent_store::StoreError::Store { .. } => "store-error",
+    };
+    NativeJobError::new(code, error.to_string())
 }
 
 #[derive(Debug)]
@@ -699,10 +857,7 @@ pub(crate) fn native_file_job_start(
     state: State<'_, NativeFileJobState>,
     request: NativeFileJobStartRequest,
 ) -> Result<NativeFileJobStarted, NativeJobError> {
-    state.start(
-        request,
-        Arc::new(PersistentReplacementSink { app }) as Arc<dyn restore::ReplacementSink>,
-    )
+    state.start(request, app)
 }
 
 #[tauri::command(async)]
@@ -733,6 +888,7 @@ pub(crate) fn native_file_job_forget(
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobKind {
     RestoreBlockRisuSave,
+    ExportBlockRisuSave,
 }
 
 #[allow(dead_code)]
@@ -755,6 +911,9 @@ pub(crate) enum JobPhase {
     ReadingSource,
     StagingDatabase,
     ActivatingDatabase,
+    WritingExport,
+    PublishingDestination,
+    FinalizingExport,
     Complete,
 }
 
@@ -949,7 +1108,10 @@ impl JobControl {
         if status.state.is_terminal() {
             return Ok(CancelOutcome::Terminal);
         }
-        if status.phase == JobPhase::ActivatingDatabase {
+        if matches!(
+            status.phase,
+            JobPhase::ActivatingDatabase | JobPhase::FinalizingExport
+        ) {
             return Ok(CancelOutcome::TooLate);
         }
         if self.cancel_requested.swap(true, Ordering::AcqRel) {
@@ -964,7 +1126,11 @@ impl JobControl {
             .status
             .lock()
             .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
-        if status.state != JobState::Queued || phase != JobPhase::ReadingSource {
+        let expected = match status.kind {
+            JobKind::RestoreBlockRisuSave => JobPhase::ReadingSource,
+            JobKind::ExportBlockRisuSave => JobPhase::WritingExport,
+        };
+        if status.state != JobState::Queued || phase != expected {
             return Err("native job can only start from queued".to_owned());
         }
         status.state = JobState::Running;
@@ -1135,14 +1301,15 @@ impl JobPhase {
     fn rank(self) -> u8 {
         match self {
             Self::Queued => 0,
-            Self::ReadingSource => 1,
-            Self::StagingDatabase => 2,
-            Self::ActivatingDatabase => 3,
+            Self::ReadingSource | Self::WritingExport => 1,
+            Self::StagingDatabase | Self::PublishingDestination => 2,
+            Self::ActivatingDatabase | Self::FinalizingExport => 3,
             Self::Complete => 4,
         }
     }
 }
 
+mod export;
 mod restore;
 
 #[cfg(test)]
@@ -1190,6 +1357,41 @@ mod tests {
         assert_eq!(status.state, JobState::Running);
         assert_eq!(status.phase, JobPhase::ReadingSource);
         assert_eq!(status.progress.completed_bytes, 8);
+    }
+
+    #[test]
+    fn export_request_is_an_explicit_path_only_job_contract() {
+        let request: NativeFileJobStartRequest = serde_json::from_value(serde_json::json!({
+            "kind": "export-block-risu-save",
+            "destination": "C:\\chosen\\backup.risudat",
+            "expectedRevision": 7,
+            "omitAccount": true
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            request,
+            NativeFileJobStartRequest::ExportBlockRisuSave {
+                destination,
+                expected_revision: 7,
+                omit_account: true,
+            } if destination == "C:\\chosen\\backup.risudat"
+        ));
+    }
+
+    #[test]
+    fn export_job_uses_its_own_ordered_phases() {
+        let job = JobRegistry::default()
+            .create(JobKind::ExportBlockRisuSave)
+            .unwrap();
+
+        job.start(JobPhase::WritingExport).unwrap();
+        job.set_phase(JobPhase::PublishingDestination).unwrap();
+        job.set_phase(JobPhase::FinalizingExport).unwrap();
+
+        assert_eq!(job.status().phase, JobPhase::FinalizingExport);
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::TooLate);
+        assert!(job.set_phase(JobPhase::StagingDatabase).is_err());
     }
 
     #[test]

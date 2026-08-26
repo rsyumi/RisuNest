@@ -252,6 +252,7 @@ export interface PersistentDataRuntime {
     readonly store: PersistentDataStore
     readonly revision: DataRevision
     initializeActiveWorkingSet(database: Database): Promise<void>
+    refreshActiveWorkingSetFromStore(revision: DataRevision): Promise<void>
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
     acknowledgeGenerationCompletion(): Promise<void>
@@ -500,6 +501,24 @@ export function createPersistentDataRuntime(
             return coordinator.revision
         },
         initializeActiveWorkingSet: (database) => workingSet.initializeActiveWorkingSet(database),
+        async refreshActiveWorkingSetFromStore(revision) {
+            const selectedCharacterId = dependencies.state.getSelectedCharacterId() ?? null
+            const selectedConversationId =
+                dependencies.state.getSelectedConversationId?.() ?? null
+            const activeCharacterIds = workingSet.activeCharacterIds
+            const database = await projectScalableWorkingSetAtRevision(
+                dependencies.store,
+                revision,
+                {
+                    selectedCharacterId,
+                    selectedConversationId,
+                    activeCharacterIds,
+                },
+            )
+            workingSet.invalidateNavigation()
+            dependencies.state.replaceDatabase(database, activeCharacterIds, true)
+            workingSet.installCommittedWorkingSet(database, revision)
+        },
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),

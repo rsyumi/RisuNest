@@ -26,9 +26,17 @@ export interface NativeFileJobResult {
 
 export interface NativeFileJobStatus {
     jobId: string
-    kind: 'restore-block-risu-save'
+    kind: 'restore-block-risu-save' | 'export-block-risu-save'
     state: NativeFileJobState
-    phase: 'queued' | 'reading-source' | 'staging-database' | 'activating-database' | 'complete'
+    phase:
+        | 'queued'
+        | 'reading-source'
+        | 'staging-database'
+        | 'activating-database'
+        | 'writing-export'
+        | 'publishing-destination'
+        | 'finalizing-export'
+        | 'complete'
     progress: {
         completedBytes: number
         totalBytes?: number
@@ -51,6 +59,11 @@ export interface NativeBlockRestoreRuntime {
 export interface NativeFileJobOptions {
     signal?: AbortSignal
     pollIntervalMs?: number
+    onStatus?(status: NativeFileJobStatus): void
+}
+
+export interface NativeFileExportJobOptions extends NativeFileJobOptions {
+    omitAccount?: boolean
 }
 
 export interface NativeFileJobDependencies {
@@ -81,7 +94,7 @@ export class NativeFileJobActivationCommittedError extends NativeFileJobError {
     ) {
         super(
             'activation-committed-refresh-failed',
-            `Native restore committed revision ${committedRevision}, but the active working set could not be refreshed`,
+            `Native restore committed revision ${committedRevision}, but the active app state could not be fully refreshed`,
         )
         this.name = 'NativeFileJobActivationCommittedError'
     }
@@ -146,6 +159,7 @@ export async function runNativeBlockRisuSaveRestore(
         const status = await invokeNative(dependencies, 'native_file_job_status', {
             jobId: started.jobId,
         }) as NativeFileJobStatus
+        options.onStatus?.(status)
         if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
             terminal = status
             break
@@ -180,6 +194,92 @@ export async function runNativeBlockRisuSaveRestore(
         throw new NativeFileJobError(
             terminal.error?.code ?? 'restore-failed',
             terminal.error?.message ?? 'Native block RisuSave restore failed',
+        )
+    }
+    catch (error) {
+        outcomeFailed = true
+        throw error
+    }
+    finally {
+        try {
+            await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+        }
+        catch (error) {
+            if (committedResult) {
+                committedResult.warningCodes = [
+                    ...committedResult.warningCodes
+                        .filter((code) => code !== 'cleanup-failed')
+                        .slice(0, 15),
+                    'cleanup-failed',
+                ]
+            }
+            else if (!outcomeFailed) throw error
+        }
+    }
+}
+
+export async function runNativeBlockRisuSaveExport(
+    runtime: Pick<NativeBlockRestoreRuntime, 'revision' | 'flushPendingData'>,
+    destination: string,
+    options: NativeFileExportJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native block RisuSave export requires Tauri')
+    }
+    if (options.signal?.aborted) throw abortError()
+
+    await runtime.flushPendingData('native-block-risu-save-export')
+    if (options.signal?.aborted) throw abortError()
+    const expectedRevision = runtime.revision
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request: {
+            kind: 'export-block-risu-save',
+            destination,
+            expectedRevision,
+            omitAccount: options.omitAccount ?? false,
+        },
+    }) as { jobId: string; warningCodes?: string[] }
+    let cancellationRequested = false
+    let terminal: NativeFileJobStatus | undefined
+
+    while (!terminal) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId: started.jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
+            terminal = status
+            break
+        }
+        await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+
+    let outcomeFailed = false
+    let committedResult: NativeFileJobResult | undefined
+    try {
+        if (terminal.state === 'succeeded') {
+            if (!terminal.result) {
+                throw new NativeFileJobError('missing-result', 'Native export returned no result')
+            }
+            committedResult = {
+                ...terminal.result,
+                warningCodes: [...new Set([
+                    ...(started.warningCodes ?? []),
+                    ...terminal.result.warningCodes,
+                ])].slice(0, 16),
+            }
+            return committedResult
+        }
+
+        if (terminal.state === 'cancelled') throw abortError()
+        throw new NativeFileJobError(
+            terminal.error?.code ?? 'export-failed',
+            terminal.error?.message ?? 'Native block RisuSave export failed',
         )
     }
     catch (error) {

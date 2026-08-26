@@ -1,6 +1,6 @@
 pub(crate) mod commands;
 mod commit;
-mod export;
+pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
 mod kei;
 mod query;
@@ -610,6 +610,31 @@ pub(crate) struct SnapshotAuthorizedReplaceCommit {
     revision: i64,
 }
 
+pub(crate) struct PreparedRisuSaveExport {
+    pub(crate) revision: i64,
+    pub(crate) lease: String,
+    pub(crate) snapshots_dir: PathBuf,
+    connection: Option<Connection>,
+}
+
+impl PreparedRisuSaveExport {
+    pub(crate) fn take_connection(&mut self) -> StoreResult<Connection> {
+        self.connection
+            .take()
+            .ok_or_else(|| StoreError::Validation {
+                message: "native export connection has already been taken".to_owned(),
+            })
+    }
+
+    pub(crate) fn release(&self, connection: &mut Connection) -> StoreResult<()> {
+        snapshot::release_revision(connection, &self.lease)
+    }
+
+    pub(crate) fn cleanup_file(&self, path: &Path) -> StoreResult<()> {
+        export::cleanup(&self.snapshots_dir, path)
+    }
+}
+
 impl PreparedReplaceCommit {
     pub(crate) fn create_snapshot(self) -> StoreResult<SnapshotAuthorizedReplaceCommit> {
         if self.revision > 0 {
@@ -865,6 +890,21 @@ impl PersistentStore {
         omit_account: bool,
     ) -> StoreResult<export::ExportedRisuSave> {
         export::create(&self.connection, &self.snapshots_dir, lease, omit_account)
+    }
+
+    pub(crate) fn prepare_risu_save_export(
+        &mut self,
+        revision: i64,
+    ) -> StoreResult<PreparedRisuSaveExport> {
+        let connection = Connection::open(&self.database_path)?;
+        connection.execute_batch("PRAGMA busy_timeout = 5000")?;
+        let lease = self.acquire_revision(revision)?.lease;
+        Ok(PreparedRisuSaveExport {
+            revision,
+            lease,
+            snapshots_dir: self.snapshots_dir.clone(),
+            connection: Some(connection),
+        })
     }
 
     pub(crate) fn cleanup_risu_save_export(&self, path: &Path) -> StoreResult<()> {

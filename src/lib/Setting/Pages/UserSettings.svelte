@@ -7,7 +7,7 @@
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     import { alertConfirm, alertError, alertNormal, alertSelect } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
-    import { isTauri, isNodeServer } from "src/ts/platform"
+    import { isTauri, isNodeServer, isTauriDesktop } from "src/ts/platform"
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
     import { LoadLocalBackup, SaveLocalBackup, SavePartialLocalBackup } from "src/ts/drive/backuplocal";
@@ -26,12 +26,24 @@
         isExpectedHubMessage,
         resolveExpectedOfficialAccountMessageUrl,
     } from "src/ts/storage/officialAccountMessage";
+    import {
+        NativeFileJobActivationCommittedError,
+        NativeFileJobError,
+        type NativeFileJobStatus,
+    } from "src/ts/storage/nativeFileJobs";
+    import {
+        exportRisuSaveFromSystemPicker,
+        importRisuSaveFromSystemPicker,
+    } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
     import { onDestroy } from "svelte";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     const drivePopup = createHubPopupController()
     let accountIframe = $state<HTMLIFrameElement>()
     let nativeAccountBusy = $state(false)
+    let risuSaveOperation = $state<'import' | 'export' | null>(null)
+    let risuSaveController = $state<AbortController>()
+    let risuSaveStatus = $state<NativeFileJobStatus>()
 
     async function runNativeAccountOperation<T>(operation: () => Promise<T>): Promise<T | undefined> {
         if (nativeAccountBusy) return undefined
@@ -43,7 +55,68 @@
         }
     }
 
-    onDestroy(() => drivePopup.close())
+    function risuSaveProgressText(status: NativeFileJobStatus | undefined): string {
+        if(!status) return ''
+        const total = status.progress.totalBytes
+        if(total && total > 0) {
+            const percent = Math.min(100, Math.round(status.progress.completedBytes * 100 / total))
+            return `${status.phase}: ${percent}%`
+        }
+        const bytes = status.progress.completedBytes
+        return bytes > 0 ? `${status.phase}: ${(bytes / (1024 * 1024)).toFixed(1)} MiB` : status.phase
+    }
+
+    function showRisuSaveError(error: unknown): void {
+        if(error instanceof DOMException && error.name === 'AbortError') return
+        if(error instanceof NativeFileJobActivationCommittedError) {
+            alertError(language.risuSaveImportCommittedRefreshFailed)
+            return
+        }
+        if(error instanceof NativeFileJobError && error.code === 'revision-conflict') {
+            alertError(language.risuSaveRevisionConflict)
+            return
+        }
+        alertError(error instanceof Error ? error.message : String(error))
+    }
+
+    async function runRisuSaveOperation(kind: 'import' | 'export'): Promise<void> {
+        if(risuSaveOperation) return
+        if(kind === 'import') {
+            if(!await alertConfirm(language.risuSaveImportConfirm)) return
+            if(!await alertConfirm(language.backupLoadConfirm2)) return
+        }
+        risuSaveOperation = kind
+        risuSaveStatus = undefined
+        risuSaveController = new AbortController()
+        try {
+            const options = {
+                signal: risuSaveController.signal,
+                onStatus: (status: NativeFileJobStatus) => risuSaveStatus = status,
+            }
+            const result = kind === 'import'
+                ? await importRisuSaveFromSystemPicker(options)
+                : await exportRisuSaveFromSystemPicker(options)
+            if(!result) return
+            alertNormal(
+                result.warningCodes.includes('cleanup-failed')
+                    ? language.risuSaveCleanupWarning
+                    : kind === 'import'
+                        ? language.risuSaveImportComplete
+                        : language.risuSaveExportComplete,
+            )
+        } catch(error) {
+            showRisuSaveError(error)
+        } finally {
+            risuSaveOperation = null
+            risuSaveController = undefined
+            risuSaveStatus = undefined
+        }
+    }
+
+    onDestroy(() => {
+        drivePopup.close()
+        risuSaveController?.abort()
+    })
 </script>
 
 <svelte:window onmessage={async (e) => {
@@ -107,6 +180,34 @@
     }} className="mt-2">
     {language.loadBackupLocal}
 </Button>
+
+{#if !isTauri || isTauriDesktop}
+    <Button
+        disabled={risuSaveOperation !== null}
+        onclick={() => runRisuSaveOperation('import')}
+        className="mt-2">
+        {language.importRisuSave}
+    </Button>
+
+    <Button
+        disabled={risuSaveOperation !== null}
+        onclick={() => runRisuSaveOperation('export')}
+        className="mt-2">
+        {language.exportRisuSave}
+    </Button>
+
+    {#if risuSaveOperation}
+        <div class="mt-2 flex items-center gap-2 text-sm text-textcolor2">
+            <span>{risuSaveProgressText(risuSaveStatus)}</span>
+            <Button
+                styled="outlined"
+                size="sm"
+                onclick={() => risuSaveController?.abort()}>
+                {language.cancelRisuSaveOperation}
+            </Button>
+        </div>
+    {/if}
+{/if}
 
 {#if isTauri}
     <Button

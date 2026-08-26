@@ -1162,3 +1162,73 @@ describe('prepared persistent replacement', () => {
         expect(materializeDatabase).not.toHaveBeenCalled()
     })
 })
+
+describe('native replacement working-set refresh', () => {
+    it('rebuilds only the scalable selected working set from the committed revision', async () => {
+        let database = makeConversationDatabase('Before native restore')
+        const restored = makeConversationDatabase('After native restore')
+        restored.characters[0].chats[0].message[0].data = 'restored selected message'
+        restored.characters.push({
+            type: 'character',
+            chaId: 'char-b',
+            name: 'Inactive',
+            personality: 'must stay outside the JS working set',
+            chats: [{
+                id: 'chat-b',
+                name: 'Inactive chat',
+                note: '',
+                localLore: [],
+                message: [{ role: 'user', data: 'inactive payload', chatId: 'message-b' }],
+            }],
+        } as Database['characters'][number])
+        const lease = makeDatabaseLease(restored, 2)
+        const materializeDatabase = vi.fn(async () => {
+            throw new Error('native refresh must not materialize the complete database')
+        })
+        const store = {
+            open: vi.fn(async () => undefined),
+            readRoot: vi.fn(async () => ({
+                revision: 1,
+                value: capturePersistentRoot(database),
+            })),
+            acquireRevision: vi.fn(async (revision: number) => {
+                expect(revision).toBe(2)
+                return lease
+            }),
+            materializeDatabase,
+        } as unknown as PersistentDataStore
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: {
+                captureRoot: () => capturePersistentRoot(database),
+                capturePluginStorage: () => database.pluginCustomStorage,
+                capturePresets: () => database.botPresets,
+                captureSelectedCharacter: () => database.characters[0] ?? null,
+                captureCharacter: (id) => database.characters.find(
+                    (character) => character.chaId === id,
+                ) ?? null,
+                getSelectedCharacterId: () => 'char-a',
+                getSelectedConversationId: () => 'chat-a',
+                replaceDatabase: (replacement) => {
+                    database = replacement
+                },
+                publishCharacter: vi.fn(),
+                publishConversation: vi.fn(),
+            },
+            prepareDatabase: async (value) => value,
+        })
+        await runtime.initializeActiveWorkingSet(database)
+
+        await runtime.refreshActiveWorkingSetFromStore(2)
+
+        expect(runtime.revision).toBe(2)
+        expect(database.username).toBe('After native restore')
+        expect(database.characters[0].chats[0].message[0].data).toBe(
+            'restored selected message',
+        )
+        expect(isCatalogCharacterStub(database.characters[1])).toBe(true)
+        expect(database.characters[1]).not.toHaveProperty('personality')
+        expect(materializeDatabase).not.toHaveBeenCalled()
+        expect(lease.release).toHaveBeenCalledOnce()
+    })
+})
