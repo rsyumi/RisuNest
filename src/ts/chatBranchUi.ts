@@ -97,12 +97,12 @@ export async function createCapturedConversationBranch(
     const sourceMessage = source.message[current.absoluteIndex]
     if (!sourceMessage) return false
 
-    let nextCharacter: CharacterDetail | undefined
+    const nextCharacter = characterDetail(current.character)
+    nextCharacter.chatPage = 0
     let nextSource: Omit<Chat, 'message'> | undefined
     let folderId = source.folderId
     if (options.createFolderOnBranch && !folderId) {
         folderId = options.createId()
-        nextCharacter = characterDetail(current.character)
         nextCharacter.chatFolders = [
             {
                 id: folderId,
@@ -153,7 +153,9 @@ export async function createCapturedConversationBranch(
             },
         })
         if (!fence) throw new Error('Conversation branch commit did not acquire a mutation fence')
-        await fence.refreshCommittedWorkingSet(result.branchRevision)
+        await fence.refreshCommittedWorkingSet(result.branchRevision, {
+            forceScalableProjection: false,
+        })
     } catch (error) {
         if (error instanceof CapturedConversationBranchStaleError) return false
         throw error

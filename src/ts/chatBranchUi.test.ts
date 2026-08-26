@@ -67,6 +67,7 @@ async function createHarness(name: string, initial = makeDatabase()) {
     const imported = await store.replaceFromDatabase(structuredClone(initial))
     let database = structuredClone(initial)
     let selectedConversationId = 'source-chat'
+    const forcedScalableProjection: Array<boolean | undefined> = []
     const runtime = createPersistentDataRuntime({
         store,
         state: {
@@ -79,7 +80,8 @@ async function createHarness(name: string, initial = makeDatabase()) {
             ) ?? null,
             getSelectedCharacterId: () => 'char-a',
             getSelectedConversationId: () => selectedConversationId,
-            replaceDatabase: (replacement) => {
+            replaceDatabase: (replacement, _activeCharacterIds, forceScalableProjection) => {
+                forcedScalableProjection.push(forceScalableProjection)
                 database = structuredClone(replacement)
             },
             publishCharacter: (character) => {
@@ -128,6 +130,7 @@ async function createHarness(name: string, initial = makeDatabase()) {
         runtime,
         context,
         imported,
+        forcedScalableProjection,
         get database() { return database },
         selectConversation(id: string) {
             selectedConversationId = id
@@ -212,6 +215,63 @@ describe('captured conversation branch UI', () => {
             ],
         })
         expect(harness.context.captureCurrent()?.conversation.id).toBe('branch-id')
+    })
+
+    it('persists the inserted branch as the selected conversation from a nonzero source index', async () => {
+        const initial = makeDatabase()
+        initial.characters[0].chats.reverse()
+        initial.characters[0].chatPage = 1
+        const harness = await createHarness('captured-branch-nonzero-source', initial)
+        const target = captureChatMessageTarget({ ...harness.context, absoluteIndex: 1 })!
+
+        await expect(createCapturedConversationBranch({
+            target,
+            context: harness.context,
+            runtime: harness.runtime,
+            createFolderOnBranch: false,
+            createId: idSequence('branch-id', 'marker-id'),
+            createBranchName: () => 'Source (Branch)',
+            navigateToBranch: (id) => harness.navigate(id),
+        })).resolves.toBe(true)
+
+        const materialized = await harness.store.materializeDatabase()
+        expect(materialized.characters[0].chats.map((chat) => chat.id)).toEqual([
+            'branch-id',
+            'other-chat',
+            'source-chat',
+        ])
+        expect(materialized.characters[0].chatPage).toBe(0)
+    })
+
+    it('refreshes a maximum-compatibility branch without forcing a scalable projection', async () => {
+        const initial = makeDatabase()
+        initial.plugins = [{
+            name: 'Compatibility plugin',
+            version: '2.1',
+            enabled: true,
+        }] as Database['plugins']
+        const harness = await createHarness('captured-branch-maximum-compatibility', initial)
+        const target = captureChatMessageTarget({ ...harness.context, absoluteIndex: 1 })!
+
+        await expect(createCapturedConversationBranch({
+            target,
+            context: harness.context,
+            runtime: harness.runtime,
+            createFolderOnBranch: false,
+            createId: idSequence('branch-id', 'marker-id'),
+            createBranchName: () => 'Source (Branch)',
+            navigateToBranch: (id) => harness.navigate(id),
+        })).resolves.toBe(true)
+
+        expect(harness.forcedScalableProjection.at(-1)).toBe(false)
+        expect(harness.database.characters.map((character) => character.chaId)).toEqual([
+            'char-a',
+        ])
+        expect(harness.database.characters[0].chats.map((chat) => chat.id)).toEqual([
+            'branch-id',
+            'source-chat',
+            'other-chat',
+        ])
     })
 
     it('creates no branch when the retained locator is already stale', async () => {

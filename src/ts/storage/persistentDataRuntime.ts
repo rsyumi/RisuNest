@@ -337,8 +337,15 @@ export interface PersistentDataRuntime {
 }
 
 export interface PersistentDestructiveReplacementFence {
-    refreshCommittedWorkingSet(revision: DataRevision): Promise<void>
+    refreshCommittedWorkingSet(
+        revision: DataRevision,
+        options?: PersistentCommittedWorkingSetRefreshOptions,
+    ): Promise<void>
     release(): void
+}
+
+export interface PersistentCommittedWorkingSetRefreshOptions {
+    forceScalableProjection?: boolean
 }
 
 export interface MaximumCompatibilityWorkingSetDependencies {
@@ -508,6 +515,7 @@ export function createPersistentDataRuntime(
     const refreshCommittedWorkingSet = async (
         revision: DataRevision,
         fenceOwner?: symbol,
+        options?: PersistentCommittedWorkingSetRefreshOptions,
     ): Promise<void> => {
         if (fenceOwner === undefined && coordinator.hasDestructiveReplacementFence) {
             throw new PersistentMutationFencedError()
@@ -538,7 +546,11 @@ export function createPersistentDataRuntime(
             coordinator.assertDestructiveReplacementFence(fenceOwner)
         }
         workingSet.invalidateNavigation()
-        dependencies.state.replaceDatabase(database, activeCharacterIds, true)
+        dependencies.state.replaceDatabase(
+            database,
+            activeCharacterIds,
+            options?.forceScalableProjection ?? true,
+        )
         workingSet.installCommittedWorkingSet(database, revision)
     }
     return {
@@ -615,13 +627,13 @@ export function createPersistentDataRuntime(
             const owner = await coordinator.acquireDestructiveReplacementFence(expected)
             let released = false
             return {
-                refreshCommittedWorkingSet(revision) {
+                refreshCommittedWorkingSet(revision, options) {
                     if (released) {
                         return Promise.reject(
                             new Error('Destructive persistent replacement fence was released'),
                         )
                     }
-                    return refreshCommittedWorkingSet(revision, owner)
+                    return refreshCommittedWorkingSet(revision, owner, options)
                 },
                 release() {
                     if (released) return
