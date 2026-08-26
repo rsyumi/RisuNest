@@ -5,7 +5,7 @@ import {
     listCharacterResources,
     listDatabaseRootResources,
 } from '../../process/coldstorageData'
-import type { AccountReadResult, AccountWriteResult } from '../accountStorage'
+import type { AccountReadResult, AccountWriteOptions, AccountWriteResult } from '../accountStorage'
 import type { BlobMetadata, BlobStore } from '../blobStore'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
 import type { Database } from '../database.svelte'
@@ -183,7 +183,11 @@ async function makeHarness(options: HarnessOptions = {}) {
         const bytes = remoteAssets.get(key)
         return bytes ? { kind: 'value', bytes: bytes.slice() } : { kind: 'missing' }
     })
-    const writeItem = vi.fn(async (key: string, bytes: Uint8Array): Promise<AccountWriteResult> => {
+    const writeItem = vi.fn(async (
+        key: string,
+        bytes: Uint8Array,
+        _options?: AccountWriteOptions,
+    ): Promise<AccountWriteResult> => {
         events.push(`asset:${key}`)
         writes.push({ key, bytes: bytes.slice() })
         return { kind: 'written', replacementKey: `remote/${key}` }
@@ -461,6 +465,32 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         await expect(publishing).rejects.toBe(aborted)
         await expect(disposing).resolves.toBeUndefined()
         expect(release).toHaveBeenCalledOnce()
+        expect(harness.markPublished).not.toHaveBeenCalled()
+    })
+
+    it('releases its lease when disposal aborts a pending asset account reauthentication', async () => {
+        const harness = await makeHarness()
+        const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        const lease = await acquireRevision.mock.results[0].value
+        const release = vi.spyOn(lease, 'release')
+        harness.writeItem.mockImplementationOnce(async (_key, _bytes, options) => {
+            await new Promise<never>((_resolve, reject) => {
+                options?.signal?.addEventListener('abort', () => {
+                    reject(options.signal?.reason)
+                }, { once: true })
+            })
+            throw new Error('Asset upload must not retry after disposal')
+        })
+
+        const publishing = publication.publish()
+        await vi.waitFor(() => expect(harness.writeItem).toHaveBeenCalledOnce())
+        const disposing = publication.dispose()
+
+        await expect(publishing).rejects.toMatchObject({ name: 'AbortError' })
+        await expect(disposing).resolves.toBeUndefined()
+        expect(release).toHaveBeenCalledOnce()
+        expect(harness.writeItem).toHaveBeenCalledOnce()
         expect(harness.markPublished).not.toHaveBeenCalled()
     })
 

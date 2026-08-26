@@ -708,6 +708,39 @@ describe('AccountStorage structured wire contract', () => {
         expect(warnBody.cancel).toHaveBeenCalledOnce()
     })
 
+    it('aborts an asset upload while its ordinary 403 reauthentication is waiting', async () => {
+        let resolveLogin!: (value: string) => void
+        mocks.alertLogin.mockReturnValueOnce(new Promise<string>((resolve) => {
+            resolveLogin = resolve
+        }))
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 8 }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response('retry', 403))
+            .mockResolvedValueOnce(response('assets/retried.png'))
+        const credentialRouting = {
+            getToken: vi.fn(() => 'old-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({ credentialRouting })
+        const controller = new AbortController()
+        const aborted = new DOMException('Publication disposed', 'AbortError')
+
+        const write = storage.writeItem('assets/a.png', Uint8Array.of(1), {
+            signal: controller.signal,
+        })
+        await vi.waitFor(() => expect(mocks.alertLogin).toHaveBeenCalledOnce())
+        controller.abort(aborted)
+        resolveLogin('new-token')
+
+        await expect(write).rejects.toBe(aborted)
+        expect(credentialRouting.reauthenticate).not.toHaveBeenCalled()
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(2)
+    })
+
     it('routes native reauthentication without reading or writing the legacy fallback token', async () => {
         localStorage.setItem('fallbackRisuToken', JSON.stringify({ token: 'legacy-token' }))
         const getItem = vi.spyOn(Storage.prototype, 'getItem')

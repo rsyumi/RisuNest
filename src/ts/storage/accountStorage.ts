@@ -240,7 +240,7 @@ export class AccountStorage{
                 if(da.headers.get('x-risu-status') === 'warn'){
                     return { kind: 'auth-warning' }
                 }
-                await this.reauthenticate()
+                await this.reauthenticate(options.signal)
                 continue
             }
             if(da.status < 200 || da.status >= 300){

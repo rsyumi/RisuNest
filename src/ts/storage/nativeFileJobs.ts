@@ -478,10 +478,14 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
     }
 }
 
-function cancelledNativeOfficialPublicationAbortError(): Error {
-    return Object.assign(abortError(), {
+function drainedNativeOfficialPublicationError(error: Error): Error {
+    return Object.assign(error, {
         nativeOfficialPublicationCancellationDrained: true,
     })
+}
+
+function cancelledNativeOfficialPublicationAbortError(): Error {
+    return drainedNativeOfficialPublicationError(abortError())
 }
 
 async function invokeNative(
@@ -1563,12 +1567,14 @@ async function pollNativeOfficialPublication(
                     status.error?.code ?? 'publication-failed',
                     status.error?.message ?? 'Native official publication failed',
                 )
+            let forgotten = false
             try {
                 await invokeNative(dependencies, 'native_file_job_forget', { jobId })
+                forgotten = true
             }
             catch {}
             if (behavior.terminalFailure === 'return-null') return null
-            throw error
+            throw forgotten ? drainedNativeOfficialPublicationError(error) : error
         }
         await dependencies.wait(options.pollIntervalMs ?? 100)
     }

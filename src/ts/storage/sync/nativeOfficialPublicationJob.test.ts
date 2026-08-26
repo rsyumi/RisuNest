@@ -5,10 +5,13 @@ import type {
     AccountNativeOfficialWriteResult,
     AccountStorage,
 } from '../accountStorage'
-import type {
-    NativeOfficialPublicationAttemptResult,
-    NativeOfficialPublicationReceipt,
-    NativeOfficialPublicationRequest,
+import {
+    continueNativeOfficialPublication,
+    type NativeFileJobOptions,
+    type NativeOfficialPublicationAttemptResult,
+    type NativeOfficialPublicationReceipt,
+    type NativeOfficialPublicationRequest,
+    type NativeOfficialPublicationRetryRequest,
 } from '../nativeFileJobs'
 import {
     nativePersistentRevisionLease,
@@ -328,6 +331,88 @@ describe('native official publication job publisher', () => {
         })).rejects.toMatchObject({ name: 'AbortError' })
 
         expect(continueAttempt).toHaveBeenCalledOnce()
+        expect(cancelAttempt).not.toHaveBeenCalled()
+    })
+
+    it('does not recancel an abort drained while polling an accepted continuation', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        const account: Pick<AccountStorage, 'writeOfficialDatabaseFromNative'> = {
+            async writeOfficialDatabaseFromNative<T>(
+                attempt: AccountNativeOfficialWriteAttempt<T>,
+                options?: { signal?: AbortSignal },
+            ): Promise<AccountNativeOfficialWriteResult<T> | null> {
+                const first = await attempt({
+                    credential: { kind: 'risu-auth', token: 'legacy-token' },
+                    session: 'session-1',
+                    saveDate: '1700000000000',
+                    signal: options?.signal,
+                })
+                expect(first).toMatchObject({ kind: 'reauthentication-needed' })
+                await attempt({
+                    credential: { kind: 'risu-auth', token: 'fresh-token' },
+                    session: first?.session ?? null,
+                    saveDate: '1700000000001',
+                    signal: options?.signal,
+                })
+                throw new Error('Continuation polling must abort')
+            },
+        }
+        const continueAttempt = vi.fn(async (
+            jobId: string,
+            request: NativeOfficialPublicationRetryRequest,
+            expected: { revision: number; accountId: string },
+            options?: NativeFileJobOptions,
+        ) => await continueNativeOfficialPublication(jobId, request, expected, options, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                commands.push(command)
+                if (command === 'native_file_job_official_publication_retry') {
+                    controller.abort(new DOMException('Publication cancelled', 'AbortError'))
+                    return 'accepted'
+                }
+                if (command === 'native_file_job_cancel') return 'requested'
+                if (command === 'native_file_job_status') return {
+                    jobId: 'publication-1',
+                    kind: 'official-publication-upload',
+                    state: 'cancelled',
+                    phase: 'complete',
+                    progress: { completedBytes: 128, completedItems: 1 },
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        }))
+        const cancelAttempt = vi.fn(async () => null)
+        const publish = createNativeOfficialPublicationJobPublisher({
+            account,
+            baseUrl: 'https://hub.invalid',
+            runAttempt: vi.fn(async () => ({
+                kind: 'waiting-for-reauthentication' as const,
+                jobId: 'publication-1',
+                accountId: 'account-1',
+                session: 'session-42',
+            })),
+            continueAttempt,
+            cancelAttempt,
+        })
+
+        await expect(publish({
+            revision: 7,
+            accountId: 'account-1',
+            lease: pinnedLease(),
+            resourceReplacements: {},
+            signal: controller.signal,
+        })).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(continueAttempt).toHaveBeenCalledOnce()
+        expect(commands).toEqual([
+            'native_file_job_official_publication_retry',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
         expect(cancelAttempt).not.toHaveBeenCalled()
     })
 
