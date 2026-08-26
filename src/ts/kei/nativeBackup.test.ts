@@ -22,6 +22,7 @@ function nativeRuntime() {
             queryPluginStorage: vi.fn(),
             readPluginStorage: vi.fn(),
             readAssetAlias: vi.fn(),
+            readAssetOwnerHead: vi.fn(),
             release,
         }) as PersistentRevisionLease,
     )
@@ -111,6 +112,7 @@ describe('tryNativeKeiBackup', () => {
             queryPluginStorage: vi.fn(),
             readPluginStorage: vi.fn(),
             readAssetAlias: vi.fn(),
+            readAssetOwnerHead: vi.fn(),
             release,
         })
         const invoke = vi.fn()
