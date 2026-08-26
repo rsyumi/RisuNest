@@ -5,14 +5,113 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::Path,
+    process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Barrier, Mutex,
     },
     thread,
+    time::Duration,
 };
+
+const CHILD_MODE_ENV: &str = "RISUNEST_P0_CLONE_CHILD_MODE";
+const CHILD_SESSION_URL_ENV: &str = "RISUNEST_P0_CLONE_SESSION_URL";
+const CHILD_STAGING_ROOT_ENV: &str = "RISUNEST_P0_CLONE_STAGING_ROOT";
+const CHILD_MARKER_ENV: &str = "RISUNEST_P0_CLONE_MARKER";
+
+#[test]
+#[ignore = "spawned by parent process tests"]
+fn clone_process_child() {
+    let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
+        return;
+    };
+    let session_url = std::env::var(CHILD_SESSION_URL_ENV).unwrap();
+    let staging_root = std::env::var(CHILD_STAGING_ROOT_ENV).unwrap();
+    let mut client = LoopbackCloneClient::new(staging_root, session_url).unwrap();
+    match mode.as_str() {
+        "proxy" => {
+            client.download(&TransferCancellation::new()).unwrap();
+        }
+        "mid-chunk-kill" => {
+            let marker = std::env::var(CHILD_MARKER_ENV).unwrap();
+            client
+                .download_with_progress(&TransferCancellation::new(), |bytes| {
+                    if bytes >= CLONE_CHUNK_SIZE + 64 * 1024 {
+                        write_durable_marker_and_wait(Path::new(&marker));
+                    }
+                })
+                .unwrap();
+            panic!("mid-chunk child completed before it was killed");
+        }
+        "cas-promotion-kill" => {
+            let marker = std::env::var(CHILD_MARKER_ENV).unwrap();
+            client.pause_after_cas_promotion_for_test(marker);
+            client.download(&TransferCancellation::new()).unwrap();
+            panic!("CAS-promotion child completed before it was killed");
+        }
+        _ => panic!("unknown clone child mode: {mode}"),
+    }
+}
+
+fn clone_child_command(mode: &str, session_url: &str, staging_root: &Path) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("peer_sync::tests::clone_process_child")
+        .arg("--nocapture")
+        .env("VITE_DISABLE_REALM", "true")
+        .env(CHILD_MODE_ENV, mode)
+        .env(CHILD_SESSION_URL_ENV, session_url)
+        .env(CHILD_STAGING_ROOT_ENV, staging_root);
+    command
+}
+
+fn write_durable_marker_and_wait(path: &Path) -> ! {
+    let mut marker = File::create(path).unwrap();
+    marker.write_all(b"ready").unwrap();
+    marker.sync_all().unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn spawn_clone_kill_child(
+    mode: &str,
+    session_url: &str,
+    staging_root: &Path,
+    marker: &Path,
+) -> Child {
+    clone_child_command(mode, session_url, staging_root)
+        .env(CHILD_MARKER_ENV, marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_for_marker_and_kill(child: &mut Child, marker: &Path) {
+    for _ in 0..400 {
+        if marker.exists() {
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            assert!(
+                !status.success(),
+                "killed clone child unexpectedly succeeded"
+            );
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("clone child exited before kill marker with {status}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("clone child did not reach the requested kill boundary");
+}
 
 struct FixtureSource {
     revision: u64,
@@ -306,6 +405,14 @@ fn freezes_a_canonical_manifest_and_releases_the_revision_before_serving() {
     assert!(source.released.load(Ordering::SeqCst));
     assert_eq!(session.manifest().source_revision, 42);
     assert_eq!(session.manifest().chunk_size, CLONE_CHUNK_SIZE);
+    let manifest_value: Value = serde_json::from_slice(session.manifest_bytes()).unwrap();
+    let created_at = manifest_value["createdAt"].as_str().unwrap();
+    assert!(created_at.contains('T') && created_at.ends_with('Z'));
+    assert_eq!(manifest_value["database"]["format"], "risusave-v1");
+    assert_eq!(
+        manifest_value["database"]["object"],
+        session.manifest().database.object
+    );
     let object = &session.manifest().objects[&payload_hash(&session, 0)];
     assert_eq!(object.chunks.len(), 2);
     assert_eq!(object.chunks[0].size, CLONE_CHUNK_SIZE);
@@ -406,6 +513,65 @@ fn refuses_nonloopback_session_urls_and_never_follows_http_redirects() {
 }
 
 #[test]
+fn loopback_child_download_ignores_proxy_environment() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64 * 1024]);
+    let session = prepare(&source, session_root.path());
+    let host = LoopbackCloneHost::start(session).unwrap();
+
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    let proxy_hit = Arc::new(AtomicBool::new(false));
+    let stop_proxy = Arc::new(AtomicBool::new(false));
+    let thread_hit = Arc::clone(&proxy_hit);
+    let thread_stop = Arc::clone(&stop_proxy);
+    let proxy_thread = thread::spawn(move || {
+        while !thread_stop.load(Ordering::SeqCst) {
+            match proxy.accept() {
+                Ok((mut stream, _)) => {
+                    thread_hit.store(true, Ordering::SeqCst);
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("proxy probe failed: {error}"),
+            }
+        }
+    });
+
+    let proxy_url = format!("http://{proxy_address}");
+    let output = clone_child_command("proxy", &host.session_url(), client_root.path())
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("https_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .output()
+        .unwrap();
+    stop_proxy.store(true, Ordering::SeqCst);
+    proxy_thread.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!proxy_hit.load(Ordering::SeqCst));
+}
+
+#[test]
 fn resumes_from_persisted_verified_offsets_after_disconnect_without_redownload() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();
@@ -483,6 +649,60 @@ fn reopens_promoted_cas_object_without_redownload_before_verified_ledger_record(
     ));
     assert_eq!(host.total_range_requests(&hash), 1);
     drop(interrupted);
+
+    let mut reopened = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
+    reopened.download(&TransferCancellation::new()).unwrap();
+    assert_eq!(host.total_range_requests(&hash), 1);
+    assert_file_hash(&reopened.verified_object_path(&hash).unwrap(), &hash);
+}
+
+#[test]
+fn resumes_after_actual_child_process_kill_in_the_middle_of_a_chunk() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[(CLONE_CHUNK_SIZE * 2 + 97) as usize]);
+    let session = prepare(&source, session_root.path());
+    let hash = payload_hash(&session, 0);
+    let host = LoopbackCloneHost::start(session).unwrap();
+    let marker = client_root.path().join("mid-chunk.kill-ready");
+    let mut child = spawn_clone_kill_child(
+        "mid-chunk-kill",
+        &host.session_url(),
+        client_root.path(),
+        &marker,
+    );
+
+    wait_for_marker_and_kill(&mut child, &marker);
+
+    let mut reopened = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
+    assert_eq!(reopened.verified_chunk_count(&hash), 1);
+    reopened.download(&TransferCancellation::new()).unwrap();
+    assert_eq!(host.range_request_count(&hash, 0), 1);
+    assert_eq!(host.range_request_count(&hash, CLONE_CHUNK_SIZE), 2);
+    assert_eq!(host.range_request_count(&hash, CLONE_CHUNK_SIZE * 2), 1);
+    assert_file_hash(&reopened.verified_object_path(&hash).unwrap(), &hash);
+}
+
+#[test]
+fn recognizes_promoted_cas_object_after_actual_child_process_kill_before_ledger() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[128 * 1024]);
+    let session = prepare(&source, session_root.path());
+    let hash = payload_hash(&session, 0);
+    let host = LoopbackCloneHost::start(session).unwrap();
+    let marker = client_root.path().join("cas-promotion.kill-ready");
+    let mut child = spawn_clone_kill_child(
+        "cas-promotion-kill",
+        &host.session_url(),
+        client_root.path(),
+        &marker,
+    );
+
+    wait_for_marker_and_kill(&mut child, &marker);
+    assert_eq!(host.total_range_requests(&hash), 1);
 
     let mut reopened = LoopbackCloneClient::new(client_root.path(), host.session_url()).unwrap();
     reopened.download(&TransferCancellation::new()).unwrap();
@@ -628,7 +848,7 @@ fn validates_staged_graph_and_hashes_before_one_atomic_activation() {
         for staged in &stage.staged {
             let expected = if staged.kind == CloneObjectKind::Database {
                 assert_eq!(staged.logical_key, "database");
-                &manifest.database
+                &manifest.database.object
             } else {
                 &manifest
                     .payloads
@@ -794,4 +1014,21 @@ fn manifest_validation_rejects_noncanonical_or_malformed_object_graphs() {
         malformed.validate(),
         Err(PeerSyncError::Protocol(_))
     ));
+
+    for (field, invalid) in [
+        ("createdAt", json!("not-rfc3339")),
+        ("database.format", json!("sqlite-live-file")),
+    ] {
+        let mut value: Value = serde_json::from_slice(session.manifest_bytes()).unwrap();
+        if field == "createdAt" {
+            value["createdAt"] = invalid;
+        } else {
+            value["database"]["format"] = invalid;
+        }
+        let malformed: CloneManifest = serde_json::from_value(value).unwrap();
+        assert!(
+            matches!(malformed.validate(), Err(PeerSyncError::Protocol(_))),
+            "manifest must reject {field}"
+        );
+    }
 }

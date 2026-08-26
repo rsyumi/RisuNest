@@ -4027,6 +4027,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tempfile",
  "tiktoken-rs",
+ "time",
  "tiny_http",
  "tokio",
  "tokio-util",

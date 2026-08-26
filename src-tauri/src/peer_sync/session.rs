@@ -1,7 +1,7 @@
 use super::{
     protocol::{
-        sha256_hex, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor, VerifiedChunk,
-        CLONE_CHUNK_SIZE, CLONE_MANIFEST_SCHEMA,
+        sha256_hex, CloneDatabase, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor,
+        VerifiedChunk, CLONE_CHUNK_SIZE, CLONE_DATABASE_FORMAT, CLONE_MANIFEST_SCHEMA,
     },
     PeerSyncError,
 };
@@ -114,8 +114,8 @@ impl PreparedCloneSession {
                 payload.object = advertised.clone();
             }
         }
-        if self.manifest.database == original {
-            self.manifest.database = advertised.clone();
+        if self.manifest.database.object == original {
+            self.manifest.database.object = advertised.clone();
         }
         let physical = self
             .served_objects
@@ -207,12 +207,18 @@ fn prepare_pinned_revision(
         schema: CLONE_MANIFEST_SCHEMA.to_owned(),
         session_id: uuid::Uuid::new_v4().to_string(),
         source_revision: lease.source_revision(),
+        created_at: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?,
         chunk_size: CLONE_CHUNK_SIZE,
-        database: database.ok_or_else(|| {
-            PeerSyncError::Protocol(
-                "pinned source must contain exactly one database object".to_owned(),
-            )
-        })?,
+        database: CloneDatabase {
+            format: CLONE_DATABASE_FORMAT.to_owned(),
+            object: database.ok_or_else(|| {
+                PeerSyncError::Protocol(
+                    "pinned source must contain exactly one database object".to_owned(),
+                )
+            })?,
+        },
         payloads,
         objects,
     };

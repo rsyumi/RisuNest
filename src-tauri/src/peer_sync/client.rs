@@ -89,6 +89,8 @@ pub struct LoopbackCloneClient {
     ledger: LedgerState,
     #[cfg(test)]
     fail_after_cas_promotion: bool,
+    #[cfg(test)]
+    pause_after_cas_promotion: Option<PathBuf>,
 }
 
 impl LoopbackCloneClient {
@@ -104,6 +106,7 @@ impl LoopbackCloneClient {
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(transport_error)?;
         Ok(Self {
@@ -115,6 +118,8 @@ impl LoopbackCloneClient {
             ledger,
             #[cfg(test)]
             fail_after_cas_promotion: false,
+            #[cfg(test)]
+            pause_after_cas_promotion: None,
         })
     }
 
@@ -173,6 +178,11 @@ impl LoopbackCloneClient {
     #[cfg(test)]
     pub fn fail_after_cas_promotion_once_for_test(&mut self) {
         self.fail_after_cas_promotion = true;
+    }
+
+    #[cfg(test)]
+    pub fn pause_after_cas_promotion_for_test(&mut self, marker: impl Into<PathBuf>) {
+        self.pause_after_cas_promotion = Some(marker.into());
     }
 
     fn fetch_manifest(&mut self) -> Result<(), PeerSyncError> {
@@ -390,6 +400,18 @@ impl LoopbackCloneClient {
             });
         }
         #[cfg(test)]
+        if let Some(marker_path) = self.pause_after_cas_promotion.take() {
+            let mut marker = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker_path)?;
+            marker.write_all(b"ready")?;
+            marker.sync_all()?;
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+        #[cfg(test)]
         if std::mem::take(&mut self.fail_after_cas_promotion) {
             return Err(PeerSyncError::Storage(
                 "injected crash after CAS promotion".to_owned(),
@@ -593,7 +615,7 @@ where
                 &mut reader,
             )?;
         }
-        let mut database = client.open_verified_object(&manifest.database)?;
+        let mut database = client.open_verified_object(&manifest.database.object)?;
         target.stage_object(
             &mut stage,
             CloneObjectKind::Database,
@@ -655,8 +677,8 @@ fn transfer_order(manifest: &CloneManifest) -> Vec<String> {
             ordered.push(payload.object.clone());
         }
     }
-    if seen.insert(manifest.database.clone()) {
-        ordered.push(manifest.database.clone());
+    if seen.insert(manifest.database.object.clone()) {
+        ordered.push(manifest.database.object.clone());
     }
     ordered
 }

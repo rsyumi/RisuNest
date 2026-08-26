@@ -16,7 +16,8 @@ pub use client::{
 };
 pub use host::LoopbackCloneHost;
 pub use protocol::{
-    CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor, VerifiedChunk, CLONE_CHUNK_SIZE,
+    CloneDatabase, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor, VerifiedChunk,
+    CLONE_CHUNK_SIZE,
 };
 pub use session::{
     prepare_clone_session, CloneSource, PinnedCloneRevision, PinnedSourceObject,

@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const CLONE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 pub const CLONE_MANIFEST_SCHEMA: &str = "risunest.peer-clone/v1";
+pub const CLONE_DATABASE_FORMAT: &str = "risusave-v1";
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OBJECTS: usize = 100_000;
 const MAX_LOGICAL_KEY_BYTES: usize = 64 * 1024;
@@ -43,14 +44,22 @@ pub struct ClonePayload {
     pub object: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloneDatabase {
+    pub format: String,
+    pub object: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloneManifest {
     pub schema: String,
     pub session_id: String,
     pub source_revision: u64,
+    pub created_at: String,
     pub chunk_size: u64,
-    pub database: String,
+    pub database: CloneDatabase,
     pub payloads: Vec<ClonePayload>,
     pub objects: BTreeMap<String, ObjectDescriptor>,
 }
@@ -81,10 +90,21 @@ impl CloneManifest {
         if self.session_id.is_empty() || self.session_id.len() > 128 {
             return protocol_error("invalid clone session identifier");
         }
+        if time::OffsetDateTime::parse(
+            &self.created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_err()
+        {
+            return protocol_error("clone creation time is not RFC3339");
+        }
+        if self.database.format != CLONE_DATABASE_FORMAT {
+            return protocol_error("unsupported clone database format");
+        }
         if self.objects.is_empty() || self.objects.len() > MAX_OBJECTS {
             return protocol_error("invalid clone object count");
         }
-        if !self.objects.contains_key(&self.database) {
+        if !self.objects.contains_key(&self.database.object) {
             return protocol_error("database object is missing from clone manifest");
         }
 
