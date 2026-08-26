@@ -1756,8 +1756,8 @@ export const languageEnglish = {
     applyAdditionalParamsToAll: "Apply Additional Parameters to All Models",
     peerClone: {
         title: "Device clone",
-        description: "Copy this RisuNest library directly between desktop devices. LAN transfer uses plain HTTP, so the bearer credential does not prevent network eavesdropping.",
-        unavailable: "LAN clone is not available yet. Atomic activation and the 10 GB / 50,000 asset release test must pass before public network access is enabled.",
+        description: "Copy this RisuNest library directly between devices on the same trusted network. LAN transfer uses plain HTTP, so the bearer credential does not prevent network eavesdropping.",
+        unavailable: "Device clone is unavailable because this build does not provide the required native transfer and atomic activation support.",
         source: "Share from this device",
         sourceHelp: "Sharing starts only when you press Start. Stop closes the server, revokes every device, and requires a new pairing before resume.",
         shareMode: "Sharing mode",

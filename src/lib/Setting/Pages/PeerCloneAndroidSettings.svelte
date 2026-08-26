@@ -3,6 +3,7 @@
 
     import { language } from 'src/lang'
     import { alertConfirm } from 'src/ts/alert'
+    import { loadPluginsAfterAuthoritativeRestore } from 'src/ts/plugins/plugins.svelte'
     import {
         acquireDestructiveReplacementFence,
         capturePersistentMutationToken,
@@ -22,6 +23,7 @@
         runtime: {
             capturePersistentMutationToken,
             acquireDestructiveReplacementFence,
+            afterRefresh: loadPluginsAfterAuthoritativeRestore,
         },
     })
     let capabilities = $state<AndroidPeerCloneCapabilities>()
@@ -54,8 +56,10 @@
         try {
             facade.join(uri)
             refreshState()
-        } catch {
-            error = language.peerClone.invalidLink
+        } catch (cause) {
+            error = cause instanceof Error && cause.message.includes('already owns')
+                ? cause.message
+                : language.peerClone.invalidLink
         }
     }
 
@@ -79,14 +83,23 @@
             void facade.targetStatus()
                 .then(() => {
                     refreshState()
-                    if (cloneState.phase === 'completed' || cloneState.phase === 'cancelled' || cloneState.phase === 'failed') {
+                    error = ''
+                    if (
+                        cloneState.phase === 'paused'
+                        || cloneState.phase === 'completed'
+                        || cloneState.phase === 'cancelled'
+                        || cloneState.phase === 'failed'
+                    ) {
                         if (progressTimer) clearInterval(progressTimer)
                         progressTimer = undefined
                     }
                 })
                 .catch((cause) => {
-                    if (progressTimer) clearInterval(progressTimer)
-                    progressTimer = undefined
+                    refreshState()
+                    if (cloneState.phase === 'failed') {
+                        if (progressTimer) clearInterval(progressTimer)
+                        progressTimer = undefined
+                    }
                     reportError(cause)
                 })
         }, 500)
@@ -117,14 +130,19 @@
     }
 
     onMount(() => {
-        const pendingUri = consumePendingPeerCloneUri()
-        if (pendingUri) acceptPairingUri(pendingUri)
-        const unsubscribe = subscribePeerCloneUri(acceptPairingUri)
+        let initialized = false
+        let pendingUri = consumePendingPeerCloneUri()
+        const unsubscribe = subscribePeerCloneUri((uri) => {
+            if (initialized) acceptPairingUri(uri)
+            else pendingUri = uri
+        })
         void Promise.all([facade.capabilities(), facade.recover()])
-            .then(([available, recovered]) => {
+            .then(([available]) => {
                 capabilities = available
                 refreshState()
-                if (recovered?.phase === 'downloading' || recovered?.phase === 'awaitingActivation') {
+                initialized = true
+                if (pendingUri) acceptPairingUri(pendingUri)
+                if (cloneState.phase === 'downloading') {
                     beginProgressPolling()
                 }
             })
@@ -159,7 +177,15 @@
             class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm"
         ></textarea>
         <div class="mt-2 flex flex-wrap gap-2">
-            <Button disabled={busy || !pairingInput} onclick={() => acceptPairingUri(pairingInput)}>
+            <Button
+                disabled={
+                    busy
+                    || !pairingInput
+                    || cloneState.phase === 'paused'
+                    || cloneState.phase === 'downloading'
+                }
+                onclick={() => acceptPairingUri(pairingInput)}
+            >
                 {language.peerClone.useLink}
             </Button>
             <Button
@@ -167,7 +193,7 @@
                 onclick={downloadClone}
             >{language.peerClone.download}</Button>
             <Button
-                disabled={!targetEnabled || busy || (cloneState.phase !== 'paused' && cloneState.phase !== 'cancelled')}
+                disabled={!targetEnabled || busy || cloneState.phase !== 'paused'}
                 onclick={resumeClone}
             >{language.peerClone.resume}</Button>
             <Button

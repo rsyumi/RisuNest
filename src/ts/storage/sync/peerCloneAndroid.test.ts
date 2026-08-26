@@ -6,6 +6,7 @@ import {
     type AndroidPeerCloneInvoke,
     type AndroidPeerCloneReplacementRuntime,
 } from './peerCloneAndroid'
+import { NativeFileJobActivationCommittedError } from '../nativeFileJobs'
 
 const pairingUri = 'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-42d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 
@@ -15,6 +16,7 @@ function runtime() {
     const replacement: AndroidPeerCloneReplacementRuntime = {
         capturePersistentMutationToken: vi.fn(async () => ({ revision: 7, mutationGeneration: 11 })),
         acquireDestructiveReplacementFence: vi.fn(async () => ({ release, refreshCommittedWorkingSet })),
+        afterRefresh: vi.fn(async () => {}),
     }
     return { replacement, release, refreshCommittedWorkingSet }
 }
@@ -129,6 +131,9 @@ describe('Android peer clone facade', () => {
                 },
             }
         })
+        replacement.afterRefresh = vi.fn(async () => {
+            order.push('plugins')
+        })
         const invoke = vi.fn(async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
             if (command === 'peer_clone_android_current') {
                 return {
@@ -157,7 +162,7 @@ describe('Android peer clone facade', () => {
         const status = await facade.targetStatus()
 
         expect(status.phase).toBe('completed')
-        expect(order).toEqual(['token', 'fence', 'finalize:7', 'refresh:8', 'release'])
+        expect(order).toEqual(['token', 'fence', 'finalize:7', 'refresh:8', 'plugins', 'release'])
         expect(invoke).toHaveBeenCalledWith('peer_clone_android_finalize', {
             jobId: '11111111-1111-4111-8111-111111111111',
             expectedRevision: 7,
@@ -228,6 +233,100 @@ describe('Android peer clone facade', () => {
             completedBytes: 1,
             totalBytes: 42,
         })
+    })
+
+    it('clears a pre-commit finalization failure so activation can retry', async () => {
+        const { replacement } = runtime()
+        replacement.capturePersistentMutationToken = vi.fn()
+            .mockRejectedValueOnce(new Error('temporary fence failure'))
+            .mockResolvedValue({ revision: 7, mutationGeneration: 11 })
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_android_current') {
+                return {
+                    jobId: '11111111-1111-4111-8111-111111111111',
+                    endpoint: 'http://192.168.1.4:43123/',
+                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
+                    manifestId: 'a'.repeat(64),
+                    phase: 'awaitingActivation',
+                    completedBytes: 42,
+                    totalBytes: 42,
+                } as T
+            }
+            if (command === 'peer_clone_android_finalize') return { revision: 8 } as T
+            throw new Error(`unexpected command ${command}`)
+        })
+        const facade = createAndroidPeerCloneFacade({
+            invoke: invoke as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: replacement,
+        })
+
+        await facade.recover()
+        await expect(facade.targetStatus()).rejects.toThrow('temporary fence failure')
+        await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
+        expect(replacement.capturePersistentMutationToken).toHaveBeenCalledTimes(2)
+    })
+
+    it('reports renderer refresh failure as an already committed activation', async () => {
+        const { replacement, release } = runtime()
+        replacement.afterRefresh = vi.fn(async () => {
+            throw new Error('plugin reload failed')
+        })
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_android_current') {
+                return {
+                    jobId: '11111111-1111-4111-8111-111111111111',
+                    endpoint: 'http://192.168.1.4:43123/',
+                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
+                    manifestId: 'a'.repeat(64),
+                    phase: 'awaitingActivation',
+                    completedBytes: 42,
+                    totalBytes: 42,
+                } as T
+            }
+            if (command === 'peer_clone_android_finalize') return { revision: 8 } as T
+            throw new Error(`unexpected command ${command}`)
+        })
+        const facade = createAndroidPeerCloneFacade({
+            invoke: invoke as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: replacement,
+        })
+
+        await facade.recover()
+        const failure = await facade.targetStatus().catch((error: unknown) => error)
+
+        expect(failure).toBeInstanceOf(NativeFileJobActivationCommittedError)
+        expect(failure).toMatchObject({ committedRevision: 8, recoveryRequired: true })
+        expect(facade.getState().phase).toBe('failed')
+        expect(release).toHaveBeenCalledOnce()
+    })
+
+    it('does not replace or resume a persistently owned target job', async () => {
+        const invoke = vi.fn(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_android_current') {
+                return {
+                    jobId: '11111111-1111-4111-8111-111111111111',
+                    endpoint: 'http://192.168.1.4:43123/',
+                    sessionId: '123e4567-e89b-42d3-a456-426614174000',
+                    manifestId: 'a'.repeat(64),
+                    phase: 'ready',
+                    completedBytes: 1,
+                } as T
+            }
+            if (command === 'peer_clone_android_request_cancel') return undefined as T
+            throw new Error(`unexpected command ${command}`)
+        })
+        const facade = createAndroidPeerCloneFacade({
+            invoke: invoke as unknown as AndroidPeerCloneInvoke,
+            bridge: bridge(),
+            runtime: runtime().replacement,
+        })
+        await facade.recover()
+
+        expect(() => facade.join(pairingUri)).toThrow('already owns a clone job')
+        await facade.cancel()
+        await expect(facade.resume()).rejects.toThrow('not paused')
     })
 
     it('fails closed when native lossless activation gates are unavailable', async () => {

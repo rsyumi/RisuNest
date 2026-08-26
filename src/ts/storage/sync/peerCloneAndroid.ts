@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 
+import { NativeFileJobActivationCommittedError } from '../nativeFileJobs'
 import { parsePeerCloneUri, type PeerClonePairing } from './peerClone'
 
 export interface AndroidPeerCloneInvoke {
@@ -24,6 +25,7 @@ export interface AndroidPeerCloneReplacementRuntime {
         refreshCommittedWorkingSet(revision: number): Promise<void>
         release(): void
     }>
+    afterRefresh?(): void | Promise<void>
 }
 
 export interface AndroidPeerCloneCapabilities {
@@ -137,29 +139,31 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
         return status
     }
     const finalize = (status: AndroidPeerCloneTargetStatus): Promise<AndroidPeerCloneTargetStatus> => {
-        finalization ??= (async () => {
+        if (finalization) return finalization
+        finalization = (async () => {
             const id = jobId
             if (!id) throw new Error('Android peer clone job is unavailable')
-            const token = await options.runtime.capturePersistentMutationToken('peer-clone-target-finalize')
-            const fence = await options.runtime.acquireDestructiveReplacementFence(token)
+            let fence: Awaited<ReturnType<AndroidPeerCloneReplacementRuntime['acquireDestructiveReplacementFence']>> | undefined
             try {
+                const token = await options.runtime.capturePersistentMutationToken('peer-clone-target-finalize')
+                fence = await options.runtime.acquireDestructiveReplacementFence(token)
                 const result = await nativeInvoke<{ revision: number }>('peer_clone_android_finalize', {
                     jobId: id,
                     expectedRevision: token.revision,
                 })
-                await fence.refreshCommittedWorkingSet(result.revision)
+                try {
+                    await fence.refreshCommittedWorkingSet(result.revision)
+                    await options.runtime.afterRefresh?.()
+                } catch (cause) {
+                    const committed = new NativeFileJobActivationCommittedError(result.revision, cause)
+                    state = { ...state, phase: 'failed', error: committed.message }
+                    throw committed
+                }
                 const completed = { ...status, phase: 'completed' as const }
                 state = { ...state, phase: 'completed' }
                 return completed
-            } catch (cause) {
-                state = {
-                    ...state,
-                    phase: 'failed',
-                    error: cause instanceof Error ? cause.message : String(cause),
-                }
-                throw cause
             } finally {
-                fence.release()
+                fence?.release()
                 finalization = undefined
             }
         })()
@@ -170,6 +174,9 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
         getState: () => state,
         capabilities,
         join(uri: string): AndroidPeerCloneState {
+            if (jobId && (state.phase === 'paused' || state.phase === 'downloading')) {
+                throw new Error('Android peer clone already owns a clone job')
+            }
             pairing = parsePeerCloneUri(uri)
             jobId = undefined
             state = { ...initialState, phase: 'joined' }
@@ -200,6 +207,7 @@ export function createAndroidPeerCloneFacade(options: AndroidPeerCloneFacadeOpti
         },
         async resume(): Promise<void> {
             if (!jobId) throw new Error('Android peer clone job is unavailable')
+            if (state.phase !== 'paused') throw new Error('Android peer clone job is not paused')
             await requireReady()
             await beginTransfer(jobId)
         },
