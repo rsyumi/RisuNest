@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 
+import { decodeColdStoragePayload } from '../../../process/coldstorageData'
 import type { Database } from '../../database.svelte'
 import type {
     Roadmap14CardFixture,
@@ -31,6 +32,7 @@ export type ReferenceTargetKind =
     | 'loadout'
     | 'folder'
     | 'card'
+    | 'conversation'
 
 export type ReferenceResolutionStatus =
     | 'present'
@@ -81,6 +83,8 @@ export interface ReferenceGraphSummary {
 interface ReferenceIndexes {
     present: Record<ReferenceTargetKind, Set<string>>
     expectedMissing: Record<ReferenceTargetKind, Set<string>>
+    conversationsByCharacter: Map<string, Set<string>>
+    foldersByCharacter: Map<string, Set<string>>
 }
 
 const coldStorageHeader = '\uEF01COLDSTORAGE\uEF01'
@@ -98,19 +102,29 @@ function targetSets(): Record<ReferenceTargetKind, Set<string>> {
         loadout: new Set(),
         folder: new Set(),
         card: new Set(),
+        conversation: new Set(),
     }
 }
 
 function createIndexes(input: ReferenceGraphInput): ReferenceIndexes {
     const present = targetSets()
     const expectedMissing = targetSets()
+    const conversationsByCharacter = new Map<string, Set<string>>()
+    const foldersByCharacter = new Map<string, Set<string>>()
 
     for (const payload of input.payloads) present[payload.kind].add(payload.key)
     for (const character of input.database.characters) {
         if (character?.chaId) present.character.add(character.chaId)
-        for (const folder of character?.chatFolders ?? []) {
-            if (folder.id) present.folder.add(folder.id)
+        const conversations = new Set<string>()
+        for (const chat of character?.chats ?? []) {
+            if (chat.id) conversations.add(chat.id)
         }
+        conversationsByCharacter.set(character.chaId, conversations)
+        const folders = new Set<string>()
+        for (const folder of character?.chatFolders ?? []) {
+            if (folder.id) folders.add(folder.id)
+        }
+        foldersByCharacter.set(character.chaId, folders)
     }
     for (const preset of input.database.botPresets ?? []) {
         if (preset.name) present.preset.add(preset.name)
@@ -134,7 +148,12 @@ function createIndexes(input: ReferenceGraphInput): ReferenceIndexes {
             expectedMissing[kind].add(key)
         }
     }
-    return { present, expectedMissing }
+    return {
+        present,
+        expectedMissing,
+        conversationsByCharacter,
+        foldersByCharacter,
+    }
 }
 
 function isExternalAssetKey(key: string): boolean {
@@ -153,13 +172,30 @@ function displayKey(value: unknown): string {
 }
 
 function classifyReference(
+    owner: ReferenceOwner,
     kind: ReferenceTargetKind,
     rawKey: unknown,
     key: string,
+    metadata: ReferenceTarget['metadata'],
     indexes: ReferenceIndexes,
 ): ReferenceResolutionStatus {
     if (typeof rawKey !== 'string' || key === '') return 'invalid'
     if (kind === 'asset' && isExternalAssetKey(key)) return 'external'
+    const characterId = typeof metadata.characterId === 'string'
+        ? metadata.characterId
+        : owner.kind === 'character' || owner.kind === 'group'
+            ? owner.id
+            : undefined
+    if (kind === 'conversation' && characterId) {
+        if (indexes.conversationsByCharacter.get(characterId)?.has(key)) return 'present'
+        if (indexes.expectedMissing.conversation.has(key)) return 'expected-missing'
+        return 'unexpected-missing'
+    }
+    if (kind === 'folder' && characterId) {
+        if (indexes.foldersByCharacter.get(characterId)?.has(key)) return 'present'
+        if (indexes.expectedMissing.folder.has(key)) return 'expected-missing'
+        return 'unexpected-missing'
+    }
     if (indexes.present[kind].has(key)) return 'present'
     if (indexes.expectedMissing[kind].has(key)) return 'expected-missing'
     return 'unexpected-missing'
@@ -193,7 +229,7 @@ class GraphCollector {
             path,
             occurrence,
             target: { kind, key, metadata },
-            status: classifyReference(kind, rawKey, key, this.indexes),
+            status: classifyReference(owner, kind, rawKey, key, metadata, this.indexes),
         })
     }
 
@@ -256,6 +292,16 @@ function emitAsset(
     collector.optional(owner, path, 'asset', key, metadata)
 }
 
+function emitRequiredAsset(
+    collector: GraphCollector,
+    owner: ReferenceOwner,
+    path: string,
+    key: unknown,
+    metadata: ReferenceTarget['metadata'],
+): void {
+    collector.emit(owner, path, 'asset', key, metadata)
+}
+
 function scanAssetTuples(
     collector: GraphCollector,
     owner: ReferenceOwner,
@@ -263,7 +309,7 @@ function scanAssetTuples(
     tuples: readonly (readonly unknown[])[] | undefined,
 ): void {
     for (const [index, tuple] of (tuples ?? []).entries()) {
-        emitAsset(collector, owner, `${basePath}[${index}][1]`, tuple[1], {
+        emitRequiredAsset(collector, owner, `${basePath}[${index}][1]`, tuple[1], {
             name: typeof tuple[0] === 'string' ? tuple[0] : '',
             ext: typeof tuple[2] === 'string' ? tuple[2] : '',
         })
@@ -295,7 +341,7 @@ function scanCharacterAssets(
 ): void {
     emitAsset(collector, owner, `${basePath}.image`, character.image, { field: 'image' })
     for (const [index, emotion] of (character.emotionImages ?? []).entries()) {
-        emitAsset(
+        emitRequiredAsset(
             collector,
             owner,
             `${basePath}.emotionImages[${index}][1]`,
@@ -311,7 +357,7 @@ function scanCharacterAssets(
     )
     if (character.type !== 'group') {
         for (const [name, key] of Object.entries(character.vits?.files ?? {})) {
-            emitAsset(
+            emitRequiredAsset(
                 collector,
                 owner,
                 propertyPath(`${basePath}.vits.files`, name),
@@ -320,7 +366,7 @@ function scanCharacterAssets(
             )
         }
         for (const [index, asset] of (character.ccAssets ?? []).entries()) {
-            emitAsset(
+            emitRequiredAsset(
                 collector,
                 owner,
                 `${basePath}.ccAssets[${index}].uri`,
@@ -382,6 +428,7 @@ function scanDatabaseRoot(
                 characterId,
             )
         }
+        scanInlays(item, folderOwner, '$', collector)
     }
 
     const collectionKeys = new Set([
@@ -455,8 +502,11 @@ function scanDatabaseCollections(
         collector.emit(owner, '$.presetName', 'preset', loadout.presetName)
         collector.emit(owner, '$.personaId', 'persona', loadout.personaId)
         for (const [index, icon] of (loadout.icons ?? []).entries()) {
-            emitAsset(collector, owner, `$.icons[${index}]`, icon, { field: 'icons' })
+            emitRequiredAsset(collector, owner, `$.icons[${index}]`, icon, {
+                field: 'icons',
+            })
         }
+        scanInlays(loadout, owner, '$', collector)
     }
 }
 
@@ -475,6 +525,16 @@ function scanCharacters(database: Database, collector: GraphCollector): void {
         for (const [index, moduleId] of (character.modules ?? []).entries()) {
             collector.emit(owner, `$.modules[${index}]`, 'module', moduleId)
         }
+        if (character.chats.length > 0) {
+            const selectedChat = character.chats[character.chatPage]
+            collector.emit(
+                owner,
+                '$.chatPage',
+                'conversation',
+                selectedChat?.id ?? `#${character.chatPage}`,
+                { characterId: character.chaId, index: character.chatPage },
+            )
+        }
         collector.optional(owner, '$.coldstorage', 'cold', character.coldstorage)
         for (const [index, coldKey] of (character.coldStoragedChats ?? []).entries()) {
             collector.emit(owner, `$.coldStoragedChats[${index}]`, 'cold', coldKey)
@@ -485,13 +545,15 @@ function scanCharacters(database: Database, collector: GraphCollector): void {
         for (const [chatIndex, chat] of chats.entries()) {
             const chatOwner: ReferenceOwner = {
                 kind: 'conversation',
-                id: chat.id ?? `${character.chaId}:#${chatIndex}`,
+                id: `${character.chaId}/${chat.id ?? `#${chatIndex}`}`,
             }
             for (const [index, moduleId] of (chat.modules ?? []).entries()) {
                 collector.emit(chatOwner, `$.modules[${index}]`, 'module', moduleId)
             }
             collector.optional(chatOwner, '$.bindedPersona', 'persona', chat.bindedPersona)
-            collector.optional(chatOwner, '$.folderId', 'folder', chat.folderId)
+            collector.optional(chatOwner, '$.folderId', 'folder', chat.folderId, {
+                characterId: character.chaId,
+            })
             const firstMessageData = chat.message?.[0]?.data
             if (typeof firstMessageData === 'string'
                 && firstMessageData.startsWith(coldStorageHeader)) {
@@ -526,14 +588,14 @@ function scanCards(
     }
 }
 
-function scanColdPayloads(
+async function scanColdPayloads(
     payloads: readonly Roadmap14Payload[],
     collector: GraphCollector,
-): void {
+): Promise<void> {
     for (const payload of payloads) {
         if (payload.kind !== 'cold') continue
         const owner: ReferenceOwner = { kind: 'cold', id: payload.key }
-        const value = payload.value
+        const value = await decodeColdStoragePayload(payload.bytes)
         if (value && typeof value === 'object' && !Array.isArray(value)
             && 'character' in value && value.character
             && typeof value.character === 'object') {
@@ -548,13 +610,13 @@ function scanColdPayloads(
     }
 }
 
-export function buildReferenceGraph(input: ReferenceGraphInput): ReferenceEdge[] {
+export async function buildReferenceGraph(input: ReferenceGraphInput): Promise<ReferenceEdge[]> {
     const collector = new GraphCollector(createIndexes(input))
     scanDatabaseRoot(input.database, collector)
     scanDatabaseCollections(input.database, collector)
     scanCharacters(input.database, collector)
     scanCards(input.cards, collector)
-    scanColdPayloads(input.coldPayloads, collector)
+    await scanColdPayloads(input.coldPayloads, collector)
     return collector.edges
 }
 
@@ -579,12 +641,19 @@ export interface PayloadInventoryValidation {
     missing: string[]
     unexpected: string[]
     mismatches: PayloadHashMismatch[]
+    duplicates: Array<{ key: string; count: number }>
+    cardinality: { expected: number; actual: number }
 }
 
 export function validatePayloadInventory(
     payloads: readonly Roadmap14Payload[],
     expectedHashes: Readonly<Record<string, string>>,
+    expectedCount = Object.keys(expectedHashes).length,
 ): PayloadInventoryValidation {
+    const counts = new Map<string, number>()
+    for (const payload of payloads) {
+        counts.set(payload.key, (counts.get(payload.key) ?? 0) + 1)
+    }
     const actual = new Map(
         payloads.map((payload) => [
             payload.key,
@@ -601,10 +670,20 @@ export function validatePayloadInventory(
             ? [{ key, expected, actual: actualHash }]
             : []
     })
+    const duplicates = [...counts.entries()]
+        .filter(([, count]) => count > 1)
+        .map(([key, count]) => ({ key, count }))
+    const cardinality = { expected: expectedCount, actual: payloads.length }
     return {
-        valid: missing.length === 0 && unexpected.length === 0 && mismatches.length === 0,
+        valid: missing.length === 0
+            && unexpected.length === 0
+            && mismatches.length === 0
+            && duplicates.length === 0
+            && cardinality.actual === cardinality.expected,
         missing,
         unexpected,
         mismatches,
+        duplicates,
+        cardinality,
     }
 }

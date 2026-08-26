@@ -1,0 +1,33 @@
+{
+    "tag": "object",
+    "entries": [
+        ["ordered-z", { "tag": "number", "value": 0 }],
+        [
+            "ordered-a",
+            {
+                "tag": "array",
+                "items": [
+                    { "tag": "array-hole" },
+                    { "tag": "undefined" },
+                    { "tag": "null" },
+                    { "tag": "boolean", "value": false },
+                    { "tag": "boolean", "value": true },
+                    { "tag": "string", "value": "" },
+                    { "tag": "object", "entries": [] },
+                    { "tag": "array", "items": [] }
+                ]
+            }
+        ],
+        ["absent", { "tag": "absent" }],
+        [
+            "duplicates",
+            {
+                "tag": "array",
+                "items": [
+                    { "tag": "string", "value": "duplicate" },
+                    { "tag": "string", "value": "duplicate" }
+                ]
+            }
+        ]
+    ]
+}

@@ -4,6 +4,7 @@ export const ABSENT = Symbol('roadmap14-absent')
 
 export type CanonicalValue =
     | { tag: 'absent' }
+    | { tag: 'array-hole' }
     | { tag: 'undefined' }
     | { tag: 'null' }
     | { tag: 'boolean'; value: boolean }
@@ -60,7 +61,9 @@ export function toCanonicalValue(
     if (Array.isArray(value)) {
         return {
             tag: 'array',
-            items: value.map((item) => toCanonicalValue(item, nextAncestors)),
+            items: Array.from({ length: value.length }, (_, index) => index in value
+                ? toCanonicalValue(value[index], nextAncestors)
+                : { tag: 'array-hole' }),
         }
     }
 
@@ -200,10 +203,12 @@ function tagged(tag: string, parts: readonly Uint8Array[] = []): Uint8Array {
     return concatBytes([new TextEncoder().encode(tag), ...parts])
 }
 
-function encodeCanonicalValue(value: CanonicalValue): Uint8Array {
+export function canonicalValueBytes(value: CanonicalValue): Uint8Array {
     switch (value.tag) {
         case 'absent':
             return tagged('A')
+        case 'array-hole':
+            return tagged('H')
         case 'undefined':
             return tagged('U')
         case 'null':
@@ -220,21 +225,25 @@ function encodeCanonicalValue(value: CanonicalValue): Uint8Array {
         case 'array':
             return tagged('L', [
                 uint32(value.items.length),
-                ...value.items.map((item) => lengthDelimited(encodeCanonicalValue(item))),
+                ...value.items.map((item) => lengthDelimited(canonicalValueBytes(item))),
             ])
         case 'object':
             return tagged('O', [
                 uint32(value.entries.length),
                 ...value.entries.flatMap(([key, item]) => [
                     lengthDelimited(new TextEncoder().encode(key)),
-                    lengthDelimited(encodeCanonicalValue(item)),
+                    lengthDelimited(canonicalValueBytes(item)),
                 ]),
             ])
     }
 }
 
 export function canonicalBytes(value: unknown | typeof ABSENT): Uint8Array {
-    return encodeCanonicalValue(toCanonicalValue(value))
+    return canonicalValueBytes(toCanonicalValue(value))
+}
+
+export function canonicalValueSha256(value: CanonicalValue): string {
+    return createHash('sha256').update(canonicalValueBytes(value)).digest('hex')
 }
 
 export function canonicalSha256(value: unknown | typeof ABSENT): string {

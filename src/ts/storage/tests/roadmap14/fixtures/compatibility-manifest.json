@@ -1,6 +1,8 @@
 {
     "version": 1,
-    "canonicalSha256": "3b6240400cd980c5d6dc569cb69655ad109d4ab58efd877169b433d4622e31e2",
+    "canonicalSha256": "8fbd86d275a129dc06fbc382aac35192efb200b44aff95456d0c9340977afd17",
+    "referenceGraphSha256": "a7a085cd7667a831aae3a606797043c5e078e8e7b1226df703d8be61fbbefb7d",
+    "payloadCount": 32,
     "payloads": {
         "assets/characters/main.PNG": "ce93c75fb081569e3902c2ec5f98dec0ff493d99653a5744f9d6e8c31c2d8352",
         "assets/characters/emotion.webp": "fac7a83185706bb57cee558063818ec256fd386769a80173414019a8538d3b9a",
@@ -32,7 +34,7 @@
         "inlay-audio": "1e76bdea2db9c01eeeb70a8fad64f80367f210b2c085f1d5c75973fb1622e7b3",
         "inlay-video": "64d63a57f4aeb7fed4767dac60af4901242f5b41245f75acb88900dd0418895f",
         "inlay-signature": "ae6ea0906153503bc495690ff83d1bec9e1347d0f53e884a03342f48a5a29700",
-        "cold-character-main": "ab68cac791647d71c1cda63d6acb3c4cc39cf3c9d6711563735de682cd9e0e53",
-        "cold-chat-main": "d330d0735a141cb8d20ce7cdb1efcc8004bd365b0ed327479dd8e1da2626cb03"
+        "cold-character-main": "655151f48dd463909d208d06d8e16f04d941cd1bb23a4afd96828ae44605d9f3",
+        "cold-chat-main": "c5b0b57567babee98abb763cbc9858f8233346c8ab3ee74cb5d591823fdac72c"
     }
 }

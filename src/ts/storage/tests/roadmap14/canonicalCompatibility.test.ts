@@ -1,11 +1,15 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
     ABSENT,
     canonicalBytes,
     canonicalSha256,
+    canonicalValueSha256,
     compareSemanticValues,
     toCanonicalValue,
+    type CanonicalValue,
 } from './canonicalCompatibility'
 
 describe('roadmap 14 canonical compatibility', () => {
@@ -57,5 +61,29 @@ describe('roadmap 14 canonical compatibility', () => {
         expect(canonicalSha256(['duplicate', 'duplicate'])).toBe(
             canonicalSha256(['duplicate', 'duplicate']),
         )
+    })
+
+    it('distinguishes a sparse array hole from an explicit undefined item', () => {
+        const sparse = new Array(1)
+
+        expect(toCanonicalValue(sparse)).toEqual({
+            tag: 'array',
+            items: [{ tag: 'array-hole' }],
+        })
+        expect(compareSemanticValues(sparse, [undefined]).equal).toBe(false)
+        expect(canonicalSha256(sparse)).not.toBe(canonicalSha256([undefined]))
+    })
+
+    it('matches the shared Rust canonical parity fixture', () => {
+        const fixture = JSON.parse(readFileSync(resolve(
+            process.cwd(),
+            'src-tauri/fixtures/roadmap14-canonical-parity.json',
+        ), 'utf8')) as CanonicalValue
+        const manifest = JSON.parse(readFileSync(resolve(
+            process.cwd(),
+            'src-tauri/fixtures/roadmap14-compatibility.json',
+        ), 'utf8')) as { paritySha256: string }
+
+        expect(canonicalValueSha256(fixture)).toBe(manifest.paritySha256)
     })
 })

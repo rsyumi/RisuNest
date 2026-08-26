@@ -1,5 +1,6 @@
 {
     "version": 1,
     "canonicalEncoding": "roadmap14-length-delimited-v1",
-    "canonicalSha256": "3b6240400cd980c5d6dc569cb69655ad109d4ab58efd877169b433d4622e31e2"
+    "canonicalSha256": "8fbd86d275a129dc06fbc382aac35192efb200b44aff95456d0c9340977afd17",
+    "paritySha256": "df5969c838b7c30495d1ad1f891d1f761dc8a029724e1622b8063adff543fe5a"
 }

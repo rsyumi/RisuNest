@@ -1,3 +1,5 @@
+import { zlibSync } from 'fflate'
+
 import type { Database } from '../../database.svelte'
 
 function makePluginStorage(): Database['pluginCustomStorage'] {
@@ -349,6 +351,7 @@ const database = {
             color: '',
             img: 'data:image/png;base64,AA==',
             imgFile: 'assets/folders/folder-main.svg',
+            roadmap14Unknown: { nestedInlay: '{{inlay::inlay-audio}}' },
         },
         'group-main',
         'character-main',
@@ -365,6 +368,7 @@ const database = {
             presetName: 'Preset Zeta',
             personaId: 'persona-main',
             icons: ['assets/characters/main.PNG', 'assets/characters/main.PNG'],
+            roadmap14Unknown: { nestedInlay: '{{inlay::inlay-signature}}' },
         },
         {
             id: 'loadout-secondary',
@@ -448,7 +452,6 @@ export interface Roadmap14Payload {
         mime: string
         inlayType?: 'image' | 'audio' | 'video' | 'signature'
     }
-    value?: unknown
 }
 
 function fixtureBytes(label: string, prefix: readonly number[] = []): Uint8Array {
@@ -561,17 +564,19 @@ export const roadmap14Payloads: Roadmap14Payload[] = [
         kind: 'cold',
         category: 'cold-character',
         key: 'cold-character-main',
-        bytes: fixtureBytes('cold-character-main', [120, 156]),
+        bytes: zlibSync(
+            new TextEncoder().encode(JSON.stringify(coldCharacterValue)),
+        ),
         metadata: { name: 'cold-character-main.json', ext: 'json', mime: 'application/json' },
-        value: coldCharacterValue,
     },
     {
         kind: 'cold',
         category: 'cold-chat',
         key: 'cold-chat-main',
-        bytes: fixtureBytes('cold-chat-main', [120, 156]),
+        bytes: zlibSync(
+            new TextEncoder().encode(JSON.stringify(coldChatValue)),
+        ),
         metadata: { name: 'cold-chat-main.json', ext: 'json', mime: 'application/json' },
-        value: coldChatValue,
     },
 ]
 

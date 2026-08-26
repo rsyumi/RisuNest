@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
+import { decodeColdStoragePayload } from '../../../process/coldstorageData'
 import { canonicalSha256 } from './canonicalCompatibility'
 import { roadmap14Corpus, roadmap14Payloads } from './losslessCorpus'
 
@@ -101,6 +102,7 @@ describe('roadmap 14 lossless corpus', () => {
             version: number
             canonicalEncoding: string
             canonicalSha256: string
+            paritySha256: string
         }
 
         expect(new Set(roadmap14Payloads.map((payload) => payload.category))).toEqual(
@@ -147,6 +149,25 @@ describe('roadmap 14 lossless corpus', () => {
             version: manifest.version,
             canonicalEncoding: 'roadmap14-length-delimited-v1',
             canonicalSha256: manifest.canonicalSha256,
+            paritySha256: 'df5969c838b7c30495d1ad1f891d1f761dc8a029724e1622b8063adff543fe5a',
         })
+    })
+
+    it('stores cold fixtures as production-decodable compressed JSON without side-channel values', async () => {
+        const coldPayloads = roadmap14Payloads.filter((payload) => payload.kind === 'cold')
+        const decoded = await Promise.all(
+            coldPayloads.map((payload) => decodeColdStoragePayload(payload.bytes)),
+        )
+
+        expect(decoded[0]).toMatchObject({
+            character: {
+                chaId: 'character-main',
+                roadmap14ColdUnknown: '{{inlay::inlay-signature}}',
+            },
+        })
+        expect(decoded[1]).toMatchObject({
+            message: [{ chatId: 'cold-message-main' }],
+        })
+        expect(coldPayloads.every((payload) => !('value' in payload))).toBe(true)
     })
 })
