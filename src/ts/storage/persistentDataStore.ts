@@ -34,6 +34,28 @@ export type ColdPayloadAuthorityState =
     | { format: 'preparing'; migrationId: string; sourceRevision: DataRevision }
     | { format: 'v2'; migrationId: string; compatibilityHash: string }
 
+export interface ColdAlias {
+    key: string
+    objectHash: string | null
+    size: number
+    metadata: Record<string, unknown>
+}
+
+export function validateColdAlias(alias: ColdAlias): void {
+    if (typeof alias.key !== 'string' || alias.key.length === 0 || alias.key.includes('\0')) {
+        throw new TypeError('Cold alias key must be nonempty and contain no NUL characters')
+    }
+    if (alias.objectHash !== null && !/^[0-9a-f]{64}$/.test(alias.objectHash)) {
+        throw new TypeError('Cold alias objectHash must be null or lowercase SHA-256')
+    }
+    if (!Number.isSafeInteger(alias.size) || alias.size < 0) {
+        throw new TypeError('Cold alias size must be a nonnegative safe integer')
+    }
+    if (alias.metadata === null || typeof alias.metadata !== 'object' || Array.isArray(alias.metadata)) {
+        throw new TypeError('Cold alias metadata must be an object')
+    }
+}
+
 export interface AssetAliasIdentity {
     kind: AssetAliasKind
     key: string
