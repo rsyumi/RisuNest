@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import goldenCardJson from './storage/tests/roadmap14/fixtures/charx/card-v3.json?raw'
 
 const mocks = vi.hoisted(() => ({
     database: {
@@ -79,7 +80,7 @@ vi.mock('./realmAccess', () => ({
 }))
 vi.mock('./media', () => ({ compressImage: vi.fn(), getImageType: vi.fn() }))
 
-import { importCharacterProcess } from './characterCards'
+import { importCharacterCardSpec, importCharacterProcess } from './characterCards'
 
 describe('character card additions', () => {
     beforeEach(() => {
@@ -112,5 +113,43 @@ describe('character card additions', () => {
         expect(character.chats).toHaveLength(1)
         expect(character.chats[0].id).toBeTruthy()
         expect(index).toBe(0)
+    })
+
+    it('maps the bounded native card.json golden through the existing semantic mapper', async () => {
+        const mapped = await importCharacterCardSpec(
+            JSON.parse(goldenCardJson),
+            undefined,
+            'normal',
+            {
+                'assets/Portrait.JPEG': 'asset://portrait',
+                'assets/config.JSON': 'asset://config',
+            },
+            null,
+            true,
+        )
+
+        expect(mapped).toMatchObject({
+            name: 'Roadmap 14 Golden Card',
+            desc: 'Bounded native card metadata fixture',
+            personality: 'Careful',
+            scenario: 'Parser parity',
+            firstMessage: 'Hello from CharX',
+            image: 'asset://portrait',
+            utilityBot: true,
+            largePortrait: false,
+            additionalAssets: [['config', 'asset://config', 'JSON']],
+            alternateGreetings: ['Second hello'],
+            tags: ['roadmap14', 'golden'],
+            nickname: 'Golden',
+            source: ['synthetic'],
+            creation_date: 1700000000,
+            modification_date: 1700000001,
+            extentions: {
+                unknown_extension: {
+                    ordered: ['first', 'second'],
+                },
+            },
+        })
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
     })
 })

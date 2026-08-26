@@ -691,7 +691,7 @@ export async function exportChar(charaID:number):Promise<string> {
 }
 
 
-async function importCharacterCardSpec<T extends boolean = false>(card:CharacterCardV2Risu|CharacterCardV3, img?:Uint8Array, mode:'hub'|'normal' = 'normal', assetDict:{[key:string]:string} = {}, overrideLorebook: loreBook[] = null, returnValue:T = false as T):Promise<T extends true ? character|false : string|false>{
+export async function importCharacterCardSpec<T extends boolean = false>(card:CharacterCardV2Risu|CharacterCardV3, img?:Uint8Array, mode:'hub'|'normal' = 'normal', assetDict:{[key:string]:string} = {}, overrideLorebook: loreBook[] = null, returnValue:T = false as T):Promise<T extends true ? character|false : string|false>{
     if(!card ||(card.spec !== 'chara_card_v2' && card.spec !== 'chara_card_v3' )){
         return false
     }
