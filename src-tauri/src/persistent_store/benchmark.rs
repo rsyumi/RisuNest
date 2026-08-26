@@ -178,6 +178,7 @@ struct PostLeaseCommitBenchmarkResult {
     fixture_conversations: usize,
     fixture_messages: usize,
     fixture_serialized_bytes: u64,
+    fixture_sha256: String,
     aggregate: PostLeaseCommitAggregate,
     samples: Vec<PostLeaseCommitSample>,
 }
@@ -987,7 +988,7 @@ fn first_post_lease_commit_measurements() {
             })
             .collect(),
     );
-    let serialized_bytes = serde_json::to_vec(&database).unwrap().len() as u64;
+    let serialized = serde_json::to_vec(&database).expect("serialize post-lease fixture");
     let mut samples = run_post_lease_commit_benchmark(&database);
     samples.remove(0);
     let result = PostLeaseCommitBenchmarkResult {
@@ -1002,7 +1003,8 @@ fn first_post_lease_commit_measurements() {
             * POST_LEASE_CHATS_PER_CHARACTER
             * POST_LEASE_TURNS_PER_CHAT
             + POST_LEASE_STRESS_TURNS,
-        fixture_serialized_bytes: serialized_bytes,
+        fixture_serialized_bytes: serialized.len() as u64,
+        fixture_sha256: sha256_hex(&serialized),
         aggregate: PostLeaseCommitAggregate {
             plugin_us: nearest_rank(
                 &samples
