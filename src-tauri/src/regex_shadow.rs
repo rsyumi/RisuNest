@@ -700,9 +700,9 @@ fn generated_plan(index: usize) -> RegexShadowPlan {
 mod tests {
     use super::{
         alternative, compare_shadow, compile_plan, execute_compiled_plan, execute_json,
-        execute_plan, execute_plan_with_control, generated_plan, ExecutionControl,
-        RegexShadowAlternative, RegexShadowAtom, RegexShadowEntry, RegexShadowPattern,
-        RegexShadowPlan, ReplacementToken,
+        execute_plan, execute_plan_with_control, generated_plan, CompiledRegexShadowEntry,
+        CompiledRegexShadowPlan, ExecutionControl, RegexShadowAlternative, RegexShadowAtom,
+        RegexShadowEntry, RegexShadowPattern, RegexShadowPlan, ReplacementToken,
     };
     use sha2::{Digest, Sha256};
     use std::sync::atomic::AtomicBool;
@@ -866,6 +866,45 @@ mod tests {
     }
 
     #[test]
+    fn preserves_compile_error_source_order() {
+        let plan = CompiledRegexShadowPlan {
+            entries: vec![
+                CompiledRegexShadowEntry {
+                    source_index: 9,
+                    global: true,
+                    replacement: Vec::new(),
+                    regex: None,
+                },
+                CompiledRegexShadowEntry {
+                    source_index: 3,
+                    global: true,
+                    replacement: Vec::new(),
+                    regex: None,
+                },
+            ],
+        };
+
+        let result = execute_compiled_plan(
+            &plan,
+            "input",
+            ExecutionControl {
+                cancelled: None,
+                deadline: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .errors
+                .iter()
+                .map(|error| error.source_index)
+                .collect::<Vec<_>>(),
+            vec![9, 3],
+        );
+    }
+
+    #[test]
     fn observes_expired_deadlines_before_execution() {
         let control = ExecutionControl {
             cancelled: None,
@@ -947,6 +986,44 @@ mod tests {
         }
         input.truncate(input_bytes);
         input
+    }
+
+    fn phase_one_fixture_input(rule_count: usize, target_bytes: usize) -> String {
+        let mut input = String::with_capacity(target_bytes);
+        let mut index = 0usize;
+        while input.len() < target_bytes {
+            input.push_str(&format!("rule-{:03}|", index % rule_count));
+            index += 1;
+        }
+        input
+    }
+
+    fn fnv1a_utf16(value: &str) -> String {
+        let hash = value.encode_utf16().fold(0x811c9dc5u32, |hash, unit| {
+            (hash ^ u32::from(unit)).wrapping_mul(0x01000193)
+        });
+        format!("{hash:08x}")
+    }
+
+    #[test]
+    fn matches_current_phase_one_fixture_hashes() {
+        for (rule_count, expected_hash) in [(20, "5e460344"), (100, "d3272578"), (500, "b61dac41")]
+        {
+            let plan = compile_plan(phase_one_plan(rule_count)).unwrap();
+            let input = phase_one_fixture_input(rule_count, 32 * 1024);
+            let result = execute_compiled_plan(
+                &plan,
+                &input,
+                ExecutionControl {
+                    cancelled: None,
+                    deadline: None,
+                },
+            )
+            .unwrap();
+
+            assert!(result.errors.is_empty());
+            assert_eq!(fnv1a_utf16(&result.data), expected_hash);
+        }
     }
 
     #[test]
