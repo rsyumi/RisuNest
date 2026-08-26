@@ -177,6 +177,8 @@ pub(crate) fn export_block_risu_save(
             character_count: encoded.character_count,
             preset_count: encoded.preset_count,
             warning_codes: Vec::new(),
+            handoff_path: None,
+            recovery_path: None,
         }),
         Err(error) => Err(phase_failure
             .into_inner()

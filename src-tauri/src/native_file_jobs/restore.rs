@@ -223,6 +223,8 @@ fn restore_risu_save_reader<R: Read>(
             character_count: parsed.character_count,
             preset_count: parsed.preset_count,
             warning_codes: Vec::new(),
+            handoff_path: None,
+            recovery_path: None,
         })
     })();
     match outcome {

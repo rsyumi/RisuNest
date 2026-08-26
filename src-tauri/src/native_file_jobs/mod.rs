@@ -110,11 +110,19 @@ pub(crate) enum NativeFileJobStartRequest {
         source: JobSource,
         expected_revision: i64,
     },
+    RestoreLosslessBackup {
+        source: JobSource,
+        expected_revision: i64,
+    },
     ExportBlockRisuSave {
         destination: String,
         expected_revision: i64,
         #[serde(default)]
         omit_account: bool,
+    },
+    ExportLosslessBackup {
+        destination: Option<String>,
+        expected_revision: i64,
     },
     PrepareContentImport {
         source: JobSource,
@@ -800,6 +808,26 @@ impl NativeFileJobState {
                     omit_account,
                     app,
                 }
+            }
+            NativeFileJobStartRequest::RestoreLosslessBackup {
+                source,
+                expected_revision,
+            } => {
+                let _ = (source, expected_revision);
+                return Err(NativeJobError::new(
+                    "capability-unavailable",
+                    "native lossless backup jobs require durable CAS pinning",
+                ));
+            }
+            NativeFileJobStartRequest::ExportLosslessBackup {
+                destination,
+                expected_revision,
+            } => {
+                let _ = (destination, expected_revision);
+                return Err(NativeJobError::new(
+                    "capability-unavailable",
+                    "native lossless backup jobs require durable CAS pinning",
+                ));
             }
             NativeFileJobStartRequest::PrepareContentImport { .. } => {
                 return Err(NativeJobError::new(
@@ -1574,7 +1602,9 @@ pub(crate) fn native_file_job_forget(
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum JobKind {
     RestoreBlockRisuSave,
+    RestoreLosslessBackup,
     ExportBlockRisuSave,
+    ExportLosslessBackup,
     PrepareContentImport,
     KeiBackupUpload,
 }
@@ -1644,6 +1674,10 @@ pub(crate) struct JobResultSummary {
     pub(crate) character_count: u64,
     pub(crate) preset_count: u64,
     pub(crate) warning_codes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) handoff_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1914,7 +1948,10 @@ impl JobControl {
         if status.state.is_terminal() {
             return Ok(FinalizeOutcome::Terminal);
         }
-        if status.kind != JobKind::RestoreBlockRisuSave {
+        if !matches!(
+            status.kind,
+            JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+        ) {
             return Ok(FinalizeOutcome::TooEarly);
         }
         if matches!(
@@ -1952,8 +1989,10 @@ impl JobControl {
                 .status
                 .lock()
                 .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
-            if status.kind != JobKind::RestoreBlockRisuSave
-                || status.state != JobState::Running
+            if !matches!(
+                status.kind,
+                JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+            ) || status.state != JobState::Running
                 || status.phase != JobPhase::StagingDatabase
             {
                 return Err("native restore cannot activate from its current state".to_owned());
@@ -1994,7 +2033,9 @@ impl JobControl {
             .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
         let expected = match status.kind {
             JobKind::RestoreBlockRisuSave => JobPhase::ReadingSource,
+            JobKind::RestoreLosslessBackup => JobPhase::ReadingSource,
             JobKind::ExportBlockRisuSave => JobPhase::WritingExport,
+            JobKind::ExportLosslessBackup => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,
             JobKind::KeiBackupUpload => JobPhase::WritingExport,
         };
@@ -2251,6 +2292,7 @@ pub(crate) mod restore;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::fs;
     use std::sync::Barrier;
     use std::thread;
@@ -2265,7 +2307,84 @@ mod tests {
             character_count: 0,
             preset_count: 0,
             warning_codes: Vec::new(),
+            handoff_path: None,
+            recovery_path: None,
         }
+    }
+
+    #[test]
+    fn lossless_job_requests_are_descriptor_only_and_keep_optional_native_paths_bounded() {
+        let restore: NativeFileJobStartRequest = serde_json::from_value(json!({
+            "kind": "restore-lossless-backup",
+            "source": {
+                "type": "desktopPath",
+                "path": "C:\\chosen\\backup.risulossless"
+            },
+            "expectedRevision": 7
+        }))
+        .unwrap();
+        assert!(matches!(
+            restore,
+            NativeFileJobStartRequest::RestoreLosslessBackup {
+                source: JobSource::DesktopPath { .. },
+                expected_revision: 7,
+            }
+        ));
+
+        let export: NativeFileJobStartRequest = serde_json::from_value(json!({
+            "kind": "export-lossless-backup",
+            "expectedRevision": 8
+        }))
+        .unwrap();
+        assert!(matches!(
+            export,
+            NativeFileJobStartRequest::ExportLosslessBackup {
+                destination: None,
+                expected_revision: 8,
+            }
+        ));
+
+        let mut summary = result(9);
+        summary.handoff_path =
+            Some("C:\\app\\persistent\\exports\\risusave-123.risudat".to_owned());
+        summary.recovery_path =
+            Some("C:\\app\\persistent\\recovery\\lossless-123.risudat".to_owned());
+        let encoded = serde_json::to_value(summary).unwrap();
+        assert_eq!(
+            encoded["handoffPath"],
+            json!("C:\\app\\persistent\\exports\\risusave-123.risudat")
+        );
+        assert_eq!(
+            encoded["recoveryPath"],
+            json!("C:\\app\\persistent\\recovery\\lossless-123.risudat")
+        );
+        assert!(encoded.get("bytes").is_none());
+    }
+
+    #[test]
+    fn lossless_restore_reuses_the_existing_finalize_and_too_late_cancel_boundary() {
+        let registry = JobRegistry::default();
+        let job = registry
+            .create_internal(JobKind::RestoreLosslessBackup, Some(4), Vec::new(), true)
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.set_phase(JobPhase::StagingDatabase).unwrap();
+
+        let waiter = Arc::clone(&job);
+        let waited = std::thread::spawn(move || waiter.wait_for_restore_finalization());
+        for _ in 0..100 {
+            if job.status().phase == JobPhase::AwaitingActivation {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(job.status().state, JobState::WaitingForInput);
+        assert_eq!(job.status().phase, JobPhase::AwaitingActivation);
+        assert_eq!(job.request_finalize().unwrap(), FinalizeOutcome::Requested);
+        assert_eq!(waited.join().unwrap(), Ok(()));
+        assert_eq!(job.status().phase, JobPhase::ActivatingDatabase);
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::TooLate);
+        job.finish_success(result(5)).unwrap();
     }
 
     fn write_literal_spool(root: &Path, token: &str, manifest: &str, created_at_millis: u64) {
@@ -2921,6 +3040,8 @@ mod tests {
                 warning_codes: (0..=MAX_WARNING_CODES)
                     .map(|index| format!("warning-{index}"))
                     .collect(),
+                handoff_path: None,
+                recovery_path: None,
             })
             .is_err());
 
