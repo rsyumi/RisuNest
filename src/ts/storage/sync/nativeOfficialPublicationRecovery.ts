@@ -48,15 +48,16 @@ export function createNativeOfficialPublicationRecovery(
             }
             const publication = receipt.result.publication
             const activeAccountId = dependencies.activeAccountId()
+            const authenticationOutcome = publication.kind === 'auth-warning'
+                || publication.kind === 'reauthentication-needed'
             if (!activeAccountId || publication.accountId !== activeAccountId) {
-                await receipt.acknowledge()
-                pending.delete(jobId)
+                if (authenticationOutcome) {
+                    await receipt.acknowledge()
+                    pending.delete(jobId)
+                }
                 continue
             }
-            if (
-                publication.kind === 'auth-warning'
-                || publication.kind === 'reauthentication-needed'
-            ) {
+            if (authenticationOutcome) {
                 dependencies.account.adoptRecoveredOfficialWrite({
                     session: publication.session,
                 })

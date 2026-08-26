@@ -108,37 +108,42 @@ describe('native official publication recovery', () => {
         expect(recovery.hasPending()).toBe(false)
     })
 
-    it('never adopts a different-account or authentication outcome', async () => {
-        const mismatchAcknowledge = vi.fn(async () => undefined)
-        const mismatch = writtenReceipt(mismatchAcknowledge)
-        mismatch.result.publication.accountId = 'account-2'
-        const authAcknowledge = vi.fn(async () => undefined)
-        const auth: NativeOfficialPublicationReceipt = {
-            ...writtenReceipt(authAcknowledge),
-            jobId: 'publication-auth',
+    it('retains successful receipts until their account can finalize them exactly once', async () => {
+        let activeAccountId: string | null = null
+        const writtenAcknowledge = vi.fn(async () => undefined)
+        const written = writtenReceipt(writtenAcknowledge)
+        const notModifiedAcknowledge = vi.fn(async () => undefined)
+        const notModifiedBase = writtenReceipt(notModifiedAcknowledge)
+        const notModified: NativeOfficialPublicationReceipt = {
+            ...notModifiedBase,
+            jobId: 'publication-not-modified',
             result: {
-                ...writtenReceipt(authAcknowledge).result,
+                ...notModifiedBase.result,
+                revision: 8,
+                sourceSha256: 'b'.repeat(64),
                 publication: {
-                    kind: 'reauthentication-needed',
-                    accountId: 'account-1',
+                    kind: 'not-modified',
+                    accountId: 'account-2',
                     session: null,
                     saveDate: '1700000000001',
-                    status: 403,
+                    status: 304,
+                    replacementKey: 'database/database.bin',
                 },
             },
         }
         const adoptPublishedRevision = vi.fn(async () => undefined)
+        const completeReload = vi.fn(async () => undefined)
         const adoptRecoveredOfficialWrite = vi.fn(() => ({
-            completeReload: vi.fn(async () => undefined),
+            completeReload,
         }))
         const receipts = new Map([
-            ['publication-mismatch', mismatch],
-            ['publication-auth', auth],
+            ['publication-written', written],
+            ['publication-not-modified', notModified],
         ])
         const recovery = createNativeOfficialPublicationRecovery(
-            ['publication-mismatch', 'publication-auth'],
+            ['publication-written', 'publication-not-modified'],
             {
-                activeAccountId: () => 'account-1',
+                activeAccountId: () => activeAccountId,
                 account: { adoptRecoveredOfficialWrite },
                 adapter: { adoptPublishedRevision },
                 flushMetadata: vi.fn(async () => undefined),
@@ -149,10 +154,88 @@ describe('native official publication recovery', () => {
 
         await recovery.reconcile()
 
+        expect(writtenAcknowledge).not.toHaveBeenCalled()
+        expect(notModifiedAcknowledge).not.toHaveBeenCalled()
+        expect(adoptPublishedRevision).not.toHaveBeenCalled()
+        expect(adoptRecoveredOfficialWrite).not.toHaveBeenCalled()
+        expect(recovery.hasPending()).toBe(true)
+
+        activeAccountId = 'account-1'
+        await recovery.reconcile()
+
+        expect(writtenAcknowledge).toHaveBeenCalledOnce()
+        expect(notModifiedAcknowledge).not.toHaveBeenCalled()
+        expect(recovery.hasPending()).toBe(true)
+
+        activeAccountId = 'account-2'
+        await recovery.reconcile()
+        await recovery.reconcile()
+
+        expect(writtenAcknowledge).toHaveBeenCalledOnce()
+        expect(notModifiedAcknowledge).toHaveBeenCalledOnce()
+        expect(adoptPublishedRevision).toHaveBeenCalledTimes(2)
+        expect(adoptRecoveredOfficialWrite).toHaveBeenCalledTimes(2)
+        expect(completeReload).toHaveBeenCalledTimes(2)
+        expect(recovery.hasPending()).toBe(false)
+    })
+
+    it('consumes authentication outcomes without adopting a publication', async () => {
+        const acknowledge = vi.fn(async () => undefined)
+        const base = writtenReceipt(acknowledge)
+        const auth: NativeOfficialPublicationReceipt = {
+            ...base,
+            jobId: 'publication-auth',
+            result: {
+                ...base.result,
+                publication: {
+                    kind: 'reauthentication-needed',
+                    accountId: 'account-1',
+                    session: null,
+                    saveDate: '1700000000001',
+                    status: 403,
+                },
+            },
+        }
+        const mismatchAcknowledge = vi.fn(async () => undefined)
+        const mismatchBase = writtenReceipt(mismatchAcknowledge)
+        const mismatchAuth: NativeOfficialPublicationReceipt = {
+            ...mismatchBase,
+            jobId: 'publication-auth-mismatch',
+            result: {
+                ...mismatchBase.result,
+                publication: {
+                    kind: 'auth-warning',
+                    accountId: 'account-2',
+                    session: 'session-3',
+                    saveDate: '1700000000002',
+                    status: 403,
+                },
+            },
+        }
+        const adoptPublishedRevision = vi.fn(async () => undefined)
+        const adoptRecoveredOfficialWrite = vi.fn(() => ({
+            completeReload: vi.fn(async () => undefined),
+        }))
+        const receipts = new Map([
+            ['publication-auth', auth],
+            ['publication-auth-mismatch', mismatchAuth],
+        ])
+        const recovery = createNativeOfficialPublicationRecovery([...receipts.keys()], {
+            activeAccountId: () => 'account-1',
+            account: { adoptRecoveredOfficialWrite },
+            adapter: { adoptPublishedRevision },
+            flushMetadata: vi.fn(async () => undefined),
+            listJobIds: vi.fn(async () => []),
+            resumeJob: vi.fn(async (jobId) => receipts.get(jobId) ?? null),
+        })
+
+        await recovery.reconcile()
+
+        expect(acknowledge).toHaveBeenCalledOnce()
         expect(mismatchAcknowledge).toHaveBeenCalledOnce()
-        expect(authAcknowledge).toHaveBeenCalledOnce()
         expect(adoptPublishedRevision).not.toHaveBeenCalled()
         expect(adoptRecoveredOfficialWrite).toHaveBeenCalledOnce()
         expect(adoptRecoveredOfficialWrite).toHaveBeenCalledWith({ session: null })
+        expect(recovery.hasPending()).toBe(false)
     })
 })
