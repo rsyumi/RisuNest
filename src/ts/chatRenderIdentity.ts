@@ -26,7 +26,9 @@ export class ChatRenderIdentitySequence {
 
 export class ChatRenderIdentityRegistry {
     private legacyKeys = new WeakMap<Message, string[]>()
+    private issuedChatIdentities = new WeakMap<Message, Map<string, number>>()
     private nextLegacyKey = 0
+    private nextChatIdentity = 0
     private registeredScope: string | null = null
     private registeredLength = 0
     private registeredKeys: string[] = []
@@ -71,6 +73,7 @@ export class ChatRenderIdentityRegistry {
                 const message = messages[previousLength + offset]
                 const chatId = suffixIds[offset]
                 if (chatId) {
+                    this.recordIssuedChatIdentity(scope, chatId, message)
                     nextKeys.push(scopedKey(scope, 'chat', chatId))
                     this.registeredIdCounts.set(chatId, 1)
                     continue
@@ -95,9 +98,23 @@ export class ChatRenderIdentityRegistry {
         }
 
         const objectOccurrences = new Map<Message, number>()
+        const preferredChatIdentity = new Map<string, { index: number, issue: number }>()
+        for (let index = 0; index < messages.length; index++) {
+            const chatId = messageIds[index]
+            if (!chatId || idCounts.get(chatId) === 1) continue
+            const issue = this.issuedChatIdentity(scope, chatId, messages[index])
+            const preferred = preferredChatIdentity.get(chatId)
+            if (issue !== undefined && (preferred === undefined || issue < preferred.issue)) {
+                preferredChatIdentity.set(chatId, { index, issue })
+            }
+        }
         const keys = messages.map((message, index) => {
             const chatId = messageIds[index]
-            if (chatId && idCounts.get(chatId) === 1) {
+            if (
+                chatId
+                && (idCounts.get(chatId) === 1 || preferredChatIdentity.get(chatId)?.index === index)
+            ) {
+                this.recordIssuedChatIdentity(scope, chatId, message)
                 return scopedKey(scope, 'chat', chatId)
             }
 
@@ -108,6 +125,20 @@ export class ChatRenderIdentityRegistry {
         this.registeredIdCounts = idCounts
         this.setRegistration(scope, messages.length, keys, objectOccurrences)
         return new ChatRenderIdentitySequence(keys)
+    }
+
+    private issuedChatIdentity(scope: string, chatId: string, message: Message): number | undefined {
+        return this.issuedChatIdentities.get(message)?.get(scopedKey(scope, 'chat', chatId))
+    }
+
+    private recordIssuedChatIdentity(scope: string, chatId: string, message: Message): void {
+        let identities = this.issuedChatIdentities.get(message)
+        if (!identities) {
+            identities = new Map()
+            this.issuedChatIdentities.set(message, identities)
+        }
+        const key = scopedKey(scope, 'chat', chatId)
+        if (!identities.has(key)) identities.set(key, this.nextChatIdentity++)
     }
 
     private legacyKey(scope: string, message: Message, occurrence: number): string {

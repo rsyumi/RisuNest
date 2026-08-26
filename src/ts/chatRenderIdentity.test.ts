@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Message } from './storage/database.svelte'
+import { buildChatViewport } from './chatViewport'
 import {
     areChatRenderSignaturesEqual,
     ChatRenderIdentityRegistry,
@@ -46,7 +47,7 @@ const sameSignature = (
 ) => areChatRenderSignaturesEqual(left, right)
 
 describe('ChatRenderIdentityRegistry', () => {
-    it('refreshes an in-place missing chat ID and safely rebuilds when a later append duplicates it', () => {
+    it('keeps an assigned chat identity when a later append duplicates it', () => {
         const registry = new ChatRenderIdentityRegistry()
         const original = message(undefined, 'first')
         const messages = [original]
@@ -61,7 +62,7 @@ describe('ChatRenderIdentityRegistry', () => {
         const duplicateKeys = registry.registerAppend('conversation-a', messages, 1).toArray()
 
         expect(new Set(duplicateKeys).size).toBe(2)
-        expect(duplicateKeys[0]).toBe(missingKey)
+        expect(duplicateKeys[0]).toBe(assignedKey)
     })
 
     it('registers a 10,000-message identity sequence once and resolves viewport rows without rescanning messages', () => {
@@ -139,7 +140,7 @@ describe('ChatRenderIdentityRegistry', () => {
         expect(suffixIndexedReads).toBeGreaterThan(0)
     })
 
-    it('rebuilds safely when an append turns a unique chat ID into a duplicate', () => {
+    it('keeps the issued identity when an append turns a unique chat ID into a duplicate', () => {
         const registry = new ChatRenderIdentityRegistry()
         const original = message('duplicate', 'first')
         const messages = [original]
@@ -149,10 +150,57 @@ describe('ChatRenderIdentityRegistry', () => {
         const duplicateKeys = registry.register('conversation-a', messages).toArray()
 
         expect(new Set(duplicateKeys).size).toBe(2)
-        expect(duplicateKeys[0]).not.toBe(uniqueKey)
+        expect(duplicateKeys[0]).toBe(uniqueKey)
 
         messages.pop()
         expect(registry.register('conversation-a', messages).keyAt(0)).toBe(uniqueKey)
+    })
+
+    it('keeps a viewport anchor on the original message when a duplicate is inserted before it', () => {
+        const registry = new ChatRenderIdentityRegistry()
+        const originalDuplicate = message('duplicate', 'original')
+        const messages = [message('x'), originalDuplicate, message('y')]
+        const beforeKeys = registry.register('conversation-a', messages).toArray()
+        const anchor = {
+            key: beforeKeys[1],
+            indexHint: 1,
+            relativeOffset: 17,
+        }
+
+        messages.splice(1, 0, message('duplicate', 'inserted'))
+        const afterKeys = registry.register('conversation-a', messages).toArray()
+        const insertedFallback = afterKeys[1]
+        const viewport = buildChatViewport({
+            keys: afterKeys,
+            budget: 3,
+            overscan: 1,
+            estimatedMessageHeight: 100,
+            anchor,
+        })
+
+        expect(afterKeys[2]).toBe(anchor.key)
+        expect(afterKeys[1]).not.toBe(anchor.key)
+        expect(viewport.anchor).toEqual({ ...anchor, indexHint: 2 })
+
+        messages.splice(2, 1)
+        registry.register('conversation-a', messages)
+        messages.splice(2, 0, originalDuplicate)
+        const reinsertedKeys = registry.register('conversation-a', messages).toArray()
+        expect(reinsertedKeys[1]).toBe(insertedFallback)
+        expect(reinsertedKeys[2]).toBe(anchor.key)
+    })
+
+    it('reuses an id-less message identity after deletion and reinsertion', () => {
+        const registry = new ChatRenderIdentityRegistry()
+        const idless = message(undefined, 'id-less')
+        const messages = [message('x'), idless, message('y')]
+        const originalKey = registry.register('conversation-a', messages).keyAt(1)
+
+        messages.splice(1, 1)
+        registry.register('conversation-a', messages)
+        messages.splice(1, 0, idless)
+
+        expect(registry.register('conversation-a', messages).keyAt(1)).toBe(originalKey)
     })
 
     it('uses a unique chatId as stable identity across edits, rerolls, and index moves', () => {
