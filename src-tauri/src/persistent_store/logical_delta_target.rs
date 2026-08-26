@@ -3105,37 +3105,6 @@ mod tests {
     fn open_fixture() -> (tempfile::TempDir, PersistentStore, PayloadCas) {
         let directory = tempfile::tempdir().expect("create fixture directory");
         let store = PersistentStore::open(directory.path()).expect("open persistent store");
-        store
-            .connection
-            .execute_batch(
-                "DROP INDEX asset_aliases_generation;
-                 DROP TABLE asset_aliases;
-                 CREATE TABLE asset_aliases (
-                    generation TEXT NOT NULL,
-                    logical_key TEXT NOT NULL,
-                    object_hash TEXT,
-                    kind TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    mime TEXT NOT NULL DEFAULT '',
-                    name TEXT NOT NULL DEFAULT '',
-                    ext TEXT NOT NULL DEFAULT '',
-                    inlay_type TEXT,
-                    width INTEGER,
-                    height INTEGER,
-                    metadata TEXT NOT NULL DEFAULT '{}',
-                    PRIMARY KEY (generation, kind, logical_key)
-                 );
-                 CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
-                 CREATE TABLE cold_aliases (
-                    generation TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    object_hash TEXT,
-                    size INTEGER NOT NULL,
-                    metadata TEXT NOT NULL,
-                    PRIMARY KEY (generation, key)
-                 );",
-            )
-            .expect("install J2 v8 fixture tables");
         let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
         (directory, store, cas)
     }

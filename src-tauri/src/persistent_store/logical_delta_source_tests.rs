@@ -26,7 +26,6 @@ impl SourceFixture {
     fn create() -> Self {
         let directory = tempfile::tempdir().expect("create source fixture");
         let mut store = PersistentStore::open(directory.path()).expect("open fixture store");
-        install_j2_fixture_schema(&store);
         let cas = PayloadCas::new(directory.path()).expect("open fixture payload CAS");
         let payload = cas
             .prepare_bytes(b"exact ordinary asset bytes")
@@ -198,7 +197,6 @@ fn source_pin_survives_normal_writes_and_store_reopen_until_explicit_release() {
     assert_eq!(logical_source_pin_count(fixture.directory.path()), 1);
 
     let mut writer = PersistentStore::open(fixture.directory.path()).expect("open writer");
-    install_j2_fixture_schema_if_missing(&writer);
     writer
         .commit(&WorkingSetCommit {
             expected_revision: 0,
@@ -363,56 +361,6 @@ fn source_open_releases_its_pin_when_compact_manifest_validation_fails() {
     };
     assert!(matches!(corrupt_open, PeerSyncError::Validation(_)));
     assert_eq!(logical_source_pin_count(corrupt.directory.path()), 0);
-}
-
-fn install_j2_fixture_schema(store: &PersistentStore) {
-    store
-        .connection
-        .execute_batch(
-            "DROP INDEX asset_aliases_generation;
-             DROP TABLE asset_aliases;
-             CREATE TABLE asset_aliases (
-                generation TEXT NOT NULL,
-                logical_key TEXT NOT NULL,
-                object_hash TEXT,
-                kind TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                mime TEXT NOT NULL DEFAULT '',
-                name TEXT NOT NULL DEFAULT '',
-                ext TEXT NOT NULL DEFAULT '',
-                inlay_type TEXT,
-                width INTEGER,
-                height INTEGER,
-                metadata TEXT NOT NULL DEFAULT '{}',
-                PRIMARY KEY (generation, kind, logical_key)
-             );
-             CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
-             CREATE TABLE cold_aliases (
-                generation TEXT NOT NULL,
-                key TEXT NOT NULL,
-                object_hash TEXT,
-                size INTEGER NOT NULL,
-                metadata TEXT NOT NULL,
-                PRIMARY KEY (generation, key)
-             );",
-        )
-        .expect("install anticipated J2 schema");
-}
-
-fn install_j2_fixture_schema_if_missing(store: &PersistentStore) {
-    let has_metadata: bool = store
-        .connection
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM pragma_table_info('asset_aliases') WHERE name = 'metadata'
-             )",
-            [],
-            |row| row.get(0),
-        )
-        .expect("inspect asset alias schema");
-    if !has_metadata {
-        install_j2_fixture_schema(store);
-    }
 }
 
 fn logical_source_pin_count(app_data_dir: &std::path::Path) -> i64 {
