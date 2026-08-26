@@ -24,8 +24,23 @@ export type PeerCloneCapability =
 
 export interface PeerCloneSourceStatus {
     sessionId?: string
+    manifestId?: string
+    pairingUri?: string
     phase: 'idle' | 'prepared' | 'running' | 'stopped'
-    devices: readonly { deviceId: string; verifiedBytes: number; lastSeenAt: number }[]
+    devices: readonly {
+        deviceId: string
+        verifiedBytes: number
+        currentObject?: string
+        lastSeenAt: number
+        revoked?: boolean
+    }[]
+}
+
+export interface PeerCloneTargetStatus {
+    phase: 'idle' | 'downloading' | 'cancelled' | 'completed' | 'failed'
+    completedBytes: number
+    totalBytes?: number
+    error?: string
 }
 
 export interface PeerCloneNativeCapabilities {
@@ -43,7 +58,7 @@ export interface PeerCloneState {
         revokedDeviceIds: string[]
     }
     target: {
-        phase: 'idle' | 'joined' | 'confirmed' | 'downloading' | 'cancelled' | 'completed'
+        phase: 'idle' | 'joined' | 'confirmed' | 'downloading' | 'cancelled' | 'completed' | 'failed'
         pairing?: PeerClonePairing
         destructiveConfirmed: boolean
         completedBytes: number
@@ -62,6 +77,7 @@ export type PeerCloneEvent =
     | { type: 'target-cancelled' }
     | { type: 'target-resumed' }
     | { type: 'target-completed' }
+    | { type: 'target-failed' }
 
 export const initialPeerCloneState: PeerCloneState = {
     source: { phase: 'idle', revokedDeviceIds: [] },
@@ -114,13 +130,14 @@ export function reducePeerCloneState(state: PeerCloneState, event: PeerCloneEven
             return { ...state, target: { ...state.target, phase: 'downloading' } }
         case 'target-completed':
             return { ...state, target: { ...state.target, phase: 'completed' } }
+        case 'target-failed':
+            return { ...state, target: { ...state.target, phase: 'failed' } }
     }
 }
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const sha256Pattern = /^[0-9a-f]{64}$/
 const claimPattern = /^[0-9a-f]{64}$/
-const hostnamePattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/i
 const maximumPairingUriLength = 8192
 const maximumEndpointLength = 2048
 const maximumClaimLength = 512
@@ -142,12 +159,13 @@ function hasExplicitValidPort(value: string): boolean {
     return Number.isInteger(port) && port >= 1 && port <= 65535
 }
 
-function isUnsafeLanHost(hostname: string): boolean {
+function isAllowedLanHost(hostname: string): boolean {
     const ipv4 = parseIpv4(hostname)
-    if (ipv4) return ipv4[0] === 0 || ipv4[0] === 127 || (ipv4[0] >= 224 && ipv4[0] <= 239)
-    const normalized = hostname.toLowerCase()
-    return normalized === 'localhost' || normalized.endsWith('.localhost')
-        || normalized === '[::]' || normalized === '[::1]'
+    if (!ipv4) return false
+    return ipv4[0] === 10
+        || (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4[1] <= 31)
+        || (ipv4[0] === 192 && ipv4[1] === 168)
+        || (ipv4[0] === 169 && ipv4[1] === 254)
 }
 
 function endpointFor(sessionId: string, value: string): string {
@@ -169,13 +187,10 @@ function endpointFor(sessionId: string, value: string): string {
         || endpoint.hash
         || endpoint.search
         || (ipv4Shaped && !ipv4)
-        || (!ipv4 && !/^\[[0-9a-f:.]+\]$/i.test(endpoint.hostname)
-            && !hostnamePattern.test(endpoint.hostname))
-        || isUnsafeLanHost(endpoint.hostname)
+        || !isAllowedLanHost(endpoint.hostname)
     ) return invalidPairingUri()
 
-    const sessionPath = `/v1/sessions/${sessionId}`
-    if (endpoint.pathname !== '/' && endpoint.pathname !== sessionPath) return invalidPairingUri()
+    if (endpoint.pathname !== '/') return invalidPairingUri()
     return endpoint.toString()
 }
 
@@ -324,8 +339,36 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             await nativeInvoke('peer_clone_cancel', targetArgs())
             state = reducePeerCloneState(state, { type: 'target-cancelled' })
         },
+        async targetStatus(): Promise<PeerCloneTargetStatus> {
+            supported()
+            const pairing = state.target.pairing
+            if (!pairing) throw new Error('Peer clone target has not joined a pairing')
+            const result = await nativeInvoke<PeerCloneTargetStatus>('peer_clone_target_status', {
+                endpoint: pairing.endpoint,
+                sessionId: pairing.sessionId,
+                manifestId: pairing.manifestId,
+            })
+            if (result.phase === 'downloading') {
+                state = reducePeerCloneState(state, {
+                    type: 'target-progress',
+                    completedBytes: result.completedBytes,
+                    totalBytes: result.totalBytes,
+                })
+            } else if (result.phase === 'cancelled') {
+                state = reducePeerCloneState(state, { type: 'target-cancelled' })
+            } else if (result.phase === 'completed') {
+                state = reducePeerCloneState(state, { type: 'target-completed' })
+            } else if (result.phase === 'failed') {
+                state = reducePeerCloneState(state, { type: 'target-failed' })
+            }
+            return result
+        },
         reportTargetProgress(completedBytes: number, totalBytes?: number): PeerCloneState {
             state = reducePeerCloneState(state, { type: 'target-progress', completedBytes, totalBytes })
+            return state
+        },
+        reportTargetFailure(): PeerCloneState {
+            state = reducePeerCloneState(state, { type: 'target-failed' })
             return state
         },
     }

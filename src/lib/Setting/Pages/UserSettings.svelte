@@ -38,6 +38,7 @@
     } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
     import { cancelActiveNativeFileOperation } from "src/ts/storage/nativeFileJobManager";
     import { onDestroy } from "svelte";
+    import PeerCloneSettings from "./PeerCloneSettings.svelte";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     const drivePopup = createHubPopupController()
@@ -228,6 +229,10 @@
         }} className="mt-2">
         {language.restoreLocalSnapshot}
     </Button>
+{/if}
+
+{#if isTauriDesktop}
+    <PeerCloneSettings />
 {/if}
 
 <Button

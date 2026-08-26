@@ -1,4 +1,5 @@
 mod client;
+pub(crate) mod commands;
 mod host;
 mod lan;
 mod protocol;

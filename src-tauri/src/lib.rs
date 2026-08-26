@@ -501,6 +501,8 @@ pub fn run() {
             run_py_server,
             #[cfg(desktop)]
             install_py_dependencies,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_capabilities,
             oauth_login,
             native_media::native_media_write_inlay_image,
             native_file_jobs::native_file_job_start,
