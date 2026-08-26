@@ -158,6 +158,7 @@ describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
             for (let depth = 0; depth < boundaryDepth; depth++) {
                 structuredPattern = `(?:x${structuredPattern}|y)`
             }
+            structuredPattern = `x${structuredPattern}|y`
             const overLimitPattern = `${'(?:'.repeat(boundaryDepth + 1)}a${')'.repeat(boundaryDepth + 1)}`
             const overLimit = classifyRegexSafePlan(
                 getRegexExecutionPlan([script(overLimitPattern, 'x', 'g')], 'editoutput'),
@@ -172,7 +173,10 @@ describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
                 { pattern: boundaryPattern, input: 'a' },
                 { pattern: concatPattern, input: 'ab' },
                 { pattern: classPattern, input: 'a' },
-                { pattern: structuredPattern, input: `${'x'.repeat(boundaryDepth)}a` },
+                {
+                    pattern: structuredPattern,
+                    input: `${'x'.repeat(boundaryDepth + 1)}a`,
+                },
             ].map(({ pattern, input }, id) => {
                 const executionPlan = getRegexExecutionPlan([
                     script(pattern, 'x', 'g'),
