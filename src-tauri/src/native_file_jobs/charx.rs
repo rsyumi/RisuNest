@@ -23,6 +23,7 @@ const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
 const LOCAL_FILE_HEADER_BYTES: usize = 30;
 const DATA_DESCRIPTOR_SIGNATURE: u32 = 0x0807_4b50;
 const ZIP64_EXTRA_FIELD_KIND: u16 = 0x0001;
+const AES_EXTRA_FIELD_KIND: u16 = 0x9901;
 const AES_COMPRESSION_METHOD: u16 = 99;
 const DEFLATE_COMPRESSION_METHOD: u16 = 8;
 
@@ -846,6 +847,33 @@ where
     if central_disk != 0 {
         return Err(invalid_archive("CharX entry belongs to another ZIP disk"));
     }
+    let central_name_length = u64::from(read_u16(&central, 28).unwrap());
+    let central_extra_length = u64::from(read_u16(&central, 30).unwrap());
+    let central_comment_length = u64::from(read_u16(&central, 32).unwrap());
+    let central_end = central_relative_start
+        .checked_add(CENTRAL_DIRECTORY_HEADER_BYTES as u64)
+        .and_then(|value| value.checked_add(central_name_length))
+        .and_then(|value| value.checked_add(central_extra_length))
+        .and_then(|value| value.checked_add(central_comment_length))
+        .ok_or_else(|| invalid_archive("CharX central entry extent overflowed"))?;
+    if central_end > directory_relative_end {
+        return Err(invalid_archive(
+            "CharX central entry exceeds the declared directory",
+        ));
+    }
+    let central_extra_start = central_start
+        .checked_add(CENTRAL_DIRECTORY_HEADER_BYTES as u64)
+        .and_then(|value| value.checked_add(central_name_length))
+        .ok_or_else(|| invalid_archive("CharX central extra offset overflowed"))?;
+    let central_extra = read_bytes_at(
+        source_path,
+        central_extra_start,
+        usize::try_from(central_extra_length)
+            .map_err(|_| invalid_archive("CharX central extra length does not fit memory"))?,
+        cancellation,
+        "central ZIP extra data",
+    )?;
+    reject_aes_extra(&central_extra, "central")?;
 
     let local_relative_start = entry.header_start();
     if local_relative_start
@@ -942,6 +970,7 @@ where
         cancellation,
         "local ZIP extra data",
     )?;
+    reject_aes_extra(&local_extra, "local")?;
 
     let data_end = data_start
         .checked_add(entry.compressed_size())
@@ -1003,17 +1032,6 @@ where
             "CharX local entry data enters the central directory",
         ));
     }
-    let central_end = central_relative_start
-        .checked_add(CENTRAL_DIRECTORY_HEADER_BYTES as u64)
-        .and_then(|value| value.checked_add(u64::from(read_u16(&central, 28).unwrap())))
-        .and_then(|value| value.checked_add(u64::from(read_u16(&central, 30).unwrap())))
-        .and_then(|value| value.checked_add(u64::from(read_u16(&central, 32).unwrap())))
-        .ok_or_else(|| invalid_archive("CharX central entry extent overflowed"))?;
-    if central_relative_start < archive_directory_start || central_end > directory_relative_end {
-        return Err(invalid_archive(
-            "CharX central entry exceeds the declared directory",
-        ));
-    }
     Ok(EntryLayout {
         local_start: local_relative_start,
         local_end: extent_end,
@@ -1033,35 +1051,7 @@ fn validate_local_zip64_sizes(
         return Ok(());
     }
 
-    let mut offset = 0_usize;
-    let mut zip64_values = None;
-    while offset < extra.len() {
-        let kind = read_u16(extra, offset)
-            .ok_or_else(|| invalid_archive("CharX local extra field header is truncated"))?;
-        let length = usize::from(
-            read_u16(extra, offset + 2)
-                .ok_or_else(|| invalid_archive("CharX local extra field header is truncated"))?,
-        );
-        let value_start = offset
-            .checked_add(4)
-            .ok_or_else(|| invalid_archive("CharX local extra field offset overflowed"))?;
-        let value_end = value_start
-            .checked_add(length)
-            .filter(|end| *end <= extra.len())
-            .ok_or_else(|| invalid_archive("CharX local extra field is truncated"))?;
-        if kind == ZIP64_EXTRA_FIELD_KIND
-            && zip64_values
-                .replace(&extra[value_start..value_end])
-                .is_some()
-        {
-            return Err(invalid_archive(
-                "CharX local header has duplicate ZIP64 extra fields",
-            ));
-        }
-        offset = value_end;
-    }
-
-    let values = zip64_values
+    let values = find_extra_field(extra, ZIP64_EXTRA_FIELD_KIND, "local")?
         .ok_or_else(|| invalid_archive("CharX local ZIP64 sizes have no ZIP64 extra field"))?;
     if values.len() < 16
         || read_u64(values, 0) != Some(expected_decoded)
@@ -1072,6 +1062,46 @@ fn validate_local_zip64_sizes(
         ));
     }
     Ok(())
+}
+
+fn reject_aes_extra(extra: &[u8], location: &str) -> Result<(), CharXParseError> {
+    if find_extra_field(extra, AES_EXTRA_FIELD_KIND, location)?.is_some() {
+        return Err(invalid_archive(format!(
+            "CharX {location} header contains unsupported AES metadata"
+        )));
+    }
+    Ok(())
+}
+
+fn find_extra_field<'a>(
+    extra: &'a [u8],
+    target_kind: u16,
+    location: &str,
+) -> Result<Option<&'a [u8]>, CharXParseError> {
+    let mut offset = 0_usize;
+    let mut target = None;
+    while offset < extra.len() {
+        let kind = read_u16(extra, offset).ok_or_else(|| {
+            invalid_archive(format!("CharX {location} extra header is truncated"))
+        })?;
+        let length = usize::from(read_u16(extra, offset + 2).ok_or_else(|| {
+            invalid_archive(format!("CharX {location} extra header is truncated"))
+        })?);
+        let value_start = offset
+            .checked_add(4)
+            .ok_or_else(|| invalid_archive(format!("CharX {location} extra offset overflowed")))?;
+        let value_end = value_start
+            .checked_add(length)
+            .filter(|end| *end <= extra.len())
+            .ok_or_else(|| invalid_archive(format!("CharX {location} extra is truncated")))?;
+        if kind == target_kind && target.replace(&extra[value_start..value_end]).is_some() {
+            return Err(invalid_archive(format!(
+                "CharX {location} header has duplicate extra field {target_kind:#06x}"
+            )));
+        }
+        offset = value_end;
+    }
+    Ok(target)
 }
 
 fn descriptor_placeholder_matches(value: u32, expected: u32) -> bool {

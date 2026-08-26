@@ -1029,6 +1029,23 @@ fn rejects_raw_aes_method_without_panicking_when_zip_rewrites_the_effective_meth
 }
 
 #[test]
+fn rejects_aes_extra_without_panicking_when_raw_methods_and_flags_look_ordinary() {
+    let card = card_json_with_data(r#"{"name":"aes-extra","extensions":{},"assets":[]}"#);
+    let mut archive = aes_method_zip_with_clear_encryption_flag("card.json", card.as_bytes());
+    let central = central_entry_offsets(&archive)[0];
+    let local = local_offset(&archive, central);
+    archive[central + 10..central + 12].copy_from_slice(&0_u16.to_le_bytes());
+    archive[local + 8..local + 10].copy_from_slice(&0_u16.to_le_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_card("aes-extra.charx", &archive, CharXLimits::default())
+    }));
+
+    let parse_result = result.expect("AES extra metadata must never reach a zip reader panic");
+    let error = parse_result.expect_err("AES extra metadata must reject before decoded access");
+    assert_eq!(error.code(), CharXParseErrorCode::InvalidArchive);
+}
+
+#[test]
 fn rejects_local_data_extents_that_overlap_or_enter_the_central_directory() {
     let mut archive = zip_bytes(&valid_entries(), false);
     let central = central_entry_offsets(&archive)[0];
