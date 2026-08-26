@@ -15,6 +15,7 @@ const OUTPUT_CHANNEL_CHUNKS: usize = 16;
 const SUPERVISOR_POLL: Duration = Duration::from_millis(25);
 const SYSTEM_POLL: Duration = Duration::from_millis(10);
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const DROP_CLEANUP_ATTEMPTS: usize = 3;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -450,6 +451,16 @@ impl TunnelProcess for SystemTunnelProcess {
     }
 }
 
+impl Drop for SystemTunnelProcess {
+    fn drop(&mut self) {
+        for _ in 0..DROP_CLEANUP_ATTEMPTS {
+            if self.stop(DEFAULT_STOP_TIMEOUT).is_ok() {
+                break;
+            }
+        }
+    }
+}
+
 fn exit_label(status: ExitStatus) -> String {
     status
         .code()
@@ -528,19 +539,36 @@ fn configure_no_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn configure_no_window(_command: &mut Command) {}
 
-struct TunnelStartFailure<P, S> {
+struct TunnelStartFailure<P: TunnelProcess, S> {
     error: TunnelError,
     process: Option<P>,
-    peer_session: S,
+    peer_session: Option<S>,
     process_cleanup_error: Option<String>,
 }
 
-impl<P, S> TunnelStartFailure<P, S> {
-    fn into_peer_session(self) -> Result<S, Self> {
+impl<P: TunnelProcess, S> TunnelStartFailure<P, S> {
+    fn into_peer_session(mut self) -> Result<S, Self> {
         if self.process.is_none() {
-            Ok(self.peer_session)
+            Ok(self.peer_session.take().expect("peer session is owned"))
         } else {
             Err(self)
+        }
+    }
+}
+
+impl<P: TunnelProcess, S> Drop for TunnelStartFailure<P, S> {
+    fn drop(&mut self) {
+        let mut stopped = false;
+        if let Some(process) = &mut self.process {
+            for _ in 0..DROP_CLEANUP_ATTEMPTS {
+                if process.stop(DEFAULT_STOP_TIMEOUT).is_ok() {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        if stopped {
+            self.process = None;
         }
     }
 }
@@ -598,7 +626,7 @@ where
                 return Err(TunnelStartFailure {
                     error,
                     process: None,
-                    peer_session,
+                    peer_session: Some(peer_session),
                     process_cleanup_error: None,
                 });
             }
@@ -609,7 +637,7 @@ where
                 return Err(TunnelStartFailure {
                     error,
                     process: None,
-                    peer_session,
+                    peer_session: Some(peer_session),
                     process_cleanup_error: None,
                 });
             }
@@ -620,7 +648,7 @@ where
                 return Err(TunnelStartFailure {
                     error,
                     process: None,
-                    peer_session,
+                    peer_session: Some(peer_session),
                     process_cleanup_error: None,
                 });
             }
@@ -632,7 +660,7 @@ where
                 return Err(TunnelStartFailure {
                     error,
                     process: process_cleanup_error.as_ref().map(|_| process),
-                    peer_session,
+                    peer_session: Some(peer_session),
                     process_cleanup_error,
                 });
             }
@@ -661,12 +689,38 @@ enum SupervisorCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TerminalReason {
     ProcessExited(Option<i32>),
+    ProcessMonitorFailed {
+        error: String,
+        process_cleanup_error: Option<String>,
+        peer_session_cleanup_error: Option<String>,
+    },
+    OwnerDisconnected {
+        process_cleanup_error: Option<String>,
+        peer_session_cleanup_error: Option<String>,
+    },
     Stopped,
+}
+
+impl TerminalReason {
+    fn cleanup_complete(&self) -> bool {
+        match self {
+            Self::ProcessMonitorFailed {
+                process_cleanup_error,
+                peer_session_cleanup_error,
+                ..
+            }
+            | Self::OwnerDisconnected {
+                process_cleanup_error,
+                peer_session_cleanup_error,
+            } => process_cleanup_error.is_none() && peer_session_cleanup_error.is_none(),
+            Self::ProcessExited(_) | Self::Stopped => true,
+        }
+    }
 }
 
 struct RunningTunnel {
     ready: TunnelReady,
-    command_tx: Sender<SupervisorCommand>,
+    command_tx: Option<Sender<SupervisorCommand>>,
     terminal_rx: Receiver<TerminalReason>,
     thread: Option<JoinHandle<()>>,
 }
@@ -683,7 +737,7 @@ impl RunningTunnel {
             thread::spawn(move || supervise(process, peer_session, command_rx, terminal_tx));
         Self {
             ready,
-            command_tx,
+            command_tx: Some(command_tx),
             terminal_rx,
             thread: Some(thread),
         }
@@ -696,6 +750,8 @@ impl RunningTunnel {
     fn stop(&mut self, timeout: Duration) -> Result<(), TunnelError> {
         let (response, result) = mpsc::channel();
         self.command_tx
+            .as_ref()
+            .ok_or(TunnelError::SupervisorUnavailable)?
             .send(SupervisorCommand::Stop { timeout, response })
             .map_err(|_| TunnelError::SupervisorUnavailable)?;
         match result.recv_timeout(timeout.saturating_add(DEFAULT_STOP_TIMEOUT)) {
@@ -717,7 +773,9 @@ impl RunningTunnel {
                 mpsc::RecvTimeoutError::Timeout => TunnelError::SupervisorTimeout,
                 mpsc::RecvTimeoutError::Disconnected => TunnelError::SupervisorUnavailable,
             })?;
-        self.join_supervisor();
+        if reason.cleanup_complete() {
+            self.join_supervisor();
+        }
         Ok(reason)
     }
 
@@ -730,13 +788,75 @@ impl RunningTunnel {
 
 impl Drop for RunningTunnel {
     fn drop(&mut self) {
-        for _ in 0..3 {
+        for _ in 0..DROP_CLEANUP_ATTEMPTS {
             if self.thread.is_none() || self.stop(DEFAULT_STOP_TIMEOUT).is_ok() {
                 break;
             }
             thread::sleep(SUPERVISOR_POLL);
         }
+        self.command_tx.take();
+        self.join_supervisor();
     }
+}
+
+enum SupervisorCommandState {
+    Command(SupervisorCommand),
+    Idle,
+    Disconnected,
+}
+
+fn next_supervisor_command(
+    command_rx: &Receiver<SupervisorCommand>,
+    wait_for_command: bool,
+) -> SupervisorCommandState {
+    if wait_for_command {
+        return match command_rx.recv() {
+            Ok(command) => SupervisorCommandState::Command(command),
+            Err(_) => SupervisorCommandState::Disconnected,
+        };
+    }
+
+    match command_rx.try_recv() {
+        Ok(command) => SupervisorCommandState::Command(command),
+        Err(mpsc::TryRecvError::Empty) => SupervisorCommandState::Idle,
+        Err(mpsc::TryRecvError::Disconnected) => SupervisorCommandState::Disconnected,
+    }
+}
+
+fn cleanup_resources<P, S>(
+    process: &mut P,
+    peer_session: &mut S,
+    process_done: &mut bool,
+    peer_done: &mut bool,
+    timeout: Duration,
+) -> (Option<String>, Option<String>)
+where
+    P: TunnelProcess,
+    S: PeerSession,
+{
+    let process_error = if *process_done {
+        None
+    } else {
+        match process.stop(timeout) {
+            Ok(()) => {
+                *process_done = true;
+                None
+            }
+            Err(error) => Some(error),
+        }
+    };
+    let peer_error = if *peer_done {
+        None
+    } else {
+        match peer_session.revoke() {
+            Ok(()) => {
+                *peer_done = true;
+                None
+            }
+            Err(error) => Some(error),
+        }
+    };
+    (process_error, peer_error)
 }
 
 fn supervise<P, S>(
@@ -750,56 +870,75 @@ fn supervise<P, S>(
 {
     let mut process_done = false;
     let mut peer_done = false;
+    let mut monitor_failed = false;
 
     loop {
-        if let Ok(SupervisorCommand::Stop { timeout, response }) = command_rx.try_recv() {
-            let process_error = if process_done {
-                None
-            } else {
-                match process.stop(timeout) {
-                    Ok(()) => {
-                        process_done = true;
-                        None
-                    }
-                    Err(error) => Some(error),
-                }
-            };
-            let peer_error = if peer_done {
-                None
-            } else {
-                match peer_session.revoke() {
-                    Ok(()) => {
-                        peer_done = true;
-                        None
-                    }
-                    Err(error) => Some(error),
-                }
-            };
-            if process_done && peer_done {
-                let _ = response.send(Ok(()));
-                let _ = terminal_tx.send(TerminalReason::Stopped);
-                return;
-            }
-            let _ = response.send(Err(TunnelError::Stop {
-                process: process_error,
-                peer_session: peer_error,
-            }));
-            continue;
-        }
-
-        if !process_done {
-            if let Ok(Some(status)) = process.poll_exit(SUPERVISOR_POLL) {
-                process_done = true;
-                if !peer_done && peer_session.revoke().is_ok() {
-                    peer_done = true;
-                }
-                if peer_done {
-                    let _ = terminal_tx.send(TerminalReason::ProcessExited(status.code()));
+        match next_supervisor_command(&command_rx, process_done || monitor_failed) {
+            SupervisorCommandState::Command(SupervisorCommand::Stop { timeout, response }) => {
+                let (process_error, peer_error) = cleanup_resources(
+                    &mut process,
+                    &mut peer_session,
+                    &mut process_done,
+                    &mut peer_done,
+                    timeout,
+                );
+                if process_done && peer_done {
+                    let _ = response.send(Ok(()));
+                    let _ = terminal_tx.send(TerminalReason::Stopped);
                     return;
                 }
+                let _ = response.send(Err(TunnelError::Stop {
+                    process: process_error,
+                    peer_session: peer_error,
+                }));
             }
-        } else {
-            thread::sleep(SUPERVISOR_POLL);
+            SupervisorCommandState::Disconnected => {
+                let (process_cleanup_error, peer_session_cleanup_error) = cleanup_resources(
+                    &mut process,
+                    &mut peer_session,
+                    &mut process_done,
+                    &mut peer_done,
+                    DEFAULT_STOP_TIMEOUT,
+                );
+                let _ = terminal_tx.send(TerminalReason::OwnerDisconnected {
+                    process_cleanup_error,
+                    peer_session_cleanup_error,
+                });
+                return;
+            }
+            SupervisorCommandState::Idle => match process.poll_exit(SUPERVISOR_POLL) {
+                Ok(Some(status)) => {
+                    process_done = true;
+                    if !peer_done && peer_session.revoke().is_ok() {
+                        peer_done = true;
+                    }
+                    if peer_done {
+                        let _ = terminal_tx.send(TerminalReason::ProcessExited(status.code()));
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    monitor_failed = true;
+                    let (process_cleanup_error, peer_session_cleanup_error) = cleanup_resources(
+                        &mut process,
+                        &mut peer_session,
+                        &mut process_done,
+                        &mut peer_done,
+                        DEFAULT_STOP_TIMEOUT,
+                    );
+                    let cleanup_complete =
+                        process_cleanup_error.is_none() && peer_session_cleanup_error.is_none();
+                    let _ = terminal_tx.send(TerminalReason::ProcessMonitorFailed {
+                        error,
+                        process_cleanup_error,
+                        peer_session_cleanup_error,
+                    });
+                    if cleanup_complete {
+                        return;
+                    }
+                }
+            },
         }
     }
 }

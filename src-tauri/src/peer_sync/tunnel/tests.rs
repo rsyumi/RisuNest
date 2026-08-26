@@ -11,6 +11,8 @@ struct FakeState {
     readiness_calls: Vec<(Duration, usize)>,
     stop_timeouts: Vec<Duration>,
     session_revokes: usize,
+    process_drops: usize,
+    peer_session_drops: usize,
 }
 
 struct FakeDiscovery {
@@ -57,7 +59,7 @@ impl TunnelProcessLauncher for FakeLauncher {
 struct FakeProcess {
     state: Arc<Mutex<FakeState>>,
     readiness: Option<Result<TunnelReady, TunnelError>>,
-    exits: VecDeque<Option<i32>>,
+    polls: VecDeque<Result<Option<i32>, String>>,
     stop_results: VecDeque<Result<(), String>>,
 }
 
@@ -76,15 +78,21 @@ impl TunnelProcess for FakeProcess {
     }
 
     fn poll_exit(&mut self, _timeout: Duration) -> Result<Option<ExitStatus>, String> {
-        let Some(code) = self.exits.pop_front().flatten() else {
-            return Ok(None);
-        };
-        Ok(Some(exit_status(code)))
+        self.polls
+            .pop_front()
+            .unwrap_or(Ok(None))
+            .map(|code| code.map(exit_status))
     }
 
     fn stop(&mut self, timeout: Duration) -> Result<(), String> {
         self.state.lock().unwrap().stop_timeouts.push(timeout);
         self.stop_results.pop_front().unwrap_or(Ok(()))
+    }
+}
+
+impl Drop for FakeProcess {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().process_drops += 1;
     }
 }
 
@@ -98,6 +106,12 @@ impl PeerSession for FakePeerSession {
     fn revoke(&mut self) -> Result<(), String> {
         self.state.lock().unwrap().session_revokes += 1;
         self.revoke_results.pop_front().unwrap_or(Ok(()))
+    }
+}
+
+impl Drop for FakePeerSession {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().peer_session_drops += 1;
     }
 }
 
@@ -127,7 +141,7 @@ fn fake_process(
     FakeProcess {
         state: Arc::clone(state),
         readiness: Some(readiness),
-        exits: VecDeque::from([None]),
+        polls: VecDeque::from([Ok(None)]),
         stop_results: VecDeque::new(),
     }
 }
@@ -159,7 +173,7 @@ fn peer(state: &Arc<Mutex<FakeState>>, id: u64) -> FakePeerSession {
     }
 }
 
-fn expect_failure<P, S>(
+fn expect_failure<P: TunnelProcess, S>(
     result: Result<RunningTunnel, TunnelStartFailure<P, S>>,
 ) -> TunnelStartFailure<P, S> {
     match result {
@@ -168,14 +182,16 @@ fn expect_failure<P, S>(
     }
 }
 
-fn expect_running<P, S>(result: Result<RunningTunnel, TunnelStartFailure<P, S>>) -> RunningTunnel {
+fn expect_running<P: TunnelProcess, S>(
+    result: Result<RunningTunnel, TunnelStartFailure<P, S>>,
+) -> RunningTunnel {
     match result {
         Ok(running) => running,
         Err(_) => panic!("expected running tunnel"),
     }
 }
 
-fn expect_peer<P, S>(failure: TunnelStartFailure<P, S>) -> S {
+fn expect_peer<P: TunnelProcess, S>(failure: TunnelStartFailure<P, S>) -> S {
     match failure.into_peer_session() {
         Ok(peer) => peer,
         Err(_) => panic!("expected peer session ownership"),
@@ -326,6 +342,29 @@ fn discovery_rejects_symlinked_path_directories() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn discovery_rejects_reparse_point_path_directories() {
+    use std::os::windows::fs::symlink_dir;
+
+    let root = tempdir().unwrap();
+    let real_bin = root.path().join("real-bin");
+    fs::create_dir(&real_bin).unwrap();
+    make_executable(&real_bin.join(cloudflared_executable_name()));
+    let linked_bin = root.path().join("linked-bin");
+    if let Err(error) = symlink_dir(&real_bin, &linked_bin) {
+        if error.raw_os_error() == Some(1314) {
+            return;
+        }
+        panic!("failed to create reparse fixture: {error}");
+    }
+
+    assert_eq!(
+        discover_in_paths([linked_bin.as_path()], &[root.path().to_owned()]),
+        Err(TunnelError::UntrustedCloudflared)
+    );
+}
+
 #[test]
 fn discovery_failure_returns_peer_session_for_lan_fallback() {
     let state = Arc::new(Mutex::new(FakeState::default()));
@@ -423,6 +462,34 @@ fn failed_start_cleanup_preserves_process_for_retry_before_returning_peer() {
 }
 
 #[test]
+fn dropping_failed_start_retries_child_cleanup_automatically() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let mut process = fake_process(
+        &state,
+        Err(TunnelError::Readiness {
+            reason: "early exit".into(),
+            output: "bounded output".into(),
+        }),
+    );
+    process.stop_results = VecDeque::from([
+        Err("startup stop failed".into()),
+        Err("first drop retry failed".into()),
+        Ok(()),
+    ]);
+    let adapter = adapter(&state, process);
+
+    drop(expect_failure(adapter.start(
+        TunnelMode::Quick,
+        32145,
+        peer(&state, 45),
+    )));
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.stop_timeouts.len(), 3);
+    assert_eq!(state.process_drops, 1);
+}
+
+#[test]
 fn successful_start_exposes_transport_url_separately_from_peer_session() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let process = fake_process(&state, Ok(ready()));
@@ -440,7 +507,7 @@ fn successful_start_exposes_transport_url_separately_from_peer_session() {
 fn natural_process_exit_revokes_peer_session() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let mut process = fake_process(&state, Ok(ready()));
-    process.exits = VecDeque::from([Some(7)]);
+    process.polls = VecDeque::from([Ok(Some(7))]);
     let mut running =
         expect_running(adapter(&state, process).start(TunnelMode::Quick, 32145, peer(&state, 47)));
 
@@ -499,7 +566,7 @@ fn peer_revoke_failure_keeps_supervisor_state_for_retry() {
 fn natural_exit_revoke_failure_can_be_retried_without_restarting_process() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let mut process = fake_process(&state, Ok(ready()));
-    process.exits = VecDeque::from([Some(9)]);
+    process.polls = VecDeque::from([Ok(Some(9))]);
     let mut peer = peer(&state, 50);
     peer.revoke_results = VecDeque::from([Err("revoke failed".into()), Ok(())]);
     let mut running =
@@ -529,6 +596,69 @@ fn drop_retries_cleanup_before_releasing_the_handle() {
 
     let state = state.lock().unwrap();
     assert_eq!(state.stop_timeouts.len(), 3);
+    assert_eq!(state.session_revokes, 1);
+}
+
+#[test]
+fn drop_disconnects_and_rejoins_supervisor_after_bounded_retry_failure() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let mut process = fake_process(&state, Ok(ready()));
+    process.stop_results = VecDeque::from([
+        Err("stop failed 1".into()),
+        Err("stop failed 2".into()),
+        Err("stop failed 3".into()),
+        Err("disconnect cleanup failed".into()),
+    ]);
+    let mut peer = peer(&state, 52);
+    peer.revoke_results = VecDeque::from([
+        Err("revoke failed 1".into()),
+        Err("revoke failed 2".into()),
+        Err("revoke failed 3".into()),
+        Err("disconnect cleanup failed".into()),
+    ]);
+    let running = expect_running(adapter(&state, process).start(TunnelMode::Quick, 32145, peer));
+
+    drop(running);
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.stop_timeouts.len(), 4);
+    assert_eq!(state.session_revokes, 4);
+    assert_eq!(state.process_drops, 1);
+    assert_eq!(state.peer_session_drops, 1);
+}
+
+#[test]
+fn poll_error_stops_process_and_revokes_peer_before_reporting_terminal_reason() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let mut process = fake_process(&state, Ok(ready()));
+    process.polls = VecDeque::from([Err("wait failed".into())]);
+    process.stop_results = VecDeque::from([Err("monitor cleanup timed out".into()), Ok(())]);
+    let mut running =
+        expect_running(adapter(&state, process).start(TunnelMode::Quick, 32145, peer(&state, 53)));
+
+    let terminal = running.wait_terminal(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(
+        terminal,
+        TerminalReason::ProcessMonitorFailed {
+            error: "wait failed".into(),
+            process_cleanup_error: Some("monitor cleanup timed out".into()),
+            peer_session_cleanup_error: None,
+        }
+    );
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.stop_timeouts, [DEFAULT_STOP_TIMEOUT]);
+        assert_eq!(state.session_revokes, 1);
+    }
+
+    running.stop(Duration::from_millis(20)).unwrap();
+
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.stop_timeouts,
+        [DEFAULT_STOP_TIMEOUT, Duration::from_millis(20)]
+    );
     assert_eq!(state.session_revokes, 1);
 }
 
