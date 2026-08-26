@@ -4011,6 +4011,184 @@ fn snapshots_create_list_and_restore_on_reopen() {
 }
 
 #[test]
+fn snapshot_creation_persists_asset_roots_before_returning() {
+    let (directory, store, _) = open_fixture();
+    let generation = super::active_generation(&store.connection).expect("read active generation");
+    let manifest_hash = "a".repeat(64);
+    let object_hash = "b".repeat(64);
+    store
+        .connection
+        .execute(
+            "UPDATE root SET value = ?2 WHERE generation = ?1",
+            rusqlite::params![
+                generation,
+                serde_json::to_string(&json!({
+                    "asset": "assets/exact.bin",
+                    "inlay": "{{inlay::kept-inlay}}",
+                    "coldStoragedChats": ["cold-chat"]
+                }))
+                .unwrap()
+            ],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height
+             ) VALUES (?1, 'assets/missing.bin', NULL, 'asset', 0,
+                'application/octet-stream', 'missing', 'bin', NULL, NULL, NULL)",
+            [&generation],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height
+             ) VALUES (?1, 'assets/exact.bin', ?2, 'asset', 1,
+                'application/octet-stream', 'exact', 'bin', NULL, NULL, NULL)",
+            rusqlite::params![generation, object_hash],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+             ) VALUES (?1, 'root-module-assets', 'module-1', 1, ?2, 1)",
+            rusqlite::params![generation, manifest_hash],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
+             VALUES (?1, 'opaque', 2, 0, '{}')",
+            [generation],
+        )
+        .unwrap();
+
+    let snapshot = store.snapshot_create("asset-roots").unwrap();
+    let sidecar = crate::asset_repository::migration_gc::read_snapshot_asset_root_sidecar(
+        Path::new(&snapshot.path),
+    )
+    .expect("read snapshot asset-root sidecar");
+
+    assert_eq!(sidecar.revision, 1);
+    assert_eq!(sidecar.roots.manifest_hashes, [manifest_hash].into());
+    assert_eq!(sidecar.roots.object_hashes, [object_hash].into());
+    assert_eq!(
+        sidecar.roots.legacy_asset_keys,
+        [
+            "assets/exact.bin".to_owned(),
+            "assets/missing.bin".to_owned()
+        ]
+        .into()
+    );
+    assert_eq!(sidecar.roots.inlay_ids, ["kept-inlay".to_owned()].into());
+    assert_eq!(sidecar.roots.cold_keys, ["cold-chat".to_owned()].into());
+    assert_eq!(
+        sidecar.roots.blockers,
+        [
+            "cold-payload-unscanned".to_owned(),
+            "plugin-storage-opaque".to_owned()
+        ]
+        .into()
+    );
+    assert!(
+        crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(Path::new(
+            &snapshot.path
+        ))
+        .is_file()
+    );
+    drop(directory);
+}
+
+#[test]
+fn asset_gc_dry_run_keeps_leased_generation_roots_until_release() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+    let original_payload = cas.prepare_bytes(b"original").unwrap();
+    let replacement_payload = cas.prepare_bytes(b"replacement").unwrap();
+    let collectable_payload = cas.prepare_bytes(b"collectable").unwrap();
+    let original = AssetAlias {
+        key: "assets/leased.bin".to_owned(),
+        object_hash: Some(original_payload.content_hash.clone()),
+        kind: "asset".to_owned(),
+        size: original_payload.byte_size as i64,
+        mime: "application/octet-stream".to_owned(),
+        name: "Leased".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+    };
+    let first = store.commit_asset_alias(&original, 0).unwrap();
+    let lease = store.acquire_revision(first.revision).unwrap();
+    let replacement = AssetAlias {
+        object_hash: Some(replacement_payload.content_hash.clone()),
+        size: replacement_payload.byte_size as i64,
+        ..original
+    };
+    store
+        .commit_asset_alias(&replacement, first.revision)
+        .unwrap();
+    let candidates = [
+        crate::asset_repository::migration_gc::AssetGcCandidate {
+            object_hash: original_payload.content_hash.clone(),
+            byte_size: original_payload.byte_size,
+            created_at_ms: 0,
+        },
+        crate::asset_repository::migration_gc::AssetGcCandidate {
+            object_hash: replacement_payload.content_hash.clone(),
+            byte_size: replacement_payload.byte_size,
+            created_at_ms: 0,
+        },
+        crate::asset_repository::migration_gc::AssetGcCandidate {
+            object_hash: collectable_payload.content_hash.clone(),
+            byte_size: collectable_payload.byte_size,
+            created_at_ms: 0,
+        },
+    ];
+
+    let leased = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    assert!(leased
+        .marked_hashes
+        .contains(&original_payload.content_hash));
+    assert!(leased
+        .marked_hashes
+        .contains(&replacement_payload.content_hash));
+    assert_eq!(
+        leased.potential_delete_hashes,
+        vec![collectable_payload.content_hash.clone()]
+    );
+
+    store.release_revision(&lease.lease).unwrap();
+    let released = store.asset_gc_dry_run(&candidates, 100, 10).unwrap();
+    assert_eq!(
+        released.marked_hashes,
+        vec![replacement_payload.content_hash]
+    );
+    assert_eq!(
+        released
+            .potential_delete_hashes
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            collectable_payload.content_hash,
+            original_payload.content_hash
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(!released.deletion_enabled);
+}
+
+#[test]
 fn checkpoints_accept_both_documented_modes() {
     let (_directory, store, _) = open_fixture();
 
@@ -4063,7 +4241,17 @@ fn ninth_snapshot_removes_the_oldest_and_leaves_eight() {
     let listed = store.snapshot_list().expect("list rotated snapshots");
     assert_eq!(listed.len(), 8);
     assert!(!Path::new(&created[0]).exists());
+    assert!(
+        !crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(Path::new(
+            &created[0]
+        ))
+        .exists()
+    );
     assert!(created[1..].iter().all(|path| Path::new(path).is_file()));
+    assert!(created[1..].iter().all(|path| {
+        crate::asset_repository::migration_gc::snapshot_asset_root_sidecar_path(Path::new(path))
+            .is_file()
+    }));
 }
 
 #[test]

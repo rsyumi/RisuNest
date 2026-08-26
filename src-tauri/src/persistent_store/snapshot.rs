@@ -2,6 +2,9 @@ use super::{
     active_generation, current_revision, CheckpointMode, LeaseResult, SnapshotCreated,
     SnapshotInfo, StoreError, StoreResult, GENERATION_TABLES,
 };
+use crate::asset_repository::migration_gc::{
+    snapshot_asset_root_sidecar_path, write_snapshot_asset_root_sidecar, AssetRootSet,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -237,6 +240,18 @@ pub(super) fn create(
     let path = snapshots_dir.join(format!("persistent-{stamp}-{reason}-{}.db", Uuid::new_v4()));
     let started = Instant::now();
     connection.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()])?;
+    let sidecar_result = (|| -> StoreResult<()> {
+        let snapshot_connection = Connection::open(&path)?;
+        let revision = current_revision(&snapshot_connection)?;
+        let roots = collect_asset_roots(&snapshot_connection)?;
+        write_snapshot_asset_root_sidecar(&path, revision, &roots)?;
+        Ok(())
+    })();
+    if let Err(error) = sidecar_result {
+        let _ = fs::remove_file(snapshot_asset_root_sidecar_path(&path));
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
     let metadata = fs::metadata(&path)?;
     let created = SnapshotCreated {
         path: path.to_string_lossy().into_owned(),
@@ -370,10 +385,156 @@ fn rotate(
             break;
         };
         let snapshot = snapshots.remove(index);
-        fs::remove_file(&snapshot.path)?;
+        remove_snapshot_with_sidecar(Path::new(&snapshot.path))?;
         total = total.saturating_sub(snapshot.bytes);
     }
     Ok(())
+}
+
+fn remove_snapshot_with_sidecar(snapshot_path: &Path) -> StoreResult<()> {
+    remove_file_if_exists(&snapshot_asset_root_sidecar_path(snapshot_path))?;
+    remove_file_if_exists(snapshot_path)
+}
+
+pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetRootSet> {
+    let mut roots = AssetRootSet::default();
+
+    scan_optional_hash_column(
+        connection,
+        "SELECT manifest_hash FROM asset_owner_heads WHERE present = 1",
+        &mut roots.manifest_hashes,
+    )?;
+    scan_asset_alias_roots(connection, &mut roots)?;
+
+    for query in [
+        "SELECT value FROM root",
+        "SELECT value FROM bot_presets",
+        "SELECT detail FROM characters",
+        "SELECT detail FROM conversations",
+        "SELECT value FROM messages",
+    ] {
+        scan_json_column(connection, query, &mut roots)?;
+    }
+    for query in [
+        "SELECT image FROM bot_presets WHERE image IS NOT NULL",
+        "SELECT image FROM characters WHERE image IS NOT NULL",
+    ] {
+        scan_text_column(connection, query, &mut roots)?;
+    }
+    let plugin_rows: i64 =
+        connection.query_row("SELECT COUNT(*) FROM plugin_storage", [], |row| row.get(0))?;
+    if plugin_rows > 0 {
+        roots.blockers.insert("plugin-storage-opaque".to_owned());
+    }
+    if !roots.cold_keys.is_empty() {
+        roots.blockers.insert("cold-payload-unscanned".to_owned());
+    }
+    Ok(roots)
+}
+
+fn scan_optional_hash_column(
+    connection: &Connection,
+    query: &str,
+    target: &mut std::collections::BTreeSet<String>,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(query)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let value: Option<String> = row.get(0)?;
+        if let Some(value) = value {
+            target.insert(value);
+        }
+    }
+    Ok(())
+}
+
+fn scan_asset_alias_roots(connection: &Connection, roots: &mut AssetRootSet) -> StoreResult<()> {
+    let mut statement = connection.prepare("SELECT logical_key, object_hash FROM asset_aliases")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let logical_key: String = row.get(0)?;
+        let object_hash: Option<String> = row.get(1)?;
+        if let Some(object_hash) = object_hash {
+            roots.object_hashes.insert(object_hash);
+        } else {
+            roots.legacy_asset_keys.insert(logical_key);
+        }
+    }
+    Ok(())
+}
+
+fn scan_json_column(
+    connection: &Connection,
+    query: &str,
+    roots: &mut AssetRootSet,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(query)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let encoded: String = row.get(0)?;
+        let value: serde_json::Value = serde_json::from_str(&encoded)?;
+        observe_json_value(&value, None, roots);
+    }
+    Ok(())
+}
+
+fn scan_text_column(
+    connection: &Connection,
+    query: &str,
+    roots: &mut AssetRootSet,
+) -> StoreResult<()> {
+    let mut statement = connection.prepare(query)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let value: String = row.get(0)?;
+        observe_text(&value, roots);
+    }
+    Ok(())
+}
+
+fn observe_json_value(
+    value: &serde_json::Value,
+    parent_key: Option<&str>,
+    roots: &mut AssetRootSet,
+) {
+    match value {
+        serde_json::Value::String(value) => {
+            observe_text(value, roots);
+            if parent_key == Some("coldstorage") && !value.is_empty() {
+                roots.cold_keys.insert(value.clone());
+            } else if parent_key == Some("coldStoragedChats") {
+                roots.cold_keys.insert(value.clone());
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                observe_json_value(value, parent_key, roots);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                observe_json_value(value, Some(key), roots);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn observe_text(value: &str, roots: &mut AssetRootSet) {
+    if value.starts_with("assets/") {
+        roots.legacy_asset_keys.insert(value.to_owned());
+    }
+    for prefix in ["{{inlay::", "{{inlayed::", "{{inlayeddata::"] {
+        let mut remainder = value;
+        while let Some(start) = remainder.find(prefix) {
+            remainder = &remainder[start + prefix.len()..];
+            let Some(end) = remainder.find("}}") else {
+                break;
+            };
+            roots.inlay_ids.insert(remainder[..end].to_owned());
+            remainder = &remainder[end + 2..];
+        }
+    }
 }
 
 fn validate_restore_database(path: &Path) -> StoreResult<()> {

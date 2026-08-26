@@ -946,6 +946,43 @@ impl PersistentStore {
         snapshot::restore_request(&self.snapshots_dir, path)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn asset_gc_dry_run(
+        &self,
+        candidates: &[crate::asset_repository::migration_gc::AssetGcCandidate],
+        now_ms: i64,
+        minimum_grace_ms: i64,
+    ) -> StoreResult<crate::asset_repository::migration_gc::AssetGcDryRunReport> {
+        use crate::asset_repository::migration_gc::{
+            collect_staged_migration_roots, dry_run_mark_and_sweep,
+            read_snapshot_asset_root_sidecar,
+        };
+
+        let persistent_dir = self
+            .snapshots_dir
+            .parent()
+            .ok_or_else(|| StoreError::Store {
+                message: "persistent snapshots directory has no parent".to_owned(),
+            })?;
+        let repository_root = persistent_dir.parent().ok_or_else(|| StoreError::Store {
+            message: "persistent directory has no repository root".to_owned(),
+        })?;
+        let mut roots = vec![snapshot::collect_asset_roots(&self.connection)?];
+        for snapshot in snapshot::list(&self.snapshots_dir)? {
+            roots.push(read_snapshot_asset_root_sidecar(Path::new(&snapshot.path))?.roots);
+        }
+        roots.extend(collect_staged_migration_roots(repository_root)?);
+        let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
+        dry_run_mark_and_sweep(
+            &cas,
+            candidates.iter().cloned(),
+            roots,
+            now_ms,
+            minimum_grace_ms,
+        )
+        .map_err(StoreError::from)
+    }
+
     pub(crate) fn get_app_kv(&self, key: &str) -> StoreResult<Option<Value>> {
         let value: Option<String> = self
             .connection
