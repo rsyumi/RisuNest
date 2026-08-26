@@ -347,6 +347,84 @@ describe('sendChat generation session integration', () => {
         ])
     })
 
+    it('does not append after character navigation while the model request is pending', async () => {
+        const second = makeCharacter(makeChat(), 'character-b')
+        const { chat, session } = installDatabase(makeChat(), [second])
+        const response = deferred<any>()
+        mocks.modelResponse = response.promise
+
+        const sending = sendChat()
+        while (mocks.modelRequestCount === 0) {
+            await Promise.resolve()
+        }
+        selectedCharID.set(1)
+        response.resolve(streamingResponse('late answer'))
+
+        await expect(sending).resolves.toBe(false)
+        expect(chat.message).toEqual([expect.objectContaining({
+            chatId: 'user-message',
+            data: 'hello',
+        })])
+        expect(second.chats[0].message).toEqual([expect.objectContaining({
+            chatId: 'user-message',
+            data: 'hello',
+        })])
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
+    it('does not append after the selected chat object is replaced while the model request is pending', async () => {
+        const { chat, currentCharacter, session } = installDatabase()
+        const response = deferred<any>()
+        mocks.modelResponse = response.promise
+        const replacement = makeChat([{
+            role: 'user',
+            data: 'replacement prompt',
+            chatId: 'replacement-message',
+        }])
+
+        const sending = sendChat()
+        while (mocks.modelRequestCount === 0) {
+            await Promise.resolve()
+        }
+        currentCharacter.chats[0] = replacement
+        response.resolve(streamingResponse('late answer'))
+
+        await expect(sending).resolves.toBe(false)
+        expect(chat.message).toEqual([expect.objectContaining({
+            chatId: 'user-message',
+            data: 'hello',
+        })])
+        expect(replacement.message).toEqual([expect.objectContaining({
+            chatId: 'replacement-message',
+            data: 'replacement prompt',
+        })])
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
+    it('does not append after the active session version changes while the model request is pending', async () => {
+        const { chat, session } = installDatabase()
+        const response = deferred<any>()
+        mocks.modelResponse = response.promise
+
+        const sending = sendChat()
+        while (mocks.modelRequestCount === 0) {
+            await Promise.resolve()
+        }
+        session.append({
+            role: 'user',
+            data: 'concurrent prompt',
+            chatId: 'concurrent-message',
+        })
+        response.resolve(streamingResponse('late answer'))
+
+        await expect(sending).resolves.toBe(false)
+        expect(chat.message).toEqual([
+            expect.objectContaining({ chatId: 'user-message', data: 'hello' }),
+            expect.objectContaining({ chatId: 'concurrent-message', data: 'concurrent prompt' }),
+        ])
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
     it.each(['append', 'edit', 'delete'] as const)(
         'fails closed when the same session performs an %s while the output trigger is pending',
         async (mutation) => {

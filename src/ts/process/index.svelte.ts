@@ -1546,6 +1546,26 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return true
     }
 
+    const requestSourceCharacterIndex = selectedChar
+    const requestSourceCharacter = nowChatroom
+    const requestSourceCharacterId = requestSourceCharacter.chaId
+    const requestSourceChatPage = selectedChat
+    const requestSourceConversation = requestSourceCharacter.chats[requestSourceChatPage]
+    const requestSourceMessages = requestSourceConversation.message
+    const requestSourceSession = getActiveConversationSession()
+    const requestSourceSessionVersion = requestSourceSession?.version
+    const isRequestSourceCurrent = () => get(selectedCharID) === requestSourceCharacterIndex
+        && DBState.db.characters[requestSourceCharacterIndex] === requestSourceCharacter
+        && requestSourceCharacter.chaId === requestSourceCharacterId
+        && requestSourceCharacter.chatPage === requestSourceChatPage
+        && requestSourceCharacter.chats[requestSourceChatPage] === requestSourceConversation
+        && requestSourceConversation.message === requestSourceMessages
+        && getActiveConversationSession() === requestSourceSession
+        && (requestSourceSession === null || (
+            requestSourceSession.isActive
+            && requestSourceSession.version === requestSourceSessionVersion
+            && requestSourceSession.materializeCompatibilityArray() === requestSourceMessages
+        ))
     const req = await requestChatData({
         formated: formated,
         biasString: biases,
@@ -1560,6 +1580,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         escape: nowChatroom.type === 'character' && nowChatroom.escapeOutput,
         rememberToolUsage: DBState.db.rememberToolUsage,
     }, 'model', abortSignal)
+    if(!isRequestSourceCurrent()){
+        return false
+    }
 
     console.log(req)
     if(req.model){
@@ -1574,7 +1597,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     let outputTarget: GenerationConversationOperation | null = null
     let generationHadOperation = false
-    const generationCharacter = nowChatroom
+    const generationCharacter = requestSourceCharacter
     const getGenerationChat = () => DBState.db.characters[selectedChar]?.chats[selectedChat]
     const isGenerationOwnerCurrent = () => get(selectedCharID) === selectedChar
         && DBState.db.characters[selectedChar] === generationCharacter

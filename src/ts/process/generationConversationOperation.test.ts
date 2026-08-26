@@ -158,6 +158,22 @@ describe('generation conversation operation', () => {
         operation.release()
     })
 
+    it('does not append when the requested owner is already stale', () => {
+        const harness = createHarness([message('user prompt', 'user-1')])
+
+        expect(() => captureGenerationConversationOperation({
+            session: harness.session,
+            getCurrentSession: () => harness.session,
+            chat: harness.chat,
+            getCurrentChat: () => harness.chat,
+            isOwnerCurrent: () => false,
+            append: message('', 'generation-1'),
+        })).toThrow('Generation operation owner is no longer current')
+
+        expect(harness.chat.message).toEqual([message('user prompt', 'user-1')])
+        expect(harness.session?.pinCount('transaction')).toBe(0)
+    })
+
     it('uses operation ownership for exact streaming action and commit order', async () => {
         const harness = createHarness([message('user prompt', 'user-1')])
         const operation = harness.capture({ append: message('', 'generation-1') })

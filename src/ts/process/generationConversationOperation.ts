@@ -41,6 +41,9 @@ export function captureGenerationConversationOperation(
     if (!hasExactlyOneTarget(options)) {
         throw new TypeError('Generation operation requires exactly one target mode')
     }
+    if (options.append !== undefined && options.isOwnerCurrent?.() === false) {
+        throw new RangeError('Generation operation owner is no longer current')
+    }
 
     const session = options.session
     const usesSession = session !== null
