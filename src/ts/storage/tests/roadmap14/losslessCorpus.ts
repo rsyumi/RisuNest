@@ -575,6 +575,53 @@ export const roadmap14Payloads: Roadmap14Payload[] = [
     },
 ]
 
+export interface Roadmap14CardFixture {
+    id: string
+    characterId: string
+    moduleId: unknown
+    personaId: string
+    folderId: string
+    assetKeys: [string, string, string][]
+    relatedCardIds: string[]
+    metadata: unknown
+}
+
+export const roadmap14Cards: Roadmap14CardFixture[] = [
+    {
+        id: 'card-main',
+        characterId: 'character-main',
+        moduleId: 'module-main',
+        personaId: 'persona-main',
+        folderId: 'folder-main',
+        assetKeys: [
+            ['Shared card asset', 'assets/shared/shared.bin', 'bin'],
+            ['Shared card asset duplicate', 'assets/shared/shared.bin', 'bin'],
+        ],
+        relatedCardIds: ['card-secondary', 'card-secondary', 'card-known-missing'],
+        metadata: { unknown: { inlay: '{{inlay::inlay-video}}' } },
+    },
+    {
+        id: 'card-secondary',
+        characterId: 'group-main',
+        moduleId: '',
+        personaId: 'persona-secondary',
+        folderId: 'folder-main',
+        assetKeys: [['Card payload', 'assets/cards/card-main.avif', 'avif']],
+        relatedCardIds: [],
+        metadata: { emptyObject: {}, emptyArray: [], falseValue: false },
+    },
+]
+
+export const roadmap14ExpectedMissing = {
+    asset: [
+        'assets/missing/known-missing.dat',
+        'assets/missing/module.dat',
+    ],
+    inlay: ['inlay-known-missing'],
+    character: ['character-known-missing'],
+    card: ['card-known-missing'],
+} as const
+
 export const roadmap14Corpus = {
     version: 1,
     database,
