@@ -1,4 +1,7 @@
-use super::{PeerSyncError, PreparedCloneSession};
+use super::{
+    protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
+    PeerSyncError, PreparedCloneSession,
+};
 use crate::asset_repository::PayloadCas;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -35,12 +38,17 @@ pub struct LanCloneClient {
 
 impl LanCloneClient {
     pub fn claim(endpoint: &str, session_id: &str, claim: &str) -> Result<Self, PeerSyncError> {
-        if endpoint.len() > MAX_URL_BYTES || session_id.len() > 64 || claim.len() != 64 {
+        if endpoint.len() > MAX_URL_BYTES
+            || uuid::Uuid::parse_str(session_id)
+                .map(|value| value.to_string() != session_id)
+                .unwrap_or(true)
+            || !is_lower_hex_256(claim)
+        {
             return Err(PeerSyncError::Protocol(
                 "invalid LAN pairing data".to_owned(),
             ));
         }
-        let endpoint = endpoint.trim_end_matches('/');
+        let endpoint = validate_lan_endpoint(endpoint)?;
         let session_url = format!("{endpoint}/v1/sessions/{session_id}");
         if session_url.len() > MAX_URL_BYTES {
             return Err(PeerSyncError::Protocol(
@@ -48,6 +56,8 @@ impl LanCloneClient {
             ));
         }
         let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()
@@ -86,7 +96,12 @@ impl LanCloneClient {
         &self.session_url
     }
 
-    pub fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
+    pub fn fetch_manifest(&self, expected_manifest_id: &str) -> Result<Vec<u8>, PeerSyncError> {
+        if !is_lower_hex_256(expected_manifest_id) {
+            return Err(PeerSyncError::Protocol(
+                "invalid LAN manifest identity".to_owned(),
+            ));
+        }
         let response = self
             .authenticated(self.client.get(format!("{}/manifest", self.session_url)))
             .send()
@@ -97,13 +112,35 @@ impl LanCloneClient {
                 response.status()
             )));
         }
-        let bytes = response.bytes().map_err(transport)?;
-        if bytes.len() > 8 * 1024 * 1024 {
+        if response.content_length().unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES as u64 {
             return Err(PeerSyncError::Protocol(
                 "LAN manifest is too large".to_owned(),
             ));
         }
-        Ok(bytes.to_vec())
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| PeerSyncError::Protocol("LAN manifest ETag is missing".to_owned()))?;
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(transport)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "LAN manifest is too large".to_owned(),
+            ));
+        }
+        let received = sha256_hex(&bytes);
+        if received != expected_manifest_id || etag != quoted(expected_manifest_id) {
+            return Err(PeerSyncError::StaleManifest {
+                expected: expected_manifest_id.to_owned(),
+                received,
+            });
+        }
+        Ok(bytes)
     }
 
     pub fn head_object(&self, object: &str) -> Result<u64, PeerSyncError> {
@@ -120,6 +157,16 @@ impl LanCloneClient {
                 "HTTP {}",
                 response.status()
             )));
+        }
+        if response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            != Some(quoted(object).as_str())
+        {
+            return Err(PeerSyncError::Protocol(
+                "LAN object ETag does not match its identity".to_owned(),
+            ));
         }
         response
             .headers()
@@ -138,6 +185,11 @@ impl LanCloneClient {
         end: u64,
     ) -> Result<Vec<u8>, PeerSyncError> {
         validate_object_hash(object)?;
+        let expected_size = end
+            .checked_sub(start)
+            .and_then(|size| size.checked_add(1))
+            .filter(|size| *size <= CLONE_CHUNK_SIZE)
+            .ok_or_else(|| PeerSyncError::Protocol("invalid LAN range".to_owned()))?;
         let response = self
             .authenticated(
                 self.client
@@ -152,18 +204,34 @@ impl LanCloneClient {
                 response.status()
             )));
         }
-        let bytes = response.bytes().map_err(transport)?;
-        if bytes.len() as u64
-            != end
-                .checked_sub(start)
-                .and_then(|size| size.checked_add(1))
-                .ok_or_else(|| PeerSyncError::Protocol("invalid LAN range".to_owned()))?
+        let expected_etag = quoted(object);
+        let expected_range_prefix = format!("bytes {start}-{end}/");
+        if response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            != Some(expected_etag.as_str())
+            || !response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with(&expected_range_prefix))
         {
+            return Err(PeerSyncError::Protocol(
+                "LAN range response headers are invalid".to_owned(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(expected_size + 1)
+            .read_to_end(&mut bytes)
+            .map_err(transport)?;
+        if bytes.len() as u64 != expected_size {
             return Err(PeerSyncError::Protocol(
                 "LAN range body length is invalid".to_owned(),
             ));
         }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     pub fn report_progress(
@@ -329,6 +397,8 @@ impl LanCloneHost {
                 .join()
                 .map_err(|_| PeerSyncError::Transport("LAN server thread panicked".to_owned()))??;
         }
+        *self.shared.claim.lock().unwrap() = None;
+        self.shared.devices.lock().unwrap().clear();
         self.address = None;
         self.stopped = None;
         Ok(())
@@ -632,13 +702,47 @@ struct ProgressRequest {
 }
 
 fn validate_object_hash(object: &str) -> Result<(), PeerSyncError> {
-    if object.len() == 64 && object.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if is_lower_hex_256(object) {
         Ok(())
     } else {
         Err(PeerSyncError::Protocol(
             "invalid LAN object hash".to_owned(),
         ))
     }
+}
+
+fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))?;
+    let valid_ip = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_none()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !valid_ip
+    {
+        return Err(PeerSyncError::Protocol("invalid LAN endpoint".to_owned()));
+    }
+    let host = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+        _ => unreachable!(),
+    };
+    Ok(format!("http://{host}:{}", url.port().unwrap()))
+}
+
+fn is_lower_hex_256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn random_secret() -> Result<[u8; 32], PeerSyncError> {

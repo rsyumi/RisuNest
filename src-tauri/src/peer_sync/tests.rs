@@ -437,7 +437,8 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     );
     host.stop().unwrap();
 
-    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let second_session_root = tempfile::tempdir().unwrap();
+    let mut host = LanCloneHost::prepare(prepare(&source, second_session_root.path()));
     let pairing = host.start().unwrap();
     let base = format!("http://127.0.0.1:{}", host.address().unwrap().port());
     let claim_url = format!("{base}/v1/sessions/{}/claim", pairing.session_id);
@@ -524,6 +525,23 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
         403
     );
     host.stop().unwrap();
+
+    let restarted = host.start().unwrap();
+    let restarted_manifest_url = format!(
+        "http://127.0.0.1:{}/v1/sessions/{}/manifest",
+        host.address().unwrap().port(),
+        restarted.session_id,
+    );
+    assert_eq!(
+        client
+            .get(&restarted_manifest_url)
+            .bearer_auth(bearer)
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    host.stop().unwrap();
 }
 
 #[test]
@@ -534,6 +552,14 @@ fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_re
     let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
     let pairing = host.start().unwrap();
     let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    assert!(matches!(
+        LanCloneClient::claim(
+            "http://example.com:43123",
+            &pairing.session_id,
+            &pairing.claim,
+        ),
+        Err(PeerSyncError::Protocol(_))
+    ));
     let client = LanCloneClient::claim(&endpoint, &pairing.session_id, &pairing.claim).unwrap();
     assert!(!client.session_url().contains(&pairing.claim));
     fs::write(
@@ -541,7 +567,11 @@ fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_re
         b"mutated-after-start",
     )
     .unwrap();
-    let manifest = client.fetch_manifest().unwrap();
+    assert!(matches!(
+        client.fetch_manifest(&"f".repeat(64)),
+        Err(PeerSyncError::StaleManifest { .. })
+    ));
+    let manifest = client.fetch_manifest(&pairing.manifest_id).unwrap();
     assert_eq!(manifest, host.manifest().canonical_bytes().unwrap());
     let object = host.manifest().payloads[0].object.clone();
     assert_eq!(client.head_object(&object).unwrap(), 64);
