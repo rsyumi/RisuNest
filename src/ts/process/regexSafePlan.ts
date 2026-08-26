@@ -53,6 +53,7 @@ class UnsafeRegexError extends Error {
 
 const parser = new RegExpParser({ ecmaVersion: 2025 })
 const allowedFlags = new Set(['g', 'u', 'gu', 'ug'])
+const regexNestLimit = 250
 const utf8Encoder = new TextEncoder()
 const escapedAsciiPunctuation = new Set(
     Array.from('!"#$%&\'()*+,-./:;<=>?@[\\]^`{|}~'),
@@ -125,6 +126,7 @@ function lowerAlternatives(
     alternatives: AST.Alternative[],
     state: LoweringState,
     insideQuantifier: boolean,
+    depth: number,
 ): RegexSafeAlternative[] {
     return alternatives.map((alternative) => {
         if (alternative.elements.length === 0) {
@@ -132,7 +134,7 @@ function lowerAlternatives(
         }
         return {
             atoms: alternative.elements.map((element) => (
-                lowerElement(element, state, insideQuantifier)
+                lowerElement(element, state, insideQuantifier, depth)
             )),
         }
     })
@@ -142,15 +144,22 @@ function lowerGroup(
     group: AST.Group | AST.CapturingGroup,
     state: LoweringState,
     insideQuantifier: boolean,
+    depth: number,
 ): RegexSafeAtom {
+    if (depth >= regexNestLimit) {
+        throw new UnsafeRegexError('regex_safe_nest_limit')
+    }
     if (group.type === 'Group' && group.modifiers !== null) {
         throw new UnsafeRegexError('regex_safe_inline_modifier')
     }
     if (group.type === 'CapturingGroup' && group.name !== null) {
         throw new UnsafeRegexError('regex_safe_named_capture')
     }
+    if (group.type === 'CapturingGroup' && insideQuantifier) {
+        throw new UnsafeRegexError('regex_safe_capture_under_repeat')
+    }
     const index = group.type === 'CapturingGroup' ? ++state.captureCount : undefined
-    const alternatives = lowerAlternatives(group.alternatives, state, insideQuantifier)
+    const alternatives = lowerAlternatives(group.alternatives, state, insideQuantifier, depth + 1)
     if (alternatives.some(alternativeIsNullable)) {
         throw new UnsafeRegexError('regex_safe_nullable_group')
     }
@@ -164,6 +173,7 @@ function lowerElement(
     element: AST.Element,
     state: LoweringState,
     insideQuantifier: boolean,
+    depth: number,
 ): RegexSafeAtom {
     switch (element.type) {
         case 'Character':
@@ -172,10 +182,11 @@ function lowerElement(
             return lowerClass(element)
         case 'Group':
         case 'CapturingGroup':
-            return lowerGroup(element, state, insideQuantifier)
+            return lowerGroup(element, state, insideQuantifier, depth)
         case 'Quantifier': {
             if (
                 insideQuantifier
+                || depth >= regexNestLimit
                 || !element.greedy
                 || !Number.isFinite(element.max)
                 || element.min < 0
@@ -184,7 +195,7 @@ function lowerElement(
             ) {
                 throw new UnsafeRegexError('regex_safe_quantifier')
             }
-            const atom = lowerElement(element.element, state, true)
+            const atom = lowerElement(element.element, state, true, depth + 1)
             return { kind: 'repeat', min: element.min, max: element.max, atom }
         }
         default:
@@ -208,6 +219,23 @@ function pushLiteral(tokens: RegexReplacementToken[], value: string): void {
 function isAsciiSource(value: string): boolean {
     for (let index = 0; index < value.length; index++) {
         if (value.charCodeAt(index) > 0x7f) {
+            return false
+        }
+    }
+    return true
+}
+
+function isWellFormedUtf16(value: string): boolean {
+    for (let index = 0; index < value.length; index++) {
+        const unit = value.charCodeAt(index)
+        if (unit >= 0xd800 && unit <= 0xdbff) {
+            const next = value.charCodeAt(index + 1)
+            if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) {
+                return false
+            }
+            index++
+        }
+        else if (unit >= 0xdc00 && unit <= 0xdfff) {
             return false
         }
     }
@@ -292,7 +320,7 @@ function lowerEntry(entry: RegexExecutionPlanEntry): RegexSafePlanEntry {
         { unicode: entry.flags.includes('u'), unicodeSets: false },
     )
     const state: LoweringState = { captureCount: 0 }
-    const alternatives = lowerAlternatives(ast.alternatives, state, false)
+    const alternatives = lowerAlternatives(ast.alternatives, state, false, 0)
     if (alternatives.some(alternativeIsNullable)) {
         throw new UnsafeRegexError('regex_safe_nullable_pattern')
     }
@@ -314,6 +342,9 @@ export function classifyRegexSafePlan(
     executionPlan: RegexExecutionPlan,
     input: string,
 ): RegexSafePlanClassification {
+    if (!isWellFormedUtf16(input)) {
+        return { accepted: false, category: 'regex_safe_input_utf16' }
+    }
     if (utf8Encoder.encode(input).byteLength > 1_048_576) {
         return { accepted: false, category: 'regex_safe_input_limit' }
     }
@@ -328,6 +359,13 @@ export function classifyRegexSafePlan(
     let patternBytes = 0
     let replacementBytes = 0
     for (const entry of executionPlan.entries) {
+        if (!isWellFormedUtf16(entry.replacement)) {
+            return {
+                accepted: false,
+                category: 'regex_safe_replacement_utf16',
+                sourceIndex: entry.sourceIndex,
+            }
+        }
         if (entry.compileError !== undefined) {
             return {
                 accepted: false,

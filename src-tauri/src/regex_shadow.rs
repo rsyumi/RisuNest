@@ -1,8 +1,10 @@
-use regex::{Captures, Regex};
+use regex::{Captures, Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+const REGEX_NEST_LIMIT: usize = 250;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +108,13 @@ struct RegexShadowFailure(&'static str);
 struct ExecutionControl<'a> {
     cancelled: Option<&'a AtomicBool>,
     deadline: Option<Instant>,
+    after_rule_compiled: Option<&'a dyn Fn(usize)>,
+}
+
+#[derive(Clone, Copy)]
+enum ExecutionPhase {
+    Compile,
+    Execute,
 }
 
 struct CompiledRegexShadowPlan {
@@ -123,6 +132,7 @@ fn validate_alternatives(
     alternatives: &[RegexShadowAlternative],
     next_capture: &mut usize,
     inside_quantifier: bool,
+    depth: usize,
 ) -> Result<usize, RegexShadowFailure> {
     if alternatives.is_empty() {
         return Err(RegexShadowFailure("regex_shadow_ir"));
@@ -134,7 +144,8 @@ fn validate_alternatives(
         }
         let mut nullable = true;
         for atom in &alternative.atoms {
-            let (atom_nullable, atom_bytes) = validate_atom(atom, next_capture, inside_quantifier)?;
+            let (atom_nullable, atom_bytes) =
+                validate_atom(atom, next_capture, inside_quantifier, depth)?;
             nullable &= atom_nullable;
             source_bytes = source_bytes.saturating_add(atom_bytes);
         }
@@ -149,6 +160,7 @@ fn validate_atom(
     atom: &RegexShadowAtom,
     next_capture: &mut usize,
     inside_quantifier: bool,
+    depth: usize,
 ) -> Result<(bool, usize), RegexShadowFailure> {
     match atom {
         RegexShadowAtom::Literal { value } => {
@@ -168,25 +180,39 @@ fn validate_atom(
             Ok((false, ranges.len().saturating_add(2)))
         }
         RegexShadowAtom::Group { alternatives } => {
-            let bytes = validate_alternatives(alternatives, next_capture, inside_quantifier)?;
+            if depth >= REGEX_NEST_LIMIT {
+                return Err(RegexShadowFailure("regex_shadow_nest_limit"));
+            }
+            let bytes =
+                validate_alternatives(alternatives, next_capture, inside_quantifier, depth + 1)?;
             Ok((false, bytes.saturating_add(4)))
         }
         RegexShadowAtom::Capture {
             index,
             alternatives,
         } => {
+            if depth >= REGEX_NEST_LIMIT {
+                return Err(RegexShadowFailure("regex_shadow_nest_limit"));
+            }
+            if inside_quantifier {
+                return Err(RegexShadowFailure("regex_shadow_capture_under_repeat"));
+            }
             *next_capture += 1;
             if *index != *next_capture {
                 return Err(RegexShadowFailure("regex_shadow_ir"));
             }
-            let bytes = validate_alternatives(alternatives, next_capture, inside_quantifier)?;
+            let bytes =
+                validate_alternatives(alternatives, next_capture, inside_quantifier, depth + 1)?;
             Ok((false, bytes.saturating_add(2)))
         }
         RegexShadowAtom::Repeat { min, max, atom } => {
+            if depth >= REGEX_NEST_LIMIT {
+                return Err(RegexShadowFailure("regex_shadow_nest_limit"));
+            }
             if inside_quantifier || min > max || *max > 64 {
                 return Err(RegexShadowFailure("regex_shadow_ir"));
             }
-            let (atom_nullable, bytes) = validate_atom(atom, next_capture, true)?;
+            let (atom_nullable, bytes) = validate_atom(atom, next_capture, true, depth + 1)?;
             let quantifier_bytes = if *min == 0 && *max == 1 {
                 1
             } else if min == max {
@@ -205,7 +231,7 @@ fn validate_atom(
 fn validate_entry(entry: &RegexShadowEntry) -> Result<(), RegexShadowFailure> {
     let mut capture_count = 0usize;
     let minimum_pattern_bytes =
-        validate_alternatives(&entry.pattern.alternatives, &mut capture_count, false)?;
+        validate_alternatives(&entry.pattern.alternatives, &mut capture_count, false, 0)?;
     if capture_count != entry.capture_count || minimum_pattern_bytes > entry.pattern_bytes {
         return Err(RegexShadowFailure("regex_shadow_ir"));
     }
@@ -232,18 +258,27 @@ fn validate_entry(entry: &RegexShadowEntry) -> Result<(), RegexShadowFailure> {
     Ok(())
 }
 
-fn check_control(control: ExecutionControl<'_>) -> Result<(), RegexShadowFailure> {
+fn check_control(
+    control: ExecutionControl<'_>,
+    phase: ExecutionPhase,
+) -> Result<(), RegexShadowFailure> {
     if control
         .cancelled
         .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
     {
-        return Err(RegexShadowFailure("regex_shadow_cancelled"));
+        return Err(RegexShadowFailure(match phase {
+            ExecutionPhase::Compile => "regex_shadow_cancelled_compile",
+            ExecutionPhase::Execute => "regex_shadow_cancelled_execute",
+        }));
     }
     if control
         .deadline
         .is_some_and(|deadline| Instant::now() >= deadline)
     {
-        return Err(RegexShadowFailure("regex_shadow_deadline"));
+        return Err(RegexShadowFailure(match phase {
+            ExecutionPhase::Compile => "regex_shadow_deadline_compile",
+            ExecutionPhase::Execute => "regex_shadow_deadline_execute",
+        }));
     }
     Ok(())
 }
@@ -284,6 +319,7 @@ fn compare_shadow(
                 ExecutionControl {
                     cancelled: None,
                     deadline: Some(Instant::now() + Duration::from_secs(2)),
+                    after_rule_compiled: None,
                 },
             )
         });
@@ -359,7 +395,7 @@ fn build_atom(atom: &RegexShadowAtom) -> String {
             alternatives,
         } => format!("({})", build_alternatives(alternatives)),
         RegexShadowAtom::Repeat { min, max, atom } => {
-            format!("(?:{}){{{min},{max}}}", build_atom(atom))
+            format!("{}{{{min},{max}}}", build_atom(atom))
         }
     }
 }
@@ -414,6 +450,7 @@ fn execute_plan(
         ExecutionControl {
             cancelled: None,
             deadline: None,
+            after_rule_compiled: None,
         },
     )
 }
@@ -423,12 +460,26 @@ fn execute_plan_with_control(
     input: &str,
     control: ExecutionControl<'_>,
 ) -> Result<RegexShadowResult, RegexShadowFailure> {
-    check_control(control)?;
-    let plan = compile_plan(plan)?;
+    let plan = compile_plan_with_control(plan, control)?;
     execute_compiled_plan(&plan, input, control)
 }
 
 fn compile_plan(plan: RegexShadowPlan) -> Result<CompiledRegexShadowPlan, RegexShadowFailure> {
+    compile_plan_with_control(
+        plan,
+        ExecutionControl {
+            cancelled: None,
+            deadline: None,
+            after_rule_compiled: None,
+        },
+    )
+}
+
+fn compile_plan_with_control(
+    plan: RegexShadowPlan,
+    control: ExecutionControl<'_>,
+) -> Result<CompiledRegexShadowPlan, RegexShadowFailure> {
+    check_control(control, ExecutionPhase::Compile)?;
     if plan.version != 1 {
         return Err(RegexShadowFailure("regex_shadow_version"));
     }
@@ -438,6 +489,7 @@ fn compile_plan(plan: RegexShadowPlan) -> Result<CompiledRegexShadowPlan, RegexS
     let mut pattern_bytes = 0usize;
     let mut replacement_bytes = 0usize;
     for entry in &plan.entries {
+        check_control(control, ExecutionPhase::Compile)?;
         if entry.pattern_bytes > 4_096 {
             return Err(RegexShadowFailure("regex_shadow_pattern_limit"));
         }
@@ -454,26 +506,32 @@ fn compile_plan(plan: RegexShadowPlan) -> Result<CompiledRegexShadowPlan, RegexS
     if replacement_bytes > 65_536 {
         return Err(RegexShadowFailure("regex_shadow_replacement_total_limit"));
     }
-    let entries = plan
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let pattern = build_alternatives(&entry.pattern.alternatives);
-            let regex = Regex::new(&pattern).ok();
-            if regex
-                .as_ref()
-                .is_some_and(|regex| regex.captures_len() != entry.capture_count + 1)
-            {
-                return Err(RegexShadowFailure("regex_shadow_ir"));
-            }
-            Ok(CompiledRegexShadowEntry {
-                source_index: entry.source_index,
-                global: entry.global,
-                replacement: entry.replacement,
-                regex,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::with_capacity(plan.entries.len());
+    for (index, entry) in plan.entries.into_iter().enumerate() {
+        check_control(control, ExecutionPhase::Compile)?;
+        let pattern = build_alternatives(&entry.pattern.alternatives);
+        let regex = RegexBuilder::new(&pattern)
+            .nest_limit(REGEX_NEST_LIMIT as u32)
+            .build()
+            .ok();
+        if let Some(after_rule_compiled) = control.after_rule_compiled {
+            after_rule_compiled(index);
+        }
+        check_control(control, ExecutionPhase::Compile)?;
+        if regex
+            .as_ref()
+            .is_some_and(|regex| regex.captures_len() != entry.capture_count + 1)
+        {
+            return Err(RegexShadowFailure("regex_shadow_ir"));
+        }
+        entries.push(CompiledRegexShadowEntry {
+            source_index: entry.source_index,
+            global: entry.global,
+            replacement: entry.replacement,
+            regex,
+        });
+    }
+    check_control(control, ExecutionPhase::Compile)?;
     Ok(CompiledRegexShadowPlan { entries })
 }
 
@@ -482,7 +540,7 @@ fn execute_compiled_plan(
     input: &str,
     control: ExecutionControl<'_>,
 ) -> Result<RegexShadowResult, RegexShadowFailure> {
-    check_control(control)?;
+    check_control(control, ExecutionPhase::Execute)?;
     if input.len() > 1_048_576 {
         return Err(RegexShadowFailure("regex_shadow_input_limit"));
     }
@@ -491,7 +549,7 @@ fn execute_compiled_plan(
     let mut errors = Vec::new();
     let mut total_matches = 0usize;
     for entry in &plan.entries {
-        check_control(control)?;
+        check_control(control, ExecutionPhase::Execute)?;
         let regex = match &entry.regex {
             Some(regex) => regex,
             None => {
@@ -511,7 +569,7 @@ fn execute_compiled_plan(
                 return Err(RegexShadowFailure("regex_shadow_match_limit"));
             }
             if total_matches % 1_024 == 0 {
-                check_control(control)?;
+                check_control(control, ExecutionPhase::Execute)?;
             }
             let full_match = captures.get(0).expect("capture zero must exist");
             push_limited(
@@ -550,6 +608,7 @@ fn execute_json(
         ExecutionControl {
             cancelled: _cancelled,
             deadline: Some(Instant::now() + Duration::from_secs(2)),
+            after_rule_compiled: None,
         },
     )
 }
@@ -699,12 +758,15 @@ fn generated_plan(index: usize) -> RegexShadowPlan {
 #[cfg(test)]
 mod tests {
     use super::{
-        alternative, compare_shadow, compile_plan, execute_compiled_plan, execute_json,
-        execute_plan, execute_plan_with_control, generated_plan, CompiledRegexShadowEntry,
-        CompiledRegexShadowPlan, ExecutionControl, RegexShadowAlternative, RegexShadowAtom,
-        RegexShadowEntry, RegexShadowPattern, RegexShadowPlan, ReplacementToken,
+        alternative, compare_shadow, compile_plan, compile_plan_with_control,
+        execute_compiled_plan, execute_json, execute_plan, execute_plan_with_control,
+        generated_plan, CompiledRegexShadowEntry, CompiledRegexShadowPlan, ExecutionControl,
+        RegexShadowAlternative, RegexShadowAtom, RegexShadowEntry, RegexShadowPattern,
+        RegexShadowPlan, ReplacementToken,
     };
     use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+    use std::io::{self, BufRead};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use std::time::Instant;
@@ -793,17 +855,18 @@ mod tests {
     }
 
     #[test]
-    fn observes_cancellation_before_execution() {
+    fn reports_cancellation_during_compilation() {
         let cancelled = AtomicBool::new(true);
         let control = ExecutionControl {
             cancelled: Some(&cancelled),
             deadline: None,
+            after_rule_compiled: None,
         };
 
         let error =
             execute_plan_with_control(literal_plan("x".to_string()), "a", control).unwrap_err();
 
-        assert_eq!(error.0, "regex_shadow_cancelled");
+        assert_eq!(error.0, "regex_shadow_cancelled_compile");
     }
 
     #[test]
@@ -853,6 +916,78 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ir_beyond_the_configured_nest_limit() {
+        let mut atom = RegexShadowAtom::Literal { value: b'a' };
+        for _ in 0..250 {
+            atom = RegexShadowAtom::Group {
+                alternatives: vec![RegexShadowAlternative { atoms: vec![atom] }],
+            };
+        }
+        let mut plan = literal_plan("x".to_string());
+        plan.entries[0].pattern_bytes = 4_096;
+        plan.entries[0].pattern.alternatives[0].atoms[0] = atom;
+
+        let boundary_result = execute_plan(plan, "a").unwrap();
+        assert!(boundary_result.errors.is_empty());
+
+        let mut atom = RegexShadowAtom::Literal { value: b'a' };
+        for _ in 0..251 {
+            atom = RegexShadowAtom::Group {
+                alternatives: vec![RegexShadowAlternative { atoms: vec![atom] }],
+            };
+        }
+        let mut plan = literal_plan("x".to_string());
+        plan.entries[0].pattern_bytes = 4_096;
+        plan.entries[0].pattern.alternatives[0].atoms[0] = atom;
+
+        let error = execute_plan(plan, "a").unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_nest_limit");
+    }
+
+    #[test]
+    fn rejects_capture_ir_under_repetition() {
+        let mut plan = literal_plan("x".to_string());
+        plan.entries[0].capture_count = 1;
+        plan.entries[0].pattern_bytes = 8;
+        plan.entries[0].replacement_bytes = 2;
+        plan.entries[0].pattern.alternatives[0].atoms[0] = RegexShadowAtom::Repeat {
+            min: 1,
+            max: 2,
+            atom: Box::new(RegexShadowAtom::Capture {
+                index: 1,
+                alternatives: vec![RegexShadowAlternative {
+                    atoms: vec![RegexShadowAtom::Literal { value: b'a' }],
+                }],
+            }),
+        };
+        plan.entries[0].replacement = vec![ReplacementToken::Capture { index: 1 }];
+
+        let error = execute_plan(plan, "aa").unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_capture_under_repeat");
+    }
+
+    #[test]
+    fn checks_cancellation_after_each_rule_compilation() {
+        let cancelled = AtomicBool::new(false);
+        let after_compile = |index: usize| {
+            if index == 0 {
+                cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let control = ExecutionControl {
+            cancelled: Some(&cancelled),
+            deadline: None,
+            after_rule_compiled: Some(&after_compile),
+        };
+
+        let error = execute_plan_with_control(phase_one_plan(20), "rule-000", control).unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_cancelled_compile");
+    }
+
+    #[test]
     fn shadow_comparison_reports_only_bounded_evidence() {
         let plan = serde_json::to_string(&literal_plan("x".to_string())).unwrap();
 
@@ -890,6 +1025,7 @@ mod tests {
             ExecutionControl {
                 cancelled: None,
                 deadline: None,
+                after_rule_compiled: None,
             },
         )
         .unwrap();
@@ -905,16 +1041,208 @@ mod tests {
     }
 
     #[test]
-    fn observes_expired_deadlines_before_execution() {
+    fn reports_expired_deadlines_during_compilation() {
         let control = ExecutionControl {
             cancelled: None,
             deadline: Some(Instant::now()),
+            after_rule_compiled: None,
         };
 
         let error =
             execute_plan_with_control(literal_plan("x".to_string()), "a", control).unwrap_err();
 
-        assert_eq!(error.0, "regex_shadow_deadline");
+        assert_eq!(error.0, "regex_shadow_deadline_compile");
+    }
+
+    #[test]
+    fn reports_cancellation_during_execution() {
+        let plan = compile_plan(literal_plan("x".to_string())).unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let error = execute_compiled_plan(
+            &plan,
+            "a",
+            ExecutionControl {
+                cancelled: Some(&cancelled),
+                deadline: None,
+                after_rule_compiled: None,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_cancelled_execute");
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DifferentialCase {
+        id: u32,
+        plan_json: String,
+        input: String,
+        authority_data: String,
+        authority_error_source_indexes: Vec<usize>,
+    }
+
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DifferentialSummary {
+        allowed_cases: usize,
+        unique_plans: usize,
+        mismatches: usize,
+        plan_hash: String,
+        input_hash: String,
+        authority_hash: String,
+        rust_hash: String,
+        first_mismatch: Option<super::RegexShadowEvidence>,
+    }
+
+    fn update_value_hash(hash: &mut Sha256, id: u32, value: &[u8]) {
+        hash.update(id.to_le_bytes());
+        hash.update((value.len() as u32).to_le_bytes());
+        hash.update(value);
+    }
+
+    fn update_result_hash(hash: &mut Sha256, id: u32, data: &str, error_source_indexes: &[usize]) {
+        update_value_hash(hash, id, data.as_bytes());
+        hash.update((error_source_indexes.len() as u32).to_le_bytes());
+        for source_index in error_source_indexes {
+            hash.update((*source_index as u32).to_le_bytes());
+        }
+    }
+
+    #[test]
+    #[ignore = "profile-only JSONL differential harness"]
+    fn jsonl_differential_harness() {
+        let mut allowed_cases = 0usize;
+        let mut mismatches = 0usize;
+        let mut plan_hash = Sha256::new();
+        let mut input_hash = Sha256::new();
+        let mut authority_hash = Sha256::new();
+        let mut rust_hash = Sha256::new();
+        let mut first_mismatch = None;
+        let mut compiled_plans = HashMap::new();
+
+        for (line_index, line) in io::stdin().lock().lines().enumerate() {
+            let line = line
+                .unwrap_or_else(|_| panic!("failed to read differential line {}", line_index + 1));
+            if line.is_empty() {
+                continue;
+            }
+            let case: DifferentialCase = serde_json::from_str(&line)
+                .unwrap_or_else(|_| panic!("invalid differential case at line {}", line_index + 1));
+            assert_eq!(case.id as usize, allowed_cases);
+            allowed_cases += 1;
+            update_value_hash(&mut plan_hash, case.id, case.plan_json.as_bytes());
+            update_value_hash(&mut input_hash, case.id, case.input.as_bytes());
+            update_result_hash(
+                &mut authority_hash,
+                case.id,
+                &case.authority_data,
+                &case.authority_error_source_indexes,
+            );
+
+            if !compiled_plans.contains_key(&case.plan_json) {
+                let compiled = serde_json::from_str(&case.plan_json)
+                    .map_err(|_| super::RegexShadowFailure("regex_shadow_plan_json"))
+                    .and_then(|plan| {
+                        compile_plan_with_control(
+                            plan,
+                            ExecutionControl {
+                                cancelled: None,
+                                deadline: Some(Instant::now() + Duration::from_secs(2)),
+                                after_rule_compiled: None,
+                            },
+                        )
+                    });
+                match compiled {
+                    Ok(plan) => {
+                        compiled_plans.insert(case.plan_json.clone(), plan);
+                    }
+                    Err(_) => {
+                        mismatches += 1;
+                        if first_mismatch.is_none() {
+                            first_mismatch = Some(compare_shadow(
+                                &format!("generated-{}", case.id),
+                                &case.plan_json,
+                                &case.input,
+                                &case.authority_data,
+                                &case.authority_error_source_indexes,
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
+            let control = ExecutionControl {
+                cancelled: None,
+                deadline: Some(Instant::now() + Duration::from_secs(2)),
+                after_rule_compiled: None,
+            };
+            match execute_compiled_plan(
+                compiled_plans
+                    .get(&case.plan_json)
+                    .expect("compiled plan must be registered"),
+                &case.input,
+                control,
+            ) {
+                Ok(result) => {
+                    let rust_error_source_indexes = result
+                        .errors
+                        .iter()
+                        .map(|error| error.source_index)
+                        .collect::<Vec<_>>();
+                    update_result_hash(
+                        &mut rust_hash,
+                        case.id,
+                        &result.data,
+                        &rust_error_source_indexes,
+                    );
+                    if result.data != case.authority_data
+                        || rust_error_source_indexes != case.authority_error_source_indexes
+                    {
+                        mismatches += 1;
+                        if first_mismatch.is_none() {
+                            first_mismatch = Some(compare_shadow(
+                                &format!("generated-{}", case.id),
+                                &case.plan_json,
+                                &case.input,
+                                &case.authority_data,
+                                &case.authority_error_source_indexes,
+                            ));
+                        }
+                    }
+                }
+                Err(_) => {
+                    mismatches += 1;
+                    if first_mismatch.is_none() {
+                        first_mismatch = Some(compare_shadow(
+                            &format!("generated-{}", case.id),
+                            &case.plan_json,
+                            &case.input,
+                            &case.authority_data,
+                            &case.authority_error_source_indexes,
+                        ));
+                    }
+                }
+            }
+        }
+
+        let summary = DifferentialSummary {
+            allowed_cases,
+            unique_plans: compiled_plans.len(),
+            mismatches,
+            plan_hash: format!("{:x}", plan_hash.finalize()),
+            input_hash: format!("{:x}", input_hash.finalize()),
+            authority_hash: format!("{:x}", authority_hash.finalize()),
+            rust_hash: format!("{:x}", rust_hash.finalize()),
+            first_mismatch,
+        };
+        println!(
+            "RISUNEST_REGEX_DIFFERENTIAL {}",
+            serde_json::to_string(&summary).expect("differential summary must serialize")
+        );
+        assert!(summary.allowed_cases > 0);
+        assert_eq!(summary.mismatches, 0);
     }
 
     #[test]
@@ -931,6 +1259,7 @@ mod tests {
                 ExecutionControl {
                     cancelled: None,
                     deadline: None,
+                    after_rule_compiled: None,
                 },
             )
             .unwrap();
@@ -1017,6 +1346,7 @@ mod tests {
                 ExecutionControl {
                     cancelled: None,
                     deadline: None,
+                    after_rule_compiled: None,
                 },
             )
             .unwrap();
@@ -1042,6 +1372,7 @@ mod tests {
                         ExecutionControl {
                             cancelled: None,
                             deadline: None,
+                            after_rule_compiled: None,
                         },
                     )
                     .unwrap();
