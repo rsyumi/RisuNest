@@ -327,10 +327,12 @@ describe('explicit native official account flow', () => {
 
     it('flushes, pins the current revision, publishes, and always disposes', async () => {
         const harness = createHarness(true)
+        const signal = new AbortController().signal
 
-        await harness.flow.publish()
+        await harness.flow.publish(signal)
 
         expect(harness.adapter.pin).toHaveBeenCalledWith(7)
+        expect(harness.publication.publish).toHaveBeenCalledWith(signal)
         expect(harness.events).toEqual(['flush', 'publish', 'dispose', 'metadata:flush'])
 
         harness.events.length = 0

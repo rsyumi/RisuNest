@@ -312,6 +312,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(input).toMatchObject({
             revision: harness.imported.revision,
             accountId: 'account-1',
+            lease,
         })
         expect(input).not.toHaveProperty('bytes')
         expect(input).not.toHaveProperty('path')
@@ -323,7 +324,8 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             expect(remote).toBe(`remote/${local}`)
         }
         expect(harness.writeItem.mock.calls.some(([key]) => key === databaseKey)).toBe(false)
-        expect(events.slice(-7)).toEqual([
+        expect(events.slice(-8)).toEqual([
+            'metadata-flush',
             'native-database',
             'mark-published',
             'association',
@@ -339,6 +341,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         const fallback = await makeHarness({
             accountId: 'account-1',
             nativeDatabasePublisher: unavailable,
+            flushPublicationMetadata: vi.fn(async () => undefined),
         })
 
         await (await fallback.adapter.pin(fallback.imported.revision)).publish()
@@ -352,6 +355,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         const noFallback = await makeHarness({
             accountId: 'account-1',
             nativeDatabasePublisher: failed,
+            flushPublicationMetadata: vi.fn(async () => undefined),
         })
         const publication = await noFallback.adapter.pin(noFallback.imported.revision)
 
@@ -379,7 +383,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
             nativeDatabasePublisher,
             flushPublicationMetadata: async () => {
                 events.push('metadata-flush')
-                if (flushAttempts++ === 0) throw new Error('metadata unavailable')
+                if (flushAttempts++ === 1) throw new Error('metadata unavailable')
             },
         })
         const publication = await harness.adapter.pin(harness.imported.revision)
@@ -394,12 +398,31 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(harness.markPublished).toHaveBeenCalledOnce()
         expect(acknowledge).toHaveBeenCalledOnce()
         expect(events).toEqual([
+            'metadata-flush',
             'native-database',
             'metadata-flush',
             'metadata-flush',
             'acknowledge',
             'reload',
         ])
+    })
+
+    it('does not transfer database ownership before asset and cold metadata is durable', async () => {
+        const nativeDatabasePublisher = vi.fn<OfficialNativeDatabasePublisher>()
+        const harness = await makeHarness({
+            accountId: 'account-1',
+            nativeDatabasePublisher,
+            flushPublicationMetadata: vi.fn(async () => {
+                throw new Error('metadata unavailable')
+            }),
+        })
+        const publication = await harness.adapter.pin(harness.imported.revision)
+
+        await expect(publication.publish()).rejects.toThrow('metadata unavailable')
+
+        expect(nativeDatabasePublisher).not.toHaveBeenCalled()
+        expect(harness.writeItem.mock.calls.some(([key]) => key === databaseKey)).toBe(false)
+        await publication.dispose()
     })
 
     it('aborts an in-flight native publication and releases its lease only after the job settles', async () => {
@@ -419,6 +442,7 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         const harness = await makeHarness({
             accountId: 'account-1',
             nativeDatabasePublisher,
+            flushPublicationMetadata: vi.fn(async () => undefined),
         })
         const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
         const publication = await harness.adapter.pin(harness.imported.revision)

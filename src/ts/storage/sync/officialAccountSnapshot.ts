@@ -99,6 +99,7 @@ export interface OfficialAccountSnapshotDependencies {
 export interface OfficialNativeDatabasePublicationInput {
     revision: DataRevision
     accountId: string
+    lease: PersistentRevisionLease
     resourceReplacements: Readonly<Record<string, string>>
     signal?: AbortSignal
 }
@@ -392,9 +393,15 @@ class OfficialPinnedPublication implements PinnedPublication {
 
         throwIfAborted(signal)
         if (this.dependencies.nativeDatabasePublisher && this.accountId) {
+            if (!this.dependencies.flushPublicationMetadata) {
+                throw new Error('Native official publication metadata flush is not configured')
+            }
+            await this.dependencies.flushPublicationMetadata()
+            throwIfAborted(signal)
             const receipt = await this.dependencies.nativeDatabasePublisher({
                 revision: this.revision,
                 accountId: this.accountId,
+                lease: this.lease,
                 resourceReplacements: replacementRecord,
                 signal,
             })

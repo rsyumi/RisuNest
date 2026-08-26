@@ -49,6 +49,7 @@
     const drivePopup = createHubPopupController()
     let accountIframe = $state<HTMLIFrameElement>()
     let nativeAccountBusy = $state(false)
+    let nativePublishController = $state<AbortController | null>(null)
     let risuSaveOperation = $derived($nativeFileOperation?.kind ?? null)
     let risuSaveStatus = $derived($nativeFileOperation?.status)
 
@@ -127,6 +128,7 @@
     }
 
     onDestroy(() => {
+        nativePublishController?.abort()
         drivePopup.close()
     })
 </script>
@@ -381,16 +383,29 @@
                 onclick={async () => {
                     await runNativeAccountOperation(async () => {
                         if(!await alertConfirm('Overwrite the official account backup with current local data?')) return
+                        const controller = new AbortController()
+                        nativePublishController = controller
                         try {
-                            await getNativeOfficialAccountFlow().publish()
+                            await getNativeOfficialAccountFlow().publish(controller.signal)
                             alertNormal('Official account backup published.')
                         } catch (error) {
-                            alertError(error instanceof Error ? error : String(error))
+                            if(!(error instanceof DOMException && error.name === 'AbortError')) {
+                                alertError(error instanceof Error ? error : String(error))
+                            }
+                        } finally {
+                            if(nativePublishController === controller) nativePublishController = null
                         }
                     })
                 }} className="mt-2">
                 Publish official account backup
             </Button>
+            {#if nativePublishController}
+                <Button
+                    onclick={() => nativePublishController?.abort()}
+                    className="mt-2">
+                    Cancel official account backup
+                </Button>
+            {/if}
         {/if}
         {#if !isTauri}
             <h1 class="text-xl font-bold mt-2">{language.googleDriveConnection}</h1>

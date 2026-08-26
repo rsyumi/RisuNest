@@ -328,11 +328,15 @@ export async function loadData() {
             ? createNativeOfficialPublicationJobPublisher({
                 account: accountStorage,
                 baseUrl: hubURL,
-                reconcilePendingPublications: async () => {
+                reconcilePendingPublications: async ({ accountId, revision }) => {
                     if (!nativePublicationRecovery) {
                         throw new Error('Native official publication recovery is not configured')
                     }
                     await nativePublicationRecovery.reconcile()
+                    return nativePublicationRecovery.takeRecoveredPublication(
+                        accountId,
+                        revision,
+                    )
                 },
             })
             : undefined

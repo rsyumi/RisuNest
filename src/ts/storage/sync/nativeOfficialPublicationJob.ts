@@ -5,7 +5,14 @@ import {
     type NativeOfficialPublicationReceipt,
     type NativeOfficialPublicationRequest,
 } from '../nativeFileJobs'
-import type { OfficialNativeDatabasePublisher } from './officialAccountSnapshot'
+import {
+    hasNativePersistentRevisionLease,
+    nativePersistentRevisionLease,
+} from '../nativePersistentExport'
+import type {
+    OfficialNativeDatabasePublisher,
+    OfficialRecoveredPublication,
+} from './officialAccountSnapshot'
 
 export interface NativeOfficialPublicationJobDependencies {
     account: Pick<AccountStorage, 'writeOfficialDatabaseFromNative'>
@@ -14,7 +21,10 @@ export interface NativeOfficialPublicationJobDependencies {
         request: NativeOfficialPublicationRequest,
         options?: NativeFileJobOptions,
     ): Promise<NativeOfficialPublicationReceipt | null>
-    reconcilePendingPublications?(): Promise<void>
+    reconcilePendingPublications?(input: {
+        accountId: string
+        revision: number
+    }): Promise<OfficialRecoveredPublication | null>
 }
 
 export function createNativeOfficialPublicationJobPublisher(
@@ -22,11 +32,23 @@ export function createNativeOfficialPublicationJobPublisher(
 ): OfficialNativeDatabasePublisher {
     const runAttempt = dependencies.runAttempt ?? runNativeOfficialPublicationAttempt
     return async (input) => {
-        await dependencies.reconcilePendingPublications?.()
+        const recovered = await dependencies.reconcilePendingPublications?.({
+            accountId: input.accountId,
+            revision: input.revision,
+        })
+        if (recovered) {
+            return {
+                databaseFingerprint: recovered.databaseFingerprint,
+                acknowledge: async () => undefined,
+                completeReload: async () => undefined,
+            }
+        }
+        if (!hasNativePersistentRevisionLease(input.lease)) return null
         const result = await dependencies.account.writeOfficialDatabaseFromNative(
             async (context) => {
                 const receipt = await runAttempt({
                     expectedRevision: input.revision,
+                    lease: input.lease[nativePersistentRevisionLease],
                     accountId: input.accountId,
                     baseUrl: dependencies.baseUrl,
                     replacements: input.resourceReplacements,

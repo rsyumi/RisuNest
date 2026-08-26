@@ -1203,6 +1203,7 @@ describe('native file jobs', () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const request = {
             expectedRevision: 17,
+            lease: 'snapshot-publication-17',
             accountId: 'account-1',
             baseUrl: 'https://realm.example',
             replacements: {
@@ -1290,6 +1291,7 @@ describe('native file jobs', () => {
     it('falls back only when publication capability is unavailable before a job ID', async () => {
         const request = {
             expectedRevision: 3,
+            lease: 'snapshot-publication-3',
             accountId: 'account-1',
             baseUrl: 'https://realm.example',
             replacements: {},
@@ -1364,6 +1366,7 @@ describe('native file jobs', () => {
         await expect(runNativeOfficialPublicationAttempt(
             {
                 expectedRevision: 3,
+                lease: 'snapshot-publication-3',
                 accountId: 'account-1',
                 baseUrl: 'https://realm.example',
                 replacements: {},
@@ -1393,6 +1396,7 @@ describe('native file jobs', () => {
         await expect(runNativeOfficialPublicationAttempt(
             {
                 expectedRevision: 3,
+                lease: 'snapshot-publication-3',
                 accountId: 'account-1',
                 baseUrl: 'https://realm.example',
                 replacements: {},
@@ -1465,6 +1469,7 @@ describe('native file jobs', () => {
         const receipt = await runNativeOfficialPublicationAttempt(
             {
                 expectedRevision: 9,
+                lease: 'snapshot-publication-9',
                 accountId: 'account-1',
                 baseUrl: 'https://realm.example',
                 replacements: {},
@@ -1522,6 +1527,7 @@ describe('native file jobs', () => {
     it('acknowledges failed and cancelled publication terminals before rejecting', async () => {
         const request = {
             expectedRevision: 3,
+            lease: 'snapshot-publication-3',
             accountId: 'account-1',
             baseUrl: 'https://realm.example',
             replacements: {},
@@ -1579,6 +1585,7 @@ describe('native file jobs', () => {
     it('retains successful publication jobs whose association metadata does not match', async () => {
         const request = {
             expectedRevision: 3,
+            lease: 'snapshot-publication-3',
             accountId: 'account-1',
             baseUrl: 'https://realm.example',
             replacements: {},
@@ -1648,6 +1655,7 @@ describe('native file jobs', () => {
         const receipt = await runNativeOfficialPublicationAttempt(
             {
                 expectedRevision: 3,
+                lease: 'snapshot-publication-3',
                 accountId: 'account-1',
                 baseUrl: 'https://realm.example',
                 replacements: {},

@@ -100,6 +100,7 @@ export type NativeOfficialPublicationAttemptResult =
 
 export interface NativeOfficialPublicationRequest {
     expectedRevision: number
+    lease: string
     accountId: string
     baseUrl: string
     replacements: Readonly<Record<string, string>>

@@ -40,7 +40,7 @@ export interface NativeOfficialAccountFlow {
     getToken(): string | null
     reauthenticate(loginResult: string): Promise<NativeOfficialAccountCredential>
     restore(): Promise<OfficialPullResult>
-    publish(): Promise<void>
+    publish(signal?: AbortSignal): Promise<void>
     logout(): Promise<void>
 }
 
@@ -181,7 +181,7 @@ export function createNativeOfficialAccountFlowService(
                 return result
             })
         },
-        publish() {
+        publish(signal) {
             return serialize(async () => {
                 if (!credential) throw new Error('Native official account login is required')
                 await dependencies.flushPendingData('native-official-publish')
@@ -190,7 +190,7 @@ export function createNativeOfficialAccountFlowService(
                 let originalError: unknown
                 try {
                     publication = await dependencies.adapter.pin(dependencies.getRevision())
-                    await publication.publish()
+                    await publication.publish(signal)
                 } catch (error) {
                     failed = true
                     originalError = error

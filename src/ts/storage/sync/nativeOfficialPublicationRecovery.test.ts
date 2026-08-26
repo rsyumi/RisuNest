@@ -65,6 +65,12 @@ describe('native official publication recovery', () => {
             'reload',
         ])
         expect(recovery.hasPending()).toBe(false)
+        expect(recovery.takeRecoveredPublication('account-1', 7)).toEqual({
+            accountId: 'account-1',
+            revision: 7,
+            databaseFingerprint: 'a'.repeat(64),
+        })
+        expect(recovery.takeRecoveredPublication('account-1', 7)).toBeNull()
 
         await recovery.reconcile()
         expect(resumeJob).toHaveBeenCalledOnce()

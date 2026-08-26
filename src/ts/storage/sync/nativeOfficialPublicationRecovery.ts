@@ -4,7 +4,10 @@ import {
     resumeNativeOfficialPublication,
     type NativeOfficialPublicationReceipt,
 } from '../nativeFileJobs'
-import type { OfficialAccountSnapshotAdapter } from './officialAccountSnapshot'
+import type {
+    OfficialAccountSnapshotAdapter,
+    OfficialRecoveredPublication,
+} from './officialAccountSnapshot'
 
 export interface NativeOfficialPublicationRecoveryDependencies {
     activeAccountId(): string | null
@@ -18,6 +21,10 @@ export interface NativeOfficialPublicationRecoveryDependencies {
 export interface NativeOfficialPublicationRecovery {
     reconcile(): Promise<void>
     hasPending(): boolean
+    takeRecoveredPublication(
+        accountId: string,
+        revision: number,
+    ): OfficialRecoveredPublication | null
 }
 
 export function createNativeOfficialPublicationRecovery(
@@ -27,7 +34,9 @@ export function createNativeOfficialPublicationRecovery(
     const pending = new Set(initialJobIds)
     const listJobIds = dependencies.listJobIds ?? listNativeOfficialPublicationJobs
     const resumeJob = dependencies.resumeJob ?? resumeNativeOfficialPublication
+    const recoveredPublications = new Map<string, OfficialRecoveredPublication>()
     let inFlight: Promise<void> | null = null
+    const recoveredKey = (accountId: string, revision: number) => `${accountId}\0${revision}`
 
     const reconcileOnce = async () => {
         for (const jobId of await listJobIds()) pending.add(jobId)
@@ -71,6 +80,15 @@ export function createNativeOfficialPublicationRecovery(
             await dependencies.flushMetadata()
             await receipt.acknowledge()
             pending.delete(jobId)
+            const recovered = {
+                accountId: publication.accountId,
+                revision: receipt.result.revision,
+                databaseFingerprint: receipt.result.sourceSha256,
+            }
+            recoveredPublications.set(
+                recoveredKey(recovered.accountId, recovered.revision),
+                recovered,
+            )
             await completion.completeReload()
         }
     }
@@ -84,5 +102,11 @@ export function createNativeOfficialPublicationRecovery(
             return inFlight
         },
         hasPending: () => pending.size > 0,
+        takeRecoveredPublication(accountId, revision) {
+            const key = recoveredKey(accountId, revision)
+            const recovered = recoveredPublications.get(key) ?? null
+            recoveredPublications.delete(key)
+            return recovered
+        },
     }
 }
