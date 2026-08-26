@@ -144,30 +144,23 @@ export function replaceCaptureMedia(root: HTMLElement) {
     }
 }
 
-function waitForAbort(signal: AbortSignal): Promise<never> {
-    return new Promise((_, reject) => {
-        if (signal.aborted) {
-            reject(new DOMException('Screenshot capture was cancelled', 'AbortError'))
-            return
-        }
-        signal.addEventListener(
-            'abort',
-            () => reject(new DOMException('Screenshot capture was cancelled', 'AbortError')),
-            { once: true },
-        )
-    })
-}
-
 async function withCaptureTimeout<T>(promise: Promise<T>, signal: AbortSignal): Promise<void> {
-    let timeout: ReturnType<typeof setTimeout> | undefined
-    const timeoutPromise = new Promise<void>((resolve) => {
-        timeout = setTimeout(resolve, CHAT_SCREENSHOT_RESOURCE_TIMEOUT_MS)
+    await new Promise<void>((resolve, reject) => {
+        let settled = false
+        const finish = (error?: unknown) => {
+            if (settled) return
+            settled = true
+            clearTimeout(timeout)
+            signal.removeEventListener('abort', onAbort)
+            if (error) reject(error)
+            else resolve()
+        }
+        const onAbort = () => finish(new DOMException('Screenshot capture was cancelled', 'AbortError'))
+        const timeout = setTimeout(() => finish(), CHAT_SCREENSHOT_RESOURCE_TIMEOUT_MS)
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) return onAbort()
+        promise.then(() => finish(), finish)
     })
-    try {
-        await Promise.race([promise.then(() => undefined), timeoutPromise, waitForAbort(signal)])
-    } finally {
-        if (timeout) clearTimeout(timeout)
-    }
 }
 
 async function waitForCaptureResources(root: HTMLElement, signal: AbortSignal) {
@@ -217,7 +210,13 @@ export function createDomScreenshotEncoder(): ChatScreenshotEncoder {
                     canvasHeight: tile.height,
                     pixelRatio: 1,
                     skipAutoScale: true,
-                    backgroundColor: 'var(--risu-theme-bgcolor)',
+                    backgroundColor: getComputedStyle(root).backgroundColor || '#fff',
+                    style: {
+                        position: 'static',
+                        left: 'auto',
+                        top: 'auto',
+                        pointerEvents: 'none',
+                    },
                 })
                 throwIfAborted(signal)
                 if (!page) throw new Error('Screenshot encoder returned no PNG data')

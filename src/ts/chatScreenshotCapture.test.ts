@@ -1,13 +1,22 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from './storage/database.svelte'
 import {
     CHAT_SCREENSHOT_BATCH_SIZE,
     CHAT_SCREENSHOT_PAGE_HEIGHT,
     CHAT_SCREENSHOT_WIDTH,
     captureChatScreenshot,
+    createDomScreenshotEncoder,
     replaceCaptureMedia,
 } from './chatScreenshotCapture'
 import type { ChatScreenshotJob } from './chatScreenshotRange'
+
+const htmlToImageMocks = vi.hoisted(() => ({
+    toBlob: vi.fn(async () => new Blob(['png'], { type: 'image/png' })),
+}))
+
+vi.mock('html-to-image', () => htmlToImageMocks)
+
+afterEach(() => vi.useRealTimers())
 
 function job(count: number): ChatScreenshotJob {
     return {
@@ -170,5 +179,46 @@ describe('capture-only media replacement', () => {
                 (element) => element.textContent,
             ),
         ).toEqual(['[audio]', '[video]', '[iframe]', '[canvas]'])
+    })
+
+    it('captures with static clone positioning and restores tile styles', async () => {
+        const root = document.createElement('div')
+        root.style.position = 'fixed'
+        root.style.left = '-100000px'
+        const content = document.createElement('div')
+        content.dataset.screenshotContent = ''
+        content.style.transform = 'scale(1)'
+        root.append(content)
+        const encoder = createDomScreenshotEncoder()
+
+        await encoder.encodeTile(
+            root,
+            { offset: 100, height: 200, width: CHAT_SCREENSHOT_WIDTH },
+            new AbortController().signal,
+        )
+
+        expect(htmlToImageMocks.toBlob).toHaveBeenCalledWith(
+            root,
+            expect.objectContaining({
+                style: expect.objectContaining({ position: 'static', left: 'auto', top: 'auto' }),
+            }),
+        )
+        expect(root.style.position).toBe('fixed')
+        expect(root.style.left).toBe('-100000px')
+        expect(content.style.transform).toBe('scale(1)')
+    })
+
+    it('bounds the wait for an image that never settles', async () => {
+        vi.useFakeTimers()
+        const root = document.createElement('div')
+        const image = document.createElement('img')
+        Object.defineProperty(image, 'complete', { value: false })
+        root.append(image)
+        const encoder = createDomScreenshotEncoder()
+
+        const preparing = encoder.prepare(root, new AbortController().signal)
+        await vi.advanceTimersByTimeAsync(5_000)
+
+        await expect(preparing).resolves.toBeUndefined()
     })
 })
