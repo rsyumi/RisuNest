@@ -120,6 +120,17 @@ function apngBytes(): Uint8Array {
     ])
 }
 
+function ftypBytes(majorBrand: string, compatibleBrands: string[] = []): Uint8Array {
+    const bytes = new Uint8Array(16 + compatibleBrands.length * 4)
+    new DataView(bytes.buffer).setUint32(0, bytes.byteLength)
+    bytes.set(new TextEncoder().encode('ftyp'), 4)
+    bytes.set(new TextEncoder().encode(majorBrand), 8)
+    compatibleBrands.forEach((brand, index) => {
+        bytes.set(new TextEncoder().encode(brand), 16 + index * 4)
+    })
+    return bytes
+}
+
 function makeImage(w: number, h: number): HTMLImageElement {
     const img = new Image()
     Object.defineProperty(img, 'width', { get: () => w })
@@ -623,6 +634,53 @@ describe('writeInlayImage', () => {
 
         expect(fakeCtx.drawImage).not.toHaveBeenCalled()
         expect(await getInlayAssetBlob('direct-unsupported')).toBeNull()
+    })
+
+    test.each([
+        ['AVIS major brand', ftypBytes('avis'), 'application/octet-stream'],
+        ['AVIF compatible brand', ftypBytes('mif1', ['miaf', 'avif']), 'application/octet-stream'],
+        ['AVIS compatible brand', ftypBytes('mif1', ['avis']), 'application/octet-stream'],
+        ['parameterized mixed-case MIME', Uint8Array.of(1, 2, 3), ' Image/AVIF; codecs="av01" '],
+    ])('rejects direct %s before canvas without relying on extension', async (_label, bytes, mime) => {
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(bytes.slice().buffer as ArrayBuffer, {
+            headers: { 'Content-Type': mime },
+        })))
+
+        await expect(writeInlayImage(makeImage(20, 10), { id: 'direct-avif-brand' }))
+            .rejects.toThrow(/AVIF|unsupported/i)
+
+        expect(fakeCtx.drawImage).not.toHaveBeenCalled()
+        expect(await getInlayAssetBlob('direct-avif-brand')).toBeNull()
+    })
+
+    test('captures a production-style load event that fires during source validation', async () => {
+        const image = {
+            complete: false,
+            currentSrc: 'data:image/png;base64,iVBORw0KGgo=',
+            src: 'data:image/png;base64,iVBORw0KGgo=',
+            naturalWidth: 64,
+            naturalHeight: 32,
+            width: 64,
+            height: 32,
+            onload: null as (() => void) | null,
+            onerror: null as (() => void) | null,
+        } as unknown as HTMLImageElement
+        vi.stubGlobal('fetch', vi.fn(async () => {
+            ;(image as unknown as { complete: boolean }).complete = true
+            image.onload?.(new Event('load'))
+            return new Response(
+                Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).buffer,
+                { headers: { 'Content-Type': 'image/png' } },
+            )
+        }))
+
+        const result = await Promise.race([
+            writeInlayImage(image, { id: 'fast-load' }),
+            new Promise<string>((resolve) => setTimeout(() => resolve('timed-out'), 25)),
+        ])
+
+        expect(result).toBe('fast-load')
+        expect(await getInlayAssetBlob('fast-load')).toMatchObject({ width: 64, height: 32 })
     })
 
     test('stores image asset with correct metadata and returns id', async () => {

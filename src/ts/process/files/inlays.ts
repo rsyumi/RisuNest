@@ -84,10 +84,40 @@ export async function postInlayAsset(img:{
     return null
 }
 
+function imageReadiness(imgObj: HTMLImageElement, sourceUrl?: string): Promise<void> {
+    let settled = false
+    let resolveReady!: () => void
+    let rejectReady!: (error: Error) => void
+    const ready = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve
+        rejectReady = reject
+    })
+    const resolve = () => {
+        if (settled) return
+        settled = true
+        resolveReady()
+    }
+    const reject = () => {
+        if (settled) return
+        settled = true
+        rejectReady(new Error('Failed to load image'))
+    }
+    imgObj.onload = resolve
+    imgObj.onerror = reject
+    if (sourceUrl) imgObj.src = sourceUrl
+    if (imgObj.complete) {
+        if (imgObj.naturalWidth > 0 && imgObj.naturalHeight > 0) resolve()
+        else reject()
+    }
+    void ready.catch(() => undefined)
+    return ready
+}
+
 export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string, ext?:string, id?:string} = {}, sourceUrl?: string) {
     const imgid = arg.id ?? v4()
     const source = sourceUrl || imgObj.currentSrc || imgObj.src
     if (!source) throw new Error('Inlay image source is unavailable')
+    const ready = isTauri ? null : imageReadiness(imgObj, sourceUrl)
     const response = await fetch(source)
     if (!response.ok) throw new Error(`Failed to read Inlay image source: ${response.status}`)
     const data = new Uint8Array(await response.arrayBuffer())
@@ -103,23 +133,13 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
     let drawWidth = 0
     const canvas = document.createElement('canvas')
     const ctx = canvas.getContext('2d')
-    await new Promise<void>((resolve, reject) => {
-        imgObj.onload = () => {
-            drawHeight = imgObj.naturalHeight || imgObj.height
-            drawWidth = imgObj.naturalWidth || imgObj.width
-
-            canvas.width = drawWidth
-            canvas.height = drawHeight
-            if (!ctx) {
-                reject(new Error('Image canvas is unavailable'))
-                return
-            }
-            ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
-            resolve(null)
-        }
-        imgObj.onerror = () => reject(new Error('Failed to load image'))
-        if (sourceUrl) imgObj.src = sourceUrl
-    })
+    await ready
+    drawHeight = imgObj.naturalHeight || imgObj.height
+    drawWidth = imgObj.naturalWidth || imgObj.width
+    canvas.width = drawWidth
+    canvas.height = drawHeight
+    if (!ctx) throw new Error('Image canvas is unavailable')
+    ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
     const imageBlob = await new Promise<Blob>((resolve, reject) => {
         canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Failed to encode Inlay image')), 'image/webp', 0.85)
     })
@@ -392,17 +412,47 @@ function isAnimatedPng(data: Uint8Array): boolean {
     return false
 }
 
+function hasAvifBrand(data: Uint8Array): boolean {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    const text = new TextDecoder()
+    for (let offset = 0; offset + 8 <= data.byteLength;) {
+        const size32 = view.getUint32(offset)
+        const type = text.decode(data.subarray(offset + 4, offset + 8))
+        let headerSize = 8
+        let boxSize = size32
+        if (size32 === 1) {
+            if (offset + 16 > data.byteLength) return false
+            const high = view.getUint32(offset + 8)
+            const low = view.getUint32(offset + 12)
+            boxSize = high * 0x1_0000_0000 + low
+            headerSize = 16
+        } else if (size32 === 0) {
+            boxSize = data.byteLength - offset
+        }
+        if (!Number.isSafeInteger(boxSize) || boxSize < headerSize || offset + boxSize > data.byteLength) return false
+        if (type === 'ftyp') {
+            const brandsStart = offset + headerSize
+            if (brandsStart + 8 > offset + boxSize) return false
+            for (let brandOffset = brandsStart; brandOffset + 4 <= offset + boxSize; brandOffset += brandOffset === brandsStart ? 8 : 4) {
+                const brand = text.decode(data.subarray(brandOffset, brandOffset + 4)).toLowerCase()
+                if (brand === 'avif' || brand === 'avis') return true
+            }
+            return false
+        }
+        offset += boxSize
+    }
+    return false
+}
+
 function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): void {
     const normalizedExt = ext.replace(/^\.+/, '').toLowerCase()
-    const normalizedMime = mime.toLowerCase()
+    const normalizedMime = mime.split(';', 1)[0].trim().toLowerCase()
     const gifSignature = data.byteLength >= 6
         && new TextDecoder().decode(data.subarray(0, 6)).startsWith('GIF8')
     if (normalizedExt === 'gif' || normalizedMime === 'image/gif' || gifSignature) {
         throw new Error('New GIF Inlay images are unsupported because animation cannot be preserved')
     }
-    const avifSignature = data.byteLength >= 12
-        && new TextDecoder().decode(data.subarray(4, 12)).startsWith('ftypavif')
-    if (normalizedExt === 'avif' || normalizedMime === 'image/avif' || avifSignature) {
+    if (normalizedExt === 'avif' || normalizedMime === 'image/avif' || hasAvifBrand(data)) {
         throw new Error('New AVIF Inlay images are unsupported')
     }
     if (isAnimatedWebP(data)) throw new Error('Animated WebP Inlay images are unsupported')

@@ -351,6 +351,23 @@ fn writes_png_inlay_as_full_dimension_webp_with_truthful_metadata() {
     );
 }
 
+#[test]
+fn first_write_creates_a_missing_app_data_directory() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("new-app-data");
+
+    let metadata = write_inlay_image(
+        &root,
+        "first-image",
+        &encoded_fixture(ImageFormat::Png, 2, 4),
+        "first.png",
+    )
+    .unwrap();
+
+    assert_eq!((metadata.width, metadata.height), (2, 4));
+    assert!(root.join("blobstore/inlay-transactions").is_dir());
+}
+
 fn with_exif_orientation(jpeg: Vec<u8>, orientation: u8) -> Vec<u8> {
     assert!(jpeg.starts_with(&[0xff, 0xd8]));
     let mut exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
@@ -547,7 +564,6 @@ fn startup_recovery_restores_the_prior_pair_after_interrupted_promotion() {
         .unwrap(),
     )
     .unwrap();
-
     recover_inlay_writes(temp.path()).unwrap();
 
     assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
@@ -602,7 +618,6 @@ fn startup_recovery_rejects_a_same_length_corrupt_new_pair() {
         .unwrap(),
     )
     .unwrap();
-
     recover_inlay_writes(temp.path()).unwrap();
 
     assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
@@ -762,6 +777,9 @@ fn process_kill_after_complete_pair_promotion_keeps_the_hash_valid_new_pair() {
     fs::write(&payload_path, &fixture_payload).unwrap();
     fs::write(&metadata_path, &new_metadata).unwrap();
     let transaction_dir = temp.path().join("blobstore/inlay-transactions");
+    let committed_temp = transaction_dir.join(format!(
+        ".{encoded_id}.process-kill.committed.json.replace-next"
+    ));
     fs::write(
         transaction_dir.join(format!("{encoded_id}.json")),
         serde_json::to_vec(&json!({
@@ -775,9 +793,146 @@ fn process_kill_after_complete_pair_promotion_keeps_the_hash_valid_new_pair() {
         .unwrap(),
     )
     .unwrap();
+    fs::write(&committed_temp, b"interrupted committed marker").unwrap();
 
     recover_inlay_writes(temp.path()).unwrap();
 
     assert_eq!(fs::read(payload_path).unwrap(), fixture_payload);
     assert_eq!(fs::read(metadata_path).unwrap(), new_metadata);
+    assert!(!committed_temp.exists());
+}
+
+#[test]
+fn first_write_recovery_removes_journal_less_staging_and_incomplete_final_files() {
+    for promoted_payload in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let id = if promoted_payload {
+            "first-promoted"
+        } else {
+            "first-staged"
+        };
+        let encoded_id = hex(id);
+        let payload_dir = temp.path().join("blobstore/inlays");
+        let metadata_dir = temp.path().join("blobstore/metadata");
+        fs::create_dir_all(&payload_dir).unwrap();
+        fs::create_dir_all(&metadata_dir).unwrap();
+        let payload_path = payload_dir.join(format!("{encoded_id}.bin"));
+        let next_payload = payload_dir.join(format!(".{encoded_id}.legacy.bin.replace-next"));
+        let next_metadata = metadata_dir.join(format!(".{encoded_id}.legacy.json.replace-next"));
+        if promoted_payload {
+            fs::write(&payload_path, b"incomplete promoted payload").unwrap();
+        } else {
+            fs::write(&next_payload, b"staged payload").unwrap();
+        }
+        fs::write(&next_metadata, b"staged metadata").unwrap();
+
+        recover_inlay_writes(temp.path()).unwrap();
+
+        assert!(!payload_path.exists());
+        assert!(!next_payload.exists());
+        assert!(!next_metadata.exists());
+    }
+}
+
+#[test]
+fn first_write_recovery_removes_unpromoted_directory_entries() {
+    let temp = TempDir::new().unwrap();
+    let blobstore_stage = temp.path().join(".blobstore.replace-next-dir");
+    let blobstore = temp.path().join("blobstore");
+    let transaction_stage = blobstore.join(".inlay-transactions.replace-next-dir");
+    fs::create_dir(&blobstore_stage).unwrap();
+    fs::create_dir(&blobstore).unwrap();
+    fs::create_dir(&transaction_stage).unwrap();
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert!(!blobstore_stage.exists());
+    assert!(!transaction_stage.exists());
+}
+
+#[test]
+fn journal_less_previous_files_restore_an_interrupted_overwrite() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "legacy-previous",
+        &encoded_fixture(ImageFormat::Png, 4, 3),
+        "prior.png",
+    )
+    .unwrap();
+    let encoded_id = hex("legacy-previous");
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{encoded_id}.bin"));
+    let prior_payload = fs::read(&payload_path).unwrap();
+    let previous_payload = payload_path.with_extension("bin.replace-previous");
+    fs::rename(&payload_path, &previous_payload).unwrap();
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
+    assert!(!previous_payload.exists());
+}
+
+#[test]
+fn committed_journal_left_by_cleanup_failure_never_rolls_back_a_later_opaque_write() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "committed-stale",
+        &encoded_fixture(ImageFormat::Png, 3, 3),
+        "prior.png",
+    )
+    .unwrap();
+    let encoded_id = hex("committed-stale");
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{encoded_id}.bin"));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{encoded_id}.json"));
+    let committed_payload = fs::read(&payload_path).unwrap();
+    let committed_metadata = fs::read(&metadata_path).unwrap();
+    let blocked_cleanup = payload_path.with_extension("bin.replace-previous");
+    fs::create_dir(&blocked_cleanup).unwrap();
+    fs::copy(
+        &metadata_path,
+        metadata_path.with_extension("json.replace-previous"),
+    )
+    .unwrap();
+    let transaction_dir = temp.path().join("blobstore/inlay-transactions");
+    fs::write(
+        transaction_dir.join(format!("{encoded_id}.json")),
+        serde_json::to_vec(&json!({
+            "id": "committed-stale",
+            "suffix": "cleanup-failed",
+            "phase": "committed",
+            "hadPayload": true,
+            "hadMetadata": true,
+            "payloadSha256": sha256_hex(&committed_payload),
+            "metadataSha256": sha256_hex(&committed_metadata),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let journal = transaction_dir.join(format!("{encoded_id}.json"));
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert!(journal.exists());
+    let opaque_payload = b"later opaque restore bytes";
+    write_blob(temp.path(), "committed-stale", opaque_payload, "image/png");
+    let opaque_metadata = fs::read(&metadata_path).unwrap();
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert_eq!(fs::read(payload_path).unwrap(), opaque_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), opaque_metadata);
+    assert!(journal.exists());
+    fs::remove_dir(blocked_cleanup).unwrap();
+    recover_inlay_writes(temp.path()).unwrap();
+    assert_eq!(fs::read_dir(transaction_dir).unwrap().count(), 0);
 }
