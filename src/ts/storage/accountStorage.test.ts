@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AccountNativeOfficialWriteAttemptContext } from './accountStorage'
 import type { NativeOfficialAccountFlow } from './sync/nativeOfficialAccountFlow'
 
 const mocks = vi.hoisted(() => {
@@ -447,6 +448,38 @@ describe('AccountStorage structured wire contract', () => {
         unsubscribe()
 
         expect(seen).toEqual(['', 'quota nearing limit'])
+    })
+
+    it('adopts recovered session and warning metadata without exposing raw session accessors', async () => {
+        const { AccountStorage, AccountWarning, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'native-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+        const seen: string[] = []
+        const unsubscribe = AccountWarning.subscribe((value) => seen.push(value))
+
+        const recovered = storage.adoptRecoveredOfficialWrite({
+            session: 'recovered-session',
+            warning: 'recovered warning',
+            reloadSession: false,
+        })
+        const attempt = vi.fn(async (_context: AccountNativeOfficialWriteAttemptContext) => ({
+            kind: 'not-modified' as const,
+            session: 'recovered-session',
+            replacementKey: 'database/database.bin',
+            receipt: undefined,
+        }))
+        await storage.writeOfficialDatabaseFromNative(attempt)
+        await recovered.completeReload()
+        unsubscribe()
+
+        expect(attempt.mock.calls[0][0].session).toBe('recovered-session')
+        expect(seen).toEqual(['', 'recovered warning'])
+        expect(mocks.alertNormalWait).not.toHaveBeenCalled()
     })
 
     it('defers native reload-session handling until durable finalization calls the callback', async () => {

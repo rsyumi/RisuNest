@@ -74,6 +74,12 @@ export type AccountNativeOfficialWriteAttempt<T> = (
     context: AccountNativeOfficialWriteAttemptContext,
 ) => Promise<AccountNativeOfficialWriteAttemptResult<T> | null>
 
+export interface AccountRecoveredOfficialWrite {
+    session: string | null
+    warning?: string | null
+    reloadSession?: boolean
+}
+
 export interface AccountStorageCache {
     getItem(key: string): Promise<unknown | null>
     setItem(key: string, value: unknown): Promise<unknown>
@@ -259,6 +265,16 @@ export class AccountStorage{
                 receipt: result.receipt,
                 completeReload: () => applyAccountReload(result.reloadSession ?? false),
             }
+        }
+    }
+
+    adoptRecoveredOfficialWrite(result: AccountRecoveredOfficialWrite): {
+        completeReload(): Promise<void>
+    } {
+        if (result.session !== null) risuSession = result.session
+        publishAccountWarning(result.warning)
+        return {
+            completeReload: () => applyAccountReload(result.reloadSession ?? false),
         }
     }
 

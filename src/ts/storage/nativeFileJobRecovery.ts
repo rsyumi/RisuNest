@@ -12,6 +12,10 @@ export interface NativeFileJobRecoveryResult {
     pendingOfficialPublications: string[]
 }
 
+export interface NativeFileJobRecoveryOptions {
+    reconcileRestores?: boolean
+}
+
 const productionDependencies: NativeFileJobRecoveryDependencies = {
     invoke: (command, args) => args === undefined ? invoke(command) : invoke(command, args),
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -102,6 +106,7 @@ function assertNever(value: never): never {
 
 export async function reconcileNativeFileJobsBeforeBootstrap(
     dependencies: NativeFileJobRecoveryDependencies = productionDependencies,
+    options: NativeFileJobRecoveryOptions = {},
 ): Promise<NativeFileJobRecoveryResult> {
     const jobs = await dependencies.invoke('native_file_job_list') as NativeFileJobStatus[]
     const pendingRestoreAcknowledgements: string[] = []
@@ -111,6 +116,7 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
         switch (kind) {
             case 'restore-block-risu-save':
             case 'restore-lossless-backup': {
+                if (options.reconcileRestores === false) break
                 const terminal = isTerminal(job) ? job : await reconcileRestore(job, dependencies)
                 if (terminal.state === 'succeeded') {
                     pendingRestoreAcknowledgements.push(terminal.jobId)
@@ -159,4 +165,13 @@ export async function acknowledgeRecoveredNativeRestores(
     for (const jobId of jobIds) {
         await dependencies.invoke('native_file_job_forget', { jobId })
     }
+}
+
+export async function listNativeOfficialPublicationJobs(
+    dependencies: NativeFileJobRecoveryDependencies = productionDependencies,
+): Promise<string[]> {
+    const jobs = await dependencies.invoke('native_file_job_list') as NativeFileJobStatus[]
+    return jobs
+        .filter((job) => job.kind === 'official-publication-upload')
+        .map((job) => job.jobId)
 }

@@ -274,6 +274,33 @@ describe('native file job bootstrap reconciliation', () => {
         expect(calls).toEqual(['native_file_job_list'])
     })
 
+    it('scans publications on Tauri targets where restore jobs are not supported', async () => {
+        const calls: string[] = []
+        const result = await reconcileNativeFileJobsBeforeBootstrap({
+            invoke: vi.fn(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [
+                    restoreStatus('restore-unsupported', 'running', 'reading-source'),
+                    {
+                        jobId: 'publication-android',
+                        kind: 'official-publication-upload',
+                        state: 'running',
+                        phase: 'uploading-database',
+                        progress: { completedBytes: 0, completedItems: 0 },
+                    },
+                ]
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        }, { reconcileRestores: false })
+
+        expect(result).toEqual({
+            pendingRestoreAcknowledgements: [],
+            pendingOfficialPublications: ['publication-android'],
+        })
+        expect(calls).toEqual(['native_file_job_list'])
+    })
+
     it('forgets committed restores only after the caller reports successful plugin loading', async () => {
         const calls: string[] = []
         const dependencies = {

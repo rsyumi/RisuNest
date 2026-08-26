@@ -1215,11 +1215,12 @@ function assertOfficialPublicationResult(
     }
     const result = value as Record<string, unknown>
     if (
-        typeof result.accountId !== 'string'
-        || (result.session !== null && typeof result.session !== 'string')
-        || typeof result.saveDate !== 'string'
-        || typeof result.status !== 'number'
-        || !Number.isFinite(result.status)
+        !isBoundedString(result.accountId, 512, false)
+        || (result.session !== null && !isBoundedString(result.session, 4_096, true))
+        || !isBoundedString(result.saveDate, 128, false)
+        || !Number.isInteger(result.status)
+        || (result.status as number) < 100
+        || (result.status as number) > 599
     ) {
         throw new NativeFileJobError(
             'invalid-result',
@@ -1229,15 +1230,15 @@ function assertOfficialPublicationResult(
     switch (result.kind) {
         case 'written':
             if (
-                typeof result.replacementKey === 'string'
-                && (result.warning === null || typeof result.warning === 'string')
+                isBoundedString(result.replacementKey, 4_096, false)
+                && (result.warning === null || isBoundedString(result.warning, 4_096, true))
                 && typeof result.reloadSession === 'boolean'
             ) {
                 return result as unknown as NativeOfficialPublicationAttemptResult
             }
             break
         case 'not-modified':
-            if (typeof result.replacementKey === 'string') {
+            if (isBoundedString(result.replacementKey, 4_096, false)) {
                 return result as unknown as NativeOfficialPublicationAttemptResult
             }
             break
@@ -1249,6 +1250,91 @@ function assertOfficialPublicationResult(
         'invalid-result',
         'Native official publication returned invalid publication metadata',
     )
+}
+
+function isBoundedString(value: unknown, maximumLength: number, allowEmpty: boolean): value is string {
+    return typeof value === 'string'
+        && value.length <= maximumLength
+        && (allowEmpty || value.length > 0)
+}
+
+function areBoundedWarningCodes(value: unknown): value is string[] {
+    return Array.isArray(value)
+        && value.length <= 64
+        && value.every((code) => isBoundedString(code, 128, false))
+}
+
+function createOfficialPublicationReceipt(
+    terminal: NativeFileJobStatus,
+    dependencies: NativeFileJobDependencies,
+    expected: {
+        jobId: string
+        revision?: number
+        accountId?: string
+        saveDate?: string
+    },
+    startWarningCodes: readonly string[] = [],
+): NativeOfficialPublicationReceipt {
+    if (terminal.state !== 'succeeded' || !terminal.result?.publication) {
+        throw new NativeFileJobError(
+            'missing-result',
+            'Native official publication returned no result',
+        )
+    }
+    const publication = assertOfficialPublicationResult(terminal.result.publication)
+    if (
+        terminal.jobId !== expected.jobId
+        || terminal.kind !== 'official-publication-upload'
+        || (expected.revision !== undefined && terminal.result.revision !== expected.revision)
+        || (expected.accountId !== undefined && publication.accountId !== expected.accountId)
+        || (expected.saveDate !== undefined && publication.saveDate !== expected.saveDate)
+        || !Number.isSafeInteger(terminal.result.revision)
+        || terminal.result.revision < 0
+        || !Number.isSafeInteger(terminal.result.sourceBytes)
+        || terminal.result.sourceBytes < 0
+        || typeof terminal.result.sourceSha256 !== 'string'
+        || !/^[0-9a-f]{64}$/.test(terminal.result.sourceSha256)
+        || !Number.isSafeInteger(terminal.result.characterCount)
+        || terminal.result.characterCount < 0
+        || !Number.isSafeInteger(terminal.result.presetCount)
+        || terminal.result.presetCount < 0
+        || !areBoundedWarningCodes(startWarningCodes)
+        || !areBoundedWarningCodes(terminal.warningCodes ?? [])
+        || !areBoundedWarningCodes(terminal.result.warningCodes)
+    ) {
+        throw new NativeFileJobError(
+            'invalid-result',
+            'Native official publication returned mismatched association metadata',
+        )
+    }
+
+    const result = {
+        ...terminal.result,
+        publication,
+        warningCodes: [...new Set([
+            ...startWarningCodes,
+            ...(terminal.warningCodes ?? []),
+            ...terminal.result.warningCodes,
+        ])].slice(0, 16),
+    } as NativeOfficialPublicationReceipt['result']
+    let acknowledged = false
+    let acknowledgement: Promise<void> | undefined
+
+    return {
+        jobId: terminal.jobId,
+        result,
+        acknowledge: async () => {
+            if (acknowledged) return
+            acknowledgement ??= invokeNative(dependencies, 'native_file_job_forget', {
+                jobId: terminal.jobId,
+            }).then(() => {
+                acknowledged = true
+            }).finally(() => {
+                acknowledgement = undefined
+            })
+            await acknowledgement
+        },
+    }
 }
 
 export async function runNativeOfficialPublicationAttempt(
@@ -1332,60 +1418,41 @@ export async function runNativeOfficialPublicationAttempt(
         catch {}
         throw error
     }
-    if (!terminal.result?.publication) {
-        throw new NativeFileJobError(
-            'missing-result',
-            'Native official publication returned no result',
-        )
-    }
-    const publication = assertOfficialPublicationResult(terminal.result.publication)
-    if (
-        terminal.jobId !== started.jobId
-        || terminal.kind !== 'official-publication-upload'
-        || terminal.result.revision !== request.expectedRevision
-        || publication.accountId !== request.accountId
-        || publication.saveDate !== request.saveDate
-        || !Number.isSafeInteger(terminal.result.sourceBytes)
-        || terminal.result.sourceBytes < 0
-        || typeof terminal.result.sourceSha256 !== 'string'
-        || !/^[0-9a-f]{64}$/.test(terminal.result.sourceSha256)
-        || !Number.isSafeInteger(terminal.result.characterCount)
-        || terminal.result.characterCount < 0
-        || !Number.isSafeInteger(terminal.result.presetCount)
-        || terminal.result.presetCount < 0
-        || !Array.isArray(terminal.result.warningCodes)
-        || terminal.result.warningCodes.some((code) => typeof code !== 'string')
-    ) {
-        throw new NativeFileJobError(
-            'invalid-result',
-            'Native official publication returned mismatched association metadata',
-        )
-    }
-
-    const result = {
-        ...terminal.result,
-        publication,
-        warningCodes: [...new Set([
-            ...(started.warningCodes ?? []),
-            ...terminal.result.warningCodes,
-        ])].slice(0, 16),
-    } as NativeOfficialPublicationReceipt['result']
-    let acknowledged = false
-    let acknowledgement: Promise<void> | undefined
-
-    return {
+    return createOfficialPublicationReceipt(terminal, dependencies, {
         jobId: started.jobId,
-        result,
-        acknowledge: async () => {
-            if (acknowledged) return
-            acknowledgement ??= invokeNative(dependencies, 'native_file_job_forget', {
-                jobId: started.jobId,
-            }).then(() => {
-                acknowledged = true
-            }).finally(() => {
-                acknowledgement = undefined
-            })
-            await acknowledgement
-        },
+        revision: request.expectedRevision,
+        accountId: request.accountId,
+        saveDate: request.saveDate,
+    }, started.warningCodes)
+}
+
+export async function resumeNativeOfficialPublication(
+    jobId: string,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeOfficialPublicationReceipt | null> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native official publication requires Tauri')
+    }
+    while (true) {
+        if (options.signal?.aborted) throw abortError()
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (status.jobId !== jobId || status.kind !== 'official-publication-upload') {
+            throw new NativeFileJobError(
+                'invalid-result',
+                'Native official publication recovery returned a mismatched job',
+            )
+        }
+        if (status.state === 'succeeded') {
+            return createOfficialPublicationReceipt(status, dependencies, { jobId })
+        }
+        if (status.state === 'failed' || status.state === 'cancelled') {
+            await invokeNative(dependencies, 'native_file_job_forget', { jobId })
+            return null
+        }
+        await dependencies.wait(options.pollIntervalMs ?? 100)
     }
 }

@@ -8,6 +8,7 @@ import {
     runNativeLosslessBackupExport,
     runNativeLosslessBackupRestore,
     runNativeOfficialPublicationAttempt,
+    resumeNativeOfficialPublication,
     type NativeFileJobStatus,
     type NativeOfficialPublicationAttemptResult,
 } from './nativeFileJobs'
@@ -1691,5 +1692,85 @@ describe('native file jobs', () => {
         expect(commands).not.toContain('native_file_job_forget')
         await receipt?.acknowledge()
         expect(commands.at(-1)).toBe('native_file_job_forget')
+    })
+
+    it('resumes an active publication as an unacknowledged terminal receipt', async () => {
+        const commands: string[] = []
+        let poll = 0
+        const terminal = {
+            jobId: 'publication-recovered',
+            kind: 'official-publication-upload' as const,
+            state: 'succeeded' as const,
+            phase: 'complete' as const,
+            progress: { completedBytes: 128, completedItems: 2 },
+            result: {
+                revision: 9,
+                sourceBytes: 128,
+                sourceSha256: 'd'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+                publication: {
+                    kind: 'not-modified' as const,
+                    accountId: 'account-1',
+                    session: 'session-2',
+                    saveDate: '1777777777777',
+                    status: 304,
+                    replacementKey: 'database/database.bin',
+                },
+            },
+        }
+        const receipt = await resumeNativeOfficialPublication(
+            'publication-recovered',
+            { pollIntervalMs: 0 },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_status') {
+                        if (poll++ === 0) return {
+                            ...terminal,
+                            state: 'running',
+                            phase: 'uploading-database',
+                            result: undefined,
+                        }
+                        return terminal
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(receipt?.result).toEqual(terminal.result)
+        expect(commands).toEqual(['native_file_job_status', 'native_file_job_status'])
+
+        await receipt?.acknowledge()
+        expect(commands.at(-1)).toBe('native_file_job_forget')
+    })
+
+    it('forgets a recovered failed publication without exposing an association receipt', async () => {
+        const commands: string[] = []
+
+        await expect(resumeNativeOfficialPublication('publication-failed', {}, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                commands.push(command)
+                if (command === 'native_file_job_status') return {
+                    jobId: 'publication-failed',
+                    kind: 'official-publication-upload',
+                    state: 'failed',
+                    phase: 'complete',
+                    progress: { completedBytes: 0, completedItems: 0 },
+                    error: { code: 'offline', message: 'offline' },
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        })).resolves.toBeNull()
+
+        expect(commands).toEqual(['native_file_job_status', 'native_file_job_forget'])
     })
 })
