@@ -2,13 +2,42 @@
 mod asset_repository;
 
 use asset_repository::{PayloadCas, PreparedPayload};
+use std::ffi::OsString;
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
+
+const RACE_ROOT_ENV: &str = "RISUNEST_CAS_RACE_ROOT";
+const RACE_START_ENV: &str = "RISUNEST_CAS_RACE_START";
+const RACE_READY_ENV: &str = "RISUNEST_CAS_RACE_READY";
+const RACE_RESULT_ENV: &str = "RISUNEST_CAS_RACE_RESULT";
+
+#[cfg(unix)]
+fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn symlink_file(original: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
+}
+
+#[cfg(unix)]
+fn symlink_directory(original: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn symlink_directory(original: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_dir(original, link)
+}
 
 #[test]
 fn stores_exact_bytes_at_the_sha256_shard_path() {
     let directory = tempfile::tempdir().expect("temporary repository");
-    let cas = PayloadCas::new(directory.path());
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
 
     let prepared = cas.prepare_bytes(b"abc").expect("prepare payload");
 
@@ -22,6 +51,7 @@ fn stores_exact_bytes_at_the_sha256_shard_path() {
         "assets-v2/objects/ba/7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
     assert!(!prepared.deduplicated);
+    assert_eq!(prepared.directory_entries_synced, cfg!(unix));
     assert_eq!(
         std::fs::read(directory.path().join(&prepared.physical_key)).expect("stored payload"),
         b"abc"
@@ -31,7 +61,7 @@ fn stores_exact_bytes_at_the_sha256_shard_path() {
 #[test]
 fn zero_byte_duplicates_reuse_the_existing_immutable_object() {
     let directory = tempfile::tempdir().expect("temporary repository");
-    let cas = PayloadCas::new(directory.path());
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
 
     let first = cas.prepare_bytes(b"").expect("first prepare");
     let second = cas.prepare_bytes(b"").expect("duplicate prepare");
@@ -60,7 +90,7 @@ fn zero_byte_duplicates_reuse_the_existing_immutable_object() {
 #[test]
 fn rejects_an_existing_target_with_different_exact_bytes() {
     let directory = tempfile::tempdir().expect("temporary repository");
-    let cas = PayloadCas::new(directory.path());
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
     let first = cas.prepare_bytes(b"abc").expect("initial prepare");
     let object_path = directory.path().join(&first.physical_key);
     std::fs::write(&object_path, b"abd").expect("corrupt existing object");
@@ -97,7 +127,7 @@ impl Read for InterruptedReader {
 #[test]
 fn interrupted_stream_removes_its_unique_staging_file() {
     let directory = tempfile::tempdir().expect("temporary repository");
-    let cas = PayloadCas::new(directory.path());
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
     let mut reader = InterruptedReader { yielded: false };
 
     let error = cas
@@ -115,7 +145,7 @@ fn interrupted_stream_removes_its_unique_staging_file() {
 #[test]
 fn direct_stat_rejects_hashes_that_could_escape_the_owned_root() {
     let directory = tempfile::tempdir().expect("temporary repository");
-    let cas = PayloadCas::new(directory.path());
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
 
     for invalid in [
         "../objects",
@@ -131,7 +161,7 @@ fn direct_stat_rejects_hashes_that_could_escape_the_owned_root() {
 #[test]
 fn direct_stat_and_read_resolve_only_the_requested_hash_path() {
     let directory = tempfile::tempdir().expect("temporary repository");
-    let cas = PayloadCas::new(directory.path());
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
     let prepared = cas
         .prepare_bytes(b"direct lookup")
         .expect("prepare payload");
@@ -152,6 +182,112 @@ fn direct_stat_and_read_resolve_only_the_requested_hash_path() {
 }
 
 #[test]
+fn rejects_a_linked_object_target_without_reading_or_replacing_it() {
+    let directory = tempfile::tempdir().expect("temporary repository");
+    let external = tempfile::NamedTempFile::new().expect("external payload");
+    std::fs::write(external.path(), b"abc").expect("write external payload");
+    let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let object_path =
+        directory
+            .path()
+            .join(format!("assets-v2/objects/{}/{}", &hash[..2], &hash[2..]));
+    std::fs::create_dir_all(object_path.parent().expect("object parent"))
+        .expect("create object parent");
+    symlink_file(external.path(), &object_path).expect("link external payload");
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
+
+    let prepare_error = cas
+        .prepare_bytes(b"abc")
+        .expect_err("linked object must not satisfy prepare");
+    let stat_error = cas
+        .stat_object(hash)
+        .expect_err("linked object must not satisfy stat");
+    let read_error = cas
+        .read_object(hash)
+        .expect_err("linked object must not satisfy read");
+
+    assert_eq!(prepare_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(stat_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read(external.path()).expect("external payload remains"),
+        b"abc"
+    );
+}
+
+#[test]
+fn rejects_a_linked_repository_component_without_writing_outside_the_root() {
+    let directory = tempfile::tempdir().expect("temporary repository");
+    let external = tempfile::tempdir().expect("external directory");
+    let assets_path = directory.path().join("assets-v2");
+    symlink_directory(external.path(), &assets_path).expect("link external directory");
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
+
+    let error = cas
+        .prepare_bytes(b"abc")
+        .expect_err("linked repository component must be rejected");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read_dir(external.path())
+            .expect("read external directory")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn rejects_a_repository_root_reached_through_a_link_component() {
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let external = tempfile::tempdir().expect("external repository");
+    let linked_root = parent.path().join("linked-root");
+    symlink_directory(external.path(), &linked_root).expect("link repository root");
+
+    let error = PayloadCas::new(&linked_root).expect_err("linked root must be rejected");
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read_dir(external.path())
+            .expect("read external repository")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn rejects_a_repository_root_replaced_after_open_for_every_operation() {
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let external = tempfile::tempdir().expect("external repository");
+    let repository_root = parent.path().join("repository");
+    let original_root = parent.path().join("original-repository");
+    std::fs::create_dir(&repository_root).expect("create repository root");
+    let cas = PayloadCas::new(&repository_root).expect("open repository");
+    std::fs::rename(&repository_root, &original_root).expect("move original repository root");
+    symlink_directory(external.path(), &repository_root).expect("replace repository root");
+    let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    let prepare_error = cas
+        .prepare_bytes(b"abc")
+        .expect_err("replaced root must reject prepare");
+    let stat_error = cas
+        .stat_object(hash)
+        .expect_err("replaced root must reject stat");
+    let read_error = cas
+        .read_object(hash)
+        .expect_err("replaced root must reject read");
+
+    assert_eq!(prepare_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(stat_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        std::fs::read_dir(external.path())
+            .expect("read external repository")
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn concurrent_publish_race_creates_one_object_and_cleans_all_staging_files() {
     let directory = tempfile::tempdir().expect("temporary repository");
     let repository_root = directory.path().to_path_buf();
@@ -161,7 +297,7 @@ fn concurrent_publish_race_creates_one_object_and_cleans_all_staging_files() {
             let repository_root = repository_root.clone();
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let cas = PayloadCas::new(repository_root);
+                let cas = PayloadCas::new(repository_root).expect("open repository");
                 barrier.wait();
                 cas.prepare_bytes(b"race payload")
             })
@@ -197,4 +333,128 @@ fn concurrent_publish_race_creates_one_object_and_cleans_all_staging_files() {
             .count(),
         0
     );
+}
+
+#[test]
+fn cross_process_publish_child() {
+    let Some(repository_root) = std::env::var_os(RACE_ROOT_ENV) else {
+        return;
+    };
+    let start = PathBuf::from(std::env::var_os(RACE_START_ENV).expect("race child start path"));
+    let ready = PathBuf::from(std::env::var_os(RACE_READY_ENV).expect("race child ready path"));
+    let result = PathBuf::from(std::env::var_os(RACE_RESULT_ENV).expect("race child result path"));
+    std::fs::write(&ready, b"ready").expect("announce race child readiness");
+    wait_for_path(&start, "race start signal");
+
+    let cas = PayloadCas::new(repository_root).expect("open repository");
+    let payload = vec![0x5a; 4 * 1024 * 1024];
+    let prepared = cas.prepare_bytes(&payload).expect("child prepare");
+    std::fs::write(
+        result,
+        if prepared.deduplicated {
+            b"duplicate".as_slice()
+        } else {
+            b"created".as_slice()
+        },
+    )
+    .expect("write race child result");
+}
+
+#[test]
+fn cross_process_publish_race_creates_exactly_one_object() {
+    let directory = tempfile::tempdir().expect("temporary repository");
+    let coordination = tempfile::tempdir().expect("temporary coordination directory");
+    let executable = std::env::current_exe().expect("current test executable");
+    let start = coordination.path().join("start");
+    let mut ready_paths = Vec::new();
+    let mut result_paths = Vec::new();
+    let mut children = Vec::new();
+
+    for index in 0..8 {
+        let ready = coordination.path().join(format!("ready-{index}"));
+        let result = coordination.path().join(format!("result-{index}"));
+        children.push(spawn_race_child(
+            &executable,
+            directory.path().as_os_str().to_owned(),
+            &start,
+            &ready,
+            &result,
+        ));
+        ready_paths.push(ready);
+        result_paths.push(result);
+    }
+
+    wait_for_paths(&ready_paths, "race children readiness");
+    std::fs::write(&start, b"start").expect("release race children");
+    wait_for_children(children);
+
+    let results = result_paths
+        .iter()
+        .map(|path| std::fs::read_to_string(path).expect("race child result"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results.iter().filter(|result| *result == "created").count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| *result == "duplicate")
+            .count(),
+        7
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path().join("assets-v2/staging"))
+            .expect("cross-process staging directory")
+            .count(),
+        0
+    );
+}
+
+fn spawn_race_child(
+    executable: &Path,
+    repository_root: OsString,
+    start: &Path,
+    ready: &Path,
+    result: &Path,
+) -> Child {
+    Command::new(executable)
+        .arg("cross_process_publish_child")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(RACE_ROOT_ENV, repository_root)
+        .env(RACE_START_ENV, start)
+        .env(RACE_READY_ENV, ready)
+        .env(RACE_RESULT_ENV, result)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn race child")
+}
+
+fn wait_for_path(path: &Path, description: &str) {
+    wait_for_paths(&[path.to_path_buf()], description);
+}
+
+fn wait_for_paths(paths: &[PathBuf], description: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !paths.iter().all(|path| path.exists()) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_children(children: Vec<Child>) {
+    for child in children {
+        let output = child.wait_with_output().expect("wait for race child");
+        assert!(
+            output.status.success(),
+            "race child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
 }
