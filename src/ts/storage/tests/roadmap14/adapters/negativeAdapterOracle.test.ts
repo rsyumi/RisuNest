@@ -52,6 +52,19 @@ describe('Roadmap 14 negative adapter oracle', () => {
         })
     })
 
+    it('records a resolved invalid required block as a known gap even when a character is returned', async () => {
+        const acceptInvalidBlock = vi.fn(async () => ({
+            characters: [{ chaId: 'char-invalid' }],
+        }))
+
+        await expect(observeRisuSaveNegativeFixture('invalid-required-block', acceptInvalidBlock)).resolves.toEqual({
+            fixtureId: 'invalid-required-block',
+            status: 'known-gap',
+            observed: 'invalid required character block was accepted',
+            warning: 'Block RisuSave may skip an invalid required block and return partial data.',
+        })
+    })
+
     it('freezes truncated-tail and payload-before-database local backup failures', () => {
         expect(inspectLocalBackupFixture('truncated-local-backup-tail')).toEqual({
             evidence: 'fixture-only',

@@ -69,20 +69,16 @@ export async function observeRisuSaveNegativeFixture(
                 }
         }
 
-        const skippedInvalidBlock = !decoded.characters?.some((character) =>
+        const acceptedInvalidBlock = decoded.characters?.some((character) =>
             character.chaId === 'char-invalid')
-        return skippedInvalidBlock
-            ? {
-                fixtureId: id,
-                status: 'known-gap',
-                observed: 'invalid required character block was skipped',
-                warning: value.warning,
-            }
-            : {
-                fixtureId: id,
-                status: 'passing',
-                observed: 'invalid required character block was rejected',
-            }
+        return {
+            fixtureId: id,
+            status: 'known-gap',
+            observed: acceptedInvalidBlock
+                ? 'invalid required character block was accepted'
+                : 'invalid required character block was skipped',
+            warning: value.warning,
+        }
     } catch {
         return {
             fixtureId: id,
