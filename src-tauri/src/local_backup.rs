@@ -129,6 +129,7 @@ pub(crate) fn parse_legacy_local_backup_v1(
 ) -> Result<LegacyLocalBackupParseReport, LocalBackupError> {
     check_cancelled(cancellation)?;
     let staging_directory = prepare_staging_directory(job_staging_root)?;
+    let mut staging_ownership = ParseStagingOwnership::default();
     let mut source = TrackedReader::new(reader);
     let mut entries = Vec::new();
     let mut normalized_names = HashSet::new();
@@ -190,6 +191,7 @@ pub(crate) fn parse_legacy_local_backup_v1(
                 logical_name,
                 byte_length,
                 cancellation,
+                &mut staging_ownership,
             )?
         } else {
             let PayloadTarget::ImmutableCas(cas) = payload_target else {
@@ -211,6 +213,7 @@ pub(crate) fn parse_legacy_local_backup_v1(
     })?;
     check_cancelled(cancellation)?;
     database_restore.restore_database(&entries[database_index])?;
+    staging_ownership.release();
 
     Ok(LegacyLocalBackupParseReport {
         source_bytes: source.bytes_read,
@@ -245,6 +248,7 @@ fn stage_entry(
     logical_name: String,
     byte_length: u64,
     cancellation: &dyn CancellationProbe,
+    staging_ownership: &mut ParseStagingOwnership,
 ) -> Result<StagedLocalBackupEntry, LocalBackupError> {
     let staged_path = staging_directory.join(format!("{}.entry", uuid::Uuid::new_v4()));
     let mut guard = IncompleteFile::new(staged_path.clone());
@@ -280,6 +284,7 @@ fn stage_entry(
     output.flush().map_err(LocalBackupError::io)?;
     output.sync_all().map_err(LocalBackupError::io)?;
     drop(output);
+    staging_ownership.track(staged_path.clone());
     guard.keep();
     Ok(StagedLocalBackupEntry {
         logical_name,
@@ -381,6 +386,29 @@ impl Drop for IncompleteFile {
     fn drop(&mut self) {
         if !self.keep {
             let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ParseStagingOwnership {
+    paths: Vec<PathBuf>,
+}
+
+impl ParseStagingOwnership {
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    fn release(&mut self) {
+        self.paths.clear();
+    }
+}
+
+impl Drop for ParseStagingOwnership {
+    fn drop(&mut self) {
+        for path in self.paths.iter().rev() {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -571,8 +599,8 @@ pub(crate) fn write_legacy_local_backup_v1(
     entries: &[LegacyBackupWriteEntry],
     cancellation: &dyn CancellationProbe,
 ) -> Result<LegacyBackupWriteReport, LocalBackupError> {
-    let (prepared, missing_references) = prepare_write_entries(entries)?;
     check_cancelled(cancellation)?;
+    let (prepared, missing_references) = prepare_write_entries(entries, cancellation)?;
     let mut report = LegacyBackupWriteReport {
         written_entries: 0,
         source_payload_bytes: 0,
@@ -638,13 +666,17 @@ pub(crate) fn write_legacy_local_backup_v1(
 
 fn prepare_write_entries(
     entries: &[LegacyBackupWriteEntry],
+    cancellation: &dyn CancellationProbe,
 ) -> Result<(Vec<PreparedWriteEntry>, Vec<String>), LocalBackupError> {
+    check_cancelled(cancellation)?;
     let mut normalized_names = HashSet::new();
     let mut prepared = Vec::new();
     let mut missing_references = Vec::new();
     let mut database_seen = false;
     for entry in entries {
+        check_cancelled(cancellation)?;
         let logical_name = normalize_logical_name(&entry.logical_name)?;
+        check_cancelled(cancellation)?;
         let is_database = logical_name == DATABASE_ENTRY_NAME;
         if is_database && database_seen {
             return Err(LocalBackupError::new(
@@ -669,9 +701,11 @@ fn prepare_write_entries(
                 missing_references.push(logical_name);
             }
             LegacyBackupWriteSource::File(path) => {
+                check_cancelled(cancellation)?;
                 let byte_length = validate_v1_entry_length(
                     fs::metadata(path).map_err(LocalBackupError::io)?.len(),
                 )?;
+                check_cancelled(cancellation)?;
                 if is_database {
                     database_seen = true;
                 }
@@ -929,6 +963,80 @@ mod tests {
 
         assert_eq!(error.code, LocalBackupErrorCode::DatabaseRestore);
         assert_eq!(error.message, "strict database rejection");
+    }
+
+    #[test]
+    fn truncated_tail_removes_every_completed_job_staging_file() {
+        let large = vec![7_u8; COPY_BUFFER_BYTES * 3];
+        let mut bytes = archive(&[
+            (b"assets/one.bin", large.as_slice()),
+            (b"assets/two.bin", large.as_slice()),
+            (b"assets/three.bin", large.as_slice()),
+            (b"database.risudat", b"db"),
+        ]);
+        bytes.extend_from_slice(&[1, 0]);
+        let directory = tempfile::tempdir().expect("temporary job root");
+        let staging = directory.path().join("local-backup-v1");
+        let mut restore = RestoreSpy::default();
+
+        let error = parse_legacy_local_backup_v1(
+            &mut Cursor::new(bytes),
+            directory.path(),
+            PayloadTarget::JobStaging,
+            &mut restore,
+            &NeverCancelled,
+        )
+        .expect_err("truncated tail must fail");
+
+        assert_eq!(error.code, LocalBackupErrorCode::TruncatedInput);
+        assert_eq!(restore.calls, 0);
+        assert_eq!(
+            fs::read_dir(&staging).expect("read job staging").count(),
+            0,
+            "all completed parser-owned files must be removed",
+        );
+        fs::remove_dir(staging).expect("staging directory has no leaked file descriptors");
+    }
+
+    #[test]
+    fn database_restore_failure_removes_every_completed_job_staging_file() {
+        struct FailingRestore;
+        impl StrictLocalBackupDatabaseRestore for FailingRestore {
+            fn restore_database(
+                &mut self,
+                _entry: &StagedLocalBackupEntry,
+            ) -> Result<(), LocalBackupError> {
+                Err(LocalBackupError::database_restore(
+                    "strict database rejection",
+                ))
+            }
+        }
+
+        let directory = tempfile::tempdir().expect("temporary job root");
+        let staging = directory.path().join("local-backup-v1");
+        let mut restore = FailingRestore;
+        let bytes = archive(&[
+            (b"assets/one.bin", &[1_u8; 128 * 1024]),
+            (b"assets/two.bin", &[2_u8; 128 * 1024]),
+            (b"database.risudat", b"invalid-db"),
+        ]);
+
+        let error = parse_legacy_local_backup_v1(
+            &mut Cursor::new(bytes),
+            directory.path(),
+            PayloadTarget::JobStaging,
+            &mut restore,
+            &NeverCancelled,
+        )
+        .expect_err("strict restore rejection must fail");
+
+        assert_eq!(error.code, LocalBackupErrorCode::DatabaseRestore);
+        assert_eq!(
+            fs::read_dir(&staging).expect("read job staging").count(),
+            0,
+            "restore failure must remove every parser-owned file",
+        );
+        fs::remove_dir(staging).expect("staging directory has no leaked file descriptors");
     }
 
     #[test]
@@ -1256,7 +1364,6 @@ mod tests {
     fn writer_honors_cancellation_before_writing() {
         let directory = tempfile::tempdir().expect("temporary sources");
         let database = directory.path().join("database.bin");
-        fs::write(&database, b"db").expect("database source");
         let entries = vec![file_entry("database.risudat", &database)];
         let cancelled = Arc::new(AtomicBool::new(true));
         let mut output = Vec::new();
@@ -1270,6 +1377,42 @@ mod tests {
 
         assert_eq!(error.code, LocalBackupErrorCode::Cancelled);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn writer_preflight_stops_visiting_a_large_entry_set_after_cancellation() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct CancelAfterChecks {
+            calls: AtomicUsize,
+            cancel_at: usize,
+        }
+        impl CancellationProbe for CancelAfterChecks {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_at
+            }
+        }
+
+        let mut entries = (0..50_000)
+            .map(|index| LegacyBackupWriteEntry {
+                logical_name: format!("missing/{index}.bin"),
+                source: LegacyBackupWriteSource::MissingReference,
+            })
+            .collect::<Vec<_>>();
+        entries.push(LegacyBackupWriteEntry {
+            logical_name: "database.risudat".to_owned(),
+            source: LegacyBackupWriteSource::MissingReference,
+        });
+        let cancellation = CancelAfterChecks {
+            calls: AtomicUsize::new(0),
+            cancel_at: 8,
+        };
+
+        let error = write_legacy_local_backup_v1(&mut Vec::new(), &entries, &cancellation)
+            .expect_err("preflight cancellation must stop the scan");
+
+        assert_eq!(error.code, LocalBackupErrorCode::Cancelled);
+        assert_eq!(cancellation.calls.load(Ordering::SeqCst), 8);
     }
 
     #[test]
