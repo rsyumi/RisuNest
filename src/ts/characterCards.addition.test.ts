@@ -13,6 +13,8 @@ const mocks = vi.hoisted(() => ({
     readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
     compressImage: vi.fn(async (_data: Uint8Array) => new Uint8Array([99])),
     charxWrites: [] as Array<{ key: string; data: Uint8Array }>,
+    pngWrites: [] as Array<{ key: string; data: Uint8Array }>,
+    downloads: [] as Array<{ name: string; data: Uint8Array }>,
     nextId: 0,
 }))
 
@@ -47,9 +49,15 @@ vi.mock('./util', () => ({
 vi.mock('src/lang', () => ({ language: { errors: {}, importedCharacter: 'imported' } }))
 vi.mock('./globalApi.svelte', () => ({
     AppendableBuffer: class {},
-    BlankWriter: class {},
+    BlankWriter: class {
+        async init() {}
+        async write() {}
+        async end() {}
+    },
     checkCharOrder: vi.fn(),
-    downloadFile: vi.fn(),
+    downloadFile: vi.fn(async (name: string, data: Uint8Array) => {
+        mocks.downloads.push({ name, data: data.slice() })
+    }),
     forageStorage: {},
     loadAsset: vi.fn(),
     LocalWriter: class {},
@@ -68,7 +76,21 @@ vi.mock('./stores.svelte', () => ({
 }))
 vi.mock('./parser/parser.svelte', () => ({ hasher: vi.fn() }))
 vi.mock('./process/files/inlays', () => ({ reencodeImage: vi.fn() }))
-vi.mock('./pngChunk', () => ({ PngChunk: {} }))
+vi.mock('./pngChunk', () => ({
+    PngChunk: {
+        streamWriter: class {
+            constructor(_image: Uint8Array, _writer: unknown) {}
+            async init() {}
+            async write(key: string, data: Uint8Array | string) {
+                mocks.pngWrites.push({
+                    key,
+                    data: typeof data === 'string' ? new TextEncoder().encode(data) : data.slice(),
+                })
+            }
+            async end() {}
+        },
+    },
+}))
 vi.mock('./process/processzip', () => ({
     CharXImporter: class {},
     CharXWriter: class {
@@ -111,6 +133,8 @@ describe('character card additions', () => {
         mocks.database.statics.imports = 0
         mocks.nextId = 0
         mocks.charxWrites = []
+        mocks.pngWrites = []
+        mocks.downloads = []
         vi.clearAllMocks()
         mocks.commitDetachedCharacter.mockImplementation(async (character, _reason) => {
             mocks.database.characters.push(character)
@@ -232,6 +256,83 @@ describe('character card additions', () => {
 
         const payload = mocks.charxWrites.find((entry) => entry.key.endsWith('/exact.bin'))
         expect(Array.from(payload?.data ?? [])).toEqual([1, 2, 3, 4])
+        expect(mocks.compressImage).not.toHaveBeenCalled()
+    })
+
+    it('keeps ordinary asset bytes exact in the JavaScript JSON export fallback', async () => {
+        const character = {
+            type: 'character',
+            name: 'JSON exact asset card',
+            image: 'assets/avatar.bin',
+            firstMessage: 'Hello',
+            desc: '',
+            chats: [],
+            chatFolders: [],
+            chatPage: 0,
+            viewScreen: 'none',
+            bias: [],
+            emotionImages: [],
+            globalLore: [],
+            chaId: 'json-exact-asset-card',
+            customscript: [],
+            triggerscript: [],
+            alternateGreetings: [],
+            tags: [],
+            additionalAssets: [],
+            ccAssets: [{
+                type: 'x-risu-asset',
+                uri: 'assets/exact.bin',
+                name: 'exact',
+                ext: 'bin',
+            }],
+            extentions: {},
+        } as any
+
+        await exportCharacterCard(character, 'json', { spec: 'v3' })
+
+        const exported = JSON.parse(new TextDecoder().decode(mocks.downloads[0].data))
+        const encoded = exported.data.assets[0].uri.split(',')[1]
+        expect(Array.from(Buffer.from(encoded, 'base64'))).toEqual([1, 2, 3, 4])
+        expect(mocks.compressImage).not.toHaveBeenCalled()
+    })
+
+    it('keeps ordinary asset bytes exact in the JavaScript PNG export fallback', async () => {
+        const character = {
+            type: 'character',
+            name: 'PNG exact asset card',
+            image: 'assets/avatar.bin',
+            firstMessage: 'Hello',
+            desc: '',
+            chats: [],
+            chatFolders: [],
+            chatPage: 0,
+            viewScreen: 'none',
+            bias: [],
+            emotionImages: [],
+            globalLore: [],
+            chaId: 'png-exact-asset-card',
+            customscript: [],
+            triggerscript: [],
+            alternateGreetings: [],
+            tags: [],
+            additionalAssets: [],
+            ccAssets: [{
+                type: 'x-risu-asset',
+                uri: 'assets/exact.bin',
+                name: 'exact',
+                ext: 'bin',
+            }],
+            extentions: {},
+        } as any
+
+        await exportCharacterCard(character, 'png', {
+            spec: 'v3',
+            writer: {} as any,
+        })
+
+        const payload = mocks.pngWrites.find((entry) => entry.key === 'chara-ext-asset_:1')
+        expect(Array.from(Buffer.from(new TextDecoder().decode(payload?.data), 'base64')))
+            .toEqual([1, 2, 3, 4])
         expect(mocks.compressImage).not.toHaveBeenCalled()
     })
 })

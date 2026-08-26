@@ -7,7 +7,7 @@ import { v4 as uuidv4, v4 } from 'uuid';
 import { changeChar, characterFormatUpdate, commitDetachedCharacter } from "./characters"
 import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, loadAsset, LocalWriter, openURL, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
 import { isTauri, isNodeServer } from "src/ts/platform"
-import { compressImage, getImageType } from "./media"
+import { getImageType } from "./media"
 import { DBState, SettingsMenuIndex, ShowRealmFrameStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { hasher } from "./parser/parser.svelte"
 import { type CharacterCardV3, type LorebookEntry } from '@risuai/ccardlib'
@@ -1266,7 +1266,7 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
                     })
                     const key = card.data.extensions.risuai.emotions[i][1]
                     const rData = await readImage(key)
-                    const b64encoded = Buffer.from(await compressImage(rData)).toString('base64')
+                    const b64encoded = Buffer.from(rData).toString('base64')
                     assetIndex++
                     card.data.extensions.risuai.emotions[i][1] = `__asset:${assetIndex}`
                     await writer.write("chara-ext-asset_:" + assetIndex, b64encoded)
@@ -1283,7 +1283,7 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
                     })
                     const key = card.data.extensions.risuai.additionalAssets[i][1]
                     const rData = await readImage(key)
-                    const b64encoded = Buffer.from(await compressImage(rData)).toString('base64')
+                    const b64encoded = Buffer.from(rData).toString('base64')
                     assetIndex++
                     card.data.extensions.risuai.additionalAssets[i][1] = `__asset:${assetIndex}`
                     await writer.write("chara-ext-asset_:" + assetIndex, b64encoded)
@@ -1344,12 +1344,12 @@ export async function exportCharacterCard(char:character, type:'png'|'json'|'cha
                     }
                     assetIndex++
                     if(type === 'png'){
-                        const b64encoded = Buffer.from(await compressImage(rData)).toString('base64')
+                        const b64encoded = Buffer.from(rData).toString('base64')
                         card.data.assets[i].uri = `__asset:${assetIndex}`
                         await writer.write("chara-ext-asset_:" + assetIndex, b64encoded)
                     }
                     else if(type === 'json'){
-                        const b64encoded = Buffer.from(await compressImage(rData)).toString('base64')
+                        const b64encoded = Buffer.from(rData).toString('base64')
                         card.data.assets[i].uri = `data:application/octet-stream;base64,${b64encoded}`
                     }
                     else{
