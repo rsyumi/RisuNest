@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "compatibilityBaseline": "RisuNest Roadmap 14 W0",
+  "expectedCanonical": "risusave-raw-v4.expected.json",
+  "expectedCanonicalSha256": "7060dd04417ec878a9793b98d987ff5df66647d381bb5da765fcb3c5b1fd8be1",
+  "warnings": "risusave-raw-v4.warnings.json",
+  "artifacts": [
+    {
+      "artifactId": "risusave-raw-v4-2026-08-26",
+      "input": "risusave-raw-v4.input.base64",
+      "inputByteLength": 535,
+      "inputSha256": "8682bfa463946b7b2dde0f8cdca46d29d0f6b689581ae05f5fc71bcd81521011"
+    },
+    {
+      "artifactId": "risusave-compressed-v4-2026-08-26",
+      "input": "risusave-compressed-v4.input.base64",
+      "inputByteLength": 321,
+      "inputSha256": "c7f69c98b5edc21e283396f5bbde6fb50eb50649cca5bf7ad8879621a3f012c8"
+    },
+    {
+      "artifactId": "risusave-stream-v4-2026-08-26",
+      "input": "risusave-stream-v4.input.base64",
+      "inputByteLength": 323,
+      "inputSha256": "5cad74b7a10f600fed1d9f3fe8ded51059741b0f9c8b7b05e1350e547631bb10"
+    },
+    {
+      "artifactId": "risusave-block-v4-2026-08-26",
+      "input": "risusave-block-v4.input.base64",
+      "inputByteLength": 743,
+      "inputSha256": "6e179d45f5239d50562407e5b4808bab1b651c9425bde488137c5f5d538f36c1",
+      "expectedCanonical": "risusave-block-v4.expected.json",
+      "expectedCanonicalSha256": "a36eb45ee671e3fd7a5a9631dbcb962358ebfe2a53db08742079089a748477d0"
+    }
+  ]
+}

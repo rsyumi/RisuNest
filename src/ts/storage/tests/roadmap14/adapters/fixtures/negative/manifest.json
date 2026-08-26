@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "id": "stale-block-cache",
+      "adapter": "risusave-block",
+      "inputBase64": "UklTVVNBVkUAAQAEcm9vdDAAAAB7ImZvcm1hdHZlcnNpb24iOjQsIl9fZGlyZWN0b3J5IjpbImNoYXItc3RhbGUiXX0=",
+      "warning": "Block RisuSave may complete a missing required block from stale local cache."
+    },
+    {
+      "id": "invalid-required-block",
+      "adapter": "risusave-block",
+      "inputBase64": "UklTVVNBVkUAAQAEcm9vdDIAAAB7ImZvcm1hdHZlcnNpb24iOjQsIl9fZGlyZWN0b3J5IjpbImNoYXItaW52YWxpZCJdfQIADGNoYXItaW52YWxpZA0AAAB7aW52YWxpZCBqc29u",
+      "warning": "Block RisuSave may skip an invalid required block and return partial data."
+    },
+    {
+      "id": "truncated-local-backup-tail",
+      "adapter": "local-full-backup",
+      "inputBase64": "EAAAAGRhdGFiYXNlLnJpc3VkYXQDAAAAAQIDCQAAAGFzc2V0",
+      "warning": "Local backup restore may ignore a truncated nonempty archive tail."
+    },
+    {
+      "id": "payload-before-database",
+      "adapter": "local-full-backup",
+      "inputBase64": "CgAAAGF2YXRhci5QTkcDAAAACQgHEAAAAGRhdGFiYXNlLnJpc3VkYXQDAAAAAQID",
+      "warning": "Local backup restore may write payloads before database validation and activation."
+    },
+    {
+      "id": "charx-extension-path-collisions",
+      "adapter": "card-charx",
+      "paths": [
+        "assets/avatar?.PNG",
+        "assets/avatar*.png",
+        "assets/avatar.webp",
+        "assets/avatar",
+        "assets/../avatar.png"
+      ],
+      "warning": "CharX does not reject every sanitized, case-folded, or traversal path collision."
+    }
+  ]
+}

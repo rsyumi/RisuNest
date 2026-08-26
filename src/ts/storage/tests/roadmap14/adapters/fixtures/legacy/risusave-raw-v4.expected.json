@@ -1,0 +1,61 @@
+{
+  "username": "Snapshot User",
+  "formatversion": 4,
+  "apiType": "fixture-provider",
+  "botPresets": [
+    {
+      "name": "Fixture preset"
+    }
+  ],
+  "botPresetsId": 0,
+  "modules": [
+    {
+      "name": "Fixture module"
+    }
+  ],
+  "loadouts": [
+    {
+      "name": "Fixture loadout"
+    }
+  ],
+  "plugins": [
+    {
+      "name": "Fixture plugin"
+    }
+  ],
+  "pluginCustomStorage": {
+    "fixture": {
+      "value": "stored"
+    }
+  },
+  "characters": [
+    {
+      "type": "character",
+      "chaId": "char-fixture",
+      "name": "Fixture Character",
+      "image": "fixture.png",
+      "lastInteraction": 100,
+      "chats": [
+        {
+          "id": "chat-fixture",
+          "name": "Fixture Chat",
+          "lastDate": 100,
+          "message": [
+            {
+              "role": "user",
+              "data": "hello",
+              "chatId": "message-1",
+              "time": 100
+            },
+            {
+              "role": "char",
+              "data": "world",
+              "chatId": "message-2",
+              "time": 101
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
