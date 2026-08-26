@@ -12,7 +12,7 @@ unsafe extern "system" {
 
 #[test]
 fn android_peer_clone_library_compiles_without_desktop_host_modules() {
-    assert!(!(risuai_lib::run as *const ()).is_null());
+    std::hint::black_box(risuai_lib::run as fn());
 }
 
 #[test]
