@@ -3,7 +3,7 @@
     import Suggestion from './Suggestion.svelte';
     import { CameraIcon, DatabaseIcon, DicesIcon, GlobeIcon, ImagePlusIcon, LanguagesIcon, Laugh, MenuIcon, MicOffIcon, PackageIcon, Plus, RefreshCcwIcon, ReplyIcon, Send, StepForwardIcon, XIcon, BrainIcon, ArrowDown, SparkleIcon } from "@lucide/svelte";
     import { selectedCharID, PlaygroundStore, createSimpleCharacter, hypaV3ModalOpen, ScrollToMessageStore, additionalChatMenu, additionalFloatingActionButtons, easyPanelStore, chatPanelStore } from "../../ts/stores.svelte";
-    import { tick } from 'svelte';
+    import { onDestroy, tick } from 'svelte';
     import Chat from "./Chat.svelte";
     import { type Message } from "../../ts/storage/database.svelte";
     import { DBState } from 'src/ts/stores.svelte';
@@ -12,16 +12,15 @@
     import { sleep } from "../../ts/util";
     import { language } from "../../lang";
     import { isExpTranslator, translate } from "../../ts/translator/translator";
-    import { alertError, alertNormal, alertWait, showHypaV2Alert } from "../../ts/alert";
+    import { alertError, alertNormal, showHypaV2Alert } from "../../ts/alert";
     import sendSound from '../../etc/send.mp3'
     import { processScript } from "src/ts/process/scripts";
     import CreatorQuote from "./CreatorQuote.svelte";
     import { stopTTS } from "src/ts/process/tts";
     import MainMenu from '../UI/MainMenu.svelte';
     import AssetInput from './AssetInput.svelte';
-    import { aiLawApplies, chatFoldedState, chatFoldedStateMessageIndex, downloadFile } from 'src/ts/globalApi.svelte';
+    import { aiLawApplies, chatFoldedState, chatFoldedStateMessageIndex, downloadFile, LocalWriter } from 'src/ts/globalApi.svelte';
     import { runTrigger } from 'src/ts/process/triggers';
-    import { v4 } from 'uuid';
     import { PreUnreroll, Prereroll } from 'src/ts/process/prereroll';
     import { processMultiCommand } from 'src/ts/process/command';
     import { postChatFile } from 'src/ts/process/files/multisend';
@@ -59,6 +58,12 @@
         type CapturedChatMessageTarget,
     } from '../../ts/chatMessageUi';
     import { handleDefaultChatUnreroll } from './defaultChatReroll';
+    import ChatScreenshotDialog from './ChatScreenshotDialog.svelte';
+    import ChatScreenshotCaptureSurface from './ChatScreenshotCaptureSurface.svelte';
+    import { createChatScreenshotJob } from 'src/ts/chatScreenshotRange';
+    import { captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
+    import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
+    import { isTauriMobile } from 'src/ts/platform';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -145,6 +150,20 @@
         if (!rerollHistory) return
         rerollHistory = refreshConversationRerollHistory(rerollHistory, target)
     }
+    let screenshotDialogOpen = $state(false)
+    let screenshotTotalTurns = $state(0)
+    let screenshotRunning = $state(false)
+    let screenshotCompletedTurns = $state(0)
+    let screenshotError = $state('')
+    let screenshotController: AbortController | null = null
+    let screenshotSurface: ChatScreenshotSurface | undefined
+    let screenshotCharacter = $state<ReturnType<typeof createSimpleCharacter>>(null)
+    let screenshotCharacterName = $state('')
+    let screenshotCharacterImage = $state('')
+    let screenshotCharacterLargePortrait = $state(false)
+    let screenshotUsername = $state('')
+    let screenshotUserImage = $state('')
+    let screenshotUserLargePortrait = $state(false)
 
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
@@ -571,65 +590,98 @@
         })
     }
 
-    async function screenShot(){
-        const previousLoadPages = loadPages
+    function openScreenshotDialog() {
+        screenshotError = ''
+        screenshotCompletedTurns = 0
+        screenshotTotalTurns = currentChat.length
+        screenshotDialogOpen = true
+    }
+
+    function cancelScreenshot() {
+        screenshotController?.abort()
+    }
+
+    function closeScreenshotDialog() {
+        cancelScreenshot()
+        screenshotDialogOpen = false
+    }
+
+    async function startScreenshot(start: number, end: number) {
+        if (screenshotRunning || !currentCharacter || !screenshotSurface) return
+        const selectedChat = currentCharacter.chats[currentCharacter.chatPage]
+        if (!selectedChat) return
+
+        const controller = new AbortController()
+        screenshotController = controller
+        screenshotRunning = true
+        screenshotCompletedTurns = 0
+        screenshotError = ''
+
+        const characterSnapshot = $state.snapshot(currentCharacter)
+        const characterImageSource = characterSnapshot.image
+        const userImageSource = userIcon
+        screenshotCharacter = createSimpleCharacter(characterSnapshot)
+        screenshotCharacterName = characterSnapshot.name
+        screenshotCharacterLargePortrait = characterSnapshot.type === 'group'
+            ? false
+            : characterSnapshot.largePortrait ?? false
+        screenshotUsername = currentUsername
+        screenshotUserLargePortrait = userIconPortrait ?? false
+
         try {
-            loadPages = Infinity
+            const job = createChatScreenshotJob({
+                characterId: characterSnapshot.chaId,
+                chatId: selectedChat.id ?? `${characterSnapshot.chaId}:${characterSnapshot.chatPage}`,
+                messages: selectedChat.message,
+                start,
+                end,
+            })
+            screenshotTotalTurns = job.totalTurns
+            ;[screenshotCharacterImage, screenshotUserImage] = await Promise.all([
+                getCharImage(characterImageSource, 'css'),
+                getCharImage(userImageSource, 'css'),
+            ])
             await tick()
-            await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-            const html2canvas = await import('html-to-image');
-            const chats = document.querySelectorAll('.default-chat-screen .risu-chat')
-            alertWait("Taking screenShot...")
-            let canvases:HTMLCanvasElement[] = []
 
-            for(const chat of chats){
-                const cnv = await html2canvas.toCanvas(chat as HTMLElement)
-                alertWait("Taking screenShot... "+canvases.length+"/"+chats.length)
-                canvases.push(cnv)
-            }
-
-            canvases.reverse()
-
-            alertWait("Merging images...")
-
-            let mergedCanvas = document.createElement('canvas');
-            mergedCanvas.width = 0;
-            mergedCanvas.height = 0;
-            let mergedCtx = mergedCanvas.getContext('2d');
-
-            let totalHeight = 0;
-            let maxWidth = 0;
-            for(let i = 0; i < canvases.length; i++) {
-                let canvas = canvases[i];
-                totalHeight += canvas.height;
-                maxWidth = Math.max(maxWidth, canvas.width);
-
-                mergedCanvas.width = maxWidth;
-                mergedCanvas.height = totalHeight;
-            }
-
-            mergedCtx.fillStyle = 'var(--risu-theme-bgcolor)'
-            mergedCtx.fillRect(0, 0, maxWidth, totalHeight);
-            let indh = 0
-            for(let i = 0; i < canvases.length; i++) {
-                let canvas = canvases[i];
-                indh += canvas.height
-                mergedCtx.drawImage(canvas, 0, indh - canvas.height);
-                canvases[i].remove();
-            }
-
-            if(mergedCanvas){
-                await downloadFile(`chat-${v4()}.png`, Buffer.from(mergedCanvas.toDataURL('png').split(',').at(-1), 'base64'))
-                mergedCanvas.remove();
-            }
+            const fileBase = `chat-${crypto.randomUUID()}`
+            await captureChatScreenshot(job, {
+                surface: screenshotSurface,
+                encoder: createDomScreenshotEncoder(),
+                signal: controller.signal,
+                onProgress: ({ completedTurns }) => {
+                    screenshotCompletedTurns = completedTurns
+                },
+                output: {
+                    async publishPng(page) {
+                        await downloadFile(`${fileBase}.png`, new Uint8Array(await page.arrayBuffer()))
+                    },
+                    async createArchive() {
+                        if (isTauriMobile) {
+                            throw new Error(language.screenshotLongAndroidUnavailable)
+                        }
+                        const writer = new LocalWriter()
+                        const selected = await writer.init('ZIP', ['zip'], `${fileBase}.zip`)
+                        if (!selected) throw new DOMException('Screenshot export was cancelled', 'AbortError')
+                        return createStreamingScreenshotArchive(writer)
+                    },
+                },
+            })
             alertNormal(language.screenshotSaved)
+            screenshotDialogOpen = false
         } catch (error) {
-            console.error(error)
-            alertError("Error while taking screenshot")
+            if (!(error instanceof DOMException && error.name === 'AbortError')) {
+                console.error(error)
+                const detail = error instanceof Error ? error.message : String(error)
+                screenshotError = language.screenshotFailed.replace('{error}', detail)
+                alertError(screenshotError)
+            }
         } finally {
-            loadPages = previousLoadPages
+            if (screenshotController === controller) screenshotController = null
+            screenshotRunning = false
         }
     }
+
+    onDestroy(cancelScreenshot)
 
     
 </script>
@@ -641,6 +693,29 @@
 <div class="w-full h-full relative" style={customStyle} onclick={() => {
     openMenu = false
 }}>
+    <ChatScreenshotCaptureSurface
+        bind:this={screenshotSurface}
+        totalTurns={screenshotTotalTurns}
+        character={screenshotCharacter}
+        characterName={screenshotCharacterName}
+        characterImage={screenshotCharacterImage}
+        characterLargePortrait={screenshotCharacterLargePortrait}
+        currentUsername={screenshotUsername}
+        userImage={screenshotUserImage}
+        userLargePortrait={screenshotUserLargePortrait}
+    />
+
+    {#if screenshotDialogOpen}
+        <ChatScreenshotDialog
+            totalTurns={screenshotTotalTurns}
+            running={screenshotRunning}
+            completedTurns={screenshotCompletedTurns}
+            error={screenshotError}
+            onStart={startScreenshot}
+            onCancel={cancelScreenshot}
+            onClose={closeScreenshotDialog}
+        />
+    {/if}
     
     {#if showNewMessageButton}
         {#if (DBState.db.newMessageButtonStyle === 'bottom-center' || !DBState.db.newMessageButtonStyle)}
@@ -1113,7 +1188,7 @@
                     {/if}
             
                     <div class="flex items-center cursor-pointer hover:text-green-500 transition-colors" onclick={() => {
-                        screenShot()
+                        openScreenshotDialog()
                     }}>
                         <CameraIcon />
                         <span class="ml-2">{language.screenshot}</span>
