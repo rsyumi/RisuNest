@@ -5,13 +5,21 @@ import {
     captureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
+import { consumeStreamingDisplayStream } from './streamingDisplayStream'
 
 function message(data: string, chatId: string): Message {
     return { role: 'char', data, chatId, time: 1 }
 }
 
 function chat(messages: Message[]): Chat {
-    return { id: 'chat-1', message: messages, note: '', localLore: [], fmIndex: -1 }
+    return {
+        id: 'chat-1',
+        name: 'Conversation',
+        message: messages,
+        note: '',
+        localLore: [],
+        fmIndex: -1,
+    }
 }
 
 function createHarness(messages: Message[]) {
@@ -147,6 +155,38 @@ describe('generation conversation operation', () => {
         expect(operation.commitData('fallback final')).toBe(true)
         expect(currentChat.message.at(-1)?.data).toBe('fallback final')
         expect(mutation).toHaveBeenCalledTimes(2)
+        operation.release()
+    })
+
+    it('uses operation ownership for exact streaming action and commit order', async () => {
+        const harness = createHarness([message('user prompt', 'user-1')])
+        const operation = harness.capture({ append: message('', 'generation-1') })
+        const actions: string[] = []
+        const values = [{ done: false, value: 'one' }, { done: true, value: 'two' }]
+
+        const result = await consumeStreamingDisplayStream({
+            mode: 'off',
+            reader: {
+                async read() {
+                    return values.shift() ?? { done: true, value: undefined }
+                },
+                async cancel() {},
+            },
+            abortSignal: new AbortController().signal,
+            getSnapshot: (value) => value,
+            isOwned: operation.isOwned,
+            async processSemantic({ value }, context) {
+                actions.push(`semantic:${value}`)
+                if (context.canCommit()) operation.commitData(`stored:${value}`)
+            },
+            async processPreview({ value }) {
+                actions.push(`preview:${value}`)
+            },
+        })
+
+        expect(result.completed).toBe(true)
+        expect(actions).toEqual(['semantic:one', 'semantic:two'])
+        expect(operation.snapshot()?.data).toBe('stored:two')
         operation.release()
     })
 })

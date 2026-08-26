@@ -1,5 +1,5 @@
 import { get, writable } from "svelte/store";
-import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
+import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -36,9 +36,13 @@ import { pluginV2 } from "../plugins/plugins.svelte";
 import { activatePresetChainForRequest } from "./presetChain";
 import { doingChat } from './generationState'
 import {
-    captureStreamingMessageTarget,
     consumeStreamingDisplayStream,
 } from './streamingDisplayStream'
+import { getActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
+import {
+    captureGenerationConversationOperation,
+    type GenerationConversationOperation,
+} from './generationConversationOperation'
 
 export { doingChat } from './generationState'
 
@@ -52,14 +56,6 @@ export interface OpenAIChat{
     multimodals?: MultiModal[]
     thoughts?: string[]
     cachePoint?: boolean
-}
-
-function findMessageIndexByChatId(chat: Chat, chatId?: string){
-    if(!chatId){
-        return -1
-    }
-
-    return chat.message.findIndex((message) => message.chatId === chatId)
 }
 
 async function runChatOutputListeners(char: any, chat: any, characterIndex: number, chatIndex: number, messageIndex: number){
@@ -1573,6 +1569,8 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return true
     }
 
+    let outputTarget: GenerationConversationOperation | null = null
+    try {
     let result = ''
     let emoChanged = false
     let resendChat = false
@@ -1586,15 +1584,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
     else if(req.type === 'streaming'){
         const reader = req.result.getReader()
-        let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
-        let prefix = ''
-        if(arg.continue){
-            msgIndex -= 1
-            const outputMessage = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
-            prefix = outputMessage.data
-        }
-        else{
-            DBState.db.characters[selectedChar].chats[selectedChat].message.push({
+        const targetCharacter = nowChatroom
+        const targetChat = targetCharacter.chats[selectedChat]
+        const getTargetChat = () => DBState.db.characters[selectedChar]?.chats[selectedChat]
+        outputTarget = captureGenerationConversationOperation({
+            session: getActiveConversationSession(),
+            getCurrentSession: getActiveConversationSession,
+            chat: targetChat,
+            getCurrentChat: getTargetChat,
+            isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+            ...(arg.continue ? { continueLast: true } : {
+                append: {
                 role: 'char',
                 data: "",
                 saying: currentChar.chaId,
@@ -1602,19 +1602,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 generationInfo,
                 promptInfo,
                 chatId: generationId,
-            })
+                },
+            }),
+        })
+        const initialOutput = outputTarget.snapshot()
+        if(initialOutput === null){
+            return false
         }
-        const outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId
+        const msgIndex = outputTarget.absoluteIndex
+        const prefix = arg.continue ? initialOutput.data : ''
+        const outputMessageId = outputTarget.messageId
         const performanceMode: StreamingDisplayOptimizationMode = DBState.db.streamingDisplayOptimizationMode ?? 'off'
-        const streamingTarget = captureStreamingMessageTarget<character | groupChat, Chat, Message>(
-            () => DBState.db.characters,
-            selectedChar,
-            selectedChat,
-            msgIndex,
-        )
-        const targetCharacter = streamingTarget.character
-        const targetChat = streamingTarget.chat
-        const targetMessage = streamingTarget.message
         targetChat.isStreaming = true
         targetChat.activeStreamingDisplayOptimizationMode = performanceMode
         targetCharacter.reloadKeys += 1
@@ -1636,7 +1634,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 mode: performanceMode,
                 reader,
                 abortSignal,
-                isOwned: streamingTarget.isOwned,
+                isOwned: outputTarget.isOwned,
                 getSnapshot: (value) => {
                     const firstChunkKey = Object.keys(value)[0]
                     const snapshot = value[firstChunkKey] || ''
@@ -1652,13 +1650,13 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     const cache = performanceMode === 'strong' ? 'normal' : 'bypass'
                     const result2 = await processStreamingSnapshot(value, cache, context.signal)
                     if(result2 === null || !context.canCommit()) return
-                    targetMessage.data = result2.data
+                    if(!outputTarget?.commitData(result2.data)) return
                     emoChanged = result2.emoChanged
                     targetCharacter.reloadKeys += 1
                 },
                 processPreview: async ({ value }, context) => {
                     if(!context.canCommit()) return
-                    targetMessage.data = reformatContent(prefix + value)
+                    if(!outputTarget?.commitData(reformatContent(prefix + value))) return
                     targetCharacter.reloadKeys += 1
                 },
             })
@@ -1676,8 +1674,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
         addRerolls(generationId, Object.values(lastResponseChunk))
 
-        DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
-        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
+        if(!outputTarget.isOwned()){
+            return false
+        }
+        targetCharacter.chats[selectedChat] = runCurrentChatFunction(targetChat)
+        currentChat = targetCharacter.chats[selectedChat]
         const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
         if(triggerResult && triggerResult.chat){
             currentChat = triggerResult.chat
@@ -1685,27 +1686,51 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
         }
-        DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
-        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
-        const inlayMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
-        const outputMessage = currentChat.message[inlayMessageIndex]
+        if(!outputTarget.refresh()){
+            return false
+        }
+        targetCharacter.chats[selectedChat] = currentChat
+        outputTarget.release()
+        if(!outputMessageId){
+            return false
+        }
+        const replacementOutputIndex = currentChat.message.findIndex(
+            (message) => message.chatId === outputMessageId,
+        )
+        outputTarget = replacementOutputIndex === -1 ? null : captureGenerationConversationOperation({
+            session: getActiveConversationSession(),
+            getCurrentSession: getActiveConversationSession,
+            chat: currentChat,
+            getCurrentChat: getTargetChat,
+            isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+            messageId: outputMessageId,
+        })
+        if(outputTarget && !outputTarget.isOwned()){
+            return false
+        }
+        const outputMessage = outputTarget?.snapshot()
         if(outputMessage){
             const inlayr = runInlayScreen(currentChar, outputMessage.data)
-            outputMessage.data = inlayr.text
-            DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
+            if(!outputTarget?.commitData(inlayr.text)){
+                return false
+            }
             if(inlayr.promise){
                 const t = await inlayr.promise
-                currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
-                const asyncInlayMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
-                if(asyncInlayMessageIndex !== -1){
-                    currentChat.message[asyncInlayMessageIndex].data = t
-                    DBState.db.characters[selectedChar].chats[selectedChat] = currentChat
+                if(!outputTarget?.commitData(t)){
+                    return false
                 }
             }
         }
-        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
-        const listenerMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
-        await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, listenerMessageIndex)
+        currentChat = targetCharacter.chats[selectedChat]
+        if(outputTarget ? outputTarget.isOwned() : getTargetChat() === currentChat){
+            await runChatOutputListeners(
+                currentChar,
+                currentChat,
+                selectedChar,
+                selectedChat,
+                outputTarget?.absoluteIndex ?? -1,
+            )
+        }
         if(DBState.db.ttsAutoSpeech){
             await sayTTS(currentChar, result)
         }
@@ -1715,16 +1740,34 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     : (req.type === 'multiline') ? req.result
                     : []
         let mrerolls:string[] = []
-        let outputMessageIndex = -1
         let outputMessageId: string | undefined
+        const targetCharacter = nowChatroom
+        const getTargetChat = () => DBState.db.characters[selectedChar]?.chats[selectedChat]
         for(let i=0;i<msgs.length;i++){
             let msg = msgs[i]
             let mess = msg[1]
-            let msgIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length
+            const operationChat = getTargetChat()
+            if(!operationChat || DBState.db.characters[selectedChar] !== targetCharacter){
+                return false
+            }
+            let msgIndex = operationChat.message.length
+            if(i === 0 && arg.continue){
+                outputTarget = captureGenerationConversationOperation({
+                    session: getActiveConversationSession(),
+                    getCurrentSession: getActiveConversationSession,
+                    chat: operationChat,
+                    getCurrentChat: getTargetChat,
+                    isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+                    continueLast: true,
+                })
+            }
             let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
             if(i === 0 && arg.continue){
-                msgIndex -= 1
-                let beforeChat = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]
+                const beforeChat = outputTarget?.snapshot()
+                if(!beforeChat){
+                    return false
+                }
+                msgIndex = outputTarget.absoluteIndex
                 result2 = await processScriptFull(nowChatroom, reformatContent(beforeChat.data + mess), 'editoutput', msgIndex)
             }
             if(DBState.db.removeIncompleteResponse){
@@ -1735,7 +1778,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             result = inlayResult.text
             emoChanged = result2.emoChanged
             if(i === 0 && arg.continue){
-                DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex] = {
+                if(!outputTarget?.commitMessage({
                     role: 'char',
                     data: result,
                     saying: currentChar.chaId,
@@ -1743,32 +1786,45 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     generationInfo,
                     promptInfo,
                     chatId: generationId,
-                }       
+                })){
+                    return false
+                }
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
-                    DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex].data = p
+                    if(!outputTarget.commitData(p)){
+                        return false
+                    }
                 }
-                outputMessageIndex = msgIndex
-                outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[msgIndex]?.chatId
+                outputMessageId = outputTarget.messageId
             }
             else if(i===0){
-                DBState.db.characters[selectedChar].chats[selectedChat].message.push({
-                    role: msg[0],
-                    data: result,
-                    saying: currentChar.chaId,
-                    time: Date.now(),
-                    generationInfo,
-                    promptInfo,
-                    chatId: generationId,
+                if(getTargetChat() !== operationChat || DBState.db.characters[selectedChar] !== targetCharacter){
+                    return false
+                }
+                outputTarget = captureGenerationConversationOperation({
+                    session: getActiveConversationSession(),
+                    getCurrentSession: getActiveConversationSession,
+                    chat: operationChat,
+                    getCurrentChat: getTargetChat,
+                    isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+                    append: {
+                        role: msg[0],
+                        data: result,
+                        saying: currentChar.chaId,
+                        time: Date.now(),
+                        generationInfo,
+                        promptInfo,
+                        chatId: generationId,
+                    },
                 })
-                const ind = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
-                    DBState.db.characters[selectedChar].chats[selectedChat].message[ind].data = p
+                    if(!outputTarget.commitData(p)){
+                        return false
+                    }
                 }
                 mrerolls.push(result)
-                outputMessageIndex = ind
-                outputMessageId = DBState.db.characters[selectedChar].chats[selectedChat].message[ind]?.chatId
+                outputMessageId = outputTarget.messageId
             }
             else{
                 mrerolls.push(result)
@@ -1783,21 +1839,73 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             addRerolls(generationId, mrerolls)
         }
 
-        DBState.db.characters[selectedChar].chats[selectedChat] = runCurrentChatFunction(DBState.db.characters[selectedChar].chats[selectedChat])
-        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]        
+        const outputChat = getTargetChat()
+        if(!outputChat || DBState.db.characters[selectedChar] !== targetCharacter){
+            return false
+        }
+        if(outputTarget && !outputTarget.isOwned()){
+            return false
+        }
+        targetCharacter.chats[selectedChat] = runCurrentChatFunction(outputChat)
+        currentChat = targetCharacter.chats[selectedChat]
 
         const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
-        if(triggerResult && triggerResult.chat){
-            DBState.db.characters[selectedChar].chats[selectedChat] = triggerResult.chat
-        }
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
         }
-        currentChat = DBState.db.characters[selectedChar].chats[selectedChat]
-        if(outputMessageId){
-            outputMessageIndex = findMessageIndexByChatId(currentChat, outputMessageId)
-            await runChatOutputListeners(currentChar, currentChat, selectedChar, selectedChat, outputMessageIndex)
+        if(outputTarget && !outputTarget.refresh()){
+            return false
         }
+        currentChat = triggerResult?.chat ?? currentChat
+        targetCharacter.chats[selectedChat] = currentChat
+        if(outputTarget){
+            outputTarget.release()
+            if(!outputMessageId){
+                return false
+            }
+            const replacementOutputIndex = currentChat.message.findIndex(
+                (message) => message.chatId === outputMessageId,
+            )
+            outputTarget = replacementOutputIndex === -1 ? null : captureGenerationConversationOperation({
+                    session: getActiveConversationSession(),
+                    getCurrentSession: getActiveConversationSession,
+                    chat: currentChat,
+                    getCurrentChat: getTargetChat,
+                    isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+                    messageId: outputMessageId,
+                })
+            await runChatOutputListeners(
+                currentChar,
+                currentChat,
+                selectedChar,
+                selectedChat,
+                outputTarget?.absoluteIndex ?? -1,
+            )
+        }
+    }
+
+    const readGeneratedOutputFallback = (): Message | undefined => {
+        const fallbackChat = DBState.db.characters[selectedChar]?.chats[selectedChat]
+        const fallbackIndex = (fallbackChat?.message.length ?? 0) - 1
+        return fallbackChat?.message[fallbackIndex]
+    }
+    const readGeneratedOutput = (): Message | null | undefined => outputTarget
+        ? outputTarget.snapshot()
+        : readGeneratedOutputFallback()
+    const updateGeneratedOutput = (update: (message: Message) => Message): boolean => {
+        if(outputTarget){
+            const message = outputTarget.snapshot()
+            return message !== null && outputTarget.commitMessage(update(message))
+        }
+
+        const fallbackChat = DBState.db.characters[selectedChar]?.chats[selectedChat]
+        const fallbackIndex = (fallbackChat?.message.length ?? 0) - 1
+        const fallbackMessage = fallbackChat?.message[fallbackIndex]
+        if(!fallbackChat || !fallbackMessage){
+            return false
+        }
+        fallbackChat.message[fallbackIndex] = update(fallbackMessage)
+        return true
     }
 
     let needsAutoContinue = false
@@ -1830,7 +1938,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             bias: {}
         },'emotion', abortSignal)
 
-        DBState.db.characters[selectedChar].chats[selectedChat].message[DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1].data += rq
+        if(!updateGeneratedOutput((message) => ({
+            ...message,
+            data: message.data + rq,
+        }))){
+            return false
+        }
     }
 
     stageTimings.stage3Duration = Date.now() - stageTimings.stage3Start
@@ -1851,9 +1964,12 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
         }
         
-        const lastMessageIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
-        if(lastMessageIndex >= 0 && DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo) {
-            DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
+        const currentOutput = readGeneratedOutput()
+        if(currentOutput?.generationInfo && !updateGeneratedOutput((message) => ({
+            ...message,
+            generationInfo,
+        }))) {
+            return false
         }
         
         doingChat.set(false)
@@ -2117,12 +2233,19 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
     }
     
-    const lastMessageIndex = DBState.db.characters[selectedChar].chats[selectedChat].message.length - 1
-    if(lastMessageIndex >= 0 && DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo) {
-        DBState.db.characters[selectedChar].chats[selectedChat].message[lastMessageIndex].generationInfo = generationInfo
+    const currentOutput = readGeneratedOutput()
+    if(currentOutput?.generationInfo && !updateGeneratedOutput((message) => ({
+        ...message,
+        generationInfo,
+    }))) {
+        return false
     }
 
     return true
+    }
+    finally {
+        outputTarget?.release()
+    }
 }
 
 function systemizeChat(chat:OpenAIChat[]){

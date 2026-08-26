@@ -10,6 +10,7 @@ interface GenerationConversationOperationOptions {
     getCurrentSession(): ActiveConversationSession | null
     chat: Chat
     getCurrentChat(): Chat | null | undefined
+    isOwnerCurrent?(): boolean
     append?: Message
     continueLast?: boolean
     messageId?: string
@@ -81,6 +82,7 @@ function captureSessionOperation(
     let released = false
     let currentMessageId = session.readMessage(locator).chatId
     const ownerIsCurrent = () => !released
+        && (options.isOwnerCurrent?.() ?? true)
         && options.getCurrentSession() === session
         && options.getCurrentChat() === options.chat
 
@@ -149,7 +151,9 @@ function captureFullArrayFallback(
 
     let released = false
     let currentMessageId = target.chatId
-    const ownerIsCurrent = () => !released && options.getCurrentChat() === chat
+    const ownerIsCurrent = () => !released
+        && (options.isOwnerCurrent?.() ?? true)
+        && options.getCurrentChat() === chat
     const operation: GenerationConversationOperation = {
         get absoluteIndex() {
             return absoluteIndex
