@@ -135,8 +135,11 @@ fn restore_risu_save_reader<R: Read>(
             RisuSaveFormat::HistoricalPrefixed => {
                 return Err(invalid("historical RisuSave codec is not enabled"))
             }
-            RisuSaveFormat::LegacyCompressed | RisuSaveFormat::LegacyStream => {
-                return Err(invalid("compressed legacy RisuSave codecs are not enabled"))
+            RisuSaveFormat::LegacyCompressed => {
+                parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
+            }
+            RisuSaveFormat::LegacyStream => {
+                return Err(invalid("gzip-stream legacy RisuSave codec is not enabled"))
             }
         };
         if job.is_cancel_requested() {
@@ -247,6 +250,33 @@ fn parse_and_stage_legacy<R: Read>(
         "legacy RisuSave",
     );
     let value = decode_messagepack(decoded, job)?.0;
+    reader.complete_item()?;
+    stage_legacy_database(value, staging_id, job, sink)
+}
+
+fn parse_and_stage_compressed_legacy<R: Read>(
+    reader: &mut TrackedReader<'_, R>,
+    staging_id: &str,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<ParsedCounts, NativeJobError> {
+    let remaining = reader.total.saturating_sub(reader.completed);
+    let source = RemainingSourceReader { reader, remaining };
+    let buffered = BufReader::with_capacity(READ_CHUNK_BYTES, source);
+    let decoder = GzDecoder::new(buffered);
+    let decoded = DecodedLimitReader::new(
+        decoder,
+        limits.max_decoded_block_bytes,
+        job,
+        "legacy RisuSave",
+    );
+    let (value, decoded) = decode_messagepack(decoded, job)?;
+    let decoder = decoded.into_inner();
+    let buffered = decoder.into_inner();
+    if !buffered.buffer().is_empty() || buffered.get_ref().remaining != 0 {
+        return Err(corrupt("trailing data in legacy RisuSave gzip stream"));
+    }
     reader.complete_item()?;
     stage_legacy_database(value, staging_id, job, sink)
 }
@@ -919,7 +949,7 @@ fn messagepack_error(error: rmpv::decode::Error, job: &JobControl) -> NativeJobE
         return cancelled("restore cancelled while decoding legacy MessagePack");
     }
     let message = error.to_string();
-    if message.contains("decoded legacy RisuSave limit exceeded") {
+    if message.contains("decoded block limit exceeded for legacy RisuSave") {
         return invalid(message);
     }
     if message.contains("source read failed") {
@@ -939,7 +969,7 @@ fn messagepack_io_error(error: io::Error, job: &JobControl) -> NativeJobError {
         return cancelled("restore cancelled while decoding legacy MessagePack");
     }
     let message = error.to_string();
-    if message.contains("decoded legacy RisuSave limit exceeded") {
+    if message.contains("decoded block limit exceeded for legacy RisuSave") {
         return invalid(message);
     }
     if message.contains("source read failed") {
@@ -1054,6 +1084,12 @@ mod tests {
 
     const MSGPACKR_PARITY_FIXTURE: &str = include_str!(
         "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/msgpackr-parity-v1.json"
+    );
+    const W0_COMPRESSED_FIXTURE: &str = include_str!(
+        "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-compressed-v4.input.base64"
+    );
+    const W0_LEGACY_EXPECTED: &str = include_str!(
+        "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-raw-v4.expected.json"
     );
 
     struct StoreSink {
@@ -1344,6 +1380,90 @@ mod tests {
         let bytes = legacy_wire(7, &payload);
 
         assert_failed_general_restore_preserves_active(&bytes, "extension 42");
+    }
+
+    #[test]
+    fn strict_compressed_msgpackr_restore_accepts_w0_fixture_and_block_round_trip() {
+        use base64::Engine;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(W0_COMPRESSED_FIXTURE.trim())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("compressed-w0.risudat");
+        fs::write(&source, bytes).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        let first = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        let expected = persistent_projection(serde_json::from_str(W0_LEGACY_EXPECTED).unwrap());
+        assert_eq!(first, expected);
+        let exported_path = {
+            let mut store = sink.store.lock().unwrap();
+            let lease = store.acquire_revision(2).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            store.release_revision(&lease).unwrap();
+            PathBuf::from(exported.path)
+        };
+        let second_job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
+        assert_eq!(
+            sink.store.lock().unwrap().materialize(Some(3)).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn strict_compressed_msgpackr_restore_rejects_trailing_members_and_decoded_overflow() {
+        use base64::Engine;
+
+        let parity = msgpackr_parity_fixture();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(parity["payloadBase64"].as_str().unwrap())
+            .unwrap();
+        let compressed = gzip(&payload);
+
+        let mut with_garbage = compressed.clone();
+        with_garbage.extend_from_slice(b"garbage");
+        assert_failed_general_restore_preserves_active(
+            &legacy_wire(8, &with_garbage),
+            "trailing data in legacy RisuSave gzip stream",
+        );
+
+        let mut concatenated = compressed.clone();
+        concatenated.extend_from_slice(&gzip(&payload));
+        assert_failed_general_restore_preserves_active(
+            &legacy_wire(8, &concatenated),
+            "trailing data in legacy RisuSave gzip stream",
+        );
+
+        let (directory, sink) = fixture();
+        let source = directory.path().join("compressed-overflow.risudat");
+        fs::write(&source, legacy_wire(8, &compressed)).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        let error = restore_risu_save_with_limits(
+            &source,
+            1,
+            &job,
+            &sink,
+            RestoreLimits {
+                max_encoded_block_bytes: u32::MAX as u64,
+                max_decoded_block_bytes: 64,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "invalid-input");
+        assert!(error.message.contains("decoded block limit"));
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
     }
 
     #[test]
