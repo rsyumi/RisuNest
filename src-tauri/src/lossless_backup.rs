@@ -918,16 +918,6 @@ fn validate_staged_owner_manifests(
     database: &Value,
     cas: &PayloadCas,
 ) -> Result<(), LosslessError> {
-    let asset_hashes = entries
-        .iter()
-        .filter(|entry| entry.kind == PayloadKind::Asset)
-        .filter_map(|entry| {
-            entry
-                .logical_key
-                .as_deref()
-                .map(|key| (key, entry.sha256.as_str()))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
     for entry in entries
         .iter()
         .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
@@ -961,26 +951,6 @@ fn validate_staged_owner_manifests(
             return Err(invalid_manifest(
                 "lossless owner manifest tuples differ from the staged parent",
             ));
-        }
-        for owner_entry in decoded {
-            let packaged_hash = asset_hashes.get(owner_entry.tuple[1].as_str());
-            match (owner_entry.payload_hash, packaged_hash) {
-                (Some(payload_hash), Some(expected)) if hex::encode(payload_hash) == **expected => {
-                }
-                (Some(_), None) => {
-                    return Err(LosslessError::new(
-                        LosslessErrorCode::MissingReference,
-                        "lossless owner manifest payload hash has no packaged asset alias",
-                    ));
-                }
-                (None, None) => {}
-                _ => {
-                    return Err(LosslessError::new(
-                        LosslessErrorCode::HashMismatch,
-                        "lossless owner manifest payload hash differs from its packaged asset",
-                    ));
-                }
-            }
         }
     }
     Ok(())
@@ -2118,6 +2088,24 @@ fn prepare_staging_directory(root: &Path) -> Result<PathBuf, LosslessError> {
             "lossless package staging root is not a directory",
         ));
     }
+    for candidate in fs::read_dir(&root).map_err(LosslessError::io)? {
+        let candidate = candidate.map_err(LosslessError::io)?;
+        let file_name = candidate.file_name();
+        let Some(id) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix("lossless-verify-"))
+        else {
+            continue;
+        };
+        let file_type = candidate.file_type().map_err(LosslessError::io)?;
+        if uuid::Uuid::parse_str(id).is_err() || !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let path = fs::canonicalize(candidate.path()).map_err(LosslessError::io)?;
+        if path.parent() == Some(root.as_path()) {
+            fs::remove_dir_all(path).map_err(LosslessError::io)?;
+        }
+    }
     let staging = root.join("lossless-v1");
     fs::create_dir_all(&staging).map_err(LosslessError::io)?;
     let staging = fs::canonicalize(staging).map_err(LosslessError::io)?;
@@ -2133,7 +2121,10 @@ fn prepare_staging_directory(root: &Path) -> Result<PathBuf, LosslessError> {
         let Some(file_name) = file_name.to_str() else {
             continue;
         };
-        let Some(id) = file_name.strip_suffix(".database") else {
+        let Some(id) = file_name
+            .strip_suffix(".database")
+            .or_else(|| file_name.strip_suffix(".owner-empty"))
+        else {
             continue;
         };
         if uuid::Uuid::parse_str(id).is_ok()
@@ -2610,24 +2601,12 @@ mod tests {
             payload_hash: Some(Sha256::digest(b"new-asset").into()),
         }])
         .unwrap();
-        let wrong_payload_hash = encode_owner_manifest(&[OwnerManifestEntry {
-            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
-            payload_hash: Some([0x77; 32]),
-        }])
-        .unwrap();
-        let missing_payload_hash = encode_owner_manifest(&[OwnerManifestEntry {
-            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
-            payload_hash: None,
-        }])
-        .unwrap();
         for (owner_manifest, expected_code) in [
             (
                 b"not-a-romf-manifest".to_vec(),
                 LosslessErrorCode::InvalidManifest,
             ),
             (mismatched, LosslessErrorCode::InvalidManifest),
-            (wrong_payload_hash, LosslessErrorCode::HashMismatch),
-            (missing_payload_hash, LosslessErrorCode::HashMismatch),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let staging = directory.path().join("job-staging");
@@ -2660,6 +2639,55 @@ mod tests {
             assert_eq!(store.revision().unwrap(), 1);
             assert_eq!(store.materialize(None).unwrap()["username"], "Old");
             assert!(!backup_path.exists());
+        }
+    }
+
+    #[test]
+    fn owner_manifest_payload_hash_is_preserved_without_rebinding_to_current_alias() {
+        for payload_hash in [Some([0x77; 32]), None] {
+            let directory = tempfile::tempdir().unwrap();
+            let staging = directory.path().join("job-staging");
+            let repository = directory.path().join("repository");
+            fs::create_dir(&staging).unwrap();
+            fs::create_dir(&repository).unwrap();
+            let owner_manifest = encode_owner_manifest(&[OwnerManifestEntry {
+                tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+                payload_hash,
+            }])
+            .unwrap();
+            let incoming = production_package_with_owner_manifest(
+                directory.path(),
+                "New",
+                b"new",
+                Some(owner_manifest.clone()),
+            );
+            let backup_path = directory.path().join("pre-replacement.lossless");
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let cas = PayloadCas::new(&repository).unwrap();
+            seed_active_store(&mut store, &cas, "Old", b"old");
+
+            let report = restore_lossless_package_v1(
+                &mut Cursor::new(incoming),
+                &staging,
+                &cas,
+                &mut store,
+                1,
+                &backup_path,
+                &NeverCancelled,
+            )
+            .unwrap();
+
+            assert_eq!(report.revision, 2);
+            let head = store
+                .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cas.read_object(head.value.manifest_hash.as_ref().unwrap())
+                    .unwrap()
+                    .unwrap(),
+                owner_manifest
+            );
         }
     }
 
@@ -3175,7 +3203,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_read_owns_database_file_and_reopen_sweeps_a_forgotten_job_file() {
+    fn successful_read_owns_database_file_and_reopen_sweeps_forgotten_job_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("staging");
         let repository = directory.path().join("repository");
@@ -3198,6 +3226,14 @@ mod tests {
             .to_path_buf();
         assert!(forgotten.is_file());
         std::mem::forget(first);
+        let forgotten_owner_marker = staging
+            .join("lossless-v1")
+            .join(format!("{}.owner-empty", uuid::Uuid::new_v4()));
+        fs::write(&forgotten_owner_marker, []).unwrap();
+        let forgotten_verification =
+            staging.join(format!("lossless-verify-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&forgotten_verification).unwrap();
+        fs::write(forgotten_verification.join("database.risudat"), b"stale").unwrap();
 
         let second =
             read_lossless_package_v1(&mut Cursor::new(&package), &staging, &cas, &NeverCancelled)
@@ -3206,6 +3242,8 @@ mod tests {
             !forgotten.exists(),
             "reopen must sweep the forgotten job file"
         );
+        assert!(!forgotten_owner_marker.exists());
+        assert!(!forgotten_verification.exists());
         let active = second
             .entries
             .iter()
