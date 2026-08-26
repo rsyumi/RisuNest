@@ -478,6 +478,8 @@ pub fn run() {
                         .join("screenshot-output"),
                 ),
             );
+            #[cfg(desktop)]
+            app.manage(peer_sync::commands::PeerCloneCommandState::default());
             #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
@@ -518,6 +520,28 @@ pub fn run() {
             install_py_dependencies,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_capabilities,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_prepare,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_start,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_status,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_stop,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_revoke,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_claim_client,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_download,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_resume,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_cancel,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_target_status,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_finalize,
             oauth_login,
             native_tokenizer::tokenize_batch,
             native_media::native_media_write_inlay_image,

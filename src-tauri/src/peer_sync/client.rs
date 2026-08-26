@@ -49,7 +49,7 @@ impl TransferCancellation {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
 }
@@ -242,6 +242,17 @@ impl LoopbackCloneClient {
         self.report_verified_progress(&manifest, None)?;
         report.verified_objects = manifest.objects.len();
         Ok(report)
+    }
+
+    pub(crate) fn transfer_progress(&mut self) -> Result<(u64, u64), PeerSyncError> {
+        self.fetch_manifest()?;
+        let manifest = self.manifest.as_ref().unwrap();
+        let total_bytes = manifest
+            .objects
+            .values()
+            .try_fold(0_u64, |total, object| total.checked_add(object.size))
+            .ok_or_else(|| PeerSyncError::Protocol("clone byte count overflow".to_owned()))?;
+        Ok((self.verified_bytes(manifest)?, total_bytes))
     }
 
     #[cfg(test)]
@@ -547,25 +558,7 @@ impl LoopbackCloneClient {
         if self.transport.bearer.is_none() {
             return Ok(());
         }
-        let verified_bytes = manifest
-            .objects
-            .iter()
-            .try_fold(0_u64, |total, (hash, object)| {
-                let next_chunk = self
-                    .ledger
-                    .objects
-                    .get(hash)
-                    .map(|progress| progress.next_chunk)
-                    .unwrap_or(0)
-                    .min(object.chunks.len());
-                let object_bytes = object.chunks[..next_chunk]
-                    .iter()
-                    .try_fold(0_u64, |subtotal, chunk| subtotal.checked_add(chunk.size))?;
-                total.checked_add(object_bytes)
-            })
-            .ok_or_else(|| {
-                PeerSyncError::Protocol("verified clone byte count overflow".to_owned())
-            })?;
+        let verified_bytes = self.verified_bytes(manifest)?;
         let response = self
             .transport
             .control_request(
@@ -586,6 +579,26 @@ impl LoopbackCloneClient {
             )));
         }
         Ok(())
+    }
+
+    fn verified_bytes(&self, manifest: &CloneManifest) -> Result<u64, PeerSyncError> {
+        manifest
+            .objects
+            .iter()
+            .try_fold(0_u64, |total, (hash, object)| {
+                let next_chunk = self
+                    .ledger
+                    .objects
+                    .get(hash)
+                    .map(|progress| progress.next_chunk)
+                    .unwrap_or(0)
+                    .min(object.chunks.len());
+                let object_bytes = object.chunks[..next_chunk]
+                    .iter()
+                    .try_fold(0_u64, |subtotal, chunk| subtotal.checked_add(chunk.size))?;
+                total.checked_add(object_bytes)
+            })
+            .ok_or_else(|| PeerSyncError::Protocol("verified clone byte count overflow".to_owned()))
     }
 
     fn verify_local_object(&self, object_hash: &str, size: u64) -> Result<bool, PeerSyncError> {

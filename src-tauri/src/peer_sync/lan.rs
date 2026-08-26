@@ -225,6 +225,17 @@ impl LanCloneClient {
         &self.session_url
     }
 
+    pub(crate) fn matches_target(
+        &self,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+    ) -> Result<bool, PeerSyncError> {
+        Ok(self.endpoint == validate_lan_endpoint(endpoint)?
+            && self.session_id == session_id
+            && self.manifest_id.as_deref() == Some(manifest_id))
+    }
+
     pub fn fetch_manifest(&self, expected_manifest_id: &str) -> Result<Vec<u8>, PeerSyncError> {
         if !is_lower_hex_256(expected_manifest_id) {
             return Err(PeerSyncError::Protocol(
