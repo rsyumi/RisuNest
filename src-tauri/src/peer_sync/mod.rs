@@ -4,6 +4,7 @@ mod android_jni;
 mod client;
 pub(crate) mod commands;
 mod host;
+mod http_stream;
 mod lan;
 mod production;
 mod protocol;

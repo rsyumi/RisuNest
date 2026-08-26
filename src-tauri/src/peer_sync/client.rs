@@ -1,12 +1,13 @@
 use super::lan::LanCloneClient;
 use super::{
+    http_stream::HttpRangeStream,
     protocol::{sha256_hex, CloneManifest, CloneObjectKind, MAX_MANIFEST_BYTES},
     PeerSyncError,
 };
 use crate::asset_repository::PayloadCas;
 use reqwest::{
     blocking::{Client, Response},
-    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE},
+    header::{ACCEPT_RANGES, CONTENT_LENGTH, ETAG},
     StatusCode, Url,
 };
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,6 @@ use std::{
 
 const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const RANGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DownloadReport {
@@ -99,6 +99,7 @@ pub struct LoopbackCloneClient {
 struct HttpCloneTransport {
     session_url: Url,
     http: Client,
+    ranges: HttpRangeStream,
     bearer: Option<String>,
 }
 
@@ -119,14 +120,6 @@ impl HttpCloneTransport {
     ) -> reqwest::blocking::RequestBuilder {
         self.authenticated_request(request)
             .timeout(CONTROL_REQUEST_TIMEOUT)
-    }
-
-    fn range_request(
-        &self,
-        request: reqwest::blocking::RequestBuilder,
-    ) -> reqwest::blocking::RequestBuilder {
-        self.authenticated_request(request)
-            .timeout(RANGE_REQUEST_TIMEOUT)
     }
 
     fn endpoint(&self, suffix: &str) -> Result<Url, PeerSyncError> {
@@ -152,16 +145,18 @@ impl LoopbackCloneClient {
         let ledger = load_ledger(&root.join("ledger.jsonl"))?;
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(2))
-            .timeout(RANGE_REQUEST_TIMEOUT)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()
             .map_err(transport_error)?;
+        let ranges = HttpRangeStream::new(Duration::from_secs(2))?;
         Ok(Self {
             root,
             transport: HttpCloneTransport {
                 session_url,
                 http,
+                ranges,
                 bearer: None,
             },
             required_manifest_id: None,
@@ -181,7 +176,8 @@ impl LoopbackCloneClient {
         expected_manifest_id: &str,
     ) -> Result<Self, PeerSyncError> {
         super::protocol::validate_hash(expected_manifest_id)?;
-        let (http, session_url, bearer, persisted_manifest_id) = lan.into_resumable_parts()?;
+        let (http, ranges, session_url, bearer, persisted_manifest_id) =
+            lan.into_resumable_parts()?;
         if persisted_manifest_id
             .as_deref()
             .is_some_and(|persisted| persisted != expected_manifest_id)
@@ -199,6 +195,7 @@ impl LoopbackCloneClient {
             transport: HttpCloneTransport {
                 session_url,
                 http,
+                ranges,
                 bearer: Some(bearer),
             },
             required_manifest_id: Some(expected_manifest_id.to_owned()),
@@ -418,56 +415,36 @@ impl LoopbackCloneClient {
             }
             file.seek(SeekFrom::Start(chunk.offset))?;
             let range_end = chunk.offset + chunk.size - 1;
-            let mut response = self
-                .transport
-                .range_request(
-                    self.transport
-                        .http
-                        .get(self.transport.endpoint(&format!("objects/{object_hash}"))?)
-                        .header(RANGE, format!("bytes={}-{}", chunk.offset, range_end)),
-                )
-                .send()
-                .map_err(transport_error)?;
-            validate_range_response(
-                &response,
-                object_hash,
-                chunk.offset,
-                range_end,
-                descriptor.size,
-            )?;
+            let range_url = self.transport.endpoint(&format!("objects/{object_hash}"))?;
             report.maximum_response_bytes = report.maximum_response_bytes.max(chunk.size);
             let mut hasher = Sha256::new();
             let mut received = 0_u64;
-            let mut buffer = [0_u8; TRANSFER_BUFFER_BYTES];
-            loop {
-                let read = match response.read(&mut buffer) {
-                    Ok(read) => read,
-                    Err(error) => {
-                        file.set_len(chunk.offset)?;
-                        file.sync_all()?;
-                        return Err(transport_error(error));
-                    }
-                };
-                if read == 0 {
-                    break;
-                }
-                if received + read as u64 > chunk.size {
-                    file.set_len(chunk.offset)?;
-                    file.sync_all()?;
-                    return Err(PeerSyncError::Protocol(
-                        "range response exceeded the requested clone chunk".to_owned(),
-                    ));
-                }
-                file.write_all(&buffer[..read])?;
-                hasher.update(&buffer[..read]);
-                received += read as u64;
-                report.transferred_bytes += read as u64;
-                progress_callback(report.transferred_bytes);
-                if cancellation.is_cancelled() {
-                    file.set_len(chunk.offset)?;
-                    file.sync_all()?;
-                    return Err(PeerSyncError::Cancelled);
-                }
+            let transfer = self.transport.ranges.read(
+                range_url,
+                self.transport.bearer.as_deref(),
+                object_hash,
+                chunk.offset,
+                range_end,
+                Some(descriptor.size),
+                &|| cancellation.is_cancelled(),
+                &mut |bytes| {
+                    file.write_all(bytes)?;
+                    hasher.update(bytes);
+                    received += bytes.len() as u64;
+                    report.transferred_bytes += bytes.len() as u64;
+                    progress_callback(report.transferred_bytes);
+                    Ok(())
+                },
+            );
+            if let Err(error) = transfer {
+                file.set_len(chunk.offset)?;
+                file.sync_all()?;
+                return Err(error);
+            }
+            if cancellation.is_cancelled() {
+                file.set_len(chunk.offset)?;
+                file.sync_all()?;
+                return Err(PeerSyncError::Cancelled);
             }
             if received != chunk.size {
                 file.set_len(chunk.offset)?;
@@ -925,31 +902,6 @@ fn validate_loopback_url(value: &str) -> Result<Url, PeerSyncError> {
     Ok(url)
 }
 
-fn validate_range_response(
-    response: &Response,
-    object_hash: &str,
-    start: u64,
-    end: u64,
-    total: u64,
-) -> Result<(), PeerSyncError> {
-    if response.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(PeerSyncError::Transport(format!(
-            "range request returned {}",
-            response.status()
-        )));
-    }
-    let expected_size = end - start + 1;
-    if parse_u64_header(response, CONTENT_LENGTH)? != expected_size
-        || required_header(response, ETAG)? != quoted(object_hash)
-        || required_header(response, CONTENT_RANGE)? != format!("bytes {start}-{end}/{total}")
-    {
-        return Err(PeerSyncError::Protocol(
-            "range response does not match the requested immutable chunk".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 fn required_header(
     response: &Response,
     name: reqwest::header::HeaderName,
@@ -1008,10 +960,11 @@ mod timeout_tests {
     use super::*;
 
     #[test]
-    fn clone_http_requests_keep_control_calls_short_without_timing_out_valid_ranges() {
+    fn clone_http_control_requests_keep_a_short_total_timeout() {
         let transport = HttpCloneTransport {
             session_url: Url::parse("http://127.0.0.1:1/v1/sessions/test").unwrap(),
             http: Client::builder().no_proxy().build().unwrap(),
+            ranges: HttpRangeStream::new(Duration::from_secs(1)).unwrap(),
             bearer: None,
         };
 
@@ -1019,17 +972,6 @@ mod timeout_tests {
             .control_request(transport.http.get(transport.endpoint("manifest").unwrap()))
             .build()
             .unwrap();
-        let range = transport
-            .range_request(
-                transport
-                    .http
-                    .get(transport.endpoint("objects/test").unwrap()),
-            )
-            .build()
-            .unwrap();
-
         assert_eq!(control.timeout(), Some(&CONTROL_REQUEST_TIMEOUT));
-        assert_eq!(range.timeout(), Some(&RANGE_REQUEST_TIMEOUT));
-        assert!(RANGE_REQUEST_TIMEOUT > CONTROL_REQUEST_TIMEOUT);
     }
 }

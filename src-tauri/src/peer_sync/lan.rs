@@ -1,4 +1,5 @@
 use super::{
+    http_stream::HttpRangeStream,
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
     PeerSyncError, PreparedCloneSession,
 };
@@ -34,6 +35,7 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
 const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct LanPairing {
     pub session_id: String,
@@ -43,6 +45,8 @@ pub struct LanPairing {
 
 pub struct LanCloneClient {
     client: reqwest::blocking::Client,
+    ranges: HttpRangeStream,
+    control_timeout: Duration,
     endpoint: String,
     session_id: String,
     session_url: String,
@@ -53,6 +57,15 @@ pub struct LanCloneClient {
 
 impl LanCloneClient {
     pub fn claim(endpoint: &str, session_id: &str, claim: &str) -> Result<Self, PeerSyncError> {
+        Self::claim_with_timeout(endpoint, session_id, claim, CONTROL_REQUEST_TIMEOUT)
+    }
+
+    fn claim_with_timeout(
+        endpoint: &str,
+        session_id: &str,
+        claim: &str,
+        control_timeout: Duration,
+    ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || uuid::Uuid::parse_str(session_id)
                 .map(|value| value.to_string() != session_id)
@@ -72,16 +85,18 @@ impl LanCloneClient {
         }
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(120))
+            .timeout(control_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()
             .map_err(transport)?;
+        let ranges = HttpRangeStream::new(Duration::from_secs(3))?;
         let response = client
             .post(format!("{session_url}/claim"))
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
             })
+            .timeout(control_timeout)
             .send()
             .map_err(transport)?;
         if !response.status().is_success() {
@@ -113,6 +128,8 @@ impl LanCloneClient {
         }
         Ok(Self {
             client,
+            ranges,
+            control_timeout,
             endpoint,
             session_id: session_id.to_owned(),
             session_url,
@@ -166,6 +183,7 @@ impl LanCloneClient {
     ) -> Result<
         (
             reqwest::blocking::Client,
+            HttpRangeStream,
             reqwest::Url,
             String,
             Option<String>,
@@ -174,7 +192,13 @@ impl LanCloneClient {
     > {
         let session_url = reqwest::Url::parse(&self.session_url)
             .map_err(|_| PeerSyncError::Protocol("invalid persisted LAN session URL".to_owned()))?;
-        Ok((self.client, session_url, self.bearer, self.manifest_id))
+        Ok((
+            self.client,
+            self.ranges,
+            session_url,
+            self.bearer,
+            self.manifest_id,
+        ))
     }
 
     pub fn session_url(&self) -> &str {
@@ -188,7 +212,7 @@ impl LanCloneClient {
             ));
         }
         let response = self
-            .authenticated(self.client.get(format!("{}/manifest", self.session_url)))
+            .control_request(self.client.get(format!("{}/manifest", self.session_url)))
             .send()
             .map_err(transport)?;
         if !response.status().is_success() {
@@ -231,7 +255,7 @@ impl LanCloneClient {
     pub fn head_object(&self, object: &str) -> Result<u64, PeerSyncError> {
         validate_object_hash(object)?;
         let response = self
-            .authenticated(
+            .control_request(
                 self.client
                     .head(format!("{}/objects/{object}", self.session_url)),
             )
@@ -275,47 +299,22 @@ impl LanCloneClient {
             .and_then(|size| size.checked_add(1))
             .filter(|size| *size <= CLONE_CHUNK_SIZE)
             .ok_or_else(|| PeerSyncError::Protocol("invalid LAN range".to_owned()))?;
-        let response = self
-            .authenticated(
-                self.client
-                    .get(format!("{}/objects/{object}", self.session_url))
-                    .header(reqwest::header::RANGE, format!("bytes={start}-{end}")),
-            )
-            .send()
-            .map_err(transport)?;
-        if response.status().as_u16() != 206 {
-            return Err(PeerSyncError::Transport(format!(
-                "HTTP {}",
-                response.status()
-            )));
-        }
-        let expected_etag = quoted(object);
-        let expected_range_prefix = format!("bytes {start}-{end}/");
-        if response
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|value| value.to_str().ok())
-            != Some(expected_etag.as_str())
-            || !response
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with(&expected_range_prefix))
-        {
-            return Err(PeerSyncError::Protocol(
-                "LAN range response headers are invalid".to_owned(),
-            ));
-        }
-        let mut bytes = Vec::new();
-        response
-            .take(expected_size + 1)
-            .read_to_end(&mut bytes)
-            .map_err(transport)?;
-        if bytes.len() as u64 != expected_size {
-            return Err(PeerSyncError::Protocol(
-                "LAN range body length is invalid".to_owned(),
-            ));
-        }
+        let url = reqwest::Url::parse(&format!("{}/objects/{object}", self.session_url))
+            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+        let mut bytes = Vec::with_capacity(expected_size as usize);
+        self.ranges.read(
+            url,
+            Some(&self.bearer),
+            object,
+            start,
+            end,
+            None,
+            &|| false,
+            &mut |chunk| {
+                bytes.extend_from_slice(chunk);
+                Ok(())
+            },
+        )?;
         Ok(bytes)
     }
 
@@ -328,7 +327,7 @@ impl LanCloneClient {
             validate_object_hash(object)?
         }
         let response = self
-            .authenticated(
+            .control_request(
                 self.client
                     .post(format!("{}/progress", self.session_url))
                     .json(&ProgressRequest {
@@ -347,11 +346,13 @@ impl LanCloneClient {
         Ok(())
     }
 
-    fn authenticated(
+    fn control_request(
         &self,
         request: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
-        request.bearer_auth(&self.bearer)
+        request
+            .bearer_auth(&self.bearer)
+            .timeout(self.control_timeout)
     }
 
     fn persist(&self, credential_path: &Path) -> Result<(), PeerSyncError> {
@@ -405,13 +406,16 @@ impl LanCloneClient {
         }
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(120))
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()
             .map_err(transport)?;
+        let ranges = HttpRangeStream::new(Duration::from_secs(3))?;
         Ok(Self {
             client,
+            ranges,
+            control_timeout: CONTROL_REQUEST_TIMEOUT,
             endpoint,
             session_id: persisted.session_id,
             session_url,
@@ -1414,5 +1418,30 @@ mod timeout_tests {
         );
         assert!(RESPONSE_WRITE_TIMEOUT > CONNECTION_READ_POLL_TIMEOUT);
         drop(client);
+    }
+
+    #[test]
+    fn stalled_claim_uses_the_short_control_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(800));
+        });
+        let started = Instant::now();
+
+        let error = LanCloneClient::claim_with_timeout(
+            &endpoint,
+            "00000000-0000-4000-8000-000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            Duration::from_millis(150),
+        )
+        .err()
+        .unwrap();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(matches!(error, PeerSyncError::Transport(_)));
+        assert!(elapsed < Duration::from_millis(500));
     }
 }
