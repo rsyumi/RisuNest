@@ -64,7 +64,7 @@ describe('bootstrapPersistentDatabase', () => {
 
         expect(prepareDatabase).toHaveBeenCalledTimes(1)
         expect(prepareDatabase).toHaveBeenCalledWith({
-            streamingDisplayOptimizationMode: 'off',
+            streamingDisplayOptimizationMode: 'balanced',
         })
         expect(store.materializeDatabase).not.toHaveBeenCalled()
         expect(store.replaceFromDatabase).toHaveBeenCalledWith(prepared, 0)
@@ -75,6 +75,7 @@ describe('bootstrapPersistentDatabase', () => {
         const persistent = structuredClone(fixtureDatabase)
         persistent.username = 'Persistent user'
         persistent.plugins = [plugin('2.1', true)]
+        persistent.streamingDisplayOptimizationMode = 'off'
         const store = createStore({ revision: 7, database: persistent })
 
         const result = await bootstrapPersistentDatabase({

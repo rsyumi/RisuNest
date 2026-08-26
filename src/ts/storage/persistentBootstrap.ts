@@ -18,7 +18,7 @@ import { removeCharacterIdFromOrder } from './characterOrderMutation'
 const BOOTSTRAP_CATALOG_PAGE_SIZE = 200
 const TRASH_EXPIRY_MS = 3 * 24 * 60 * 60 * 1000
 const NEW_DATABASE_SEED: Partial<Database> = {
-    streamingDisplayOptimizationMode: 'off',
+    streamingDisplayOptimizationMode: 'balanced',
 }
 
 export interface PersistentBootstrapDependencies {
