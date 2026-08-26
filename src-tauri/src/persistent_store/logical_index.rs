@@ -4043,7 +4043,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_leased_building_moves_once_then_resumes_in_place_saves() {
+    fn detached_snapshot_reader_allows_building_generation_to_save_in_place() {
         let (_directory, mut store, cas) = open_j2_fixture();
         store
             .initialize_logical_index_building(&cas, logical_build_request())
@@ -4055,7 +4055,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::super::active_generation(&store.connection).unwrap(),
-            "revision-1"
+            "revision-0"
         );
         let logical: (String, String, i64) = store
             .connection
@@ -4068,7 +4068,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             logical,
-            ("generation-0".to_owned(), "revision-1".to_owned(), 1)
+            ("generation-0".to_owned(), "revision-0".to_owned(), 1)
         );
         store.release_revision(&lease).unwrap();
 
@@ -4077,7 +4077,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::super::active_generation(&store.connection).unwrap(),
-            "revision-1"
+            "revision-0"
         );
     }
 
@@ -4087,9 +4087,7 @@ mod tests {
         store
             .initialize_logical_index_building(&cas, logical_build_request())
             .unwrap();
-        let lease = snapshot::acquire_revision(&mut store.connection, 0)
-            .unwrap()
-            .lease;
+        let lease = store.acquire_revision(0).unwrap().lease;
         store
             .commit(&root_commit(0, json!({"version": 1})))
             .unwrap();
@@ -4106,7 +4104,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(error.to_string().contains("current active PDS revision"));
+        assert!(error.to_string().contains("detached revision"));
         let head: (String, String, i64) = store
             .connection
             .query_row(
@@ -4136,7 +4134,7 @@ mod tests {
             .unwrap();
         assert_eq!(historical_rows, 0);
 
-        snapshot::release_revision(&mut store.connection, &lease).unwrap();
+        store.release_revision(&lease).unwrap();
         store
             .commit(&root_commit(1, json!({"version": 2})))
             .unwrap();
@@ -4288,13 +4286,11 @@ mod tests {
         let session = store
             .pin_logical_generation("library", "generation-0")
             .unwrap();
-        let lease = snapshot::acquire_revision(&mut store.connection, 0)
-            .unwrap()
-            .lease;
+        let lease = store.acquire_revision(0).unwrap().lease;
         store
             .commit(&root_commit(0, json!({"version": 1})))
             .unwrap();
-        snapshot::release_revision(&mut store.connection, &lease).unwrap();
+        store.release_revision(&lease).unwrap();
         drop(store);
 
         let mut reopened = PersistentStore::open(directory.path()).unwrap();
