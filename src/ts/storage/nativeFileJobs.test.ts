@@ -7,7 +7,9 @@ import {
     runNativeBlockRisuSaveExport,
     runNativeLosslessBackupExport,
     runNativeLosslessBackupRestore,
+    runNativeOfficialPublicationAttempt,
     type NativeFileJobStatus,
+    type NativeOfficialPublicationAttemptResult,
 } from './nativeFileJobs'
 
 function status(
@@ -1194,5 +1196,500 @@ describe('native file jobs', () => {
             'native_file_job_status',
             'native_file_job_forget',
         ])
+    })
+
+    it('starts an exact official publication request and leaves success unacknowledged', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const request = {
+            expectedRevision: 17,
+            accountId: 'account-1',
+            baseUrl: 'https://realm.example',
+            replacements: {
+                'asset://old': 'asset://new',
+                'asset://portrait': 'https://cdn.example/portrait',
+            },
+            session: 'session-9',
+            saveDate: '1777777777777',
+            credential: { kind: 'risu-auth' as const, token: 'legacy-secret' },
+        }
+        const result = {
+            revision: 17,
+            sourceBytes: 512,
+            sourceSha256: 'f'.repeat(64),
+            characterCount: 2,
+            presetCount: 1,
+            warningCodes: [],
+            publication: {
+                kind: 'written' as const,
+                accountId: 'account-1',
+                session: 'session-9',
+                saveDate: '1777777777777',
+                status: 200,
+                replacementKey: 'replacement-1',
+                warning: null,
+                reloadSession: false,
+            },
+        }
+
+        const receipt = await runNativeOfficialPublicationAttempt(
+            request,
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') {
+                        return { jobId: 'publication-1' }
+                    }
+                    if (command === 'native_file_job_status') {
+                        return {
+                            jobId: 'publication-1',
+                            kind: 'official-publication-upload',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: {
+                                completedBytes: 1024,
+                                totalBytes: 1024,
+                                completedItems: 2,
+                                totalItems: 2,
+                            },
+                            result,
+                        }
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(receipt).not.toBeNull()
+        expect(receipt?.jobId).toBe('publication-1')
+        expect(receipt?.result).toEqual(result)
+        expect(calls).toEqual([
+            ['native_file_job_start', {
+                request: {
+                    kind: 'official-publication-upload',
+                    ...request,
+                },
+            }],
+            ['native_file_job_status', { jobId: 'publication-1' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('database')
+        expect(JSON.stringify(calls)).not.toContain('path')
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+
+        await receipt?.acknowledge()
+        await receipt?.acknowledge()
+        expect(calls.slice(2)).toEqual([
+            ['native_file_job_forget', { jobId: 'publication-1' }],
+        ])
+    })
+
+    it('falls back only when publication capability is unavailable before a job ID', async () => {
+        const request = {
+            expectedRevision: 3,
+            accountId: 'account-1',
+            baseUrl: 'https://realm.example',
+            replacements: {},
+            session: null,
+            saveDate: '1777777777777',
+            credential: { kind: 'risu-auth' as const, token: 'legacy-secret' },
+        }
+
+        await expect(runNativeOfficialPublicationAttempt(request, {}, {
+            isTauri: () => true,
+            invoke: async () => {
+                throw {
+                    code: 'capability-unavailable',
+                    message: 'publication jobs are unavailable',
+                }
+            },
+            wait: async () => undefined,
+        })).resolves.toBeNull()
+
+        await expect(runNativeOfficialPublicationAttempt(request, {}, {
+            isTauri: () => true,
+            invoke: async () => {
+                throw { code: 'invalid-request', message: 'invalid base URL' }
+            },
+            wait: async () => undefined,
+        })).rejects.toMatchObject({
+            name: 'NativeFileJobError',
+            code: 'invalid-request',
+        })
+
+        const malformedStartCommands: string[] = []
+        await expect(runNativeOfficialPublicationAttempt(request, {}, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                malformedStartCommands.push(command)
+                if (command === 'native_file_job_start') return {}
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        })).rejects.toMatchObject({
+            name: 'NativeFileJobError',
+            code: 'invalid-result',
+        })
+        expect(malformedStartCommands).toEqual(['native_file_job_start'])
+
+        let started = false
+        await expect(runNativeOfficialPublicationAttempt(request, {}, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                if (command === 'native_file_job_start') {
+                    started = true
+                    return { jobId: 'publication-1' }
+                }
+                throw {
+                    code: 'capability-unavailable',
+                    message: 'status temporarily unavailable',
+                }
+            },
+            wait: async () => undefined,
+        })).rejects.toMatchObject({
+            name: 'NativeFileJobError',
+            code: 'capability-unavailable',
+        })
+        expect(started).toBe(true)
+    })
+
+    it('does not start publication when already aborted', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        controller.abort()
+
+        await expect(runNativeOfficialPublicationAttempt(
+            {
+                expectedRevision: 3,
+                accountId: 'account-1',
+                baseUrl: 'https://realm.example',
+                replacements: {},
+                session: null,
+                saveDate: '1777777777777',
+                credential: { kind: 'risu-auth', token: 'legacy-secret' },
+            },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({ name: 'AbortError' })
+        expect(commands).toEqual([])
+    })
+
+    it('requests publication cancellation once and waits for terminal cleanup', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        const states: NativeFileJobStatus['state'][] = ['running', 'cancelling', 'cancelled']
+        let waitCount = 0
+
+        await expect(runNativeOfficialPublicationAttempt(
+            {
+                expectedRevision: 3,
+                accountId: 'account-1',
+                baseUrl: 'https://realm.example',
+                replacements: {},
+                session: null,
+                saveDate: '1777777777777',
+                credential: { kind: 'risu-auth', token: 'legacy-secret' },
+            },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') {
+                        return { jobId: 'publication-1' }
+                    }
+                    if (command === 'native_file_job_status') {
+                        const state = states.shift() ?? 'cancelled'
+                        return {
+                            jobId: 'publication-1',
+                            kind: 'official-publication-upload',
+                            state,
+                            phase: state === 'cancelled' ? 'complete' : 'uploading-database',
+                            progress: { completedBytes: 64, completedItems: 0 },
+                        }
+                    }
+                    if (command === 'native_file_job_cancel') {
+                        throw { code: 'store-error', message: 'cancel response was lost' }
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => {
+                    waitCount++
+                    if (waitCount === 1) controller.abort()
+                },
+            },
+        )).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+    })
+
+    it('keeps a too-late publication success unacknowledged after abort', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        let statusCount = 0
+        const result = {
+            revision: 9,
+            sourceBytes: 128,
+            sourceSha256: 'd'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+            publication: {
+                kind: 'not-modified' as const,
+                accountId: 'account-1',
+                session: 'session-1',
+                saveDate: '1777777777777',
+                status: 304,
+                replacementKey: 'replacement-1',
+            },
+        }
+
+        const receipt = await runNativeOfficialPublicationAttempt(
+            {
+                expectedRevision: 9,
+                accountId: 'account-1',
+                baseUrl: 'https://realm.example',
+                replacements: {},
+                session: 'session-1',
+                saveDate: '1777777777777',
+                credential: { kind: 'risu-auth', token: 'legacy-secret' },
+            },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') {
+                        return { jobId: 'publication-1' }
+                    }
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        if (statusCount === 1) {
+                            return {
+                                jobId: 'publication-1',
+                                kind: 'official-publication-upload',
+                                state: 'running',
+                                phase: 'uploading-database',
+                                progress: { completedBytes: 64, completedItems: 0 },
+                            }
+                        }
+                        return {
+                            jobId: 'publication-1',
+                            kind: 'official-publication-upload',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: { completedBytes: 256, completedItems: 1 },
+                            result,
+                        }
+                    }
+                    if (command === 'native_file_job_cancel') return 'tooLate'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => controller.abort(),
+            },
+        )
+
+        expect(receipt?.result).toEqual(result)
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
+        ])
+        await receipt?.acknowledge()
+        expect(commands.at(-1)).toBe('native_file_job_forget')
+    })
+
+    it('acknowledges failed and cancelled publication terminals before rejecting', async () => {
+        const request = {
+            expectedRevision: 3,
+            accountId: 'account-1',
+            baseUrl: 'https://realm.example',
+            replacements: {},
+            session: null,
+            saveDate: '1777777777777',
+            credential: { kind: 'risu-auth' as const, token: 'legacy-secret' },
+        }
+        const failedCommands: string[] = []
+
+        await expect(runNativeOfficialPublicationAttempt(request, {}, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                failedCommands.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'publication-1' }
+                if (command === 'native_file_job_status') {
+                    return {
+                        jobId: 'publication-1',
+                        kind: 'official-publication-upload',
+                        state: 'failed',
+                        phase: 'complete',
+                        progress: { completedBytes: 0, completedItems: 0 },
+                        error: { code: 'publication-timeout', message: 'upload stalled' },
+                    }
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        })).rejects.toMatchObject({ code: 'publication-timeout' })
+        expect(failedCommands.at(-1)).toBe('native_file_job_forget')
+
+        const cancelledCommands: string[] = []
+        await expect(runNativeOfficialPublicationAttempt(request, {}, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                cancelledCommands.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'publication-2' }
+                if (command === 'native_file_job_status') {
+                    return {
+                        jobId: 'publication-2',
+                        kind: 'official-publication-upload',
+                        state: 'cancelled',
+                        phase: 'complete',
+                        progress: { completedBytes: 0, completedItems: 0 },
+                    }
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        })).rejects.toMatchObject({ name: 'AbortError' })
+        expect(cancelledCommands.at(-1)).toBe('native_file_job_forget')
+    })
+
+    it('retains successful publication jobs whose association metadata does not match', async () => {
+        const request = {
+            expectedRevision: 3,
+            accountId: 'account-1',
+            baseUrl: 'https://realm.example',
+            replacements: {},
+            session: null,
+            saveDate: '1777777777777',
+            credential: { kind: 'risu-auth' as const, token: 'legacy-secret' },
+        }
+        const cases = [
+            { revision: 4, accountId: 'account-1' },
+            { revision: 3, accountId: 'account-2' },
+        ]
+
+        for (const mismatch of cases) {
+            const commands: string[] = []
+            const attempt = runNativeOfficialPublicationAttempt(request, {}, {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') {
+                        return { jobId: 'publication-1' }
+                    }
+                    if (command === 'native_file_job_status') {
+                        return {
+                            jobId: 'publication-1',
+                            kind: 'official-publication-upload',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: { completedBytes: 128, completedItems: 1 },
+                            result: {
+                                revision: mismatch.revision,
+                                sourceBytes: 128,
+                                sourceSha256: 'a'.repeat(64),
+                                characterCount: 1,
+                                presetCount: 0,
+                                warningCodes: [],
+                                publication: {
+                                    kind: 'not-modified',
+                                    accountId: mismatch.accountId,
+                                    session: 'session-1',
+                                    saveDate: '1777777777777',
+                                    status: 304,
+                                    replacementKey: 'replacement-1',
+                                },
+                            },
+                        }
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            })
+
+            await expect(attempt).rejects.toMatchObject({ code: 'invalid-result' })
+            expect(commands).not.toContain('native_file_job_forget')
+        }
+    })
+
+    it('returns auth outcomes as unacknowledged receipts for the account retry loop', async () => {
+        const commands: string[] = []
+        const publication = {
+            kind: 'reauthentication-needed' as const,
+            accountId: 'account-1',
+            session: null,
+            saveDate: '1777777777777',
+            status: 403,
+        } satisfies NativeOfficialPublicationAttemptResult
+        const receipt = await runNativeOfficialPublicationAttempt(
+            {
+                expectedRevision: 3,
+                accountId: 'account-1',
+                baseUrl: 'https://realm.example',
+                replacements: {},
+                session: null,
+                saveDate: '1777777777777',
+                credential: { kind: 'risu-auth', token: 'legacy-secret' },
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') {
+                        return { jobId: 'publication-1' }
+                    }
+                    if (command === 'native_file_job_status') {
+                        return {
+                            jobId: 'publication-1',
+                            kind: 'official-publication-upload',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: { completedBytes: 0, completedItems: 0 },
+                            result: {
+                                revision: 3,
+                                sourceBytes: 128,
+                                sourceSha256: 'a'.repeat(64),
+                                characterCount: 1,
+                                presetCount: 0,
+                                warningCodes: [],
+                                publication,
+                            },
+                        }
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(receipt?.result.publication).toEqual(publication)
+        expect(commands).not.toContain('native_file_job_forget')
+        await receipt?.acknowledge()
+        expect(commands.at(-1)).toBe('native_file_job_forget')
     })
 })

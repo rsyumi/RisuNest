@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
     acknowledgeRecoveredNativeRestores,
+    reconcileNativeFileJobsBeforeBootstrap,
     reconcileNativeRestoresBeforeBootstrap,
     shouldReconcileNativeFileJobs,
 } from './nativeFileJobRecovery'
@@ -29,8 +30,8 @@ function restoreStatus(
     }
 }
 
-describe('native restore bootstrap reconciliation', () => {
-    it('reconciles persisted jobs on every Tauri target without widening to web', () => {
+describe('native file job bootstrap reconciliation', () => {
+    it('reconciles persisted jobs on desktop and Android without widening to other targets', () => {
         expect(shouldReconcileNativeFileJobs(true, false, false)).toBe(true)
         expect(shouldReconcileNativeFileJobs(false, true, true)).toBe(true)
         expect(shouldReconcileNativeFileJobs(false, true, false)).toBe(true)
@@ -215,6 +216,62 @@ describe('native restore bootstrap reconciliation', () => {
                 ['native_file_job_forget', { jobId: 'lossless-export' }],
             ])
         })
+    })
+
+    it('returns every publication job for late reconciliation without touching it early', async () => {
+        const calls: string[] = []
+        const publications: NativeFileJobStatus[] = [
+            {
+                jobId: 'publication-running',
+                kind: 'official-publication-upload',
+                state: 'running',
+                phase: 'uploading-database',
+                progress: { completedBytes: 64, completedItems: 0 },
+            },
+            {
+                jobId: 'publication-succeeded',
+                kind: 'official-publication-upload',
+                state: 'succeeded',
+                phase: 'complete',
+                progress: { completedBytes: 128, completedItems: 1 },
+            },
+            {
+                jobId: 'publication-failed',
+                kind: 'official-publication-upload',
+                state: 'failed',
+                phase: 'complete',
+                progress: { completedBytes: 64, completedItems: 0 },
+            },
+            {
+                jobId: 'publication-cancelled',
+                kind: 'official-publication-upload',
+                state: 'cancelled',
+                phase: 'complete',
+                progress: { completedBytes: 0, completedItems: 0 },
+            },
+        ]
+
+        const result = await reconcileNativeFileJobsBeforeBootstrap({
+            invoke: vi.fn(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return publications
+                throw new Error(`Publication recovery touched ${command}`)
+            }),
+            wait: vi.fn(async () => {
+                throw new Error('Publication recovery waited during bootstrap')
+            }),
+        })
+
+        expect(result).toEqual({
+            pendingRestoreAcknowledgements: [],
+            pendingOfficialPublications: [
+                'publication-running',
+                'publication-succeeded',
+                'publication-failed',
+                'publication-cancelled',
+            ],
+        })
+        expect(calls).toEqual(['native_file_job_list'])
     })
 
     it('forgets committed restores only after the caller reports successful plugin loading', async () => {

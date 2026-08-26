@@ -36,6 +36,7 @@ export interface NativeFileJobResult {
     warningCodes: string[]
     handoffPath?: string
     recoveryPath?: string
+    publication?: NativeOfficialPublicationAttemptResult
 }
 
 export interface NativeOfficialAccountSnapshotRestoreRequest {
@@ -76,6 +77,48 @@ export interface PreparedNativeContent {
     module?: PreparedNativeCharacterCardModule
 }
 
+interface NativeOfficialPublicationCommonResult {
+    accountId: string
+    session: string | null
+    saveDate: string
+    status: number
+}
+
+export type NativeOfficialPublicationAttemptResult =
+    | (NativeOfficialPublicationCommonResult & {
+          kind: 'written'
+          replacementKey: string
+          warning: string | null
+          reloadSession: boolean
+      })
+    | (NativeOfficialPublicationCommonResult & {
+          kind: 'not-modified'
+          replacementKey: string
+      })
+    | (NativeOfficialPublicationCommonResult & { kind: 'auth-warning' })
+    | (NativeOfficialPublicationCommonResult & { kind: 'reauthentication-needed' })
+
+export interface NativeOfficialPublicationRequest {
+    expectedRevision: number
+    accountId: string
+    baseUrl: string
+    replacements: Readonly<Record<string, string>>
+    session: string | null
+    saveDate: string
+    credential: {
+        kind: 'risu-auth'
+        token: string
+    }
+}
+
+export interface NativeOfficialPublicationReceipt {
+    jobId: string
+    result: NativeFileJobResult & {
+        publication: NativeOfficialPublicationAttemptResult
+    }
+    acknowledge(): Promise<void>
+}
+
 export interface NativeFileJobStatus {
     jobId: string
     kind:
@@ -86,6 +129,7 @@ export interface NativeFileJobStatus {
         | 'prepare-content-import'
         | 'kei-backup-upload'
         | 'restore-official-account-snapshot'
+        | 'official-publication-upload'
     expectedRevision?: number
     warningCodes?: string[]
     state: NativeFileJobState
@@ -97,6 +141,8 @@ export interface NativeFileJobStatus {
         | 'awaiting-activation'
         | 'activating-database'
         | 'writing-export'
+        | 'uploading-database'
+        | 'finalizing-publication'
         | 'publishing-destination'
         | 'finalizing-export'
         | 'complete'
@@ -1155,5 +1201,191 @@ export async function prepareNativeContentImport(
             }
         }
         throw error
+    }
+}
+
+function assertOfficialPublicationResult(
+    value: unknown,
+): NativeOfficialPublicationAttemptResult {
+    if (!value || typeof value !== 'object') {
+        throw new NativeFileJobError(
+            'invalid-result',
+            'Native official publication returned invalid publication metadata',
+        )
+    }
+    const result = value as Record<string, unknown>
+    if (
+        typeof result.accountId !== 'string'
+        || (result.session !== null && typeof result.session !== 'string')
+        || typeof result.saveDate !== 'string'
+        || typeof result.status !== 'number'
+        || !Number.isFinite(result.status)
+    ) {
+        throw new NativeFileJobError(
+            'invalid-result',
+            'Native official publication returned invalid publication metadata',
+        )
+    }
+    switch (result.kind) {
+        case 'written':
+            if (
+                typeof result.replacementKey === 'string'
+                && (result.warning === null || typeof result.warning === 'string')
+                && typeof result.reloadSession === 'boolean'
+            ) {
+                return result as unknown as NativeOfficialPublicationAttemptResult
+            }
+            break
+        case 'not-modified':
+            if (typeof result.replacementKey === 'string') {
+                return result as unknown as NativeOfficialPublicationAttemptResult
+            }
+            break
+        case 'auth-warning':
+        case 'reauthentication-needed':
+            return result as unknown as NativeOfficialPublicationAttemptResult
+    }
+    throw new NativeFileJobError(
+        'invalid-result',
+        'Native official publication returned invalid publication metadata',
+    )
+}
+
+export async function runNativeOfficialPublicationAttempt(
+    request: NativeOfficialPublicationRequest,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeOfficialPublicationReceipt | null> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native official publication requires Tauri')
+    }
+    if (options.signal?.aborted) throw abortError()
+
+    let started: { jobId: string; warningCodes?: string[] }
+    try {
+        const value = await invokeNative(dependencies, 'native_file_job_start', {
+            request: {
+                kind: 'official-publication-upload',
+                ...request,
+            },
+        })
+        if (
+            !value
+            || typeof value !== 'object'
+            || !('jobId' in value)
+            || typeof value.jobId !== 'string'
+            || value.jobId.length === 0
+            || ('warningCodes' in value && (
+                !Array.isArray(value.warningCodes)
+                || value.warningCodes.some((code) => typeof code !== 'string')
+            ))
+        ) {
+            throw new NativeFileJobError(
+                'invalid-result',
+                'Native official publication start returned no job ID',
+            )
+        }
+        started = value as unknown as typeof started
+    }
+    catch (error) {
+        if (error instanceof NativeFileJobError && error.code === 'capability-unavailable') {
+            return null
+        }
+        throw error
+    }
+    let cancellationRequested = false
+    let terminal: NativeFileJobStatus | undefined
+
+    while (!terminal) {
+        if (options.signal?.aborted && !cancellationRequested) {
+            cancellationRequested = true
+            try {
+                await invokeNative(dependencies, 'native_file_job_cancel', {
+                    jobId: started.jobId,
+                })
+            }
+            catch {}
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId: started.jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
+            terminal = status
+            break
+        }
+        await dependencies.wait(options.pollIntervalMs ?? 100)
+    }
+
+    if (terminal.state !== 'succeeded') {
+        const error = terminal.state === 'cancelled'
+            ? abortError()
+            : new NativeFileJobError(
+                terminal.error?.code ?? 'publication-failed',
+                terminal.error?.message ?? 'Native official publication failed',
+            )
+        try {
+            await invokeNative(dependencies, 'native_file_job_forget', {
+                jobId: started.jobId,
+            })
+        }
+        catch {}
+        throw error
+    }
+    if (!terminal.result?.publication) {
+        throw new NativeFileJobError(
+            'missing-result',
+            'Native official publication returned no result',
+        )
+    }
+    const publication = assertOfficialPublicationResult(terminal.result.publication)
+    if (
+        terminal.jobId !== started.jobId
+        || terminal.kind !== 'official-publication-upload'
+        || terminal.result.revision !== request.expectedRevision
+        || publication.accountId !== request.accountId
+        || publication.saveDate !== request.saveDate
+        || !Number.isSafeInteger(terminal.result.sourceBytes)
+        || terminal.result.sourceBytes < 0
+        || typeof terminal.result.sourceSha256 !== 'string'
+        || !/^[0-9a-f]{64}$/.test(terminal.result.sourceSha256)
+        || !Number.isSafeInteger(terminal.result.characterCount)
+        || terminal.result.characterCount < 0
+        || !Number.isSafeInteger(terminal.result.presetCount)
+        || terminal.result.presetCount < 0
+        || !Array.isArray(terminal.result.warningCodes)
+        || terminal.result.warningCodes.some((code) => typeof code !== 'string')
+    ) {
+        throw new NativeFileJobError(
+            'invalid-result',
+            'Native official publication returned mismatched association metadata',
+        )
+    }
+
+    const result = {
+        ...terminal.result,
+        publication,
+        warningCodes: [...new Set([
+            ...(started.warningCodes ?? []),
+            ...terminal.result.warningCodes,
+        ])].slice(0, 16),
+    } as NativeOfficialPublicationReceipt['result']
+    let acknowledged = false
+    let acknowledgement: Promise<void> | undefined
+
+    return {
+        jobId: started.jobId,
+        result,
+        acknowledge: async () => {
+            if (acknowledged) return
+            acknowledgement ??= invokeNative(dependencies, 'native_file_job_forget', {
+                jobId: started.jobId,
+            }).then(() => {
+                acknowledged = true
+            }).finally(() => {
+                acknowledgement = undefined
+            })
+            await acknowledgement
+        },
     }
 }

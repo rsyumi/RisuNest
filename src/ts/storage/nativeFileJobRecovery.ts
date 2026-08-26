@@ -7,6 +7,11 @@ export interface NativeFileJobRecoveryDependencies {
     wait(milliseconds: number): Promise<void>
 }
 
+export interface NativeFileJobRecoveryResult {
+    pendingRestoreAcknowledgements: string[]
+    pendingOfficialPublications: string[]
+}
+
 const productionDependencies: NativeFileJobRecoveryDependencies = {
     invoke: (command, args) => args === undefined ? invoke(command) : invoke(command, args),
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -91,35 +96,60 @@ async function discardContentJob(
     await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
 }
 
+function assertNever(value: never): never {
+    throw new Error(`Unsupported native file job kind: ${String(value)}`)
+}
+
+export async function reconcileNativeFileJobsBeforeBootstrap(
+    dependencies: NativeFileJobRecoveryDependencies = productionDependencies,
+): Promise<NativeFileJobRecoveryResult> {
+    const jobs = await dependencies.invoke('native_file_job_list') as NativeFileJobStatus[]
+    const pendingRestoreAcknowledgements: string[] = []
+    const pendingOfficialPublications: string[] = []
+    for (const job of jobs) {
+        const kind = job.kind
+        switch (kind) {
+            case 'restore-block-risu-save':
+            case 'restore-lossless-backup': {
+                const terminal = isTerminal(job) ? job : await reconcileRestore(job, dependencies)
+                if (terminal.state === 'succeeded') {
+                    pendingRestoreAcknowledgements.push(terminal.jobId)
+                }
+                else {
+                    await dependencies.invoke('native_file_job_forget', {
+                        jobId: terminal.jobId,
+                    })
+                }
+                break
+            }
+            case 'export-block-risu-save':
+            case 'export-lossless-backup':
+            case 'kei-backup-upload':
+                void reconcileExportInBackground(job, dependencies).catch((error) => {
+                    console.error('Native export reconciliation failed', error)
+                })
+                break
+            case 'prepare-content-import':
+                await discardContentJob(job, dependencies)
+                break
+            case 'official-publication-upload':
+                pendingOfficialPublications.push(job.jobId)
+                break
+            default:
+                assertNever(kind)
+        }
+    }
+    return {
+        pendingRestoreAcknowledgements,
+        pendingOfficialPublications,
+    }
+}
+
 export async function reconcileNativeRestoresBeforeBootstrap(
     dependencies: NativeFileJobRecoveryDependencies = productionDependencies,
 ): Promise<string[]> {
-    const jobs = await dependencies.invoke('native_file_job_list') as NativeFileJobStatus[]
-    const pendingAcknowledgements: string[] = []
-    for (const job of jobs) {
-        if (job.kind === 'prepare-content-import') {
-            await discardContentJob(job, dependencies)
-            continue
-        }
-        if (
-            job.kind === 'export-block-risu-save'
-            || job.kind === 'export-lossless-backup'
-            || job.kind === 'kei-backup-upload'
-        ) {
-            void reconcileExportInBackground(job, dependencies).catch((error) => {
-                console.error('Native export reconciliation failed', error)
-            })
-            continue
-        }
-        const terminal = isTerminal(job) ? job : await reconcileRestore(job, dependencies)
-        if (terminal.state === 'succeeded') {
-            pendingAcknowledgements.push(terminal.jobId)
-        }
-        else {
-            await dependencies.invoke('native_file_job_forget', { jobId: terminal.jobId })
-        }
-    }
-    return pendingAcknowledgements
+    const result = await reconcileNativeFileJobsBeforeBootstrap(dependencies)
+    return result.pendingRestoreAcknowledgements
 }
 
 export async function acknowledgeRecoveredNativeRestores(
