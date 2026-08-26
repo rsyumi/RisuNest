@@ -5,6 +5,7 @@ mod client;
 pub(crate) mod commands;
 mod host;
 mod lan;
+mod production;
 mod protocol;
 mod session;
 
@@ -22,9 +23,10 @@ pub use client::{
 };
 pub use host::LoopbackCloneHost;
 pub use lan::{LanCloneClient, LanCloneHost, LanDevice, LanPairing};
+pub(crate) use production::{prepare_lossless_clone_session, LosslessCloneTargetAdapter};
 pub use protocol::{
     CloneDatabase, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor, VerifiedChunk,
-    CLONE_CHUNK_SIZE,
+    CLONE_CHUNK_SIZE, CLONE_LOSSLESS_DATABASE_FORMAT,
 };
 pub use session::{
     prepare_clone_session, CloneSource, PinnedCloneRevision, PinnedSourceObject,

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CLONE_CHUNK_SIZE: u64 = 8 * 1024 * 1024;
 pub const CLONE_MANIFEST_SCHEMA: &str = "risunest.peer-clone/v1";
 pub const CLONE_DATABASE_FORMAT: &str = "risusave-v1";
+pub const CLONE_LOSSLESS_DATABASE_FORMAT: &str = "risunest-lossless-v1";
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OBJECTS: usize = 100_000;
 const MAX_LOGICAL_KEY_BYTES: usize = 64 * 1024;
@@ -98,7 +99,10 @@ impl CloneManifest {
         {
             return protocol_error("clone creation time is not RFC3339");
         }
-        if self.database.format != CLONE_DATABASE_FORMAT {
+        if !matches!(
+            self.database.format.as_str(),
+            CLONE_DATABASE_FORMAT | CLONE_LOSSLESS_DATABASE_FORMAT
+        ) {
             return protocol_error("unsupported clone database format");
         }
         if self.objects.is_empty() || self.objects.len() > MAX_OBJECTS {

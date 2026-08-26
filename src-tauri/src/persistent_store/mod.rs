@@ -1019,6 +1019,20 @@ impl PersistentStore {
         )
     }
 
+    pub(crate) fn finish_prepared_replace_with_app_kv(
+        &mut self,
+        prepared: SnapshotAuthorizedReplaceCommit,
+        key: &str,
+        value: &Value,
+    ) -> StoreResult<RevisionResult> {
+        commit::replace_commit_with_app_kv(
+            &mut self.connection,
+            &prepared.staging_id,
+            Some(prepared.revision),
+            Some((key, value)),
+        )
+    }
+
     pub(crate) fn replace_abort(&mut self, staging_id: &str) -> StoreResult<()> {
         commit::replace_abort(&mut self.connection, staging_id)
     }

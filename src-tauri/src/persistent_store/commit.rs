@@ -505,6 +505,18 @@ pub(super) fn replace_commit(
     staging_id: &str,
     expected_revision: Option<i64>,
 ) -> StoreResult<RevisionResult> {
+    replace_commit_with_app_kv(connection, staging_id, expected_revision, None)
+}
+
+pub(super) fn replace_commit_with_app_kv(
+    connection: &mut Connection,
+    staging_id: &str,
+    expected_revision: Option<i64>,
+    app_kv: Option<(&str, &Value)>,
+) -> StoreResult<RevisionResult> {
+    let serialized_app_kv = app_kv
+        .map(|(key, value)| serde_json::to_string(value).map(|value| (key, value)))
+        .transpose()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
     let actual_revision = current_revision(&transaction)?;
@@ -523,6 +535,13 @@ pub(super) fn replace_commit(
     delete_generation(&transaction, &active)?;
     move_generation(&transaction, staging_id, &generation)?;
     set_active(&transaction, revision, &generation)?;
+    if let Some((key, value)) = serialized_app_kv {
+        transaction.execute(
+            "INSERT INTO app_kv (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+    }
     transaction.commit()?;
     Ok(RevisionResult { revision })
 }

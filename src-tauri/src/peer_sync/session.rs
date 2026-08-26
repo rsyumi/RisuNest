@@ -32,6 +32,7 @@ pub struct PinnedSourceObject {
     pub logical_key: String,
     pub metadata: Value,
     pub path: PathBuf,
+    database_format: Option<String>,
 }
 
 impl PinnedSourceObject {
@@ -41,6 +42,17 @@ impl PinnedSourceObject {
             logical_key: "database".to_owned(),
             metadata: Value::Null,
             path: path.into(),
+            database_format: Some(CLONE_DATABASE_FORMAT.to_owned()),
+        }
+    }
+
+    pub fn database_with_format(path: impl Into<PathBuf>, format: impl Into<String>) -> Self {
+        Self {
+            kind: CloneObjectKind::Database,
+            logical_key: "database".to_owned(),
+            metadata: Value::Null,
+            path: path.into(),
+            database_format: Some(format.into()),
         }
     }
 
@@ -55,6 +67,7 @@ impl PinnedSourceObject {
             logical_key: logical_key.into(),
             metadata,
             path: path.into(),
+            database_format: None,
         }
     }
 }
@@ -188,7 +201,10 @@ fn prepare_pinned_revision(
         served_objects.insert(prepared.content_hash.clone(), prepared.content_hash.clone());
 
         if source_object.kind == CloneObjectKind::Database {
-            if database.replace(prepared.content_hash).is_some() {
+            let format = source_object.database_format.ok_or_else(|| {
+                PeerSyncError::Protocol("pinned database has no declared format".to_owned())
+            })?;
+            if database.replace((prepared.content_hash, format)).is_some() {
                 return Err(PeerSyncError::Protocol(
                     "pinned source must contain exactly one database object".to_owned(),
                 ));
@@ -211,13 +227,13 @@ fn prepare_pinned_revision(
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|error| PeerSyncError::Protocol(error.to_string()))?,
         chunk_size: CLONE_CHUNK_SIZE,
-        database: CloneDatabase {
-            format: CLONE_DATABASE_FORMAT.to_owned(),
-            object: database.ok_or_else(|| {
+        database: {
+            let (object, format) = database.ok_or_else(|| {
                 PeerSyncError::Protocol(
                     "pinned source must contain exactly one database object".to_owned(),
                 )
-            })?,
+            })?;
+            CloneDatabase { format, object }
         },
         payloads,
         objects,

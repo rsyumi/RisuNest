@@ -394,6 +394,30 @@ fn fixture_source(root: &Path, large_sizes: &[usize]) -> FixtureSource {
     }
 }
 
+#[test]
+fn production_source_manifest_declares_the_lossless_database_format() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let database = source_root.path().join("source.lossless");
+    fs::write(&database, b"synthetic-lossless-package").unwrap();
+    let source = FixtureSource {
+        revision: 7,
+        objects: vec![PinnedSourceObject::database_with_format(
+            database,
+            CLONE_LOSSLESS_DATABASE_FORMAT,
+        )],
+        released: Arc::new(AtomicBool::new(false)),
+    };
+
+    let session = prepare(&source, session_root.path());
+
+    assert_eq!(
+        session.manifest().database.format,
+        CLONE_LOSSLESS_DATABASE_FORMAT
+    );
+    assert!(session.manifest().payloads.is_empty());
+}
+
 fn write_pattern_file(path: &Path, size: usize, seed: u8) {
     let mut file = File::create(path).unwrap();
     let mut remaining = size;
