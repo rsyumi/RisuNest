@@ -105,6 +105,7 @@ export interface ActiveConversationMutationRange {
     deleteCount: number
     messages: Message[]
     sessionVersion: number
+    completeOwner?: boolean
 }
 
 export type ActiveConversationCommandName =
@@ -1922,6 +1923,7 @@ export class ActiveConversationSession {
             deleteCount: this.compatibilityBaselineMessageCount ?? 0,
             messages,
             sessionVersion: previousVersion + 1,
+            completeOwner: true,
         }]
         for (
             let sessionVersion = previousVersion + 2;

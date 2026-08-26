@@ -1073,6 +1073,7 @@ describe('ActiveConversationSession', () => {
                 deleteCount: 1,
                 messages: conversation.message,
                 sessionVersion: 1,
+                completeOwner: true,
             },
             {
                 start: 4,

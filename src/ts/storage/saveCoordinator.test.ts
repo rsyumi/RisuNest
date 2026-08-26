@@ -3302,6 +3302,9 @@ describe('SaveCoordinator', () => {
     it('retains then acknowledges a session command captured after a legacy structural append', async () => {
         const database = makeChattyDatabase()
         const commit = vi.fn()
+            .mockImplementationOnce(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            }))
             .mockRejectedValueOnce(new Error('fallback write failed'))
             .mockImplementation(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
         let session!: ActiveConversationSession
@@ -3333,6 +3336,8 @@ describe('SaveCoordinator', () => {
             onMutation: (event) => coordinator.recordActiveConversationMutation(event),
         })
         conversation.message.push({ role: 'char', data: 'legacy direct append' })
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('legacy-structural-baseline')
 
         session.append({ role: 'user', data: 'session append' })
         await expect(
@@ -3349,20 +3354,20 @@ describe('SaveCoordinator', () => {
         expect(session.pinCount('dirty')).toBe(0)
         expect(session.pinCount('pending-save')).toBe(0)
         expect(session.residentBytes).toBe(0)
-        expect(commit).toHaveBeenCalledTimes(2)
-        expect(commit.mock.calls[1][0].conversations).toEqual([
+        expect(commit).toHaveBeenCalledTimes(3)
+        expect(commit.mock.calls[2][0].conversations).toEqual([
             expect.objectContaining({
                 type: 'replace-range',
                 characterId: 'char-a',
                 conversationId: 'two',
                 start: 0,
-                deleteCount: baselineMessageCount,
+                deleteCount: baselineMessageCount + 1,
                 messages: conversation.message,
             }),
         ])
 
         await coordinator.flushPendingData('legacy-structural-fallback-repeat')
-        expect(commit).toHaveBeenCalledTimes(2)
+        expect(commit).toHaveBeenCalledTimes(3)
     })
 
     it('keeps strict replacement evidence across a session-token rollover before flush', async () => {

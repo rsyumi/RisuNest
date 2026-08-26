@@ -864,7 +864,8 @@ export class SaveCoordinator {
                 !Number.isSafeInteger(mutation.deleteCount) || mutation.deleteCount < 0 ||
                 !Number.isSafeInteger(mutation.sessionVersion) ||
                 mutation.sessionVersion !== previousMutationVersion + 1 ||
-                mutation.sessionVersion > event.sessionVersion
+                mutation.sessionVersion > event.sessionVersion ||
+                (mutation.completeOwner === true && mutation.start !== 0)
             ) {
                 throw new RangeError('Conversation replacement evidence is invalid')
             }
@@ -2571,21 +2572,24 @@ export class SaveCoordinator {
                 ) as Omit<Chat, 'message'>
                 let valid = true
                 for (const range of event.mutations) {
+                    const deleteCount = range.completeOwner
+                        ? conversation.message.length
+                        : range.deleteCount
                     if (
                         range.start > conversation.message.length ||
-                        range.deleteCount > conversation.message.length - range.start
+                        deleteCount > conversation.message.length - range.start
                     ) {
                         valid = false
                         break
                     }
                     const messages = safeStructuredClone(range.messages)
-                    conversation.message.splice(range.start, range.deleteCount, ...messages)
+                    conversation.message.splice(range.start, deleteCount, ...messages)
                     eventMutations.push({
                         type: 'replace-range',
                         characterId: event.characterId,
                         conversationId: event.conversationId,
                         start: range.start,
-                        deleteCount: range.deleteCount,
+                        deleteCount,
                         messages,
                         conversation: safeStructuredClone(conversationMetadata),
                     })
