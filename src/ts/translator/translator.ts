@@ -1,6 +1,6 @@
 import { get } from "svelte/store"
 import { parseChatML } from "../parser/chatML";
-import { getDatabase, type character, type customscript, type groupChat } from "../storage/database.svelte"
+import { getDatabase, type character, type customscript, type Database, type groupChat } from "../storage/database.svelte"
 import {
     defaultTranslatorPrompt,
     getCurrentTranslatorPresetFromState,
@@ -11,11 +11,11 @@ import { isTauri, isNodeServer } from "src/ts/platform"
 import { alertError } from "../alert"
 import { requestChatData } from "../process/request/request"
 import { doingChat, type OpenAIChat } from "../process/index.svelte"
-import { applyMarkdownToNode, risuChatParser, type simpleCharacterArgument } from "../parser/parser.svelte"
+import { applyMarkdownToNode, risuChatParser, type CbsConditions, type simpleCharacterArgument } from "../parser/parser.svelte"
 import { selectedCharID } from "../stores.svelte"
 import { getModuleRegexScripts } from "../process/modules"
 import { getNodetextToSentence, sleep } from "../util"
-import { processScriptFull } from "../process/scripts"
+import { processScriptFull, type ProcessScriptCaptureContext } from "../process/scripts"
 import localforage from "localforage"
 import sendSound from '../../etc/send.mp3'
 
@@ -32,12 +32,19 @@ export const LLMCacheStorage = localforage.createInstance({
 
 let waitTrans = 0
 
-export function getCurrentTranslatorPreset(): TranslatorPreset {
-    return getCurrentTranslatorPresetFromState(getDatabase())
+export interface TranslateHTMLContext {
+    scriptContext: ProcessScriptCaptureContext
+    projectedChatID?: number
+    chara?: character | groupChat | string
+    cbsConditions?: CbsConditions
 }
 
-export async function translate(text:string, reverse:boolean) {
-    let db = getDatabase()
+export function getCurrentTranslatorPreset(database: Database = getDatabase()): TranslatorPreset {
+    return getCurrentTranslatorPresetFromState(database)
+}
+
+export async function translate(text:string, reverse:boolean, captureContext?: TranslateHTMLContext) {
+    let db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
     if(!reverse){
         const ind = cache.origin.indexOf(text)
         if(ind !== -1){
@@ -51,10 +58,17 @@ export async function translate(text:string, reverse:boolean) {
         }
     }
 
-    return runTranslator(text, reverse, db.translator,db.aiModel.startsWith('novellist') ? 'ja' : 'en')
+    return runTranslator(
+        text,
+        reverse,
+        db.translator,
+        db.aiModel.startsWith('novellist') ? 'ja' : 'en',
+        undefined,
+        captureContext,
+    )
 }
 
-export async function runTranslator(text:string, reverse:boolean, from:string,target:string, exarg?:{translatorNote?:string}) {
+export async function runTranslator(text:string, reverse:boolean, from:string,target:string, exarg?:{translatorNote?:string}, captureContext?: TranslateHTMLContext) {
     const arg = {
 
         from: reverse ? from : target,
@@ -92,7 +106,7 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
                 fullResult.push(chunk[0])
                 continue
             }
-            const result = await translateMain(trimed, arg);
+            const result = await translateMain(trimed, arg, captureContext);
 
             if(result.startsWith('ERR::')){
                 alertError(result)
@@ -118,11 +132,11 @@ export async function runTranslator(text:string, reverse:boolean, from:string,ta
 
 }
 
-async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}){
-    let db = getDatabase()
+async function translateMain(text:string, arg:{from:string, to:string, host:string, translatorNote?:string}, captureContext?: TranslateHTMLContext){
+    let db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
     if(db.translatorType === 'llm'){
         const tr = arg.to || 'en'
-        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote})
+        return translateLLM(text, {to: tr, from: arg.from, translatorNote: arg.translatorNote}, captureContext)
     }
     if(db.translatorType === 'deepl'){
         const body = {
@@ -249,22 +263,31 @@ async function jaTrans(text:string) {
     return await runTranslator(text, true, 'en','ja')
 }
 
-export function isExpTranslator(){
-    const db = getDatabase()
+export function isExpTranslator(database: Database = getDatabase()){
+    const db = database
     return db.translatorType === 'llm' || db.translatorType === 'deepl' || db.translatorType === 'deeplX'
 }
 
-export async function translateHTML(html: string, reverse:boolean, charArg:simpleCharacterArgument|string = '', chatID:number, regenerate = false): Promise<string> {
+export async function translateHTML(
+    html: string,
+    reverse:boolean,
+    charArg:simpleCharacterArgument|character|groupChat|string|null = '',
+    chatID:number,
+    regenerate = false,
+    captureContext?: TranslateHTMLContext,
+): Promise<string> {
+    const db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
     let alwaysExistChar: character | groupChat | simpleCharacterArgument;
-    if(charArg !== ''){
+    if(charArg){
         if(typeof(charArg) === 'string'){
-            const db = getDatabase()
-            const charId = get(selectedCharID)
+            const charId = captureContext?.scriptContext.parserContext.selectedCharID ?? get(selectedCharID)
             alwaysExistChar = db.characters[charId]
         }
         else{
             alwaysExistChar=charArg
         }
+    } else if(captureContext) {
+        alwaysExistChar = captureContext.scriptContext.parserContext.character
     } else {
         alwaysExistChar = {
             type: 'simple',
@@ -274,10 +297,9 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             chaId: 'simple'
         }
     }
-    let db = getDatabase()
-    let DoingChat = get(doingChat)
+    let DoingChat = captureContext ? false : get(doingChat)
     if(DoingChat){
-        if(isExpTranslator()){
+        if(isExpTranslator(db)){
             if(!(db.translatorType === 'llm' && await getLLMCache(html) !== null)){
                 return html
             }
@@ -286,13 +308,13 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
     if(db.translatorType === 'llm'){
         const tr = db.translator || 'en'
         const from = db.translatorInputLanguage
-        const r = await translateLLM(html, {to: tr, from: from, regenerate})
+        const r = await translateLLM(html, {to: tr, from: from, regenerate}, captureContext)
         if(db.playMessageOnTranslateEnd){
             const audio = new Audio(sendSound);
             audio.play().catch(() => {});
         }
 
-        return applyEdittransRegex(r, charArg, alwaysExistChar, chatID)
+        return applyEdittransRegex(r, charArg, alwaysExistChar, chatID, captureContext)
     }
     if(db.translatorType == "bergamot" && db.htmlTranslation) {
         const from = db.aiModel.startsWith('novellist') ? 'ja' : 'en'
@@ -303,7 +325,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             bergamotTranslate = bergamotTranslator.bergamotTranslate
         }
  
-        return applyEdittransRegex(await bergamotTranslate(html, from, to, true), charArg, alwaysExistChar, chatID)
+        return applyEdittransRegex(await bergamotTranslate(html, from, to, true), charArg, alwaysExistChar, chatID, captureContext)
     }
     const dom = new DOMParser().parseFromString(html, 'text/html');
     console.log(html)
@@ -319,7 +341,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
     
 
     async function translateTranslationChunks(force:boolean = false, additionalChunkLength = 0){
-        if(translationChunks.length === 0 || !needSuperChunkedTranslate()){
+        if(translationChunks.length === 0 || !needSuperChunkedTranslate(db)){
             return
         }
 
@@ -339,7 +361,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             return
         }
 
-        const translated = await translate(text, reverse)
+        const translated = await translate(text, reverse, captureContext)
 
         const split = translated.split('■')
 
@@ -350,7 +372,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             for(let i = 0; i < currentChunk.chunks.length; i++){
                 currentChunk.resolvers[i](
                     await translate(currentChunk.chunks[i]
-                , reverse))
+                , reverse, captureContext))
             }
         }
         
@@ -364,7 +386,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
 
     async function translateNodeText(node:Node, reprocessDisplayScript:boolean = false) {
         if(node.textContent.trim().length !== 0){
-            if(needSuperChunkedTranslate()){
+            if(needSuperChunkedTranslate(db)){
                 const prm = new Promise<string>((resolve) => {
                     translateTranslationChunks(false, node.textContent.length)
                     translationChunks[translationChunks.length-1].resolvers.push(resolve)
@@ -378,7 +400,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
             const translateChunks = (node.textContent || '').split(/\n\n+/g);
             let translatedChunksPromises: Promise<string>[] = [];
             for (const chunk of translateChunks) {
-                const translatedPromise = translate(chunk, reverse);
+                const translatedPromise = translate(chunk, reverse, captureContext);
                 translatedChunksPromises.push(translatedPromise);
             }
 
@@ -393,7 +415,13 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
                 alwaysExistChar,
                 translated,
                 "editdisplay",
-                chatID
+                chatID,
+                captureContext?.cbsConditions,
+                {
+                    captureContext: captureContext?.scriptContext,
+                    projectedChatID: captureContext?.projectedChatID,
+                    cache: captureContext ? 'bypass' : 'normal',
+                },
             );
             // If the translation is the same, don't replace the node
             if (translated == processedTranslated) {
@@ -489,7 +517,7 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
     // Remove the outer <html|body|head> tags
     translatedHTML = translatedHTML.replace(/<\/?(html|body|head)[^>]*>/g, '');
 
-    translatedHTML = applyEdittransRegex(translatedHTML, charArg, alwaysExistChar, chatID);
+    translatedHTML = applyEdittransRegex(translatedHTML, charArg, alwaysExistChar, chatID, captureContext);
 
     // console.log(html)
     // console.log(translatedHTML)
@@ -497,11 +525,11 @@ export async function translateHTML(html: string, reverse:boolean, charArg:simpl
     return translatedHTML
 }
 
-function needSuperChunkedTranslate(){
-    return getDatabase().translatorType === 'deeplX'
+function needSuperChunkedTranslate(database: Database = getDatabase()){
+    return database.translatorType === 'deeplX'
 }
 
-async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}):Promise<string>{
+async function translateLLM(text:string, arg:{to:string, from:string, regenerate?:boolean,translatorNote?:string}, captureContext?: TranslateHTMLContext):Promise<string>{
     if(!arg.regenerate){
         const cacheMatch = await LLMCacheStorage.getItem(text)
         if(cacheMatch){
@@ -515,8 +543,8 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
         return `<style-data style-index="${styleDecodes.length-1}"></style-data>`
     })
 
-    const db = getDatabase()
-    const charIndex = get(selectedCharID)
+    const db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
+    const charIndex = captureContext?.scriptContext.parserContext.selectedCharID ?? get(selectedCharID)
     const currentChar = db.characters[charIndex]
     let translatorNote = ""
     console.log(arg.translatorNote)
@@ -531,7 +559,12 @@ async function translateLLM(text:string, arg:{to:string, from:string, regenerate
     console.log(translatorNote)
 
     let formated:OpenAIChat[] = []
-    const preset = getCurrentTranslatorPreset()
+    const preset = captureContext
+        ? getCurrentTranslatorPreset({
+            ...db,
+            translatorPresets: db.translatorPresets?.map((preset) => ({ ...preset })),
+        })
+        : getCurrentTranslatorPreset(db)
     let prompt = preset.prompt || defaultTranslatorPrompt
     let parsedPrompt = parseChatML(prompt.replaceAll('{{slot::from}}', arg.from).replaceAll('{{slot}}', arg.to).replaceAll('{{solt::content}}', text).replaceAll('{{slot::content}}', text).replaceAll('{{slot::tnote}}', translatorNote))
     if(parsedPrompt){
@@ -627,15 +660,20 @@ interface pEdittransScript {
 
 export function applyEdittransRegex(
       text: string,
-      charArg: simpleCharacterArgument | string,
+      charArg: simpleCharacterArgument | character | groupChat | string | null,
       alwaysExistChar: character | groupChat | simpleCharacterArgument,
-      chatID = -1
+      chatID = -1,
+      captureContext?: TranslateHTMLContext,
   ): string {
       if (charArg === '') return text
 
-      const db = getDatabase()
+      const db = captureContext?.scriptContext.parserContext.database ?? getDatabase()
       let scripts: customscript[] = []
-      scripts = (db.presetRegex ?? []).concat(getModuleRegexScripts() ?? []).concat(alwaysExistChar?.customscript ?? [])
+      scripts = [
+          ...(captureContext?.scriptContext.presetRegex ?? db.presetRegex ?? []),
+          ...(captureContext?.scriptContext.moduleRegexScripts ?? getModuleRegexScripts() ?? []),
+          ...(alwaysExistChar?.customscript ?? []),
+      ]
 
       const parsedScripts: pEdittransScript[] = []
       let orderChanged = false
@@ -699,7 +737,24 @@ export function applyEdittransRegex(
 
               let input = script.in
               if (pscript.actions.includes('cbs')) {
-                  input = risuChatParser(input, { chatID: chatID })
+                  const parser = captureContext?.scriptContext.parserContext
+                  input = risuChatParser(input, parser ? {
+                      chatID,
+                      projectedChatID: captureContext.projectedChatID,
+                      historyOffset: parser.historyOffset,
+                      cbsConditions: captureContext.cbsConditions,
+                      db: parser.database,
+                      chara: captureContext.chara ?? parser.character,
+                      userName: parser.userName,
+                      personaPrompt: parser.personaPrompt,
+                      modules: parser.modules,
+                      moduleLorebooks: parser.moduleLorebooks,
+                      selectedCharID: parser.selectedCharID,
+                      chatVariables: parser.chatVariables,
+                      globalChatVariables: parser.globalChatVariables,
+                      currentTime: parser.currentTime,
+                      triggerId: parser.triggerId,
+                  } : { chatID })
               }
 
               const reg = new RegExp(input, pscript.flag)

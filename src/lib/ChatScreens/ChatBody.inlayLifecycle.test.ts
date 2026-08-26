@@ -343,6 +343,99 @@ describe('ChatBody deferred inlay lifecycle', () => {
         expect(onCaptureSettled).toHaveBeenCalledOnce()
     })
 
+    test('passes the immutable capture parser context into auto-translation', async () => {
+        vi.useFakeTimers()
+        parserMocks.ParseMarkdown.mockResolvedValue('<span>parsed</span>')
+        const { translateHTML } = await import('src/ts/translator/translator')
+        vi.mocked(translateHTML).mockResolvedValue('<span>translated</span>')
+        const character = {
+            type: 'character' as const,
+            name: 'Frozen Character',
+            chaId: 'frozen-character',
+            chatPage: 0,
+            chats: [{ message: [], note: '', name: '', localLore: [] }],
+            customscript: [],
+        }
+        const captureContext = {
+            character: {
+                type: 'simple' as const,
+                chaId: 'frozen-character',
+                customscript: [],
+            },
+            characterName: 'Frozen Character',
+            characterImageSource: '',
+            characterLargePortrait: false,
+            userName: 'Frozen User',
+            userImageSource: '',
+            userLargePortrait: false,
+            moduleAssets: [],
+            presetRegex: [],
+            moduleRegexScripts: [],
+            assetStyle: '',
+            parserContext: {
+                database: { characters: [character] } as any,
+                character: character as any,
+                userName: 'Frozen User',
+                personaPrompt: 'Frozen Persona',
+                modules: [],
+                moduleLorebooks: [],
+                selectedCharID: 0,
+                chatVariables: {},
+                globalChatVariables: {},
+                currentTime: 1,
+                historyOffset: 4,
+            },
+            settings: {
+                autoTranslate: true,
+                autoTranslateCachedOnly: false,
+                translatorType: 'mock',
+                translateBeforeHTMLFormatting: false,
+                legacyTranslation: false,
+                showTranslationLoading: false,
+                newImageHandlingBeta: false,
+                assetWidth: -1,
+                hideAllImages: false,
+                iconSize: 100,
+                zoomSize: 100,
+                lineHeight: 1.25,
+                dynamicAssets: false,
+                dynamicAssetsEditDisplay: false,
+                legacyMediaFindings: false,
+                assetMaxDifference: 0.5,
+            },
+        }
+
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: {
+                captureContext,
+                idx: 6,
+                captureParserIndex: 2,
+                name: 'Frozen Character',
+            },
+        })
+        await Promise.resolve(); await tick()
+        await vi.advanceTimersByTimeAsync(10)
+        await tick()
+        await vi.runAllTimersAsync()
+        await tick()
+
+        expect(translateHTML).toHaveBeenCalledWith(
+            expect.any(String),
+            false,
+            expect.objectContaining({ chaId: 'frozen-character' }),
+            6,
+            false,
+            expect.objectContaining({
+                projectedChatID: 2,
+                chara: expect.objectContaining({ name: 'Frozen Character' }),
+                scriptContext: expect.objectContaining({
+                    parserContext: expect.objectContaining({ historyOffset: 4 }),
+                }),
+            }),
+        )
+    })
+
     test('does not report capture settled after a pending body is destroyed', async () => {
         const pendingParse = deferred<string>()
         parserMocks.ParseMarkdown.mockReturnValue(pendingParse.promise)

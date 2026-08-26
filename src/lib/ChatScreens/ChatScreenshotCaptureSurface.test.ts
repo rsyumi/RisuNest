@@ -166,6 +166,20 @@ describe('ChatScreenshotCaptureSurface', () => {
         expect(root.querySelector('[data-character-name]')?.textContent).toBe('Character')
         expect(root.querySelector('[data-message-time]')?.textContent).toBe('123')
     })
+
+    test('passes absolute and projected indexes from the frozen history offset', async () => {
+        mounted = mount(ChatScreenshotCaptureSurface, { target })
+        const surface = mounted as SurfaceInstance
+        const root = await surface.mountBatch(
+            [{ role: 'char', data: 'indexed' }],
+            7,
+            { ...renderContext(), historyStartIndex: 3 },
+            new AbortController().signal,
+        )
+
+        expect(root.querySelector('[data-capture-probe]')?.getAttribute('data-index')).toBe('6')
+        expect(root.querySelector('[data-capture-probe]')?.getAttribute('data-parser-index')).toBe('3')
+    })
 })
 
 function renderContext() {

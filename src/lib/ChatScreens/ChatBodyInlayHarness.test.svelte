@@ -8,6 +8,9 @@
         onCaptureSettled?: (generation: number) => void
         onCaptureError?: (generation: number, error: unknown) => void
         captureContext?: FrozenChatScreenshotRenderContext
+        idx?: number
+        captureParserIndex?: number
+        name?: string
     }
 
     let {
@@ -15,6 +18,9 @@
         onCaptureSettled,
         onCaptureError,
         captureContext,
+        idx = 0,
+        captureParserIndex = idx,
+        name = 'Frozen Character',
     }: Props = $props()
     let message = $state('first')
     let raw = $state(false)
@@ -32,6 +38,8 @@
 <div bind:this={bodyRoot}>
     <ChatBody
         msgDisplay={message}
+        {idx}
+        {name}
         role="char"
         character={captureContext?.character as simpleCharacterArgument | null}
         bind:translated
@@ -44,5 +52,6 @@
         {onCaptureSettled}
         {onCaptureError}
         {captureContext}
+        {captureParserIndex}
     />
 </div>

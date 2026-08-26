@@ -6,6 +6,7 @@
         idx,
         captureMessage,
         captureContext,
+        captureParserIndex,
         onCaptureSettled,
         onCaptureError,
     }: {
@@ -13,6 +14,7 @@
         idx: number
         captureMessage: { data: string; time?: number }
         captureContext: { characterName: string }
+        captureParserIndex: number
         onCaptureSettled?: (generation: number) => void
         onCaptureError?: (generation: number, error: unknown) => void
     } = $props()
@@ -23,6 +25,6 @@
     })
 </script>
 
-<div data-capture-probe={message} data-index={idx}>{message}</div>
+<div data-capture-probe={message} data-index={idx} data-parser-index={captureParserIndex}>{message}</div>
 <span data-character-name>{captureContext.characterName}</span>
 <span data-message-time>{captureMessage.time}</span>

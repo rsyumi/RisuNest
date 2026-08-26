@@ -692,6 +692,7 @@ export interface ParseMarkdownRenderContext {
     scriptContext?: ProcessScriptCaptureContext
     markdownSettings?: MarkdownRenderSettings
     returnCSSError?: boolean
+    projectedChatID?: number
 }
 
 function parseThoughtsAndTools(data:string){
@@ -740,6 +741,7 @@ export async function ParseMarkdown(
         data = (await processScriptFull(char, data, 'editdisplay', chatID, cbsConditions, {
             captureContext: renderContext.scriptContext,
             cache: renderContext.scriptContext ? 'bypass' : 'normal',
+            projectedChatID: renderContext.projectedChatID,
         })).data
     }
 
@@ -766,6 +768,7 @@ export async function ParseMarkdown(
         returnCSSError: renderContext.returnCSSError,
         parserContext: renderContext.scriptContext?.parserContext,
         chatID,
+        projectedChatID: renderContext.projectedChatID,
         cbsConditions,
     })
 }
@@ -780,6 +783,7 @@ export interface TrimMarkdownRenderContext {
     returnCSSError?: boolean
     parserContext?: ProcessScriptCaptureContext['parserContext']
     chatID?: number
+    projectedChatID?: number
     cbsConditions?: CbsConditions
 }
 
@@ -995,9 +999,11 @@ function decodeStyleContent(
         const parser = renderContext.parserContext
         text = risuChatParser(text, parser ? {
             chatID: renderContext.chatID,
+            projectedChatID: renderContext.projectedChatID,
+            historyOffset: parser.historyOffset,
             cbsConditions: renderContext.cbsConditions,
             db: parser.database,
-            chara: parser.character,
+            chara: parser.chara ?? parser.character,
             userName: parser.userName,
             personaPrompt: parser.personaPrompt,
             modules: parser.modules,
@@ -1616,6 +1622,8 @@ function blockEndMatcher(p1:string,type:{type:blockMatch,type2?:string,mode?:str
 
 export function risuChatParser(da:string, arg:{
     chatID?:number
+    projectedChatID?:number
+    historyOffset?:number
     db?:Database
     chara?:string|character|groupChat
     rmVar?:boolean,
@@ -1699,6 +1707,8 @@ export function risuChatParser(da:string, arg:{
 
     const matcherObj = {
         chatID: chatID,
+        projectedChatID: arg.projectedChatID,
+        historyOffset: arg.historyOffset,
         chara: chara,
         rmVar: arg.rmVar ?? false,
         db: db,

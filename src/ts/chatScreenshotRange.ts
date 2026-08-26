@@ -1,4 +1,4 @@
-import type { Message, customscript } from './storage/database.svelte'
+import type { Chat, Message, character, customscript, groupChat } from './storage/database.svelte'
 import type { simpleCharacterArgument } from './parser/parser.svelte'
 import type { ProcessScriptCaptureContext } from './process/scripts'
 import rfdc from 'rfdc'
@@ -72,6 +72,7 @@ export interface ChatScreenshotRenderContext {
     parserContext: ProcessScriptCaptureContext['parserContext']
     totalTurns?: number
     selectionStart?: number
+    historyStartIndex?: number
     firstParserMessageIndex?: number
     settings: ChatScreenshotRenderSettings
 }
@@ -112,6 +113,67 @@ export function fullScreenshotRange(totalTurns: number): ScreenshotRange {
     return Object.freeze({ start: 1, end: totalTurns })
 }
 
+export function snapshotChatScreenshotCharacter(
+    source: character | groupChat,
+    chat: Chat,
+): character | groupChat {
+    const captureChat: Chat = {
+        message: [],
+        note: chat.note ?? '',
+        name: chat.name ?? '',
+        localLore: chat.localLore ?? [],
+        scriptstate: chat.scriptstate ?? {},
+        modules: chat.modules ?? [],
+        id: chat.id,
+        bindedPersona: chat.bindedPersona,
+        fmIndex: chat.fmIndex ?? -1,
+        bookmarks: chat.bookmarks ?? [],
+        bookmarkNames: chat.bookmarkNames ?? {},
+        useLocallySetGlobalVariables: chat.useLocallySetGlobalVariables,
+        GLGlobalVariables: chat.GLGlobalVariables ?? {},
+    }
+    const shared = {
+        type: source.type,
+        name: source.name,
+        nickname: source.nickname,
+        chaId: source.chaId,
+        firstMessage: source.firstMessage ?? '',
+        alternateGreetings: source.alternateGreetings ?? [],
+        chats: [captureChat],
+        chatPage: 0,
+        customscript: source.customscript ?? [],
+        virtualscript: source.virtualscript,
+        globalLore: source.globalLore ?? [],
+        defaultVariables: source.defaultVariables ?? '',
+        additionalAssets: source.additionalAssets ?? [],
+        emotionImages: source.emotionImages ?? [],
+        prebuiltAssetStyle: source.prebuiltAssetStyle ?? '',
+        prebuiltAssetCommand: source.prebuiltAssetCommand ?? false,
+        prebuiltAssetExclude: source.prebuiltAssetExclude ?? [],
+    }
+    if (source.type === 'group') {
+        return {
+            ...shared,
+            type: 'group',
+            characters: source.characters ?? [],
+            characterTalks: source.characterTalks ?? [],
+            characterActive: source.characterActive ?? [],
+        } as groupChat
+    }
+    return {
+        ...shared,
+        type: 'character',
+        desc: source.desc ?? '',
+        personality: source.personality ?? '',
+        scenario: source.scenario ?? '',
+        exampleMessage: source.exampleMessage ?? '',
+        systemPrompt: source.systemPrompt ?? '',
+        postHistoryInstructions: source.postHistoryInstructions ?? '',
+        translatorNote: source.translatorNote ?? '',
+        triggerscript: source.triggerscript ?? [],
+    } as character
+}
+
 function deepFreeze<T>(value: T): DeepReadonly<T> {
     if (value && typeof value === 'object' && !Object.isFrozen(value)) {
         Object.freeze(value)
@@ -135,18 +197,27 @@ export function createChatScreenshotJob(input: {
         input.messages.slice(validation.start - 1, validation.end),
     )
     const renderContext = cloneScreenshotData(input.renderContext)
-    const previousMessage = validation.start > 1
-        ? cloneScreenshotData(input.messages[validation.start - 2])
-        : null
-    const parserMessages = previousMessage
-        ? [previousMessage, ...selectedMessages]
-        : selectedMessages
+    const historyBounds = deriveParserHistoryBounds(
+        input.messages,
+        validation.start - 1,
+        validation.end,
+        renderContext,
+    )
+    const historyMessages = cloneScreenshotData(
+        input.messages.slice(historyBounds.start, validation.start - 1),
+    )
+    const trailingMessages = cloneScreenshotData(
+        input.messages.slice(validation.end, historyBounds.end),
+    )
+    const parserMessages = [...historyMessages, ...selectedMessages, ...trailingMessages]
     const parserCharacter = renderContext.parserContext.character
     parserCharacter.chats[parserCharacter.chatPage].message = parserMessages
     renderContext.parserContext.database.characters[renderContext.parserContext.selectedCharID] = parserCharacter
+    renderContext.parserContext.historyOffset = historyBounds.start
     renderContext.totalTurns = input.messages.length
     renderContext.selectionStart = validation.start
-    renderContext.firstParserMessageIndex = previousMessage ? 1 : 0
+    renderContext.historyStartIndex = historyBounds.start
+    renderContext.firstParserMessageIndex = validation.start - 1 - historyBounds.start
     return deepFreeze({
         characterId: input.characterId,
         chatId: input.chatId,
@@ -156,4 +227,67 @@ export function createChatScreenshotJob(input: {
         messages: selectedMessages,
         renderContext,
     })
+}
+
+function deriveParserHistoryBounds(
+    messages: Message[],
+    selectionStartIndex: number,
+    selectionEndExclusive: number,
+    renderContext: ChatScreenshotRenderContext,
+) {
+    let start = selectionStartIndex
+    let end = selectionEndExclusive
+
+    const selectedRoles = new Set(
+        messages.slice(selectionStartIndex, selectionEndExclusive).map((message) => message.role),
+    )
+    selectedRoles.add('char')
+
+    for (const role of selectedRoles) {
+        const previousIndex = findPreviousRoleIndex(messages, selectionStartIndex, role)
+        if (previousIndex !== -1) start = Math.min(start, previousIndex)
+    }
+
+    let previousUserIndex = selectionStartIndex
+    for (let count = 0; count < 2; count += 1) {
+        previousUserIndex = findPreviousRoleIndex(messages, previousUserIndex, 'user')
+        if (previousUserIndex === -1) break
+        start = Math.min(start, previousUserIndex)
+    }
+
+    const captureText = collectCaptureText([
+        messages.slice(selectionStartIndex, selectionEndExclusive),
+        renderContext,
+    ]).join('\n')
+    if (/{{\s*(?:userhistory|usermessages|user_history|charhistory|charmessages|char_history|history|messages|messageunixtimearray|idleduration|idle_duration)(?=\s*(?:::|}}))/i.test(captureText)) {
+        start = 0
+        end = messages.length
+    }
+
+    for (const match of captureText.matchAll(/{{\s*(?:previouschatlog|previous_chat_log)\s*::\s*(\d+)/gi)) {
+        const requestedIndex = Number(match[1])
+        if (!Number.isInteger(requestedIndex) || requestedIndex < 0 || requestedIndex >= messages.length) {
+            continue
+        }
+        start = Math.min(start, requestedIndex)
+        end = Math.max(end, requestedIndex + 1)
+    }
+
+    return { start, end }
+}
+
+function findPreviousRoleIndex(messages: Message[], beforeIndex: number, role: Message['role']) {
+    for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+        if (messages[index].role === role) return index
+    }
+    return -1
+}
+
+function collectCaptureText(value: unknown, seen = new WeakSet<object>()): string[] {
+    if (typeof value === 'string') return [value]
+    if (!value || typeof value !== 'object' || seen.has(value)) return []
+    seen.add(value)
+    const output: string[] = []
+    for (const child of Object.values(value)) output.push(...collectCaptureText(child, seen))
+    return output
 }

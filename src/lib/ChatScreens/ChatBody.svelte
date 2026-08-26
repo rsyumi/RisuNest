@@ -4,7 +4,7 @@
     import { sleep } from "src/ts/util"
     import { alertError } from "../../ts/alert"
     import { addMetadataToElement, getDistance, ParseMarkdown, postTranslationParse, trimMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
-    import { getLLMCache, translateHTML } from "../../ts/translator/translator"
+    import { getLLMCache, translateHTML, type TranslateHTMLContext } from "../../ts/translator/translator"
     import { getModuleAssets } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc } from "src/ts/globalApi.svelte";
@@ -30,6 +30,7 @@
         onCaptureSettled?: (generation: number) => void
         onCaptureError?: (generation: number, error: unknown) => void
         captureContext?: FrozenChatScreenshotRenderContext
+        captureParserIndex?: number
     }
 
     let {
@@ -37,6 +38,7 @@
         idx = 0,
         firstMessage = false,
         msgDisplay,
+        name = '',
         role,
         translated = $bindable(false),
         translating = $bindable(false),
@@ -48,6 +50,7 @@
         onCaptureSettled,
         onCaptureError,
         captureContext,
+        captureParserIndex = idx,
     }: Props =  $props()
 
     // svelte-ignore non_reactive_update
@@ -71,6 +74,37 @@
     let activeParseJob: ChatBodyParseJob|null = null
     let parseGeneration = 0
 
+    function captureParserChara() {
+        const parserCharacter = captureContext?.parserContext.character
+        return parserCharacter?.type === 'group' ? name : parserCharacter
+    }
+
+    function captureScriptContext(): ProcessScriptCaptureContext | undefined {
+        if (!captureContext) return undefined
+        return {
+            presetRegex: captureContext.presetRegex,
+            moduleRegexScripts: captureContext.moduleRegexScripts,
+            moduleAssets: captureContext.moduleAssets,
+            dynamicAssets: captureContext.settings.dynamicAssets,
+            dynamicAssetsEditDisplay: captureContext.settings.dynamicAssetsEditDisplay,
+            parserContext: {
+                ...captureContext.parserContext,
+                chara: captureParserChara(),
+            },
+        } as ProcessScriptCaptureContext
+    }
+
+    function captureTranslationContext(): TranslateHTMLContext | undefined {
+        const scriptContext = captureScriptContext()
+        if (!scriptContext) return undefined
+        return {
+            scriptContext,
+            projectedChatID: captureParserIndex,
+            chara: captureParserChara() as unknown as TranslateHTMLContext['chara'],
+            cbsConditions: getCbsCondition(),
+        }
+    }
+
     function captureMarkdownSettings() {
         if (!captureContext) return undefined
         return {
@@ -88,8 +122,9 @@
             ? trimMarkdown(value, {
                 hideAllImages: captureContext.settings.hideAllImages,
                 returnCSSError: captureContext.settings.returnCSSError,
-                parserContext: captureContext.parserContext as unknown as ProcessScriptCaptureContext['parserContext'],
+                parserContext: captureScriptContext()?.parserContext,
                 chatID: idx,
+                projectedChatID: captureParserIndex,
                 cbsConditions: getCbsCondition(),
             })
             : trimMarkdown(value)
@@ -130,16 +165,10 @@
                 assetMaxDifference: captureContext?.settings.assetMaxDifference,
                 characterImageSource: captureContext?.characterImageSource,
                 userImageSource: captureContext?.userImageSource,
-                scriptContext: captureContext ? ({
-                    presetRegex: captureContext.presetRegex,
-                    moduleRegexScripts: captureContext.moduleRegexScripts,
-                    moduleAssets: captureContext.moduleAssets,
-                    dynamicAssets: captureContext.settings.dynamicAssets,
-                    dynamicAssetsEditDisplay: captureContext.settings.dynamicAssetsEditDisplay,
-                    parserContext: captureContext.parserContext,
-                } as unknown as ProcessScriptCaptureContext) : undefined,
+                scriptContext: captureScriptContext(),
                 markdownSettings: captureMarkdownSettings(),
                 returnCSSError: captureContext?.settings.returnCSSError,
+                projectedChatID: captureContext ? captureParserIndex : undefined,
             })
         )
         // track 'translated' and 'retranslate' state
@@ -203,6 +232,7 @@
                         translationCharacter,
                         chatID,
                         retranslate,
+                        captureTranslationContext(),
                     )
                     translating = false
                     const marked = await parseForRender(data, mode)
@@ -219,6 +249,7 @@
                         translationCharacter,
                         chatID,
                         retranslate,
+                        captureTranslationContext(),
                     ), captureMarkdownSettings())
                     translating = false
                     lastParsedQueue = translated
@@ -234,6 +265,7 @@
                         translationCharacter,
                         chatID,
                         retranslate,
+                        captureTranslationContext(),
                     )
                     translating = false
                     lastParsedQueue = translated

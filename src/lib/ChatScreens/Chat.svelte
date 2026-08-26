@@ -118,13 +118,20 @@
     let captureLineHeight = $derived(captureSettings?.lineHeight ?? DBState.db.lineHeight ?? 1.25)
     let hideCaptureIcon = $derived(captureSettings?.hideIcons ?? $HideIconStore)
 
+    function captureParserChara() {
+        const character = captureContext?.parserContext.character
+        return character?.type === 'group' ? name : character
+    }
+
     function captureParserArgs() {
         if (!captureContext) return {}
         const parser = captureContext.parserContext
         return {
             db: parser.database,
-            chara: parser.character,
-            chatID: captureParserIndex,
+            chara: captureParserChara(),
+            chatID: idx,
+            projectedChatID: captureParserIndex,
+            historyOffset: parser.historyOffset,
             userName: parser.userName,
             personaPrompt: parser.personaPrompt,
             modules: parser.modules,
@@ -548,7 +555,8 @@
                     {rawStreamingText}
                     {onCaptureSettled}
                     {onCaptureError}
-                    {captureContext} />
+                    {captureContext}
+                    {captureParserIndex} />
             {/key}
             {#if !captureContext && idx >= 0 && !editMode && !isOptimizedStreamingMessage && partialEditEnabled && (DBState.db.enableBlockPartialEdit || DBState.db.enableDragPartialEdit)}
                 <PartialEditController

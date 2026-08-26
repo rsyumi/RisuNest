@@ -7,6 +7,12 @@ import { mount, unmount } from 'svelte'
 const live = vi.hoisted(() => ({
     db: {} as Record<string, any>,
 }))
+const parserCalls = vi.hoisted(() => [] as Array<{
+    chara?: unknown
+    role?: string
+    chatID?: number
+    projectedChatID?: number
+}>)
 
 vi.mock('./ChatBody.svelte', async () => ({
     default: (await import('./ChatBodyCaptureProbe.test.svelte')).default,
@@ -30,7 +36,29 @@ vi.mock('src/ts/globalApi.svelte', () => ({
     createChatCopyName: vi.fn(),
 }))
 vi.mock('src/ts/process/scripts', () => ({
-    risuChatParser: (value: string) => value,
+    risuChatParser: (value: string, arg: {
+        chara?: any
+        role?: string
+        chatID?: number
+        projectedChatID?: number
+    } = {}) => {
+        parserCalls.push({
+            chara: arg.chara,
+            role: arg.role,
+            chatID: arg.chatID,
+            projectedChatID: arg.projectedChatID,
+        })
+        if (!value.includes('{{char}}')) return value
+        if (typeof arg.chara === 'string') return value.replaceAll('{{char}}', arg.chara)
+        if (arg.chara?.type === 'group') {
+            const message = arg.chara.chats[arg.chara.chatPage].message.at(-1)
+            const member = arg.chara.characters
+                .map((id: string) => live.db.characters.find((candidate: any) => candidate.chaId === id))
+                .find((candidate: any) => candidate?.chaId === message?.saying)
+            return value.replaceAll('{{char}}', member?.name ?? arg.chara.name)
+        }
+        return value.replaceAll('{{char}}', arg.chara?.name ?? '')
+    },
 }))
 vi.mock('src/ts/model/modellist', () => ({
     getModelInfo: (model: string) => ({ shortName: model || 'model' }),
@@ -62,6 +90,7 @@ vi.mock('src/ts/process/files/inlayRenderSource', () => ({
 vi.mock('src/ts/process/files/chatCopyInlays', () => ({ copyImageSourceToDataUrl: vi.fn() }))
 
 import Chat from './Chat.svelte'
+import ChatCaptureBatchHarness from './ChatCaptureBatchHarness.test.svelte'
 
 function context(overrides: Record<string, unknown> = {}) {
     const character = {
@@ -141,6 +170,7 @@ describe('Chat frozen capture presentation', () => {
     let mounted: ReturnType<typeof mount> | undefined
 
     beforeEach(() => {
+        parserCalls.length = 0
         live.db = {
             theme: 'cardboard',
             iconsize: 25,
@@ -265,5 +295,51 @@ describe('Chat frozen capture presentation', () => {
 
         await vi.waitFor(() => expect(target.textContent).toContain('Frozen Model'))
         expect(target.querySelector('.border-amber-500')).not.toBeNull()
+    })
+
+    test('renders each frozen group turn with the same names as the normal Chat presentation', async () => {
+        const memberA = { ...context().parserContext.character, name: 'Member A', chaId: 'member-a' }
+        const memberB = { ...context().parserContext.character, name: 'Member B', chaId: 'member-b' }
+        const messages = [
+            { role: 'char' as const, data: '{{char}}', saying: 'member-a' },
+            { role: 'char' as const, data: '{{char}}', saying: 'member-b' },
+        ]
+        const group = {
+            type: 'group' as const,
+            name: 'Frozen Group',
+            chaId: 'group',
+            chatPage: 0,
+            chats: [{ message: messages, note: '', name: '', localLore: [], bookmarks: [] }],
+            characters: ['member-a', 'member-b'],
+            customscript: [],
+        }
+        const frozen = context()
+        frozen.character = null
+        frozen.characterName = group.name
+        frozen.parserContext.character = group as any
+        frozen.parserContext.database = { characters: [group, memberA, memberB] } as any
+        live.db.characters = [group, memberA, memberB]
+
+        mounted = mount(ChatCaptureBatchHarness, {
+            target,
+            props: { messages, captureContext: frozen as any, firstIndex: 4 },
+        })
+
+        await vi.waitFor(() => expect(target.querySelectorAll('[data-chat-body-probe]')).toHaveLength(2))
+        expect([...target.querySelectorAll('[data-chat-body-probe]')].map((node) => node.textContent)).toEqual([
+            'Frozen Group',
+            'Frozen Group',
+        ])
+        expect(parserCalls.filter((call) => call.role === 'char').map((call) => call.chara)).toEqual([
+            'Frozen Group',
+            'Frozen Group',
+        ])
+        expect(parserCalls.filter((call) => call.role === 'char').map((call) => [
+            call.chatID,
+            call.projectedChatID,
+        ])).toEqual([
+            [4, 0],
+            [5, 1],
+        ])
     })
 })

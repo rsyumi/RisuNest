@@ -162,7 +162,7 @@ describe('chat screenshot ranges', () => {
         ])
     })
 
-    it('keeps only the selected messages and one frozen previous-message input for CBS', () => {
+    it('keeps the selected messages and the derived frozen history window needed by CBS', () => {
         const messages = [
             { role: 'char' as const, data: 'too old' },
             { role: 'user' as const, data: 'previous' },
@@ -212,12 +212,63 @@ describe('chat screenshot ranges', () => {
 
         const parserMessages = job.renderContext.parserContext.character.chats[0].message
         expect(parserMessages.map((message) => message.data)).toEqual([
+            'too old',
             'previous',
             'selected one',
             'selected two',
         ])
-        expect(parserMessages).not.toContainEqual(expect.objectContaining({ data: 'too old' }))
-        expect(parserMessages[1]).toBe(job.messages[0])
-        expect(job.renderContext.firstParserMessageIndex).toBe(1)
+        expect(parserMessages[2]).toBe(job.messages[0])
+        expect(job.renderContext.historyStartIndex).toBe(0)
+        expect(job.renderContext.firstParserMessageIndex).toBe(2)
+    })
+
+    it('keeps the parser history projection bounded when full history is not requested', () => {
+        const messages = Array.from({ length: 100 }, (_, index) => ({
+            role: index % 2 === 0 ? 'char' as const : 'user' as const,
+            data: `turn ${index + 1}`,
+        }))
+        const job = createChatScreenshotJob({
+            characterId: 'character-1',
+            chatId: 'chat-1',
+            messages,
+            start: 100,
+            end: 100,
+            renderContext: {
+                character: null,
+                characterName: 'Character',
+                characterImageSource: '',
+                characterLargePortrait: false,
+                userName: 'User',
+                userImageSource: '',
+                userLargePortrait: false,
+                moduleAssets: [],
+                presetRegex: [],
+                moduleRegexScripts: [],
+                assetStyle: '',
+                parserContext: parserContext(),
+                settings: {
+                    autoTranslate: false,
+                    autoTranslateCachedOnly: false,
+                    translatorType: 'google',
+                    translateBeforeHTMLFormatting: false,
+                    legacyTranslation: false,
+                    showTranslationLoading: false,
+                    newImageHandlingBeta: false,
+                    assetWidth: -1,
+                    hideAllImages: false,
+                    iconSize: 100,
+                    zoomSize: 100,
+                    lineHeight: 1.25,
+                    dynamicAssets: false,
+                    dynamicAssetsEditDisplay: false,
+                    legacyMediaFindings: false,
+                    assetMaxDifference: 0.5,
+                },
+            },
+        })
+
+        expect(job.renderContext.historyStartIndex).toBe(95)
+        expect(job.renderContext.parserContext.character.chats[0].message).toHaveLength(5)
+        expect(job.messages).toHaveLength(1)
     })
 })

@@ -24,6 +24,7 @@ export interface ProcessScriptOptions {
     /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
     regexWorker?: boolean
     captureContext?: ProcessScriptCaptureContext
+    projectedChatID?: number
 }
 
 export interface ProcessScriptCaptureContext {
@@ -35,6 +36,7 @@ export interface ProcessScriptCaptureContext {
     parserContext: {
         database: Database
         character: character | groupChat
+        chara?: character | groupChat | string
         userName: string
         personaPrompt: string
         modules: RisuModule[]
@@ -44,6 +46,7 @@ export interface ProcessScriptCaptureContext {
         globalChatVariables: Record<string, string>
         currentTime: number
         triggerId?: string
+        historyOffset?: number
     }
 }
 
@@ -136,13 +139,15 @@ export function resetScriptCache(){
 }
 
 export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
-    let db = getDatabase()
     const captureContext = options.captureContext
+    let db = captureContext?.parserContext.database ?? getDatabase()
     const parseCbs = (value: string) => risuChatParser(value, captureContext ? {
         chatID,
+        projectedChatID: options.projectedChatID,
+        historyOffset: captureContext.parserContext.historyOffset,
         cbsConditions,
         db: captureContext.parserContext.database,
-        chara: captureContext.parserContext.character,
+        chara: captureContext.parserContext.chara ?? captureContext.parserContext.character,
         userName: captureContext.parserContext.userName,
         personaPrompt: captureContext.parserContext.personaPrompt,
         modules: captureContext.parserContext.modules,
@@ -321,14 +326,15 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                 }
                 else{
                     if((outScript.startsWith('@@repeat_back') || entry.actions.includes('repeat_back'))  && chatID !== -1){
-                        if (captureContext) return
                         const v = outScript.split(' ', 2)[1]
-                        const selchar = db.characters[get(selectedCharID)]
+                        const selectedIndex = captureContext?.parserContext.selectedCharID ?? get(selectedCharID)
+                        const selchar = db.characters[selectedIndex]
                         const chat = selchar.chats[selchar.chatPage]
                         let lastChat = chat.fmIndex === -1 ? selchar.firstMessage : selchar.alternateGreetings[chat.fmIndex]
-                        let pointer = chatID - 1
+                        const historyChatID = options.projectedChatID ?? chatID
+                        let pointer = historyChatID - 1
                         while(pointer >= 0){
-                            if(chat.message[pointer].role === chat.message[chatID].role){
+                            if(chat.message[pointer].role === chat.message[historyChatID].role){
                                 lastChat = chat.message[pointer].data
                                 break
                             }

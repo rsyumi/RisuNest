@@ -83,8 +83,7 @@
             key: `${batchGeneration}:${index}`,
             generation: batchGeneration,
             turn: firstTurn + index,
-            parserIndex: (context.firstParserMessageIndex ?? 0) +
-                (firstTurn + index - (context.selectionStart ?? firstTurn)),
+            parserIndex: firstTurn + index - 1 - (context.historyStartIndex ?? 0),
             message: message as Message,
         }))
 

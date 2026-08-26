@@ -51,6 +51,8 @@ export const defaultCBSRegisterArg: CBSRegisterArg = {
 
 export type matcherArg = {
     chatID: number,
+    projectedChatID?: number,
+    historyOffset?: number,
     db: Database,
     chara: character | groupChat | string,
     rmVar: boolean,
@@ -150,6 +152,11 @@ export function registerCBS(arg:CBSRegisterArg) {
         callInternalFunction
     } = arg;
 
+    const historyChatID = (matcherArg: matcherArg) => matcherArg.projectedChatID ?? matcherArg.chatID
+    const projectedHistoryIndex = (matcherArg: matcherArg, absoluteIndex: number) => (
+        absoluteIndex - (matcherArg.historyOffset ?? 0)
+    )
+
     // Basic character/user variables
     registerFunction({
         name: 'char',
@@ -207,7 +214,8 @@ export function registerCBS(arg:CBSRegisterArg) {
             const db = getDatabase()
             const selchar = db.characters[getSelectedCharID()]
             const chat = selchar.chats[selchar.chatPage]
-            let pointer = matcherArg.chatID !== -1 ? matcherArg.chatID - 1 : chat.message.length - 1
+            const currentIndex = historyChatID(matcherArg)
+            let pointer = currentIndex !== -1 ? currentIndex - 1 : chat.message.length - 1
             while(pointer >= 0){
                 if(chat.message[pointer].role === 'char'){
                     return chat.message[pointer].data
@@ -223,7 +231,7 @@ export function registerCBS(arg:CBSRegisterArg) {
     registerFunction({
         name: 'previoususerchat',
         callback: (str, matcherArg, args, vars) => {
-            const chatID = matcherArg.chatID
+            const chatID = historyChatID(matcherArg)
             if(chatID !== -1){
                 const db = getDatabase()
                 const selchar = db.characters[getSelectedCharID()]
@@ -465,7 +473,7 @@ export function registerCBS(arg:CBSRegisterArg) {
             const db = getDatabase()
             const selchar = db.characters[getSelectedCharID()]
             const chat = selchar.chats[selchar.chatPage]
-            const message = chat.message[matcherArg.chatID]
+            const message = chat.message[historyChatID(matcherArg)]
             if(!message.time){
                 return "[Cannot get time, message was sent in older version]"
             }
@@ -488,7 +496,7 @@ export function registerCBS(arg:CBSRegisterArg) {
             const db = getDatabase()
             const selchar = db.characters[getSelectedCharID()]
             const chat = selchar.chats[selchar.chatPage]
-            const message = chat.message[matcherArg.chatID]
+            const message = chat.message[historyChatID(matcherArg)]
             if(!message.time){
                 return "[Cannot get time, message was sent in older version]"
             }
@@ -567,7 +575,7 @@ export function registerCBS(arg:CBSRegisterArg) {
             const selchar = db.characters[getSelectedCharID()]
             const chat = selchar.chats[selchar.chatPage]
             
-            let pointer = matcherArg.chatID
+            let pointer = historyChatID(matcherArg)
             let pointerMode: 'findLast'|'findSecondLast' = 'findLast'
             let message:any
             let previous_message:any
@@ -689,7 +697,7 @@ export function registerCBS(arg:CBSRegisterArg) {
             if (matcherArg.chatID !== -1) {
                 const db = getDatabase()
                 const selchar = db.characters[getSelectedCharID()]
-                return selchar.chats[selchar.chatPage].message[matcherArg.chatID].role;
+                return selchar.chats[selchar.chatPage].message[historyChatID(matcherArg)].role;
             }
             return matcherArg.role ?? 'null'
         },
@@ -1160,7 +1168,7 @@ export function registerCBS(arg:CBSRegisterArg) {
             const db = getDatabase()
             const selchar = db.characters[getSelectedCharID()]
             const chat = selchar?.chats?.[selchar.chatPage]
-            return chat?.message[Number(args[0])]?.data ?? 'Out of range'
+            return chat?.message[projectedHistoryIndex(matcherArg, Number(args[0]))]?.data ?? 'Out of range'
         },
         alias: ['previous_chat_log'],
         description: 'Retrieves the message content at the specified index in the chat history. Returns "Out of range" if index is invalid.\n\nUsage:: {{previouschatlog::5}}',

@@ -60,7 +60,7 @@
     import { handleDefaultChatUnreroll } from './defaultChatReroll';
     import ChatScreenshotDialog from './ChatScreenshotDialog.svelte';
     import ChatScreenshotCaptureSurface from './ChatScreenshotCaptureSurface.svelte';
-    import { createChatScreenshotJob } from 'src/ts/chatScreenshotRange';
+    import { createChatScreenshotJob, snapshotChatScreenshotCharacter } from 'src/ts/chatScreenshotRange';
     import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
     import { isTauri } from 'src/ts/platform';
@@ -602,67 +602,6 @@
         screenshotDialogOpen = false
     }
 
-    function snapshotCaptureChat(chat: ChatRecord): ChatRecord {
-        return {
-            message: [],
-            note: chat.note ?? '',
-            name: chat.name ?? '',
-            localLore: chat.localLore ?? [],
-            scriptstate: chat.scriptstate ?? {},
-            modules: chat.modules ?? [],
-            id: chat.id,
-            bindedPersona: chat.bindedPersona,
-            fmIndex: chat.fmIndex ?? -1,
-            bookmarks: chat.bookmarks ?? [],
-            bookmarkNames: chat.bookmarkNames ?? {},
-            useLocallySetGlobalVariables: chat.useLocallySetGlobalVariables,
-            GLGlobalVariables: chat.GLGlobalVariables ?? {},
-        }
-    }
-
-    function snapshotCaptureCharacter(
-        source: character | groupChat,
-        chat: ChatRecord,
-    ): character | groupChat {
-        const shared = {
-            type: source.type,
-            name: source.name,
-            nickname: source.nickname,
-            chaId: source.chaId,
-            firstMessage: source.firstMessage ?? '',
-            alternateGreetings: source.alternateGreetings ?? [],
-            chats: [snapshotCaptureChat(chat)],
-            chatPage: 0,
-            customscript: source.customscript ?? [],
-            virtualscript: source.virtualscript,
-            globalLore: source.globalLore ?? [],
-            defaultVariables: source.defaultVariables ?? '',
-            additionalAssets: source.additionalAssets ?? [],
-            emotionImages: source.emotionImages ?? [],
-            prebuiltAssetStyle: source.prebuiltAssetStyle ?? '',
-        }
-        if (source.type === 'group') {
-            return {
-                ...shared,
-                type: 'group',
-                characters: source.characters ?? [],
-                characterTalks: source.characterTalks ?? [],
-                characterActive: source.characterActive ?? [],
-            } as groupChat
-        }
-        return {
-            ...shared,
-            type: 'character',
-            desc: source.desc ?? '',
-            personality: source.personality ?? '',
-            scenario: source.scenario ?? '',
-            exampleMessage: source.exampleMessage ?? '',
-            systemPrompt: source.systemPrompt ?? '',
-            postHistoryInstructions: source.postHistoryInstructions ?? '',
-            triggerscript: source.triggerscript ?? [],
-        } as character
-    }
-
     function captureVariables(source: character | groupChat, chat: ChatRecord) {
         const variables = Object.fromEntries([
             ...parseKeyValue(DBState.db.templateDefaultVariables ?? ''),
@@ -680,14 +619,14 @@
         start: number,
         end: number,
     ) {
-        const character = snapshotCaptureCharacter(source, chat)
+        const character = snapshotChatScreenshotCharacter(source, chat)
         const memberIds = new Set(source.type === 'group' ? source.characters : [])
         for (const message of chat.message.slice(Math.max(0, start - 2), end)) {
             if (message.saying) memberIds.add(message.saying)
         }
         const members = DBState.db.characters
             .filter((candidate) => candidate !== source && memberIds.has(candidate.chaId))
-            .map((candidate) => snapshotCaptureCharacter(
+            .map((candidate) => snapshotChatScreenshotCharacter(
                 candidate,
                 candidate.chats[candidate.chatPage] ?? chat,
             ))
@@ -702,6 +641,20 @@
             subModel: DBState.db.subModel,
             language: DBState.db.language,
             promptTemplate: DBState.db.promptTemplate,
+            translatorType: DBState.db.translatorType,
+            translator: DBState.db.translator,
+            translatorInputLanguage: DBState.db.translatorInputLanguage,
+            translatorPrompt: DBState.db.translatorPrompt,
+            translatorMaxResponse: DBState.db.translatorMaxResponse,
+            translatorPresets: DBState.db.translatorPresets,
+            translatorPresetId: DBState.db.translatorPresetId,
+            htmlTranslation: DBState.db.htmlTranslation,
+            combineTranslation: DBState.db.combineTranslation,
+            playMessageOnTranslateEnd: DBState.db.playMessageOnTranslateEnd,
+            useExperimentalGoogleTranslator: DBState.db.useExperimentalGoogleTranslator,
+            noWaitForTranslate: DBState.db.noWaitForTranslate,
+            deeplOptions: DBState.db.deeplOptions,
+            deeplXOptions: DBState.db.deeplXOptions,
         } as Database
         const globalChatVariables = { ...(DBState.db.globalChatVariables ?? {}) }
         for (const [key, value] of Object.entries(chat.GLGlobalVariables ?? {})) {
