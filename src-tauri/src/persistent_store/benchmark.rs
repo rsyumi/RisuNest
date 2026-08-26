@@ -524,6 +524,14 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
     store
         .replace_put_root(&staging.staging_id, root)
         .expect("stage benchmark root");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            database["botPresets"]
+                .as_array()
+                .expect("benchmark presets"),
+        )
+        .expect("stage benchmark presets");
     stage_in_public_batches(
         &mut store,
         &staging.staging_id,
@@ -788,6 +796,14 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
     store
         .replace_put_root(&staging.staging_id, &root_without_characters(database))
         .expect("stage post-lease fixture root");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            database["botPresets"]
+                .as_array()
+                .expect("post-lease benchmark presets"),
+        )
+        .expect("stage post-lease benchmark presets");
     stage_in_public_batches(
         &mut store,
         &staging.staging_id,
