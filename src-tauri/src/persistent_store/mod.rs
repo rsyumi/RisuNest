@@ -910,6 +910,7 @@ pub(crate) struct PreparedOfficialPublication {
 }
 
 #[cfg(feature = "native-official-publication")]
+#[derive(Debug)]
 pub(crate) struct OfficialPublicationPayload {
     path: PathBuf,
     snapshots_dir: PathBuf,
@@ -956,29 +957,37 @@ impl PreparedOfficialPublication {
             &self.lease,
             expected_account_id,
             replacements,
-            is_cancelled,
+            &is_cancelled,
             on_progress,
         );
         let exported = match exported {
             Ok(exported) => exported,
             Err(error) => {
-                let _ = self.release_reader();
-                return Err(error);
+                return Err(combine_publication_cleanup_error(
+                    error,
+                    self.release_reader(),
+                    "reader release",
+                ));
             }
         };
         let path = PathBuf::from(&exported.path);
-        let sha256 = match hash_exact_file(&path) {
+        if let Err(error) = self.release_reader() {
+            return Err(combine_publication_cleanup_error(
+                error,
+                export::cleanup(&self.snapshots_dir, &path),
+                "payload cleanup",
+            ));
+        }
+        let sha256 = match hash_exact_file(&path, &is_cancelled) {
             Ok(hash) => hash,
             Err(error) => {
-                let _ = self.release_reader();
-                let _ = export::cleanup(&self.snapshots_dir, &path);
-                return Err(error);
+                return Err(combine_publication_cleanup_error(
+                    error,
+                    export::cleanup(&self.snapshots_dir, &path),
+                    "payload cleanup",
+                ));
             }
         };
-        if let Err(error) = self.release_reader() {
-            let _ = export::cleanup(&self.snapshots_dir, &path);
-            return Err(error);
-        }
         Ok(OfficialPublicationPayload {
             path,
             snapshots_dir: self.snapshots_dir.clone(),
@@ -1031,13 +1040,18 @@ impl Drop for OfficialPublicationPayload {
 }
 
 #[cfg(feature = "native-official-publication")]
-fn hash_exact_file(path: &Path) -> StoreResult<String> {
+fn hash_exact_file(path: &Path, is_cancelled: &impl Fn() -> bool) -> StoreResult<String> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)?;
     let mut buffer = [0u8; 64 * 1024];
     let mut hasher = Sha256::new();
     loop {
+        if is_cancelled() {
+            return Err(StoreError::Validation {
+                message: export::EXPORT_CANCELLED_MESSAGE.to_owned(),
+            });
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -1045,6 +1059,20 @@ fn hash_exact_file(path: &Path) -> StoreResult<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(feature = "native-official-publication")]
+fn combine_publication_cleanup_error(
+    primary: StoreError,
+    cleanup: StoreResult<()>,
+    operation: &str,
+) -> StoreError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => StoreError::Store {
+            message: format!("{primary}; official publication {operation} failed: {cleanup}"),
+        },
+    }
 }
 
 impl PreparedReplaceCommit {
@@ -1642,20 +1670,19 @@ impl PersistentStore {
         }
         let reader = self
             .revision_leases
-            .remove(lease)
+            .get(lease)
             .ok_or(StoreError::SnapshotReleased)?;
         if reader.target.revision != expected_revision {
-            let actual = reader.target.revision;
-            self.revision_leases.insert(lease.to_owned(), reader);
             return Err(StoreError::RevisionConflict {
                 expected: expected_revision,
-                actual,
+                actual: reader.target.revision,
             });
         }
-        if let Err(error) = reader.publish_detached_asset_roots() {
-            self.revision_leases.insert(lease.to_owned(), reader);
-            return Err(error);
-        }
+        reader.publish_detached_asset_roots()?;
+        let reader = self
+            .revision_leases
+            .remove(lease)
+            .ok_or(StoreError::SnapshotReleased)?;
         Ok(PreparedOfficialPublication {
             revision: reader.target.revision,
             lease: lease.to_owned(),

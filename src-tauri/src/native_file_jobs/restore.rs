@@ -305,6 +305,7 @@ where
             warning_codes: Vec::new(),
             handoff_path: None,
             recovery_path,
+            publication: None,
         })
     })();
     match outcome {

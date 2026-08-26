@@ -10,7 +10,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
+    io::Read,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc,
+    },
     thread,
     time::Duration,
 };
@@ -2093,6 +2098,185 @@ fn official_publication_transfers_only_the_exact_expected_revision_lease() {
         Err(StoreError::SnapshotReleased)
     ));
     drop(prepared);
+}
+
+#[cfg(feature = "native-official-publication")]
+#[test]
+fn official_publication_payload_closes_its_reader_and_reopens_exact_managed_bytes() {
+    let directory = tempfile::tempdir().expect("create publication store");
+    let mut store = PersistentStore::open(directory.path()).expect("open publication store");
+    let staging = store.replace_begin().expect("begin publication fixture");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({
+                "account": { "id": "account-1", "token": "not-pinned" },
+                "customBackground": "local-asset"
+            }),
+        )
+        .expect("stage publication root");
+    store
+        .replace_put_presets(&staging.staging_id, &[])
+        .expect("stage publication presets");
+    let revision = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("commit publication fixture")
+        .revision;
+    let lease = store
+        .acquire_revision(revision)
+        .expect("acquire publication lease")
+        .lease;
+    let prepared = store
+        .prepare_official_publication(&lease, revision)
+        .expect("transfer publication lease");
+    let payload = prepared
+        .create_payload(
+            "account-1",
+            &std::collections::HashMap::from([(
+                "local-asset".to_owned(),
+                "remote-asset".to_owned(),
+            )]),
+            || false,
+            |_, _, _| {},
+        )
+        .expect("create publication payload");
+
+    assert_eq!(store.active_readers.active_count(), 0);
+    assert!(store
+        .active_readers
+        .detached_asset_roots()
+        .expect("read detached publication roots")
+        .is_empty());
+    assert!(matches!(
+        store.read_root(Some(&lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    let (mut reopened, bytes) = payload.open().expect("reopen managed payload");
+    let mut body = Vec::new();
+    reopened
+        .read_to_end(&mut body)
+        .expect("read managed payload");
+    assert_eq!(bytes, payload.bytes);
+    assert_eq!(body.len() as u64, payload.bytes);
+    assert_eq!(hex::encode(Sha256::digest(&body)), payload.sha256);
+    let exports_dir = store.snapshots_dir.parent().unwrap().join("exports");
+    assert_eq!(fs::read_dir(&exports_dir).unwrap().count(), 2);
+    payload.cleanup().expect("cleanup managed payload pair");
+    assert_eq!(fs::read_dir(exports_dir).unwrap().count(), 0);
+}
+
+#[cfg(feature = "native-official-publication")]
+#[test]
+fn exact_payload_hash_stops_on_cancellation_without_consuming_the_source() {
+    let directory = tempfile::tempdir().expect("create hash fixture");
+    let path = directory.path().join("payload.risudat");
+    fs::write(&path, vec![7u8; 128 * 1024]).expect("write hash fixture");
+    let cancelled = AtomicBool::new(true);
+
+    let error = super::hash_exact_file(&path, &|| cancelled.load(AtomicOrdering::Acquire))
+        .expect_err("cancel payload hash");
+
+    assert!(matches!(error, StoreError::Validation { .. }));
+    assert!(path.is_file());
+}
+
+#[cfg(feature = "native-official-publication")]
+#[test]
+fn official_publication_hash_cancellation_closes_reader_and_cleans_managed_pair() {
+    let directory = tempfile::tempdir().expect("create publication store");
+    let mut store = PersistentStore::open(directory.path()).expect("open publication store");
+    let staging = store.replace_begin().expect("begin publication fixture");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "account": { "id": "account-1" } }),
+        )
+        .expect("stage publication root");
+    store
+        .replace_put_presets(&staging.staging_id, &[])
+        .expect("stage publication presets");
+    let revision = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("commit publication fixture")
+        .revision;
+    let lease = store
+        .acquire_revision(revision)
+        .expect("acquire publication lease")
+        .lease;
+    let active_readers = Arc::clone(&store.active_readers);
+    let prepared = store
+        .prepare_official_publication(&lease, revision)
+        .expect("transfer publication lease");
+
+    let error = prepared
+        .create_payload(
+            "account-1",
+            &std::collections::HashMap::new(),
+            || active_readers.active_count() == 0,
+            |_, _, _| {},
+        )
+        .expect_err("cancel after reader release before hashing");
+
+    assert!(matches!(error, StoreError::Validation { .. }));
+    assert_eq!(store.active_readers.active_count(), 0);
+    assert!(store
+        .active_readers
+        .detached_asset_roots()
+        .expect("read roots after cancelled hash")
+        .is_empty());
+    assert!(matches!(
+        store.read_root(Some(&lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    let exports_dir = store.snapshots_dir.parent().unwrap().join("exports");
+    assert_eq!(fs::read_dir(exports_dir).unwrap().count(), 0);
+}
+
+#[cfg(feature = "native-official-publication")]
+#[test]
+fn pinned_publication_account_mismatch_releases_reader_and_cleans_export_files() {
+    let directory = tempfile::tempdir().expect("create publication store");
+    let mut store = PersistentStore::open(directory.path()).expect("open publication store");
+    let staging = store.replace_begin().expect("begin publication fixture");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({ "account": { "id": "account-1" } }),
+        )
+        .expect("stage publication root");
+    store
+        .replace_put_presets(&staging.staging_id, &[])
+        .expect("stage publication presets");
+    let revision = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("commit publication fixture")
+        .revision;
+    let lease = store
+        .acquire_revision(revision)
+        .expect("acquire publication lease")
+        .lease;
+    let prepared = store
+        .prepare_official_publication(&lease, revision)
+        .expect("transfer publication lease");
+
+    let error = prepared
+        .create_payload(
+            "different-account",
+            &std::collections::HashMap::new(),
+            || false,
+            |_, _, _| {},
+        )
+        .expect_err("reject mismatched pinned account");
+
+    assert!(matches!(error, StoreError::Validation { .. }));
+    assert_eq!(store.active_readers.active_count(), 0);
+    assert!(store
+        .active_readers
+        .detached_asset_roots()
+        .expect("read roots after account mismatch")
+        .is_empty());
+    let exports_dir = store.snapshots_dir.parent().unwrap().join("exports");
+    assert_eq!(fs::read_dir(exports_dir).unwrap().count(), 0);
 }
 
 #[test]

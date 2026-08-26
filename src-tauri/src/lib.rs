@@ -609,6 +609,7 @@ pub fn run() {
             native_file_jobs::native_file_job_list,
             native_file_jobs::native_file_job_finalize,
             native_file_jobs::native_file_job_cancel,
+            native_file_jobs::native_file_job_official_publication_retry,
             native_file_jobs::native_file_job_forget,
             native_file_jobs::native_lossless_handoff_cleanup,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_start,

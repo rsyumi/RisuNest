@@ -179,6 +179,7 @@ pub(crate) fn export_block_risu_save(
             warning_codes: Vec::new(),
             handoff_path: None,
             recovery_path: None,
+            publication: None,
         }),
         Err(error) => Err(phase_failure
             .into_inner()

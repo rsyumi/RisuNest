@@ -474,6 +474,7 @@ pub(crate) fn run_job(
                     warning_codes: Vec::new(),
                     handoff_path: None,
                     recovery_path: None,
+                    publication: None,
                 })
             }
         }

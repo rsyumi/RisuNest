@@ -97,6 +97,79 @@ struct JobOwnership {
     job_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum OfficialPublicationCredential {
+    RisuAuth { token: String },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OfficialPublicationRetryRequest {
+    pub(crate) job_id: String,
+    pub(crate) account_id: String,
+    pub(crate) session: Option<String>,
+    pub(crate) save_date: String,
+    pub(crate) credential: OfficialPublicationCredential,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum OfficialPublicationAttemptResult {
+    Written {
+        account_id: String,
+        session: Option<String>,
+        save_date: String,
+        status: u16,
+        replacement_key: String,
+        warning: Option<String>,
+        reload_session: bool,
+    },
+    NotModified {
+        account_id: String,
+        session: Option<String>,
+        save_date: String,
+        status: u16,
+        replacement_key: String,
+    },
+    AuthWarning {
+        account_id: String,
+        session: Option<String>,
+        save_date: String,
+        status: u16,
+    },
+    ReauthenticationNeeded {
+        account_id: String,
+        session: Option<String>,
+        save_date: String,
+        status: u16,
+    },
+}
+
+#[cfg(feature = "native-official-publication")]
+#[derive(Clone)]
+pub(crate) struct OfficialPublicationJobRequest {
+    pub(crate) lease: String,
+    pub(crate) expected_revision: i64,
+    pub(crate) account_id: String,
+    pub(crate) base_url: String,
+    pub(crate) replacements: HashMap<String, String>,
+    pub(crate) session: Option<String>,
+    pub(crate) save_date: String,
+    pub(crate) credential: OfficialPublicationCredential,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OfficialPublicationRetryInput {
+    pub(crate) session: Option<String>,
+    pub(crate) save_date: String,
+    pub(crate) credential: OfficialPublicationCredential,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(
     tag = "kind",
@@ -137,6 +210,16 @@ pub(crate) enum NativeFileJobStartRequest {
         url: String,
         expected_account_id: String,
         token: String,
+    },
+    OfficialPublicationUpload {
+        lease: String,
+        expected_revision: i64,
+        account_id: String,
+        base_url: String,
+        replacements: HashMap<String, String>,
+        session: Option<String>,
+        save_date: String,
+        credential: OfficialPublicationCredential,
     },
 }
 
@@ -1033,6 +1116,49 @@ impl NativeFileJobState {
                     ));
                 }
             }
+            NativeFileJobStartRequest::OfficialPublicationUpload {
+                lease,
+                expected_revision,
+                account_id,
+                base_url,
+                replacements,
+                session,
+                save_date,
+                credential,
+            } => {
+                #[cfg(feature = "native-official-publication")]
+                {
+                    let request = OfficialPublicationJobRequest {
+                        lease,
+                        expected_revision,
+                        account_id,
+                        base_url,
+                        replacements,
+                        session,
+                        save_date,
+                        credential,
+                    };
+                    publication::validate_start_request(&request)?;
+                    NativeFileJobTask::OfficialPublication { request, app }
+                }
+                #[cfg(not(feature = "native-official-publication"))]
+                {
+                    let _ = (
+                        lease,
+                        expected_revision,
+                        account_id,
+                        base_url,
+                        replacements,
+                        session,
+                        save_date,
+                        credential,
+                    );
+                    return Err(NativeJobError::new(
+                        "capability-unavailable",
+                        "native official publication jobs are not compiled in this build",
+                    ));
+                }
+            }
         };
         self.spawn(task, true)
     }
@@ -1350,6 +1476,10 @@ impl NativeFileJobState {
                 NativeFileJobTask::KeiBackup { prepared } => {
                     crate::persistent_store::kei::run_job(prepared, Arc::clone(&job))
                 }
+                #[cfg(feature = "native-official-publication")]
+                NativeFileJobTask::OfficialPublication { request, app } => {
+                    publication::run_job(request, app, Arc::clone(&job))
+                }
             };
             let mut cleanup_errors = Vec::new();
             if let Err(error) =
@@ -1359,7 +1489,11 @@ impl NativeFileJobState {
             }
             match (outcome, cleanup_errors.is_empty()) {
                 (Ok(result), true) => {
-                    let _ = job.finish_success(result);
+                    let _ = if kind == JobKind::OfficialPublicationUpload {
+                        job.finish_official_publication_success(result)
+                    } else {
+                        job.finish_success(result)
+                    };
                 }
                 (Ok(mut result), false) => {
                     if !result
@@ -1369,7 +1503,11 @@ impl NativeFileJobState {
                     {
                         result.warning_codes.push("cleanup-failed".to_owned());
                     }
-                    let _ = job.finish_success(result);
+                    let _ = if kind == JobKind::OfficialPublicationUpload {
+                        job.finish_official_publication_success(result)
+                    } else {
+                        job.finish_success(result)
+                    };
                 }
                 (Err(error), false) => {
                     let cleanup = cleanup_errors.join("; ");
@@ -1456,6 +1594,29 @@ impl NativeFileJobState {
         self.registry
             .cancel(job_id)
             .map_err(|error| NativeJobError::new("store-error", error))
+    }
+
+    pub(crate) fn retry_official_publication(
+        &self,
+        request: OfficialPublicationRetryRequest,
+    ) -> Result<(), NativeJobError> {
+        #[cfg(not(feature = "native-official-publication"))]
+        {
+            let _ = request;
+            return Err(NativeJobError::new(
+                "capability-unavailable",
+                "native official publication jobs are not compiled in this build",
+            ));
+        }
+        #[cfg(feature = "native-official-publication")]
+        {
+            publication::validate_retry_request(&request)?;
+            validate_official_publication_retry(&request)
+                .map_err(|error| NativeJobError::new("invalid-input", error))?;
+            self.registry
+                .retry_official_publication(request)
+                .map_err(|error| NativeJobError::new("invalid-input", error))
+        }
     }
 
     pub(crate) fn forget(&self, job_id: &str) -> Result<bool, NativeJobError> {
@@ -1555,6 +1716,11 @@ enum NativeFileJobTask {
     KeiBackup {
         prepared: crate::persistent_store::kei::PreparedKeiUpload,
     },
+    #[cfg(feature = "native-official-publication")]
+    OfficialPublication {
+        request: OfficialPublicationJobRequest,
+        app: AppHandle,
+    },
 }
 
 impl NativeFileJobTask {
@@ -1567,6 +1733,8 @@ impl NativeFileJobTask {
             Self::ExportLossless { .. } => JobKind::ExportLosslessBackup,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
+            #[cfg(feature = "native-official-publication")]
+            Self::OfficialPublication { .. } => JobKind::OfficialPublicationUpload,
         }
     }
 
@@ -1589,6 +1757,8 @@ impl NativeFileJobTask {
             } => *expected_revision,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { prepared } => prepared.revision(),
+            #[cfg(feature = "native-official-publication")]
+            Self::OfficialPublication { request, .. } => request.expected_revision,
         }
     }
 }
@@ -1799,6 +1969,14 @@ pub(crate) fn native_file_job_cancel(
 }
 
 #[tauri::command(async)]
+pub(crate) fn native_file_job_official_publication_retry(
+    state: State<'_, NativeFileJobState>,
+    request: OfficialPublicationRetryRequest,
+) -> Result<(), NativeJobError> {
+    state.retry_official_publication(request)
+}
+
+#[tauri::command(async)]
 pub(crate) fn native_file_job_forget(
     state: State<'_, NativeFileJobState>,
     job_id: String,
@@ -1824,6 +2002,7 @@ pub(crate) enum JobKind {
     ExportLosslessBackup,
     PrepareContentImport,
     KeiBackupUpload,
+    OfficialPublicationUpload,
 }
 
 #[allow(dead_code)]
@@ -1849,6 +2028,9 @@ pub(crate) enum JobPhase {
     AwaitingActivation,
     ActivatingDatabase,
     WritingExport,
+    UploadingDatabase,
+    AwaitingPublicationRetry,
+    FinalizingPublication,
     PublishingDestination,
     FinalizingExport,
     Complete,
@@ -1880,6 +2062,8 @@ pub(crate) struct JobStatus {
     pub(crate) error: Option<JobFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prepared_content: Option<PreparedContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publication_attempt: Option<OfficialPublicationAttemptResult>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1895,6 +2079,8 @@ pub(crate) struct JobResultSummary {
     pub(crate) handoff_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) recovery_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) publication: Option<OfficialPublicationAttemptResult>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1928,6 +2114,12 @@ pub(crate) struct JobRegistry {
     jobs: Mutex<HashMap<String, Arc<JobControl>>>,
     max_terminal_jobs: usize,
     max_terminal_age: Duration,
+}
+
+#[derive(Default)]
+struct JobWaitState {
+    restore_finalized: bool,
+    official_publication_retry: Option<OfficialPublicationRetryInput>,
 }
 
 impl Default for JobRegistry {
@@ -1983,8 +2175,8 @@ impl JobRegistry {
         let job = Arc::new(JobControl {
             cancel_requested: AtomicBool::new(false),
             requires_restore_finalization,
-            restore_finalized: Mutex::new(false),
-            restore_finalization_changed: Condvar::new(),
+            wait_state: Mutex::new(JobWaitState::default()),
+            wait_changed: Condvar::new(),
             terminal_at: Mutex::new(None),
             status: Mutex::new(JobStatus {
                 job_id: id.clone(),
@@ -1997,6 +2189,7 @@ impl JobRegistry {
                 result: None,
                 error: None,
                 prepared_content: None,
+                publication_attempt: None,
             }),
         });
         self.jobs
@@ -2042,6 +2235,17 @@ impl JobRegistry {
             return Ok(FinalizeOutcome::Missing);
         };
         job.request_finalize()
+    }
+
+    pub(crate) fn retry_official_publication(
+        &self,
+        request: OfficialPublicationRetryRequest,
+    ) -> Result<(), String> {
+        self.prune()?;
+        let job = self
+            .lookup(&request.job_id)?
+            .ok_or_else(|| "native job not found".to_owned())?;
+        job.request_official_publication_retry(request)
     }
 
     pub(crate) fn forget(&self, id: &str) -> Result<bool, String> {
@@ -2102,8 +2306,8 @@ impl JobRegistry {
 pub(crate) struct JobControl {
     cancel_requested: AtomicBool,
     requires_restore_finalization: bool,
-    restore_finalized: Mutex<bool>,
-    restore_finalization_changed: Condvar,
+    wait_state: Mutex<JobWaitState>,
+    wait_changed: Condvar,
     terminal_at: Mutex<Option<Instant>>,
     status: Mutex<JobStatus>,
 }
@@ -2144,21 +2348,24 @@ impl JobControl {
         }
         if matches!(
             status.phase,
-            JobPhase::ActivatingDatabase | JobPhase::FinalizingExport
+            JobPhase::ActivatingDatabase
+                | JobPhase::FinalizingExport
+                | JobPhase::FinalizingPublication
         ) {
             return Ok(CancelOutcome::TooLate);
         }
-        let wait = self
-            .restore_finalized
+        let mut wait = self
+            .wait_state
             .lock()
             .map_err(|error| format!("native job wait mutex poisoned: {error}"))?;
+        wait.official_publication_retry = None;
         if self.cancel_requested.swap(true, Ordering::AcqRel) {
             return Ok(CancelOutcome::AlreadyRequested);
         }
         status.state = JobState::Cancelling;
         drop(status);
         drop(wait);
-        self.restore_finalization_changed.notify_all();
+        self.wait_changed.notify_all();
         Ok(CancelOutcome::Requested)
     }
 
@@ -2191,19 +2398,19 @@ impl JobControl {
         if self.cancel_requested.load(Ordering::Acquire) {
             return Ok(FinalizeOutcome::TooEarly);
         }
-        let mut finalized = self
-            .restore_finalized
+        let mut wait = self
+            .wait_state
             .lock()
             .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?;
-        if *finalized {
+        if wait.restore_finalized {
             return Ok(FinalizeOutcome::AlreadyRequested);
         }
-        *finalized = true;
+        wait.restore_finalized = true;
         status.state = JobState::Running;
         status.phase = JobPhase::ActivatingDatabase;
-        drop(finalized);
+        drop(wait);
         drop(status);
-        self.restore_finalization_changed.notify_all();
+        self.wait_changed.notify_all();
         Ok(FinalizeOutcome::Requested)
     }
 
@@ -2234,22 +2441,148 @@ impl JobControl {
             status.phase = JobPhase::AwaitingActivation;
         }
 
-        let mut finalized = self
-            .restore_finalized
+        let mut wait = self
+            .wait_state
             .lock()
             .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?;
         loop {
             if self.cancel_requested.load(Ordering::Acquire) {
                 return Err("native restore was cancelled before activation".to_owned());
             }
-            if *finalized {
+            if wait.restore_finalized {
                 return Ok(());
             }
-            finalized = self
-                .restore_finalization_changed
-                .wait(finalized)
+            wait = self
+                .wait_changed
+                .wait(wait)
                 .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?;
         }
+    }
+
+    pub(crate) fn wait_for_official_publication_retry(
+        &self,
+        attempt: OfficialPublicationAttemptResult,
+    ) -> Result<OfficialPublicationRetryInput, NativeJobError> {
+        match &attempt {
+            OfficialPublicationAttemptResult::ReauthenticationNeeded { status, .. }
+                if *status == 403 => {}
+            _ => {
+                return Err(NativeJobError::new(
+                    "store-error",
+                    "official publication can only wait after an ordinary 403",
+                ));
+            }
+        }
+        let mut status = self.status.lock().map_err(|error| {
+            NativeJobError::new(
+                "store-error",
+                format!("native job status mutex poisoned: {error}"),
+            )
+        })?;
+        if self.is_cancel_requested() {
+            return Err(publication_cancelled());
+        }
+        if status.kind != JobKind::OfficialPublicationUpload
+            || status.state != JobState::Running
+            || status.phase != JobPhase::UploadingDatabase
+        {
+            return Err(NativeJobError::new(
+                "store-error",
+                "official publication cannot wait from its current state",
+            ));
+        }
+        let mut wait = self.wait_state.lock().map_err(|error| {
+            NativeJobError::new(
+                "store-error",
+                format!("native publication wait mutex poisoned: {error}"),
+            )
+        })?;
+        wait.official_publication_retry = None;
+        status.state = JobState::WaitingForInput;
+        status.phase = JobPhase::AwaitingPublicationRetry;
+        status.publication_attempt = Some(attempt);
+        drop(status);
+
+        loop {
+            if self.is_cancel_requested() {
+                wait.official_publication_retry = None;
+                return Err(publication_cancelled());
+            }
+            if let Some(retry) = wait.official_publication_retry.take() {
+                return Ok(retry);
+            }
+            wait = self.wait_changed.wait(wait).map_err(|error| {
+                NativeJobError::new(
+                    "store-error",
+                    format!("native publication wait mutex poisoned: {error}"),
+                )
+            })?;
+        }
+    }
+
+    fn request_official_publication_retry(
+        &self,
+        request: OfficialPublicationRetryRequest,
+    ) -> Result<(), String> {
+        validate_official_publication_retry(&request)?;
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.kind != JobKind::OfficialPublicationUpload
+            || status.state != JobState::WaitingForInput
+            || status.phase != JobPhase::AwaitingPublicationRetry
+            || self.is_cancel_requested()
+        {
+            return Err("official publication is not waiting for retry".to_owned());
+        }
+        let attempt_account = match status.publication_attempt.as_ref() {
+            Some(OfficialPublicationAttemptResult::ReauthenticationNeeded {
+                account_id,
+                status,
+                ..
+            }) if *status == 403 => account_id,
+            _ => return Err("official publication retry metadata is unavailable".to_owned()),
+        };
+        if attempt_account != &request.account_id {
+            return Err("official publication retry account does not match".to_owned());
+        }
+        let mut wait = self
+            .wait_state
+            .lock()
+            .map_err(|error| format!("native publication wait mutex poisoned: {error}"))?;
+        if wait.official_publication_retry.is_some() {
+            return Err("official publication retry is already occupied".to_owned());
+        }
+        wait.official_publication_retry = Some(OfficialPublicationRetryInput {
+            session: request.session,
+            save_date: request.save_date,
+            credential: request.credential,
+        });
+        status.state = JobState::Running;
+        status.phase = JobPhase::UploadingDatabase;
+        status.publication_attempt = None;
+        drop(wait);
+        drop(status);
+        self.wait_changed.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn begin_official_publication_finalization(&self) -> Result<(), String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.kind != JobKind::OfficialPublicationUpload
+            || !matches!(status.state, JobState::Running | JobState::Cancelling)
+            || status.phase != JobPhase::UploadingDatabase
+        {
+            return Err("official publication cannot finalize from its current state".to_owned());
+        }
+        status.state = JobState::Running;
+        status.phase = JobPhase::FinalizingPublication;
+        status.publication_attempt = None;
+        Ok(())
     }
 
     pub(crate) fn start(&self, phase: JobPhase) -> Result<(), String> {
@@ -2265,6 +2598,7 @@ impl JobControl {
             JobKind::ExportLosslessBackup => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,
             JobKind::KeiBackupUpload => JobPhase::WritingExport,
+            JobKind::OfficialPublicationUpload => JobPhase::WritingExport,
         };
         if status.state != JobState::Queued || phase != expected {
             return Err("native job can only start from queued".to_owned());
@@ -2331,6 +2665,7 @@ impl JobControl {
         status.state = JobState::Cancelled;
         status.phase = JobPhase::Complete;
         status.prepared_content = None;
+        status.publication_attempt = None;
         drop(status);
         self.mark_terminal()?;
         Ok(())
@@ -2412,12 +2747,16 @@ impl JobControl {
         status.result = None;
         status.error = failure;
         status.prepared_content = prepared_content;
+        status.publication_attempt = None;
         drop(status);
         self.mark_terminal()
     }
 
     pub(crate) fn finish_success(&self, mut result: JobResultSummary) -> Result<(), String> {
         validate_result(&result)?;
+        if result.publication.is_some() {
+            return Err("non-publication job returned publication metadata".to_owned());
+        }
         let context_warnings = self.status().warning_codes;
         for warning in context_warnings {
             if !result.warning_codes.contains(&warning) {
@@ -2438,9 +2777,46 @@ impl JobControl {
         status.result = Some(result);
         status.error = None;
         status.prepared_content = None;
+        status.publication_attempt = None;
         drop(status);
         self.mark_terminal()?;
         Ok(())
+    }
+
+    pub(crate) fn finish_official_publication_success(
+        &self,
+        mut result: JobResultSummary,
+    ) -> Result<(), String> {
+        validate_result(&result)?;
+        if result.publication.is_none() {
+            return Err("official publication result metadata is missing".to_owned());
+        }
+        let context_warnings = self.status().warning_codes;
+        for warning in context_warnings {
+            if !result.warning_codes.contains(&warning) {
+                result.warning_codes.push(warning);
+            }
+        }
+        result.warning_codes.truncate(MAX_WARNING_CODES);
+        validate_result(&result)?;
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.kind != JobKind::OfficialPublicationUpload
+            || status.state != JobState::Running
+            || status.phase != JobPhase::FinalizingPublication
+        {
+            return Err("official publication cannot succeed from its current state".to_owned());
+        }
+        status.state = JobState::Succeeded;
+        status.phase = JobPhase::Complete;
+        status.result = Some(result);
+        status.error = None;
+        status.prepared_content = None;
+        status.publication_attempt = None;
+        drop(status);
+        self.mark_terminal()
     }
 
     pub(crate) fn finish_failure(&self, code: &str, message: &str) -> Result<(), String> {
@@ -2462,6 +2838,7 @@ impl JobControl {
             message: bounded_message(message),
         });
         status.prepared_content = None;
+        status.publication_attempt = None;
         drop(status);
         self.mark_terminal()?;
         Ok(())
@@ -2486,6 +2863,9 @@ impl JobControl {
 
 fn validate_result(result: &JobResultSummary) -> Result<(), String> {
     validate_warning_codes(&result.warning_codes)?;
+    if let Some(publication) = &result.publication {
+        validate_official_publication_attempt(publication)?;
+    }
     if result.source_sha256.len() != 64
         || !result
             .source_sha256
@@ -2495,6 +2875,110 @@ fn validate_result(result: &JobResultSummary) -> Result<(), String> {
         return Err("native job result has an invalid source hash".to_owned());
     }
     Ok(())
+}
+
+fn validate_official_publication_retry(
+    request: &OfficialPublicationRetryRequest,
+) -> Result<(), String> {
+    if request.job_id.is_empty() || request.job_id.len() > 128 {
+        return Err("official publication retry job ID is invalid".to_owned());
+    }
+    validate_bounded_publication_string(&request.account_id, 512, false, "account")?;
+    if let Some(session) = &request.session {
+        validate_bounded_publication_string(session, 4096, true, "session")?;
+    }
+    validate_bounded_publication_string(&request.save_date, 128, false, "save date")?;
+    validate_official_publication_credential(&request.credential)
+}
+
+fn validate_official_publication_credential(
+    credential: &OfficialPublicationCredential,
+) -> Result<(), String> {
+    match credential {
+        OfficialPublicationCredential::RisuAuth { token } => {
+            validate_bounded_publication_string(token, 4096, false, "credential")
+        }
+    }
+}
+
+fn validate_official_publication_attempt(
+    attempt: &OfficialPublicationAttemptResult,
+) -> Result<(), String> {
+    let (account_id, session, save_date, status) = match attempt {
+        OfficialPublicationAttemptResult::Written {
+            account_id,
+            session,
+            save_date,
+            status,
+            replacement_key,
+            warning,
+            ..
+        } => {
+            if !(200..300).contains(status) || *status == 304 {
+                return Err("official publication written status is invalid".to_owned());
+            }
+            validate_bounded_publication_string(replacement_key, 4096, false, "replacement key")?;
+            if let Some(warning) = warning {
+                validate_bounded_publication_string(warning, 4096, true, "warning")?;
+            }
+            (account_id, session, save_date, status)
+        }
+        OfficialPublicationAttemptResult::NotModified {
+            account_id,
+            session,
+            save_date,
+            status,
+            replacement_key,
+        } => {
+            if *status != 304 {
+                return Err("official publication not-modified status is invalid".to_owned());
+            }
+            validate_bounded_publication_string(replacement_key, 4096, false, "replacement key")?;
+            (account_id, session, save_date, status)
+        }
+        OfficialPublicationAttemptResult::AuthWarning {
+            account_id,
+            session,
+            save_date,
+            status,
+        }
+        | OfficialPublicationAttemptResult::ReauthenticationNeeded {
+            account_id,
+            session,
+            save_date,
+            status,
+        } => {
+            if *status != 403 {
+                return Err("official publication authentication status is invalid".to_owned());
+            }
+            (account_id, session, save_date, status)
+        }
+    };
+    validate_bounded_publication_string(account_id, 512, false, "account")?;
+    if let Some(session) = session {
+        validate_bounded_publication_string(session, 4096, true, "session")?;
+    }
+    validate_bounded_publication_string(save_date, 128, false, "save date")?;
+    if !(100..=599).contains(status) {
+        return Err("official publication HTTP status is invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_bounded_publication_string(
+    value: &str,
+    maximum_bytes: usize,
+    allow_empty: bool,
+    label: &str,
+) -> Result<(), String> {
+    if value.len() > maximum_bytes || (!allow_empty && value.is_empty()) {
+        return Err(format!("official publication {label} is invalid"));
+    }
+    Ok(())
+}
+
+fn publication_cancelled() -> NativeJobError {
+    NativeJobError::new("cancelled", "official publication was cancelled")
 }
 
 fn validate_warning_codes(warning_codes: &[String]) -> Result<(), String> {
@@ -2533,8 +3017,14 @@ impl JobPhase {
         match self {
             Self::Queued => 0,
             Self::ReadingSource | Self::WritingExport => 1,
-            Self::AwaitingContentMapping | Self::StagingDatabase | Self::PublishingDestination => 2,
-            Self::AwaitingActivation | Self::FinalizingExport => 3,
+            Self::AwaitingContentMapping
+            | Self::StagingDatabase
+            | Self::PublishingDestination
+            | Self::UploadingDatabase => 2,
+            Self::AwaitingActivation
+            | Self::FinalizingExport
+            | Self::AwaitingPublicationRetry
+            | Self::FinalizingPublication => 3,
             Self::ActivatingDatabase => 4,
             Self::Complete => 5,
         }
@@ -2542,6 +3032,8 @@ impl JobPhase {
 }
 
 mod export;
+#[cfg(feature = "native-official-publication")]
+mod publication;
 pub(crate) mod restore;
 
 #[cfg(test)]
@@ -2671,9 +3163,7 @@ mod tests {
     #[test]
     fn official_publication_retry_resumes_the_same_waiting_job_with_private_input() {
         let registry = JobRegistry::default();
-        let job = registry
-            .create(JobKind::OfficialPublicationUpload)
-            .unwrap();
+        let job = registry.create(JobKind::OfficialPublicationUpload).unwrap();
         job.start(JobPhase::WritingExport).unwrap();
         job.set_phase(JobPhase::UploadingDatabase).unwrap();
         let worker = Arc::clone(&job);
@@ -2707,9 +3197,7 @@ mod tests {
     #[test]
     fn cancellation_clears_publication_retry_and_wakes_the_waiter_without_lost_wakeup() {
         let registry = JobRegistry::default();
-        let job = registry
-            .create(JobKind::OfficialPublicationUpload)
-            .unwrap();
+        let job = registry.create(JobKind::OfficialPublicationUpload).unwrap();
         job.start(JobPhase::WritingExport).unwrap();
         job.set_phase(JobPhase::UploadingDatabase).unwrap();
         let worker = Arc::clone(&job);
@@ -2731,9 +3219,7 @@ mod tests {
     #[test]
     fn terminal_publication_response_wins_a_racing_cancel_and_stays_durable() {
         let registry = JobRegistry::default();
-        let job = registry
-            .create(JobKind::OfficialPublicationUpload)
-            .unwrap();
+        let job = registry.create(JobKind::OfficialPublicationUpload).unwrap();
         job.start(JobPhase::WritingExport).unwrap();
         job.set_phase(JobPhase::UploadingDatabase).unwrap();
         assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
@@ -4175,7 +4661,7 @@ mod tests {
         let registry = JobRegistry::default();
         let job = registry.create(JobKind::PrepareContentImport).unwrap();
         job.start(JobPhase::ReadingSource).unwrap();
-        let wait_guard = job.restore_finalized.lock().unwrap();
+        let wait_guard = job.wait_state.lock().unwrap();
         let started = Arc::new(Barrier::new(2));
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancelled = Arc::clone(&job);
@@ -4216,6 +4702,62 @@ mod tests {
                 omit_account: true,
             } if destination == "C:\\chosen\\backup.risudat"
         ));
+    }
+
+    #[test]
+    fn official_publication_start_request_is_always_deserializable() {
+        let request: NativeFileJobStartRequest = serde_json::from_value(serde_json::json!({
+            "kind": "official-publication-upload",
+            "lease": "snapshot-publication",
+            "expectedRevision": 7,
+            "accountId": "account-1",
+            "baseUrl": "https://example.invalid",
+            "replacements": { "local": "remote" },
+            "session": "session-1",
+            "saveDate": "save-date",
+            "credential": { "kind": "risuAuth", "token": "private-token" }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            request,
+            NativeFileJobStartRequest::OfficialPublicationUpload {
+                lease,
+                expected_revision: 7,
+                account_id,
+                base_url,
+                replacements,
+                session: Some(session),
+                save_date,
+                credential: OfficialPublicationCredential::RisuAuth { token },
+            } if lease == "snapshot-publication"
+                && account_id == "account-1"
+                && base_url == "https://example.invalid"
+                && replacements.get("local").map(String::as_str) == Some("remote")
+                && session == "session-1"
+                && save_date == "save-date"
+                && token == "private-token"
+        ));
+    }
+
+    #[cfg(not(feature = "native-official-publication"))]
+    #[test]
+    fn official_publication_retry_is_capability_unavailable_without_feature() {
+        let directory = TempDir::new().unwrap();
+        let state = NativeFileJobState::initialize(directory.path().to_path_buf());
+        let error = state
+            .retry_official_publication(OfficialPublicationRetryRequest {
+                job_id: "missing-job".to_owned(),
+                account_id: "account-1".to_owned(),
+                session: Some("session".to_owned()),
+                save_date: "date".to_owned(),
+                credential: OfficialPublicationCredential::RisuAuth {
+                    token: "token".to_owned(),
+                },
+            })
+            .expect_err("feature-disabled retry must not inspect job state");
+
+        assert_eq!(error.code, "capability-unavailable");
     }
 
     #[test]
@@ -4292,6 +4834,7 @@ mod tests {
                     .collect(),
                 handoff_path: None,
                 recovery_path: None,
+                publication: None,
             })
             .is_err());
 
