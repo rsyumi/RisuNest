@@ -53,6 +53,24 @@ function createSession(conversation = chat(), onMutation = vi.fn()) {
 }
 
 describe('ActiveConversationSession', () => {
+    it('reads and resolves an owned message through a locator without exposing the backing array', () => {
+        const { session } = createSession(chat([
+            message('duplicate', 'first'),
+            message('duplicate', 'second'),
+            message('target-id', 'target'),
+        ]))
+
+        const locator = session.findMessageLocatorById('target-id')
+
+        expect(locator).not.toBeNull()
+        expect(session.readMessage(locator!)).toMatchObject({
+            data: 'target',
+            chatId: 'target-id',
+        })
+        expect(session.ownsMessageLocator(locator!)).toBe(true)
+        expect(session.findMessageLocatorById('missing')).toBeNull()
+    })
+
     it('rejects a missing full-array conversation distinctly from a missing locator', () => {
         expect(() => new ActiveConversationSession({
             characterId: 'character-a',

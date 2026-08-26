@@ -870,6 +870,42 @@ export class ActiveConversationSession {
         return locator.absoluteIndex
     }
 
+    findMessageLocatorById(messageId: string): MessageLocator | null {
+        this.assertActive()
+        const absoluteIndex = this.conversation.message.findIndex(
+            (message) => message.chatId === messageId,
+        )
+        return absoluteIndex === -1 ? null : this.locate(absoluteIndex)
+    }
+
+    readMessage(locator: MessageLocator): Message {
+        this.assertActive()
+        const message = validateLocator(
+            this.conversationId,
+            this.conversation.message,
+            this.sessionVersion,
+            locator,
+            this.locatorRegistry,
+        )
+        return safeStructuredClone(message)
+    }
+
+    ownsMessageLocator(locator: MessageLocator): boolean {
+        if (!this.active) return false
+        try {
+            validateLocator(
+                this.conversationId,
+                this.conversation.message,
+                this.sessionVersion,
+                locator,
+                this.locatorRegistry,
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
     positionAt(absoluteIndex: number): ConversationPosition {
         this.assertActive()
         return createPosition(
