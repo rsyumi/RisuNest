@@ -15,8 +15,8 @@ use crate::{
     },
     persistent_store::{
         materialized_asset_owner_entries, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
-        AssetRepositoryAuthorityState, ColdAlias, PersistentStore, RevisionResult, StagingResult,
-        StoreError, StoreResult,
+        AssetRepositoryAuthorityState, ColdAlias, ColdPayloadAuthorityState, PersistentStore,
+        RevisionResult, StagingResult, StoreError, StoreResult,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -319,6 +319,28 @@ fn asset_repository_authority_extension(
     {
         return Err(invalid_manifest(
             "lossless asset repository authority extension has unsupported fields",
+        ));
+    }
+    Ok(Some(authority))
+}
+
+fn cold_payload_authority_extension(
+    manifest: &LosslessManifest,
+) -> Result<Option<ColdPayloadAuthorityState>, LosslessError> {
+    let Some(value) = manifest.extensions.get("coldPayloadAuthority") else {
+        return Ok(None);
+    };
+    let authority: ColdPayloadAuthorityState =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            invalid_manifest(format!(
+                "invalid lossless cold payload authority extension: {error}"
+            ))
+        })?;
+    if serde_json::to_value(&authority).map_err(|error| invalid_manifest(error.to_string()))?
+        != *value
+    {
+        return Err(invalid_manifest(
+            "lossless cold payload authority extension has unsupported fields",
         ));
     }
     Ok(Some(authority))
@@ -823,6 +845,7 @@ fn restore_lossless_package_v1_inner(
 ) -> Result<LosslessRestoreReport, LosslessError> {
     let incoming = read_lossless_package_v1(reader, job_staging_root, cas, cancellation)?;
     let asset_repository_authority = asset_repository_authority_extension(&incoming.manifest)?;
+    let cold_payload_authority = cold_payload_authority_extension(&incoming.manifest)?;
     let lease = store
         .acquire_revision(expected_revision)
         .map_err(store_error)?
@@ -858,6 +881,11 @@ fn restore_lossless_package_v1_inner(
         if let Some(authority) = &asset_repository_authority {
             store
                 .replace_put_asset_repository_authority(&staging_id, authority)
+                .map_err(store_error)?;
+        }
+        if let Some(authority) = &cold_payload_authority {
+            store
+                .replace_put_cold_payload_authority(&staging_id, authority)
                 .map_err(store_error)?;
         }
         check_cancelled(cancellation)?;
@@ -1264,10 +1292,14 @@ fn create_and_verify_pre_replacement_backup(
     let asset_repository_authority = store
         .read_asset_repository_authority(Some(lease))
         .map_err(store_error)?;
+    let cold_payload_authority = store
+        .read_cold_payload_authority(Some(lease))
+        .map_err(store_error)?;
     if assets.revision != expected_revision
         || owner_heads.revision != expected_revision
         || cold.revision != expected_revision
         || asset_repository_authority.revision != expected_revision
+        || cold_payload_authority.revision != expected_revision
     {
         return Err(LosslessError::new(
             LosslessErrorCode::RevisionConflict,
@@ -1319,6 +1351,7 @@ fn create_and_verify_pre_replacement_backup(
             serde_json::json!({
                 "sourceRevision": expected_revision,
                 "assetRepositoryAuthority": asset_repository_authority.value,
+                "coldPayloadAuthority": cold_payload_authority.value,
             }),
             cancellation,
         )?;
@@ -3126,6 +3159,14 @@ mod tests {
                 "compatibilityHash": "ab".repeat(32),
             })
         );
+        assert_eq!(
+            verified.manifest.extensions["coldPayloadAuthority"],
+            json!({
+                "format": "v2",
+                "migrationId": "lossless-test-cold-migration",
+                "compatibilityHash": "cd".repeat(32),
+            })
+        );
         for kind in [
             PayloadKind::Database,
             PayloadKind::Asset,
@@ -3222,6 +3263,10 @@ mod tests {
             store.read_asset_repository_authority(None).unwrap().value,
             AssetRepositoryAuthorityState::Legacy
         );
+        assert_eq!(
+            store.read_cold_payload_authority(None).unwrap().value,
+            ColdPayloadAuthorityState::Legacy
+        );
     }
 
     #[test]
@@ -3268,6 +3313,55 @@ mod tests {
             AssetRepositoryAuthorityState::V2 {
                 migration_id: "lossless-test-migration".to_owned(),
                 compatibility_hash: "ab".repeat(32),
+            }
+        );
+        assert!(!backup_path.exists());
+    }
+
+    #[test]
+    fn unsupported_cold_authority_extension_fails_without_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package_with_extensions(
+            directory.path(),
+            "New",
+            b"new",
+            json!({
+                "coldPayloadAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-cold-migration",
+                    "compatibilityHash": "cd".repeat(32),
+                    "unsupported": true,
+                }
+            }),
+        );
+        let backup_path = directory.path().join("pre-replacement.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::InvalidManifest);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+        assert_eq!(
+            store.read_cold_payload_authority(None).unwrap().value,
+            ColdPayloadAuthorityState::V2 {
+                migration_id: "lossless-test-cold-migration".to_owned(),
+                compatibility_hash: "cd".repeat(32),
             }
         );
         assert!(!backup_path.exists());
@@ -3659,6 +3753,13 @@ mod tests {
                     AssetRepositoryAuthorityState::V2 {
                         migration_id: "lossless-test-migration".to_owned(),
                         compatibility_hash: "ab".repeat(32),
+                    }
+                );
+                assert_eq!(
+                    reopened.read_cold_payload_authority(None).unwrap().value,
+                    ColdPayloadAuthorityState::V2 {
+                        migration_id: "lossless-test-cold-migration".to_owned(),
+                        compatibility_hash: "cd".repeat(32),
                     }
                 );
                 let asset = reopened
@@ -4769,6 +4870,11 @@ mod tests {
                     "format": "v2",
                     "migrationId": "lossless-test-migration",
                     "compatibilityHash": "ab".repeat(32),
+                },
+                "coldPayloadAuthority": {
+                    "format": "v2",
+                    "migrationId": "lossless-test-cold-migration",
+                    "compatibilityHash": "cd".repeat(32),
                 }
             }),
         )
@@ -5032,6 +5138,15 @@ mod tests {
                 &AssetRepositoryAuthorityState::V2 {
                     migration_id: "lossless-test-migration".to_owned(),
                     compatibility_hash: "ab".repeat(32),
+                },
+            )
+            .unwrap();
+        store
+            .replace_put_cold_payload_authority(
+                &staging,
+                &ColdPayloadAuthorityState::V2 {
+                    migration_id: "lossless-test-cold-migration".to_owned(),
+                    compatibility_hash: "cd".repeat(32),
                 },
             )
             .unwrap();
