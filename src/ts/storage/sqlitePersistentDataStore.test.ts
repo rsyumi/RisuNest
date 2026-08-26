@@ -40,11 +40,6 @@ describe('SqlitePersistentDataStore', () => {
             after: 5,
         }
         const { chats: _chats, ...characterDetail } = fixtureDatabase.characters[0]
-        const commit = {
-            expectedRevision: 8,
-            deleteCharacterId: 'char-c',
-            characterDetails: [characterDetail],
-        }
         const alias = {
             key: 'assets/native.bin',
             objectHash: '44'.repeat(32),
@@ -53,6 +48,12 @@ describe('SqlitePersistentDataStore', () => {
             mime: 'application/octet-stream',
             name: 'Native',
             ext: 'bin',
+        }
+        const commit = {
+            expectedRevision: 8,
+            deleteCharacterId: 'char-c',
+            characterDetails: [characterDetail],
+            assetAliases: [alias],
         }
         const owner = { kind: 'root-module-assets' as const, index: 0 }
 
@@ -91,7 +92,17 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_read_asset_alias', { kind: 'asset', key: alias.key }],
             ['pds_read_asset_owner_head', { owner }],
             ['pds_commit_asset_alias', { alias, expectedRevision: 8 }],
-            ['pds_commit', { commit }],
+            [
+                'pds_commit',
+                {
+                    commit: {
+                        expectedRevision: 8,
+                        deleteCharacterId: 'char-c',
+                        characterDetails: [characterDetail],
+                    },
+                    assetAliases: [alias],
+                },
+            ],
             ['pds_materialize', { revision: 9 }],
         ])
     })

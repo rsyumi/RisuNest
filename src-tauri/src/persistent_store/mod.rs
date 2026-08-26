@@ -915,7 +915,15 @@ impl PersistentStore {
     }
 
     pub(crate) fn commit(&mut self, commit: &WorkingSetCommit) -> StoreResult<RevisionResult> {
-        commit::commit(&mut self.connection, commit)
+        self.commit_with_asset_aliases(commit, &[])
+    }
+
+    pub(crate) fn commit_with_asset_aliases(
+        &mut self,
+        commit: &WorkingSetCommit,
+        asset_aliases: &[AssetAlias],
+    ) -> StoreResult<RevisionResult> {
+        commit::commit(&mut self.connection, commit, asset_aliases)
     }
 
     pub(crate) fn commit_asset_alias(

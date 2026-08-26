@@ -245,8 +245,11 @@ pub(crate) fn pds_commit_asset_alias(
 pub(crate) fn pds_commit(
     state: State<'_, PersistentStoreState>,
     commit: WorkingSetCommit,
+    asset_aliases: Vec<AssetAlias>,
 ) -> Result<RevisionResult, StoreError> {
-    with_store_mut(state, |store| store.commit(&commit))
+    with_store_mut(state, |store| {
+        store.commit_with_asset_aliases(&commit, &asset_aliases)
+    })
 }
 
 #[tauri::command(async)]

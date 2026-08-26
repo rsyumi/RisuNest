@@ -543,6 +543,15 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     input.deleteCharacterId,
                 )
             }
+            const aliasKeys = new Set<string>()
+            for (const alias of input.assetAliases ?? []) {
+                validateAssetAlias(alias)
+                const key = `${alias.kind}\0${alias.key}`
+                if (aliasKeys.has(key)) {
+                    throw new TypeError(`Duplicate asset alias ${alias.kind}:${alias.key}`)
+                }
+                aliasKeys.add(key)
+            }
             validateOwnerHeadsForCommit(input)
 
             const revision = active.revision + 1
@@ -571,6 +580,13 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             }
             for (const mutation of input.pluginStorage ?? []) {
                 await this.applyPluginStorageMutation(transaction, generation, mutation)
+            }
+            for (const alias of input.assetAliases ?? []) {
+                transaction.objectStore('assetAliases').put({
+                    key: this.assetAliasKey(generation, alias.kind, alias.key),
+                    generation,
+                    value: structuredClone(alias),
+                } satisfies StoredRecord<AssetAlias>)
             }
             await this.replaceChangedOwnerHeads(transaction, generation, input)
             this.setActive(transaction, revision, generation)

@@ -33,6 +33,7 @@ use serde_json::{Map, Value};
 pub(super) fn commit(
     connection: &mut Connection,
     input: &WorkingSetCommit,
+    asset_aliases: &[AssetAlias],
 ) -> StoreResult<RevisionResult> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actual_revision = current_revision(&transaction)?;
@@ -48,6 +49,13 @@ pub(super) fn commit(
     }
     if let Some(character) = &input.add_character {
         validate_character(character, "Character addition")?;
+    }
+    let mut alias_identities = HashSet::new();
+    for alias in asset_aliases {
+        alias.validate()?;
+        if !alias_identities.insert((alias.kind.as_str(), alias.key.as_str())) {
+            return Err(validation("Duplicate asset alias"));
+        }
     }
 
     let active = active_generation(&transaction)?;
@@ -94,6 +102,9 @@ pub(super) fn commit(
     }
     for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
         apply_plugin_storage_mutation(&transaction, &generation, mutation)?;
+    }
+    for alias in asset_aliases {
+        put_asset_alias(&transaction, &generation, alias)?;
     }
     replace_changed_owner_heads(&transaction, &generation, input)?;
     set_active(&transaction, revision, &generation)?;

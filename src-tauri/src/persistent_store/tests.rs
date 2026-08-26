@@ -1310,6 +1310,155 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
 }
 
 #[test]
+fn working_set_asset_alias_batch_is_atomic_with_imported_owners() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut imported_root = root(&database);
+    imported_root["modules"] = json!([{
+        "id": "native-module",
+        "name": "Native module",
+        "description": "",
+        "assets": [["module asset", "assets/native-module.bin", "BIN"]]
+    }]);
+    let mut character = database["characters"][0].clone();
+    character["chaId"] = json!("native-character");
+    character["name"] = json!("Native character");
+    character["additionalAssets"] =
+        json!([["character asset", "assets/native-character.bin", "BIN"]]);
+    let aliases = vec![
+        AssetAlias {
+            key: "assets/native-character.bin".to_owned(),
+            object_hash: Some("91".repeat(32)),
+            kind: "asset".to_owned(),
+            size: 4,
+            mime: "application/octet-stream".to_owned(),
+            name: "native-character.bin".to_owned(),
+            ext: "BIN".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({}),
+        },
+        AssetAlias {
+            key: "assets/native-module.bin".to_owned(),
+            object_hash: Some("92".repeat(32)),
+            kind: "asset".to_owned(),
+            size: 5,
+            mime: "application/octet-stream".to_owned(),
+            name: "native-module.bin".to_owned(),
+            ext: "BIN".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({}),
+        },
+    ];
+    let heads = vec![
+        AssetOwnerHead::present(
+            AssetOwnerLocator::CharacterAdditionalAssets {
+                character_id: "native-character".to_owned(),
+            },
+            "93".repeat(32),
+            1,
+        ),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "94".repeat(32),
+            1,
+        ),
+    ];
+    let committed = store
+        .commit_with_asset_aliases(
+            &WorkingSetCommit {
+                expected_revision: 1,
+                root: Some(imported_root),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: Some(character),
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: Some(heads.clone()),
+            },
+            &aliases,
+        )
+        .expect("commit imported content atomically");
+
+    assert_eq!(
+        store
+            .read_character("native-character", None)
+            .expect("read imported character")
+            .expect("imported character exists")
+            .revision,
+        committed.revision
+    );
+    for alias in &aliases {
+        assert_eq!(
+            store
+                .read_asset_alias(&alias.kind, &alias.key, None)
+                .expect("read imported alias"),
+            Some(super::Versioned {
+                revision: committed.revision,
+                value: alias.clone(),
+            })
+        );
+    }
+    for head in &heads {
+        assert_eq!(
+            store
+                .read_asset_owner_head(&head.owner, None)
+                .expect("read imported owner head"),
+            Some(super::Versioned {
+                revision: committed.revision,
+                value: head.clone(),
+            })
+        );
+    }
+
+    let before = store
+        .materialize(None)
+        .expect("materialize before rejection");
+    let invalid = AssetAlias {
+        object_hash: Some("INVALID".to_owned()),
+        ..aliases[0].clone()
+    };
+    let error = store
+        .commit_with_asset_aliases(
+            &WorkingSetCommit {
+                expected_revision: committed.revision,
+                root: Some(json!({ "username": "must not commit" })),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: Some(json!({
+                    "chaId": "rejected-native-character",
+                    "name": "Rejected native character",
+                    "chats": []
+                })),
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            },
+            &[invalid],
+        )
+        .expect_err("reject invalid imported alias batch");
+    assert!(matches!(error, StoreError::Validation { .. }));
+    assert_eq!(
+        store
+            .materialize(None)
+            .expect("materialize after rejection"),
+        before
+    );
+    assert!(store
+        .read_character("rejected-native-character", None)
+        .expect("read rejected character")
+        .is_none());
+}
+
+#[test]
 fn payload_alias_abort_and_reopen_sweep_remove_all_staged_rows() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");

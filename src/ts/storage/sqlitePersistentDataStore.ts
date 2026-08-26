@@ -169,7 +169,8 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     }
 
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
-        return invokeStore('pds_commit', { commit: input })
+        const { assetAliases = [], ...commit } = input
+        return invokeStore('pds_commit', { commit, assetAliases })
     }
 
     async replaceFromDatabase(

@@ -316,6 +316,7 @@ export interface WorkingSetCommit {
     conversations?: ConversationMutation[]
     deleteCharacterId?: string
     pluginStorage?: PluginStorageMutation[]
+    assetAliases?: AssetAlias[]
     assetOwnerHeads?: AssetOwnerHead[]
 }
 

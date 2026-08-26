@@ -317,6 +317,125 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             await lease.release()
         })
 
+        it('commits imported character and module aliases in one revision', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const root = structuredClone((await store.readRoot()).value)
+            root.modules = [{
+                id: 'native-module',
+                name: 'Native module',
+                description: '',
+                assets: [['module asset', 'assets/native-module.bin', 'BIN']],
+            }]
+            const character = structuredClone(fixtureDatabase.characters[0])
+            character.chaId = 'native-character'
+            character.name = 'Native character'
+            character.additionalAssets = [
+                ['character asset', 'assets/native-character.bin', 'BIN'],
+            ]
+            const aliases: AssetAlias[] = [
+                {
+                    key: 'assets/native-character.bin',
+                    objectHash: '91'.repeat(32),
+                    kind: 'asset',
+                    size: 4,
+                    mime: 'application/octet-stream',
+                    name: 'native-character.bin',
+                    ext: 'BIN',
+                },
+                {
+                    key: 'assets/native-module.bin',
+                    objectHash: '92'.repeat(32),
+                    kind: 'asset',
+                    size: 5,
+                    mime: 'application/octet-stream',
+                    name: 'native-module.bin',
+                    ext: 'BIN',
+                },
+            ]
+            const ownerHeads: AssetOwnerHead[] = [
+                {
+                    owner: {
+                        kind: 'character-additional-assets',
+                        characterId: character.chaId,
+                    },
+                    present: true,
+                    manifestHash: '93'.repeat(32),
+                    entryCount: 1,
+                },
+                {
+                    owner: { kind: 'root-module-assets', index: 0 },
+                    present: true,
+                    manifestHash: '94'.repeat(32),
+                    entryCount: 1,
+                },
+            ]
+
+            const committed = await store.commit({
+                expectedRevision: imported.revision,
+                root,
+                addCharacter: character,
+                assetAliases: aliases,
+                assetOwnerHeads: ownerHeads,
+            })
+
+            expect((await store.readCharacter(character.chaId))?.revision).toBe(committed.revision)
+            expect((await store.readRoot()).revision).toBe(committed.revision)
+            for (const alias of aliases) {
+                expect(await store.readAssetAlias({ kind: alias.kind, key: alias.key })).toEqual({
+                    revision: committed.revision,
+                    value: alias,
+                })
+            }
+            for (const head of ownerHeads) {
+                expect(await store.readAssetOwnerHead(head.owner)).toEqual({
+                    revision: committed.revision,
+                    value: head,
+                })
+            }
+        })
+
+        it('rejects an imported alias batch without exposing its character or module', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const beforeRoot = await store.readRoot()
+            const root = structuredClone(beforeRoot.value)
+            root.modules = [{
+                id: 'rejected-native-module',
+                name: 'Rejected native module',
+                description: '',
+                assets: [['module asset', 'assets/rejected-module.bin', 'BIN']],
+            }]
+            const character = structuredClone(fixtureDatabase.characters[0])
+            character.chaId = 'rejected-native-character'
+            character.additionalAssets = [
+                ['character asset', 'assets/rejected-character.bin', 'BIN'],
+            ]
+            const invalidAlias = {
+                key: 'assets/rejected-character.bin',
+                objectHash: 'INVALID',
+                kind: 'asset',
+                size: 4,
+                mime: 'application/octet-stream',
+                name: 'rejected-character.bin',
+                ext: 'BIN',
+            } as unknown as AssetAlias
+
+            await expect(store.commit({
+                expectedRevision: imported.revision,
+                root,
+                addCharacter: character,
+                assetAliases: [invalidAlias],
+            })).rejects.toThrow('objectHash')
+
+            expect(await store.readRoot()).toEqual(beforeRoot)
+            expect(await store.readCharacter(character.chaId)).toBeNull()
+            expect(await store.readAssetAlias({
+                kind: 'asset',
+                key: invalidAlias.key,
+            })).toBeNull()
+        })
+
         it('keeps asset and inlay aliases with the same logical key independent', async () => {
             const { store } = await createHarness()
             const sharedKey = 'shared/same-key.bin'
