@@ -3,6 +3,7 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
 use std::path::Path;
 use tokio_util::io::ReaderStream;
 
@@ -195,6 +196,7 @@ async fn acquire_session(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn upload_file_attempt(
     request: OfficialPublicationUploadRequest,
 ) -> Result<OfficialPublicationUploadResult, OfficialPublicationUploadError> {
