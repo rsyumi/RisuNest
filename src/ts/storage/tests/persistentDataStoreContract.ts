@@ -797,6 +797,90 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             ])
         })
 
+        it('creates a conversation at an explicit configured position without replacing siblings', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(fixtureDatabase)
+            const source = fixtureDatabase.characters[1].chats[0]
+            const { message: _sourceMessages, ...sourceDetail } = structuredClone(source)
+            const conversation = {
+                ...sourceDetail,
+                id: 'conv-branch',
+                name: 'Long chat (Branch)',
+                note: 'branch detail',
+                fmIndex: -1,
+                unknownDetail: { keep: false },
+            }
+            const branchMessages = [
+                { role: 'user' as const, data: 'duplicate first', chatId: 'duplicate' },
+                { role: 'char' as const, data: 'missing ID' },
+                { role: 'user' as const, data: 'duplicate second', chatId: 'duplicate' },
+            ]
+
+            await store.commit({
+                expectedRevision: imported.revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-branch',
+                    start: 0,
+                    deleteCount: 0,
+                    messages: branchMessages,
+                    conversation,
+                    configuredIndex: 0,
+                }],
+            })
+
+            const summaries = (await store.queryConversations({
+                characterId: 'char-a',
+                order: 'configured',
+                limit: 10,
+            })).items
+            expect(summaries.map(({ id, configuredIndex }) => ({ id, configuredIndex }))).toEqual([
+                { id: 'conv-branch', configuredIndex: 0 },
+                { id: 'conv-long', configuredIndex: 1 },
+                { id: 'conv-short', configuredIndex: 2 },
+            ])
+            expect(summaries[0]).toHaveProperty('fmIndex', -1)
+            expect(summaries[1]).not.toHaveProperty('fmIndex')
+            const materialized = await store.materializeDatabase()
+            expect(materialized.characters[1].chats.map((chat) => chat.id)).toEqual([
+                'conv-branch',
+                'conv-long',
+                'conv-short',
+            ])
+            expect(materialized.characters[1].chats[0]).toEqual({
+                ...conversation,
+                message: branchMessages,
+            })
+        })
+
+        it('rejects an explicit conversation insertion when the target ID already exists', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(fixtureDatabase)
+            const before = await store.materializeDatabase()
+
+            await expect(store.commit({
+                expectedRevision: imported.revision,
+                conversations: [{
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    start: 0,
+                    deleteCount: 0,
+                    messages: [{ role: 'user', data: 'must not insert' }],
+                    conversation: {
+                        id: 'conv-long',
+                        name: 'Collision',
+                        note: '',
+                        localLore: [],
+                    },
+                    configuredIndex: 0,
+                }],
+            })).rejects.toThrow('already exists')
+            expect(await store.materializeDatabase()).toEqual(before)
+            expect((await store.readRoot()).revision).toBe(imported.revision)
+        })
+
         it('atomically replaces the selected character and root while preserving catalog order', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(fixtureDatabase)

@@ -250,6 +250,7 @@ pub(super) fn query_conversations(
             configured_index: row.get(3)?,
             recent_at: row.get(4)?,
             message_count: row.get(5)?,
+            fm_index: detail.get("fmIndex").and_then(Value::as_i64),
         });
     }
     let has_more = items.len() as i64 > limit;

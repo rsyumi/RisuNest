@@ -668,6 +668,7 @@ fn apply_conversation_mutation(
             delete_count,
             messages,
             conversation,
+            configured_index: requested_configured_index,
         } => {
             let existing: Option<(i64, i64, i64, String, String)> = transaction
                 .query_row(
@@ -687,6 +688,12 @@ fn apply_conversation_mutation(
                 )
                 .optional()?;
 
+            if existing.is_some() && requested_configured_index.is_some() {
+                return Err(validation(format!(
+                    "Conversation {conversation_id} already exists"
+                )));
+            }
+
             let Some((configured_index, existing_recent_at, old_count, _, existing_detail)) =
                 existing
             else {
@@ -698,11 +705,21 @@ fn apply_conversation_mutation(
                 let mut value = object(detail, "Conversation")?.clone();
                 value.insert("id".to_owned(), Value::String(conversation_id.clone()));
                 value.insert("message".to_owned(), Value::Array(messages.clone()));
-                let configured_index: i64 = transaction.query_row(
+                let conversation_count: i64 = transaction.query_row(
                     "SELECT COUNT(*) FROM conversations WHERE generation = ?1 AND character_id = ?2",
                     params![generation, character_id],
                     |row| row.get(0),
                 )?;
+                let configured_index = requested_configured_index
+                    .unwrap_or(conversation_count)
+                    .clamp(0, conversation_count);
+                if configured_index < conversation_count {
+                    transaction.execute(
+                        "UPDATE conversations SET configured_index = configured_index + 1
+                         WHERE generation = ?1 AND character_id = ?2 AND configured_index >= ?3",
+                        params![generation, character_id, configured_index],
+                    )?;
+                }
                 put_conversation(
                     transaction,
                     generation,

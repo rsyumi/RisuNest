@@ -618,6 +618,7 @@ fn conversation_catalog_includes_chat_list_metadata() {
     detail.remove("message");
     detail.insert("folderId".to_owned(), json!("folder-a"));
     detail.insert("bindedPersona".to_owned(), json!("persona-a"));
+    detail.insert("fmIndex".to_owned(), json!(-1));
     commit(
         &mut store,
         1,
@@ -628,6 +629,7 @@ fn conversation_catalog_includes_chat_list_metadata() {
             delete_count: 0,
             messages: Vec::new(),
             conversation: Some(Value::Object(detail.clone())),
+            configured_index: None,
         },
     );
 
@@ -658,7 +660,8 @@ fn conversation_catalog_includes_chat_list_metadata() {
             "bindedPersona": "persona-a",
             "configuredIndex": 1,
             "recentAt": 250,
-            "messageCount": 2
+            "messageCount": 2,
+            "fmIndex": -1
         })
     );
 }
@@ -770,6 +773,7 @@ fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
             delete_count: 0,
             messages: vec![message("append")],
             conversation: None,
+            configured_index: None,
         },
     );
     let revision = commit(
@@ -782,6 +786,7 @@ fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
             delete_count: 0,
             messages: vec![message("insert")],
             conversation: None,
+            configured_index: None,
         },
     );
     let revision = commit(
@@ -794,6 +799,7 @@ fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
             delete_count: 1,
             messages: vec![],
             conversation: None,
+            configured_index: None,
         },
     );
 
@@ -820,6 +826,7 @@ fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
             conversation: Some(json!({
                 "id": "conv-new", "name": "New chat", "note": "", "localLore": []
             })),
+            configured_index: None,
         },
     );
     assert!(store
@@ -838,6 +845,88 @@ fn replace_range_supports_append_insert_delete_and_conversation_lifecycle() {
         .read_conversation("char-a", "conv-new", None)
         .expect("read deleted conversation")
         .is_none());
+}
+
+#[test]
+fn replace_range_creates_conversation_at_explicit_configured_position() {
+    let (_directory, mut store, _) = open_fixture();
+    let revision = commit(
+        &mut store,
+        1,
+        ConversationMutation::ReplaceRange {
+            character_id: "char-a".to_owned(),
+            conversation_id: "conv-branch".to_owned(),
+            start: 0,
+            delete_count: 0,
+            messages: vec![
+                message("duplicate"),
+                json!({ "role": "char", "data": "missing ID" }),
+                message("duplicate"),
+            ],
+            conversation: Some(json!({
+                "id": "conv-branch",
+                "name": "Long chat (Branch)",
+                "note": "branch detail",
+                "localLore": [],
+                "fmIndex": -1,
+                "unknownDetail": { "keep": false }
+            })),
+            configured_index: Some(0),
+        },
+    );
+
+    let conversations = store
+        .query_conversations(
+            &ConversationQuery {
+                character_id: "char-a".to_owned(),
+                order: QueryOrder::Configured,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("query configured conversations");
+    assert_eq!(
+        conversations
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), item.configured_index))
+            .collect::<Vec<_>>(),
+        vec![("conv-branch", 0), ("conv-long", 1), ("conv-short", 2)]
+    );
+    let branch = store
+        .read_conversation("char-a", "conv-branch", None)
+        .expect("read branch")
+        .expect("branch exists");
+    assert_eq!(branch.value["note"], "branch detail");
+    assert_eq!(branch.value["unknownDetail"]["keep"], false);
+    assert_eq!(branch.value["message"].as_array().unwrap().len(), 3);
+    assert!(matches!(
+        store.commit(&WorkingSetCommit {
+            expected_revision: revision,
+            root: None,
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-branch".to_owned(),
+                start: 0,
+                delete_count: 0,
+                messages: vec![message("must-not-insert")],
+                conversation: Some(json!({
+                    "id": "conv-branch", "name": "Collision", "note": "", "localLore": []
+                })),
+                configured_index: Some(0),
+            }]),
+            delete_character_id: None,
+            plugin_storage: None,
+        }),
+        Err(StoreError::Validation { .. })
+    ));
+    assert_eq!(store.revision().expect("unchanged revision"), revision);
 }
 
 #[test]
@@ -1272,6 +1361,7 @@ fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
                 delete_count: 0,
                 messages: vec![message("active-append")],
                 conversation: None,
+                configured_index: None,
             }]),
             delete_character_id: Some("char-b".to_owned()),
             plugin_storage: Some(vec![PluginStorageMutation::Set {
@@ -1719,6 +1809,7 @@ fn replace_range_updates_conversation_detail_and_preserves_recent_at_without_it(
                 "id": "conv-short", "name": "Renamed chat", "note": "updated",
                 "localLore": [], "lastDate": 999
             })),
+            configured_index: None,
         },
     );
 
@@ -1763,6 +1854,7 @@ fn replace_range_updates_conversation_detail_and_preserves_recent_at_without_it(
             delete_count: 0,
             messages: vec![message("later")],
             conversation: None,
+            configured_index: None,
         },
     );
     let items = query(&store);
@@ -1787,6 +1879,7 @@ fn summary_recent_at_falls_back_to_message_time_then_zero() {
             delete_count: 0,
             messages: vec![message("timed")],
             conversation: Some(json!({ "name": "From message", "note": "", "localLore": [] })),
+            configured_index: None,
         },
     );
     let revision = commit(
@@ -1799,6 +1892,7 @@ fn summary_recent_at_falls_back_to_message_time_then_zero() {
             delete_count: 0,
             messages: vec![],
             conversation: Some(json!({ "name": "Empty", "note": "", "localLore": [] })),
+            configured_index: None,
         },
     );
     store
@@ -1874,6 +1968,7 @@ fn replace_range_clamps_out_of_bounds_indices() {
             delete_count: 5,
             messages: vec![message("tail")],
             conversation: None,
+            configured_index: None,
         },
     );
     commit(
@@ -1886,6 +1981,7 @@ fn replace_range_clamps_out_of_bounds_indices() {
             delete_count: 100,
             messages: vec![message("only")],
             conversation: None,
+            configured_index: None,
         },
     );
 
@@ -1922,6 +2018,7 @@ fn revision_leases_isolate_conversation_reads() {
             delete_count: 0,
             messages: vec![message("live-only")],
             conversation: None,
+            configured_index: None,
         },
     );
 

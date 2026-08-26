@@ -240,6 +240,8 @@ pub(crate) struct ConversationSummary {
     pub(crate) configured_index: i64,
     pub(crate) recent_at: i64,
     pub(crate) message_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) fm_index: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -296,6 +298,8 @@ pub(crate) enum ConversationMutation {
         messages: Vec<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        configured_index: Option<i64>,
     },
     Delete {
         character_id: String,

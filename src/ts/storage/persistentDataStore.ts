@@ -60,6 +60,7 @@ export interface ConversationSummary {
     configuredIndex: number
     recentAt: number
     messageCount: number
+    fmIndex?: number
 }
 
 export interface ConversationWindow {
@@ -143,6 +144,7 @@ export type ConversationMutation =
           deleteCount: number
           messages: Message[]
           conversation?: Omit<Chat, 'message'>
+          configuredIndex?: number
       }
     | {
           type: 'delete'

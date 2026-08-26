@@ -915,6 +915,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 ...item.summary,
                 folderId: item.detail.folderId,
                 bindedPersona: item.detail.bindedPersona,
+                ...(item.detail.fmIndex === undefined ? {} : { fmIndex: item.detail.fmIndex }),
             })),
             nextCursor: result.nextCursor,
         }
@@ -1265,10 +1266,45 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const existing = (await requestResult(
             transaction.objectStore('conversations').get(key),
         )) as StoredRecord<StoredConversation> | undefined
+        if (existing && mutation.configuredIndex !== undefined) {
+            throw new Error(`Conversation ${mutation.conversationId} already exists`)
+        }
         if (!existing && !mutation.conversation) {
             throw new Error(`Conversation ${mutation.conversationId} does not exist`)
         }
         if (!existing) {
+            const conversationCount = await this.conversationCount(
+                transaction,
+                generation,
+                mutation.characterId,
+            )
+            const configuredIndex = Math.min(
+                conversationCount,
+                Math.max(0, mutation.configuredIndex ?? conversationCount),
+            )
+            if (configuredIndex < conversationCount) {
+                const index = transaction.objectStore('conversations').index(
+                    'byGenerationCharacterConfigured',
+                )
+                const records = await requestResult(index.getAll(this.keyRangeFactory.bound(
+                    [generation, mutation.characterId, configuredIndex],
+                    [generation, mutation.characterId, MAX_INDEX_VALUE],
+                ))) as Array<StoredRecord<StoredConversation>>
+                for (const record of records) {
+                    const nextConfiguredIndex = record.value.summary.configuredIndex + 1
+                    transaction.objectStore('conversations').put({
+                        ...record,
+                        configuredIndex: nextConfiguredIndex,
+                        value: {
+                            ...record.value,
+                            summary: {
+                                ...record.value.summary,
+                                configuredIndex: nextConfiguredIndex,
+                            },
+                        },
+                    })
+                }
+            }
             this.putConversation(
                 transaction,
                 generation,
@@ -1278,7 +1314,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     id: mutation.conversationId,
                     message: mutation.messages,
                 },
-                await this.conversationCount(transaction, generation, mutation.characterId),
+                configuredIndex,
             )
             await this.refreshCharacterSummary(transaction, generation, mutation.characterId)
             return

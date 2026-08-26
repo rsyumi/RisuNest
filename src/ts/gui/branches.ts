@@ -1,121 +1,279 @@
-import type { character, groupChat } from '../storage/database.svelte'
-import { readPersistentCompleteCharacter } from '../storage/persistentDataRuntime.svelte'
+import {
+    capturePersistentMutationToken,
+    getPersistentDataRuntime,
+} from '../storage/persistentDataRuntime.svelte'
+import type {
+    DataRevision,
+    PersistentDataStore,
+    PersistentRevisionReader,
+} from '../storage/persistentDataStore'
+import {
+    assertPinnedRevision,
+    withPersistentRevisionLease,
+} from '../storage/persistentRecordIterator'
+
+const BRANCH_SCAN_PAGE_SIZE = 128
 
 type ChatBranch = {
-    children: Map<string, ChatBranch>,
-    maxChildren: number,
-    chatId: number,
+    children: Map<string, ChatBranch>
+    maxChildren: number
+    chatId: number
+    preview: string
+    sourceConversationId: string
+    sourceIndex: number | null
 }
 
-function search(left: string[], branch: ChatBranch, chatId:number){
-    if(left.length === 0){
-        return
-    }
+export type RenderedBranch = {
+    x: number
+    y: number
+    connectX: number
+    connectY: number
+    content: string
+    preview: string
+    multiChild: boolean
+    chatId: number
+    sourceConversationId: string
+    sourceIndex: number | null
+    revision: DataRevision
+}
 
-    const current = left[0]
-    if(!branch.children.has(current)){
-        branch.children.set(current, {
+export interface PinnedChatBranchGraph {
+    revision: DataRevision
+    branches: RenderedBranch[]
+}
+
+export interface PinnedChatBranchScanOptions {
+    signal?: AbortSignal
+}
+
+function simpleHasher(str: string): string {
+    let hash = 0
+    if (str.length === 0) return ''
+    for (let index = 0; index < str.length; index++) {
+        const character = str.charCodeAt(index)
+        hash = ((hash << 5) - hash) + character
+        hash &= hash
+    }
+    return hash.toString(36)
+}
+
+function insertBranch(
+    parent: ChatBranch,
+    content: string,
+    chatId: number,
+    preview: string,
+    sourceConversationId: string,
+    sourceIndex: number | null,
+): ChatBranch {
+    let child = parent.children.get(content)
+    if (!child) {
+        child = {
             children: new Map(),
             maxChildren: 0,
-            chatId: chatId,
-        })
+            chatId,
+            preview,
+            sourceConversationId,
+            sourceIndex,
+        }
+        parent.children.set(content, child)
     }
-
-    search(left.slice(1), branch.children.get(current)!, chatId)
+    return child
 }
 
-function getMaxChildren(branch: ChatBranch){
-    let max = 0
-    if(branch.children.size === 0){
-        return 1
+function calculateWidths(root: ChatBranch): void {
+    const widths = new WeakMap<ChatBranch, number>()
+    const stack: Array<{ node: ChatBranch; visited: boolean }> = [{ node: root, visited: false }]
+    while (stack.length > 0) {
+        const entry = stack.pop()!
+        if (!entry.visited) {
+            stack.push({ node: entry.node, visited: true })
+            for (const child of entry.node.children.values()) {
+                stack.push({ node: child, visited: false })
+            }
+            continue
+        }
+        if (entry.node.children.size === 0) {
+            widths.set(entry.node, 1)
+            continue
+        }
+        let width = 0
+        for (const child of entry.node.children.values()) width += widths.get(child)!
+        entry.node.maxChildren = width
+        widths.set(entry.node, width)
     }
-
-    for(const child of branch.children.values()){
-        max += (getMaxChildren(child))
-    }
-    branch.maxChildren = max
-    return max
 }
 
-type RenderedBranch = {
-    x: number,
-    y: number,
-    connectX:number,
-    connectY:number,
-    content: string,
-    preview: string,
-    multiChild: boolean,
-    chatId: number,
-}
-
-function renderBranch(branch: ChatBranch, x: number, y: number, connectX = -1, connectY = -1): Omit<RenderedBranch, 'preview'>[]{
-    const rendered: Omit<RenderedBranch, 'preview'>[] = []
-    for(const [key, child] of branch.children){
+function renderBranches(root: ChatBranch, revision: DataRevision): RenderedBranch[] {
+    const rendered: RenderedBranch[] = []
+    type Frame = {
+        node: ChatBranch
+        children: Array<[string, ChatBranch]>
+        childIndex: number
+        x: number
+        y: number
+        connectX: number
+        connectY: number
+    }
+    const stack: Frame[] = [{
+        node: root,
+        children: [...root.children],
+        childIndex: 0,
+        x: 0,
+        y: 0,
+        connectX: -1,
+        connectY: -1,
+    }]
+    while (stack.length > 0) {
+        const frame = stack.at(-1)!
+        if (frame.childIndex >= frame.children.length) {
+            stack.pop()
+            continue
+        }
+        const [content, child] = frame.children[frame.childIndex++]
+        const childX = frame.x
         rendered.push({
-            x,
-            y,
-            content: key,
-            connectX,
-            connectY,
-            multiChild: branch.children.size > 1,
+            x: childX,
+            y: frame.y,
+            content,
+            connectX: frame.connectX,
+            connectY: frame.connectY,
+            multiChild: frame.node.children.size > 1,
             chatId: child.chatId,
+            preview: child.preview,
+            sourceConversationId: child.sourceConversationId,
+            sourceIndex: child.sourceIndex,
+            revision,
         })
-        const childRendered = renderBranch(child, x, y + 1, x, y)
-        rendered.push(...childRendered)
-        x += child.maxChildren
+        frame.x += child.maxChildren
+        stack.push({
+            node: child,
+            children: [...child.children],
+            childIndex: 0,
+            x: childX,
+            y: frame.y + 1,
+            connectX: childX,
+            connectY: frame.y,
+        })
     }
     return rendered
-    
 }
 
-export async function getChatBranches(characterId: string): Promise<RenderedBranch[]> {
-    const character = await readPersistentCompleteCharacter(characterId, 'chat-branches')
-    if (!character) return []
-
-    const mainBranch: ChatBranch = {
+async function scanPinnedGraph(
+    reader: PersistentRevisionReader,
+    characterId: string,
+    signal?: AbortSignal,
+): Promise<PinnedChatBranchGraph> {
+    signal?.throwIfAborted()
+    const character = await reader.readCharacter(characterId)
+    signal?.throwIfAborted()
+    if (!character) return { revision: reader.revision, branches: [] }
+    assertPinnedRevision(reader.revision, character.revision, `Character ${characterId}`)
+    if (character.value.chaId !== characterId) {
+        throw new Error(`Character ${characterId} returned mismatched detail`)
+    }
+    const root: ChatBranch = {
         children: new Map(),
         maxChildren: 0,
         chatId: -1,
+        preview: '',
+        sourceConversationId: '',
+        sourceIndex: null,
     }
-
-    let i = 0;
-    for(const chat of character.chats){
-        const fm = chat.fmIndex === -1
-            ? character.firstMessage
-            : character.alternateGreetings?.[chat.fmIndex ?? 0]
-        // const chatList = [fm].concat(chat.message.map((v) => v.data))
-        const chatList:string[] = [simpleHasher(fm ?? '')]
-        for(const message of chat.message){
-            chatList.push(simpleHasher(message.data))
+    let cursor: string | undefined
+    let chatId = 0
+    do {
+        signal?.throwIfAborted()
+        const page = await reader.queryConversations({
+            characterId,
+            order: 'configured',
+            limit: BRANCH_SCAN_PAGE_SIZE,
+            ...(cursor === undefined ? {} : { cursor }),
+        })
+        signal?.throwIfAborted()
+        assertPinnedRevision(reader.revision, page.revision, `Conversation page for ${characterId}`)
+        for (const summary of page.items) {
+            signal?.throwIfAborted()
+            if (summary.characterId !== characterId) {
+                throw new Error(`Conversation ${summary.id} returned mismatched character ID`)
+            }
+            const firstMessage = summary.fmIndex === -1
+                ? character.value.firstMessage ?? ''
+                : character.value.alternateGreetings?.[summary.fmIndex ?? 0] ?? ''
+            let branch = insertBranch(
+                root,
+                simpleHasher(firstMessage),
+                chatId,
+                firstMessage,
+                summary.id,
+                null,
+            )
+            for (let startIndex = 0; startIndex < summary.messageCount;) {
+                signal?.throwIfAborted()
+                const result = await reader.readConversationWindow({
+                    characterId,
+                    conversationId: summary.id,
+                    startIndex,
+                    limit: Math.min(BRANCH_SCAN_PAGE_SIZE, summary.messageCount - startIndex),
+                })
+                signal?.throwIfAborted()
+                if (!result) throw new Error(`Missing conversation ${summary.id}`)
+                assertPinnedRevision(reader.revision, result.revision, `Conversation ${summary.id}`)
+                const window = result.value
+                if (
+                    window.characterId !== characterId
+                    || window.conversationId !== summary.id
+                    || window.startIndex !== startIndex
+                    || window.endIndex !== startIndex + window.messages.length
+                    || window.totalMessages !== summary.messageCount
+                    || window.messages.length === 0
+                ) {
+                    throw new Error(`Conversation ${summary.id} returned mismatched range evidence`)
+                }
+                for (let offset = 0; offset < window.messages.length; offset++) {
+                    const sourceIndex = window.startIndex + offset
+                    const message = window.messages[offset]
+                    branch = insertBranch(
+                        branch,
+                        simpleHasher(message.data),
+                        chatId,
+                        message.data,
+                        summary.id,
+                        sourceIndex,
+                    )
+                }
+                startIndex = window.endIndex
+            }
+            chatId++
         }
+        cursor = page.nextCursor
+    } while (cursor !== undefined)
 
-        search(chatList, mainBranch, i++)
+    signal?.throwIfAborted()
+    calculateWidths(root)
+    return {
+        revision: reader.revision,
+        branches: renderBranches(root, reader.revision),
     }
-
-    getMaxChildren(mainBranch)
-
-    return renderBranch(mainBranch, 0, 0).map((branch) => ({
-        ...branch,
-        preview: branch.y === 0
-            ? getFirstMessage(character, branch.chatId)
-            : character.chats[branch.chatId].message[branch.y - 1]?.data ?? '',
-    }))
 }
 
-function getFirstMessage(character: character | groupChat, chatId: number): string {
-    const chat = character.chats[chatId]
-    return chat.fmIndex === -1
-        ? character.firstMessage ?? ''
-        : character.alternateGreetings?.[chat.fmIndex ?? 0] ?? ''
+export async function scanPinnedChatBranches(
+    store: PersistentDataStore,
+    characterId: string,
+    revision: DataRevision,
+    options: PinnedChatBranchScanOptions = {},
+): Promise<PinnedChatBranchGraph> {
+    options.signal?.throwIfAborted()
+    const lease = await store.acquireRevision(revision)
+    return withPersistentRevisionLease(lease, (reader) =>
+        scanPinnedGraph(reader, characterId, options.signal))
 }
 
-function simpleHasher(str: string){
-    let hash = 0;
-    if (str.length == 0) return '';
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash<<5)-hash)+char;
-        hash = hash & hash; // Convert to 32bit integer
-    }
-    return hash.toString(36);
+export async function getChatBranches(characterId: string): Promise<RenderedBranch[]> {
+    const token = await capturePersistentMutationToken('chat-branches')
+    const result = await scanPinnedChatBranches(
+        getPersistentDataRuntime().store,
+        characterId,
+        token.revision,
+    )
+    return result.branches
 }
