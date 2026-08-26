@@ -267,16 +267,19 @@ async fn upload_payload(url: &Url, payload: &KeiPayloadFile) -> StoreResult<u16>
         .body(body)
         .send()
         .await
-        .map_err(|error| StoreError::Store {
-            message: if error.is_timeout() {
-                "KEI backup upload timed out".to_owned()
+        .map_err(|error| {
+            let summary = if error.is_timeout() {
+                "KEI backup upload timed out"
             } else if error.is_connect() {
-                "KEI backup endpoint is unavailable".to_owned()
+                "KEI backup endpoint is unavailable"
             } else if error.is_body() {
-                "KEI backup payload could not be streamed".to_owned()
+                "KEI backup payload could not be streamed"
             } else {
-                "KEI backup upload failed".to_owned()
-            },
+                "KEI backup upload failed"
+            };
+            StoreError::Store {
+                message: format!("{summary}: {error}"),
+            }
         })?;
     Ok(response.status().as_u16())
 }
@@ -615,7 +618,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
     use std::sync::mpsc;
     use std::thread;
 
@@ -773,6 +776,9 @@ mod tests {
             stream
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .expect("write response");
+            stream.flush().expect("flush response");
+            stream.shutdown(Shutdown::Write).expect("finish response");
+            while stream.read(&mut buffer).expect("drain client close") > 0 {}
         });
         let prepared = prepare_upload(
             &store,
@@ -830,8 +836,12 @@ mod tests {
             .block_on(prepared.upload())
             .expect_err("closed endpoint must fail");
 
-        assert_eq!(error.to_string(), "KEI backup endpoint is unavailable");
-        assert!(!error.to_string().contains("secret-token"));
+        let message = error.to_string();
+        assert!(
+            message.starts_with("KEI backup endpoint is unavailable: "),
+            "request source was not preserved: {message}"
+        );
+        assert!(!message.contains("secret-token"));
         assert!(fs::read_dir(output_directory)
             .expect("read upload directory")
             .next()

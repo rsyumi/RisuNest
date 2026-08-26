@@ -1,6 +1,7 @@
 pub(crate) mod commands;
 mod commit;
 mod export;
+#[cfg(feature = "native-kei-upload-pilot")]
 mod kei;
 mod query;
 mod schema;
@@ -538,6 +539,7 @@ impl PersistentStore {
         )?;
         transaction.commit()?;
         export::sweep_abandoned(&mut connection, &snapshots_dir)?;
+        #[cfg(feature = "native-kei-upload-pilot")]
         kei::sweep_abandoned(&snapshots_dir);
         snapshot::sweep_temporary_generations(&mut connection)?;
 
@@ -749,6 +751,7 @@ impl PersistentStore {
         export::open_for_upload(&self.connection, &self.snapshots_dir, path)
     }
 
+    #[cfg(feature = "native-kei-upload-pilot")]
     fn prepare_kei_upload(
         &self,
         lease: &str,

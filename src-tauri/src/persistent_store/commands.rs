@@ -1,4 +1,5 @@
 use super::export::ExportedRisuSave;
+#[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
 use super::{
     AssetAlias, CharacterPage, CharacterQuery, CheckpointMode, ConversationPage, ConversationQuery,
@@ -360,6 +361,7 @@ pub(crate) async fn official_publication_upload_file(
     upload_open_file_attempt(request, source, bytes).await
 }
 
+#[cfg(feature = "native-kei-upload-pilot")]
 #[tauri::command(async)]
 pub(crate) async fn pds_kei_backup_upload(
     state: State<'_, PersistentStoreState>,

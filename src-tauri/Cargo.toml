@@ -15,7 +15,7 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2.11.5", features = ["protocol-asset", "devtools"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-ryu-js = "1.0.3"
+ryu-js = { version = "1.0.3", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
@@ -36,7 +36,7 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-shell = "2.3.5"
 tauri-plugin-http = "2.5.9"
 oauth2 = "5.0.0"
-tokio = { version = "1.47.1", features = ["fs", "io-util", "time"] }
+tokio = { version = "1.47.1", features = ["time"] }
 tokio-util = { version = "0.7.19", features = ["io"], optional = true }
 libc = { version = "0.2", optional = true }
 hex = "0.4.3"
@@ -55,6 +55,13 @@ official-publication-upload-pilot = [
     "tokio/fs",
     "tokio/io-util",
 ]
+native-kei-upload-pilot = [
+    "dep:ryu-js",
+    "dep:tokio-util",
+    "reqwest/stream",
+    "tokio/fs",
+    "tokio/io-util",
+]
 
 [lib]
 name = "risuai_lib"
@@ -68,10 +75,10 @@ tauri-plugin-updater = "2.10.1"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-reqwest = { version = "0.11.16", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.11.16", default-features = false, features = ["json", "rustls-tls"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.11.16", features = ["json", "stream"] }
+reqwest = { version = "0.11.16", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"

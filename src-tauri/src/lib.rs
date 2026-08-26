@@ -529,6 +529,7 @@ pub fn run() {
             persistent_store::commands::pds_export_risu_save_cleanup,
             #[cfg(feature = "official-publication-upload-pilot")]
             persistent_store::commands::official_publication_upload_file,
+            #[cfg(feature = "native-kei-upload-pilot")]
             persistent_store::commands::pds_kei_backup_upload,
             persistent_store::commands::pds_checkpoint,
             persistent_store::commands::pds_snapshot_create,

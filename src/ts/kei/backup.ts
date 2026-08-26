@@ -1,10 +1,6 @@
 import { getDatabase } from '../storage/database.svelte'
-import {
-    getPersistentDataRuntime,
-    materializePersistentDatabaseSnapshot,
-} from '../storage/persistentDataRuntime.svelte'
+import { materializePersistentDatabaseSnapshot } from '../storage/persistentDataRuntime.svelte'
 import { keiServerURL } from './kei'
-import { tryNativeKeiBackup } from './nativeBackup'
 
 let lastKeiSave = 0
 
@@ -21,16 +17,6 @@ export async function saveDbKei(): Promise<void> {
         const liveAccountId = liveAccount.id
         const liveToken = liveAccount.token
         const url = keiServerURL() + '/autobackup/save'
-        if (
-            await tryNativeKeiBackup({
-                runtime: getPersistentDataRuntime(),
-                url,
-                accountId: liveAccountId,
-                token: liveToken,
-            })
-        ) {
-            return
-        }
         const database = await materializePersistentDatabaseSnapshot('kei-auto-backup')
         const snapshotAccount = database.account
         if (
