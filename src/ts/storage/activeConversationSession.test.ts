@@ -190,6 +190,68 @@ describe('ActiveConversationSession', () => {
         expect(session.version).toBe(4)
     })
 
+    it('updates bookmark metadata and missing message IDs through strict locators', () => {
+        const { conversation, onMutation, session } = createSession()
+        const missingId = session.locate(1)
+
+        const bookmarked = session.setBookmark(missingId, {
+            bookmarked: true,
+            messageId: 'assigned-id',
+            name: 'Assigned bookmark',
+        })
+
+        expect(conversation.message[1].chatId).toBe('assigned-id')
+        expect(conversation.bookmarks).toEqual(['assigned-id'])
+        expect(conversation.bookmarkNames).toEqual({
+            'assigned-id': 'Assigned bookmark',
+        })
+        expect(bookmarked.absoluteIndex).toBe(1)
+        expect(bookmarked.sessionVersion).toBe(1)
+
+        const renamed = session.renameBookmark(bookmarked, 'Renamed bookmark')
+        expect(conversation.bookmarkNames).toEqual({
+            'assigned-id': 'Renamed bookmark',
+        })
+
+        session.setBookmark(renamed, { bookmarked: false })
+        expect(conversation.bookmarks).toEqual([])
+        expect(conversation.bookmarkNames).toEqual({})
+        expect(conversation.message[1].chatId).toBe('assigned-id')
+        expect(onMutation.mock.calls.map(([event]) => event.commands)).toEqual([
+            ['bookmark'],
+            ['bookmark'],
+            ['bookmark'],
+        ])
+    })
+
+    it('preserves duplicate bookmark IDs and removes their first bookmark occurrence', () => {
+        const conversation = chat()
+        conversation.bookmarks = ['duplicate', 'duplicate']
+        conversation.bookmarkNames = { duplicate: 'Shared name' }
+        const { session } = createSession(conversation)
+
+        session.setBookmark(session.locate(2), { bookmarked: false })
+
+        expect(conversation.bookmarks).toEqual(['duplicate'])
+        expect(conversation.bookmarkNames).toEqual({})
+        expect(conversation.message[0].chatId).toBe('duplicate')
+        expect(conversation.message[2].chatId).toBe('duplicate')
+    })
+
+    it('does not replace bookmark metadata identities for ordinary message commands', () => {
+        const conversation = chat()
+        conversation.bookmarks = ['duplicate']
+        conversation.bookmarkNames = { duplicate: 'Duplicate' }
+        const originalBookmarks = conversation.bookmarks
+        const originalBookmarkNames = conversation.bookmarkNames
+        const { session } = createSession(conversation)
+
+        session.edit(session.locate(0), message('duplicate', 'edited'))
+
+        expect(conversation.bookmarks).toBe(originalBookmarks)
+        expect(conversation.bookmarkNames).toBe(originalBookmarkNames)
+    })
+
     it('replaces tails for reroll and exposes an inclusive branch source without cloning the chat shape', () => {
         const { conversation, session } = createSession()
 

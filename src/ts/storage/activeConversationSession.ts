@@ -94,6 +94,13 @@ export type ActiveConversationCommandName =
     | 'truncate'
     | 'replace-tail'
     | 'reroll'
+    | 'bookmark'
+
+export interface SetConversationBookmarkOptions {
+    bookmarked: boolean
+    messageId?: string
+    name?: string
+}
 
 export interface ActiveConversationPin {
     readonly reason: ActiveConversationPinReason
@@ -260,6 +267,9 @@ const abortConversationTransaction = Symbol('abortConversationTransaction')
 
 interface CompletedConversationTransaction {
     messages: Message[]
+    bookmarks?: string[]
+    bookmarkNames?: Record<string, string>
+    bookmarkMetadataChanged: boolean
     version: number
     commands: readonly ActiveConversationCommandName[]
     locatorRegistry: ConversationLocatorRegistry
@@ -492,6 +502,9 @@ function readRange(
 
 export class ActiveConversationTransaction {
     private currentMessages: Message[]
+    private currentBookmarks?: string[]
+    private currentBookmarkNames?: Record<string, string>
+    private bookmarkMetadataChanged = false
     private currentVersion: number
     private readonly locatorRegistry: ConversationLocatorRegistry
     private readonly commandNames: ActiveConversationCommandName[] = []
@@ -500,12 +513,19 @@ export class ActiveConversationTransaction {
     constructor(
         private readonly characterId: string,
         private readonly conversationId: string,
+        sourceConversation: Chat,
         private readonly sourceMessages: readonly Message[],
         private readonly storeRevision: DataRevision,
         private readonly sourceLocatorRegistry: ConversationLocatorRegistry,
         sessionVersion: number,
     ) {
         this.currentMessages = [...sourceMessages]
+        this.currentBookmarks = sourceConversation.bookmarks === undefined
+            ? undefined
+            : [...sourceConversation.bookmarks]
+        this.currentBookmarkNames = sourceConversation.bookmarkNames === undefined
+            ? undefined
+            : { ...sourceConversation.bookmarkNames }
         this.currentVersion = sessionVersion
         this.locatorRegistry = sourceLocatorRegistry.fork()
     }
@@ -579,6 +599,72 @@ export class ActiveConversationTransaction {
         nextMessages[locator.absoluteIndex] = safeStructuredClone(message)
         this.currentMessages = nextMessages
         this.record('edit')
+        return this.locate(locator.absoluteIndex)
+    }
+
+    setBookmark(
+        locator: MessageLocator,
+        options: SetConversationBookmarkOptions,
+    ): MessageLocator {
+        this.assertOpen()
+        const message = validateLocator(
+            this.conversationId,
+            this.currentMessages,
+            this.currentVersion,
+            locator,
+            this.locatorRegistry,
+            this.sourceMessages,
+            this.sourceLocatorRegistry,
+        )
+        const messageId = message.chatId ?? options.messageId
+        if (!messageId) throw new Error('A bookmark requires a message ID')
+
+        if (options.bookmarked) {
+            if (message.chatId === undefined) {
+                const nextMessages = this.currentMessages.slice()
+                nextMessages[locator.absoluteIndex] = {
+                    ...safeStructuredClone(message),
+                    chatId: messageId,
+                }
+                this.currentMessages = nextMessages
+            }
+            this.currentBookmarks ??= []
+            this.currentBookmarkNames ??= {}
+            if (!this.currentBookmarks.includes(messageId)) {
+                this.currentBookmarks.push(messageId)
+            }
+            if (options.name !== undefined) {
+                this.currentBookmarkNames[messageId] = options.name
+            }
+        } else {
+            const bookmarkIndex = this.currentBookmarks?.indexOf(messageId) ?? -1
+            if (bookmarkIndex >= 0) this.currentBookmarks!.splice(bookmarkIndex, 1)
+            if (this.currentBookmarkNames) delete this.currentBookmarkNames[messageId]
+        }
+
+        this.bookmarkMetadataChanged = true
+        this.record('bookmark')
+        return this.locate(locator.absoluteIndex)
+    }
+
+    renameBookmark(locator: MessageLocator, name: string): MessageLocator {
+        this.assertOpen()
+        const message = validateLocator(
+            this.conversationId,
+            this.currentMessages,
+            this.currentVersion,
+            locator,
+            this.locatorRegistry,
+            this.sourceMessages,
+            this.sourceLocatorRegistry,
+        )
+        if (!message.chatId || !this.currentBookmarks?.includes(message.chatId)) {
+            throw new Error('The message is not bookmarked')
+        }
+        this.currentBookmarkNames ??= {}
+        this.currentBookmarkNames[message.chatId] = name
+        this.bookmarkMetadataChanged = true
+        this.record('bookmark')
         return this.locate(locator.absoluteIndex)
     }
 
@@ -669,6 +755,9 @@ export class ActiveConversationTransaction {
         this.closed = true
         return {
             messages: this.currentMessages,
+            bookmarks: this.currentBookmarks,
+            bookmarkNames: this.currentBookmarkNames,
+            bookmarkMetadataChanged: this.bookmarkMetadataChanged,
             version: this.currentVersion,
             commands: this.commandNames.slice(),
             locatorRegistry: this.locatorRegistry,
@@ -764,6 +853,18 @@ export class ActiveConversationSession {
         )
     }
 
+    resolveLocator(locator: MessageLocator): number {
+        this.assertActive()
+        validateLocator(
+            this.conversationId,
+            this.conversation.message,
+            this.sessionVersion,
+            locator,
+            this.locatorRegistry,
+        )
+        return locator.absoluteIndex
+    }
+
     positionAt(absoluteIndex: number): ConversationPosition {
         this.assertActive()
         return createPosition(
@@ -832,6 +933,19 @@ export class ActiveConversationSession {
         return this.transaction((transaction) => transaction.edit(locator, message))
     }
 
+    setBookmark(
+        locator: MessageLocator,
+        options: SetConversationBookmarkOptions,
+    ): MessageLocator {
+        this.assertActive()
+        return this.transaction((transaction) => transaction.setBookmark(locator, options))
+    }
+
+    renameBookmark(locator: MessageLocator, name: string): MessageLocator {
+        this.assertActive()
+        return this.transaction((transaction) => transaction.renameBookmark(locator, name))
+    }
+
     delete(locator: MessageLocator): void {
         this.assertActive()
         this.transaction((transaction) => transaction.delete(locator))
@@ -882,6 +996,7 @@ export class ActiveConversationSession {
         const transaction = new ActiveConversationTransaction(
             this.characterId,
             this.conversationId,
+            this.conversation,
             this.conversation.message,
             this.storeRevision,
             this.locatorRegistry,
@@ -903,8 +1018,14 @@ export class ActiveConversationSession {
                         snapshot: safeStructuredClone(message),
                     }))
                     : null
+                const previousBookmarks = this.conversation.bookmarks
+                const previousBookmarkNames = this.conversation.bookmarkNames
                 const previousLocatorRegistry = this.locatorRegistry
                 this.conversation.message = completed.messages
+                if (completed.bookmarkMetadataChanged) {
+                    this.conversation.bookmarks = completed.bookmarks
+                    this.conversation.bookmarkNames = completed.bookmarkNames
+                }
                 this.sessionVersion = completed.version
                 this.locatorRegistry = completed.locatorRegistry
                 try {
@@ -926,6 +1047,10 @@ export class ActiveConversationSession {
                         }
                     }
                     this.conversation.message = previousMessages
+                    if (completed.bookmarkMetadataChanged) {
+                        this.conversation.bookmarks = previousBookmarks
+                        this.conversation.bookmarkNames = previousBookmarkNames
+                    }
                     this.sessionVersion = previousVersion
                     completed.locatorRegistry.clear()
                     this.locatorRegistry = previousLocatorRegistry
