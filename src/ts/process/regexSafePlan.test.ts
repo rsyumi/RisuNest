@@ -174,9 +174,9 @@ describe('Rust regex safe-plan classifier', () => {
         })
     })
 
-    it('rejects AST nesting beyond the Rust parser limit', () => {
-        const boundaryPattern = `${'(?:'.repeat(250)}a${')'.repeat(250)}`
-        const pattern = `${'(?:'.repeat(251)}a${')'.repeat(251)}`
+    it('rejects AST nesting beyond the JSONL transport limit', () => {
+        const boundaryPattern = `${'(?:'.repeat(29)}a${')'.repeat(29)}`
+        const pattern = `${'(?:'.repeat(30)}a${')'.repeat(30)}`
         const boundaryPlan = getRegexExecutionPlan([script(boundaryPattern)], 'editoutput')
         const executionPlan = getRegexExecutionPlan([script(pattern)], 'editoutput')
 

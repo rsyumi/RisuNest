@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const REGEX_NEST_LIMIT: usize = 250;
+const REGEX_NEST_LIMIT: usize = 29;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn rejects_ir_beyond_the_configured_nest_limit() {
         let mut atom = RegexShadowAtom::Literal { value: b'a' };
-        for _ in 0..250 {
+        for _ in 0..29 {
             atom = RegexShadowAtom::Group {
                 alternatives: vec![RegexShadowAlternative { atoms: vec![atom] }],
             };
@@ -931,7 +931,7 @@ mod tests {
         assert!(boundary_result.errors.is_empty());
 
         let mut atom = RegexShadowAtom::Literal { value: b'a' };
-        for _ in 0..251 {
+        for _ in 0..30 {
             atom = RegexShadowAtom::Group {
                 alternatives: vec![RegexShadowAlternative { atoms: vec![atom] }],
             };

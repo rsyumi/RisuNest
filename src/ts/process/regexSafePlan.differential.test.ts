@@ -149,6 +149,120 @@ async function writeLine(
 describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
     'Rust regex JSONL differential profile',
     () => {
+        it('keeps classifier nesting within the JSONL transport boundary', async () => {
+            const boundaryDepth = 29
+            const boundaryPattern = `${'(?:'.repeat(boundaryDepth)}a${')'.repeat(boundaryDepth)}`
+            const overLimitPattern = `${'(?:'.repeat(boundaryDepth + 1)}a${')'.repeat(boundaryDepth + 1)}`
+            const executionPlan = getRegexExecutionPlan([
+                script(boundaryPattern, 'x', 'g'),
+            ], 'editoutput')
+            const classification = classifyRegexSafePlan(executionPlan, 'a')
+            const overLimit = classifyRegexSafePlan(
+                getRegexExecutionPlan([script(overLimitPattern, 'x', 'g')], 'editoutput'),
+                'a',
+            )
+
+            expect(classification).toMatchObject({ accepted: true })
+            expect(overLimit).toEqual({
+                accepted: false,
+                category: 'regex_safe_nest_limit',
+                sourceIndex: 0,
+            })
+            if (classification.accepted === false) {
+                throw new Error(`Boundary plan rejected: ${classification.category}`)
+            }
+
+            let response: RegexWorkerResponse | undefined
+            const handleWorkerMessage = createRegexWorkerMessageHandler((value) => {
+                response = value
+            })
+            handleWorkerMessage({
+                type: 'register',
+                revision: executionPlan.revision,
+                entries: executionPlan.entries.map((entry) => [
+                    entry.sourceIndex,
+                    entry.pattern,
+                    entry.replacement,
+                    entry.flags,
+                ]),
+            })
+            handleWorkerMessage({
+                type: 'execute',
+                id: 0,
+                revision: executionPlan.revision,
+                input: 'a',
+            })
+            if (response?.type !== 'result') {
+                throw new Error('JavaScript Worker did not return the boundary case')
+            }
+
+            const child = spawn(
+                'cargo',
+                [
+                    'test',
+                    '--locked',
+                    '--lib',
+                    'regex_shadow::tests::jsonl_differential_harness',
+                    '--',
+                    '--ignored',
+                    '--exact',
+                    '--nocapture',
+                ],
+                {
+                    cwd: resolve(process.cwd(), 'src-tauri'),
+                    env: {
+                        ...process.env,
+                        VITE_DISABLE_REALM: 'true',
+                    },
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                },
+            )
+            let stdout = ''
+            let stderr = ''
+            child.stdout.setEncoding('utf8')
+            child.stderr.setEncoding('utf8')
+            child.stdout.on('data', (chunk: string) => {
+                stdout += chunk
+            })
+            child.stderr.on('data', (chunk: string) => {
+                stderr += chunk
+            })
+            const exit = once(child, 'exit')
+            await writeLine(child, {
+                id: 0,
+                planJson: JSON.stringify(classification.plan),
+                input: 'a',
+                authorityData: response.data,
+                authorityErrorSourceIndexes: response.errors.map(([sourceIndex]) => sourceIndex),
+            })
+            child.stdin.end()
+            const [exitCode] = await exit
+            if (exitCode !== 0) {
+                throw new Error(`Rust boundary harness failed with ${exitCode}: ${stderr.slice(-2_000)}`)
+            }
+            const marker = stdout
+                .split(/\r?\n/)
+                .find((line) => line.startsWith('RISUNEST_REGEX_DIFFERENTIAL '))
+            if (marker === undefined) {
+                throw new Error('Rust boundary harness did not emit a summary')
+            }
+            const summary = JSON.parse(
+                marker.slice('RISUNEST_REGEX_DIFFERENTIAL '.length),
+            ) as {
+                allowedCases: number
+                uniquePlans: number
+                mismatches: number
+                firstMismatch: unknown
+            }
+
+            expect(summary).toMatchObject({
+                allowedCases: 1,
+                uniquePlans: 1,
+                mismatches: 0,
+                firstMismatch: null,
+            })
+        }, 600_000)
+
         it('executes classifier-produced IR against JavaScript Worker authority', async () => {
             const allowedCases = Number(
                 process.env.RISUNEST_REGEX_DIFFERENTIAL_CASES ?? defaultAllowedCases,

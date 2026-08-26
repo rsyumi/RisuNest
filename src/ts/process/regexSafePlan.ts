@@ -53,7 +53,7 @@ class UnsafeRegexError extends Error {
 
 const parser = new RegExpParser({ ecmaVersion: 2025 })
 const allowedFlags = new Set(['g', 'u', 'gu', 'ug'])
-const regexNestLimit = 250
+const regexNestLimit = 29
 const utf8Encoder = new TextEncoder()
 const escapedAsciiPunctuation = new Set(
     Array.from('!"#$%&\'()*+,-./:;<=>?@[\\]^`{|}~'),
