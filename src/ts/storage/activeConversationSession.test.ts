@@ -238,6 +238,24 @@ describe('ActiveConversationSession', () => {
         expect(conversation.message[2].chatId).toBe('duplicate')
     })
 
+    it('never uses a supplied message ID to remove another bookmark', () => {
+        const conversation = chat()
+        conversation.bookmarks = ['duplicate']
+        conversation.bookmarkNames = { duplicate: 'Duplicate' }
+        const { session } = createSession(conversation)
+
+        const unchanged = session.setBookmark(session.locate(1), {
+            bookmarked: false,
+            messageId: 'duplicate',
+        })
+
+        expect(conversation.bookmarks).toEqual(['duplicate'])
+        expect(conversation.bookmarkNames).toEqual({ duplicate: 'Duplicate' })
+        expect(conversation.message[1].chatId).toBeUndefined()
+        expect(unchanged.sessionVersion).toBe(0)
+        expect(session.version).toBe(0)
+    })
+
     it('does not replace bookmark metadata identities for ordinary message commands', () => {
         const conversation = chat()
         conversation.bookmarks = ['duplicate']

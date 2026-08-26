@@ -616,8 +616,13 @@ export class ActiveConversationTransaction {
             this.sourceMessages,
             this.sourceLocatorRegistry,
         )
-        const messageId = message.chatId ?? options.messageId
-        if (!messageId) throw new Error('A bookmark requires a message ID')
+        const messageId = options.bookmarked
+            ? message.chatId ?? options.messageId
+            : message.chatId
+        if (!messageId) {
+            if (!options.bookmarked) return this.locate(locator.absoluteIndex)
+            throw new Error('A bookmark requires a message ID')
+        }
 
         if (options.bookmarked) {
             if (message.chatId === undefined) {
