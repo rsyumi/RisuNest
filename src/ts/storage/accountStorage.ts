@@ -100,6 +100,33 @@ function withSignal(options: RequestInit, signal?: AbortSignal): RequestInit {
     return signal ? { ...options, signal } : options
 }
 
+function abortReason(signal: AbortSignal): unknown {
+    return signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+}
+
+async function waitForSignal<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return await operation
+    if (signal.aborted) throw abortReason(signal)
+    return await new Promise<T>((resolve, reject) => {
+        const removeAbortListener = () => signal.removeEventListener('abort', onAbort)
+        const onAbort = () => {
+            removeAbortListener()
+            reject(abortReason(signal))
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+        operation.then(
+            (value) => {
+                removeAbortListener()
+                resolve(value)
+            },
+            (error) => {
+                removeAbortListener()
+                reject(error)
+            },
+        )
+    })
+}
+
 function isJsonResponse(response: Response): boolean {
     return /^\s*application\/json\s*(?:;|$)/i.test(response.headers.get('content-type') ?? '')
 }
@@ -254,7 +281,7 @@ export class AccountStorage{
             if (result === null) return null
             if (result.session !== null) risuSession = result.session
             if (result.kind === 'reauthentication-needed') {
-                await this.reauthenticate()
+                await this.reauthenticate(options.signal)
                 continue
             }
             if (result.kind === 'auth-warning') return { kind: 'auth-warning' }
@@ -387,8 +414,9 @@ export class AccountStorage{
         }
     }
 
-    private async reauthenticate(): Promise<void> {
-        const loginResult = await alertLogin()
+    private async reauthenticate(signal?: AbortSignal): Promise<void> {
+        const loginResult = await waitForSignal(alertLogin(), signal)
+        if (signal?.aborted) throw abortReason(signal)
         if (this.credentialRouting) {
             await this.credentialRouting.reauthenticate(loginResult)
         } else {

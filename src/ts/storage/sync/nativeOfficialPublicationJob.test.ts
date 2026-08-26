@@ -8,6 +8,7 @@ import type {
 import type {
     NativeOfficialPublicationAttemptResult,
     NativeOfficialPublicationReceipt,
+    NativeOfficialPublicationRequest,
 } from '../nativeFileJobs'
 import {
     nativePersistentRevisionLease,
@@ -30,6 +31,8 @@ function pinnedLease(): NativePersistentRevisionLease {
         queryPluginStorage: vi.fn(),
         readPluginStorage: vi.fn(),
         readAssetAlias: vi.fn(),
+        listAssetAliases: vi.fn(),
+        readAssetRepositoryAuthority: vi.fn(),
         readAssetOwnerHead: vi.fn(),
         release: vi.fn(),
     }
@@ -208,7 +211,7 @@ describe('native official publication job publisher', () => {
             warning: null,
             reloadSession: false,
         })
-        const runAttempt = vi.fn(async () => ({
+        const runAttempt = vi.fn(async (_request: NativeOfficialPublicationRequest) => ({
             kind: 'waiting-for-reauthentication' as const,
             jobId: 'publication-1',
             accountId: 'account-1',

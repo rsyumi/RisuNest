@@ -343,6 +343,39 @@ describe('AccountStorage structured wire contract', () => {
         ])
     })
 
+    it('aborts while waiting for native reauthentication without retrying after login resolves', async () => {
+        let resolveLogin!: (value: string) => void
+        mocks.alertLogin.mockReturnValueOnce(new Promise<string>((resolve) => {
+            resolveLogin = resolve
+        }))
+        const credentialRouting = {
+            getToken: vi.fn(() => 'old-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        const attempt = vi.fn(async () => ({
+            kind: 'reauthentication-needed' as const,
+            session: 'session-42',
+        }))
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({ credentialRouting })
+        const controller = new AbortController()
+
+        const publication = storage.writeOfficialDatabaseFromNative(attempt, {
+            signal: controller.signal,
+        })
+        await vi.waitFor(() => expect(mocks.alertLogin).toHaveBeenCalledOnce())
+        controller.abort(new DOMException('Publication cancelled', 'AbortError'))
+
+        await expect(publication).rejects.toMatchObject({ name: 'AbortError' })
+        resolveLogin('new-token')
+        await Promise.resolve()
+        await Promise.resolve()
+
+        expect(attempt).toHaveBeenCalledOnce()
+        expect(credentialRouting.reauthenticate).not.toHaveBeenCalled()
+    })
+
     it('preserves the shared session when a native auth outcome has no acquired session', async () => {
         let token = 'old-token'
         const credentialRouting = {
