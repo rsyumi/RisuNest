@@ -1,3 +1,4 @@
+mod native_file_jobs;
 mod native_media;
 mod persistent_store;
 
@@ -448,8 +449,13 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            let root = app.path().app_data_dir()?;
-            native_media::recover_inlay_writes(&root).map_err(std::io::Error::other)?;
+            let app_data_dir = app.path().app_data_dir()?;
+            native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
+            let state = native_file_jobs::NativeFileJobState::initialize(
+                app_data_dir.join("native-file-jobs"),
+            )
+            .map_err(std::io::Error::other)?;
+            app.manage(state);
             Ok(())
         })
         .register_asynchronous_uri_scheme_protocol("risuasset", |context, request, responder| {
@@ -488,6 +494,10 @@ pub fn run() {
             install_py_dependencies,
             oauth_login,
             native_media::native_media_write_inlay_image,
+            native_file_jobs::native_file_job_start,
+            native_file_jobs::native_file_job_status,
+            native_file_jobs::native_file_job_cancel,
+            native_file_jobs::native_file_job_forget,
             persistent_store::commands::pds_open,
             persistent_store::commands::pds_read_root,
             persistent_store::commands::pds_query_presets,

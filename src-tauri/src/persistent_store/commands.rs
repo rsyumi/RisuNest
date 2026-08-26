@@ -35,7 +35,7 @@ fn with_store<T>(
     operation(store)
 }
 
-fn with_store_mut<T>(
+pub(crate) fn with_store_mut<T>(
     state: State<'_, PersistentStoreState>,
     operation: impl FnOnce(&mut PersistentStore) -> StoreResult<T>,
 ) -> StoreResult<T> {
