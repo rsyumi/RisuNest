@@ -71,6 +71,21 @@ describe('ActiveConversationSession', () => {
         expect(session.findMessageLocatorById('missing')).toBeNull()
     })
 
+    it('appends and edits without cloning the full backing array or untouched messages', () => {
+        const first = message('first', 'first')
+        const second = message('second', 'second')
+        const { conversation, session } = createSession(chat([first, second]))
+        const backing = conversation.message
+
+        const appended = session.append(message('third', 'third'))
+        const edited = session.edit(appended, message('third', 'edited'))
+
+        expect(conversation.message).toBe(backing)
+        expect(conversation.message[0]).toBe(first)
+        expect(conversation.message[1]).toBe(second)
+        expect(session.readMessage(edited).data).toBe('edited')
+    })
+
     it('rejects a missing full-array conversation distinctly from a missing locator', () => {
         expect(() => new ActiveConversationSession({
             characterId: 'character-a',

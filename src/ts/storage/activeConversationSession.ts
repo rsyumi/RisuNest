@@ -966,12 +966,55 @@ export class ActiveConversationSession {
 
     append(message: Message): MessageLocator {
         this.assertActive()
-        return this.transaction((transaction) => transaction.append(message))
+        if (this.transactionActive) throw new Error('Nested conversation session transactions are not supported')
+        const previousVersion = this.sessionVersion
+        const previousLocatorRegistry = this.locatorRegistry
+        const nextLocatorRegistry = previousLocatorRegistry.fork()
+        const absoluteIndex = this.conversation.message.length
+        this.conversation.message.push(safeStructuredClone(message))
+        this.sessionVersion += 1
+        this.locatorRegistry = nextLocatorRegistry
+        try {
+            this.notifyMutation(previousVersion, ['append'])
+            previousLocatorRegistry.clear()
+        } catch (error) {
+            this.conversation.message.pop()
+            this.sessionVersion = previousVersion
+            nextLocatorRegistry.clear()
+            this.locatorRegistry = previousLocatorRegistry
+            throw error
+        }
+        return this.locate(absoluteIndex)
     }
 
     edit(locator: MessageLocator, message: Message): MessageLocator {
         this.assertActive()
-        return this.transaction((transaction) => transaction.edit(locator, message))
+        if (this.transactionActive) throw new Error('Nested conversation session transactions are not supported')
+        validateLocator(
+            this.conversationId,
+            this.conversation.message,
+            this.sessionVersion,
+            locator,
+            this.locatorRegistry,
+        )
+        const previousVersion = this.sessionVersion
+        const previousLocatorRegistry = this.locatorRegistry
+        const nextLocatorRegistry = previousLocatorRegistry.fork()
+        const previousMessage = this.conversation.message[locator.absoluteIndex]
+        this.conversation.message[locator.absoluteIndex] = safeStructuredClone(message)
+        this.sessionVersion += 1
+        this.locatorRegistry = nextLocatorRegistry
+        try {
+            this.notifyMutation(previousVersion, ['edit'])
+            previousLocatorRegistry.clear()
+        } catch (error) {
+            this.conversation.message[locator.absoluteIndex] = previousMessage
+            this.sessionVersion = previousVersion
+            nextLocatorRegistry.clear()
+            this.locatorRegistry = previousLocatorRegistry
+            throw error
+        }
+        return this.locate(locator.absoluteIndex)
     }
 
     setBookmark(
@@ -1139,6 +1182,19 @@ export class ActiveConversationSession {
 
     private assertActive(): void {
         if (!this.active) throw new ConversationSessionInactiveError()
+    }
+
+    private notifyMutation(
+        previousVersion: number,
+        commands: readonly ActiveConversationCommandName[],
+    ): void {
+        this.onMutation?.({
+            characterId: this.characterId,
+            conversationId: this.conversationId,
+            previousVersion,
+            sessionVersion: this.sessionVersion,
+            commands,
+        })
     }
 }
 
