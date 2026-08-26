@@ -25,7 +25,7 @@ export interface ImmutablePayloadCas {
     statObject(contentHash: string): Promise<number | null>
 }
 
-async function sha256(bytes: Uint8Array): Promise<string> {
+export async function hashPayloadBytes(bytes: Uint8Array): Promise<string> {
     const digest = await globalThis.crypto.subtle.digest(
         'SHA-256',
         bytes.slice().buffer as ArrayBuffer,
@@ -51,7 +51,7 @@ async function verifyObject(
     if (
         stored === null
         || stored.byteLength !== byteSize
-        || await sha256(stored) !== contentHash
+        || await hashPayloadBytes(stored) !== contentHash
     ) {
         throw new Error(`Payload collision or corruption at ${physicalKey}`)
     }
@@ -61,7 +61,7 @@ export function createImmutablePayloadCas(backend: ImmutablePayloadBackend): Imm
     return {
         async prepare(data) {
             const ownedData = data.slice()
-            const contentHash = await sha256(ownedData)
+            const contentHash = await hashPayloadBytes(ownedData)
             const physicalKey = objectPhysicalKey(contentHash)
             const created = await backend.putIfAbsent(physicalKey, ownedData)
             await verifyObject(backend, physicalKey, contentHash, ownedData.byteLength)
