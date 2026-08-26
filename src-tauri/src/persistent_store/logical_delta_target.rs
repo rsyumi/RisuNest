@@ -3084,7 +3084,8 @@ mod tests {
             LogicalDeltaObjectSource, ReadyLogicalDeltaPlan,
         },
         persistent_store::{
-            logical_index::LogicalIndexBuildRequest, snapshot, PersistentStore, WorkingSetCommit,
+            logical_index::LogicalIndexBuildRequest, snapshot, AssetOwnerHead, AssetOwnerLocator,
+            PersistentStore, WorkingSetCommit,
         },
     };
     use serde_json::json;
@@ -5149,7 +5150,18 @@ mod tests {
                 conversations: None,
                 delete_character_id: None,
                 plugin_storage: None,
-                asset_owner_heads: None,
+                asset_owner_heads: Some(vec![
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::RootModuleAssets { index: 0 },
+                        owner_manifest_hash.clone(),
+                        1,
+                    ),
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 },
+                        owner_manifest_hash,
+                        1,
+                    ),
+                ]),
             })
             .expect("ordinary commit follows logical target activation");
         let next_manifest = store
