@@ -5591,7 +5591,6 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE logical_record_dependencies;
              DROP TABLE logical_record_heads;
              DROP TABLE logical_sync_generations;
-             DROP TABLE asset_repository_authority;
              PRAGMA user_version = 5;",
         )
         .expect("downgrade fixture schema marker");
@@ -5623,13 +5622,20 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
 }
 
 #[test]
-fn schema_v9_adds_generation_scoped_asset_repository_authority_to_v8() {
+fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
     let directory = tempfile::tempdir().expect("create v8 authority migration directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
     store
         .connection
         .execute_batch(
             "DROP TABLE asset_repository_authority;
+             DROP TABLE logical_generation_session_pins;
+             DROP TABLE logical_library_head;
+             DROP TABLE logical_message_page_sources;
+             DROP TABLE logical_peer_common_bases;
+             DROP TABLE logical_record_dependencies;
+             DROP TABLE logical_record_heads;
+             DROP TABLE logical_sync_generations;
              PRAGMA user_version = 8;",
         )
         .expect("downgrade authority schema fixture");
@@ -5640,7 +5646,7 @@ fn schema_v9_adds_generation_scoped_asset_repository_authority_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(
         store
             .read_asset_repository_authority(None)
@@ -5752,7 +5758,6 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
-            DROP TABLE asset_repository_authority;
             PRAGMA user_version = 6;
             ",
         )
@@ -5842,7 +5847,6 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
-            DROP TABLE asset_repository_authority;
             PRAGMA user_version = 7;
             "#,
         )
