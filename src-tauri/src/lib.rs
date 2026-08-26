@@ -3,7 +3,7 @@ mod asset_repository;
 pub mod import_export_jobs;
 #[allow(dead_code)]
 mod local_backup;
-mod native_file_jobs;
+pub mod native_file_jobs;
 mod native_media;
 #[cfg(desktop)]
 #[allow(dead_code, unused_imports)]

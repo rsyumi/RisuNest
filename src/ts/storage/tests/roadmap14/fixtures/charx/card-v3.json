@@ -1,0 +1,55 @@
+{
+    "spec": "chara_card_v3",
+    "spec_version": "3.0",
+    "data": {
+        "name": "Roadmap 14 Golden Card",
+        "description": "Bounded native card metadata fixture",
+        "personality": "Careful",
+        "scenario": "Parser parity",
+        "first_mes": "Hello from CharX",
+        "mes_example": "<START>\n{{char}}: Example",
+        "creator_notes": "Golden fixture",
+        "system_prompt": "Stay compatible",
+        "post_history_instructions": "Preserve semantics",
+        "alternate_greetings": ["Second hello"],
+        "character_book": {
+            "scan_depth": 5,
+            "token_budget": 2048,
+            "recursive_scanning": false,
+            "extensions": {"risu_fullWordMatching": true},
+            "entries": []
+        },
+        "tags": ["roadmap14", "golden"],
+        "creator": "RisuNest",
+        "character_version": "1.0",
+        "extensions": {
+            "risuai": {
+                "utilityBot": true,
+                "largePortrait": false,
+                "lowLevelAccess": false
+            },
+            "unknown_extension": {
+                "ordered": ["first", "second"]
+            }
+        },
+        "group_only_greetings": ["Group hello"],
+        "nickname": "Golden",
+        "source": ["synthetic"],
+        "creation_date": 1700000000,
+        "modification_date": 1700000001,
+        "assets": [
+            {
+                "type": "icon",
+                "uri": "embeded://assets/Portrait.JPEG",
+                "name": "main",
+                "ext": "JPEG"
+            },
+            {
+                "type": "x-risu-asset",
+                "uri": "embeded://assets/config.JSON",
+                "name": "config",
+                "ext": "JSON"
+            }
+        ]
+    }
+}
