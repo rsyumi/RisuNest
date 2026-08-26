@@ -13,6 +13,8 @@ mod peer_sync;
 mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]
 mod publication_upload;
+#[cfg(test)]
+mod regex_shadow;
 
 use base64::{engine::general_purpose, Engine as _};
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};

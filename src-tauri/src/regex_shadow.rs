@@ -1,0 +1,992 @@
+use regex::{Captures, Regex};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegexShadowPlan {
+    version: u8,
+    entries: Vec<RegexShadowEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegexShadowEntry {
+    source_index: usize,
+    global: bool,
+    capture_count: usize,
+    pattern_bytes: usize,
+    replacement_bytes: usize,
+    pattern: RegexShadowPattern,
+    replacement: Vec<ReplacementToken>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RegexShadowPattern {
+    alternatives: Vec<RegexShadowAlternative>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RegexShadowAlternative {
+    atoms: Vec<RegexShadowAtom>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RegexShadowAtom {
+    Literal {
+        value: u8,
+    },
+    Class {
+        ranges: Vec<RegexShadowRange>,
+    },
+    Group {
+        alternatives: Vec<RegexShadowAlternative>,
+    },
+    Capture {
+        index: usize,
+        alternatives: Vec<RegexShadowAlternative>,
+    },
+    Repeat {
+        min: usize,
+        max: usize,
+        atom: Box<RegexShadowAtom>,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RegexShadowRange {
+    start: u8,
+    end: u8,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReplacementToken {
+    Literal { value: String },
+    Match,
+    Prefix,
+    Suffix,
+    Capture { index: usize },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegexShadowRuleError {
+    source_index: usize,
+    category: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct RegexShadowResult {
+    data: String,
+    errors: Vec<RegexShadowRuleError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RegexShadowEvidence {
+    fixture_id: String,
+    plan_fingerprint: String,
+    input_hash: String,
+    authority_output_hash: String,
+    rust_output_hash: Option<String>,
+    first_differing_utf16_index: Option<usize>,
+    authority_error_source_indexes: Vec<usize>,
+    rust_error_source_indexes: Vec<usize>,
+    category: &'static str,
+}
+
+#[derive(Debug)]
+struct RegexShadowFailure(&'static str);
+
+#[derive(Clone, Copy)]
+struct ExecutionControl<'a> {
+    cancelled: Option<&'a AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+struct CompiledRegexShadowPlan {
+    entries: Vec<CompiledRegexShadowEntry>,
+}
+
+struct CompiledRegexShadowEntry {
+    source_index: usize,
+    global: bool,
+    replacement: Vec<ReplacementToken>,
+    regex: Option<Regex>,
+}
+
+fn validate_alternatives(
+    alternatives: &[RegexShadowAlternative],
+    next_capture: &mut usize,
+    inside_quantifier: bool,
+) -> Result<usize, RegexShadowFailure> {
+    if alternatives.is_empty() {
+        return Err(RegexShadowFailure("regex_shadow_ir"));
+    }
+    let mut source_bytes = alternatives.len() - 1;
+    for alternative in alternatives {
+        if alternative.atoms.is_empty() {
+            return Err(RegexShadowFailure("regex_shadow_ir"));
+        }
+        let mut nullable = true;
+        for atom in &alternative.atoms {
+            let (atom_nullable, atom_bytes) = validate_atom(atom, next_capture, inside_quantifier)?;
+            nullable &= atom_nullable;
+            source_bytes = source_bytes.saturating_add(atom_bytes);
+        }
+        if nullable {
+            return Err(RegexShadowFailure("regex_shadow_ir"));
+        }
+    }
+    Ok(source_bytes)
+}
+
+fn validate_atom(
+    atom: &RegexShadowAtom,
+    next_capture: &mut usize,
+    inside_quantifier: bool,
+) -> Result<(bool, usize), RegexShadowFailure> {
+    match atom {
+        RegexShadowAtom::Literal { value } => {
+            if *value > 0x7f {
+                return Err(RegexShadowFailure("regex_shadow_ir"));
+            }
+            Ok((false, 1))
+        }
+        RegexShadowAtom::Class { ranges } => {
+            if ranges.is_empty()
+                || ranges
+                    .iter()
+                    .any(|range| range.start > range.end || range.end > 0x7f)
+            {
+                return Err(RegexShadowFailure("regex_shadow_ir"));
+            }
+            Ok((false, ranges.len().saturating_add(2)))
+        }
+        RegexShadowAtom::Group { alternatives } => {
+            let bytes = validate_alternatives(alternatives, next_capture, inside_quantifier)?;
+            Ok((false, bytes.saturating_add(4)))
+        }
+        RegexShadowAtom::Capture {
+            index,
+            alternatives,
+        } => {
+            *next_capture += 1;
+            if *index != *next_capture {
+                return Err(RegexShadowFailure("regex_shadow_ir"));
+            }
+            let bytes = validate_alternatives(alternatives, next_capture, inside_quantifier)?;
+            Ok((false, bytes.saturating_add(2)))
+        }
+        RegexShadowAtom::Repeat { min, max, atom } => {
+            if inside_quantifier || min > max || *max > 64 {
+                return Err(RegexShadowFailure("regex_shadow_ir"));
+            }
+            let (atom_nullable, bytes) = validate_atom(atom, next_capture, true)?;
+            let quantifier_bytes = if *min == 0 && *max == 1 {
+                1
+            } else if min == max {
+                min.to_string().len() + 2
+            } else {
+                min.to_string().len() + max.to_string().len() + 3
+            };
+            Ok((
+                *min == 0 || atom_nullable,
+                bytes.saturating_add(quantifier_bytes),
+            ))
+        }
+    }
+}
+
+fn validate_entry(entry: &RegexShadowEntry) -> Result<(), RegexShadowFailure> {
+    let mut capture_count = 0usize;
+    let minimum_pattern_bytes =
+        validate_alternatives(&entry.pattern.alternatives, &mut capture_count, false)?;
+    if capture_count != entry.capture_count || minimum_pattern_bytes > entry.pattern_bytes {
+        return Err(RegexShadowFailure("regex_shadow_ir"));
+    }
+    let mut minimum_replacement_bytes = 0usize;
+    for token in &entry.replacement {
+        minimum_replacement_bytes = minimum_replacement_bytes.saturating_add(match token {
+            ReplacementToken::Literal { value } => value.len(),
+            ReplacementToken::Match | ReplacementToken::Prefix | ReplacementToken::Suffix => 2,
+            ReplacementToken::Capture { index } => {
+                if *index == 0 || *index > entry.capture_count {
+                    return Err(RegexShadowFailure("regex_shadow_ir"));
+                }
+                if *index >= 10 {
+                    3
+                } else {
+                    2
+                }
+            }
+        });
+    }
+    if minimum_replacement_bytes > entry.replacement_bytes {
+        return Err(RegexShadowFailure("regex_shadow_ir"));
+    }
+    Ok(())
+}
+
+fn check_control(control: ExecutionControl<'_>) -> Result<(), RegexShadowFailure> {
+    if control
+        .cancelled
+        .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
+    {
+        return Err(RegexShadowFailure("regex_shadow_cancelled"));
+    }
+    if control
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Err(RegexShadowFailure("regex_shadow_deadline"));
+    }
+    Ok(())
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
+}
+
+fn first_differing_utf16_index(left: &str, right: &str) -> Option<usize> {
+    let mut left_units = left.encode_utf16();
+    let mut right_units = right.encode_utf16();
+    let mut index = 0usize;
+    loop {
+        match (left_units.next(), right_units.next()) {
+            (Some(left), Some(right)) if left == right => index += 1,
+            (None, None) => return None,
+            _ => return Some(index),
+        }
+    }
+}
+
+fn compare_shadow(
+    fixture_id: &str,
+    plan_json: &str,
+    input: &str,
+    authority_output: &str,
+    authority_error_source_indexes: &[usize],
+) -> RegexShadowEvidence {
+    let plan_fingerprint = sha256_hex(plan_json.as_bytes());
+    let input_hash = sha256_hex(input.as_bytes());
+    let authority_output_hash = sha256_hex(authority_output.as_bytes());
+    let result = serde_json::from_str(plan_json)
+        .map_err(|_| RegexShadowFailure("regex_shadow_plan_json"))
+        .and_then(|plan| {
+            execute_plan_with_control(
+                plan,
+                input,
+                ExecutionControl {
+                    cancelled: None,
+                    deadline: Some(Instant::now() + Duration::from_secs(2)),
+                },
+            )
+        });
+    match result {
+        Ok(result) => {
+            let rust_error_source_indexes = result
+                .errors
+                .iter()
+                .map(|error| error.source_index)
+                .collect::<Vec<_>>();
+            let first_difference = first_differing_utf16_index(authority_output, &result.data);
+            let category = if first_difference.is_some() {
+                "regex_shadow_output_mismatch"
+            } else if rust_error_source_indexes != authority_error_source_indexes {
+                "regex_shadow_error_order_mismatch"
+            } else {
+                "match"
+            };
+            RegexShadowEvidence {
+                fixture_id: fixture_id.to_string(),
+                plan_fingerprint,
+                input_hash,
+                authority_output_hash,
+                rust_output_hash: Some(sha256_hex(result.data.as_bytes())),
+                first_differing_utf16_index: first_difference,
+                authority_error_source_indexes: authority_error_source_indexes.to_vec(),
+                rust_error_source_indexes,
+                category,
+            }
+        }
+        Err(error) => RegexShadowEvidence {
+            fixture_id: fixture_id.to_string(),
+            plan_fingerprint,
+            input_hash,
+            authority_output_hash,
+            rust_output_hash: None,
+            first_differing_utf16_index: None,
+            authority_error_source_indexes: authority_error_source_indexes.to_vec(),
+            rust_error_source_indexes: Vec::new(),
+            category: error.0,
+        },
+    }
+}
+
+fn build_alternatives(alternatives: &[RegexShadowAlternative]) -> String {
+    alternatives
+        .iter()
+        .map(|alternative| alternative.atoms.iter().map(build_atom).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn build_atom(atom: &RegexShadowAtom) -> String {
+    match atom {
+        RegexShadowAtom::Literal { value } => format!(r"\x{value:02X}"),
+        RegexShadowAtom::Class { ranges } => {
+            let mut pattern = String::from("[");
+            for range in ranges {
+                pattern.push_str(&format!(r"\x{:02X}", range.start));
+                if range.start != range.end {
+                    pattern.push('-');
+                    pattern.push_str(&format!(r"\x{:02X}", range.end));
+                }
+            }
+            pattern.push(']');
+            pattern
+        }
+        RegexShadowAtom::Group { alternatives } => {
+            format!("(?:{})", build_alternatives(alternatives))
+        }
+        RegexShadowAtom::Capture {
+            index: _,
+            alternatives,
+        } => format!("({})", build_alternatives(alternatives)),
+        RegexShadowAtom::Repeat { min, max, atom } => {
+            format!("(?:{}){{{min},{max}}}", build_atom(atom))
+        }
+    }
+}
+
+fn append_substitution(
+    output: &mut String,
+    tokens: &[ReplacementToken],
+    input: &str,
+    captures: &Captures<'_>,
+    output_limit: usize,
+) -> Result<(), RegexShadowFailure> {
+    let full_match = captures.get(0).expect("capture zero must exist");
+    for token in tokens {
+        match token {
+            ReplacementToken::Literal { value } => push_limited(output, value, output_limit)?,
+            ReplacementToken::Match => push_limited(output, full_match.as_str(), output_limit)?,
+            ReplacementToken::Prefix => {
+                push_limited(output, &input[..full_match.start()], output_limit)?
+            }
+            ReplacementToken::Suffix => {
+                push_limited(output, &input[full_match.end()..], output_limit)?
+            }
+            ReplacementToken::Capture { index } => {
+                if let Some(capture) = captures.get(*index) {
+                    push_limited(output, capture.as_str(), output_limit)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_limited(
+    output: &mut String,
+    value: &str,
+    output_limit: usize,
+) -> Result<(), RegexShadowFailure> {
+    if output.len().saturating_add(value.len()) > output_limit {
+        return Err(RegexShadowFailure("regex_shadow_output_limit"));
+    }
+    output.push_str(value);
+    Ok(())
+}
+
+fn execute_plan(
+    plan: RegexShadowPlan,
+    input: &str,
+) -> Result<RegexShadowResult, RegexShadowFailure> {
+    execute_plan_with_control(
+        plan,
+        input,
+        ExecutionControl {
+            cancelled: None,
+            deadline: None,
+        },
+    )
+}
+
+fn execute_plan_with_control(
+    plan: RegexShadowPlan,
+    input: &str,
+    control: ExecutionControl<'_>,
+) -> Result<RegexShadowResult, RegexShadowFailure> {
+    check_control(control)?;
+    let plan = compile_plan(plan)?;
+    execute_compiled_plan(&plan, input, control)
+}
+
+fn compile_plan(plan: RegexShadowPlan) -> Result<CompiledRegexShadowPlan, RegexShadowFailure> {
+    if plan.version != 1 {
+        return Err(RegexShadowFailure("regex_shadow_version"));
+    }
+    if plan.entries.is_empty() || plan.entries.len() > 500 {
+        return Err(RegexShadowFailure("regex_shadow_rule_limit"));
+    }
+    let mut pattern_bytes = 0usize;
+    let mut replacement_bytes = 0usize;
+    for entry in &plan.entries {
+        if entry.pattern_bytes > 4_096 {
+            return Err(RegexShadowFailure("regex_shadow_pattern_limit"));
+        }
+        if entry.capture_count > 99 {
+            return Err(RegexShadowFailure("regex_shadow_capture_limit"));
+        }
+        validate_entry(entry)?;
+        pattern_bytes = pattern_bytes.saturating_add(entry.pattern_bytes);
+        replacement_bytes = replacement_bytes.saturating_add(entry.replacement_bytes);
+    }
+    if pattern_bytes > 65_536 {
+        return Err(RegexShadowFailure("regex_shadow_pattern_total_limit"));
+    }
+    if replacement_bytes > 65_536 {
+        return Err(RegexShadowFailure("regex_shadow_replacement_total_limit"));
+    }
+    let entries = plan
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let pattern = build_alternatives(&entry.pattern.alternatives);
+            let regex = Regex::new(&pattern).ok();
+            if regex
+                .as_ref()
+                .is_some_and(|regex| regex.captures_len() != entry.capture_count + 1)
+            {
+                return Err(RegexShadowFailure("regex_shadow_ir"));
+            }
+            Ok(CompiledRegexShadowEntry {
+                source_index: entry.source_index,
+                global: entry.global,
+                replacement: entry.replacement,
+                regex,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CompiledRegexShadowPlan { entries })
+}
+
+fn execute_compiled_plan(
+    plan: &CompiledRegexShadowPlan,
+    input: &str,
+    control: ExecutionControl<'_>,
+) -> Result<RegexShadowResult, RegexShadowFailure> {
+    check_control(control)?;
+    if input.len() > 1_048_576 {
+        return Err(RegexShadowFailure("regex_shadow_input_limit"));
+    }
+    let output_limit = 8_388_608usize.min(input.len().saturating_mul(4).saturating_add(65_536));
+    let mut data = input.to_string();
+    let mut errors = Vec::new();
+    let mut total_matches = 0usize;
+    for entry in &plan.entries {
+        check_control(control)?;
+        let regex = match &entry.regex {
+            Some(regex) => regex,
+            None => {
+                errors.push(RegexShadowRuleError {
+                    source_index: entry.source_index,
+                    category: "regex_shadow_compile",
+                });
+                continue;
+            }
+        };
+        let original = data;
+        let mut output = String::with_capacity(original.len());
+        let mut end = 0;
+        for captures in regex.captures_iter(&original) {
+            total_matches += 1;
+            if total_matches > 1_000_000 {
+                return Err(RegexShadowFailure("regex_shadow_match_limit"));
+            }
+            if total_matches % 1_024 == 0 {
+                check_control(control)?;
+            }
+            let full_match = captures.get(0).expect("capture zero must exist");
+            push_limited(
+                &mut output,
+                &original[end..full_match.start()],
+                output_limit,
+            )?;
+            append_substitution(
+                &mut output,
+                &entry.replacement,
+                &original,
+                &captures,
+                output_limit,
+            )?;
+            end = full_match.end();
+            if !entry.global {
+                break;
+            }
+        }
+        push_limited(&mut output, &original[end..], output_limit)?;
+        data = output;
+    }
+    Ok(RegexShadowResult { data, errors })
+}
+
+fn execute_json(
+    plan_json: &str,
+    input: &str,
+    _cancelled: Option<&AtomicBool>,
+) -> Result<RegexShadowResult, RegexShadowFailure> {
+    let plan = serde_json::from_str(plan_json)
+        .map_err(|_| RegexShadowFailure("regex_shadow_plan_json"))?;
+    execute_plan_with_control(
+        plan,
+        input,
+        ExecutionControl {
+            cancelled: _cancelled,
+            deadline: Some(Instant::now() + Duration::from_secs(2)),
+        },
+    )
+}
+
+fn alternative(atoms: Vec<RegexShadowAtom>) -> RegexShadowAlternative {
+    RegexShadowAlternative { atoms }
+}
+
+fn generated_plan(index: usize) -> RegexShadowPlan {
+    let entries = match index % 4 {
+        0 => vec![RegexShadowEntry {
+            source_index: 0,
+            global: true,
+            capture_count: 2,
+            pattern_bytes: 7,
+            replacement_bytes: 4,
+            pattern: RegexShadowPattern {
+                alternatives: vec![
+                    alternative(vec![RegexShadowAtom::Capture {
+                        index: 1,
+                        alternatives: vec![alternative(vec![RegexShadowAtom::Literal {
+                            value: b'a',
+                        }])],
+                    }]),
+                    alternative(vec![RegexShadowAtom::Capture {
+                        index: 2,
+                        alternatives: vec![alternative(vec![RegexShadowAtom::Literal {
+                            value: b'b',
+                        }])],
+                    }]),
+                ],
+            },
+            replacement: vec![
+                ReplacementToken::Capture { index: 2 },
+                ReplacementToken::Capture { index: 1 },
+            ],
+        }],
+        1 => vec![RegexShadowEntry {
+            source_index: 0,
+            global: true,
+            capture_count: 0,
+            pattern_bytes: 10,
+            replacement_bytes: 6,
+            pattern: RegexShadowPattern {
+                alternatives: vec![alternative(vec![RegexShadowAtom::Repeat {
+                    min: 1,
+                    max: 2,
+                    atom: Box::new(RegexShadowAtom::Class {
+                        ranges: vec![RegexShadowRange {
+                            start: b'A',
+                            end: b'Z',
+                        }],
+                    }),
+                }])],
+            },
+            replacement: vec![
+                ReplacementToken::Literal {
+                    value: "$[".to_string(),
+                },
+                ReplacementToken::Match,
+                ReplacementToken::Literal {
+                    value: "]".to_string(),
+                },
+            ],
+        }],
+        2 => vec![RegexShadowEntry {
+            source_index: 0,
+            global: false,
+            capture_count: 0,
+            pattern_bytes: 12,
+            replacement_bytes: 12,
+            pattern: RegexShadowPattern {
+                alternatives: vec![alternative(vec![RegexShadowAtom::Repeat {
+                    min: 1,
+                    max: 3,
+                    atom: Box::new(RegexShadowAtom::Group {
+                        alternatives: vec![
+                            alternative(vec![RegexShadowAtom::Literal { value: b'x' }]),
+                            alternative(vec![RegexShadowAtom::Literal { value: b'y' }]),
+                        ],
+                    }),
+                }])],
+            },
+            replacement: vec![
+                ReplacementToken::Literal {
+                    value: "[".to_string(),
+                },
+                ReplacementToken::Prefix,
+                ReplacementToken::Literal {
+                    value: "][".to_string(),
+                },
+                ReplacementToken::Match,
+                ReplacementToken::Literal {
+                    value: "][".to_string(),
+                },
+                ReplacementToken::Suffix,
+                ReplacementToken::Literal {
+                    value: "]".to_string(),
+                },
+            ],
+        }],
+        _ => vec![
+            RegexShadowEntry {
+                source_index: 0,
+                global: true,
+                capture_count: 0,
+                pattern_bytes: 7,
+                replacement_bytes: 4,
+                pattern: RegexShadowPattern {
+                    alternatives: vec![alternative(vec![
+                        RegexShadowAtom::Repeat {
+                            min: 0,
+                            max: 1,
+                            atom: Box::new(RegexShadowAtom::Class {
+                                ranges: vec![RegexShadowRange {
+                                    start: b'0',
+                                    end: b'9',
+                                }],
+                            }),
+                        },
+                        RegexShadowAtom::Literal { value: b'z' },
+                    ])],
+                },
+                replacement: vec![ReplacementToken::Match, ReplacementToken::Match],
+            },
+            RegexShadowEntry {
+                source_index: 1,
+                global: true,
+                capture_count: 0,
+                pattern_bytes: 1,
+                replacement_bytes: 1,
+                pattern: RegexShadowPattern {
+                    alternatives: vec![alternative(vec![RegexShadowAtom::Literal { value: b'z' }])],
+                },
+                replacement: vec![ReplacementToken::Literal {
+                    value: "Z".to_string(),
+                }],
+            },
+        ],
+    };
+    RegexShadowPlan {
+        version: 1,
+        entries,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        alternative, compare_shadow, compile_plan, execute_compiled_plan, execute_json,
+        execute_plan, execute_plan_with_control, generated_plan, ExecutionControl,
+        RegexShadowAlternative, RegexShadowAtom, RegexShadowEntry, RegexShadowPattern,
+        RegexShadowPlan, ReplacementToken,
+    };
+    use sha2::{Digest, Sha256};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    fn literal_plan(replacement: String) -> RegexShadowPlan {
+        RegexShadowPlan {
+            version: 1,
+            entries: vec![RegexShadowEntry {
+                source_index: 0,
+                global: true,
+                capture_count: 0,
+                pattern_bytes: 1,
+                replacement_bytes: replacement.len(),
+                pattern: RegexShadowPattern {
+                    alternatives: vec![RegexShadowAlternative {
+                        atoms: vec![RegexShadowAtom::Literal { value: b'a' }],
+                    }],
+                },
+                replacement: vec![ReplacementToken::Literal { value: replacement }],
+            }],
+        }
+    }
+
+    #[test]
+    fn executes_ordered_rules_with_ecmascript_substitution() {
+        let plan = r#"{
+            "version": 1,
+            "entries": [
+                {
+                    "sourceIndex": 7,
+                    "global": true,
+                    "captureCount": 1,
+                    "patternBytes": 4,
+                    "replacementBytes": 3,
+                    "pattern": {
+                        "alternatives": [{
+                            "atoms": [{
+                                "kind": "capture",
+                                "index": 1,
+                                "alternatives": [{
+                                    "atoms": [{"kind": "literal", "value": 97}]
+                                }]
+                            }]
+                        }]
+                    },
+                    "replacement": [{"kind": "capture", "index": 1}, {"kind": "literal", "value": "b"}]
+                },
+                {
+                    "sourceIndex": 3,
+                    "global": false,
+                    "captureCount": 0,
+                    "patternBytes": 2,
+                    "replacementBytes": 1,
+                    "pattern": {
+                        "alternatives": [{
+                            "atoms": [{"kind": "literal", "value": 98}]
+                        }]
+                    },
+                    "replacement": [{"kind": "literal", "value": "X"}]
+                }
+            ]
+        }"#;
+
+        let result = execute_json(plan, "aa", None).unwrap();
+
+        assert_eq!(result.data, "aXab");
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn enforces_the_dynamic_output_limit() {
+        let plan = literal_plan("x".repeat(100));
+
+        let error = execute_plan(plan, &"a".repeat(20_000)).unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_output_limit");
+    }
+
+    #[test]
+    fn enforces_the_total_match_limit() {
+        let plan = literal_plan("x".to_string());
+
+        let error = execute_plan(plan, &"a".repeat(1_000_001)).unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_match_limit");
+    }
+
+    #[test]
+    fn observes_cancellation_before_execution() {
+        let cancelled = AtomicBool::new(true);
+        let control = ExecutionControl {
+            cancelled: Some(&cancelled),
+            deadline: None,
+        };
+
+        let error =
+            execute_plan_with_control(literal_plan("x".to_string()), "a", control).unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_cancelled");
+    }
+
+    #[test]
+    fn validates_classifier_resource_metadata() {
+        let mut plan = literal_plan("x".to_string());
+        plan.entries[0].pattern_bytes = 4_097;
+
+        let error = execute_plan(plan, "a").unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_pattern_limit");
+    }
+
+    #[test]
+    fn rejects_malformed_neutral_ir() {
+        let mut plan = literal_plan("x".to_string());
+        plan.entries[0].capture_count = 1;
+        plan.entries[0].pattern.alternatives[0].atoms[0] = RegexShadowAtom::Capture {
+            index: 2,
+            alternatives: vec![RegexShadowAlternative {
+                atoms: vec![RegexShadowAtom::Literal { value: b'a' }],
+            }],
+        };
+
+        let error = execute_plan(plan, "a").unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_ir");
+    }
+
+    #[test]
+    fn rejects_non_ascii_values_in_neutral_ir() {
+        let mut literal = literal_plan("x".to_string());
+        literal.entries[0].pattern.alternatives[0].atoms[0] =
+            RegexShadowAtom::Literal { value: 0x80 };
+        let literal_error = execute_plan(literal, "a").unwrap_err();
+
+        let mut character_class = literal_plan("x".to_string());
+        character_class.entries[0].pattern.alternatives[0].atoms[0] = RegexShadowAtom::Class {
+            ranges: vec![super::RegexShadowRange {
+                start: b'a',
+                end: 0x80,
+            }],
+        };
+        let class_error = execute_plan(character_class, "a").unwrap_err();
+
+        assert_eq!(literal_error.0, "regex_shadow_ir");
+        assert_eq!(class_error.0, "regex_shadow_ir");
+    }
+
+    #[test]
+    fn shadow_comparison_reports_only_bounded_evidence() {
+        let plan = serde_json::to_string(&literal_plan("x".to_string())).unwrap();
+
+        let evidence = compare_shadow("fixture-1", &plan, "a🙂", "x🙂", &[]);
+        let serialized = serde_json::to_string(&evidence).unwrap();
+
+        assert_eq!(evidence.category, "match");
+        assert_eq!(evidence.first_differing_utf16_index, None);
+        assert!(!serialized.contains("a🙂"));
+        assert!(!serialized.contains("x🙂"));
+    }
+
+    #[test]
+    fn observes_expired_deadlines_before_execution() {
+        let control = ExecutionControl {
+            cancelled: None,
+            deadline: Some(Instant::now()),
+        };
+
+        let error =
+            execute_plan_with_control(literal_plan("x".to_string()), "a", control).unwrap_err();
+
+        assert_eq!(error.0, "regex_shadow_deadline");
+    }
+
+    #[test]
+    fn matches_the_javascript_authority_hash_for_generated_corpus() {
+        let mut hash = Sha256::new();
+        let plans = (0..4)
+            .map(|index| compile_plan(generated_plan(index)).unwrap())
+            .collect::<Vec<_>>();
+        for index in 0..100_000u32 {
+            let input = format!("🙂abABzxy.{}\r\n", index % 997);
+            let result = execute_compiled_plan(
+                &plans[index as usize % plans.len()],
+                &input,
+                ExecutionControl {
+                    cancelled: None,
+                    deadline: None,
+                },
+            )
+            .unwrap();
+            hash.update(index.to_le_bytes());
+            hash.update((result.data.len() as u32).to_le_bytes());
+            hash.update(result.data.as_bytes());
+            hash.update((result.errors.len() as u32).to_le_bytes());
+            for error in result.errors {
+                hash.update((error.source_index as u32).to_le_bytes());
+            }
+        }
+
+        assert_eq!(
+            format!("{:x}", hash.finalize()),
+            "6fc3f4ec46d9a5806b576b005aac64beba109e174d0e3e143dcb3cd93e19e4f5",
+        );
+    }
+
+    fn phase_one_plan(rule_count: usize) -> RegexShadowPlan {
+        RegexShadowPlan {
+            version: 1,
+            entries: (0..rule_count)
+                .map(|index| {
+                    let pattern = format!("rule-{index:03}");
+                    let replacement = format!("done-{index:03}");
+                    RegexShadowEntry {
+                        source_index: index,
+                        global: true,
+                        capture_count: 0,
+                        pattern_bytes: pattern.len(),
+                        replacement_bytes: replacement.len(),
+                        pattern: RegexShadowPattern {
+                            alternatives: vec![alternative(
+                                pattern
+                                    .bytes()
+                                    .map(|value| RegexShadowAtom::Literal { value })
+                                    .collect(),
+                            )],
+                        },
+                        replacement: vec![ReplacementToken::Literal { value: replacement }],
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn phase_one_input(rule_count: usize, input_bytes: usize) -> String {
+        let mut input = String::with_capacity(input_bytes);
+        let mut index = 0usize;
+        while input.len() < input_bytes {
+            input.push_str(&format!("rule-{:03}|", index % rule_count));
+            index += 1;
+        }
+        input.truncate(input_bytes);
+        input
+    }
+
+    #[test]
+    #[ignore = "Windows profile benchmark"]
+    fn windows_profile_benchmark() {
+        for rule_count in [20, 100, 500] {
+            let plan = compile_plan(phase_one_plan(rule_count)).unwrap();
+            for input_bytes in [32 * 1024, 256 * 1024, 1024 * 1024] {
+                let input = phase_one_input(rule_count, input_bytes);
+                let mut samples = Vec::with_capacity(10);
+                for run in 0..11 {
+                    let started = Instant::now();
+                    let result = execute_compiled_plan(
+                        &plan,
+                        &input,
+                        ExecutionControl {
+                            cancelled: None,
+                            deadline: None,
+                        },
+                    )
+                    .unwrap();
+                    assert!(result.errors.is_empty());
+                    assert_eq!(result.data.len(), input.len());
+                    if run != 0 {
+                        samples.push(started.elapsed());
+                    }
+                }
+                samples.sort_unstable();
+                let p50 = samples[4];
+                let p95 = samples[9];
+                println!(
+                    "{{\"engine\":\"rust_regex\",\"rules\":{rule_count},\"inputBytes\":{input_bytes},\"samples\":10,\"p50Micros\":{},\"p95Micros\":{}}}",
+                    duration_micros(p50),
+                    duration_micros(p95),
+                );
+            }
+        }
+    }
+
+    fn duration_micros(duration: Duration) -> u128 {
+        duration.as_micros()
+    }
+}
