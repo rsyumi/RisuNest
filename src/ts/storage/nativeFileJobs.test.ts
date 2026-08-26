@@ -324,6 +324,52 @@ describe('native file jobs', () => {
         ])
     })
 
+    it('rejects a short Android SAF handoff and still cleans both native receipts', async () => {
+        const commands: string[] = []
+        const handoffPath = 'C:\\app\\persistent\\exports\\risusave-short.risudat'
+        const terminal: NativeFileJobStatus = {
+            jobId: 'lossless-export',
+            kind: 'export-lossless-backup',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 4096, completedItems: 1 },
+            result: {
+                revision: 22,
+                sourceBytes: 4096,
+                sourceSha256: 'b'.repeat(64),
+                characterCount: 0,
+                presetCount: 0,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+
+        await expect(runNativeLosslessBackupExport(
+            { revision: 22, flushPendingData: async () => undefined },
+            { type: 'androidSaf', suggestedName: 'backup.risulossless' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'pds_export_risu_save_cleanup') return undefined
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 2048, warningCodes: [] }),
+            },
+        )).rejects.toMatchObject({ code: 'length-mismatch' })
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'pds_export_risu_save_cleanup',
+            'native_file_job_forget',
+        ])
+    })
+
     it('restores from a descriptor without sending file or database bytes through IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const statuses = [

@@ -520,6 +520,12 @@ export async function runNativeLosslessBackupExport(
                 suggestedName: destination.suggestedName,
                 signal: options.signal,
             })
+            if (published.bytes !== committedResult.sourceBytes) {
+                throw new NativeFileJobError(
+                    'length-mismatch',
+                    'Android SAF lossless backup length differs from its native source',
+                )
+            }
             const { handoffPath: _handoffPath, ...publishedResult } = committedResult
             committedResult = {
                 ...publishedResult,
