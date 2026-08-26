@@ -8,6 +8,12 @@ import {
     getPlatformBlobKeyValueBackend,
 } from './platformBlobStore'
 import { migrateLegacyAssetRepository } from './assetRepositoryMigration'
+import { migrateLegacyColdPayloads } from './coldPayloadMigration'
+import { createCompleteColdPayloadStore } from './coldPayloadRepository'
+import {
+    createRuntimeColdPayloadDispatcher,
+    selectRuntimeColdPayloadStore,
+} from './coldPayloadRuntime'
 import {
     createNativeV2BlobStore,
     createRuntimeAssetRepositoryDispatcher,
@@ -35,7 +41,7 @@ async function createLocalColdPayloadStore() {
 async function installPersistentStorage(): Promise<void> {
     const authority = getPersistentStorageAuthority()
     await authority.rawStore.open()
-    const cold = await createLocalColdPayloadStore()
+    const coldLegacy = await createLocalColdPayloadStore()
     const legacy = getLegacyBlobStore()
     const v2 = isTauri
         ? createNativeV2BlobStore({
@@ -53,12 +59,29 @@ async function installPersistentStorage(): Promise<void> {
         v2Capability: isTauri,
     }
     await selectRuntimeAssetRepository(selection)
+    const coldV2 = isTauri
+        ? createCompleteColdPayloadStore({
+            catalog: authority.rawStore,
+            cas: createNativeImmutablePayloadCas(),
+            legacy: coldLegacy,
+        })
+        : undefined
+    const coldSelection = {
+        store: authority.rawStore,
+        legacy: coldLegacy,
+        v2: coldV2,
+        v2Capability: isTauri,
+    }
+    await selectRuntimeColdPayloadStore(coldSelection)
     configureActiveBlobStore(
         authority.gate,
         createRuntimeAssetRepositoryDispatcher(selection),
     )
     configureLocalColdStorageRuntime(
-        createLocalColdStorageRuntime(createGatedColdPayloadStore(cold, authority.gate)),
+        createLocalColdStorageRuntime(createGatedColdPayloadStore(
+            createRuntimeColdPayloadDispatcher(coldSelection),
+            authority.gate,
+        )),
     )
 }
 
@@ -67,15 +90,31 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
     const authority = getPersistentStorageAuthority()
     return authority.gate.runTransition(async () => {
         const legacy = getLegacyBlobStore()
+        const coldLegacy = await createLocalColdPayloadStore()
         const cas = createNativeImmutablePayloadCas()
         const current = await authority.rawStore.readAssetRepositoryAuthority()
+        const currentCold = await authority.rawStore.readColdPayloadAuthority()
         if (current.value.format === 'preparing') {
             throw new Error('Active asset repository generation cannot be preparing')
         }
+        if (currentCold.value.format === 'preparing') {
+            throw new Error('Active cold payload generation cannot be preparing')
+        }
         if (current.value.format === 'legacy') {
+            if (currentCold.value.format !== 'legacy') {
+                throw new Error('Asset migration cannot replace an active cold payload v2 generation')
+            }
             await migrateLegacyAssetRepository({
                 store: authority.rawStore,
                 legacy,
+                cas,
+            })
+        }
+        const migratedCold = await authority.rawStore.readColdPayloadAuthority()
+        if (migratedCold.value.format === 'legacy') {
+            await migrateLegacyColdPayloads({
+                store: authority.rawStore,
+                legacy: coldLegacy,
                 cas,
             })
         }
@@ -92,12 +131,30 @@ export async function activateNativeAssetRepository(): Promise<number | null> {
             v2,
             v2Capability: true,
         }
+        const coldV2 = createCompleteColdPayloadStore({
+            catalog: authority.rawStore,
+            cas,
+            legacy: coldLegacy,
+        })
+        const coldSelection = {
+            store: authority.rawStore,
+            legacy: coldLegacy,
+            v2: coldV2,
+            v2Capability: true,
+        }
         await selectRuntimeAssetRepository(selection)
+        await selectRuntimeColdPayloadStore(coldSelection)
         configureActiveBlobStore(
             authority.gate,
             createRuntimeAssetRepositoryDispatcher(selection),
         )
-        return (await authority.rawStore.readAssetRepositoryAuthority()).revision
+        configureLocalColdStorageRuntime(
+            createLocalColdStorageRuntime(createGatedColdPayloadStore(
+                createRuntimeColdPayloadDispatcher(coldSelection),
+                authority.gate,
+            )),
+        )
+        return (await authority.rawStore.readColdPayloadAuthority()).revision
     })
 }
 
