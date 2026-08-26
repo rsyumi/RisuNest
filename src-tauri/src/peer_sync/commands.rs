@@ -827,7 +827,7 @@ impl PeerCloneCommandState {
         request: &PeerCloneTargetRequest,
     ) -> Result<PeerCloneFinalizeResult, PeerSyncError> {
         let paths = target_paths(peer_root, request)?;
-        let worker = {
+        let (worker, fail_cleanup_after_commit) = {
             let mut runtime = self.lock_runtime()?;
             let target = require_target_mut(&mut runtime, request, &paths.job_root)?;
             if target.status.phase != PeerCloneTargetPhase::AwaitingActivation {
