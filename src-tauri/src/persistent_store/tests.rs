@@ -4508,7 +4508,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        9
+        10
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),
@@ -4916,6 +4916,26 @@ fn assert_j2_v8_payload_schema(connection: &rusqlite::Connection) {
     );
 }
 
+fn assert_m4_v9_authority_schema(connection: &rusqlite::Connection, expected_rows: i64) {
+    assert_eq!(
+        table_columns(connection, "asset_repository_authority"),
+        vec![
+            ("generation".to_owned(), "TEXT".to_owned(), false, None, 1),
+            ("value".to_owned(), "TEXT".to_owned(), true, None, 0),
+        ]
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM asset_repository_authority",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count M4 authority rows"),
+        expected_rows
+    );
+}
+
 fn assert_empty_logical_schema(connection: &rusqlite::Connection) {
     const TABLES: &[&str] = &[
         "logical_generation_session_pins",
@@ -5142,23 +5162,35 @@ fn assert_logical_schema_fixture(connection: &rusqlite::Connection) {
 }
 
 #[test]
-fn fresh_schema_v9_creates_empty_logical_tables_without_changing_j2_schema() {
-    let directory = tempfile::tempdir().expect("create fresh v9 directory");
-    let store = PersistentStore::open(directory.path()).expect("open fresh v9 store");
+fn fresh_schema_v10_contains_m4_authority_and_empty_p4_logical_tables() {
+    let directory = tempfile::tempdir().expect("create fresh v10 directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v10 store");
 
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        9
+        10
     );
     assert_j2_v8_payload_schema(&store.connection);
+    assert_m4_v9_authority_schema(&store.connection, 1);
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT value FROM asset_repository_authority WHERE generation = 'revision-0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read fresh legacy authority"),
+        r#"{"format":"legacy"}"#
+    );
     assert_empty_logical_schema(&store.connection);
 }
 
 #[test]
-fn schema_v9_migrates_v8_table_only_and_preserves_j2_data() {
+fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
     let directory = tempfile::tempdir().expect("create v8 migration directory");
     let store = PersistentStore::open(directory.path()).expect("create v8 store");
     let cas_sentinel = directory
@@ -5207,6 +5239,7 @@ fn schema_v9_migrates_v8_table_only_and_preserves_j2_data() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
+            DROP TABLE asset_repository_authority;
             PRAGMA user_version = 8;
             "#,
         )
@@ -5220,16 +5253,28 @@ fn schema_v9_migrates_v8_table_only_and_preserves_j2_data() {
     );
     drop(store);
 
-    let store = PersistentStore::open(directory.path()).expect("migrate v8 store to v9");
+    let store = PersistentStore::open(directory.path()).expect("migrate v8 store to v10");
 
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        9
+        10
     );
     assert_j2_v8_payload_schema(&store.connection);
+    assert_m4_v9_authority_schema(&store.connection, 1);
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT value FROM asset_repository_authority WHERE generation = 'revision-0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read migrated legacy authority"),
+        r#"{"format":"legacy"}"#
+    );
     assert_empty_logical_schema(&store.connection);
     assert_eq!(
         store.read_root(None).expect("read preserved v8 root").value,
@@ -5311,7 +5356,7 @@ fn schema_v9_migrates_v8_table_only_and_preserves_j2_data() {
 }
 
 #[test]
-fn schema_v9_migration_collision_rolls_back_version_and_preserves_v8_rows() {
+fn schema_v10_migration_collision_preserves_completed_m4_v9_and_v8_rows() {
     let directory = tempfile::tempdir().expect("create v8 rollback directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
     store
@@ -5342,6 +5387,7 @@ fn schema_v9_migration_collision_rolls_back_version_and_preserves_v8_rows() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
+            DROP TABLE asset_repository_authority;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 8;
             "#,
@@ -5356,14 +5402,25 @@ fn schema_v9_migration_collision_rolls_back_version_and_preserves_v8_rows() {
     assert!(error.to_string().contains("logical_record_heads"));
 
     let database_path = directory.path().join("persistent/persistent.db");
-    let connection = rusqlite::Connection::open(database_path).expect("reopen rolled-back v8 db");
+    let connection = rusqlite::Connection::open(database_path).expect("reopen retained M4 v9 db");
     assert_eq!(
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read rolled-back schema version"),
-        8
+        9
     );
     assert_j2_v8_payload_schema(&connection);
+    assert_m4_v9_authority_schema(&connection, 1);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM asset_repository_authority WHERE generation = 'revision-0'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read retained M4 legacy authority"),
+        r#"{"format":"legacy"}"#
+    );
     assert_eq!(
         connection
             .query_row(
@@ -5418,13 +5475,72 @@ fn schema_v9_migration_collision_rolls_back_version_and_preserves_v8_rows() {
 }
 
 #[test]
-fn schema_v9_logical_rows_survive_snapshot_restore_and_reopen() {
-    let directory = tempfile::tempdir().expect("create v9 snapshot directory");
-    let store = PersistentStore::open(directory.path()).expect("open v9 store");
+fn schema_v10_migration_collision_rolls_back_v9_logical_ddl_only() {
+    let directory = tempfile::tempdir().expect("create M4 v9 rollback directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            r#"
+            DROP TABLE logical_generation_session_pins;
+            DROP TABLE logical_library_head;
+            DROP TABLE logical_message_page_sources;
+            DROP TABLE logical_peer_common_bases;
+            DROP TABLE logical_record_dependencies;
+            DROP TABLE logical_record_heads;
+            DROP TABLE logical_sync_generations;
+            CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
+            PRAGMA user_version = 9;
+            "#,
+        )
+        .expect("create colliding M4 v9 fixture");
+    drop(store);
+
+    let error = match PersistentStore::open(directory.path()) {
+        Ok(_) => panic!("logical table collision must fail v9 to v10 migration"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("logical_record_heads"));
+
+    let database_path = directory.path().join("persistent/persistent.db");
+    let connection = rusqlite::Connection::open(database_path).expect("reopen rolled-back v9 db");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read rolled-back M4 schema version"),
+        9
+    );
+    assert_m4_v9_authority_schema(&connection, 1);
+    assert_eq!(
+        table_columns(&connection, "logical_record_heads"),
+        vec![(
+            "collision_marker".to_owned(),
+            "TEXT".to_owned(),
+            true,
+            None,
+            0,
+        )]
+    );
+    let partial_table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table'
+               AND name IN ('logical_sync_generations', 'logical_record_dependencies')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count rolled-back logical tables");
+    assert_eq!(partial_table_count, 0);
+}
+
+#[test]
+fn schema_v10_logical_rows_survive_snapshot_restore_and_reopen() {
+    let directory = tempfile::tempdir().expect("create v10 snapshot directory");
+    let store = PersistentStore::open(directory.path()).expect("open v10 store");
     insert_logical_schema_fixture(&store.connection);
     let snapshot = store
-        .snapshot_create("logical-v9")
-        .expect("create v9 logical snapshot");
+        .snapshot_create("logical-v10")
+        .expect("create v10 logical snapshot");
     store
         .connection
         .execute_batch(
@@ -5437,21 +5553,21 @@ fn schema_v9_logical_rows_survive_snapshot_restore_and_reopen() {
         .expect("change logical rows after snapshot");
     store
         .snapshot_restore_request(Path::new(&snapshot.path))
-        .expect("request v9 logical snapshot restore");
+        .expect("request v10 logical snapshot restore");
     drop(store);
 
-    let restored = PersistentStore::open(directory.path()).expect("restore v9 snapshot on reopen");
+    let restored = PersistentStore::open(directory.path()).expect("restore v10 snapshot on reopen");
     assert_eq!(
         restored
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read restored schema version"),
-        9
+        10
     );
     assert_logical_schema_fixture(&restored.connection);
     drop(restored);
 
-    let reopened = PersistentStore::open(directory.path()).expect("reopen restored v9 store");
+    let reopened = PersistentStore::open(directory.path()).expect("reopen restored v10 store");
     assert_logical_schema_fixture(&reopened.connection);
 }
 
@@ -5475,6 +5591,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE logical_record_dependencies;
              DROP TABLE logical_record_heads;
              DROP TABLE logical_sync_generations;
+             DROP TABLE asset_repository_authority;
              PRAGMA user_version = 5;",
         )
         .expect("downgrade fixture schema marker");
@@ -5496,7 +5613,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -5635,6 +5752,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
+            DROP TABLE asset_repository_authority;
             PRAGMA user_version = 6;
             ",
         )
@@ -5646,7 +5764,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -5724,6 +5842,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             DROP TABLE logical_record_dependencies;
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
+            DROP TABLE asset_repository_authority;
             PRAGMA user_version = 7;
             "#,
         )
@@ -5746,7 +5865,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -5836,7 +5955,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 
     let snapshot_rows: i64 = store
         .connection
@@ -5977,7 +6096,7 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        9
+        10
     );
     assert_eq!(
         store
@@ -6005,7 +6124,7 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        9
+        10
     );
     assert_eq!(
         store
@@ -6046,7 +6165,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -6071,7 +6190,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -6209,7 +6328,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -6351,7 +6470,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -6497,7 +6616,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 9);
+    assert_eq!(integer_pragma("user_version"), 10);
 }
 
 #[test]
@@ -7297,7 +7416,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 10;")
+                .execute_batch("PRAGMA user_version = 11;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");

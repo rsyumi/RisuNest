@@ -2,7 +2,7 @@ use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 9;
+pub(super) const SCHEMA_VERSION: u32 = 10;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -19,15 +19,16 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => create_v9(connection),
+        0 => create_v10(connection),
         1 => migrate_v1(connection),
         2 => migrate_v2(connection),
         3 => migrate_v3(connection),
         4 => migrate_v4(connection),
         5 => migrate_v5(connection),
-        6 => migrate_v6_or_v7_to_v9(connection, true),
-        7 => migrate_v6_or_v7_to_v9(connection, false),
-        8 => migrate_v8_to_v9(connection),
+        6 => migrate_v6_or_v7_to_v10(connection, true),
+        7 => migrate_v6_or_v7_to_v10(connection, false),
+        8 => migrate_v8_to_v10(connection),
+        9 => migrate_v9_to_v10(connection),
         SCHEMA_VERSION => Ok(()),
         _ => Err(StoreError::Store {
             message: format!("unsupported persistent schema version {version}"),
@@ -35,7 +36,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     }
 }
 
-fn create_v9(connection: &mut Connection) -> StoreResult<()> {
+fn create_v10(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
         "
@@ -180,20 +181,32 @@ fn create_v9(connection: &mut Connection) -> StoreResult<()> {
         CREATE INDEX cold_aliases_generation ON cold_aliases (generation);
         ",
     )?;
-    finish_v9_migration(&transaction)?;
+    finish_v10_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn migrate_v8_to_v10(connection: &mut Connection) -> StoreResult<()> {
+    migrate_v8_to_v9(connection)?;
+    migrate_v9_to_v10(connection)
 }
 
 fn migrate_v8_to_v9(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     create_asset_repository_authority(&transaction)?;
-    finish_v9_migration(&transaction)?;
+    transaction.pragma_update(None, "user_version", 9)?;
     transaction.commit()?;
     Ok(())
 }
 
-fn finish_v9_migration(transaction: &Transaction<'_>) -> StoreResult<()> {
+fn migrate_v9_to_v10(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    finish_v10_migration(&transaction)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn finish_v10_migration(transaction: &Transaction<'_>) -> StoreResult<()> {
     logical_schema::create_logical_schema_strict(transaction).map_err(|error| {
         StoreError::Store {
             message: error.to_string(),
@@ -209,7 +222,7 @@ fn migrate_v5(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    finish_v9_migration(&transaction)?;
+    finish_v10_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -294,14 +307,6 @@ fn create_asset_repository_authority(transaction: &Transaction<'_>) -> StoreResu
     Ok(())
 }
 
-fn migrate_v8(connection: &mut Connection) -> StoreResult<()> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_asset_repository_authority(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    transaction.commit()?;
-    Ok(())
-}
-
 fn create_cold_aliases(transaction: &Transaction<'_>) -> StoreResult<()> {
     transaction.execute_batch(
         "
@@ -324,7 +329,7 @@ fn create_cold_aliases(transaction: &Transaction<'_>) -> StoreResult<()> {
     Ok(())
 }
 
-fn migrate_v6_or_v7_to_v9(
+fn migrate_v6_or_v7_to_v10(
     connection: &mut Connection,
     create_owner_heads: bool,
 ) -> StoreResult<()> {
@@ -371,7 +376,7 @@ fn migrate_v6_or_v7_to_v9(
     }
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    finish_v9_migration(&transaction)?;
+    finish_v10_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -410,7 +415,7 @@ fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    finish_v9_migration(&transaction)?;
+    finish_v10_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -435,7 +440,7 @@ fn migrate_v2(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    finish_v9_migration(&transaction)?;
+    finish_v10_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -448,7 +453,7 @@ fn migrate_v3(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    finish_v9_migration(&transaction)?;
+    finish_v10_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -461,7 +466,7 @@ fn migrate_v4(connection: &mut Connection) -> StoreResult<()> {
     create_asset_owner_heads(&transaction)?;
     create_asset_repository_authority(&transaction)?;
     create_cold_aliases(&transaction)?;
-    finish_v9_migration(&transaction)?;
+    finish_v10_migration(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
