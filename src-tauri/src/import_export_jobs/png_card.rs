@@ -364,11 +364,16 @@ pub(crate) fn parse_png_card<R: Read, F: Fn() -> bool>(
             "PNG is missing required image chunks".to_string(),
         ));
     }
-    if chara.is_none() && ccv3.is_none() {
-        return Err(PngCardError::Invalid(
-            "PNG does not contain card metadata".to_string(),
-        ));
-    }
+    let selected_card = ccv3
+        .as_deref()
+        .or(chara.as_deref())
+        .ok_or_else(|| PngCardError::Invalid("PNG does not contain card metadata".to_string()))?;
+    let selected_card = std::str::from_utf8(selected_card)
+        .map_err(|_| PngCardError::Invalid("PNG card metadata is not UTF-8".to_string()))?;
+    validate_card_metadata(selected_card, limits.max_card_metadata_bytes)?;
+
+    let chara = chara.map(|value| String::from_utf8_lossy(&value).into_owned());
+    let ccv3 = ccv3.map(|value| String::from_utf8_lossy(&value).into_owned());
 
     base_image.finish()?;
     let base_image = base_image.into_descriptor();
@@ -396,8 +401,8 @@ fn parse_text_chunk<R: Read, F: Fn() -> bool>(
     limits: PngCardLimits,
     recognized_metadata_bytes: &mut u64,
     embedded_asset_total_bytes: &mut u64,
-    chara: &mut Option<String>,
-    ccv3: &mut Option<String>,
+    chara: &mut Option<Vec<u8>>,
+    ccv3: &mut Option<Vec<u8>>,
     embedded_assets: &mut Vec<OwnedStagedPayload>,
     asset_by_reference: &mut HashMap<String, usize>,
     is_cancelled: &F,
@@ -471,9 +476,6 @@ fn parse_text_chunk<R: Read, F: Fn() -> bool>(
             is_cancelled,
         };
         copy_all(&mut chunk_reader, &mut value, is_cancelled)?;
-        let value = String::from_utf8(value)
-            .map_err(|_| PngCardError::Invalid("PNG card metadata is not UTF-8".to_string()))?;
-        validate_card_metadata(&value, limits.max_card_metadata_bytes)?;
         let slot = if keyword == b"chara" { chara } else { ccv3 };
         match slot {
             Some(existing) if existing != &value => {
@@ -546,9 +548,6 @@ fn parse_text_chunk<R: Read, F: Fn() -> bool>(
                 "conflicting duplicate PNG embedded asset {asset_reference}"
             )));
         }
-        *embedded_asset_total_bytes = embedded_asset_total_bytes
-            .checked_sub(staged.descriptor.byte_size)
-            .expect("duplicate bytes were included in the aggregate");
         return Ok(true);
     }
     asset_by_reference.insert(asset_reference, embedded_assets.len());
@@ -769,10 +768,11 @@ mod tests {
     }
 
     fn text_chunk(keyword: &str, value: &str) -> Vec<u8> {
-        chunk(
-            b"tEXt",
-            &[keyword.as_bytes(), b"\0", value.as_bytes()].concat(),
-        )
+        text_chunk_bytes(keyword, value.as_bytes())
+    }
+
+    fn text_chunk_bytes(keyword: &str, value: &[u8]) -> Vec<u8> {
+        chunk(b"tEXt", &[keyword.as_bytes(), b"\0", value].concat())
     }
 
     fn encoded_card(name: &str) -> String {
@@ -1019,6 +1019,54 @@ mod tests {
     }
 
     #[test]
+    fn validates_only_the_ccv3_selected_over_stale_chara_metadata() {
+        let ccv3 = STANDARD.encode(r#"{"spec":"chara_card_v3","data":{"name":"V3"}}"#);
+        let stale_chara_values = [
+            b"%%%".to_vec(),
+            b"rcc||rccv1||%%%||stale-hash||%%%".to_vec(),
+            vec![0xff, 0xfe],
+        ];
+
+        for stale_chara in stale_chara_values {
+            let input = png_with([
+                ihdr(),
+                chunk(b"IDAT", &[1]),
+                text_chunk_bytes("chara", &stale_chara),
+                text_chunk("ccv3", &ccv3),
+                chunk(b"IEND", &[]),
+            ]);
+            let staging = tempfile::tempdir().expect("staging directory");
+
+            let result = parse_png_card(
+                &mut Cursor::new(input),
+                staging.path(),
+                PngCardLimits::default(),
+                || false,
+            )
+            .expect("ccv3 must take semantic priority over stale chara metadata");
+
+            assert_eq!(result.ccv3.as_deref(), Some(ccv3.as_str()));
+        }
+    }
+
+    #[test]
+    fn rejects_an_invalid_selected_ccv3_instead_of_falling_back_to_chara() {
+        let input = png_with([
+            ihdr(),
+            chunk(b"IDAT", &[1]),
+            text_chunk("chara", &encoded_card("V2")),
+            text_chunk("ccv3", "%%%"),
+            chunk(b"IEND", &[]),
+        ]);
+
+        assert!(
+            assert_failure_cleans_staging(input, PngCardLimits::default())
+                .to_string()
+                .contains("invalid base64")
+        );
+    }
+
+    #[test]
     fn preserves_the_encrypted_card_envelope_for_the_existing_mapper() {
         let envelope = format!(
             "rcc||rccv1||{}||hash-placeholder||{}",
@@ -1187,6 +1235,22 @@ mod tests {
         ]);
         assert!(matches!(
             assert_failure_cleans_staging(aggregate_assets, limits),
+            PngCardError::LimitExceeded(_)
+        ));
+
+        let limits = PngCardLimits {
+            max_embedded_asset_bytes: 10,
+            max_embedded_asset_total_bytes: 8,
+            ..PngCardLimits::default()
+        };
+        let repeated_asset = text_chunk("chara-ext-asset_:same", &STANDARD.encode([1, 2, 3, 4]));
+        let duplicate_assets = card_png([
+            repeated_asset.clone(),
+            repeated_asset.clone(),
+            repeated_asset,
+        ]);
+        assert!(matches!(
+            assert_failure_cleans_staging(duplicate_assets, limits),
             PngCardError::LimitExceeded(_)
         ));
 
