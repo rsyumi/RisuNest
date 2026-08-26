@@ -950,6 +950,18 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_registry_consumes_cancel_before_registration() {
+        let registry = RegexCancellationRegistry::default();
+
+        assert!(!registry.cancel("request-a").unwrap());
+        let execution = registry.register("request-a").unwrap();
+
+        assert!(execution
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
     fn executes_ordered_rules_with_ecmascript_substitution() {
         let plan = r#"{
             "version": 1,
