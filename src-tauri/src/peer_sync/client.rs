@@ -12,6 +12,8 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -94,6 +96,8 @@ pub struct LoopbackCloneClient {
     fail_after_cas_promotion: bool,
     #[cfg(test)]
     pause_after_cas_promotion: Option<PathBuf>,
+    #[cfg(test)]
+    pause_after_verified_chunk: Option<Arc<Barrier>>,
 }
 
 struct HttpCloneTransport {
@@ -167,6 +171,8 @@ impl LoopbackCloneClient {
             fail_after_cas_promotion: false,
             #[cfg(test)]
             pause_after_cas_promotion: None,
+            #[cfg(test)]
+            pause_after_verified_chunk: None,
         })
     }
 
@@ -206,6 +212,8 @@ impl LoopbackCloneClient {
             fail_after_cas_promotion: false,
             #[cfg(test)]
             pause_after_cas_promotion: None,
+            #[cfg(test)]
+            pause_after_verified_chunk: None,
         })
     }
 
@@ -281,6 +289,11 @@ impl LoopbackCloneClient {
     #[cfg(test)]
     pub fn pause_after_cas_promotion_for_test(&mut self, marker: impl Into<PathBuf>) {
         self.pause_after_cas_promotion = Some(marker.into());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_verified_chunk_for_test(&mut self, pause: Arc<Barrier>) {
+        self.pause_after_verified_chunk = Some(pause);
     }
 
     fn fetch_manifest(&mut self) -> Result<(), PeerSyncError> {
@@ -476,6 +489,11 @@ impl LoopbackCloneClient {
             file.sync_all()?;
             self.record_object_progress(object_hash, index + 1, false)?;
             self.report_verified_progress(manifest, Some(object_hash))?;
+            #[cfg(test)]
+            if let Some(pause) = self.pause_after_verified_chunk.take() {
+                pause.wait();
+                pause.wait();
+            }
         }
 
         file.seek(SeekFrom::Start(0))?;

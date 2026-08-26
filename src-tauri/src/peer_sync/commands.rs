@@ -79,6 +79,7 @@ pub enum PeerCloneSourcePhase {
     Idle,
     Prepared,
     Running,
+    Stopping,
     Stopped,
 }
 
@@ -126,6 +127,7 @@ pub struct PeerCloneTargetRequest {
 pub enum PeerCloneTargetPhase {
     Idle,
     Downloading,
+    Cancelling,
     AwaitingActivation,
     Activating,
     Cancelled,
@@ -176,8 +178,21 @@ struct SourceRuntime {
     manifest_id: String,
     session_root: PathBuf,
     host: Option<LanCloneHost>,
-    pairing_uri: Option<String>,
     phase: PeerCloneSourcePhase,
+    stop_in_progress: bool,
+    #[cfg(test)]
+    stop_pause: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    fail_cleanup_once: bool,
+}
+
+impl Drop for SourceRuntime {
+    fn drop(&mut self) {
+        if let Some(host) = self.host.as_mut() {
+            let _ = host.stop();
+        }
+        let _ = remove_directory_if_exists(&self.session_root);
+    }
 }
 
 struct TargetRuntime {
@@ -273,8 +288,12 @@ impl PeerCloneCommandState {
             manifest_id,
             session_root,
             host: Some(LanCloneHost::prepare(prepared)),
-            pairing_uri: None,
             phase: PeerCloneSourcePhase::Prepared,
+            stop_in_progress: false,
+            #[cfg(test)]
+            stop_pause: None,
+            #[cfg(test)]
+            fail_cleanup_once: false,
         });
         source_status(&runtime)
     }
@@ -310,9 +329,10 @@ impl PeerCloneCommandState {
                 return Err(error);
             }
         };
-        source.pairing_uri = Some(pairing_uri);
         source.phase = PeerCloneSourcePhase::Running;
-        source_status(&runtime)
+        let mut status = source_status(&runtime)?;
+        status.pairing_uri = Some(pairing_uri);
+        Ok(status)
     }
 
     pub fn source_status(&self) -> Result<PeerCloneSourceStatus, PeerSyncError> {
@@ -350,26 +370,104 @@ impl PeerCloneCommandState {
     }
 
     pub fn stop_source(&self, session_id: &str) -> Result<(), PeerSyncError> {
-        let (host, session_root) = {
+        let (mut host, session_root, stop_pause, fail_cleanup) = {
             let mut runtime = self.lock_runtime()?;
             let source = require_source_mut(&mut runtime, session_id)?;
             if source.phase == PeerCloneSourcePhase::Stopped {
                 return Ok(());
             }
+            if source.stop_in_progress {
+                return Err(PeerSyncError::Protocol(
+                    "peer clone source stop is already in progress".to_owned(),
+                ));
+            }
+            source.stop_in_progress = true;
             let host = source.host.take();
-            source.pairing_uri = None;
-            source.phase = PeerCloneSourcePhase::Stopped;
-            (host, source.session_root.clone())
+            source.phase = PeerCloneSourcePhase::Stopping;
+            (
+                host,
+                source.session_root.clone(),
+                #[cfg(test)]
+                source.stop_pause.take(),
+                #[cfg(not(test))]
+                (),
+                #[cfg(test)]
+                std::mem::take(&mut source.fail_cleanup_once),
+                #[cfg(not(test))]
+                false,
+            )
         };
-        let stop = host.map(|mut host| host.stop()).transpose().map(|_| ());
-        let cleanup = remove_directory_if_exists(&session_root);
-        match (stop, cleanup) {
+        #[cfg(test)]
+        if let Some(stop_pause) = stop_pause {
+            stop_pause.wait();
+            stop_pause.wait();
+        }
+        #[cfg(not(test))]
+        let _ = stop_pause;
+        let stop = host
+            .as_mut()
+            .map(LanCloneHost::stop)
+            .transpose()
+            .map(|_| ());
+        let cleanup = if fail_cleanup {
+            Err(PeerSyncError::Storage(
+                "injected peer clone source cleanup failure".to_owned(),
+            ))
+        } else {
+            remove_directory_if_exists(&session_root)
+        };
+        let keep_host = stop.is_err();
+        let result = match (stop, cleanup) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
             (Err(stop), Err(cleanup)) => Err(PeerSyncError::Storage(format!(
                 "{stop}; peer clone source session cleanup failed: {cleanup}"
             ))),
+        };
+        let mut runtime = self.lock_runtime()?;
+        let source = require_source_mut(&mut runtime, session_id)?;
+        source.stop_in_progress = false;
+        if keep_host {
+            source.host = host;
         }
+        if result.is_ok() {
+            source.phase = PeerCloneSourcePhase::Stopped;
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn pause_source_stop_before_cleanup_for_test(
+        &self,
+        pause: Arc<std::sync::Barrier>,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let source = runtime.source.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone source session is unavailable".to_owned())
+        })?;
+        source.stop_pause = Some(pause);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_source_cleanup_once_for_test(&self) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let source = runtime.source.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone source session is unavailable".to_owned())
+        })?;
+        source.fail_cleanup_once = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn source_session_root_for_test(&self) -> Result<PathBuf, PeerSyncError> {
+        self.lock_runtime()?
+            .source
+            .as_ref()
+            .map(|source| source.session_root.clone())
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("peer clone source session is unavailable".to_owned())
+            })
     }
 
     pub fn claim_target(
@@ -449,6 +547,22 @@ impl PeerCloneCommandState {
         self.start_target_worker(peer_root, request, false)
     }
 
+    #[cfg(test)]
+    fn pause_target_after_verified_chunk_for_test(
+        &self,
+        pause: Arc<std::sync::Barrier>,
+    ) -> Result<(), PeerSyncError> {
+        let mut runtime = self.lock_runtime()?;
+        let target = runtime.target.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target job is unavailable".to_owned())
+        })?;
+        let client = target.client.as_mut().ok_or_else(|| {
+            PeerSyncError::Protocol("peer clone target client is unavailable".to_owned())
+        })?;
+        client.pause_after_verified_chunk_for_test(pause);
+        Ok(())
+    }
+
     pub fn resume_target_download(
         &self,
         peer_root: &Path,
@@ -518,9 +632,9 @@ impl PeerCloneCommandState {
     ) -> Result<(), PeerSyncError> {
         self.reap_finished_target_worker()?;
         let paths = target_paths(peer_root, &request)?;
+        let mut command_runtime = self.lock_runtime()?;
         let (mut client, cancellation) = {
-            let mut runtime = self.lock_runtime()?;
-            let target = require_target_mut(&mut runtime, &request, &paths.job_root)?;
+            let target = require_target_mut(&mut command_runtime, &request, &paths.job_root)?;
             let allowed = target.status.phase == PeerCloneTargetPhase::Idle
                 || (resume
                     && matches!(
@@ -577,7 +691,6 @@ impl PeerCloneCommandState {
             };
             finish_target_worker(&runtime, &worker_request, client, result, final_progress);
         });
-        let mut command_runtime = self.lock_runtime()?;
         let target = require_target_mut(&mut command_runtime, &request, &paths.job_root)?;
         target.worker = Some(handle);
         Ok(())
@@ -601,9 +714,17 @@ impl PeerCloneCommandState {
                     )
                 })?
                 .cancel();
+            target.status.phase = PeerCloneTargetPhase::Cancelling;
             target.worker.take()
         };
-        join_target_worker(worker)?;
+        if let Err(error) = join_target_worker(worker) {
+            let mut runtime = self.lock_runtime()?;
+            let target = require_target_request_mut(&mut runtime, request)?;
+            target.cancellation = None;
+            target.status.phase = PeerCloneTargetPhase::Failed;
+            target.status.error = Some(error.to_string());
+            return Err(error);
+        }
         let mut runtime = self.lock_runtime()?;
         let target = require_target_request_mut(&mut runtime, request)?;
         target.cancellation = None;
@@ -784,6 +905,9 @@ fn finish_target_worker(
         target.status.completed_bytes = completed_bytes;
         target.status.total_bytes = Some(total_bytes);
     }
+    if target.status.phase == PeerCloneTargetPhase::Cancelling {
+        return;
+    }
     match result {
         Ok(()) => {
             target.status.phase = PeerCloneTargetPhase::AwaitingActivation;
@@ -855,7 +979,7 @@ fn source_status(runtime: &PeerCloneRuntime) -> Result<PeerCloneSourceStatus, Pe
     Ok(PeerCloneSourceStatus {
         session_id: Some(source.session_id.clone()),
         manifest_id: Some(source.manifest_id.clone()),
-        pairing_uri: source.pairing_uri.clone(),
+        pairing_uri: None,
         phase: source.phase,
         devices,
     })
@@ -1009,13 +1133,15 @@ pub fn peer_clone_status(
     state.source_status().map_err(|error| error.to_string())
 }
 
-#[tauri::command(async)]
-pub fn peer_clone_stop(
+#[tauri::command]
+pub async fn peer_clone_stop(
     state: State<'_, PeerCloneCommandState>,
     session_id: String,
 ) -> Result<(), String> {
-    state
-        .stop_source(&session_id)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.stop_source(&session_id))
+        .await
+        .map_err(|error| format!("peer clone source stop worker failed: {error}"))?
         .map_err(|error| error.to_string())
 }
 
@@ -1066,8 +1192,8 @@ pub fn peer_clone_download(
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command(async)]
-pub fn peer_clone_resume(
+#[tauri::command]
+pub async fn peer_clone_resume(
     app: AppHandle,
     state: State<'_, PeerCloneCommandState>,
     endpoint: String,
@@ -1075,11 +1201,11 @@ pub fn peer_clone_resume(
     manifest_id: String,
 ) -> Result<(), String> {
     let (_, peer_root) = app_peer_root(&app)?;
-    state
-        .resume_target_download(
-            &peer_root,
-            target_request(endpoint, session_id, manifest_id),
-        )
+    let state = state.inner().clone();
+    let request = target_request(endpoint, session_id, manifest_id);
+    tauri::async_runtime::spawn_blocking(move || state.resume_target_download(&peer_root, request))
+        .await
+        .map_err(|error| format!("peer clone target resume worker failed: {error}"))?
         .map_err(|error| error.to_string())
 }
 
@@ -1138,7 +1264,12 @@ pub async fn peer_clone_finalize(
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::{net::Ipv4Addr, thread, time::Duration};
+    use std::{
+        net::Ipv4Addr,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     #[test]
     fn public_lan_clone_exposes_verified_production_gates() {
@@ -1233,6 +1364,7 @@ mod tests {
         let bound = source.source_bind_address().unwrap().unwrap();
         assert!(bound.ip().is_unspecified());
         let pairing = parse_product_pairing(running.pairing_uri.as_deref().unwrap());
+        assert!(source.source_status().unwrap().pairing_uri.is_none());
         assert_eq!(
             pairing.advertised_endpoint,
             format!("http://192.168.1.4:{}", bound.port())
@@ -1346,11 +1478,41 @@ mod tests {
                 &pairing.claim,
             )
             .unwrap();
+        let transfer_pause = Arc::new(Barrier::new(2));
+        target
+            .pause_target_after_verified_chunk_for_test(Arc::clone(&transfer_pause))
+            .unwrap();
         target
             .start_target_download(&peer_root, request.clone())
             .unwrap();
-        target.cancel_target(&request).unwrap();
+        transfer_pause.wait();
+        let cancel_state = target.clone();
+        let cancel_request = request.clone();
+        let cancel = thread::spawn(move || cancel_state.cancel_target(&cancel_request));
+        let cancelling = wait_for_target_phase(&target, PeerCloneTargetPhase::Cancelling);
+        assert!(cancelling.completed_bytes > 0);
+        assert!(target
+            .resume_target_download(&peer_root, request.clone())
+            .is_err());
+        let mut target_store = PersistentStore::open(target_root.path()).unwrap();
+        let target_cas = PayloadCas::new(target_root.path()).unwrap();
+        assert!(target
+            .finalize_target(&mut target_store, &target_cas, &peer_root, &request)
+            .is_err());
+        transfer_pause.wait();
+        cancel.join().unwrap().unwrap();
         wait_for_target_phase(&target, PeerCloneTargetPhase::Cancelled);
+        let credential = peer_root
+            .join("targets")
+            .join(&request.session_id)
+            .join("credential.json");
+        let ledger = peer_root
+            .join("targets")
+            .join(&request.session_id)
+            .join("transfer")
+            .join("ledger.jsonl");
+        assert!(credential.is_file());
+        let persisted_chunk = first_persisted_chunk_event(&ledger);
         drop(target);
 
         let resumed = PeerCloneCommandState::default();
@@ -1358,9 +1520,118 @@ mod tests {
             .resume_target_download(&peer_root, request.clone())
             .unwrap();
         wait_for_target_phase(&resumed, PeerCloneTargetPhase::AwaitingActivation);
+        assert_eq!(
+            persisted_chunk_event_count(&ledger, &persisted_chunk),
+            1,
+            "resume must not redownload an already verified chunk"
+        );
 
         assert_eq!(source.source_status().unwrap().devices.len(), 1);
         source.stop_source(&request.session_id).unwrap();
+    }
+
+    #[test]
+    fn product_source_stop_owns_runtime_until_shutdown_and_cleanup_finish() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let source = PeerCloneCommandState::default();
+        let prepared = source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_root.path().join("peer-sync"),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let session_id = prepared.session_id.unwrap();
+        source
+            .start_source(&session_id, Ipv4Addr::new(192, 168, 1, 4))
+            .unwrap();
+        let stop_pause = Arc::new(Barrier::new(2));
+        source
+            .pause_source_stop_before_cleanup_for_test(Arc::clone(&stop_pause))
+            .unwrap();
+
+        let stop_state = source.clone();
+        let stop_session = session_id.clone();
+        let stop = thread::spawn(move || stop_state.stop_source(&stop_session));
+        stop_pause.wait();
+        assert_eq!(
+            source.source_status().unwrap().phase,
+            PeerCloneSourcePhase::Stopping
+        );
+        assert!(source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_root.path().join("peer-sync"),
+                &NeverCancelled,
+            )
+            .is_err());
+        stop_pause.wait();
+        stop.join().unwrap().unwrap();
+        assert_eq!(
+            source.source_status().unwrap().phase,
+            PeerCloneSourcePhase::Stopped
+        );
+        assert!(!source.source_session_root_for_test().unwrap().exists());
+    }
+
+    #[test]
+    fn product_source_stop_cleanup_failure_is_retryable() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let source = PeerCloneCommandState::default();
+        let prepared = source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_root.path().join("peer-sync"),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let session_id = prepared.session_id.unwrap();
+        let session_root = source.source_session_root_for_test().unwrap();
+        source.fail_source_cleanup_once_for_test().unwrap();
+
+        assert!(source.stop_source(&session_id).is_err());
+        assert_eq!(
+            source.source_status().unwrap().phase,
+            PeerCloneSourcePhase::Stopping
+        );
+        assert!(session_root.exists());
+        source.stop_source(&session_id).unwrap();
+        assert_eq!(
+            source.source_status().unwrap().phase,
+            PeerCloneSourcePhase::Stopped
+        );
+        assert!(!session_root.exists());
+    }
+
+    #[test]
+    fn product_owned_source_runtime_cleans_up_on_drop() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source_cas = PayloadCas::new(source_root.path()).unwrap();
+        let mut source_store = PersistentStore::open(source_root.path()).unwrap();
+        seed_product_store(&mut source_store, "Source", 0);
+        let source = PeerCloneCommandState::default();
+        source
+            .prepare_source(
+                &mut source_store,
+                &source_cas,
+                &source_root.path().join("peer-sync"),
+                &NeverCancelled,
+            )
+            .unwrap();
+        let session_root = source.source_session_root_for_test().unwrap();
+
+        drop(source);
+
+        assert!(!session_root.exists());
     }
 
     fn wait_for_target_phase(
@@ -1433,7 +1704,7 @@ mod tests {
                     "loadouts": [],
                     "plugins": [],
                     "pluginCustomStorage": {},
-                    "productCloneFiller": "x".repeat(filler_bytes),
+                    "productCloneFiller": product_filler(filler_bytes),
                 }),
             )
             .unwrap();
@@ -1441,5 +1712,47 @@ mod tests {
             .replace_put_presets(&staging, &[json!({ "name": "preset" })])
             .unwrap();
         store.replace_commit(&staging, Some(0)).unwrap();
+    }
+
+    fn product_filler(bytes: usize) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut state = 0x9e37_79b9_u32;
+        let mut filler = String::with_capacity(bytes);
+        for _ in 0..bytes {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            filler.push(ALPHABET[(state as usize) % ALPHABET.len()] as char);
+        }
+        filler
+    }
+
+    fn first_persisted_chunk_event(ledger: &Path) -> (String, u64) {
+        fs::read_to_string(ledger)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find_map(|event| {
+                let next_chunk = event.get("next_chunk")?.as_u64()?;
+                (!event.get("verified")?.as_bool()? && next_chunk > 0).then(|| {
+                    (
+                        event.get("object").unwrap().as_str().unwrap().to_owned(),
+                        next_chunk,
+                    )
+                })
+            })
+            .expect("cancelled clone must retain a nonzero verified chunk")
+    }
+
+    fn persisted_chunk_event_count(ledger: &Path, expected: &(String, u64)) -> usize {
+        fs::read_to_string(ledger)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event.get("object").and_then(serde_json::Value::as_str) == Some(expected.0.as_str())
+                    && event.get("next_chunk").and_then(serde_json::Value::as_u64)
+                        == Some(expected.1)
+                    && event.get("verified").and_then(serde_json::Value::as_bool) == Some(false)
+            })
+            .count()
     }
 }
