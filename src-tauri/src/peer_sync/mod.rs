@@ -1,5 +1,6 @@
 mod client;
 mod host;
+mod lan;
 mod protocol;
 mod session;
 
@@ -15,6 +16,7 @@ pub use client::{
     LoopbackCloneClient, TransferCancellation,
 };
 pub use host::LoopbackCloneHost;
+pub use lan::{LanCloneClient, LanCloneHost, LanDevice, LanPairing};
 pub use protocol::{
     CloneDatabase, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor, VerifiedChunk,
     CLONE_CHUNK_SIZE,

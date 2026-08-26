@@ -4003,6 +4003,7 @@ dependencies = [
  "eventsource-client",
  "flate2",
  "futures",
+ "getrandom 0.2.17",
  "hex",
  "image",
  "libc",

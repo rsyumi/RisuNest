@@ -389,6 +389,166 @@ fn payload_hash(session: &PreparedCloneSession, index: usize) -> String {
     session.manifest().payloads[index].object.clone()
 }
 
+#[test]
+fn lan_host_binds_only_on_explicit_start_and_stops_completely() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    assert_eq!(host.address(), None);
+
+    let pairing = host.start().unwrap();
+    let address = host.address().unwrap();
+    assert!(address.ip().is_unspecified());
+    assert!(!pairing.claim.is_empty());
+    host.stop().unwrap();
+    assert!(TcpStream::connect(("127.0.0.1", address.port())).is_err());
+}
+
+#[test]
+fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let base = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let claim_url = format!("{base}/v1/sessions/{}/claim", pairing.session_id);
+    let client = Client::new();
+
+    assert_eq!(
+        client
+            .post(&claim_url)
+            .json(&json!({"claim": "wrong"}))
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    host.expire_claim_for_test();
+    assert_eq!(
+        client
+            .post(&claim_url)
+            .json(&json!({"claim": pairing.claim}))
+            .send()
+            .unwrap()
+            .status(),
+        410
+    );
+    host.stop().unwrap();
+
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let base = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let claim_url = format!("{base}/v1/sessions/{}/claim", pairing.session_id);
+    let claim: Value = client
+        .post(&claim_url)
+        .json(&json!({"claim": pairing.claim}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let bearer = claim["bearer"].as_str().unwrap();
+    assert_eq!(
+        client
+            .post(&claim_url)
+            .json(&json!({"claim": pairing.claim}))
+            .send()
+            .unwrap()
+            .status(),
+        410
+    );
+
+    let manifest_url = format!("{base}/v1/sessions/{}/manifest", pairing.session_id);
+    assert_eq!(client.get(&manifest_url).send().unwrap().status(), 401);
+    assert_eq!(
+        client
+            .get(&manifest_url)
+            .bearer_auth("0".repeat(32))
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(&manifest_url)
+            .bearer_auth(bearer)
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
+    let object = host.manifest().payloads[0].object.clone();
+    let object_url = format!("{base}/v1/sessions/{}/objects/{object}", pairing.session_id);
+    assert_eq!(
+        client
+            .head(&object_url)
+            .bearer_auth(bearer)
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth(bearer)
+            .header("range", "bytes=0-63")
+            .send()
+            .unwrap()
+            .status(),
+        206
+    );
+    let progress_url = format!("{base}/v1/sessions/{}/progress", pairing.session_id);
+    assert_eq!(
+        client
+            .post(&progress_url)
+            .bearer_auth(bearer)
+            .json(&json!({"verifiedBytes": 42, "currentObject": object}))
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(host.devices()[0].verified_bytes, 42);
+    let device_id = claim["deviceId"].as_str().unwrap();
+    assert!(host.revoke(device_id));
+    assert_eq!(
+        client
+            .get(&manifest_url)
+            .bearer_auth(bearer)
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    host.stop().unwrap();
+}
+
+#[test]
+fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_reads() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let client = LanCloneClient::claim(&endpoint, &pairing.session_id, &pairing.claim).unwrap();
+    assert!(!client.session_url().contains(&pairing.claim));
+    let manifest = client.fetch_manifest().unwrap();
+    assert_eq!(manifest, host.manifest().canonical_bytes().unwrap());
+    let object = host.manifest().payloads[0].object.clone();
+    assert_eq!(client.head_object(&object).unwrap(), 64);
+    assert_eq!(client.fetch_chunk(&object, 0, 63).unwrap().len(), 64);
+    client.report_progress(64, Some(&object)).unwrap();
+    assert!(host.revoke(&client.device_id));
+    assert!(
+        matches!(client.head_object(&object), Err(PeerSyncError::Transport(message)) if message.contains("403"))
+    );
+    host.stop().unwrap();
+}
+
 fn assert_file_hash(path: &Path, expected: &str) {
     let bytes = fs::read(path).unwrap();
     assert_eq!(hex::encode(Sha256::digest(bytes)), expected);
