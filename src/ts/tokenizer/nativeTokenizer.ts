@@ -10,7 +10,7 @@ export const NATIVE_TOKENIZER_FINGERPRINTS = {
         'o200k_base:dqbd-1.0.22:a2c363f80642c0f07d916716b3940ff030121f3b5cef72b2c5bd1d4f64c14fb8:tiktoken-rs-0.12.0:contract-1',
 } as const satisfies Record<NativeTokenizerId, string>
 
-// Physical Android performance evidence is required before production adoption.
+// General routing stays disabled. Measured production seams opt in explicitly.
 export const NATIVE_TOKENIZER_PRODUCTION_ENABLED = false
 
 export type ResolvedTokenizerRoute =
@@ -28,7 +28,10 @@ export type NativeTokenizeBatchResponse =
     | { mode: 'count'; artifact_fingerprint: string; counts: number[] }
     | { mode: 'ids'; artifact_fingerprint: string; ids: number[][] }
 
-type Invoke = (command: string, args: Record<string, unknown>) => Promise<unknown>
+export type NativeTokenizerInvoke = (
+    command: string,
+    args: Record<string, unknown>,
+) => Promise<unknown>
 
 export class NativeTokenizerBoundaryError extends Error {
     constructor(
@@ -84,7 +87,7 @@ export async function invokeNativeTokenizerBatch(
     route: Extract<ResolvedTokenizerRoute, { kind: 'native-tiktoken' }>,
     texts: string[],
     mode: NativeTokenizeMode,
-    invokeCommand: Invoke = invoke,
+    invokeCommand: NativeTokenizerInvoke = invoke,
 ): Promise<NativeTokenizeBatchResponse> {
     const response = (await invokeCommand('tokenize_batch', {
         request: {

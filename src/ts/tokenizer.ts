@@ -10,6 +10,8 @@ import { getModelInfo, LLMTokenizer, type LLMModel } from "./model/modellist";
 import { pluginV2 } from "./plugins/plugins.svelte";
 import type { GemmaTokenizer } from "@huggingface/transformers";
 import { LRUMap } from 'mnemonist';
+import { isTauri } from './platform';
+import { tryNativeTokenizerIdsBatch } from './tokenizer/nativeTokenizerProduction';
 
 const MAX_CACHE_SIZE = 1500;
 
@@ -496,8 +498,6 @@ export async function strongBan(data:string, bias:{[key:number]:number}) {
     if(localStorage.getItem('strongBan_' + data)){
         return JSON.parse(localStorage.getItem('strongBan_' + data))
     }
-    const performace = performance.now()
-    const length = Object.keys(bias).length
     let charAlt = [
         data,
         data.trim(),
@@ -508,37 +508,88 @@ export async function strongBan(data:string, bias:{[key:number]:number}) {
     ]
 
     let banChars = " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~“”‘’«»「」…–―※"
-    let unbanChars:number[] = []
 
-    for(const char of banChars){
-        unbanChars.push((await tokenizeNum(char))[0])
-    }
-
-
-
-    for(const char of banChars){
-        const encoded = await tokenizeNum(char)
-        if(encoded.length > 0){
-            if(!unbanChars.includes(encoded[0])){
+    const runJavaScript = async () => {
+        let unbanChars:number[] = []
+        for(const char of banChars){
+            unbanChars.push((await tokenizeNum(char))[0])
+        }
+        for(const char of banChars){
+            const encoded = await tokenizeNum(char)
+            if(encoded.length > 0 && !unbanChars.includes(encoded[0])){
                 bias[encoded[0]] = -100
             }
-        }
-        for(const alt of charAlt){
-            let fchar = char
-
-            const encoded = await tokenizeNum(alt + fchar)
-            if(encoded.length > 0){
-                if(!unbanChars.includes(encoded[0])){
+            for(const alt of charAlt){
+                const encoded = await tokenizeNum(alt + char)
+                if(encoded.length > 0 && !unbanChars.includes(encoded[0])){
                     bias[encoded[0]] = -100
                 }
-            }
-            const encoded2 = await tokenizeNum(fchar + alt)
-            if(encoded2.length > 0){
-                if(!unbanChars.includes(encoded2[0])){
+                const encoded2 = await tokenizeNum(char + alt)
+                if(encoded2.length > 0 && !unbanChars.includes(encoded2[0])){
                     bias[encoded2[0]] = -100
                 }
             }
         }
+    }
+
+    const texts:string[] = []
+    for(const char of banChars){
+        texts.push(char)
+    }
+    for(const char of banChars){
+        texts.push(char)
+        for(const alt of charAlt){
+            texts.push(alt + char, char + alt)
+        }
+    }
+
+    const db = getDatabase()
+    const modelInfo = getModelInfo(db.aiModel)
+    const modelTokenizerId = modelInfo.tokenizer === LLMTokenizer.tiktokenCl100kBase
+        ? 'cl100k_base'
+        : modelInfo.tokenizer === LLMTokenizer.tiktokenO200Base
+            ? 'o200k_base'
+            : null
+    let nativeIds:number[][]|null = null
+    try {
+        nativeIds = await tryNativeTokenizerIdsBatch(texts, {
+            isTauri,
+            aiModel: db.aiModel,
+            customTokenizer: db.customTokenizer,
+            modelTokenizerId,
+            pluginTokenizer: pluginV2.providerOptions.get(db.currentPluginProvider)?.tokenizer,
+        })
+    } catch {
+        await runJavaScript()
+        localStorage.setItem('strongBan_' + data, JSON.stringify(bias))
+        return bias
+    }
+
+    if(nativeIds){
+        let index = 0
+        const unbanChars:number[] = []
+        for(const _char of banChars){
+            unbanChars.push(nativeIds[index++][0])
+        }
+        for(const _char of banChars){
+            const encoded = nativeIds[index++]
+            if(encoded.length > 0 && !unbanChars.includes(encoded[0])){
+                bias[encoded[0]] = -100
+            }
+            for(const _alt of charAlt){
+                const encodedWithPrefix = nativeIds[index++]
+                if(encodedWithPrefix.length > 0 && !unbanChars.includes(encodedWithPrefix[0])){
+                    bias[encodedWithPrefix[0]] = -100
+                }
+                const encodedWithSuffix = nativeIds[index++]
+                if(encodedWithSuffix.length > 0 && !unbanChars.includes(encodedWithSuffix[0])){
+                    bias[encodedWithSuffix[0]] = -100
+                }
+            }
+        }
+    }
+    else {
+        await runJavaScript()
     }
     localStorage.setItem('strongBan_' + data, JSON.stringify(bias))
     return bias

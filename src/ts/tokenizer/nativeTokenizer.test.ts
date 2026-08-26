@@ -7,7 +7,7 @@ import {
 } from './nativeTokenizer'
 
 describe('native tokenizer candidate routing', () => {
-    it('keeps production disabled until physical Android evidence exists', () => {
+    it('keeps general routing disabled outside an explicitly measured production seam', () => {
         expect(NATIVE_TOKENIZER_PRODUCTION_ENABLED).toBe(false)
         expect(resolveNativeTokenizerRoute('cl100k_base', true)).toEqual({
             kind: 'existing',
