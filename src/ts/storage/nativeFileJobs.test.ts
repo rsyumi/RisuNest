@@ -202,6 +202,51 @@ describe('native file jobs', () => {
         ])
     })
 
+    it('keeps committed success when terminal acknowledgement fails', async () => {
+        const commands: string[] = []
+        const committed = {
+            revision: 9,
+            sourceBytes: 128,
+            sourceSha256: 'c'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+        }
+
+        const result = await runNativeBlockRisuSaveRestore(
+            {
+                revision: 8,
+                flushPendingData: async () => undefined,
+                refreshActiveWorkingSet: async () => undefined,
+            },
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            undefined,
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') return status('succeeded', committed)
+                    if (command === 'native_file_job_forget') {
+                        throw { code: 'store-error', message: 'terminal acknowledgement failed' }
+                    }
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result).toEqual({
+            ...committed,
+            warningCodes: ['cleanup-failed'],
+        })
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+    })
+
     it('acknowledges terminal failure even when translating it to an exception', async () => {
         const commands: string[] = []
         const failed = status('failed')

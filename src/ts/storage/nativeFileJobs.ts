@@ -154,6 +154,7 @@ export async function runNativeBlockRisuSaveRestore(
     }
 
     let outcomeFailed = false
+    let committedResult: NativeFileJobResult | undefined
     try {
         if (terminal.state === 'succeeded') {
             if (!terminal.result) {
@@ -165,13 +166,14 @@ export async function runNativeBlockRisuSaveRestore(
             catch (error) {
                 throw new NativeFileJobActivationCommittedError(terminal.result.revision, error)
             }
-            return {
+            committedResult = {
                 ...terminal.result,
                 warningCodes: [...new Set([
                     ...(started.warningCodes ?? []),
                     ...terminal.result.warningCodes,
                 ])].slice(0, 16),
             }
+            return committedResult
         }
 
         if (terminal.state === 'cancelled') throw abortError()
@@ -189,7 +191,15 @@ export async function runNativeBlockRisuSaveRestore(
             await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
         }
         catch (error) {
-            if (!outcomeFailed) throw error
+            if (committedResult) {
+                committedResult.warningCodes = [
+                    ...committedResult.warningCodes
+                        .filter((code) => code !== 'cleanup-failed')
+                        .slice(0, 15),
+                    'cleanup-failed',
+                ]
+            }
+            else if (!outcomeFailed) throw error
         }
     }
 }
