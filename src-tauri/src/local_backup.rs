@@ -1271,4 +1271,80 @@ mod tests {
         assert_eq!(error.code, LocalBackupErrorCode::Cancelled);
         assert!(output.is_empty());
     }
+
+    #[test]
+    fn writer_rejects_sources_that_change_after_preflight() {
+        struct MutatingOutput {
+            bytes: Vec<u8>,
+            source: PathBuf,
+            replacement: Vec<u8>,
+            mutated: bool,
+        }
+        impl Write for MutatingOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if !self.mutated {
+                    fs::write(&self.source, &self.replacement)?;
+                    self.mutated = true;
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for replacement in [b"".as_slice(), b"database-grew".as_slice()] {
+            let directory = tempfile::tempdir().expect("temporary sources");
+            let database = directory.path().join("database.bin");
+            fs::write(&database, b"db").expect("database source");
+            let entries = vec![file_entry("database.risudat", &database)];
+            let mut output = MutatingOutput {
+                bytes: Vec::new(),
+                source: database,
+                replacement: replacement.to_vec(),
+                mutated: false,
+            };
+
+            let error = write_legacy_local_backup_v1(&mut output, &entries, &NeverCancelled)
+                .expect_err("changed source length must fail");
+
+            assert_eq!(error.code, LocalBackupErrorCode::SourceLengthMismatch);
+        }
+    }
+
+    #[test]
+    fn writer_checks_cancellation_between_partial_destination_writes() {
+        struct CancellingOutput {
+            cancelled: Arc<AtomicBool>,
+        }
+        impl Write for CancellingOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.cancelled.store(true, Ordering::SeqCst);
+                Ok(bytes.len().min(1))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory = tempfile::tempdir().expect("temporary sources");
+        let database = directory.path().join("database.bin");
+        fs::write(&database, b"db").expect("database source");
+        let entries = vec![file_entry("database.risudat", &database)];
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut output = CancellingOutput {
+            cancelled: Arc::clone(&cancelled),
+        };
+
+        let error = write_legacy_local_backup_v1(
+            &mut output,
+            &entries,
+            &AtomicCancellation::new(cancelled),
+        )
+        .expect_err("mid-write cancellation must fail");
+
+        assert_eq!(error.code, LocalBackupErrorCode::Cancelled);
+    }
 }
