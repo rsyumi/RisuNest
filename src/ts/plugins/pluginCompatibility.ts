@@ -5,6 +5,17 @@ export interface PluginCompatibilityDescriptor {
     enabled?: boolean
 }
 
+export function assertPluginFullObjectCompatibility(
+    profile: PluginCompatibilityProfile,
+    operation: string,
+): void {
+    if (profile === 'maximum-compatibility') return
+    throw new Error(
+        `${operation} requires maximum-compatibility. Use queryCharacters, ` +
+        'queryConversations, queryConversationMessages, or the explicit complete getDatabase snapshot.',
+    )
+}
+
 export function getManualPluginInstallVersion(
     apiVersion: string,
 ): '2.1' | '3.0' | null {

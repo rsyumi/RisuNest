@@ -36,10 +36,13 @@ import {
 } from "src/ts/process/ttsHooks";
 import {
     flushPendingData,
+    getActiveConversationSession,
     getPersistentNavigationGeneration,
     materializePersistentDatabaseSnapshotWithRevision,
     replacePersistentDatabase,
 } from "src/ts/storage/persistentDataRuntime.svelte";
+import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
+import { assertPluginFullObjectCompatibility } from "../pluginCompatibility";
 import {
     createProductionPluginDatabaseAccess,
     linkPluginQueryAbortSignals,
@@ -685,6 +688,16 @@ function throwIfPluginReadAborted(signal: AbortSignal): void {
 const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
 
     const oldApis = getV2PluginAPIs();
+    const requireFullObjectAccess = (operation: string) =>
+        assertPluginFullObjectCompatibility(pluginCompatibility.profile, operation)
+    const getCompleteCurrentCharacter = () => {
+        requireFullObjectAccess('getCharacter')
+        return oldApis.getChar()
+    }
+    const setCompleteCurrentCharacter = (character: unknown) => {
+        requireFullObjectAccess('setCharacter')
+        return oldApis.setChar(character)
+    }
     const pluginLifetime = new AbortController()
     addPluginUnloadCallback(plugin.name, () => pluginLifetime.abort())
     return {
@@ -723,8 +736,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
             return oldApis.nativeFetch(url, options);
         },
-        getChar: oldApis.getChar,
-        setChar: oldApis.setChar,
+        getChar: getCompleteCurrentCharacter,
+        setChar: setCompleteCurrentCharacter,
         addProvider: (name: string, func: (arg: PluginV2ProviderArgument, abortSignal?: AbortSignal) => Promise<{ success: boolean, content: string | ReadableStream<string> }>, options?: PluginV3ProviderOptions) => {
             console.warn(`[WARN] addProvider is a powerful API that can potentially be unsafe if used incorrectly. addProvider's functionality might be limited or changed in future updates to ensure security. please use other APIs if possible.`);
             let provs = get(customProviderStore)
@@ -777,6 +790,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         },
         removeRisuReplacer: oldApis.removeRisuReplacer,
         addRisuChatListener: async (mode:'output', func:Function) => {
+            requireFullObjectAccess('addRisuChatListener')
             //permission check, lets use same as replacer
             const conf = await getPluginPermission(plugin.name, 'replacer', 'periodically');
             if(!conf){
@@ -923,6 +937,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getCharacterFromIndex: (index:number) => {
+            requireFullObjectAccess('getCharacterFromIndex')
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
@@ -932,6 +947,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return null;
         },
         setCharacterToIndex: (index:number, char:any) => {
+            requireFullObjectAccess('setCharacterToIndex')
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
@@ -940,6 +956,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
+            requireFullObjectAccess('getChatFromIndex')
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
@@ -952,6 +969,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return null;
         },
         setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
+            requireFullObjectAccess('setChatToIndex')
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
@@ -983,8 +1001,8 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return $state.snapshot(characterLore.concat(chatLore).concat(moduleLore))
         },
         //New names for character APIs, to match API naming conventions
-        getCharacter: oldApis.getChar,
-        setCharacter: oldApis.setChar,
+        getCharacter: getCompleteCurrentCharacter,
+        setCharacter: setCompleteCurrentCharacter,
 
         showContainer: (
             //more types may be added in future
@@ -1381,7 +1399,7 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             }
 
             if(message){
-                chat.message.push({
+                appendCurrentConversationMessage(char, chat, getActiveConversationSession(), {
                     role: 'user',
                     data: message,
                     time: Date.now(),

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+    assertPluginFullObjectCompatibility,
     createAwaitablePluginLoaderSource,
     createFullCompatibilityPersistence,
     createPluginCompatibilityController,
@@ -36,6 +37,18 @@ describe('manual plugin installation compatibility', () => {
 })
 
 describe('plugin compatibility profiles', () => {
+    it('rejects legacy full-object plugin access in the scalable profile', () => {
+        expect(() => assertPluginFullObjectCompatibility(
+            'scalable-v3',
+            'getCharacter',
+        )).toThrow(/getCharacter.*maximum-compatibility.*queryCharacters/i)
+
+        expect(() => assertPluginFullObjectCompatibility(
+            'maximum-compatibility',
+            'getCharacter',
+        )).not.toThrow()
+    })
+
     it('selects scalable mode unless an enabled API v2.1 plugin exists', () => {
         expect(selectPluginCompatibilityProfile([])).toBe('scalable-v3')
         expect(selectPluginCompatibilityProfile([{ version: '3.0', enabled: true }])).toBe(
