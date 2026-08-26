@@ -1347,6 +1347,55 @@ mod tests {
     }
 
     #[test]
+    fn projected_publication_validates_the_pinned_account_during_root_projection() {
+        let (_directory, store, _revision, lease) = fixture();
+        let (connection, target) = store.read_view(Some(&lease)).unwrap();
+
+        let mismatch = create_projected_controlled_for_account(
+            connection,
+            &store.snapshots_dir,
+            &target,
+            &lease,
+            "different-account",
+            &HashMap::new(),
+            || false,
+            |_, _, _| {},
+        )
+        .expect_err("reject a mismatched pinned account");
+        assert!(matches!(mismatch, StoreError::Validation { .. }));
+
+        let (_directory, mut store, _revision, lease) = fixture();
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(
+                &staging,
+                &json!({
+                    "account": { "id": "account-1", "token": "not-pinned" },
+                    "customBackground": "old"
+                }),
+            )
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        let revision = store.replace_commit(&staging, None).unwrap().revision;
+        let lease = store.acquire_revision(revision).unwrap().lease;
+        let (connection, target) = store.read_view(Some(&lease)).unwrap();
+        let exported = create_projected_controlled_for_account(
+            connection,
+            &store.snapshots_dir,
+            &target,
+            &lease,
+            "account-1",
+            &HashMap::from([("old".to_owned(), "new".to_owned())]),
+            || false,
+            |_, _, _| {},
+        )
+        .unwrap();
+        let blocks = read_blocks(Path::new(&exported.path));
+        assert_eq!(blocks[0].value["account"]["token"], "not-pinned");
+        assert_eq!(blocks[0].value["customBackground"], "new");
+    }
+
+    #[test]
     fn exports_current_framing_and_configured_trash_order_from_a_lease() {
         let (_directory, store, _revision, lease) = fixture();
 

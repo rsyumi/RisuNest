@@ -2568,6 +2568,7 @@ mod tests {
             warning_codes: Vec::new(),
             handoff_path: None,
             recovery_path: None,
+            publication: None,
         }
     }
 
@@ -2644,6 +2645,111 @@ mod tests {
         assert_eq!(job.status().phase, JobPhase::ActivatingDatabase);
         assert_eq!(job.request_cancel().unwrap(), CancelOutcome::TooLate);
         job.finish_success(result(5)).unwrap();
+    }
+
+    fn publication_retry(account_id: &str, token: &str) -> OfficialPublicationRetryRequest {
+        OfficialPublicationRetryRequest {
+            job_id: String::new(),
+            account_id: account_id.to_owned(),
+            session: Some("fresh-session".to_owned()),
+            save_date: "fresh-date".to_owned(),
+            credential: OfficialPublicationCredential::RisuAuth {
+                token: token.to_owned(),
+            },
+        }
+    }
+
+    fn reauthentication(account_id: &str) -> OfficialPublicationAttemptResult {
+        OfficialPublicationAttemptResult::ReauthenticationNeeded {
+            account_id: account_id.to_owned(),
+            session: Some("stale-session".to_owned()),
+            save_date: "stale-date".to_owned(),
+            status: 403,
+        }
+    }
+
+    #[test]
+    fn official_publication_retry_resumes_the_same_waiting_job_with_private_input() {
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::OfficialPublicationUpload)
+            .unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
+        job.set_phase(JobPhase::UploadingDatabase).unwrap();
+        let worker = Arc::clone(&job);
+        let waiting = thread::spawn(move || {
+            worker.wait_for_official_publication_retry(reauthentication("account-1"))
+        });
+
+        for _ in 0..100 {
+            if job.status().state == JobState::WaitingForInput {
+                break;
+            }
+            thread::yield_now();
+        }
+        let mut retry = publication_retry("account-1", "fresh-secret");
+        retry.job_id = job.id();
+        assert_eq!(registry.retry_official_publication(retry), Ok(()));
+        let resumed = waiting.join().unwrap().unwrap();
+        assert_eq!(resumed.session.as_deref(), Some("fresh-session"));
+        assert_eq!(
+            resumed.credential,
+            OfficialPublicationCredential::RisuAuth {
+                token: "fresh-secret".to_owned()
+            }
+        );
+        let status = job.status();
+        assert_eq!(status.state, JobState::Running);
+        assert_eq!(status.phase, JobPhase::UploadingDatabase);
+        assert!(status.publication_attempt.is_none());
+    }
+
+    #[test]
+    fn cancellation_clears_publication_retry_and_wakes_the_waiter_without_lost_wakeup() {
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::OfficialPublicationUpload)
+            .unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
+        job.set_phase(JobPhase::UploadingDatabase).unwrap();
+        let worker = Arc::clone(&job);
+        let waiting = thread::spawn(move || {
+            worker.wait_for_official_publication_retry(reauthentication("account-1"))
+        });
+
+        for _ in 0..100 {
+            if job.status().state == JobState::WaitingForInput {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
+        let error = waiting.join().unwrap().expect_err("cancel waiting retry");
+        assert_eq!(error.code, "cancelled");
+    }
+
+    #[test]
+    fn terminal_publication_response_wins_a_racing_cancel_and_stays_durable() {
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::OfficialPublicationUpload)
+            .unwrap();
+        job.start(JobPhase::WritingExport).unwrap();
+        job.set_phase(JobPhase::UploadingDatabase).unwrap();
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
+        job.begin_official_publication_finalization().unwrap();
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::TooLate);
+        let mut summary = result(7);
+        summary.publication = Some(OfficialPublicationAttemptResult::NotModified {
+            account_id: "account-1".to_owned(),
+            session: Some("session".to_owned()),
+            save_date: "date".to_owned(),
+            status: 304,
+            replacement_key: "database/database.bin".to_owned(),
+        });
+        job.finish_official_publication_success(summary).unwrap();
+        assert_eq!(job.status().state, JobState::Succeeded);
+        assert!(job.status().result.unwrap().publication.is_some());
     }
 
     fn write_literal_spool(root: &Path, token: &str, manifest: &str, created_at_millis: u64) {

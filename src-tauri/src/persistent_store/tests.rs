@@ -2063,6 +2063,37 @@ fn native_export_lease_retains_its_asset_alias_generation() {
         .expect("cleanup native export");
 }
 
+#[cfg(feature = "native-official-publication")]
+#[test]
+fn official_publication_transfers_only_the_exact_expected_revision_lease() {
+    let (_directory, mut store, _) = open_fixture();
+    let lease = store
+        .acquire_revision(1)
+        .expect("acquire publication lease")
+        .lease;
+
+    let mismatch = store
+        .prepare_official_publication(&lease, 2)
+        .expect_err("reject revision mismatch");
+    assert!(matches!(mismatch, StoreError::RevisionConflict { .. }));
+    assert_eq!(
+        store
+            .read_root(Some(&lease))
+            .expect("mismatch keeps attached lease")
+            .revision,
+        1
+    );
+
+    let prepared = store
+        .prepare_official_publication(&lease, 1)
+        .expect("transfer exact lease");
+    assert!(matches!(
+        store.read_root(Some(&lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    drop(prepared);
+}
+
 #[test]
 fn preset_catalog_reads_and_materializes_in_configured_order() {
     let (_directory, mut store, database) = open_fixture();
