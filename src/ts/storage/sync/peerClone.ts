@@ -276,10 +276,12 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     let targetIdentityEpoch = 0
     let warning = ''
     let ownedTarget: { endpoint: string; sessionId: string; manifestId: string } | undefined
+    let claimOwned = false
     let pendingRefresh: {
         request: { endpoint: string; sessionId: string; manifestId: string }
         revision: number
         fence: Awaited<ReturnType<PeerCloneReplacementRuntime['acquireDestructiveReplacementFence']>>
+        rendererRefreshed: boolean
     } | undefined
     const supported = () => options.platform === 'desktop' || unsupported(options.platform)
     const targetArgs = () => {
@@ -312,6 +314,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             const runtime = replacementRuntime()
             let fence = pendingRefresh?.fence
             let revision = pendingRefresh?.revision
+            let rendererRefreshed = pendingRefresh?.rendererRefreshed ?? false
             let nativeStarted = revision !== undefined
             try {
                 if (pendingRefresh && !sameTargetRequest(pendingRefresh.request, request)) {
@@ -326,15 +329,21 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                     const result = await nativeInvoke<{ revision: number; warning?: string }>('peer_clone_finalize', request)
                     revision = result.revision
                     warning = result.warning ?? ''
-                    pendingRefresh = { request, revision, fence }
+                    pendingRefresh = { request, revision, fence, rendererRefreshed: false }
                 }
-                await fence.refreshCommittedWorkingSet(revision)
+                if (!rendererRefreshed) {
+                    await fence.refreshCommittedWorkingSet(revision)
+                    rendererRefreshed = true
+                    if (pendingRefresh) pendingRefresh.rendererRefreshed = true
+                }
+                await nativeInvoke('peer_clone_release_target', request)
                 pendingRefresh = undefined
                 fence.release()
                 fence = undefined
                 const completed = { ...awaiting, phase: 'completed' as const }
                 state = reducePeerCloneState(state, { type: 'target-completed' })
                 ownedTarget = undefined
+                claimOwned = false
                 return completed
             } catch (error) {
                 if (nativeStarted && !pendingRefresh) {
@@ -442,13 +451,23 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 manifestId: pairing.manifestId,
             })
             const pairingClaim = pairing.claim
-            await requireTargetReady()
-            await nativeInvoke('peer_clone_claim_client', {
-                ...args,
-                claim: pairingClaim,
-            })
-            await nativeInvoke('peer_clone_download', args)
-            state = reducePeerCloneState(state, { type: 'target-resumed' })
+            try {
+                await requireTargetReady()
+                if (!claimOwned) {
+                    await nativeInvoke('peer_clone_claim_client', {
+                        ...args,
+                        claim: pairingClaim,
+                    })
+                    claimOwned = true
+                }
+                await nativeInvoke('peer_clone_download', args)
+                state = reducePeerCloneState(state, { type: 'target-resumed' })
+            } catch (error) {
+                state = claimOwned
+                    ? reducePeerCloneState(state, { type: 'target-failed' })
+                    : reducePeerCloneState(state, { type: 'target-joined', pairing })
+                throw error
+            }
         },
         async resume(): Promise<void> {
             supported()
@@ -497,7 +516,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 state = reducePeerCloneState(state, { type: 'target-cancelled' })
             } else if (result.phase === 'completed') {
                 state = reducePeerCloneState(state, { type: 'target-completed' })
-                ownedTarget = undefined
             } else if (result.phase === 'failed') {
                 state = reducePeerCloneState(state, { type: 'target-failed' })
             }

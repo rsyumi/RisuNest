@@ -819,6 +819,31 @@ impl PeerCloneCommandState {
         Ok(target.status.clone())
     }
 
+    pub fn release_target(&self, request: &PeerCloneTargetRequest) -> Result<(), PeerSyncError> {
+        self.reap_finished_target_worker()?;
+        let mut runtime = self.lock_runtime()?;
+        let Some(target) = runtime.target.as_ref() else {
+            return Ok(());
+        };
+        if &target.request != request {
+            return Err(PeerSyncError::Protocol(
+                "peer clone target request does not own the active job".to_owned(),
+            ));
+        }
+        if target.status.phase != PeerCloneTargetPhase::Completed {
+            return Err(PeerSyncError::Protocol(
+                "peer clone target is not ready for release".to_owned(),
+            ));
+        }
+        if target.worker.is_some() {
+            return Err(PeerSyncError::Protocol(
+                "peer clone target worker is still active".to_owned(),
+            ));
+        }
+        runtime.target = None;
+        Ok(())
+    }
+
     pub fn finalize_target(
         &self,
         store: &mut PersistentStore,
@@ -1326,6 +1351,18 @@ pub fn peer_clone_target_status(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command(async)]
+pub fn peer_clone_release_target(
+    state: State<'_, PeerCloneCommandState>,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+) -> Result<(), String> {
+    state
+        .release_target(&target_request(endpoint, session_id, manifest_id))
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn peer_clone_finalize(
     app: AppHandle,
@@ -1496,6 +1533,7 @@ mod tests {
             .unwrap();
         let downloaded = wait_for_target_phase(&target, PeerCloneTargetPhase::AwaitingActivation);
         assert_eq!(downloaded.completed_bytes, downloaded.total_bytes.unwrap());
+        assert!(target.release_target(&request).is_err());
         let device_id = source.source_status().unwrap().devices[0].device_id.clone();
         source
             .revoke_source_device(&request.session_id, &device_id)
@@ -1534,6 +1572,9 @@ mod tests {
             target_store.read_root(None).unwrap().value["username"],
             "Source"
         );
+        target.release_target(&request).unwrap();
+        target.release_target(&request).unwrap();
+        assert!(target.target_status(&request).is_err());
     }
 
     #[test]

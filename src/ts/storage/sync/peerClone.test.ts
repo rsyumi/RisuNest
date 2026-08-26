@@ -7,7 +7,7 @@ import {
     parsePeerCloneUri,
     reducePeerCloneState,
 } from './peerClone'
-import type { PeerCloneInvoke } from './peerClone'
+import type { PeerCloneInvoke, PeerCloneReplacementRuntime } from './peerClone'
 
 const claim = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 const pairingUri = `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`
@@ -112,6 +112,7 @@ describe('PeerClone facade', () => {
         await expect(facade.prepare()).rejects.toThrow('not enabled')
         await expect(facade.start('source-session')).rejects.toThrow('not enabled')
         await expect(facade.download()).rejects.toThrow('not enabled')
+        facade.confirmDestructiveReplace()
         await expect(facade.resume()).rejects.toThrow('not enabled')
 
         expect(invoke.mock.calls).toEqual([
@@ -259,6 +260,10 @@ describe('PeerClone facade', () => {
                 finalized = true
                 return { revision: 42 } as T
             }
+            if (command === 'peer_clone_release_target') {
+                events.push('native-release')
+                return undefined as T
+            }
             return undefined as T
         })
         const facade = createPeerCloneFacade({
@@ -297,6 +302,7 @@ describe('PeerClone facade', () => {
             'acquire:41:7',
             'finalize',
             'refresh:42',
+            'native-release',
             'release',
         ])
         expect(facade.getState().target).toMatchObject({
@@ -434,6 +440,48 @@ describe('PeerClone facade', () => {
         await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
         expect(events).toEqual(['capture', 'acquire', 'finalize', 'refresh:42', 'refresh:42', 'release'])
         expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_finalize')).toHaveLength(1)
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_release_target')).toHaveLength(1)
+    })
+
+    it('retains the completed native target until release succeeds after one renderer refresh', async () => {
+        let finalized = false
+        let releaseAttempt = 0
+        const refresh = vi.fn(async (_revision: number) => undefined)
+        const fenceRelease = vi.fn()
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_target_status') {
+                return {
+                    phase: finalized ? 'completed' : 'awaitingActivation',
+                    completedBytes: 10,
+                    totalBytes: 10,
+                } as T
+            }
+            if (command === 'peer_clone_finalize') {
+                finalized = true
+                return { revision: 42 } as T
+            }
+            if (command === 'peer_clone_release_target' && releaseAttempt++ === 0) {
+                throw new Error('native release failed')
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(refresh, fenceRelease),
+        })
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+
+        await expect(facade.targetStatus()).rejects.toThrow('native release failed')
+        expect(facade.getState().target.phase).not.toBe('completed')
+        expect(fenceRelease).not.toHaveBeenCalled()
+        await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
+
+        expect(refresh).toHaveBeenCalledTimes(1)
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_finalize')).toHaveLength(1)
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_release_target')).toHaveLength(2)
+        expect(fenceRelease).toHaveBeenCalledTimes(1)
     })
 
     it('captures target identity before the asynchronous finalize handshake', async () => {
@@ -555,6 +603,94 @@ describe('PeerClone facade', () => {
         })
     })
 
+    it.each(['capabilities', 'claim', 'download'] as const)(
+        'keeps the same target retryable when the initial %s step fails',
+        async (failure) => {
+            let failed = false
+            const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+                const failingCommand = failure === 'capabilities'
+                    ? 'peer_clone_capabilities'
+                    : failure === 'claim'
+                        ? 'peer_clone_claim_client'
+                        : 'peer_clone_download'
+                if (command === failingCommand && !failed) {
+                    failed = true
+                    throw new Error(`${failure} failed`)
+                }
+                if (command === 'peer_clone_capabilities') return productionCapabilities() as T
+                return undefined as T
+            })
+            const facade = createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: replacementRuntime(),
+            })
+            facade.join(pairingUri)
+            facade.confirmDestructiveReplace()
+
+            await expect(facade.download()).rejects.toThrow(`${failure} failed`)
+            expect(() => facade.join(pairingUri.replace(
+                '123e4567-e89b-12d3-a456-426614174000',
+                '223e4567-e89b-42d3-a456-426614174000',
+            ))).toThrow('already owned')
+
+            if (failure === 'download') {
+                expect(facade.getState().target.phase).toBe('failed')
+                await facade.resume()
+            } else {
+                expect(facade.getState().target.phase).toBe('joined')
+                facade.confirmDestructiveReplace()
+                await facade.download()
+            }
+
+            expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_claim_client')).toHaveLength(
+                failure === 'capabilities' ? 1 : failure === 'claim' ? 2 : 1,
+            )
+            expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_download')).toHaveLength(1)
+            expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_resume')).toHaveLength(
+                failure === 'download' ? 1 : 0,
+            )
+            expect(facade.getState().target.phase).toBe('downloading')
+        },
+    )
+
+    it('allows a different target only after committed refresh and native release complete', async () => {
+        const events: string[] = []
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+            if (command === 'peer_clone_target_status') {
+                return { phase: 'awaitingActivation', completedBytes: 10, totalBytes: 10 } as T
+            }
+            if (command === 'peer_clone_finalize') return { revision: 42 } as T
+            if (command === 'peer_clone_release_target') events.push(`native-release:${String(args?.sessionId)}`)
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(
+                async () => { events.push('refresh') },
+                () => { events.push('fence-release') },
+            ),
+        })
+        const other = pairingUri.replace(
+            '123e4567-e89b-12d3-a456-426614174000',
+            '223e4567-e89b-42d3-a456-426614174000',
+        )
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+
+        await facade.targetStatus()
+        expect(events).toEqual([
+            'refresh',
+            'native-release:123e4567-e89b-12d3-a456-426614174000',
+            'fence-release',
+        ])
+        expect(facade.join(other).target).toMatchObject({
+            phase: 'joined',
+            pairing: { sessionId: '223e4567-e89b-42d3-a456-426614174000' },
+        })
+    })
+
     it('discards a stale target status response after a different unowned pairing joins', async () => {
         let resolveStatus: ((value: unknown) => void) | undefined
         const status = new Promise((resolve) => {
@@ -668,13 +804,16 @@ function productionCapabilities() {
     }
 }
 
-function replacementRuntime() {
+function replacementRuntime(
+    refreshCommittedWorkingSet: (revision: number) => Promise<void> = vi.fn(async (_revision: number) => undefined),
+    release: () => void = vi.fn(),
+): PeerCloneReplacementRuntime {
     return {
         flushPendingData: vi.fn(async () => undefined),
         capturePersistentMutationToken: vi.fn(async () => ({ revision: 1, mutationGeneration: 0 })),
         acquireDestructiveReplacementFence: vi.fn(async () => ({
-            refreshCommittedWorkingSet: vi.fn(async () => undefined),
-            release: vi.fn(),
+            refreshCommittedWorkingSet,
+            release,
         })),
     }
 }

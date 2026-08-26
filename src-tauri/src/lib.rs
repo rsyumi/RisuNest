@@ -541,6 +541,8 @@ pub fn run() {
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_target_status,
             #[cfg(desktop)]
+            peer_sync::commands::peer_clone_release_target,
+            #[cfg(desktop)]
             peer_sync::commands::peer_clone_finalize,
             oauth_login,
             native_tokenizer::tokenize_batch,
