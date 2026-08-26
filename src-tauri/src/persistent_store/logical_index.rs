@@ -1386,12 +1386,12 @@ fn project_character_by_id(
     let Some((configured_index, raw)) = row else {
         return Ok(false);
     };
-    let owner_heads = validate_owner_heads(
+    let mut owner_heads = validate_owner_heads(
         cas,
         load_owner_heads(transaction, &logical.pds_generation, Some(character_id))?,
     )?;
     let mut detail: Value = serde_json::from_str(&raw)?;
-    strip_character_owner_property(&mut detail, character_id, &owner_heads)?;
+    strip_character_owner_property(&mut detail, character_id, &mut owner_heads)?;
     let dependencies = owner_dependencies(&owner_heads)?;
     insert_live_record(
         transaction,
@@ -2771,7 +2771,7 @@ fn project_tombstones(
     Ok(())
 }
 
-fn scan_compact_manifest(
+pub(super) fn scan_compact_manifest(
     connection: &Connection,
     library_id: &str,
     generation_id: &str,

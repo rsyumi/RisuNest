@@ -376,7 +376,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
     }
 
     fn load_common_base_manifest(&self, base: &PeerBase) -> Result<LogicalManifest, PeerSyncError> {
-        let mut reader = self.cas.open_object(&base.manifest_hash)?.ok_or_else(|| {
+        let reader = self.cas.open_object(&base.manifest_hash)?.ok_or_else(|| {
             PeerSyncError::Validation(
                 "logical delta durable common-base manifest is absent from CAS".to_owned(),
             )
@@ -1302,6 +1302,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                 if expected_local_revision != original_revision {
                     return validation("logical delta retry revision differs from its stage");
                 }
+                let remote_base = self.remote_base();
                 let transaction = self
                     .store
                     .connection
@@ -1311,7 +1312,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                 let actual_base = common_base(&transaction, &self.peer_id, &self.library_id)?;
                 let active = active_generation(&transaction).map_err(storage_error)?;
                 if actual_revision != *revision
-                    || actual_base.as_ref() != Some(&self.remote_base())
+                    || actual_base.as_ref() != Some(&remote_base)
                     || !current_logical_head_matches(
                         &transaction,
                         &self.library_id,
