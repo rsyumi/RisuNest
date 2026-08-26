@@ -105,6 +105,7 @@
     "ws": "^8.18.3"
   },
   "devDependencies": {
+    "@eslint-community/regexpp": "4.12.2",
     "@rollup/plugin-strip": "^3.0.4",
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@swc/core": "1.5.7",
