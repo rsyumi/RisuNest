@@ -43,7 +43,11 @@ $env:CARGO_TARGET_DIR = 'E:\Programming\Github\RisuNest\.worktrees\_cargo-target
 pnpm benchmark:tokenizer:tauri -- --output "$env:CARGO_TARGET_DIR\k2-tokenizer-windows.json"
 ```
 
-The runner builds an isolated release Tauri app, executes the checked-in parity corpus through the real `tokenize_batch` IPC command, and compares warm JavaScript and native end-to-end timing for both encodings and both result modes. The isolated profile is removed after the run unless `--keep-profile` is supplied.
+The runner builds an isolated release Tauri app with `VITE_TOKENIZER_BENCHMARK=true`. That flag installs a narrow WebView-only benchmark seam. The seam proves the JavaScript implementation against the checked-in corpus, executes the same corpus through the real `tokenize_batch` IPC command, and times both implementations inside the same release WebView.
+
+Each implementation receives one untimed warm-up for every fixture and mode. Count results are `number[]` on both paths. ID results are `Uint32Array[]` on both paths, and the native IPC array conversion is included in its measured interval. The Node CDP driver is not timed. WebView garbage collection and heap samples bracket each implementation separately.
+
+The runner owns the Tauri build and app process trees. Normal completion, failure, SIGINT, and SIGTERM stop owned processes and remove the isolated profile unless a normally completed run explicitly uses `--keep-profile`.
 
 The runner does not access live RisuRealm or live account services.
 

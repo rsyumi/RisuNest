@@ -6,10 +6,6 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { performance } from 'node:perf_hooks'
-import { Tiktoken } from '@dqbd/tiktoken'
-import cl100kBase from '@dqbd/tiktoken/encoders/cl100k_base.json' with { type: 'json' }
-import o200kBase from '../../src/etc/o200k_base.json' with { type: 'json' }
 import corpus from '../../src/ts/tokenizer/nativeTokenizerCorpus.json' with { type: 'json' }
 
 const CDP_HOST = '127.0.0.1'
@@ -183,6 +179,7 @@ async function runCommand(command, args, options) {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
     })
+    options.onSpawn?.(child)
     child.stdout.on('data', (chunk) => process.stderr.write(chunk))
     child.stderr.on('data', (chunk) => process.stderr.write(chunk))
     const [exitCode] = await once(child, 'exit')
@@ -236,8 +233,40 @@ async function waitForInvoke(page, timeoutMs) {
     throw new Error('Tauri invoke did not become available')
 }
 
+async function waitForBenchmarkSeam(page, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+        if (await evaluate(page, 'Boolean(globalThis.__RISUNEST_TOKENIZER_BENCHMARK__)')) return
+        await delay(100)
+    }
+    throw new Error('Tokenizer benchmark WebView seam did not become available')
+}
+
 function delay(milliseconds) {
     return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+export function installSignalCleanup(processLike, cleanup, exit) {
+    let handlingSignal = false
+    const remove = () => {
+        processLike.removeListener('SIGINT', handleSigint)
+        processLike.removeListener('SIGTERM', handleSigterm)
+    }
+    const handle = (signal) => {
+        if (handlingSignal) return
+        handlingSignal = true
+        remove()
+        const exitCode = signal === 'SIGINT' ? 130 : 143
+        void Promise.resolve()
+            .then(cleanup)
+            .catch((error) => process.stderr.write(`Signal cleanup failed: ${error.stack ?? error}${os.EOL}`))
+            .finally(() => exit(exitCode))
+    }
+    const handleSigint = () => handle('SIGINT')
+    const handleSigterm = () => handle('SIGTERM')
+    processLike.once('SIGINT', handleSigint)
+    processLike.once('SIGTERM', handleSigterm)
+    return remove
 }
 
 function resolveCorpusInput(input) {
@@ -248,23 +277,12 @@ function resolveCorpusInput(input) {
     return input.value.repeat(input.count)
 }
 
-function createOracle(tokenizerId) {
-    const artifact = tokenizerId === 'cl100k_base' ? cl100kBase : o200kBase
-    const startedAt = performance.now()
-    const tokenizer = new Tiktoken(artifact.bpe_ranks, artifact.special_tokens, artifact.pat_str)
-    return { tokenizer, initializationMs: performance.now() - startedAt }
+function benchmarkSeamExpression(method, argumentsList) {
+    return `globalThis.__RISUNEST_TOKENIZER_BENCHMARK__.${method}(...${JSON.stringify(argumentsList)})`
 }
 
-function oracleResponse(tokenizer, tokenizerId, mode, texts) {
-    const encoded = texts.map((text) => Array.from(tokenizer.encode(text)))
-    if (mode === 'count') {
-        return {
-            mode,
-            artifact_fingerprint: FINGERPRINTS[tokenizerId],
-            counts: encoded.map((ids) => ids.length),
-        }
-    }
-    return { mode, artifact_fingerprint: FINGERPRINTS[tokenizerId], ids: encoded }
+function callBenchmarkSeam(page, method, ...argumentsList) {
+    return evaluate(page, benchmarkSeamExpression(method, argumentsList))
 }
 
 function nativeExpression(request) {
@@ -372,46 +390,43 @@ function benchmarkFixtures() {
     ]
 }
 
-function measureJavaScript(tokenizer, tokenizerId, mode, texts, samples) {
-    const durations = []
-    let expected
-    for (let sample = 0; sample < samples; sample++) {
-        const startedAt = performance.now()
-        expected = oracleResponse(tokenizer, tokenizerId, mode, texts)
-        durations.push(performance.now() - startedAt)
-    }
-    return { timing: summarizeDurations(durations), expected }
+async function collectWebViewGarbage(page) {
+    await page.call('HeapProfiler.collectGarbage')
 }
 
-async function measureNative(page, request, expected, samples) {
-    const durations = []
-    let responseBytes = 0
-    for (let sample = 0; sample < samples; sample++) {
-        const response = await invokeNative(page, request)
-        if (!response.ok) throw new Error(`Native benchmark failed: ${JSON.stringify(response.error)}`)
-        assertEqual(response.result, expected, 'native benchmark result')
-        durations.push(response.durationMs)
-        responseBytes = Buffer.byteLength(JSON.stringify(response.result))
-    }
+async function getWebViewHeap(page) {
+    const heap = await page.call('Runtime.getHeapUsage')
+    return { usedBytes: heap.usedSize, totalBytes: heap.totalSize }
+}
+
+async function measureWebViewImplementation(page, implementation, request, samples) {
+    await collectWebViewGarbage(page)
+    const heapBefore = await getWebViewHeap(page)
+    const measurement = await callBenchmarkSeam(page, 'measure', implementation, request, samples)
+    await collectWebViewGarbage(page)
+    const heapAfter = await getWebViewHeap(page)
     return {
-        timing: summarizeDurations(durations),
-        transferredBytes: Buffer.byteLength(JSON.stringify(request)) + responseBytes,
+        timing: summarizeDurations(measurement.durationsMs),
+        result: measurement.result,
+        heap: {
+            beforeUsedBytes: heapBefore.usedBytes,
+            afterUsedBytes: heapAfter.usedBytes,
+            deltaUsedBytes: heapAfter.usedBytes - heapBefore.usedBytes,
+            beforeTotalBytes: heapBefore.totalBytes,
+            afterTotalBytes: heapAfter.totalBytes,
+        },
     }
 }
 
-async function stopProcess(child) {
+async function stopOwnedProcessTree(child) {
     if (!child || child.exitCode !== null) return
-    child.kill()
-    const exited = await Promise.race([
-        once(child, 'exit').then(() => true),
-        delay(5_000).then(() => false),
-    ])
-    if (exited || child.exitCode !== null) return
     const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
         windowsHide: true,
         stdio: 'ignore',
     })
     await once(killer, 'exit')
+    if (child.exitCode !== null) return
+    await Promise.race([once(child, 'exit'), delay(5_000)])
 }
 
 function assertSafeTemporaryDirectory(directory) {
@@ -430,8 +445,32 @@ async function runBenchmark(options) {
     const isolatedRoaming = path.join(temporaryRoot, 'roaming')
     const isolatedLocal = path.join(temporaryRoot, 'local')
     const port = await getFreePort()
+    let buildProcess
     let appProcess
     let page
+    let cleanupPromise
+
+    const cleanupOwnedResources = (removeProfile) => {
+        cleanupPromise ??= (async () => {
+            page?.close()
+            await Promise.all([
+                stopOwnedProcessTree(buildProcess),
+                stopOwnedProcessTree(appProcess),
+            ])
+            if (removeProfile) {
+                assertSafeTemporaryDirectory(temporaryRoot)
+                await rm(temporaryRoot, { recursive: true, force: true })
+            } else {
+                process.stderr.write(`Kept isolated benchmark profile: ${temporaryRoot}${os.EOL}`)
+            }
+        })()
+        return cleanupPromise
+    }
+    const removeSignalCleanup = installSignalCleanup(
+        process,
+        () => cleanupOwnedResources(true),
+        (code) => process.exit(code),
+    )
 
     try {
         await Promise.all([
@@ -448,6 +487,7 @@ async function runBenchmark(options) {
             ...process.env,
             VITE_DISABLE_REALM: 'true',
             VITE_RISU_LEGAL_CONFIGURED: 'TRUE',
+            VITE_TOKENIZER_BENCHMARK: 'true',
             APPDATA: isolatedRoaming,
             LOCALAPPDATA: isolatedLocal,
         }
@@ -462,8 +502,15 @@ async function runBenchmark(options) {
                 '--config',
                 configPath,
             ],
-            { cwd: repositoryRoot, env: environment },
+            {
+                cwd: repositoryRoot,
+                env: environment,
+                onSpawn: (child) => {
+                    buildProcess = child
+                },
+            },
         )
+        buildProcess = undefined
 
         const cargoTarget = resolveCargoTargetDirectory(repositoryRoot, environment.CARGO_TARGET_DIR)
         const executable = path.join(cargoTarget, 'release', `${baseConfig.mainBinaryName}.exe`)
@@ -480,13 +527,21 @@ async function runBenchmark(options) {
         page = new CdpClient(target.webSocketDebuggerUrl)
         await page.connect(options.timeoutMs)
         await page.call('Runtime.enable')
+        await page.call('HeapProfiler.enable')
         await waitForInvoke(page, options.timeoutMs)
+        await waitForBenchmarkSeam(page, options.timeoutMs)
         const userAgent = await evaluate(page, 'navigator.userAgent')
-        const heapBefore = await page.call('Runtime.getHeapUsage')
+        await collectWebViewGarbage(page)
+        const heapBefore = await getWebViewHeap(page)
 
         const tokenizerResults = []
         for (const tokenizerId of ['cl100k_base', 'o200k_base']) {
-            const oracle = createOracle(tokenizerId)
+            const javascriptInitialization = await callBenchmarkSeam(page, 'initialize', tokenizerId)
+            const javascriptParity = await callBenchmarkSeam(
+                page,
+                'verifyJavaScriptCorpus',
+                tokenizerId,
+            )
             const coldRequest = {
                 tokenizer_id: tokenizerId,
                 artifact_fingerprint: FINGERPRINTS[tokenizerId],
@@ -495,29 +550,37 @@ async function runBenchmark(options) {
             }
             const cold = await invokeNative(page, coldRequest)
             if (!cold.ok) throw new Error(`Cold native call failed: ${JSON.stringify(cold.error)}`)
-            const parity = await runIntegratedParity(page, tokenizerId)
+            const nativeParity = await runIntegratedParity(page, tokenizerId)
             const cases = []
             for (const fixture of benchmarkFixtures()) {
                 for (const mode of ['count', 'ids']) {
-                    const javascript = measureJavaScript(
-                        oracle.tokenizer,
-                        tokenizerId,
-                        mode,
-                        fixture.texts,
-                        options.samples,
-                    )
                     const request = {
-                        tokenizer_id: tokenizerId,
-                        artifact_fingerprint: FINGERPRINTS[tokenizerId],
+                        tokenizerId,
                         mode,
                         texts: fixture.texts,
                     }
-                    const native = await measureNative(
+                    const javascriptWarmup = await callBenchmarkSeam(
                         page,
+                        'warm',
+                        'javascript',
                         request,
-                        javascript.expected,
+                    )
+                    const nativeWarmup = await callBenchmarkSeam(page, 'warm', 'native', request)
+                    assertEqual(nativeWarmup, javascriptWarmup, 'untimed warm-up result')
+
+                    const javascript = await measureWebViewImplementation(
+                        page,
+                        'javascript',
+                        request,
                         options.samples,
                     )
+                    const native = await measureWebViewImplementation(
+                        page,
+                        'native',
+                        request,
+                        options.samples,
+                    )
+                    assertEqual(native.result, javascript.result, 'measured tokenizer result')
                     cases.push({
                         fixture: fixture.name,
                         mode,
@@ -526,26 +589,32 @@ async function runBenchmark(options) {
                             (total, text) => total + Buffer.byteLength(text),
                             0,
                         ),
-                        javascript: javascript.timing,
-                        nativeEndToEnd: native.timing,
-                        transferredBytes: native.transferredBytes,
+                        warmup: {
+                            performed: true,
+                            javascript: javascriptWarmup,
+                            native: nativeWarmup,
+                        },
+                        result: javascript.result,
+                        javascript: { ...javascript.timing, heap: javascript.heap },
+                        nativeEndToEnd: { ...native.timing, heap: native.heap },
                     })
                 }
             }
-            oracle.tokenizer.free()
             tokenizerResults.push({
                 tokenizerId,
                 fingerprint: FINGERPRINTS[tokenizerId],
-                javascriptColdInitializationMs: oracle.initializationMs,
+                javascriptColdInitializationMs: javascriptInitialization.durationMs,
                 nativeColdEndToEndMs: cold.durationMs,
-                parity,
+                javascriptParity,
+                nativeParity,
                 cases,
             })
         }
-        const heapAfter = await page.call('Runtime.getHeapUsage')
+        await collectWebViewGarbage(page)
+        const heapAfter = await getWebViewHeap(page)
 
         return {
-            schemaVersion: 1,
+            schemaVersion: 2,
             measuredAt: new Date().toISOString(),
             platform: {
                 os: `${os.type()} ${os.release()}`,
@@ -560,10 +629,18 @@ async function runBenchmark(options) {
                 cargoTargetDirectory: cargoTarget,
             },
             samplesPerWarmCase: options.samples,
+            measurementContract: {
+                timingRealm: 'release-tauri-webview',
+                javascriptOutput: 'count number[] or IDs Uint32Array[]',
+                nativeOutput: 'count number[] or timed IPC IDs conversion to Uint32Array[]',
+                warmup: 'one untimed call per implementation, fixture, and mode',
+                heap: 'WebView garbage collection and Runtime.getHeapUsage before and after each implementation',
+                nodeDriverTimed: false,
+            },
             webViewHeap: {
-                beforeBytes: heapBefore.usedSize,
-                afterBytes: heapAfter.usedSize,
-                deltaBytes: heapAfter.usedSize - heapBefore.usedSize,
+                beforeBytes: heapBefore.usedBytes,
+                afterBytes: heapAfter.usedBytes,
+                deltaBytes: heapAfter.usedBytes - heapBefore.usedBytes,
             },
             tokenizers: tokenizerResults,
             adoption: {
@@ -571,21 +648,16 @@ async function runBenchmark(options) {
                 reason: 'Physical Android performance evidence is unavailable.',
             },
             limits: [
-                'JavaScript oracle timing runs in the Windows Node process, while native end-to-end timing runs inside the release Tauri WebView and includes IPC.',
+                'JavaScript and native timing both run inside the same release Tauri WebView.',
+                'The Node process orchestrates CDP and is not part of either measured interval.',
                 'The candidate remains outside production tokenizer.ts routing.',
                 'Physical Android measurements are required before production adoption.',
                 'Live RisuRealm and live account services are intentionally not exercised.',
             ],
         }
     } finally {
-        page?.close()
-        await stopProcess(appProcess)
-        if (!options.keepProfile) {
-            assertSafeTemporaryDirectory(temporaryRoot)
-            await rm(temporaryRoot, { recursive: true, force: true })
-        } else {
-            process.stderr.write(`Kept isolated benchmark profile: ${temporaryRoot}${os.EOL}`)
-        }
+        removeSignalCleanup()
+        await cleanupOwnedResources(!options.keepProfile)
     }
 }
 

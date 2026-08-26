@@ -3,6 +3,7 @@
 
 interface ImportMetaEnv {
     readonly VITE_RUNTIME_PERFORMANCE_PROFILE?: 'normal' | 'low-spec'
+    readonly VITE_TOKENIZER_BENCHMARK?: 'true'
 }
 
 interface ImportMeta {

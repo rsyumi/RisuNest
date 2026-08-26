@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import test from 'node:test'
 
 import {
     buildBenchmarkConfig,
     buildShortSegments,
+    installSignalCleanup,
     parseArguments,
     percentile,
     resolveCargoTargetDirectory,
@@ -51,4 +53,38 @@ test('release executable follows the shared absolute Cargo target directory', ()
         'E:\\shared-target',
     )
     assert.equal(resolveCargoTargetDirectory('E:\\repo', undefined), 'E:\\repo\\src-tauri\\target')
+})
+
+test('SIGINT and SIGTERM clean owned resources once before exiting', async () => {
+    const processLike = new EventEmitter()
+    const exits = []
+    let cleanupCalls = 0
+    const remove = installSignalCleanup(
+        processLike,
+        async () => {
+            cleanupCalls++
+        },
+        (code) => exits.push(code),
+    )
+
+    processLike.emit('SIGTERM')
+    processLike.emit('SIGINT')
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.equal(cleanupCalls, 1)
+    assert.deepEqual(exits, [143])
+    assert.equal(processLike.listenerCount('SIGINT'), 0)
+    assert.equal(processLike.listenerCount('SIGTERM'), 0)
+    remove()
+})
+
+test('SIGINT exits with its conventional code after cleanup', async () => {
+    const processLike = new EventEmitter()
+    const exits = []
+    installSignalCleanup(processLike, async () => {}, (code) => exits.push(code))
+
+    processLike.emit('SIGINT')
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.deepEqual(exits, [130])
 })
