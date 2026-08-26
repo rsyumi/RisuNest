@@ -61,7 +61,7 @@ function accountHarness() {
             attempt: AccountNativeOfficialWriteAttempt<T>,
             options?: { signal?: AbortSignal },
         ): Promise<AccountNativeOfficialWriteResult<T> | null> {
-            const attempted = await attempt({
+            let attempted = await attempt({
                 credential: { kind: 'risu-auth', token: 'legacy-token' },
                 session: 'session-1',
                 saveDate: '1700000000000',
@@ -70,7 +70,17 @@ function accountHarness() {
             if (attempted === null) return null
             if (attempted.kind === 'auth-warning') return { kind: 'auth-warning' }
             if (attempted.kind === 'reauthentication-needed') {
-                throw new Error('Harness does not retry reauthentication')
+                attempted = await attempt({
+                    credential: { kind: 'risu-auth', token: 'fresh-token' },
+                    session: attempted.session,
+                    saveDate: '1700000000001',
+                    signal: options?.signal,
+                })
+                if (attempted === null) return null
+                if (attempted.kind === 'auth-warning') return { kind: 'auth-warning' }
+                if (attempted.kind === 'reauthentication-needed') {
+                    throw new Error('Harness received repeated reauthentication')
+                }
             }
             return {
                 kind: attempted.kind,
@@ -99,7 +109,7 @@ describe('native official publication job publisher', () => {
         }, acknowledge)
         const runAttempt = vi.fn(async () => {
             events.push('attempt')
-            return terminal
+            return { kind: 'completed' as const, receipt: terminal }
         })
         const reconcilePendingPublications = vi.fn(async () => {
             events.push('reconcile')
@@ -158,7 +168,10 @@ describe('native official publication job publisher', () => {
         const authPublisher = createNativeOfficialPublicationJobPublisher({
             ...authHarness,
             baseUrl: 'https://hub.invalid',
-            runAttempt: vi.fn(async () => authReceipt),
+            runAttempt: vi.fn(async () => ({
+                kind: 'completed' as const,
+                receipt: authReceipt,
+            })),
         })
 
         await expect(authPublisher({
@@ -182,6 +195,65 @@ describe('native official publication job publisher', () => {
             lease: pinnedLease(),
             resourceReplacements: {},
         })).resolves.toBeNull()
+    })
+
+    it('reauthenticates and continues the same publication job without reacquiring its lease', async () => {
+        const terminal = receipt({
+            kind: 'written',
+            accountId: 'account-1',
+            session: 'session-42',
+            saveDate: '1700000000001',
+            status: 200,
+            replacementKey: 'database/database.bin',
+            warning: null,
+            reloadSession: false,
+        })
+        const runAttempt = vi.fn(async () => ({
+            kind: 'waiting-for-reauthentication' as const,
+            jobId: 'publication-1',
+            accountId: 'account-1',
+            session: 'session-42',
+        }))
+        const continueAttempt = vi.fn(async () => ({
+            kind: 'completed' as const,
+            receipt: terminal,
+        }))
+        const cancelAttempt = vi.fn(async () => null)
+        const harness = accountHarness()
+        const publish = createNativeOfficialPublicationJobPublisher({
+            ...harness,
+            baseUrl: 'https://hub.invalid',
+            runAttempt,
+            continueAttempt,
+            cancelAttempt,
+        })
+
+        const result = await publish({
+            revision: 7,
+            accountId: 'account-1',
+            lease: pinnedLease(),
+            resourceReplacements: { 'asset://old': 'asset://new' },
+        })
+
+        expect(runAttempt).toHaveBeenCalledOnce()
+        expect(runAttempt.mock.calls[0][0]).toMatchObject({
+            lease: 'snapshot-publication-1',
+            credential: { kind: 'risu-auth', token: 'legacy-token' },
+            saveDate: '1700000000000',
+        })
+        expect(continueAttempt).toHaveBeenCalledWith(
+            'publication-1',
+            {
+                accountId: 'account-1',
+                session: 'session-42',
+                saveDate: '1700000000001',
+                credential: { kind: 'risu-auth', token: 'fresh-token' },
+            },
+            { revision: 7, accountId: 'account-1' },
+            { signal: undefined },
+        )
+        expect(cancelAttempt).not.toHaveBeenCalled()
+        expect(result?.databaseFingerprint).toBe('a'.repeat(64))
     })
 
     it('falls back before account session work when the pinned lease is not native', async () => {
