@@ -174,13 +174,31 @@ describe('Rust regex safe-plan classifier', () => {
         })
     })
 
-    it('rejects AST nesting beyond the JSONL transport limit', () => {
+    it('accepts bounded structured nesting and rejects deeper ASTs', () => {
         const boundaryPattern = `${'(?:'.repeat(29)}a${')'.repeat(29)}`
+        const concatPattern = `${'(?:'.repeat(29)}ab${')'.repeat(29)}`
+        const classPattern = `${'(?:'.repeat(29)}[a-b]${')'.repeat(29)}`
+        let structuredPattern = '[a-bx-z]'
+        for (let depth = 0; depth < 29; depth++) {
+            structuredPattern = `(?:x${structuredPattern}|y)`
+        }
         const pattern = `${'(?:'.repeat(30)}a${')'.repeat(30)}`
         const boundaryPlan = getRegexExecutionPlan([script(boundaryPattern)], 'editoutput')
         const executionPlan = getRegexExecutionPlan([script(pattern)], 'editoutput')
 
         expect(classifyRegexSafePlan(boundaryPlan, 'a')).toMatchObject({ accepted: true })
+        expect(classifyRegexSafePlan(
+            getRegexExecutionPlan([script(concatPattern)], 'editoutput'),
+            'ab',
+        )).toMatchObject({ accepted: true })
+        expect(classifyRegexSafePlan(
+            getRegexExecutionPlan([script(classPattern)], 'editoutput'),
+            'a',
+        )).toMatchObject({ accepted: true })
+        expect(classifyRegexSafePlan(
+            getRegexExecutionPlan([script(structuredPattern)], 'editoutput'),
+            `${'x'.repeat(29)}a`,
+        )).toMatchObject({ accepted: true })
         expect(classifyRegexSafePlan(executionPlan, 'a')).toEqual({
             accepted: false,
             category: 'regex_safe_nest_limit',

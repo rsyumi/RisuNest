@@ -4,7 +4,9 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const REGEX_NEST_LIMIT: usize = 29;
+const REGEX_IR_NEST_LIMIT: usize = 29;
+// regex-syntax also counts concat, alternation, bracketed class, and class union nodes.
+const REGEX_COMPILE_NEST_LIMIT: u32 = REGEX_IR_NEST_LIMIT as u32 * 3 + 4;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -180,7 +182,7 @@ fn validate_atom(
             Ok((false, ranges.len().saturating_add(2)))
         }
         RegexShadowAtom::Group { alternatives } => {
-            if depth >= REGEX_NEST_LIMIT {
+            if depth >= REGEX_IR_NEST_LIMIT {
                 return Err(RegexShadowFailure("regex_shadow_nest_limit"));
             }
             let bytes =
@@ -191,7 +193,7 @@ fn validate_atom(
             index,
             alternatives,
         } => {
-            if depth >= REGEX_NEST_LIMIT {
+            if depth >= REGEX_IR_NEST_LIMIT {
                 return Err(RegexShadowFailure("regex_shadow_nest_limit"));
             }
             if inside_quantifier {
@@ -206,7 +208,7 @@ fn validate_atom(
             Ok((false, bytes.saturating_add(2)))
         }
         RegexShadowAtom::Repeat { min, max, atom } => {
-            if depth >= REGEX_NEST_LIMIT {
+            if depth >= REGEX_IR_NEST_LIMIT {
                 return Err(RegexShadowFailure("regex_shadow_nest_limit"));
             }
             if inside_quantifier || min > max || *max > 64 {
@@ -511,7 +513,7 @@ fn compile_plan_with_control(
         check_control(control, ExecutionPhase::Compile)?;
         let pattern = build_alternatives(&entry.pattern.alternatives);
         let regex = RegexBuilder::new(&pattern)
-            .nest_limit(REGEX_NEST_LIMIT as u32)
+            .nest_limit(REGEX_COMPILE_NEST_LIMIT)
             .build()
             .ok();
         if let Some(after_rule_compiled) = control.after_rule_compiled {
@@ -790,6 +792,19 @@ mod tests {
         }
     }
 
+    fn nested_plan(atoms: Vec<RegexShadowAtom>) -> RegexShadowPlan {
+        let mut alternatives = vec![RegexShadowAlternative { atoms }];
+        for _ in 0..29 {
+            let atom = RegexShadowAtom::Group { alternatives };
+            alternatives = vec![RegexShadowAlternative { atoms: vec![atom] }];
+        }
+        let atom = alternatives.pop().unwrap().atoms.pop().unwrap();
+        let mut plan = literal_plan("x".to_string());
+        plan.entries[0].pattern_bytes = 4_096;
+        plan.entries[0].pattern.alternatives[0].atoms[0] = atom;
+        plan
+    }
+
     #[test]
     fn executes_ordered_rules_with_ecmascript_substitution() {
         let plan = r#"{
@@ -943,6 +958,73 @@ mod tests {
         let error = execute_plan(plan, "a").unwrap_err();
 
         assert_eq!(error.0, "regex_shadow_nest_limit");
+    }
+
+    #[test]
+    fn compiles_classifier_boundary_concatenation_through_json() {
+        let plan = nested_plan(vec![
+            RegexShadowAtom::Literal { value: b'a' },
+            RegexShadowAtom::Literal { value: b'b' },
+        ]);
+        let plan_json = serde_json::to_string(&plan).unwrap();
+
+        let result = execute_json(&plan_json, "ab", None).unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.data, "x");
+    }
+
+    #[test]
+    fn compiles_classifier_boundary_character_class_through_json() {
+        let plan = nested_plan(vec![RegexShadowAtom::Class {
+            ranges: vec![super::RegexShadowRange {
+                start: b'a',
+                end: b'b',
+            }],
+        }]);
+        let plan_json = serde_json::to_string(&plan).unwrap();
+
+        let result = execute_json(&plan_json, "a", None).unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.data, "x");
+    }
+
+    #[test]
+    fn compiles_classifier_boundary_with_nested_concat_and_alternation() {
+        let mut atom = RegexShadowAtom::Class {
+            ranges: vec![
+                super::RegexShadowRange {
+                    start: b'a',
+                    end: b'b',
+                },
+                super::RegexShadowRange {
+                    start: b'x',
+                    end: b'z',
+                },
+            ],
+        };
+        for _ in 0..29 {
+            atom = RegexShadowAtom::Group {
+                alternatives: vec![
+                    RegexShadowAlternative {
+                        atoms: vec![RegexShadowAtom::Literal { value: b'x' }, atom],
+                    },
+                    RegexShadowAlternative {
+                        atoms: vec![RegexShadowAtom::Literal { value: b'y' }],
+                    },
+                ],
+            };
+        }
+        let mut plan = literal_plan("r".to_string());
+        plan.entries[0].pattern_bytes = 4_096;
+        plan.entries[0].pattern.alternatives[0].atoms[0] = atom;
+        let plan_json = serde_json::to_string(&plan).unwrap();
+
+        let result = execute_json(&plan_json, &format!("{}a", "x".repeat(29)), None).unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.data, "r");
     }
 
     #[test]

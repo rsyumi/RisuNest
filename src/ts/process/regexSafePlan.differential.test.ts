@@ -152,49 +152,61 @@ describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
         it('keeps classifier nesting within the JSONL transport boundary', async () => {
             const boundaryDepth = 29
             const boundaryPattern = `${'(?:'.repeat(boundaryDepth)}a${')'.repeat(boundaryDepth)}`
+            const concatPattern = `${'(?:'.repeat(boundaryDepth)}ab${')'.repeat(boundaryDepth)}`
+            const classPattern = `${'(?:'.repeat(boundaryDepth)}[a-b]${')'.repeat(boundaryDepth)}`
+            let structuredPattern = '[a-bx-z]'
+            for (let depth = 0; depth < boundaryDepth; depth++) {
+                structuredPattern = `(?:x${structuredPattern}|y)`
+            }
             const overLimitPattern = `${'(?:'.repeat(boundaryDepth + 1)}a${')'.repeat(boundaryDepth + 1)}`
-            const executionPlan = getRegexExecutionPlan([
-                script(boundaryPattern, 'x', 'g'),
-            ], 'editoutput')
-            const classification = classifyRegexSafePlan(executionPlan, 'a')
             const overLimit = classifyRegexSafePlan(
                 getRegexExecutionPlan([script(overLimitPattern, 'x', 'g')], 'editoutput'),
                 'a',
             )
-
-            expect(classification).toMatchObject({ accepted: true })
             expect(overLimit).toEqual({
                 accepted: false,
                 category: 'regex_safe_nest_limit',
                 sourceIndex: 0,
             })
-            if (classification.accepted === false) {
-                throw new Error(`Boundary plan rejected: ${classification.category}`)
-            }
-
-            let response: RegexWorkerResponse | undefined
-            const handleWorkerMessage = createRegexWorkerMessageHandler((value) => {
-                response = value
+            const boundaryCases = [
+                { pattern: boundaryPattern, input: 'a' },
+                { pattern: concatPattern, input: 'ab' },
+                { pattern: classPattern, input: 'a' },
+                { pattern: structuredPattern, input: `${'x'.repeat(boundaryDepth)}a` },
+            ].map(({ pattern, input }, id) => {
+                const executionPlan = getRegexExecutionPlan([
+                    script(pattern, 'x', 'g'),
+                ], 'editoutput')
+                const classification = classifyRegexSafePlan(executionPlan, input)
+                expect(classification).toMatchObject({ accepted: true })
+                if (classification.accepted === false) {
+                    throw new Error(`Boundary plan rejected: ${classification.category}`)
+                }
+                let response: RegexWorkerResponse | undefined
+                const handleWorkerMessage = createRegexWorkerMessageHandler((value) => {
+                    response = value
+                })
+                handleWorkerMessage({
+                    type: 'register',
+                    revision: executionPlan.revision,
+                    entries: executionPlan.entries.map((entry) => [
+                        entry.sourceIndex,
+                        entry.pattern,
+                        entry.replacement,
+                        entry.flags,
+                    ]),
+                })
+                handleWorkerMessage({
+                    type: 'execute',
+                    id,
+                    revision: executionPlan.revision,
+                    input,
+                })
+                if (response?.type !== 'result') {
+                    throw new Error('JavaScript Worker did not return the boundary case')
+                }
+                return { id, classification, input, response }
             })
-            handleWorkerMessage({
-                type: 'register',
-                revision: executionPlan.revision,
-                entries: executionPlan.entries.map((entry) => [
-                    entry.sourceIndex,
-                    entry.pattern,
-                    entry.replacement,
-                    entry.flags,
-                ]),
-            })
-            handleWorkerMessage({
-                type: 'execute',
-                id: 0,
-                revision: executionPlan.revision,
-                input: 'a',
-            })
-            if (response?.type !== 'result') {
-                throw new Error('JavaScript Worker did not return the boundary case')
-            }
 
             const child = spawn(
                 'cargo',
@@ -228,13 +240,16 @@ describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
                 stderr += chunk
             })
             const exit = once(child, 'exit')
-            await writeLine(child, {
-                id: 0,
-                planJson: JSON.stringify(classification.plan),
-                input: 'a',
-                authorityData: response.data,
-                authorityErrorSourceIndexes: response.errors.map(([sourceIndex]) => sourceIndex),
-            })
+            for (const boundaryCase of boundaryCases) {
+                await writeLine(child, {
+                    id: boundaryCase.id,
+                    planJson: JSON.stringify(boundaryCase.classification.plan),
+                    input: boundaryCase.input,
+                    authorityData: boundaryCase.response.data,
+                    authorityErrorSourceIndexes: boundaryCase.response.errors
+                        .map(([sourceIndex]) => sourceIndex),
+                })
+            }
             child.stdin.end()
             const [exitCode] = await exit
             if (exitCode !== 0) {
@@ -256,8 +271,8 @@ describe.skipIf(process.env.RISUNEST_REGEX_DIFFERENTIAL !== 'true')(
             }
 
             expect(summary).toMatchObject({
-                allowedCases: 1,
-                uniquePlans: 1,
+                allowedCases: boundaryCases.length,
+                uniquePlans: boundaryCases.length,
                 mismatches: 0,
                 firstMismatch: null,
             })
