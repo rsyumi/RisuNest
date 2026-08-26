@@ -160,18 +160,31 @@ pub(crate) struct LosslessReadReport {
     pub(crate) manifest: LosslessManifest,
     pub(crate) entries: Vec<StagedLosslessEntry>,
     pub(crate) archive_bytes: u64,
+    pub(crate) archive_sha256: String,
 }
 
 #[derive(Debug)]
 pub(crate) struct VerifiedLosslessBackup {
     pub(crate) manifest: LosslessManifest,
     pub(crate) archive_bytes: u64,
+    pub(crate) archive_sha256: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct CreatedLosslessBackup {
+    pub(crate) archive_bytes: u64,
+    pub(crate) archive_sha256: String,
+    pub(crate) character_count: u64,
+    pub(crate) preset_count: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LosslessRestoreReport {
     pub(crate) revision: i64,
     pub(crate) source_bytes: u64,
+    pub(crate) source_sha256: String,
+    pub(crate) character_count: u64,
+    pub(crate) preset_count: u64,
     pub(crate) backup_bytes: u64,
     pub(crate) warnings: Vec<LosslessWarning>,
 }
@@ -760,6 +773,7 @@ pub(crate) fn read_lossless_package_v1(
         manifest,
         entries,
         archive_bytes: source.bytes_read,
+        archive_sha256: source.sha256(),
     })
 }
 
@@ -786,6 +800,7 @@ pub(crate) fn verify_lossless_package_v1(
     Ok(VerifiedLosslessBackup {
         manifest,
         archive_bytes: source.bytes_read,
+        archive_sha256: source.sha256(),
     })
 }
 
@@ -805,6 +820,7 @@ pub(crate) fn restore_lossless_package_v1(
         store,
         expected_revision,
         pre_replacement_backup,
+        None,
         None,
         cancellation,
     )
@@ -829,6 +845,30 @@ pub(crate) fn restore_lossless_package_v1_with_app_kv(
         expected_revision,
         pre_replacement_backup,
         Some((app_kv_key, app_kv_value)),
+        None,
+        cancellation,
+    )
+}
+
+pub(crate) fn restore_lossless_package_v1_controlled(
+    reader: &mut impl Read,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    store: &mut PersistentStore,
+    expected_revision: i64,
+    pre_replacement_backup: &Path,
+    before_activation: &dyn Fn() -> Result<(), String>,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LosslessRestoreReport, LosslessError> {
+    restore_lossless_package_v1_inner(
+        reader,
+        job_staging_root,
+        cas,
+        store,
+        expected_revision,
+        pre_replacement_backup,
+        None,
+        Some(before_activation),
         cancellation,
     )
 }
@@ -841,6 +881,7 @@ fn restore_lossless_package_v1_inner(
     expected_revision: i64,
     pre_replacement_backup: &Path,
     app_kv: Option<(&str, &Value)>,
+    before_activation: Option<&dyn Fn() -> Result<(), String>>,
     cancellation: &dyn CancellationProbe,
 ) -> Result<LosslessRestoreReport, LosslessError> {
     let incoming = read_lossless_package_v1(reader, job_staging_root, cas, cancellation)?;
@@ -892,9 +933,17 @@ fn restore_lossless_package_v1_inner(
         let staged_database = store
             .materialize_staging(&staging_id)
             .map_err(store_error)?;
+        let character_count = staged_database
+            .get("characters")
+            .and_then(Value::as_array)
+            .map_or(0, |characters| characters.len() as u64);
+        let preset_count = staged_database
+            .get("botPresets")
+            .and_then(Value::as_array)
+            .map_or(0, |presets| presets.len() as u64);
         validate_staged_f0(&incoming.manifest, &incoming.entries, &staged_database, cas)?;
         check_cancelled(cancellation)?;
-        create_and_verify_pre_replacement_backup(
+        let backup = create_and_verify_pre_replacement_backup(
             pre_replacement_backup,
             job_staging_root,
             cas,
@@ -902,11 +951,12 @@ fn restore_lossless_package_v1_inner(
             &lease,
             expected_revision,
             cancellation,
-        )
+        )?;
+        Ok((backup, character_count, preset_count))
     })();
     let released = store.release_revision(&lease).map_err(store_error);
-    let backup_bytes = match (prepared, released) {
-        (Ok(bytes), Ok(())) => bytes,
+    let (backup, character_count, preset_count) = match (prepared, released) {
+        (Ok(prepared), Ok(())) => prepared,
         (Err(error), Ok(())) => return abort_restore(store, &staging_id, error),
         (Ok(_), Err(cleanup)) => return abort_restore(store, &staging_id, cleanup),
         (Err(error), Err(cleanup)) => {
@@ -918,6 +968,20 @@ fn restore_lossless_package_v1_inner(
         }
     };
     check_cancelled(cancellation).or_else(|error| abort_restore(store, &staging_id, error))?;
+    if let Some(before_activation) = before_activation {
+        before_activation()
+            .map_err(|message| {
+                LosslessError::new(
+                    if cancellation.is_cancelled() {
+                        LosslessErrorCode::Cancelled
+                    } else {
+                        LosslessErrorCode::Store
+                    },
+                    message,
+                )
+            })
+            .or_else(|error| abort_restore(store, &staging_id, error))?;
+    }
     let prepared = match store
         .prepare_replace_commit(&staging_id, Some(expected_revision))
         .map_err(store_error)
@@ -941,7 +1005,10 @@ fn restore_lossless_package_v1_inner(
     Ok(LosslessRestoreReport {
         revision,
         source_bytes: incoming.archive_bytes,
-        backup_bytes,
+        source_sha256: incoming.archive_sha256,
+        character_count,
+        preset_count,
+        backup_bytes: backup.archive_bytes,
         warnings: incoming.manifest.warnings,
     })
 }
@@ -1281,7 +1348,7 @@ fn create_and_verify_pre_replacement_backup(
     lease: &str,
     expected_revision: i64,
     cancellation: &dyn CancellationProbe,
-) -> Result<u64, LosslessError> {
+) -> Result<CreatedLosslessBackup, LosslessError> {
     check_cancelled(cancellation)?;
     let database = store.materialize_lease(lease).map_err(store_error)?;
     let assets = store.list_asset_aliases(Some(lease)).map_err(store_error)?;
@@ -1358,7 +1425,7 @@ fn create_and_verify_pre_replacement_backup(
         output_guard.sync()?;
         validate_payload_manifest(&written.manifest, &payloads)?;
         validate_owner_head_manifest(&written.manifest, &owner_heads.value)?;
-        let verified_bytes = verify_pre_replacement_backup(
+        let verified = verify_pre_replacement_backup(
             output_path,
             &written.manifest,
             &database,
@@ -1367,14 +1434,19 @@ fn create_and_verify_pre_replacement_backup(
             store,
             cancellation,
         )?;
-        if verified_bytes != written.archive_bytes {
+        if verified.archive_bytes != written.archive_bytes {
             return Err(LosslessError::new(
                 LosslessErrorCode::BackupIncomplete,
                 "pre-replacement lossless backup byte count changed during verification",
             ));
         }
         output_guard.keep();
-        Ok(verified_bytes)
+        Ok(CreatedLosslessBackup {
+            archive_bytes: verified.archive_bytes,
+            archive_sha256: verified.archive_sha256,
+            character_count: exported.character_count,
+            preset_count: exported.preset_count,
+        })
     })();
     let cleanup = store
         .cleanup_risu_save_export(&export_path)
@@ -1399,6 +1471,25 @@ pub(crate) fn create_and_verify_lossless_backup_v1(
     expected_revision: i64,
     cancellation: &dyn CancellationProbe,
 ) -> Result<u64, LosslessError> {
+    create_and_verify_lossless_backup_v1_report(
+        output_path,
+        job_staging_root,
+        cas,
+        store,
+        expected_revision,
+        cancellation,
+    )
+    .map(|report| report.archive_bytes)
+}
+
+pub(crate) fn create_and_verify_lossless_backup_v1_report(
+    output_path: &Path,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    store: &mut PersistentStore,
+    expected_revision: i64,
+    cancellation: &dyn CancellationProbe,
+) -> Result<CreatedLosslessBackup, LosslessError> {
     let lease = store
         .acquire_revision(expected_revision)
         .map_err(store_error)?
@@ -1778,7 +1869,7 @@ fn verify_pre_replacement_backup(
     cas: &PayloadCas,
     store: &mut PersistentStore,
     cancellation: &dyn CancellationProbe,
-) -> Result<u64, LosslessError> {
+) -> Result<VerifiedLosslessBackup, LosslessError> {
     let mut raw = File::open(backup_path).map_err(LosslessError::io)?;
     let verified = verify_lossless_package_v1(&mut raw, cancellation)?;
     if &verified.manifest != expected_manifest {
@@ -1830,7 +1921,7 @@ fn verify_pre_replacement_backup(
         .replace_abort(&verification_staging)
         .map_err(store_error);
     match (validation, aborted) {
-        (Ok(()), Ok(())) => Ok(verified.archive_bytes),
+        (Ok(()), Ok(())) => Ok(verified),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(cleanup)) => Err(cleanup),
         (Err(error), Err(cleanup)) => Err(cleanup_error(
@@ -2396,6 +2487,7 @@ impl<R: Read> Read for DeclaredReader<'_, R> {
 struct CountingReader<'a, R> {
     inner: &'a mut R,
     bytes_read: u64,
+    hasher: Sha256,
 }
 
 impl<'a, R> CountingReader<'a, R> {
@@ -2403,7 +2495,12 @@ impl<'a, R> CountingReader<'a, R> {
         Self {
             inner,
             bytes_read: 0,
+            hasher: Sha256::new(),
         }
+    }
+
+    fn sha256(&self) -> String {
+        hex::encode(self.hasher.clone().finalize())
     }
 }
 
@@ -2414,6 +2511,7 @@ impl<R: Read> Read for CountingReader<'_, R> {
             .bytes_read
             .checked_add(read as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "source size overflow"))?;
+        self.hasher.update(&buffer[..read]);
         Ok(read)
     }
 }
@@ -3226,6 +3324,73 @@ mod tests {
         .unwrap();
 
         assert_eq!(store.revision().unwrap(), 2);
+    }
+
+    #[test]
+    fn managed_export_report_matches_the_exact_package_bytes_and_counts() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("source-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let output = directory.path().join("managed-source.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Source", b"source");
+
+        let report = create_and_verify_lossless_backup_v1_report(
+            &output,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &NeverCancelled,
+        )
+        .unwrap();
+        let package = fs::read(&output).unwrap();
+
+        assert_eq!(report.archive_bytes, package.len() as u64);
+        assert_eq!(report.archive_sha256, hex::encode(Sha256::digest(package)));
+        assert_eq!(report.character_count, 1);
+        assert_eq!(report.preset_count, 1);
+    }
+
+    #[test]
+    fn managed_restore_activation_fence_aborts_staging_and_keeps_the_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let backup_path = directory.path().join("pre-replacement.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let activation_attempted = AtomicBool::new(false);
+
+        let error = restore_lossless_package_v1_controlled(
+            &mut Cursor::new(&incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &|| {
+                activation_attempted.store(true, Ordering::SeqCst);
+                Err("managed restore finalization was not approved".to_owned())
+            },
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::Store);
+        assert!(activation_attempted.load(Ordering::SeqCst));
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+        assert!(backup_path.is_file());
+        verify_lossless_package_v1(&mut File::open(&backup_path).unwrap(), &NeverCancelled)
+            .unwrap();
     }
 
     #[test]
