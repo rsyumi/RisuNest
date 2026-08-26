@@ -134,7 +134,8 @@ const HISTORY_SENSITIVE_CBS_NAMES = new Set([
     'message_unixtime_array', 'messageidleduration', 'message_idle_duration',
     'idleduration', 'idle_duration', 'role', 'lastmessage', 'lastmessageid',
     'lastmessageindex', 'previouschatlog', 'previous_chat_log', 'history',
-    'messages', 'pick', 'getvar', 'addvar', 'setvar', 'setdefaultvar',
+    'messages', 'pick', 'rollp', 'rollpick', 'getvar', 'addvar', 'setvar',
+    'setdefaultvar',
     'personality', 'description', 'scenario', 'exampledialogue', 'examplemessage',
     'example_dialogue', 'persona', 'userpersona', 'mainprompt', 'systemprompt',
     'main_prompt', 'jb', 'jailbreak', 'globalnote', 'systemnote', 'ujb',
@@ -215,7 +216,7 @@ function requiresConversationOperation(
         entry.actions.includes('repeat_back') ||
         entry.replacement.startsWith('@@inject') ||
         entry.replacement.startsWith('@@repeat_back') ||
-        containsHistorySensitiveCbs(entry.pattern) ||
+        (entry.dynamicPattern && containsHistorySensitiveCbs(entry.pattern)) ||
         containsHistorySensitiveCbs(entry.replacement),
     )
 }

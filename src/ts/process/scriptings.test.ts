@@ -11,7 +11,8 @@ import { asBuffer } from '../util'
 import { writeInlayImage } from './files/inlays'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import { createConversationOperationContext } from './conversationOperationContext'
-import type { Chat } from '../storage/database.svelte'
+import type { Chat, character } from '../storage/database.svelte'
+import { DBState } from '../stores.svelte'
 
 const scriptingSelectionState = vi.hoisted(() => ({ index: 0 }))
 
@@ -69,6 +70,48 @@ vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))
 
 let runScripted: typeof import('./scriptings').runScripted
+
+function operationCharacterFixture(
+  suffix: string,
+  onMutation?: () => void,
+) {
+  const chat = {
+    id: `lua-metadata-chat-${suffix}`,
+    message: [{ role: 'user', data: 'message', chatId: `message-${suffix}` }],
+    localLore: [],
+  } as unknown as Chat
+  const char = {
+    type: 'character',
+    chaId: `lua-metadata-character-${suffix}`,
+    chatPage: 0,
+    chats: [chat],
+    firstMessage: 'first-before',
+    backgroundHTML: 'background-before',
+    alternateGreetings: [],
+    globalLore: [],
+    defaultVariables: '',
+  } as unknown as character
+  const database = {
+    characters: [char],
+    templateDefaultVariables: '',
+  }
+  const session = new ActiveConversationSession({
+    characterId: char.chaId,
+    conversationId: chat.id!,
+    conversation: chat,
+    storeRevision: 14,
+    onMutation,
+  })
+  return { chat, char, database, session }
+}
+
+function installOperationCharacterFixture(
+  fixture: ReturnType<typeof operationCharacterFixture>,
+) {
+  scriptingSelectionState.index = 0
+  DBState.db = fixture.database as never
+  vi.mocked(getDatabase).mockReturnValue(fixture.database as never)
+}
 
 beforeAll(async () => {
   const jsonLua = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
@@ -684,6 +727,250 @@ test('keeps the eager Lua mutation in the operation batch after a handler error'
   finally {
     consoleError.mockRestore()
   }
+})
+
+test('publishes local lore through the conversation metadata batch', async () => {
+  const fixture = operationCharacterFixture('local-lore-success')
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+
+  await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      upsertLocalLoreBook(id, 'operation lore', 'operation content', {})
+      return value
+    end)
+  `, {
+    char: fixture.char,
+    data: 'input',
+    mode: 'editInput',
+    operationContext,
+  })
+
+  expect(fixture.chat.localLore).toEqual([])
+  expect(operationContext.chat.localLore).toEqual([
+    expect.objectContaining({
+      comment: 'operation lore',
+      content: 'operation content',
+    }),
+  ])
+
+  operationContext.commit(fixture.session)
+  expect(fixture.chat.localLore).toEqual([
+    expect.objectContaining({ comment: 'operation lore' }),
+  ])
+  expect(fixture.session.version).toBe(1)
+})
+
+test('keeps local lore partial-error semantics inside the original owner', async () => {
+  const fixture = operationCharacterFixture('local-lore-partial')
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+  try {
+    const result = await runScripted(`
+      listenEdit('editInput', function(id, value, meta)
+        upsertLocalLoreBook(id, 'partial lore', 'partial content', {})
+        error('after local lore mutation')
+      end)
+    `, {
+      char: fixture.char,
+      mode: 'editInput',
+      operationContext,
+    })
+
+    expect(result.res).toBeUndefined()
+    expect(fixture.chat.localLore).toEqual([])
+    operationContext.commit(fixture.session)
+    expect(fixture.chat.localLore).toEqual([
+      expect.objectContaining({ comment: 'partial lore' }),
+    ])
+  } finally {
+    consoleError.mockRestore()
+  }
+})
+
+test('does not publish local lore after conversation navigation', async () => {
+  const original = operationCharacterFixture('local-lore-original')
+  const replacement = operationCharacterFixture('local-lore-replacement')
+  installOperationCharacterFixture(original)
+  const operationContext = createConversationOperationContext(
+    original.session,
+    original.chat,
+  )
+
+  await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      upsertLocalLoreBook(id, 'stale lore', 'stale content', {})
+      return value
+    end)
+  `, {
+    char: original.char,
+    data: 'input',
+    mode: 'editInput',
+    operationContext,
+  })
+
+  expect(() => operationContext.commit(replacement.session)).toThrow(/inactive/i)
+  expect(original.chat.localLore).toEqual([])
+  expect(replacement.chat.localLore).toEqual([])
+})
+
+test('rolls local lore back when metadata publication fails', async () => {
+  const fixture = operationCharacterFixture('local-lore-rollback', () => {
+    throw new Error('local lore publication failed')
+  })
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+
+  await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      upsertLocalLoreBook(id, 'rollback lore', 'rollback content', {})
+      return value
+    end)
+  `, {
+    char: fixture.char,
+    data: 'input',
+    mode: 'editInput',
+    operationContext,
+  })
+
+  expect(() => operationContext.commit(fixture.session)).toThrow(
+    'local lore publication failed',
+  )
+  expect(fixture.chat.localLore).toEqual([])
+  expect(fixture.session.version).toBe(0)
+})
+
+test('updates only captured live character fields without installing the projection', async () => {
+  const fixture = operationCharacterFixture('captured-fields')
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+  const liveCharacter = fixture.database.characters[0]
+  const liveChat = liveCharacter.chats[0]
+
+  const result = await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      return {
+        first = setCharacterFirstMessage(id, 'first-after'),
+        background = setBackgroundEmbedding(id, 'background-after')
+      }
+    end)
+  `, {
+    char: fixture.char,
+    mode: 'editInput',
+    operationContext,
+  })
+
+  expect(result.res).toEqual({ first: true, background: true })
+  expect(fixture.database.characters[0]).toBe(liveCharacter)
+  expect(fixture.database.characters[0].chats[0]).toBe(liveChat)
+  expect(liveCharacter.firstMessage).toBe('first-after')
+  expect(liveCharacter.backgroundHTML).toBe('background-after')
+  expect(fixture.session.version).toBe(0)
+  operationContext.release()
+})
+
+test('re-finds the captured character after an awaited character array reorder', async () => {
+  const fixture = operationCharacterFixture('captured-field-reorder')
+  const replacement = operationCharacterFixture('captured-field-replacement')
+  fixture.database.characters.push(replacement.char)
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+  let resolveRequest!: (value: unknown) => void
+  const pendingRequest = new Promise<unknown>((resolve) => {
+    resolveRequest = resolve
+  })
+  vi.mocked(requestChatData).mockReset()
+  vi.mocked(requestChatData).mockReturnValueOnce(pendingRequest as never)
+
+  const pending = runScripted(`
+    captured_field_reorder = async(function(id)
+      LLM(id, {{ role = 'user', content = 'wait' }})
+      return {
+        first = setCharacterFirstMessage(id, 'reordered-first'),
+        background = setBackgroundEmbedding(id, 'reordered-background')
+      }
+    end)
+  `, {
+    char: fixture.char,
+    lowLevelAccess: true,
+    mode: 'captured_field_reorder',
+    operationContext,
+  })
+  await vi.waitFor(() => expect(requestChatData).toHaveBeenCalledOnce())
+  fixture.database.characters.reverse()
+  scriptingSelectionState.index = 0
+  resolveRequest({ type: 'success', result: 'done' })
+
+  await expect(pending).resolves.toEqual(expect.objectContaining({
+    res: { first: true, background: true },
+  }))
+  expect(fixture.char.firstMessage).toBe('reordered-first')
+  expect(fixture.char.backgroundHTML).toBe('reordered-background')
+  expect(replacement.char.firstMessage).toBe('first-before')
+  expect(replacement.char.backgroundHTML).toBe('background-before')
+  expect(fixture.database.characters[1]).toBe(fixture.char)
+  operationContext.release()
+  vi.mocked(requestChatData).mockReset()
+})
+
+test('rejects awaited captured field writes after a concurrent update', async () => {
+  const fixture = operationCharacterFixture('captured-field-cas')
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+  let resolveRequest!: (value: unknown) => void
+  const pendingRequest = new Promise<unknown>((resolve) => {
+    resolveRequest = resolve
+  })
+  vi.mocked(requestChatData).mockReset()
+  vi.mocked(requestChatData).mockReturnValueOnce(pendingRequest as never)
+
+  const pending = runScripted(`
+    captured_field_cas = async(function(id)
+      LLM(id, {{ role = 'user', content = 'wait' }})
+      return {
+        first = setCharacterFirstMessage(id, 'stale-first'),
+        background = setBackgroundEmbedding(id, 'stale-background')
+      }
+    end)
+  `, {
+    char: fixture.char,
+    lowLevelAccess: true,
+    mode: 'captured_field_cas',
+    operationContext,
+  })
+  await vi.waitFor(() => expect(requestChatData).toHaveBeenCalledOnce())
+  fixture.char.firstMessage = 'concurrent-first'
+  fixture.char.backgroundHTML = 'concurrent-background'
+  resolveRequest({ type: 'success', result: 'done' })
+
+  await expect(pending).resolves.toEqual(expect.objectContaining({
+    res: { first: false, background: false },
+  }))
+  expect(fixture.char.firstMessage).toBe('concurrent-first')
+  expect(fixture.char.backgroundHTML).toBe('concurrent-background')
+  expect(fixture.database.characters[0]).toBe(fixture.char)
+  operationContext.release()
+  vi.mocked(requestChatData).mockReset()
 })
 
 test('Lua history and chat variables stay bound to the captured character', async () => {

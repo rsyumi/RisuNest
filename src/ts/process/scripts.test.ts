@@ -463,6 +463,115 @@ describe('history-sensitive regex conversation operations', () => {
         }
     })
 
+    it.each(['rollp', 'rollpick'])(
+        'opens a conversation operation for the history-sensitive %s CBS helper',
+        async (helper) => {
+            const chat = {
+                id: `history-${helper}-chat`,
+                message: [{ role: 'user', data: 'before', chatId: 'message-0' }],
+            } as Chat
+            const char = makeCharacter([])
+            char.chaId = `history-${helper}-character`
+            char.chats = [chat]
+            char.chatPage = 0
+            const session = new ActiveConversationSession({
+                characterId: char.chaId,
+                conversationId: chat.id!,
+                conversation: chat,
+                storeRevision: 27,
+            })
+            mocks.database.characters = [char] as never
+            mocks.state.currentChat = chat
+            mocks.state.session = session
+            const structuredCloneSpy = vi.spyOn(globalThis, 'structuredClone')
+
+            try {
+                await processScriptFull(
+                    char,
+                    `{{${helper}::6}}`,
+                    'editoutput',
+                    -1,
+                    {},
+                    { cache: 'bypass', regexWorker: false },
+                )
+
+                expect(structuredCloneSpy).toHaveBeenCalled()
+                expect(session.activePinReasons).toEqual([])
+            } finally {
+                structuredCloneSpy.mockRestore()
+            }
+        },
+    )
+
+    it('does not treat CBS-looking text in a static regex pattern as history-sensitive', async () => {
+        const chat = {
+            id: 'static-cbs-pattern-chat',
+            message: [{ role: 'user', data: 'before', chatId: 'message-0' }],
+        } as Chat
+        const char = makeCharacter([makeScript('{{history}}', 'replacement')])
+        char.chaId = 'static-cbs-pattern-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 28,
+        })
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        const structuredCloneSpy = vi.spyOn(globalThis, 'structuredClone')
+
+        try {
+            await processScriptFull(char, 'plain', 'editoutput', -1, {}, {
+                cache: 'bypass',
+                regexWorker: false,
+            })
+
+            expect(structuredCloneSpy).not.toHaveBeenCalled()
+            expect(session.version).toBe(0)
+            expect(session.activePinReasons).toEqual([])
+        } finally {
+            structuredCloneSpy.mockRestore()
+        }
+    })
+
+    it('classifies CBS helpers in dynamic regex patterns', async () => {
+        const chat = {
+            id: 'dynamic-cbs-pattern-chat',
+            message: [{ role: 'user', data: 'before', chatId: 'message-0' }],
+        } as Chat
+        const char = makeCharacter([
+            makeScript('{{history}}', 'replacement', 'g<cbs>'),
+        ])
+        char.chaId = 'dynamic-cbs-pattern-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 29,
+        })
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        const structuredCloneSpy = vi.spyOn(globalThis, 'structuredClone')
+
+        try {
+            await processScriptFull(char, 'plain', 'editoutput', -1, {}, {
+                cache: 'bypass',
+                regexWorker: false,
+            })
+
+            expect(structuredCloneSpy).toHaveBeenCalled()
+            expect(session.activePinReasons).toEqual([])
+        } finally {
+            structuredCloneSpy.mockRestore()
+        }
+    })
+
     it('pins an unsupported plugin callback to the explicit full-array compatibility path', async () => {
         const chat = {
             id: 'plugin-chat',

@@ -52,6 +52,10 @@ interface BasicScriptingEngineState {
     operationDatabase?: ReturnType<ConversationOperationContext['createDatabaseView']>
     operationCharacter?: character|groupChat|simpleCharacterArgument
     selectedCharacterId?: string
+    capturedCharacterFields?: {
+        firstMessage: string
+        backgroundHTML: string|undefined
+    }
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -131,6 +135,17 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.operationCharacter = char
         ScriptingEngineState.operationDatabase = operationDatabase
         ScriptingEngineState.selectedCharacterId = arg.operationContext?.characterId ?? char?.chaId
+        const capturedCharacter = ScriptingEngineState.selectedCharacterId === undefined
+            ? undefined
+            : DBState.db.characters?.find(
+                (candidate) => candidate.chaId === ScriptingEngineState.selectedCharacterId,
+            )
+        ScriptingEngineState.capturedCharacterFields = capturedCharacter
+            ? {
+                firstMessage: capturedCharacter.firstMessage,
+                backgroundHTML: capturedCharacter.backgroundHTML,
+            }
+            : undefined
         if (code !== ScriptingEngineState.code) {
             try {
             let declareAPI:(name: string, func:Function) => void
@@ -166,6 +181,30 @@ export async function runScripted(code:string, arg:{
             const getScriptingCharacter = () => {
                 const db = getScriptingDatabase()
                 return db.characters[getScriptingCharacterIndex(db)]
+            }
+            const updateCapturedCharacterField = (
+                field: 'firstMessage'|'backgroundHTML',
+                value: string,
+            ) => {
+                const capturedId = ScriptingEngineState.selectedCharacterId
+                const baseline = ScriptingEngineState.capturedCharacterFields
+                if (capturedId === undefined || baseline === undefined) return false
+
+                const liveCharacter = DBState.db.characters?.find(
+                    (candidate) => candidate.chaId === capturedId,
+                )
+                if (!liveCharacter || !Object.is(liveCharacter[field], baseline[field])) {
+                    return false
+                }
+
+                liveCharacter[field] = value
+                baseline[field] = value
+                const projectedCharacter = ScriptingEngineState.operationDatabase
+                    ?.characters.find((candidate) => candidate.chaId === capturedId)
+                if (projectedCharacter && projectedCharacter !== liveCharacter) {
+                    projectedCharacter[field] = value
+                }
+                return true
             }
             declareAPI('getChatVar', (id:string,key:string) => {
                 return ScriptingEngineState.getVar(key)
@@ -785,15 +824,10 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                const db = getScriptingDatabase()
-                const selectedChar = getScriptingCharacterIndex(db)
-                const char = db.characters[selectedChar]
                 if(typeof data !== 'string'){
                     return false
                 }
-                char.firstMessage = data
-                DBState.db.characters[selectedChar] = char
-                return true
+                return updateCapturedCharacterField('firstMessage', data)
             })
 
             declareAPI('getPersonaName', (id:string) => {
@@ -826,13 +860,10 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                const db = getScriptingDatabase()
-                const selectedChar = getScriptingCharacterIndex(db)
                 if(typeof data !== 'string'){
                     return false
                 }
-                DBState.db.characters[selectedChar].backgroundHTML = data
-                return true
+                return updateCapturedCharacterField('backgroundHTML', data)
             })
 
             // Lore books
@@ -886,9 +917,13 @@ export async function runScripted(code:string, arg:{
                     secondKey = '',
                 } = options
 
-                const currentChat = char.chats[char.chatPage]
+                const currentChat = ScriptingEngineState.chat
+                if (!currentChat) {
+                    return
+                }
 
-                const newLocalLoreBooks = currentChat.localLore.filter((book) => book.comment !== name)
+                const newLocalLoreBooks = (currentChat.localLore ?? [])
+                    .filter((book) => book.comment !== name)
                 newLocalLoreBooks.push({
                     alwaysActive,
                     comment: name,
