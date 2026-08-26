@@ -128,6 +128,7 @@ struct BenchmarkResult {
     benchmark: &'static str,
     source_revision: Option<String>,
     fixture: FixtureDescription,
+    export_traversal_sha256_provenance: &'static str,
     discarded_warmup_runs: usize,
     measured_runs: usize,
     write_metric: &'static str,
@@ -1032,6 +1033,8 @@ fn phase3_step5_measurements() {
             fnv1a64: format!("{:016x}", fnv1a64(&serialized)),
             sha256: sha256_hex(&serialized),
         },
+        export_traversal_sha256_provenance:
+            "sha256-of-u64le-length-prefixed-json-fragments-in-export-traversal-order-after-append",
         discarded_warmup_runs: 1,
         measured_runs: all_samples.len(),
         write_metric: "SQLite DBSTATUS_CACHE_WRITE pages multiplied by page size, a logical cache-write proxy, not physical I/O",

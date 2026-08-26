@@ -82,8 +82,10 @@ node benchmarks/roadmap14/windows.mjs `
 The runner requires both raw results and the embedded Tauri identifier to match
 the current Git HEAD. It also requires matching fixture bytes, SHA-256, and
 500-character, 5,001-conversation, 510,000-message shape. The canonical output
-hash is the framed post-append export traversal digest, not the input fixture
-hash. Raw artifact hashes are calculated from the files and cannot be overridden.
+hash is SHA-256 over each post-append export traversal JSON fragment prefixed by
+its little-endian 64-bit byte length, in traversal order. It is not the input
+fixture hash. Raw artifact hashes are calculated from the files and cannot be
+overridden.
 
 The other three descriptors are ready for their workstream-specific release
 measurement adapters. They must use the same result schema. No Windows result is

@@ -454,6 +454,7 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
             serializedBytes: 1000,
             sha256: 'c'.repeat(64),
         },
+        exportTraversalSha256Provenance: 'sha256-of-u64le-length-prefixed-json-fragments-in-export-traversal-order-after-append',
         samples: [
             {
                 importUs: 2000,
@@ -501,6 +502,10 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
         explicitImport: {
             memorySamples: [
                 {
+                    jsHeap: { usedBytes: 10 },
+                    processMemory: { workingSetBytes: 20 },
+                },
+                {
                     jsHeap: { usedBytes: 30 },
                     processMemory: { workingSetBytes: 40 },
                 },
@@ -530,7 +535,7 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
     assert.equal(result.build.identity, `${sourceRevision}-windows-release`)
     assert.deepEqual(result.canonicalOutput, {
         sha256: 'd'.repeat(64),
-        provenance: 'phase3-export-traversal-after-append',
+        provenance: 'sha256-of-u64le-length-prefixed-json-fragments-in-export-traversal-order-after-append',
     })
     assert.deepEqual(result.latency.samples, [
         { name: 'staged-replace-import', valuesMs: [2, 2.5] },
@@ -543,7 +548,7 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
     assert.deepEqual(result.bytes, {
         artifacts: [
             { name: 'fixture-serialized-json', bytes: 1000 },
-            { name: 'export-traversal-json', bytes: 900 },
+            { name: 'export-traversal-json-fragments', bytes: 900 },
             { name: 'snapshot-file', bytes: 1200 },
         ],
     })

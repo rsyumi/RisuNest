@@ -10,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createRoadmap14Result, requireRealmDisabled } from './result.mjs'
 import { getRoadmap14Scenario } from './scenarios.mjs'
 
+const EXPORT_DIGEST_PROVENANCE = 'sha256-of-u64le-length-prefixed-json-fragments-in-export-traversal-order-after-append'
+
 export function convertExistingWindowsMeasurements({
     phase3,
     tauri,
@@ -33,6 +35,9 @@ export function convertExistingWindowsMeasurements({
     }
     if (!Array.isArray(phase3.samples) || phase3.samples.length === 0) {
         throw new Error('Phase 3 result has no retained samples')
+    }
+    if (phase3.exportTraversalSha256Provenance !== EXPORT_DIGEST_PROVENANCE) {
+        throw new Error('Phase 3 result has unknown export traversal SHA-256 provenance')
     }
     if (
         !sourceRevision
@@ -69,7 +74,6 @@ export function convertExistingWindowsMeasurements({
     }
 
     const memorySamples = [
-        tauri.boot?.memory,
         ...(tauri.explicitImport?.memorySamples ?? []),
         ...(tauri.snapshot?.memorySamples ?? []),
     ].filter(Boolean)
@@ -129,22 +133,23 @@ export function convertExistingWindowsMeasurements({
         bytes: {
             artifacts: [
                 { name: 'fixture-serialized-json', bytes: phase3.fixture.serializedBytes },
-                { name: 'export-traversal-json', bytes: lastSample.exportTraversalJsonBytes },
+                { name: 'export-traversal-json-fragments', bytes: lastSample.exportTraversalJsonBytes },
                 { name: 'snapshot-file', bytes: lastSample.snapshotBytes },
             ],
         },
         canonicalOutput: {
             sha256: [...canonicalHashes][0],
-            provenance: 'phase3-export-traversal-after-append',
+            provenance: EXPORT_DIGEST_PROVENANCE,
         },
         source: {
             runner: 'roadmap14-windows-v2',
             measurements: [
                 'persistent-store-staged-replace-import',
                 'persistent-store-append-commit',
-                'persistent-store-export-traversal',
+                'persistent-store-framed-export-traversal',
                 'persistent-store-snapshot-create',
-                'tauri-save-large-memory-and-ui',
+                'tauri-save-large-staged-import-memory',
+                'tauri-post-stage-shell-ui',
             ],
             artifacts: [
                 { name: 'save-large-fixture-json', sha256: phase3.fixture.sha256 },
@@ -154,8 +159,9 @@ export function convertExistingWindowsMeasurements({
         },
         notes: [
             'Phase 3 save-large timings are native SQLite measurements in a release Rust test process.',
-            'Heap and RSS samples come from the isolated release Tauri CDP measurement.',
+            'Heap and RSS samples cover the exact fixture staged import and post-stage snapshot in isolated release Tauri.',
             'The Tauri staged import uses the same serialized save-large fixture as the Rust measurement.',
+            'UI counts describe the application shell after staging, not 510,000 simultaneously rendered messages.',
             'Live RisuRealm is intentionally not exercised.',
         ],
     })
