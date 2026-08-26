@@ -7,10 +7,28 @@
     import { createSimpleCharacter, bookmarkListOpen, DBState, selectedCharID, ScrollToMessageStore } from "src/ts/stores.svelte";
     import { language } from "src/lang";
     import { alertInput } from "src/ts/alert";
+    import { getActiveConversationSession } from "src/ts/storage/persistentDataRuntime.svelte";
+    import {
+        captureChatMessageTarget,
+        removeCapturedBookmark,
+        renameCapturedBookmark,
+        type CapturedChatMessageTarget,
+    } from "src/ts/chatMessageUi";
 
     const close = () => $bookmarkListOpen = false;
     let chara = $derived(DBState.db.characters[$selectedCharID]);
     const simpleChar = $derived(createSimpleCharacter(chara));
+
+    function captureCurrentChat() {
+        const character = DBState.db.characters[$selectedCharID];
+        const conversation = character?.chats[character.chatPage];
+        return character && conversation ? { character, conversation } : null;
+    }
+
+    const chatMessageContext = {
+        captureCurrent: captureCurrentChat,
+        getCurrentSession: getActiveConversationSession,
+    };
 
     const messageMap = $derived.by(() => {
         if (!chara) return new Map();
@@ -20,7 +38,15 @@
         const map = new Map();
         
         allMessages.forEach((m, index) => {
-            map.set(m.chatId, { ...m, originalIndex: index, saying: m.saying ?? '' });
+            map.set(m.chatId, {
+                ...m,
+                originalIndex: index,
+                saying: m.saying ?? '',
+                target: captureChatMessageTarget({
+                    ...chatMessageContext,
+                    absoluteIndex: index,
+                }),
+            });
         });
 
         return map;
@@ -90,25 +116,18 @@
         }
     }
 
-    async function editName(chatId: string) {
-        const chat = chara.chats[chara.chatPage];
-        const newName = await alertInput(language.bookmarkAskNameOrCancel, [], chat.bookmarkNames?.[chatId] || '');
-        if (newName && newName.trim() !== '') {
-            chat.bookmarkNames[chatId] = newName;
-        }
+    async function editName(target: CapturedChatMessageTarget) {
+        await renameCapturedBookmark(target, chatMessageContext, (currentName) =>
+            alertInput(language.bookmarkAskNameOrCancel, [], currentName),
+        );
     }
 
-    function removeBookmark(chatId: string) {
-        const chat = chara.chats[chara.chatPage];
-        const index = chat.bookmarks.indexOf(chatId);
-        if (index > -1) {
-            chat.bookmarks.splice(index, 1);
-            delete chat.bookmarkNames[chatId];
-        }
+    function removeBookmark(target: CapturedChatMessageTarget) {
+        removeCapturedBookmark(target, chatMessageContext);
     }
 
-    function goToChat(index: number) {
-        ScrollToMessageStore.value = index;
+    function goToChat(target: CapturedChatMessageTarget) {
+        ScrollToMessageStore.set(target);
         close();
     }
 </script>
@@ -163,13 +182,13 @@
                         >
                             <span class="grow text-left truncate">{chara.chats[chara.chatPage].bookmarkNames?.[msg.chatId] || msg.data.substring(0, 30) + '...'}</span>
                             <div class="shrink-0 flex items-center gap-2 ml-2">
-                                <button class="text-textcolor2 hover:text-blue-500" title={language.goToChat} onclick={(e) => { e.stopPropagation(); goToChat(msg.originalIndex); }}>
+                                <button class="text-textcolor2 hover:text-blue-500" title={language.goToChat} onclick={(e) => { e.stopPropagation(); if (msg.target) goToChat(msg.target); }}>
                                     <ArrowRightIcon size={20} />
                                 </button>
-                                <button class="text-textcolor2 hover:text-green-500" onclick={(e) => { e.stopPropagation(); editName(msg.chatId); }}>
+                                <button class="text-textcolor2 hover:text-green-500" onclick={(e) => { e.stopPropagation(); if (msg.target) editName(msg.target); }}>
                                     <PencilIcon size={16} />
                                 </button>
-                                <button class="text-textcolor2 hover:text-red-500" onclick={(e) => { e.stopPropagation(); removeBookmark(msg.chatId); }}>
+                                <button class="text-textcolor2 hover:text-red-500" onclick={(e) => { e.stopPropagation(); if (msg.target) removeBookmark(msg.target); }}>
                                     <TrashIcon size={16} />
                                 </button>
                             </div>

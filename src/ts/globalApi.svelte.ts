@@ -59,6 +59,13 @@ import {
     markPersistentDataDirty,
     replacePersistentDatabase,
 } from "./storage/persistentDataRuntime.svelte";
+import * as persistentDataRuntime from "./storage/persistentDataRuntime.svelte";
+import {
+    captureChatMessageTarget,
+    captureChatMessageTargetById,
+    resolveChatMessageTarget,
+    type CapturedChatMessageTarget,
+} from "./chatMessageUi";
 import {
     createPersistentSaveObserverInstallation,
     installPersistentSaveNotifications,
@@ -1975,12 +1982,17 @@ export function aiWatermarkingLawApplies(): boolean {
     return false
 }
 
+const foldTargetContext = {
+    captureCurrent: () => {
+        const character = DBState.db.characters[selIdState.selId]
+        const conversation = character?.chats[character.chatPage]
+        return character && conversation ? { character, conversation } : null
+    },
+    getCurrentSession: () => persistentDataRuntime.getActiveConversationSession(),
+}
+
 export const chatFoldedState = $state<{
-    data: null| {
-        targetCharacterId: string,
-        targetChatId: string,
-        targetMessageId: string,
-    }
+    data: null | CapturedChatMessageTarget
 }>({
     data: null
 })
@@ -1992,56 +2004,31 @@ export let chatFoldedStateMessageIndex = $state({
 
 $effect.root(() => {
     $effect(() => {
-        if(!chatFoldedState.data){
-            return
-        }
-        const char = DBState.db.characters[selIdState.selId]
-        const chat = char.chats[char.chatPage]
-        if(chatFoldedState.data.targetCharacterId !== char.chaId){
-            chatFoldedState.data = null
-        }
-        if(chatFoldedState.data.targetChatId !== chat.id){
-            chatFoldedState.data = null
-        }
-    })
-
-    $effect(() => {
         if(chatFoldedState.data === null){
             chatFoldedStateMessageIndex.index = -1
             return
         }
-        const char = DBState.db.characters[selIdState.selId]
-        const chat = char.chats[char.chatPage]
-        const messageIndex = chat.message.findIndex((v) => {
-            return chatFoldedState.data?.targetMessageId === v.chatId
-        })
-        if(messageIndex === -1){
-            console.warn('Target message for folding id' + chatFoldedState.data?.targetMessageId + ' not found')
+        const target = resolveChatMessageTarget(chatFoldedState.data, foldTargetContext)
+        if(!target){
+            console.warn('Target message for folding is stale')
             chatFoldedStateMessageIndex.index = -1
             return
         }
-        chatFoldedStateMessageIndex.index = messageIndex
+        chatFoldedStateMessageIndex.index = target.absoluteIndex
     })
 })
 
 export function foldChatToMessage(targetMessageIdOrIndex: string | number) {
-    let targetMessageId = ''
-    if (typeof targetMessageIdOrIndex === 'number') {
-        const char = getCurrentCharacter()
-        const chat = char.chats[char.chatPage]
-        const message = chat.message[targetMessageIdOrIndex]
-        targetMessageId = message.chatId
-    }
-    else{
-        targetMessageId = targetMessageIdOrIndex
-    }
-    const char = getCurrentCharacter()
-    const chat = char.chats[char.chatPage]
-    chatFoldedState.data = {
-        targetCharacterId: char.chaId,
-        targetChatId: chat.id,
-        targetMessageId: targetMessageId,
-    }
+    chatFoldedState.data = typeof targetMessageIdOrIndex === 'number'
+        ? captureChatMessageTarget({
+            ...foldTargetContext,
+            absoluteIndex: targetMessageIdOrIndex,
+        })
+        : captureChatMessageTargetById(
+            foldTargetContext,
+            targetMessageIdOrIndex,
+            'first',
+        )
 }
 
 export async function changeChatTo(IdOrIndex: string | number): Promise<boolean> {

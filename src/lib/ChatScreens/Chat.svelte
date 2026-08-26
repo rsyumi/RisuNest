@@ -29,6 +29,14 @@
     import { copyImageSourceToDataUrl } from "src/ts/process/files/chatCopyInlays"
     import { getActiveConversationSession } from "../../ts/storage/persistentDataRuntime.svelte"
     import { removeChatMessage } from "../../ts/chatRemoval"
+    import {
+        captureChatMessageTarget,
+        editCapturedChatMessage,
+        toggleCapturedBookmark,
+        toggleCapturedMessageDisabled,
+        toggleCapturedMessageRole,
+        type CapturedChatMessageTarget,
+    } from "../../ts/chatMessageUi"
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -37,6 +45,8 @@
     let editTranslationMode = $state(false)
     let editTranslationText = $state('')
     let bodyRoot:HTMLElement|null = $state(null)
+    let editTarget: CapturedChatMessageTarget | null = null
+    let partialEditTarget: CapturedChatMessageTarget | null = null
     interface Props {
         message?: string;
         name?: string;
@@ -113,6 +123,29 @@
             : null
     }
 
+    function captureCurrentChat() {
+        const character = DBState.db.characters[selIdState.selId]
+        const conversation = character?.chats[character.chatPage]
+        return character && conversation ? { character, conversation } : null
+    }
+
+    const chatMessageContext = {
+        captureCurrent: captureCurrentChat,
+        getCurrentSession: currentConversationSession,
+    }
+
+    function captureCurrentMessage() {
+        return captureChatMessageTarget({
+            ...chatMessageContext,
+            absoluteIndex: idx,
+        })
+    }
+
+    function beginEdit() {
+        editTarget = captureCurrentMessage()
+        editMode = editTarget !== null
+    }
+
     async function rm(e:MouseEvent, rec?:boolean){
         await removeChatMessage({
             absoluteIndex: idx,
@@ -120,11 +153,7 @@
             recursive: rec ?? false,
             askRemoval: DBState.db.askRemoval ?? false,
             instantRemove: DBState.db.instantRemove ?? false,
-            captureCurrent: () => {
-                const character = DBState.db.characters[selIdState.selId]
-                const conversation = character?.chats[character.chatPage]
-                return character && conversation ? { character, conversation } : null
-            },
+            captureCurrent: captureCurrentChat,
             getCurrentSession: currentConversationSession,
             confirmRemoval: () => alertConfirm(language.removeChat),
             confirmInstantRemoval: () => alertConfirm(language.instantRemoveConfirm),
@@ -132,19 +161,17 @@
     }
 
     async function edit(){
-        const currentMessage = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
-        const session = currentConversationSession()
-        if (session) session.edit(session.locate(idx), { ...currentMessage, data: message })
-        else currentMessage.data = message
+        const target = editTarget ?? captureCurrentMessage()
+        editTarget = null
+        if (target) editCapturedChatMessage(target, chatMessageContext, message)
     }
 
     function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
         if (idx >= 0) {
             message = e.detail.newData
-            const currentMessage = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
-            const session = currentConversationSession()
-            if (session) session.edit(session.locate(idx), { ...currentMessage, data: e.detail.newData })
-            else currentMessage.data = e.detail.newData
+            const target = partialEditTarget
+            partialEditTarget = null
+            if (target) editCapturedChatMessage(target, chatMessageContext, e.detail.newData)
             displaya(e.detail.newData)
         }
     }
@@ -287,55 +314,28 @@
             ?.bookmarks?.includes(DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]?.chatId) ?? false
     );
 
-    async function toggleBookmark() {
-        const chat = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage];
-        
-        if(!chat.message[idx]) return;
-
-        let messageId = chat.message[idx]?.chatId;
-        const messageContent = chat.message[idx]?.data;
-
-        if (!messageId) {
-            messageId = uuidv4();
-            chat.message[idx].chatId = messageId;
-        }
-
-        chat.bookmarks ??= [];
-        chat.bookmarkNames ??= {};
-
-        const bookmarkIndex = chat.bookmarks.indexOf(messageId);
-
-        if (bookmarkIndex > -1) {
-            chat.bookmarks.splice(bookmarkIndex, 1);
-            delete chat.bookmarkNames[messageId];
-        } else {
-            chat.bookmarks.push(messageId);
-
-            const msgSender = chat.message[idx]?.role === 'user' ? getUserName() : name;
-            const newName= await alertInput(language.bookmarkAskNameOrDefault, [], chat.bookmarkNames[messageId] || '');
-
-            if (newName && newName.trim() !== '') {
-                chat.bookmarkNames[messageId] = newName;
-            } else {
-                let defaultName;
-
-                const blacklist = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '-', '=', '[', ']', '{', '}', '|', ';', ':', '"', "'", ',', '.', '<', '>', '/', '?'];
-                let lines = messageContent.split('\n');
-                lines = lines.splice(Math.floor(lines.length * 0.5));
-                for (const line of lines) {
-                    if (line && !blacklist.some(char => line.startsWith(char))) {
-                        defaultName = line.trim().slice(0, 50) + '...';
-                        break;
-                    }
-                }
-                if (!defaultName) {
-                    defaultName = messageContent.slice(0, 50) + '...';
-                }
-                chat.bookmarkNames[messageId] = msgSender + '| ' + defaultName;
-            }
-        }
-
-        chat.bookmarks = [...chat.bookmarks];
+    async function toggleBookmark(target: CapturedChatMessageTarget) {
+        await toggleCapturedBookmark(target, chatMessageContext, {
+            requestName: (currentName) => alertInput(
+                language.bookmarkAskNameOrDefault,
+                [],
+                currentName,
+            ),
+            createMessageId: uuidv4,
+            defaultName: (targetMessage) => {
+                const msgSender = targetMessage.role === 'user' ? getUserName() : name
+                const blacklist = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '-', '=', '[', ']', '{', '}', '|', ';', ':', '"', "'", ',', '.', '<', '>', '/', '?']
+                let lines = targetMessage.data.split('\n')
+                lines = lines.splice(Math.floor(lines.length * 0.5))
+                const defaultLine = lines.find((line) =>
+                    line && !blacklist.some((character) => line.startsWith(character)),
+                )
+                const defaultName = defaultLine
+                    ? defaultLine.trim().slice(0, 50) + '...'
+                    : targetMessage.data.slice(0, 50) + '...'
+                return msgSender + '| ' + defaultName
+            },
+        })
     }
 </script>
 
@@ -437,7 +437,7 @@
             bind:this={bodyRoot}
             onclick={() => {
             if(DBState.db.clickToEdit && idx > -1 && !isOptimizedStreamingMessage){
-                editMode = true
+                beginEdit()
             }
         }}
             style:font-size="{0.875 * (DBState.db.zoomsize / 100)}rem"
@@ -468,6 +468,7 @@
                     {bodyRoot}
                     blockEditEnabled={DBState.db.enableBlockPartialEdit}
                     dragEditEnabled={DBState.db.enableDragPartialEdit}
+                    on:start={() => partialEditTarget = captureCurrentMessage()}
                     on:save={handlePartialEditSave}
                 />
             {/if}
@@ -795,7 +796,7 @@
     {#if idx > -1 && !isOptimizedStreamingMessage}
         <button class={"flex items-center hover:text-blue-500 transition-colors button-icon-edit "+(editMode?'text-blue-400':'')} onclick={() => {
             if(!editMode){
-                editMode = true
+                beginEdit()
             }
             else{
                 editMode = false
@@ -835,8 +836,10 @@
     
     {#if DBState.db.enableBookmark}
         <button class="flex items-center hover:text-blue-500 transition-colors button-icon-bookmark {isBookmarked ? 'text-yellow-400' : ''}" onclick={async () => {
+            const target = captureCurrentMessage()
+            if (!target) return
             await sleep(1)
-            toggleBookmark()
+            await toggleBookmark(target)
         }}>
             <BookmarkIcon size={20}/>
             {#if showNames}
@@ -883,9 +886,10 @@
     </button>
 
     <button class="flex items-center hover:text-blue-500 transition-colors" onclick={async () => {
+        const target = captureCurrentMessage()
+        if (!target) return
         await sleep(1)
-        const currentMessage = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
-        DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].disabled = !currentMessage.disabled
+        toggleCapturedMessageDisabled(target, chatMessageContext, 'message')
     }}>
         <PowerOff size={20}/>
         {#if showNames}
@@ -894,9 +898,10 @@
     </button>
 
     <button class="flex items-center hover:text-blue-500 transition-colors" onclick={async () => {
+        const target = captureCurrentMessage()
+        if (!target) return
         await sleep(1)
-        const currentMessage = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]
-        DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].disabled = currentMessage.disabled === 'allBefore' ? false : 'allBefore'
+        toggleCapturedMessageDisabled(target, chatMessageContext, 'allBefore')
     }}>
         <Scissors size={20}/>
         {#if showNames}
@@ -1145,7 +1150,8 @@
                         <span class="chat-width text-xl border-darkborderc flex items-center text-textcolor">
                             <span>{DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role === 'char' ? 'Assistant' : 'User'}</span>
                             <button class="ml-2 text-textcolor2 hover:text-textcolor" onclick={() => {
-                                DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role === 'char' ? 'user' : 'char'
+                                const target = captureCurrentMessage()
+                                if (!target || !toggleCapturedMessageRole(target, chatMessageContext)) return
                                 ReloadChatPointer.update((v) => {
                                     v[idx] = (v[idx] ?? 0) + 1
                                     return v

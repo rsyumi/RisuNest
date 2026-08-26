@@ -33,6 +33,7 @@
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
     import { getActiveConversationSession } from '../../ts/storage/persistentDataRuntime.svelte';
+    import { resolveChatMessageTarget, type CapturedChatMessageTarget } from '../../ts/chatMessageUi';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -63,24 +64,36 @@
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
     }
+    const scrollTargetContext = {
+        captureCurrent: () => {
+            const character = DBState.db.characters[$selectedCharID]
+            const conversation = character?.chats[character.chatPage]
+            return character && conversation ? { character, conversation } : null
+        },
+        getCurrentSession: getActiveConversationSession,
+    }
     $effect(() => {
-        if(ScrollToMessageStore.value !== -1){
-            const index = ScrollToMessageStore.value
-            ScrollToMessageStore.value = -1
-            scrollToMessage(index)
+        if($ScrollToMessageStore){
+            const target = $ScrollToMessageStore
+            ScrollToMessageStore.set(null)
+            scrollToMessage(target)
         }
     })
 
-    async function scrollToMessage(index: number){
+    async function scrollToMessage(target: CapturedChatMessageTarget){
         // Forces the loading of past messages not rendered on the screen
         isScrollingToMessage = true
         try {
+            const resolved = resolveChatMessageTarget(target, scrollTargetContext)
+            if (!resolved) return
+            const index = resolved.absoluteIndex
             const totalMessages = currentChat.length
             const neededLoadPages = totalMessages - index + 5
 
             if(loadPages < neededLoadPages){
                 loadPages = neededLoadPages
                 await tick()
+                if (!resolveChatMessageTarget(target, scrollTargetContext)) return
             }
 
             let element: Element | null = null;
@@ -89,6 +102,7 @@
                 element = document.querySelector(`[data-chat-index="${index}"]`)
                 if(element) break;
                 await sleep(100)
+                if (!resolveChatMessageTarget(target, scrollTargetContext)) return
             }
 
             const preIndex = Math.max(0, index - 3)
@@ -99,6 +113,7 @@
                 element?.scrollIntoView({behavior: "instant", block: "start"})
             }
             await sleep(50)
+            if (!resolveChatMessageTarget(target, scrollTargetContext)) return
 
             if(element){
                 // Wait for images to load to prevent layout shift
@@ -117,12 +132,14 @@
                         Promise.all(promises),
                         sleep(4000)
                     ]);
+                    if (!resolveChatMessageTarget(target, scrollTargetContext)) return
                 }
 
                 element.scrollIntoView({behavior: "instant", block: "start"})
                 
                 // Small delay and scroll again to ensure position is correct after any final layout adjustments
                 await sleep(50)
+                if (!resolveChatMessageTarget(target, scrollTargetContext)) return
                 element.scrollIntoView({behavior: "instant", block: "start"})
 
                 element.classList.add('ring-2', 'ring-blue-500')

@@ -29,6 +29,7 @@
     }: Props = $props();
 
     const dispatch = createEventDispatcher<{
+        start: void;
         save: { newData: string };
     }>();
 
@@ -267,6 +268,7 @@
 
     // Proceed with edit/delete after match found
     function proceedWithEdit(match: RangeResultWithContext) {
+        dispatch('start');
         matchingState.selectedRange = match;
         matchingState.mode = null;
         editText = messageData.slice(match.start, match.end);
@@ -347,6 +349,7 @@
 
     // Proceed with delete after match selected
     function proceedWithDelete(match: RangeResultWithContext) {
+        dispatch('start');
         matchingState.selectedRange = match;
         matchingState.mode = null;
         isConfirmingDelete = true;
