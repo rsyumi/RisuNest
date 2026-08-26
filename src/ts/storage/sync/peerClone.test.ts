@@ -199,6 +199,41 @@ describe('PeerClone facade', () => {
         expect(events).toEqual(['flush:peer-clone-source-prepare', 'prepare'])
     })
 
+    it('returns the pairing claim only from start and keeps later source status claim-free', async () => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
+            if (command === 'peer_clone_start') {
+                return {
+                    phase: 'running',
+                    sessionId: 'source-session',
+                    manifestId: 'a'.repeat(64),
+                    pairingUri,
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_status') {
+                return {
+                    phase: 'running',
+                    sessionId: 'source-session',
+                    manifestId: 'a'.repeat(64),
+                    devices: [],
+                } as T
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(),
+        })
+
+        await expect(facade.start('source-session')).resolves.toMatchObject({ pairingUri })
+        const status = await facade.sourceStatus()
+
+        expect(status.pairingUri).toBeUndefined()
+        expect(JSON.stringify(status)).not.toContain(claim)
+    })
+
     it('finalizes only after native download reaches the activation barrier', async () => {
         const events: string[] = []
         let finalized = false
@@ -310,6 +345,141 @@ describe('PeerClone facade', () => {
         await expect(facade.targetStatus()).rejects.toThrow('revision conflict')
         expect(events).toEqual(['capture', 'acquire', 'finalize', 'release'])
         expect(facade.getState().target.phase).toBe('failed')
+    })
+
+    it.each(['capture', 'acquire'] as const)('clears a failed %s handshake so finalization can retry', async (failure) => {
+        let attempt = 0
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_target_status') {
+                return { phase: 'awaitingActivation', completedBytes: 10, totalBytes: 10 } as T
+            }
+            if (command === 'peer_clone_finalize') return { revision: 42 } as T
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: {
+                flushPendingData: vi.fn(),
+                async capturePersistentMutationToken() {
+                    if (failure === 'capture' && attempt++ === 0) throw new Error('capture failed')
+                    return { revision: 41, mutationGeneration: 7 }
+                },
+                async acquireDestructiveReplacementFence() {
+                    if (failure === 'acquire' && attempt++ === 0) throw new Error('acquire failed')
+                    return {
+                        refreshCommittedWorkingSet: vi.fn(),
+                        release: vi.fn(),
+                    }
+                },
+            },
+        })
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+
+        await expect(facade.targetStatus()).rejects.toThrow(`${failure} failed`)
+        await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_finalize')).toHaveLength(1)
+    })
+
+    it('retains the committed revision and fence until renderer refresh succeeds', async () => {
+        const events: string[] = []
+        let finalized = false
+        let refreshAttempt = 0
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_target_status') {
+                return {
+                    phase: finalized ? 'completed' : 'awaitingActivation',
+                    completedBytes: 10,
+                    totalBytes: 10,
+                } as T
+            }
+            if (command === 'peer_clone_finalize') {
+                events.push('finalize')
+                finalized = true
+                return { revision: 42 } as T
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: {
+                flushPendingData: vi.fn(),
+                async capturePersistentMutationToken() {
+                    events.push('capture')
+                    return { revision: 41, mutationGeneration: 7 }
+                },
+                async acquireDestructiveReplacementFence() {
+                    events.push('acquire')
+                    return {
+                        async refreshCommittedWorkingSet(revision: number) {
+                            events.push(`refresh:${revision}`)
+                            if (refreshAttempt++ === 0) throw new Error('refresh failed')
+                        },
+                        release() {
+                            events.push('release')
+                        },
+                    }
+                },
+            },
+        })
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+
+        await expect(facade.targetStatus()).rejects.toThrow('refresh failed')
+        expect(facade.getState().target.phase).not.toBe('failed')
+        expect(events).toEqual(['capture', 'acquire', 'finalize', 'refresh:42'])
+
+        await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
+        expect(events).toEqual(['capture', 'acquire', 'finalize', 'refresh:42', 'refresh:42', 'release'])
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_finalize')).toHaveLength(1)
+    })
+
+    it('captures target identity before the asynchronous finalize handshake', async () => {
+        let releaseCapture: (() => void) | undefined
+        const captureBlocked = new Promise<void>((resolve) => {
+            releaseCapture = resolve
+        })
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_target_status') {
+                return { phase: 'awaitingActivation', completedBytes: 10, totalBytes: 10 } as T
+            }
+            if (command === 'peer_clone_finalize') return { revision: 42 } as T
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: {
+                flushPendingData: vi.fn(),
+                async capturePersistentMutationToken() {
+                    await captureBlocked
+                    return { revision: 41, mutationGeneration: 7 }
+                },
+                async acquireDestructiveReplacementFence() {
+                    return {
+                        refreshCommittedWorkingSet: vi.fn(),
+                        release: vi.fn(),
+                    }
+                },
+            },
+        })
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+        const finalizing = facade.targetStatus()
+        await Promise.resolve()
+        expect(() => facade.join(
+            pairingUri.replace('123e4567-e89b-12d3-a456-426614174000', '223e4567-e89b-42d3-a456-426614174000'),
+        )).toThrow('finalization is still active')
+        releaseCapture?.()
+
+        await finalizing
+        expect(invoke).toHaveBeenCalledWith('peer_clone_finalize', {
+            endpoint: 'http://192.168.1.4:43123/',
+            sessionId: '123e4567-e89b-12d3-a456-426614174000',
+            manifestId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        })
     })
 
     it('does not finalize while native transfer is still downloading, and resume does not reclaim', async () => {

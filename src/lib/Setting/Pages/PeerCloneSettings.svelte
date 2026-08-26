@@ -97,8 +97,7 @@
     async function startSource(): Promise<void> {
         if (!sourceStatus.sessionId) return
         await withBusy(async () => {
-            await facade.start(sourceStatus.sessionId!)
-            sourceStatus = await facade.sourceStatus()
+            sourceStatus = await facade.start(sourceStatus.sessionId!)
             sourcePairingUri = sourceStatus.pairingUri ?? ''
             if (sourcePairingUri) {
                 const { default: QRCode } = await import('qrcode')
@@ -140,10 +139,11 @@
                     }
                 })
                 .catch((cause) => {
-                    if (progressTimer) clearInterval(progressTimer)
-                    progressTimer = undefined
-                    facade.reportTargetFailure()
                     refreshState()
+                    if (cloneState.target.phase === 'failed') {
+                        if (progressTimer) clearInterval(progressTimer)
+                        progressTimer = undefined
+                    }
                     reportError(cause)
                 })
         }, 500)
@@ -287,7 +287,7 @@
                 onclick={downloadClone}
             >{language.peerClone.download}</Button>
             <Button
-                disabled={!targetEnabled || busy || cloneState.target.phase !== 'cancelled'}
+                disabled={!targetEnabled || busy || (cloneState.target.phase !== 'cancelled' && cloneState.target.phase !== 'failed')}
                 onclick={resumeClone}
             >{language.peerClone.resume}</Button>
             <Button
