@@ -1,5 +1,5 @@
 import { get, writable } from "svelte/store";
-import { type character, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
+import { type character, type groupChat, type MessageGenerationInfo, type Chat, type MessagePresetInfo, changeToPreset, setCurrentChat, type Message, type StreamingDisplayOptimizationMode } from "../storage/database.svelte";
 import { DBState } from '../stores.svelte';
 import { CharEmotion, selectedCharID } from "../stores.svelte";
 import { ChatTokenizer, tokenize, tokenizeNum } from "../tokenizer";
@@ -937,7 +937,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    const requiresLivePromptCompatibility = pluginV2.editprocess.size > 0
+    const requiresLivePromptCompatibility = (pluginV2.editprocess?.size ?? 0) > 0
     const promptHistory = beginPromptHistoryOperation(nowChatroom, currentChat)
     let promptHistoryCompatibilitySnapshot: PromptHistoryCompatibilitySnapshot | null = null
     try {
