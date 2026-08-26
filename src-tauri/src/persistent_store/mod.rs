@@ -226,6 +226,22 @@ impl AssetAlias {
                 message: "Asset alias kind must be asset or inlay".to_owned(),
             });
         }
+        match self.kind.as_str() {
+            "inlay" if self.inlay_type.is_none() => {
+                return Err(StoreError::Validation {
+                    message: "Asset alias inlayType is required and must be valid".to_owned(),
+                });
+            }
+            "asset"
+                if self.inlay_type.is_some() || self.width.is_some() || self.height.is_some() =>
+            {
+                return Err(StoreError::Validation {
+                    message: "Asset alias Inlay metadata is forbidden for ordinary assets"
+                        .to_owned(),
+                });
+            }
+            _ => {}
+        }
         if self.size < 0 {
             return Err(StoreError::Validation {
                 message: "Asset alias size must be nonnegative".to_owned(),

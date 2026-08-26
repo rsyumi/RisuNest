@@ -519,6 +519,38 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         await expect(store.readAssetAlias('assets/corrupt.bin')).rejects.toThrow('objectHash')
     })
 
+    it('fails closed when a persisted alias row identity does not match its lookup key', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `asset-alias-identity-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const requestedKey = 'assets/requested.bin'
+        const recordKey = `revision-0:asset-alias:${requestedKey}`
+        const value = {
+            key: requestedKey,
+            objectHash: '88'.repeat(32),
+            kind: 'asset',
+            size: 1,
+            mime: 'application/octet-stream',
+            name: 'Requested',
+            ext: 'bin',
+        }
+        await writeRawRecords(indexedDB, databaseName, 'assetAliases', [{
+            key: recordKey,
+            generation: 'revision-other',
+            value,
+        }])
+
+        await expect(store.readAssetAlias(requestedKey)).rejects.toThrow('generation')
+
+        await writeRawRecords(indexedDB, databaseName, 'assetAliases', [{
+            key: recordKey,
+            generation: 'revision-0',
+            value: { ...value, key: 'assets/other.bin' },
+        }])
+        await expect(store.readAssetAlias(requestedKey)).rejects.toThrow('logical key')
+    })
+
     it('acquires a revision by reference without copying persistent records', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `revision-reference-count-${databaseSequence++}`

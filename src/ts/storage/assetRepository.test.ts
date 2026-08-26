@@ -1,6 +1,6 @@
 import { IDBFactory, IDBKeyRange } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
-import type { BlobStore } from './blobStore'
+import type { BlobStore, BlobWriteMetadata } from './blobStore'
 import { createImmutablePayloadCas, type ImmutablePayloadCas } from './payloadCas'
 import { IndexedDbPersistentDataStore } from './indexedDbPersistentDataStore'
 import type {
@@ -12,6 +12,53 @@ import { createAssetRepository, createAssetRepositoryBlobStore } from './assetRe
 import { fixtureDatabase } from './tests/persistentDataFixtures'
 
 describe('AssetRepository BlobStore facade', () => {
+    it('rejects kind-invalid metadata before preparing bytes or reading the revision', async () => {
+        const store = {
+            readRoot: vi.fn(),
+            commitAssetAlias: vi.fn(),
+            readAssetAlias: vi.fn(),
+        } as unknown as PersistentDataStore
+        const cas = { prepare: vi.fn() } as unknown as ImmutablePayloadCas
+        const legacy = {} as BlobStore
+        const facade = createAssetRepositoryBlobStore({
+            store,
+            cas,
+            legacy,
+            legacyFallback: false,
+            removal: 'disabled',
+        })
+        const invalidMetadata = [
+            {
+                kind: 'inlay',
+                mime: 'image/png',
+                name: 'Missing type',
+                ext: 'png',
+            },
+            {
+                kind: 'asset',
+                mime: 'image/png',
+                name: 'Ordinary asset',
+                ext: 'png',
+                inlayType: 'image',
+            },
+        ] as unknown as BlobWriteMetadata[]
+
+        await expect(facade.put(
+            'assets/invalid-inlay.bin',
+            new Uint8Array([1]),
+            invalidMetadata[0],
+        )).rejects.toThrow('inlayType')
+        await expect(facade.put(
+            'assets/invalid-asset.bin',
+            new Uint8Array([2]),
+            invalidMetadata[1],
+        )).rejects.toThrow('Inlay metadata')
+
+        expect(cas.prepare).not.toHaveBeenCalled()
+        expect(store.readRoot).not.toHaveBeenCalled()
+        expect(store.commitAssetAlias).not.toHaveBeenCalled()
+    })
+
     it('prepares the immutable object before committing one exact alias', async () => {
         const events: string[] = []
         let alias: AssetAlias | null = null
@@ -72,6 +119,79 @@ describe('AssetRepository BlobStore facade', () => {
             ext: 'BIN',
         })
         expect(legacy.put).not.toHaveBeenCalled()
+    })
+
+    it('advertises only CAS-correct methods and observes a CAS-only put without legacy access', async () => {
+        let revision = 1
+        let alias: AssetAlias | null = null
+        const objects = new Map<string, Uint8Array>()
+        const store = {
+            readRoot: vi.fn(async () => ({ revision, value: {} })),
+            readAssetAlias: vi.fn(async () => alias === null
+                ? null
+                : { revision, value: structuredClone(alias) }),
+            commitAssetAlias: vi.fn(async (value: AssetAlias, expectedRevision: number) => {
+                expect(expectedRevision).toBe(revision)
+                alias = structuredClone(value)
+                revision++
+                return { revision }
+            }),
+        } as unknown as PersistentDataStore
+        const cas = {
+            prepare: vi.fn(async (data: Uint8Array) => {
+                const contentHash = 'ab'.repeat(32)
+                objects.set(contentHash, data.slice())
+                return {
+                    contentHash,
+                    byteSize: data.byteLength,
+                    physicalKey: `assets-v2/objects/ab/${'ab'.repeat(31)}`,
+                    deduplicated: false,
+                }
+            }),
+            readObject: vi.fn(async (hash: string) => objects.get(hash)?.slice() ?? null),
+            statObject: vi.fn(async (hash: string) => objects.get(hash)?.byteLength ?? null),
+        } as ImmutablePayloadCas
+        const legacy = {
+            read: vi.fn(),
+            stat: vi.fn(),
+            list: vi.fn(),
+            remove: vi.fn(),
+            resolveUrl: vi.fn(),
+        } as unknown as BlobStore
+        const facade = createAssetRepositoryBlobStore({
+            store,
+            cas,
+            legacy,
+            legacyFallback: false,
+            removal: 'legacy-only',
+        })
+        const bytes = new Uint8Array([7, 8, 9])
+
+        await facade.put('assets/cas-only.bin', bytes, {
+            kind: 'asset',
+            mime: 'application/octet-stream',
+            name: 'CAS only',
+            ext: 'bin',
+        })
+
+        await expect(facade.read('assets/cas-only.bin')).resolves.toEqual(bytes)
+        await expect(facade.stat('assets/cas-only.bin')).resolves.toEqual({
+            key: 'assets/cas-only.bin',
+            kind: 'asset',
+            size: 3,
+            mime: 'application/octet-stream',
+            name: 'CAS only',
+            ext: 'bin',
+        })
+        await facade.remove('assets/cas-only.bin')
+        await expect(facade.read('assets/cas-only.bin')).resolves.toEqual(bytes)
+        expect('list' in facade).toBe(false)
+        expect('resolveUrl' in facade).toBe(false)
+        expect(legacy.read).not.toHaveBeenCalled()
+        expect(legacy.stat).not.toHaveBeenCalled()
+        expect(legacy.list).not.toHaveBeenCalled()
+        expect(legacy.remove).not.toHaveBeenCalled()
+        expect(legacy.resolveUrl).not.toHaveBeenCalled()
     })
 
     it('reads and stats current and pinned aliases directly without enumerating objects', async () => {

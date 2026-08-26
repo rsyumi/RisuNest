@@ -260,8 +260,6 @@ fn asset_alias_abort_and_reopen_sweep_remove_staged_rows() {
 
 #[test]
 fn invalid_asset_aliases_leave_revision_and_staging_rows_unchanged() {
-    let directory = tempfile::tempdir().expect("create temporary directory");
-    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     let valid = AssetAlias {
         key: "assets/valid.bin".to_owned(),
         object_hash: Some("99".repeat(32)),
@@ -274,24 +272,46 @@ fn invalid_asset_aliases_leave_revision_and_staging_rows_unchanged() {
         width: None,
         height: None,
     };
-    let invalid = AssetAlias {
+    let invalid_hash = AssetAlias {
         key: "assets/invalid.bin".to_owned(),
         object_hash: Some("INVALID".to_owned()),
         ..valid.clone()
     };
+    let inlay_without_type = AssetAlias {
+        key: "inlay/invalid.bin".to_owned(),
+        kind: "inlay".to_owned(),
+        ..valid.clone()
+    };
+    let asset_with_inlay_metadata = AssetAlias {
+        key: "assets/invalid-metadata.bin".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: Some(1),
+        height: Some(1),
+        ..valid.clone()
+    };
 
-    assert!(store.commit_asset_alias(&invalid, 0).is_err());
-    assert_eq!(store.revision().expect("read unchanged revision"), 0);
-    assert_eq!(
-        store
-            .read_asset_alias(&invalid.key, None)
-            .expect("read rejected current alias"),
-        None
-    );
+    for invalid in [
+        &invalid_hash,
+        &inlay_without_type,
+        &asset_with_inlay_metadata,
+    ] {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+        assert!(store.commit_asset_alias(invalid, 0).is_err());
+        assert_eq!(store.revision().expect("read unchanged revision"), 0);
+        assert_eq!(
+            store
+                .read_asset_alias(&invalid.key, None)
+                .expect("read rejected current alias"),
+            None
+        );
+    }
 
+    let directory = tempfile::tempdir().expect("create staging directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open staging store");
     let staging = store.replace_begin().expect("begin staged replacement");
     assert!(store
-        .replace_put_asset_aliases(&staging.staging_id, &[valid, invalid])
+        .replace_put_asset_aliases(&staging.staging_id, &[valid, invalid_hash])
         .is_err());
     let staged_rows: i64 = store
         .connection
@@ -337,6 +357,40 @@ fn corrupt_persisted_asset_alias_fails_direct_lookup_and_integrity_check() {
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .expect("run integrity check");
     assert_ne!(integrity, "ok");
+}
+
+#[test]
+fn asset_alias_direct_lookup_is_scoped_to_generation_and_logical_key() {
+    let directory = tempfile::tempdir().expect("create temporary directory");
+    let store = PersistentStore::open(directory.path()).expect("open persistent store");
+    store
+        .connection
+        .execute_batch(
+            "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext
+             ) VALUES
+                ('revision-other', 'assets/requested.bin', NULL, 'asset', 0,
+                 'application/octet-stream', 'Other generation', 'bin'),
+                ('revision-0', 'assets/other.bin', NULL, 'asset', 0,
+                 'application/octet-stream', 'Other key', 'bin');",
+        )
+        .expect("insert direct lookup scope fixtures");
+
+    assert_eq!(
+        store
+            .read_asset_alias("assets/requested.bin", None)
+            .expect("read requested alias"),
+        None
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("assets/other.bin", None)
+            .expect("read active other alias")
+            .expect("active other alias exists")
+            .value
+            .key,
+        "assets/other.bin"
+    );
 }
 
 #[test]

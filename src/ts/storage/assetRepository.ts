@@ -5,6 +5,7 @@ import {
     type BlobStore,
 } from './blobStore'
 import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
+import { validateAssetAlias } from './persistentDataStore'
 import type {
     AssetAlias,
     PersistentDataStore,
@@ -81,6 +82,7 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
             const versioned = await reader.readAssetAlias(key)
             if (!versioned) return null
             const alias = versioned.value
+            validateAssetAlias(alias)
             if (alias.objectHash !== null) {
                 const data = await cas.readObject(alias.objectHash)
                 if (data !== null) {
@@ -120,6 +122,7 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
             const versioned = await reader.readAssetAlias(key)
             if (!versioned) return null
             const alias = versioned.value
+            validateAssetAlias(alias)
             if (alias.objectHash !== null) {
                 const objectSize = await cas.statObject(alias.objectHash)
                 if (objectSize !== null) {
@@ -160,9 +163,14 @@ export interface AssetRepositoryBlobStoreOptions {
     removal: 'disabled' | 'legacy-only'
 }
 
+export type AssetRepositoryBlobStoreFacade = Pick<
+    BlobStore,
+    'put' | 'read' | 'stat' | 'remove'
+>
+
 export function createAssetRepositoryBlobStore(
     options: AssetRepositoryBlobStoreOptions,
-): BlobStore {
+): AssetRepositoryBlobStoreFacade {
     const { store, cas, legacy } = options
     const repository = createAssetRepository({
         reader: store,
@@ -173,14 +181,20 @@ export function createAssetRepositoryBlobStore(
     return {
         async put(key, data, metadata) {
             const ownedData = data.slice()
-            const { revision } = await store.readRoot()
-            const prepared = await cas.prepare(ownedData)
-            const alias: AssetAlias = {
+            const pendingAlias = {
                 ...metadata,
                 key,
-                objectHash: prepared.contentHash,
+                objectHash: null,
                 size: ownedData.byteLength,
+            } as AssetAlias
+            validateAssetAlias(pendingAlias)
+            const prepared = await cas.prepare(ownedData)
+            const alias: AssetAlias = {
+                ...pendingAlias,
+                objectHash: prepared.contentHash,
             }
+            validateAssetAlias(alias)
+            const { revision } = await store.readRoot()
             await store.commitAssetAlias(alias, revision)
             return aliasBlobMetadata(alias)
         },
@@ -197,10 +211,10 @@ export function createAssetRepositoryBlobStore(
             }
             return options.legacyFallback ? legacy.stat(key) : null
         },
-        list: (query) => legacy.list(query),
         async remove(key) {
-            if (options.removal === 'legacy-only') await legacy.remove(key)
+            if (options.legacyFallback && options.removal === 'legacy-only') {
+                await legacy.remove(key)
+            }
         },
-        resolveUrl: (key) => legacy.resolveUrl(key),
     }
 }

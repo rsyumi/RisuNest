@@ -24,20 +24,36 @@ export interface PluginStorageCatalog {
 export type AssetAliasKind = 'asset' | 'inlay'
 export type AssetAliasInlayType = 'image' | 'video' | 'audio' | 'signature'
 
-export interface AssetAlias {
+interface AssetAliasBase {
     key: string
     objectHash: string | null
-    kind: AssetAliasKind
     size: number
     mime: string
     name: string
     ext: string
-    inlayType?: AssetAliasInlayType
-    width?: number
-    height?: number
 }
 
+export type AssetAlias = AssetAliasBase & (
+    | {
+        kind: 'asset'
+        inlayType?: never
+        width?: never
+        height?: never
+    }
+    | {
+        kind: 'inlay'
+        inlayType: AssetAliasInlayType
+        width?: number
+        height?: number
+    }
+)
+
 export function validateAssetAlias(alias: AssetAlias): void {
+    const inlayMetadata = alias as unknown as {
+        inlayType?: unknown
+        width?: unknown
+        height?: unknown
+    }
     if (typeof alias.key !== 'string') throw new TypeError('Asset alias key must be a string')
     if (alias.objectHash !== null && !/^[0-9a-f]{64}$/.test(alias.objectHash)) {
         throw new TypeError('Asset alias objectHash must be null or 64 lowercase hexadecimal characters')
@@ -55,17 +71,28 @@ export function validateAssetAlias(alias: AssetAlias): void {
     ] as const) {
         if (typeof value !== 'string') throw new TypeError(`Asset alias ${field} must be a string`)
     }
-    if (
-        alias.inlayType !== undefined
-        && !['image', 'video', 'audio', 'signature'].includes(alias.inlayType)
+    if (alias.kind === 'inlay') {
+        if (
+            typeof inlayMetadata.inlayType !== 'string'
+            || !['image', 'video', 'audio', 'signature'].includes(inlayMetadata.inlayType)
+        ) {
+            throw new TypeError('Asset alias inlayType is required and must be valid')
+        }
+    } else if (
+        inlayMetadata.inlayType !== undefined
+        || inlayMetadata.width !== undefined
+        || inlayMetadata.height !== undefined
     ) {
-        throw new TypeError('Asset alias inlayType is invalid')
+        throw new TypeError('Asset alias Inlay metadata is forbidden for ordinary assets')
     }
     for (const [field, value] of [
-        ['width', alias.width],
-        ['height', alias.height],
+        ['width', inlayMetadata.width],
+        ['height', inlayMetadata.height],
     ] as const) {
-        if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) {
+        if (
+            value !== undefined
+            && (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
+        ) {
             throw new TypeError(`Asset alias ${field} must be a nonnegative safe integer`)
         }
     }

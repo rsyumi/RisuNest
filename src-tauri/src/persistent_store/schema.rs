@@ -126,6 +126,10 @@ fn create_v6(connection: &mut Connection) -> StoreResult<()> {
             ),
             width INTEGER CHECK (width IS NULL OR width >= 0),
             height INTEGER CHECK (height IS NULL OR height >= 0),
+            CHECK (
+                (kind = 'asset' AND inlay_type IS NULL AND width IS NULL AND height IS NULL)
+                OR (kind = 'inlay' AND inlay_type IS NOT NULL)
+            ),
             PRIMARY KEY (generation, logical_key)
         );
         CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
@@ -166,6 +170,10 @@ fn create_asset_aliases(transaction: &Transaction<'_>) -> StoreResult<()> {
             ),
             width INTEGER CHECK (width IS NULL OR width >= 0),
             height INTEGER CHECK (height IS NULL OR height >= 0),
+            CHECK (
+                (kind = 'asset' AND inlay_type IS NULL AND width IS NULL AND height IS NULL)
+                OR (kind = 'inlay' AND inlay_type IS NOT NULL)
+            ),
             PRIMARY KEY (generation, logical_key)
         );
         CREATE INDEX asset_aliases_generation ON asset_aliases (generation);

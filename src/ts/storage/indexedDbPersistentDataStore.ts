@@ -857,6 +857,12 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         )) as StoredRecord<AssetAlias> | undefined
         await transactionDone(transaction)
         if (!record) return null
+        if (record.generation !== generation) {
+            throw new TypeError('Asset alias stored generation does not match its lookup key')
+        }
+        if (record.value.key !== key) {
+            throw new TypeError('Asset alias stored logical key does not match its lookup key')
+        }
         validateAssetAlias(record.value)
         return { revision, value: structuredClone(record.value) }
     }

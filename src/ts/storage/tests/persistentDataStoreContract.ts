@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Database, groupChat } from '../database.svelte'
-import type { PersistentDataStore } from '../persistentDataStore'
+import type { AssetAlias, PersistentDataStore } from '../persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
 
@@ -131,6 +131,39 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect((await store.readRoot()).revision).toBe(imported.revision)
             expect(await store.readAssetAlias(valid.key)).toBeNull()
             expect(await store.readAssetAlias(invalid.key)).toBeNull()
+        })
+
+        it('rejects aliases whose metadata does not match their kind', async () => {
+            const { store } = await createHarness()
+            const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const base = {
+                key: 'assets/discriminated.bin',
+                objectHash: '44'.repeat(32),
+                size: 1,
+                mime: 'application/octet-stream',
+                name: 'Discriminated',
+                ext: 'bin',
+            }
+            const inlayWithoutType = { ...base, kind: 'inlay' as const }
+            const assetWithInlayMetadata = {
+                ...base,
+                kind: 'asset' as const,
+                inlayType: 'image' as const,
+                width: 1,
+                height: 1,
+            }
+
+            await expect(store.commitAssetAlias(
+                inlayWithoutType as unknown as AssetAlias,
+                imported.revision,
+            )).rejects.toThrow('inlayType')
+            await expect(store.commitAssetAlias(
+                assetWithInlayMetadata as unknown as AssetAlias,
+                imported.revision,
+            )).rejects.toThrow('Inlay metadata')
+
+            expect((await store.readRoot()).revision).toBe(imported.revision)
+            expect(await store.readAssetAlias(base.key)).toBeNull()
         })
 
         it('stores plugin values outside root and materializes the legacy object losslessly', async () => {
