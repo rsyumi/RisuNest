@@ -301,10 +301,16 @@ impl LoopbackCloneClient {
         if self.manifest.is_some() {
             return Ok(());
         }
+        let requested_session_id = self
+            .transport
+            .session_url
+            .path_segments()
+            .and_then(|segments| segments.last());
         if let Some((manifest, manifest_id)) = load_persisted_manifest(
             &self.root.join(PERSISTED_MANIFEST_FILE),
             self.required_manifest_id.as_deref(),
             self.ledger.manifest_id.as_deref(),
+            requested_session_id,
         )? {
             if self.ledger.manifest_id.is_none() {
                 self.append_event(&LedgerEvent::Manifest {
@@ -863,6 +869,7 @@ fn load_persisted_manifest(
     path: &Path,
     required_manifest_id: Option<&str>,
     ledger_manifest_id: Option<&str>,
+    requested_session_id: Option<&str>,
 ) -> Result<Option<(CloneManifest, String)>, PeerSyncError> {
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -908,6 +915,9 @@ fn load_persisted_manifest(
                 received: manifest_id,
             });
         }
+    }
+    if requested_session_id.is_some_and(|session_id| session_id != manifest.session_id) {
+        return Ok(None);
     }
     if required_manifest_id.is_none() && ledger_manifest_id.is_none() {
         return Err(PeerSyncError::Storage(
