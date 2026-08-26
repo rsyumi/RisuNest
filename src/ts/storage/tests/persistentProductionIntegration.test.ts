@@ -246,6 +246,45 @@ describe('persistent production runtime', () => {
         expect(legacyWriter).not.toHaveBeenCalled()
     })
 
+    it('recovers a completed generation when the renderer reloads before the debounce flush', async () => {
+        const databaseName = `runtime-generation-reload-${crypto.randomUUID()}`
+        const database = makeDatabase()
+        const store = makeStore(databaseName)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            clock: {
+                setTimeout: () => Symbol('renderer-owned-debounce'),
+                clearTimeout: () => undefined,
+            },
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+
+        const completedGeneration = {
+            role: 'char' as const,
+            data: 'completed provider response',
+            chatId: 'generation-complete',
+            generationInfo: {
+                generationId: 'generation-complete',
+                model: 'synthetic-model',
+            },
+        }
+        adapter.current().characters[0].chats[0].message.push(completedGeneration)
+        runtime.markPersistentDataDirty(64)
+
+        const reopened = makeStore(databaseName)
+        await reopened.open()
+        const recovered = await reopened.materializeDatabase()
+
+        expect(recovered.characters[0].chats[0].message).toContainEqual(
+            completedGeneration,
+        )
+    })
+
     it('preserves inactive preset rows across scalable root flushes and active switches', async () => {
         const complete = makeDatabase()
         complete.botPresetsId = 0
