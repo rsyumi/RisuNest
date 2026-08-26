@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    io::{self, Read, Seek, SeekFrom},
-    net::{Ipv4Addr, SocketAddr, TcpStream},
+    fmt::Write as _,
+    io::{self, Read, Seek, SeekFrom, Write},
+    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -16,12 +17,17 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 const CLAIM_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_URL_BYTES: usize = 512;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 1024;
+const MAX_CLAIM_RESPONSE_BYTES: usize = 1024;
+const MAX_REQUEST_LINE_BYTES: usize = MAX_URL_BYTES + 32;
+const MAX_REQUEST_HEAD_BYTES: usize = MAX_REQUEST_LINE_BYTES + 2 + MAX_HEADER_BYTES + 4;
+const CONNECTION_IO_TIMEOUT: Duration = Duration::from_millis(250);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 pub struct LanPairing {
     pub session_id: String,
@@ -75,7 +81,18 @@ impl LanCloneClient {
                 response.status()
             )));
         }
-        let response: ClaimResponseOwned = response.json().map_err(transport)?;
+        let mut body = Vec::new();
+        response
+            .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(transport)?;
+        if body.len() > MAX_CLAIM_RESPONSE_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "LAN claim response is too large".to_owned(),
+            ));
+        }
+        let response: ClaimResponseOwned = serde_json::from_slice(&body)
+            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
         if response.device_id.is_empty()
             || response.bearer.len() != 64
             || response.permission != "clone-read"
@@ -301,6 +318,7 @@ pub struct LanCloneHost {
     shared: Arc<LanShared>,
     address: Option<SocketAddr>,
     stopped: Option<Arc<AtomicBool>>,
+    active_connection: Option<Arc<Mutex<Option<TcpStream>>>>,
     thread: Option<JoinHandle<Result<(), PeerSyncError>>>,
 }
 
@@ -315,6 +333,7 @@ impl LanCloneHost {
             }),
             address: None,
             stopped: None,
+            active_connection: None,
             thread: None,
         }
     }
@@ -331,23 +350,25 @@ impl LanCloneHost {
             expires_at: Instant::now() + CLAIM_TTL,
             consumed: false,
         });
-        let server = Server::http((Ipv4Addr::UNSPECIFIED, 0))
-            .map_err(|error| PeerSyncError::Transport(error.to_string()))?;
-        let address = server
-            .server_addr()
-            .to_ip()
-            .ok_or_else(|| PeerSyncError::Transport("LAN server has no IP address".to_owned()))?;
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(transport)?;
+        listener.set_nonblocking(true).map_err(transport)?;
+        let address = listener.local_addr().map_err(transport)?;
         if !address.ip().is_unspecified() {
             return Err(PeerSyncError::Protocol(
                 "LAN clone server must bind 0.0.0.0".to_owned(),
             ));
         }
         let stopped = Arc::new(AtomicBool::new(false));
+        let active_connection = Arc::new(Mutex::new(None));
         let shared = Arc::clone(&self.shared);
         let thread_stopped = Arc::clone(&stopped);
-        self.thread = Some(thread::spawn(move || serve(server, shared, thread_stopped)));
+        let thread_active_connection = Arc::clone(&active_connection);
+        self.thread = Some(thread::spawn(move || {
+            serve(listener, shared, thread_stopped, thread_active_connection)
+        }));
         self.address = Some(address);
         self.stopped = Some(stopped);
+        self.active_connection = Some(active_connection);
         Ok(LanPairing {
             session_id: self.shared.session.manifest().session_id.clone(),
             manifest_id: self.shared.session.manifest_id().to_owned(),
@@ -386,11 +407,10 @@ impl LanCloneHost {
         if let Some(stopped) = &self.stopped {
             stopped.store(true, Ordering::SeqCst);
         }
-        if let Some(address) = self.address {
-            let _ = TcpStream::connect_timeout(
-                &(Ipv4Addr::LOCALHOST, address.port()).into(),
-                Duration::from_millis(100),
-            );
+        if let Some(active_connection) = &self.active_connection {
+            if let Some(connection) = active_connection.lock().unwrap().take() {
+                let _ = connection.shutdown(Shutdown::Both);
+            }
         }
         if let Some(thread) = self.thread.take() {
             thread
@@ -401,6 +421,7 @@ impl LanCloneHost {
         self.shared.devices.lock().unwrap().clear();
         self.address = None;
         self.stopped = None;
+        self.active_connection = None;
         Ok(())
     }
 
@@ -419,115 +440,285 @@ impl Drop for LanCloneHost {
 }
 
 fn serve(
-    server: Server,
+    listener: TcpListener,
     shared: Arc<LanShared>,
     stopped: Arc<AtomicBool>,
+    active_connection: Arc<Mutex<Option<TcpStream>>>,
 ) -> Result<(), PeerSyncError> {
     while !stopped.load(Ordering::SeqCst) {
-        let Some(request) = server
-            .recv_timeout(Duration::from_millis(50))
-            .map_err(|error| PeerSyncError::Transport(error.to_string()))?
-        else {
-            continue;
+        let (stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+                continue;
+            }
+            Err(error) => return Err(transport(error)),
         };
-        if !stopped.load(Ordering::SeqCst) {
-            let _ = handle_request(request, &shared);
+        stream.set_nonblocking(false).map_err(transport)?;
+        stream
+            .set_read_timeout(Some(CONNECTION_IO_TIMEOUT))
+            .map_err(transport)?;
+        stream
+            .set_write_timeout(Some(CONNECTION_IO_TIMEOUT))
+            .map_err(transport)?;
+        let shutdown_handle = stream.try_clone().map_err(transport)?;
+        {
+            let mut active = active_connection.lock().unwrap();
+            if stopped.load(Ordering::SeqCst) {
+                let _ = shutdown_handle.shutdown(Shutdown::Both);
+                break;
+            }
+            *active = Some(shutdown_handle);
         }
+        let _ = handle_connection(stream, &shared, &stopped);
+        active_connection.lock().unwrap().take();
     }
     Ok(())
 }
 
-fn handle_request(request: Request, shared: &LanShared) -> Result<(), PeerSyncError> {
-    if request.url().len() > MAX_URL_BYTES
-        || request
-            .headers()
-            .iter()
-            .map(|header| header.field.as_str().len() + header.value.as_str().len())
-            .sum::<usize>()
-            > MAX_HEADER_BYTES
-    {
-        return respond_empty(request, 413);
+struct HttpRequest {
+    method: String,
+    url: String,
+    authorization: Option<String>,
+    range: Option<String>,
+    range_count: usize,
+    body: Vec<u8>,
+}
+
+enum RequestReadError {
+    Http(u16),
+    Io(io::Error),
+    Stopped,
+}
+
+fn handle_connection(
+    mut stream: TcpStream,
+    shared: &LanShared,
+    stopped: &AtomicBool,
+) -> Result<(), PeerSyncError> {
+    let request = match read_request(&mut stream, stopped) {
+        Ok(request) => request,
+        Err(RequestReadError::Http(status)) => return respond_empty(&mut stream, status),
+        Err(RequestReadError::Io(error)) => return Err(transport(error)),
+        Err(RequestReadError::Stopped) => return Ok(()),
+    };
+    if stopped.load(Ordering::SeqCst) {
+        return Ok(());
     }
+    handle_request(&mut stream, request, shared, stopped)
+}
+
+fn read_request(
+    stream: &mut TcpStream,
+    stopped: &AtomicBool,
+) -> Result<HttpRequest, RequestReadError> {
+    let mut head = [0_u8; MAX_REQUEST_HEAD_BYTES];
+    let mut head_len = 0_usize;
+    let head_end = loop {
+        if stopped.load(Ordering::SeqCst) {
+            return Err(RequestReadError::Stopped);
+        }
+        if let Some(position) = find_bytes(&head[..head_len], b"\r\n\r\n") {
+            break position;
+        }
+        if let Some(line_end) = find_bytes(&head[..head_len], b"\r\n") {
+            if line_end > MAX_REQUEST_LINE_BYTES
+                || head_len.saturating_sub(line_end + 2) > MAX_HEADER_BYTES
+            {
+                return Err(RequestReadError::Http(413));
+            }
+        } else if head_len > MAX_REQUEST_LINE_BYTES {
+            return Err(RequestReadError::Http(413));
+        }
+        if head_len == head.len() {
+            return Err(RequestReadError::Http(413));
+        }
+        match stream.read(&mut head[head_len..]) {
+            Ok(0) => return Err(RequestReadError::Http(400)),
+            Ok(read) => head_len += read,
+            Err(error) if is_timeout(&error) => {
+                return if stopped.load(Ordering::SeqCst) {
+                    Err(RequestReadError::Stopped)
+                } else {
+                    Err(RequestReadError::Http(408))
+                };
+            }
+            Err(error) => return Err(RequestReadError::Io(error)),
+        }
+    };
+
+    let line_end = find_bytes(&head[..head_end], b"\r\n").unwrap_or(head_end);
+    if line_end > MAX_REQUEST_LINE_BYTES
+        || head_end.saturating_sub(line_end.saturating_add(2)) > MAX_HEADER_BYTES
+    {
+        return Err(RequestReadError::Http(413));
+    }
+    let request_line =
+        std::str::from_utf8(&head[..line_end]).map_err(|_| RequestReadError::Http(400))?;
+    let mut parts = request_line.split(' ');
+    let method = parts.next().unwrap_or_default();
+    let url = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or_default();
+    if method.is_empty() || url.is_empty() || version != "HTTP/1.1" || parts.next().is_some() {
+        return Err(RequestReadError::Http(400));
+    }
+    if url.len() > MAX_URL_BYTES {
+        return Err(RequestReadError::Http(413));
+    }
+
+    let mut authorization = None;
+    let mut range = None;
+    let mut range_count = 0_usize;
+    let mut content_length = None;
+    let header_start = (line_end + 2).min(head_end);
+    let headers = std::str::from_utf8(&head[header_start..head_end])
+        .map_err(|_| RequestReadError::Http(400))?;
+    for line in headers.split("\r\n").filter(|line| !line.is_empty()) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(RequestReadError::Http(400));
+        };
+        if !valid_header_name(name) {
+            return Err(RequestReadError::Http(400));
+        }
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("authorization") {
+            if authorization.replace(value.to_owned()).is_some() {
+                return Err(RequestReadError::Http(400));
+            }
+        } else if name.eq_ignore_ascii_case("range") {
+            range_count += 1;
+            if range.is_none() {
+                range = Some(value.to_owned());
+            }
+        } else if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(RequestReadError::Http(400));
+            }
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| RequestReadError::Http(400))?,
+            );
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(RequestReadError::Http(400));
+        }
+    }
+
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        return Err(RequestReadError::Http(413));
+    }
+    let body_start = head_end + 4;
+    let available = head_len.saturating_sub(body_start).min(content_length);
+    let mut body = Vec::with_capacity(content_length);
+    body.extend_from_slice(&head[body_start..body_start + available]);
+    while body.len() < content_length {
+        if stopped.load(Ordering::SeqCst) {
+            return Err(RequestReadError::Stopped);
+        }
+        let remaining = content_length - body.len();
+        let mut buffer = [0_u8; MAX_BODY_BYTES];
+        match stream.read(&mut buffer[..remaining]) {
+            Ok(0) => return Err(RequestReadError::Http(400)),
+            Ok(read) => body.extend_from_slice(&buffer[..read]),
+            Err(error) if is_timeout(&error) => {
+                return if stopped.load(Ordering::SeqCst) {
+                    Err(RequestReadError::Stopped)
+                } else {
+                    Err(RequestReadError::Http(408))
+                };
+            }
+            Err(error) => return Err(RequestReadError::Io(error)),
+        }
+    }
+
+    Ok(HttpRequest {
+        method: method.to_owned(),
+        url: url.to_owned(),
+        authorization,
+        range,
+        range_count,
+        body,
+    })
+}
+
+fn handle_request(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+    stopped: &AtomicBool,
+) -> Result<(), PeerSyncError> {
     let prefix = format!("/v1/sessions/{}", shared.session.manifest().session_id);
-    if request.url() == format!("{prefix}/claim") {
-        return claim(request, shared);
+    if request.url == format!("{prefix}/claim") {
+        return claim(stream, request, shared);
     }
     let device = match authorize(&request, shared) {
         Ok(device) => device,
-        Err(status) => return respond_empty(request, status),
+        Err(status) => return respond_empty(stream, status),
     };
-    if request.url() == format!("{prefix}/manifest") {
-        if request.method() != &Method::Get {
-            return respond_empty(request, 405);
+    if request.url == format!("{prefix}/manifest") {
+        if request.method != "GET" {
+            return respond_empty(stream, 405);
         }
-        return request
-            .respond(
-                Response::new(
-                    StatusCode(200),
-                    vec![
-                        header("content-type", "application/json")?,
-                        header("etag", &quoted(shared.session.manifest_id()))?,
-                    ],
-                    io::Cursor::new(Arc::clone(&shared.manifest_bytes)),
-                    Some(shared.session.manifest_bytes().len()),
-                    None,
-                )
-                .with_chunked_threshold(usize::MAX),
-            )
-            .map_err(transport);
+        return respond_bytes(
+            stream,
+            200,
+            &[
+                ("Content-Type", "application/json"),
+                ("ETag", &quoted(shared.session.manifest_id())),
+            ],
+            &shared.manifest_bytes,
+        );
     }
-    if request.url() == format!("{prefix}/progress") {
-        if request.method() != &Method::Post {
-            return respond_empty(request, 405);
+    if request.url == format!("{prefix}/progress") {
+        if request.method != "POST" {
+            return respond_empty(stream, 405);
         }
-        return progress(request, shared, &device);
+        return progress(stream, request, shared, &device);
     }
     let object_prefix = format!("{prefix}/objects/");
-    let Some(object) = request
-        .url()
-        .strip_prefix(&object_prefix)
-        .map(str::to_owned)
-    else {
-        return respond_empty(request, 404);
+    let Some(object) = request.url.strip_prefix(&object_prefix).map(str::to_owned) else {
+        return respond_empty(stream, 404);
     };
     if object.contains('/') || !shared.session.manifest().objects.contains_key(&object) {
-        return respond_empty(request, 404);
+        return respond_empty(stream, 404);
     }
-    match request.method() {
-        Method::Head => head(request, shared, &object),
-        Method::Get => range(request, shared, &object),
-        _ => respond_empty(request, 405),
+    match request.method.as_str() {
+        "HEAD" => head(stream, shared, &object),
+        "GET" => range(stream, &request, shared, &object, stopped),
+        _ => respond_empty(stream, 405),
     }
 }
 
-fn claim(mut request: Request, shared: &LanShared) -> Result<(), PeerSyncError> {
-    if request.method() != &Method::Post {
-        return respond_empty(request, 405);
+fn claim(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+) -> Result<(), PeerSyncError> {
+    if request.method != "POST" {
+        return respond_empty(stream, 405);
     }
-    let Some(body) = read_small_body(request.as_reader()) else {
-        return respond_empty(request, 413);
-    };
-    let Ok(request_body) = serde_json::from_slice::<ClaimRequest>(&body) else {
-        return respond_empty(request, 400);
+    let Ok(request_body) = serde_json::from_slice::<ClaimRequest>(&request.body) else {
+        return respond_empty(stream, 400);
     };
     if request_body.claim.len() != 64 {
-        return respond_empty(request, 403);
+        return respond_empty(stream, 403);
     }
     let Ok(secret) = hex::decode(request_body.claim) else {
-        return respond_empty(request, 403);
+        return respond_empty(stream, 403);
     };
     if secret.len() != 32 {
-        return respond_empty(request, 403);
+        return respond_empty(stream, 403);
     }
     let mut claim = shared.claim.lock().unwrap();
     let Some(claim) = claim.as_mut() else {
-        return respond_empty(request, 410);
+        return respond_empty(stream, 410);
     };
     if claim.consumed || Instant::now() >= claim.expires_at {
-        return respond_empty(request, 410);
+        return respond_empty(stream, 410);
     }
     if !constant_time_eq(&claim.digest, &digest(&secret)) {
-        return respond_empty(request, 403);
+        return respond_empty(stream, 403);
     }
     claim.consumed = true;
     let bearer = random_secret()?;
@@ -550,16 +741,11 @@ fn claim(mut request: Request, shared: &LanShared) -> Result<(), PeerSyncError> 
             bearer_digest: digest(response.bearer.as_bytes()),
         },
     );
-    respond_json(request, 200, &response)
+    respond_json(stream, 200, &response)
 }
 
-fn authorize(request: &Request, shared: &LanShared) -> Result<String, u16> {
-    let value = request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("authorization"))
-        .map(|header| header.value.as_str())
-        .ok_or(401_u16)?;
+fn authorize(request: &HttpRequest, shared: &LanShared) -> Result<String, u16> {
+    let value = request.authorization.as_deref().ok_or(401_u16)?;
     let Some(bearer) = value.strip_prefix("Bearer ") else {
         return Err(401);
     };
@@ -581,62 +767,51 @@ fn authorize(request: &Request, shared: &LanShared) -> Result<String, u16> {
 }
 
 fn progress(
-    mut request: Request,
+    stream: &mut TcpStream,
+    request: HttpRequest,
     shared: &LanShared,
     device_id: &str,
 ) -> Result<(), PeerSyncError> {
-    let Some(body) = read_small_body(request.as_reader()) else {
-        return respond_empty(request, 413);
-    };
-    let Ok(progress) = serde_json::from_slice::<ProgressRequest>(&body) else {
-        return respond_empty(request, 400);
+    let Ok(progress) = serde_json::from_slice::<ProgressRequest>(&request.body) else {
+        return respond_empty(stream, 400);
     };
     if progress
         .current_object
         .as_deref()
         .is_some_and(|object| !shared.session.manifest().objects.contains_key(object))
     {
-        return respond_empty(request, 400);
+        return respond_empty(stream, 400);
     }
     if let Some(device) = shared.devices.lock().unwrap().get_mut(device_id) {
         device.info.verified_bytes = progress.verified_bytes;
         device.info.current_object = progress.current_object;
         device.info.last_seen_unix_ms = now_ms();
     }
-    respond_empty(request, 204)
+    respond_empty(stream, 204)
 }
 
-fn head(request: Request, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
+fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
     let descriptor = &shared.session.manifest().objects[object];
-    request
-        .respond(
-            Response::new(
-                StatusCode(200),
-                vec![
-                    header("content-length", &descriptor.size.to_string())?,
-                    header("accept-ranges", "bytes")?,
-                    header("etag", &quoted(object))?,
-                ],
-                io::empty(),
-                Some(descriptor.size as usize),
-                None,
-            )
-            .with_chunked_threshold(usize::MAX),
-        )
-        .map_err(transport)
+    write_response_head(
+        stream,
+        200,
+        &[("Accept-Ranges", "bytes"), ("ETag", &quoted(object))],
+        descriptor.size,
+    )
 }
 
-fn range(request: Request, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
-    let ranges: Vec<_> = request
-        .headers()
-        .iter()
-        .filter(|header| header.field.equiv("range"))
-        .collect();
-    if ranges.len() != 1 {
-        return respond_empty(request, 416);
+fn range(
+    stream: &mut TcpStream,
+    request: &HttpRequest,
+    shared: &LanShared,
+    object: &str,
+    stopped: &AtomicBool,
+) -> Result<(), PeerSyncError> {
+    if request.range_count != 1 {
+        return respond_empty(stream, 416);
     }
-    let Some((start, end)) = parse_range(ranges[0].value.as_str()) else {
-        return respond_empty(request, 416);
+    let Some((start, end)) = request.range.as_deref().and_then(parse_range) else {
+        return respond_empty(stream, 416);
     };
     let descriptor = &shared.session.manifest().objects[object];
     let Some(chunk) = descriptor
@@ -644,7 +819,7 @@ fn range(request: Request, shared: &LanShared, object: &str) -> Result<(), PeerS
         .iter()
         .find(|chunk| chunk.offset == start && chunk.offset + chunk.size - 1 == end)
     else {
-        return respond_empty(request, 416);
+        return respond_empty(stream, 416);
     };
     let physical = shared
         .session
@@ -655,25 +830,20 @@ fn range(request: Request, shared: &LanShared, object: &str) -> Result<(), PeerS
         .open_object(physical)?
         .ok_or_else(|| PeerSyncError::Storage("session object file is missing".to_owned()))?;
     file.seek(SeekFrom::Start(start))?;
-    request
-        .respond(
-            Response::new(
-                StatusCode(206),
-                vec![
-                    header("accept-ranges", "bytes")?,
-                    header("etag", &quoted(object))?,
-                    header(
-                        "content-range",
-                        &format!("bytes {start}-{end}/{}", descriptor.size),
-                    )?,
-                ],
-                file.take(chunk.size),
-                Some(chunk.size as usize),
-                None,
-            )
-            .with_chunked_threshold(usize::MAX),
-        )
-        .map_err(transport)
+    write_response_head(
+        stream,
+        206,
+        &[
+            ("Accept-Ranges", "bytes"),
+            ("ETag", &quoted(object)),
+            (
+                "Content-Range",
+                &format!("bytes {start}-{end}/{}", descriptor.size),
+            ),
+        ],
+        chunk.size,
+    )?;
+    copy_exact_response(stream, &mut file, chunk.size, stopped)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -777,43 +947,137 @@ fn parse_range(value: &str) -> Option<(u64, u64)> {
 fn quoted(value: &str) -> String {
     format!("\"{value}\"")
 }
-fn header(name: &str, value: &str) -> Result<Header, PeerSyncError> {
-    Header::from_bytes(name, value)
-        .map_err(|_| PeerSyncError::Protocol("invalid HTTP response header".to_owned()))
-}
 fn transport(error: impl std::fmt::Display) -> PeerSyncError {
     PeerSyncError::Transport(error.to_string())
 }
-fn respond_empty(request: Request, status: u16) -> Result<(), PeerSyncError> {
-    request
-        .respond(Response::empty(StatusCode(status)))
-        .map_err(transport)
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+fn valid_header_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        206 => "Partial Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        410 => "Gone",
+        413 => "Content Too Large",
+        416 => "Range Not Satisfiable",
+        _ => "Error",
+    }
+}
+fn write_response_head(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(&str, &str)],
+    content_length: u64,
+) -> Result<(), PeerSyncError> {
+    let mut response = String::with_capacity(512);
+    write!(
+        response,
+        "HTTP/1.1 {status} {}\r\nContent-Length: {content_length}\r\nConnection: close\r\n",
+        status_reason(status)
+    )
+    .map_err(transport)?;
+    for (name, value) in headers {
+        if !valid_header_name(name) || value.contains(['\r', '\n']) {
+            return Err(PeerSyncError::Protocol(
+                "invalid HTTP response header".to_owned(),
+            ));
+        }
+        write!(response, "{name}: {value}\r\n").map_err(transport)?;
+    }
+    response.push_str("\r\n");
+    stream.write_all(response.as_bytes()).map_err(transport)
+}
+fn respond_empty(stream: &mut TcpStream, status: u16) -> Result<(), PeerSyncError> {
+    write_response_head(stream, status, &[], 0)
+}
+fn respond_bytes(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(), PeerSyncError> {
+    write_response_head(stream, status, headers, body.len() as u64)?;
+    stream.write_all(body).map_err(transport)
 }
 fn respond_json<T: Serialize>(
-    request: Request,
+    stream: &mut TcpStream,
     status: u16,
     value: &T,
 ) -> Result<(), PeerSyncError> {
     let body =
         serde_json::to_vec(value).map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-    request
-        .respond(
-            Response::new(
-                StatusCode(status),
-                vec![header("content-type", "application/json")?],
-                io::Cursor::new(body.clone()),
-                Some(body.len()),
-                None,
-            )
-            .with_chunked_threshold(usize::MAX),
-        )
-        .map_err(transport)
+    respond_bytes(
+        stream,
+        status,
+        &[("Content-Type", "application/json")],
+        &body,
+    )
 }
-fn read_small_body(reader: &mut dyn Read) -> Option<Vec<u8>> {
-    let mut body = Vec::new();
-    reader
-        .take((MAX_BODY_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .ok()?;
-    (body.len() <= MAX_BODY_BYTES).then_some(body)
+fn copy_exact_response(
+    stream: &mut TcpStream,
+    reader: &mut dyn Read,
+    size: u64,
+    stopped: &AtomicBool,
+) -> Result<(), PeerSyncError> {
+    let mut remaining = size;
+    let mut buffer = [0_u8; RESPONSE_COPY_BUFFER_BYTES];
+    while remaining != 0 {
+        if stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let expected = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..expected])?;
+        if read == 0 {
+            return Err(PeerSyncError::Storage(
+                "LAN object ended before its manifest size".to_owned(),
+            ));
+        }
+        if let Err(error) = stream.write_all(&buffer[..read]) {
+            return if stopped.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(transport(error))
+            };
+        }
+        remaining -= read as u64;
+    }
+    Ok(())
 }

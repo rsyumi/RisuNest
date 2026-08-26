@@ -10,10 +10,10 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Barrier, Mutex,
+        mpsc, Arc, Barrier, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const CHILD_MODE_ENV: &str = "RISUNEST_P0_CLONE_CHILD_MODE";
@@ -582,6 +582,177 @@ fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_re
         matches!(client.head_object(&object), Err(PeerSyncError::Transport(message)) if message.contains("403"))
     );
     host.stop().unwrap();
+}
+
+fn assert_lan_stop_is_bounded(mut host: LanCloneHost, stalled: TcpStream) {
+    const STOP_DEADLINE: Duration = Duration::from_secs(1);
+    let (result_tx, result_rx) = mpsc::channel();
+    let stopper = thread::spawn(move || {
+        let started = Instant::now();
+        let result = host.stop();
+        let _ = result_tx.send((started.elapsed(), result));
+    });
+
+    let outcome = result_rx.recv_timeout(STOP_DEADLINE);
+    if outcome.is_err() {
+        drop(stalled);
+    }
+    let (elapsed, result) = outcome.unwrap_or_else(|_| {
+        result_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("LAN host did not stop after the stalled peer disconnected")
+    });
+    stopper.join().unwrap();
+    result.unwrap();
+    assert!(
+        elapsed <= STOP_DEADLINE,
+        "LAN host stop took {elapsed:?} while a peer was stalled"
+    );
+}
+
+#[test]
+fn lan_stop_interrupts_a_peer_stalled_in_an_incomplete_header() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let mut stalled = TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
+    write!(
+        stalled,
+        "GET /v1/sessions/{}/manifest HTTP/1.1\r\nHost: localhost\r\n",
+        pairing.session_id
+    )
+    .unwrap();
+    stalled.flush().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    assert_lan_stop_is_bounded(host, stalled);
+}
+
+#[test]
+fn lan_stop_interrupts_a_peer_stalled_in_an_incomplete_body() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let mut stalled = TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
+    write!(
+        stalled,
+        "POST /v1/sessions/{}/claim HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{{",
+        pairing.session_id
+    )
+    .unwrap();
+    stalled.flush().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    assert_lan_stop_is_bounded(host, stalled);
+}
+
+#[test]
+fn lan_stop_interrupts_a_range_receiver_that_does_not_read() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[CLONE_CHUNK_SIZE as usize]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let claim: Value = Client::new()
+        .post(format!(
+            "{endpoint}/v1/sessions/{}/claim",
+            pairing.session_id
+        ))
+        .json(&json!({"claim": pairing.claim}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let bearer = claim["bearer"].as_str().unwrap();
+    let object = host.manifest().payloads[0].object.clone();
+    let mut stalled = TcpStream::connect(("127.0.0.1", host.address().unwrap().port())).unwrap();
+    write!(
+        stalled,
+        "GET /v1/sessions/{}/objects/{} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nRange: bytes=0-{}\r\n\r\n",
+        pairing.session_id,
+        object,
+        bearer,
+        CLONE_CHUNK_SIZE - 1
+    )
+    .unwrap();
+    stalled.flush().unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    assert_lan_stop_is_bounded(host, stalled);
+}
+
+#[test]
+fn lan_server_rejects_oversized_request_lines_headers_and_bodies() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    host.start().unwrap();
+    let address = ("127.0.0.1", host.address().unwrap().port());
+
+    for request in [
+        format!(
+            "GET /{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "x".repeat(600)
+        ),
+        format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nX-Fill: {}\r\n\r\n",
+            "x".repeat(9 * 1024)
+        ),
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1025\r\n\r\n".to_owned(),
+    ] {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 413 "),
+            "unexpected oversized-request response: {response:?}"
+        );
+    }
+    host.stop().unwrap();
+}
+
+#[test]
+fn lan_client_bounds_an_incomplete_oversized_claim_response() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000000\r\n\r\n{}",
+            "x".repeat(1025)
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_secs(1));
+    });
+    let endpoint = format!("http://{address}");
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let claim = "a".repeat(64);
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = result_tx.send(LanCloneClient::claim(&endpoint, &session_id, &claim));
+    });
+
+    let result = result_rx
+        .recv_timeout(Duration::from_millis(750))
+        .expect("claim response reader waited for an oversized response to finish");
+    assert!(matches!(result, Err(PeerSyncError::Protocol(_))));
+    server.join().unwrap();
+    worker.join().unwrap();
 }
 
 fn assert_file_hash(path: &Path, expected: &str) {
