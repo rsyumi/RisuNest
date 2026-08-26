@@ -28,6 +28,7 @@ export type LogicalDeltaPullPlan =
           expectedLocalRevision: number
           expectedBaseManifestHash: string
           expectedRemoteGeneration: string
+          nextBaseGenerationSequence: string
           apply: LogicalDeltaApplyOperation[]
           preserveLocalKeys: string[]
           candidateObjectHashes: string[]
@@ -258,6 +259,7 @@ export async function planLogicalDeltaPull(input: {
         expectedLocalRevision: input.expectedLocalRevision,
         expectedBaseManifestHash: input.baseManifestHash,
         expectedRemoteGeneration: remote.generation,
+        nextBaseGenerationSequence: remote.generationSequence,
         apply,
         preserveLocalKeys,
         candidateObjectHashes: missingCandidateHashes(candidateObjectHashes, local),

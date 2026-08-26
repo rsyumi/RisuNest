@@ -83,6 +83,7 @@ describe('logical delta pull planner', () => {
             expectedLocalRevision: 4,
             expectedBaseManifestHash: baseHash,
             expectedRemoteGeneration: 'generation-1',
+            nextBaseGenerationSequence: '1',
             apply: [],
             preserveLocalKeys: [],
             candidateObjectHashes: [],
@@ -112,6 +113,7 @@ describe('logical delta pull planner', () => {
             expectedLocalRevision: 7,
             expectedBaseManifestHash: await hashLogicalManifest(base),
             expectedRemoteGeneration: 'generation-2',
+            nextBaseGenerationSequence: '2',
             apply: [
                 {
                     type: 'put',
