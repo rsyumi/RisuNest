@@ -391,13 +391,13 @@ test('records the bounded Worker pilot pure CPU and recursive golden result', as
       return k3_fibonacci(value - 1) + k3_fibonacci(value - 2)
     end
 
-    function k3_pure_cpu(id)
+    listenEdit('editInput', function(id, value, meta)
       return k3_fibonacci(10)
-    end
+    end)
   `, {
     char: { chaId: 'k3-pure-cpu' } as never,
     chat: { message: [] } as never,
-    mode: 'k3_pure_cpu',
+    mode: 'editInput',
   })
 
   expect(result).toEqual({
@@ -411,26 +411,26 @@ test('records Lua global persistence with owner and mode isolation', async () =>
   const code = `
     counter = 0
 
-    function k3_global_a(id)
+    listenEdit('editInput', function(id, value, meta)
       counter = counter + 1
       return counter
-    end
+    end)
 
-    function k3_global_b(id)
+    listenEdit('editOutput', function(id, value, meta)
       counter = counter + 1
       return counter
-    end
+    end)
   `
-  const invoke = (owner: string, mode: string) => runScripted(code, {
+  const invoke = (owner: string, mode: 'editInput' | 'editOutput') => runScripted(code, {
     char: { chaId: owner } as never,
     chat: { message: [] } as never,
     mode,
   })
 
-  await expect(invoke('k3-owner-a', 'k3_global_a')).resolves.toMatchObject({ res: 1 })
-  await expect(invoke('k3-owner-a', 'k3_global_a')).resolves.toMatchObject({ res: 2 })
-  await expect(invoke('k3-owner-a', 'k3_global_b')).resolves.toMatchObject({ res: 1 })
-  await expect(invoke('k3-owner-b', 'k3_global_a')).resolves.toMatchObject({ res: 1 })
+  await expect(invoke('k3-owner-a', 'editInput')).resolves.toMatchObject({ res: 1 })
+  await expect(invoke('k3-owner-a', 'editInput')).resolves.toMatchObject({ res: 2 })
+  await expect(invoke('k3-owner-a', 'editOutput')).resolves.toMatchObject({ res: 1 })
+  await expect(invoke('k3-owner-b', 'editInput')).resolves.toMatchObject({ res: 1 })
 })
 
 test('records nil, null, false, arrays, and JSON round trips', async () => {
@@ -439,29 +439,30 @@ test('records nil, null, false, arrays, and JSON round trips', async () => {
     object: { empty: '', falseValue: false, zero: 0 },
   }
   const code = `
-    function k3_nil(id)
-      return nil
-    end
-
     listenEdit('editInput', function(id, value, meta)
-      return value
+      return nil
     end)
   `
 
   await expect(runScripted(code, {
     char: { chaId: 'k3-values' } as never,
     chat: { message: [] } as never,
-    mode: 'k3_nil',
+    mode: 'editInput',
   })).resolves.toMatchObject({ res: null, stopSending: false })
 
-  await expect(runScripted(code, {
-    char: { chaId: 'k3-values' } as never,
+  const roundTripCode = `
+    listenEdit('editInput', function(id, value, meta)
+      return value
+    end)
+  `
+  await expect(runScripted(roundTripCode, {
+    char: { chaId: 'k3-values-round-trip' } as never,
     chat: { message: [] } as never,
     data: data as never,
     mode: 'editInput',
   })).resolves.toMatchObject({ res: data, stopSending: false })
 
-  await expect(runScripted(code, {
+  await expect(runScripted(roundTripCode, {
     char: { chaId: 'k3-values-null' } as never,
     chat: { message: [] } as never,
     data: { nullValue: null } as never,
@@ -523,22 +524,27 @@ test.each(['editRequest', 'editInput', 'editOutput', 'editDisplay'] as const)(
   },
 )
 
-test('records handler errors as an empty result without partial chat mutation', async () => {
-  const chat = { message: [{ role: 'user', data: 'unchanged' }] }
+test('records eager partial chat mutation before a listener handler error', async () => {
+  const chat = { message: [{ role: 'user', data: 'before-error' }] }
   const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
 
   try {
     const result = await runScripted(`
-      function k3_handler_error(id)
+      listenEdit('editInput', function(id, value, meta)
+        setChat(id, 0, 'mutated-before-error')
         error('synthetic handler failure')
-      end
+      end)
     `, {
       char: { chaId: 'k3-handler-error' } as never,
       chat: chat as never,
-      mode: 'k3_handler_error',
+      mode: 'editInput',
     })
 
-    expect(result).toEqual({ chat, res: undefined, stopSending: false })
+    expect(result).toEqual({
+      chat: { message: [{ role: 'user', data: 'mutated-before-error' }] },
+      res: undefined,
+      stopSending: false,
+    })
     expect(consoleError).toHaveBeenCalled()
   }
   finally {
@@ -548,7 +554,7 @@ test('records handler errors as an empty result without partial chat mutation', 
 
 test('records explicit false stop and ordered chat mutations', async () => {
   const result = await runScripted(`
-    function k3_ordered_mutations(id)
+    listenEdit('editInput', function(id, value, meta)
       setChat(id, 0, 'edited')
       insertChat(id, 1, 'char', 'inserted')
       setChatRole(id, 0, 'char')
@@ -556,7 +562,7 @@ test('records explicit false stop and ordered chat mutations', async () => {
       addChat(id, 'user', 'tail')
       cutChat(id, 1, 4)
       return false
-    end
+    end)
   `, {
     char: { chaId: 'k3-ordered-mutations' } as never,
     chat: {
@@ -566,7 +572,7 @@ test('records explicit false stop and ordered chat mutations', async () => {
         { role: 'user', data: 'keep-me' },
       ],
     } as never,
-    mode: 'k3_ordered_mutations',
+    mode: 'editInput',
   })
 
   expect(result).toEqual({
@@ -580,4 +586,93 @@ test('records explicit false stop and ordered chat mutations', async () => {
     res: false,
     stopSending: true,
   })
+})
+
+test('records absolute and negative chat reads plus recent and length semantics', async () => {
+  const result = await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      return {
+        first = getChat(id, 0),
+        last = getChat(id, -1),
+        lastData = getChatData(id, -1),
+        firstRole = getChatRole(id, 0),
+        missingChatIsNil = getChat(id, 99) == nil,
+        missingNegativeIsNil = getChat(id, -4) == nil,
+        missingData = getChatData(id, 99),
+        missingRole = getChatRole(id, 99),
+        recent = getRecentChats(id, 2),
+        recentAll = getRecentChats(id, 99),
+        recentZero = getRecentChats(id, 0),
+        length = getChatLength(id)
+      }
+    end)
+  `, {
+    char: { chaId: 'k3-chat-reads' } as never,
+    chat: {
+      message: [
+        { role: 'user', data: 'zero', time: 10 },
+        { role: 'char', data: 'one' },
+        { role: 'user', data: 'two', time: 30 },
+      ],
+    } as never,
+    mode: 'editInput',
+  })
+
+  expect(result.res).toEqual({
+    first: { role: 'user', data: 'zero', time: 10 },
+    last: { role: 'user', data: 'two', time: 30 },
+    lastData: 'two',
+    firstRole: 'user',
+    missingChatIsNil: true,
+    missingNegativeIsNil: true,
+    missingData: '',
+    missingRole: '',
+    recent: [
+      { role: 'char', data: 'one', time: 0 },
+      { role: 'user', data: 'two', time: 30 },
+    ],
+    recentAll: [
+      { role: 'user', data: 'zero', time: 10 },
+      { role: 'char', data: 'one', time: 0 },
+      { role: 'user', data: 'two', time: 30 },
+    ],
+    recentZero: [],
+    length: 3,
+  })
+})
+
+test('records the synthetic LLM Promise await result in a supported listener mode', async () => {
+  const mockedRequestChatData = vi.mocked(requestChatData)
+  mockedRequestChatData.mockReset()
+  mockedRequestChatData.mockResolvedValueOnce({
+    type: 'success',
+    result: 'synthetic LLM response',
+  } as never)
+
+  const result = await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      local response = LLM(id, {
+        { role = 'user', content = 'synthetic fixture' }
+      })
+      return response.result
+    end)
+  `, {
+    char: { chaId: 'k3-promise-await' } as never,
+    chat: { message: [] } as never,
+    lowLevelAccess: true,
+    mode: 'editInput',
+  })
+
+  expect(result).toMatchObject({
+    res: 'synthetic LLM response',
+    stopSending: false,
+  })
+  expect(mockedRequestChatData).toHaveBeenCalledTimes(1)
+  expect(requestChatData).toHaveBeenCalledWith({
+    formated: [{ role: 'user', content: 'synthetic fixture' }],
+    bias: {},
+    useStreaming: false,
+    forceStreaming: false,
+    noMultiGen: true,
+  }, 'model')
 })
