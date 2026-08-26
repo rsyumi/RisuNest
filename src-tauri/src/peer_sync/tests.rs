@@ -704,6 +704,99 @@ fn lan_transport_reuses_the_p0_ledger_and_persisted_bearer_after_restart() {
     host.stop().unwrap();
 }
 
+#[test]
+fn persisted_lan_credential_rotates_atomically_over_an_existing_file() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let credential_root = tempfile::tempdir().unwrap();
+    let credential_path = credential_root.path().join("lan-credential.json");
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+
+    let first_pairing = host.start().unwrap();
+    let first_endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let first = LanCloneClient::claim_and_persist(
+        &credential_path,
+        &first_endpoint,
+        &first_pairing.session_id,
+        &first_pairing.manifest_id,
+        &first_pairing.claim,
+    )
+    .unwrap();
+    let first_device_id = first.device_id.clone();
+    let first_bytes = fs::read(&credential_path).unwrap();
+    host.stop().unwrap();
+
+    let second_pairing = host.start().unwrap();
+    let second_endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let second = LanCloneClient::claim_and_persist(
+        &credential_path,
+        &second_endpoint,
+        &second_pairing.session_id,
+        &second_pairing.manifest_id,
+        &second_pairing.claim,
+    )
+    .unwrap();
+    assert_ne!(second.device_id, first_device_id);
+    assert_ne!(fs::read(&credential_path).unwrap(), first_bytes);
+    assert!(fs::read_dir(credential_root.path())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".peer-credential-")));
+
+    let reopened = LanCloneClient::open_persisted(&credential_path).unwrap();
+    assert_eq!(reopened.device_id, second.device_id);
+    assert_eq!(
+        reopened
+            .fetch_manifest(&second_pairing.manifest_id)
+            .unwrap(),
+        host.manifest().canonical_bytes().unwrap()
+    );
+    host.stop().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn persisted_lan_credential_is_owner_only_on_unix() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let credential_root = tempfile::tempdir().unwrap();
+    let credential_parent = credential_root.path().join("peer-private");
+    let credential_path = credential_parent.join("lan-credential.json");
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+
+    LanCloneClient::claim_and_persist(
+        &credential_path,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::metadata(&credential_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&credential_parent)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    host.stop().unwrap();
+}
+
 fn assert_lan_stop_is_bounded(mut host: LanCloneHost, stalled: TcpStream) {
     const STOP_DEADLINE: Duration = Duration::from_secs(1);
     let (result_tx, result_rx) = mpsc::channel();

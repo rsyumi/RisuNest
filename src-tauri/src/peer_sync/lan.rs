@@ -376,18 +376,15 @@ impl LanCloneClient {
         let parent = credential_path.parent().ok_or_else(|| {
             PeerSyncError::Storage("LAN clone credential path has no parent".to_owned())
         })?;
-        fs::create_dir_all(parent)?;
+        ensure_credential_parent(parent)?;
         let temporary = parent.join(format!(".peer-credential-{}.tmp", uuid::Uuid::new_v4()));
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
+            let mut file = create_owner_only_credential_file(&temporary)?;
             file.write_all(&bytes)?;
             file.flush()?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, credential_path)?;
+            replace_credential_atomic(&temporary, credential_path)?;
             sync_parent_directory(parent)?;
             Ok(())
         })();
@@ -1092,6 +1089,80 @@ fn is_canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value)
         .map(|parsed| parsed.to_string() == value)
         .unwrap_or(false)
+}
+
+fn ensure_credential_parent(path: &Path) -> Result<(), PeerSyncError> {
+    #[cfg(unix)]
+    let created = !path.exists();
+    fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(PeerSyncError::Storage(
+            "invalid LAN clone credential directory".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    if created {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn create_owner_only_credential_file(path: &Path) -> Result<File, PeerSyncError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn replace_credential_atomic(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_credential_atomic(source: &Path, destination: &Path) -> Result<(), PeerSyncError> {
+    fs::rename(source, destination)?;
+    Ok(())
 }
 
 #[cfg(unix)]
