@@ -175,15 +175,17 @@ describe('LuaWorkerHarnessClient', () => {
     const middleWindow = {
       messages: [
         { role: 'user' as const, data: 'absolute eight' },
-        { role: 'char' as const, data: 'absolute nine' },
+        { role: 'char' as const, data: 'absolute nine', time: 9 },
       ],
       startIndex: 8,
       totalMessages: 12,
     }
 
     expect(getLuaWorkerContextLength(middleWindow)).toBe(12)
-    expect(readLuaWorkerContextMessage(middleWindow, 8)).toMatchObject({
+    expect(readLuaWorkerContextMessage(middleWindow, 8)).toEqual({
+      role: 'user',
       data: 'absolute eight',
+      time: 0,
     })
     expect(() => readLuaWorkerContextMessage(middleWindow, 0)).toThrowError(
       expect.objectContaining({ category: 'lua_worker_context_window' }),
@@ -191,6 +193,7 @@ describe('LuaWorkerHarnessClient', () => {
     expect(() => readLuaWorkerContextMessage(middleWindow, -1)).toThrowError(
       expect.objectContaining({ category: 'lua_worker_context_window' }),
     )
+    expect(readLuaWorkerRecentMessages(middleWindow, 0)).toEqual([])
     expect(() => readLuaWorkerRecentMessages(middleWindow, 2)).toThrowError(
       expect.objectContaining({ category: 'lua_worker_context_window' }),
     )
@@ -199,9 +202,14 @@ describe('LuaWorkerHarnessClient', () => {
       ...middleWindow,
       startIndex: 10,
     }
-    expect(readLuaWorkerRecentMessages(tailWindow, 2)).toEqual(tailWindow.messages)
-    expect(readLuaWorkerContextMessage(tailWindow, -1)).toMatchObject({
+    expect(readLuaWorkerRecentMessages(tailWindow, 2)).toEqual([
+      { role: 'user', data: 'absolute eight', time: 0 },
+      { role: 'char', data: 'absolute nine', time: 9 },
+    ])
+    expect(readLuaWorkerContextMessage(tailWindow, -1)).toEqual({
+      role: 'char',
       data: 'absolute nine',
+      time: 9,
     })
   })
 
@@ -1471,6 +1479,85 @@ describe('LuaWorkerHarnessClient', () => {
       category: 'lua_worker_crash',
     }))
     expect(commitMutations).toHaveBeenCalledTimes(1)
+    expect(worker.terminated).toBe(true)
+  })
+
+  it('rejects queued work immediately when a Worker crashes during a never-settling CAS', async () => {
+    const worker = new FakeLuaWorker()
+    const commitMutations = vi.fn(() => new Promise<boolean>(() => undefined))
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'never-settling-commit-crash-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const active = client.invoke(invocation(), { commitMutations })
+    const queued = client.invoke({ ...invocation(), data: 'queued' }, {
+      commitMutations: () => true,
+    })
+    const queuedOutcome = queued.catch((error) => error)
+    let activeSettled = false
+    void active.then(
+      () => { activeSettled = true },
+      () => { activeSettled = true },
+    )
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'claimed',
+      stopSending: false,
+    })
+    await vi.waitFor(() => expect(commitMutations).toHaveBeenCalledTimes(1))
+    worker.crash('crash while CAS never settles')
+
+    await expect(queuedOutcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_crash',
+    }))
+    await expect(client.invoke({ ...invocation(), data: 'after-crash' }, {
+      commitMutations: () => true,
+    })).rejects.toEqual(expect.objectContaining({ category: 'lua_worker_crash' }))
+    expect(activeSettled).toBe(false)
+    expect(worker.terminated).toBe(true)
+  })
+
+  it('rejects queued work immediately when disposed during a never-settling CAS', async () => {
+    const worker = new FakeLuaWorker()
+    const commitMutations = vi.fn(() => new Promise<boolean>(() => undefined))
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'never-settling-commit-dispose-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const active = client.invoke(invocation(), { commitMutations })
+    const queued = client.invoke({ ...invocation(), data: 'queued' }, {
+      commitMutations: () => true,
+    })
+    const queuedOutcome = queued.catch((error) => error)
+    let activeSettled = false
+    void active.then(
+      () => { activeSettled = true },
+      () => { activeSettled = true },
+    )
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'claimed',
+      stopSending: false,
+    })
+    await vi.waitFor(() => expect(commitMutations).toHaveBeenCalledTimes(1))
+    client.dispose()
+
+    await expect(queuedOutcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_disposed',
+    }))
+    expect(activeSettled).toBe(false)
     expect(worker.terminated).toBe(true)
   })
 

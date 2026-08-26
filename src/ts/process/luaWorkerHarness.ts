@@ -187,6 +187,9 @@ export class LuaWorkerHarnessClient {
         'Lua Worker harness client is disposed',
       ))
     }
+    if (this.active?.postCommitFailure !== undefined) {
+      return Promise.reject(this.active.postCommitFailure)
+    }
     if (options.signal?.aborted) {
       return Promise.reject(new LuaWorkerHarnessError(
         'lua_worker_abort',
@@ -830,6 +833,7 @@ export class LuaWorkerHarnessClient {
     const active = this.active
     if (active?.phase === 'committing') {
       active.postCommitFailure ??= error
+      this.rejectPending(error)
       return
     }
     this.active = undefined

@@ -158,7 +158,7 @@ export function readLuaWorkerContextMessage(
       `Lua Worker chat index ${absoluteIndex} is outside the bounded context window`,
     )
   }
-  return message
+  return projectLuaWorkerContextMessage(message)
 }
 
 export function readLuaWorkerRecentMessages(
@@ -168,6 +168,9 @@ export function readLuaWorkerRecentMessages(
   if (!Number.isSafeInteger(count) || count < 0) {
     throw new LuaWorkerContextWindowError('Lua Worker recent chat count must be a non-negative integer')
   }
+  if (count === 0) {
+    return []
+  }
   const firstIndex = Math.max(0, context.totalMessages - count)
   const windowEnd = context.startIndex + context.messages.length
   if (context.startIndex > firstIndex || windowEnd < context.totalMessages) {
@@ -175,7 +178,17 @@ export function readLuaWorkerRecentMessages(
       `Lua Worker recent ${count} chats are outside the bounded context window`,
     )
   }
-  return context.messages.slice(firstIndex - context.startIndex)
+  return context.messages
+    .slice(firstIndex - context.startIndex)
+    .map(projectLuaWorkerContextMessage)
+}
+
+function projectLuaWorkerContextMessage(message: LuaWorkerContextMessage): LuaWorkerContextMessage {
+  return {
+    role: message.role,
+    data: message.data,
+    time: message.time ?? 0,
+  }
 }
 
 export function assertLuaWorkerMutationInContextWindow(
