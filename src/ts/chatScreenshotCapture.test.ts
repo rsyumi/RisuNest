@@ -90,7 +90,7 @@ function harness(options: { height?: number; encodeError?: Error } = {}) {
     const batches: string[][] = []
     const archive = {
         addPage: vi.fn(async (_pageNumber: number, _page: Blob) => {}),
-        close: vi.fn(async (_signal?: AbortSignal) => {}),
+        close: vi.fn(async (_signal?: AbortSignal): Promise<void | boolean> => {}),
         abort: vi.fn(async () => {}),
     }
     const surface = {
@@ -135,9 +135,10 @@ function harness(options: { height?: number; encodeError?: Error } = {}) {
 }
 
 describe('bounded chat screenshot capture', () => {
-    it('fails closed for long archive export on every native runtime', () => {
-        expect(canExportLongScreenshotArchive(true)).toBe(false)
-        expect(canExportLongScreenshotArchive(false)).toBe(true)
+    it('allows long archives on Web and Tauri desktop while Android SAF stays gated', () => {
+        expect(canExportLongScreenshotArchive(false, false)).toBe(true)
+        expect(canExportLongScreenshotArchive(true, true)).toBe(true)
+        expect(canExportLongScreenshotArchive(true, false)).toBe(false)
     })
     it('exports a short bounded batch as one PNG in chronological order', async () => {
         const deps = harness()
@@ -184,6 +185,24 @@ describe('bounded chat screenshot capture', () => {
         expect(deps.archive.addPage.mock.calls.map((call) => call[0])).toEqual([1, 2, 3, 4])
         expect(deps.archive.close).toHaveBeenCalledOnce()
         expect(deps.archive.abort).not.toHaveBeenCalled()
+    })
+
+    it('reports a native ZIP as saved when cancellation loses to atomic publication', async () => {
+        const controller = new AbortController()
+        const deps = harness()
+        deps.archive.close.mockImplementation(async () => {
+            controller.abort()
+            return true
+        })
+
+        const result = await captureChatScreenshot(job(CHAT_SCREENSHOT_BATCH_SIZE + 1), {
+            ...deps,
+            signal: controller.signal,
+        })
+
+        expect(result).toEqual({ kind: 'zip', pages: 2 })
+        expect(deps.archive.abort).not.toHaveBeenCalled()
+        expect(controller.signal.aborted).toBe(true)
     })
 
     it('aborts output and releases the mounted surface after cancellation', async () => {

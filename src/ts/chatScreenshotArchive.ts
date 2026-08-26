@@ -3,12 +3,12 @@ import { Zip, ZipPassThrough } from 'fflate'
 export interface ScreenshotArchiveWriter {
     write(chunk: Uint8Array): Promise<void>
     close(): Promise<void>
-    abort(): Promise<void>
+    abort(): Promise<void | boolean>
 }
 
 export interface StreamingScreenshotArchive {
     addPage(pageNumber: number, page: Blob): Promise<void>
-    close(signal?: AbortSignal): Promise<void>
+    close(signal?: AbortSignal): Promise<void | boolean>
     abort(): Promise<void>
 }
 
@@ -50,16 +50,21 @@ export function createStreamingScreenshotArchive(
         if (final) resolveFinal()
     })
 
-    async function abortOnce() {
-        if (state === 'aborted') return
-        if (state === 'closed') return
-        state = 'aborted'
+    async function abortOnce(): Promise<boolean> {
+        if (state === 'aborted') return true
+        if (state === 'closed') return false
         zip.terminate()
-        await writer.abort()
+        const aborted = await writer.abort()
+        if (aborted === false) {
+            state = 'closed'
+            return false
+        }
+        state = 'aborted'
+        return true
     }
 
-    async function fail(error: unknown): Promise<never> {
-        await abortOnce()
+    async function fail(error: unknown): Promise<boolean> {
+        if (!await abortOnce()) return true
         throw error
     }
 
@@ -72,11 +77,23 @@ export function createStreamingScreenshotArchive(
             try {
                 const entry = new ZipPassThrough(`page-${pageNumber.toString().padStart(4, '0')}.png`)
                 zip.add(entry)
-                entry.push(new Uint8Array(await page.arrayBuffer()), true)
-                await writeChain
+                const reader = page.stream().getReader()
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read()
+                        if (done) break
+                        entry.push(value, false)
+                        await writeChain
+                        if (streamError) throw streamError
+                    }
+                    entry.push(new Uint8Array(0), true)
+                    await writeChain
+                } finally {
+                    reader.releaseLock()
+                }
                 if (streamError) throw streamError
             } catch (error) {
-                return fail(error)
+                await fail(error)
             }
         },
 
@@ -97,6 +114,8 @@ export function createStreamingScreenshotArchive(
             }
         },
 
-        abort: abortOnce,
+        async abort() {
+            await abortOnce()
+        },
     }
 }

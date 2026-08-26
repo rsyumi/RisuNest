@@ -44,6 +44,23 @@ describe('streaming screenshot archive', () => {
         expect(writer.abort).not.toHaveBeenCalled()
     })
 
+    it('streams each PNG blob without materializing its full array buffer', async () => {
+        const page = blob('streamed page')
+        const arrayBuffer = vi.spyOn(page, 'arrayBuffer')
+        const writer = {
+            write: vi.fn(async () => {}),
+            close: vi.fn(async () => {}),
+            abort: vi.fn(async () => {}),
+        }
+        const archive = createStreamingScreenshotArchive(writer)
+
+        await archive.addPage(1, page)
+        await archive.close()
+
+        expect(arrayBuffer).not.toHaveBeenCalled()
+        expect(writer.write).toHaveBeenCalled()
+    })
+
     it('aborts the writer once and cannot close or add after abort', async () => {
         const writer = {
             write: vi.fn(async () => {}),
@@ -88,6 +105,21 @@ describe('streaming screenshot archive', () => {
 
         await archive.addPage(1, blob('page'))
         await expect(archive.close(controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(writer.abort).toHaveBeenCalledOnce()
+    })
+
+    it('completes when native publication has crossed the cancellation boundary', async () => {
+        const controller = new AbortController()
+        const writer = {
+            write: vi.fn(async () => {}),
+            close: vi.fn(async () => controller.abort()),
+            abort: vi.fn(async () => false),
+        }
+        const archive = createStreamingScreenshotArchive(writer)
+
+        await archive.addPage(1, blob('page'))
+        await expect(archive.close(controller.signal)).resolves.toBe(true)
 
         expect(writer.abort).toHaveBeenCalledOnce()
     })

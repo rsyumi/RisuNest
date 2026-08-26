@@ -471,6 +471,13 @@ pub fn run() {
                 app_data_dir.join("native-file-jobs"),
             );
             app.manage(state);
+            app.manage(
+                native_file_jobs::screenshot_output::ScreenshotOutputState::initialize(
+                    app_data_dir
+                        .join("native-file-jobs")
+                        .join("screenshot-output"),
+                ),
+            );
             #[cfg(target_os = "windows")]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
@@ -525,6 +532,10 @@ pub fn run() {
             native_file_jobs::native_file_job_finalize,
             native_file_jobs::native_file_job_cancel,
             native_file_jobs::native_file_job_forget,
+            native_file_jobs::screenshot_output::native_file_job_screenshot_output_start,
+            native_file_jobs::screenshot_output::native_file_job_screenshot_output_append,
+            native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,
+            native_file_jobs::screenshot_output::native_file_job_screenshot_output_cancel,
             persistent_store::commands::pds_open,
             persistent_store::commands::pds_read_root,
             persistent_store::commands::pds_query_presets,

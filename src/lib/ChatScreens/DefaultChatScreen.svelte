@@ -66,7 +66,8 @@
     } from 'src/ts/chatScreenshotRange';
     import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
-    import { isTauri } from 'src/ts/platform';
+    import { createNativeScreenshotArchiveWriter } from 'src/ts/nativeScreenshotArchiveWriter';
+    import { isTauri, isTauriDesktop } from 'src/ts/platform';
     import { getModuleAssets, getModuleLorebooks, getModuleRegexScripts, getModules } from 'src/ts/process/modules';
     import { ColorSchemeTypeStore } from 'src/ts/gui/colorscheme';
     import { HideIconStore } from 'src/ts/stores.svelte';
@@ -713,8 +714,12 @@
                         return downloadFile(`${fileBase}.png`, new Uint8Array(await page.arrayBuffer()))
                     },
                     async createArchive() {
-                        if (!canExportLongScreenshotArchive(isTauri)) {
+                        if (!canExportLongScreenshotArchive(isTauri, isTauriDesktop)) {
                             throw new Error(language.screenshotLongNativeUnavailable)
+                        }
+                        if (isTauriDesktop) {
+                            const writer = await createNativeScreenshotArchiveWriter(`${fileBase}.zip`)
+                            return createStreamingScreenshotArchive(writer)
                         }
                         const writer = new LocalWriter()
                         const selected = await writer.init('ZIP', ['zip'], `${fileBase}.zip`)

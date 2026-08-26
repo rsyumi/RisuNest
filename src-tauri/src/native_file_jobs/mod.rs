@@ -1,4 +1,8 @@
 pub mod charx;
+pub mod screenshot_output;
+
+#[cfg(test)]
+mod screenshot_output_test;
 
 use crate::import_export_jobs::{
     classify_content, parse_json_card, ContentKind, FormatError, FormatErrorKind, ImportLimits,

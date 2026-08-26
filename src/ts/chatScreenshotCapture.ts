@@ -49,8 +49,8 @@ function throwIfAborted(signal: AbortSignal) {
     if (signal.aborted) throw new DOMException('Screenshot capture was cancelled', 'AbortError')
 }
 
-export function canExportLongScreenshotArchive(isNative: boolean) {
-    return !isNative
+export function canExportLongScreenshotArchive(isNative: boolean, isNativeDesktop: boolean) {
+    return !isNative || isNativeDesktop
 }
 
 export async function captureChatScreenshot(
@@ -133,8 +133,8 @@ export async function captureChatScreenshot(
         }
 
         throwIfAborted(signal)
-        if (archive) await archive.close(signal)
-        throwIfAborted(signal)
+        const committedAfterCancellation = archive ? await archive.close(signal) : false
+        if (!committedAfterCancellation) throwIfAborted(signal)
         return { kind: archive ? 'zip' : 'png', pages: pageNumber }
     } catch (error) {
         if (archive) await archive.abort()
