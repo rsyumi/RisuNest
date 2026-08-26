@@ -1,0 +1,737 @@
+use super::PeerSyncError;
+use crate::asset_repository::PayloadCas;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalDeltaApplyOperation {
+    Put {
+        key: String,
+        object_hash: String,
+        dependencies: Vec<String>,
+    },
+    Delete {
+        key: String,
+        deleted_generation_sequence: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyLogicalDeltaPlan {
+    pub expected_local_revision: i64,
+    pub expected_base_manifest_hash: String,
+    pub expected_remote_generation: String,
+    pub apply: Vec<LogicalDeltaApplyOperation>,
+    pub preserve_local_keys: Vec<String>,
+    pub candidate_object_hashes: Vec<String>,
+    pub next_base_manifest_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalDeltaObject {
+    pub hash: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalDeltaTransferSelection {
+    reused_from_local_manifest: Vec<LogicalDeltaObject>,
+    reused_from_cas: Vec<LogicalDeltaObject>,
+    missing_objects: Vec<LogicalDeltaObject>,
+}
+
+impl LogicalDeltaTransferSelection {
+    pub fn reused_from_local_manifest(&self) -> &[LogicalDeltaObject] {
+        &self.reused_from_local_manifest
+    }
+
+    pub fn reused_from_cas(&self) -> &[LogicalDeltaObject] {
+        &self.reused_from_cas
+    }
+
+    pub fn missing_objects(&self) -> &[LogicalDeltaObject] {
+        &self.missing_objects
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalDeltaActivation {
+    Activated {
+        revision: i64,
+    },
+    AlreadyActive {
+        revision: i64,
+    },
+    Conflict {
+        actual_revision: i64,
+        actual_base_manifest_hash: String,
+    },
+}
+
+pub trait LogicalDeltaObjectSource {
+    fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError>;
+}
+
+pub trait LogicalDeltaStagedTarget {
+    type Stage;
+
+    fn begin(&mut self, plan: &ReadyLogicalDeltaPlan) -> Result<Self::Stage, PeerSyncError>;
+
+    fn stage_payload(
+        &mut self,
+        stage: &mut Self::Stage,
+        object: &LogicalDeltaObject,
+        reader: &mut dyn Read,
+    ) -> Result<(), PeerSyncError>;
+
+    fn stage_database_changes(
+        &mut self,
+        stage: &mut Self::Stage,
+        plan: &ReadyLogicalDeltaPlan,
+    ) -> Result<(), PeerSyncError>;
+
+    /// The expected revision and base checks, database activation, and base update must be one
+    /// atomic target transaction. An error must mean that transaction did not commit.
+    fn activate_database_and_base_if_current(
+        &mut self,
+        stage: &mut Self::Stage,
+        expected_local_revision: i64,
+        expected_base_manifest_hash: &str,
+        next_base_manifest_hash: &str,
+    ) -> Result<LogicalDeltaActivation, PeerSyncError>;
+
+    fn abort(&mut self, stage: Self::Stage) -> Result<(), PeerSyncError>;
+}
+
+pub fn select_missing_logical_delta_objects(
+    plan: &ReadyLogicalDeltaPlan,
+    local_manifest_object_hashes: &BTreeSet<String>,
+    target_cas: &PayloadCas,
+    remote_object_sizes: &BTreeMap<String, u64>,
+) -> Result<LogicalDeltaTransferSelection, PeerSyncError> {
+    validate_ready_plan(plan)?;
+    let mut selection = LogicalDeltaTransferSelection {
+        reused_from_local_manifest: Vec::new(),
+        reused_from_cas: Vec::new(),
+        missing_objects: Vec::new(),
+    };
+    for hash in &plan.candidate_object_hashes {
+        let size = *remote_object_sizes.get(hash).ok_or_else(|| {
+            PeerSyncError::Validation(format!(
+                "logical delta remote manifest is missing object size for {hash}"
+            ))
+        })?;
+        let object = LogicalDeltaObject {
+            hash: hash.clone(),
+            size,
+        };
+        match target_cas.stat_object(hash)? {
+            Some(actual_size) if actual_size != size => {
+                return Err(PeerSyncError::Validation(format!(
+                    "logical delta object size mismatch for {hash}: expected {size}, found {actual_size}"
+                )));
+            }
+            Some(_) if local_manifest_object_hashes.contains(hash) => {
+                selection.reused_from_local_manifest.push(object);
+            }
+            Some(_) => selection.reused_from_cas.push(object),
+            None => selection.missing_objects.push(object),
+        }
+    }
+    Ok(selection)
+}
+
+pub fn execute_logical_delta_pull<S, T>(
+    plan: &ReadyLogicalDeltaPlan,
+    local_manifest_object_hashes: &BTreeSet<String>,
+    target_cas: &PayloadCas,
+    remote_object_sizes: &BTreeMap<String, u64>,
+    source: &mut S,
+    target: &mut T,
+) -> Result<LogicalDeltaActivation, PeerSyncError>
+where
+    S: LogicalDeltaObjectSource,
+    T: LogicalDeltaStagedTarget,
+{
+    let selection = select_missing_logical_delta_objects(
+        plan,
+        local_manifest_object_hashes,
+        target_cas,
+        remote_object_sizes,
+    )?;
+    let mut stage = target.begin(plan)?;
+    let result = (|| {
+        for object in selection.missing_objects() {
+            let mut source_reader = source.open_object(object)?;
+            let mut verified_reader = VerifiedObjectReader::new(source_reader.as_mut());
+            target.stage_payload(&mut stage, object, &mut verified_reader)?;
+            verified_reader.finish(object)?;
+        }
+        target.stage_database_changes(&mut stage, plan)?;
+        target.activate_database_and_base_if_current(
+            &mut stage,
+            plan.expected_local_revision,
+            &plan.expected_base_manifest_hash,
+            &plan.next_base_manifest_hash,
+        )
+    })();
+
+    match result {
+        Ok(activation @ LogicalDeltaActivation::Activated { .. }) => Ok(activation),
+        Ok(activation) => {
+            target.abort(stage)?;
+            Ok(activation)
+        }
+        Err(primary) => match target.abort(stage) {
+            Ok(()) => Err(primary),
+            Err(abort) => Err(PeerSyncError::Storage(format!(
+                "{primary}; logical delta staging abort failed: {abort}"
+            ))),
+        },
+    }
+}
+
+fn validate_ready_plan(plan: &ReadyLogicalDeltaPlan) -> Result<(), PeerSyncError> {
+    if plan.expected_local_revision < 0 {
+        return validation("logical delta expected local revision must be nonnegative");
+    }
+    validate_hash(
+        &plan.expected_base_manifest_hash,
+        "logical delta expected base manifest hash",
+    )?;
+    validate_hash(
+        &plan.next_base_manifest_hash,
+        "logical delta next base manifest hash",
+    )?;
+    if plan.expected_remote_generation.is_empty() {
+        return validation("logical delta expected remote generation must be nonempty");
+    }
+
+    let mut required_objects = BTreeSet::new();
+    for operation in &plan.apply {
+        match operation {
+            LogicalDeltaApplyOperation::Put {
+                object_hash,
+                dependencies,
+                ..
+            } => {
+                validate_hash(object_hash, "logical delta record object hash")?;
+                required_objects.insert(object_hash.clone());
+                let mut previous: Option<&str> = None;
+                for dependency in dependencies {
+                    validate_hash(dependency, "logical delta record dependency")?;
+                    if previous.is_some_and(|previous| previous >= dependency.as_str()) {
+                        return validation(
+                            "logical delta record dependencies must be sorted and unique",
+                        );
+                    }
+                    required_objects.insert(dependency.clone());
+                    previous = Some(dependency);
+                }
+            }
+            LogicalDeltaApplyOperation::Delete { .. } => {}
+        }
+    }
+    let candidates = plan
+        .candidate_object_hashes
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if candidates.len() != plan.candidate_object_hashes.len()
+        || candidates.iter().ne(plan.candidate_object_hashes.iter())
+    {
+        return validation("logical delta candidate object hashes must be sorted and unique");
+    }
+    for hash in &plan.candidate_object_hashes {
+        validate_hash(hash, "logical delta candidate object hash")?;
+    }
+    if candidates != required_objects {
+        return validation(
+            "logical delta candidate object hashes do not match the ready plan record graph",
+        );
+    }
+    Ok(())
+}
+
+fn validate_hash(hash: &str, description: &str) -> Result<(), PeerSyncError> {
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    validation(format!(
+        "{description} must be 64 lowercase hexadecimal characters"
+    ))
+}
+
+fn validation<T>(message: impl Into<String>) -> Result<T, PeerSyncError> {
+    Err(PeerSyncError::Validation(message.into()))
+}
+
+struct VerifiedObjectReader<'a> {
+    inner: &'a mut dyn Read,
+    hasher: Sha256,
+    bytes: u64,
+}
+
+impl<'a> VerifiedObjectReader<'a> {
+    fn new(inner: &'a mut dyn Read) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(mut self, object: &LogicalDeltaObject) -> Result<(), PeerSyncError> {
+        let mut extra = [0_u8; 1];
+        if self.read(&mut extra)? != 0 || self.bytes != object.size {
+            return Err(PeerSyncError::Validation(format!(
+                "logical delta object {} did not transfer its exact declared size",
+                object.hash
+            )));
+        }
+        if hex::encode(self.hasher.finalize()) != object.hash {
+            return Err(PeerSyncError::WholeObjectHashMismatch {
+                object: object.hash.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Read for VerifiedObjectReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(output)?;
+        self.hasher.update(&output[..read]);
+        self.bytes = self
+            .bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| std::io::Error::other("logical delta transfer byte count overflow"))?;
+        Ok(read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        execute_logical_delta_pull, select_missing_logical_delta_objects, LogicalDeltaActivation,
+        LogicalDeltaApplyOperation, LogicalDeltaObject, LogicalDeltaObjectSource,
+        LogicalDeltaStagedTarget, ReadyLogicalDeltaPlan,
+    };
+    use crate::{asset_repository::PayloadCas, peer_sync::PeerSyncError};
+    use sha2::{Digest, Sha256};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        io::{Cursor, Read},
+    };
+
+    fn hash(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    fn ready_plan(
+        apply: Vec<LogicalDeltaApplyOperation>,
+        candidate_object_hashes: Vec<String>,
+    ) -> ReadyLogicalDeltaPlan {
+        ReadyLogicalDeltaPlan {
+            expected_local_revision: 7,
+            expected_base_manifest_hash: "1".repeat(64),
+            expected_remote_generation: "remote-generation-8".to_owned(),
+            apply,
+            preserve_local_keys: Vec::new(),
+            candidate_object_hashes,
+            next_base_manifest_hash: "2".repeat(64),
+        }
+    }
+
+    fn put(
+        key: &str,
+        object_hash: String,
+        mut dependencies: Vec<String>,
+    ) -> LogicalDeltaApplyOperation {
+        dependencies.sort();
+        LogicalDeltaApplyOperation::Put {
+            key: key.to_owned(),
+            object_hash,
+            dependencies,
+        }
+    }
+
+    #[test]
+    fn exact_cas_stat_reuses_local_and_unreferenced_objects_and_selects_only_missing_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local = cas.prepare_bytes(b"local-object").unwrap();
+        let deduplicated = cas.prepare_bytes(b"unreferenced-but-present").unwrap();
+        let missing_hash = hash(b"missing-object");
+        let mut candidates = vec![
+            local.content_hash.clone(),
+            deduplicated.content_hash.clone(),
+            missing_hash.clone(),
+        ];
+        candidates.sort();
+        let plan = ready_plan(
+            vec![put(
+                "r1:root",
+                local.content_hash.clone(),
+                vec![deduplicated.content_hash.clone(), missing_hash.clone()],
+            )],
+            candidates.clone(),
+        );
+        let local_manifest_objects = BTreeSet::from([local.content_hash.clone()]);
+        let remote_object_sizes = BTreeMap::from([
+            (local.content_hash.clone(), local.byte_size),
+            (deduplicated.content_hash.clone(), deduplicated.byte_size),
+            (missing_hash.clone(), b"missing-object".len() as u64),
+        ]);
+
+        let selection = select_missing_logical_delta_objects(
+            &plan,
+            &local_manifest_objects,
+            &cas,
+            &remote_object_sizes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection.reused_from_local_manifest(),
+            &[LogicalDeltaObject {
+                hash: local.content_hash,
+                size: local.byte_size,
+            }]
+        );
+        assert_eq!(
+            selection.reused_from_cas(),
+            &[LogicalDeltaObject {
+                hash: deduplicated.content_hash,
+                size: deduplicated.byte_size,
+            }]
+        );
+        assert_eq!(
+            selection.missing_objects(),
+            &[LogicalDeltaObject {
+                hash: missing_hash,
+                size: b"missing-object".len() as u64,
+            }]
+        );
+    }
+
+    #[test]
+    fn selector_rejects_remote_size_mismatch_for_an_existing_immutable_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let prepared = cas.prepare_bytes(b"immutable").unwrap();
+        let plan = ready_plan(
+            vec![put("r1:root", prepared.content_hash.clone(), vec![])],
+            vec![prepared.content_hash.clone()],
+        );
+        let error = select_missing_logical_delta_objects(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(prepared.content_hash, prepared.byte_size + 1)]),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PeerSyncError::Validation(message) if message.contains("size")));
+    }
+
+    struct FixtureSource {
+        objects: BTreeMap<String, Vec<u8>>,
+        content_gets: usize,
+    }
+
+    impl LogicalDeltaObjectSource for FixtureSource {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            self.content_gets += 1;
+            let bytes = self
+                .objects
+                .get(&object.hash)
+                .ok_or_else(|| PeerSyncError::Transport("missing fixture object".to_owned()))?;
+            Ok(Box::new(Cursor::new(bytes.clone())))
+        }
+    }
+
+    #[derive(Default)]
+    struct FixtureStage {
+        payloads: Vec<String>,
+        database_staged: bool,
+    }
+
+    struct FixtureTarget {
+        active_revision: i64,
+        active_base: String,
+        events: Vec<String>,
+        aborts: usize,
+        fail_database_stage: bool,
+    }
+
+    impl FixtureTarget {
+        fn new() -> Self {
+            Self {
+                active_revision: 7,
+                active_base: "1".repeat(64),
+                events: Vec::new(),
+                aborts: 0,
+                fail_database_stage: false,
+            }
+        }
+    }
+
+    impl LogicalDeltaStagedTarget for FixtureTarget {
+        type Stage = FixtureStage;
+
+        fn begin(&mut self, _plan: &ReadyLogicalDeltaPlan) -> Result<Self::Stage, PeerSyncError> {
+            self.events.push("begin".to_owned());
+            Ok(FixtureStage::default())
+        }
+
+        fn stage_payload(
+            &mut self,
+            stage: &mut Self::Stage,
+            object: &LogicalDeltaObject,
+            reader: &mut dyn Read,
+        ) -> Result<(), PeerSyncError> {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            self.events.push(format!("payload:{}", object.hash));
+            stage.payloads.push(object.hash.clone());
+            Ok(())
+        }
+
+        fn stage_database_changes(
+            &mut self,
+            stage: &mut Self::Stage,
+            _plan: &ReadyLogicalDeltaPlan,
+        ) -> Result<(), PeerSyncError> {
+            self.events.push("database".to_owned());
+            if self.fail_database_stage {
+                return Err(PeerSyncError::Storage("database staging failed".to_owned()));
+            }
+            stage.database_staged = true;
+            Ok(())
+        }
+
+        fn activate_database_and_base_if_current(
+            &mut self,
+            stage: &mut Self::Stage,
+            expected_local_revision: i64,
+            expected_base_manifest_hash: &str,
+            next_base_manifest_hash: &str,
+        ) -> Result<LogicalDeltaActivation, PeerSyncError> {
+            self.events.push("activate".to_owned());
+            if self.active_revision != expected_local_revision
+                || self.active_base != expected_base_manifest_hash
+            {
+                return Ok(LogicalDeltaActivation::Conflict {
+                    actual_revision: self.active_revision,
+                    actual_base_manifest_hash: self.active_base.clone(),
+                });
+            }
+            assert!(stage.database_staged);
+            self.active_revision += 1;
+            self.active_base = next_base_manifest_hash.to_owned();
+            Ok(LogicalDeltaActivation::Activated {
+                revision: self.active_revision,
+            })
+        }
+
+        fn abort(&mut self, _stage: Self::Stage) -> Result<(), PeerSyncError> {
+            self.events.push("abort".to_owned());
+            self.aborts += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn no_op_ready_plan_performs_zero_content_gets() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let plan = ready_plan(vec![], vec![]);
+        let mut source = FixtureSource {
+            objects: BTreeMap::new(),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+
+        let activation = execute_logical_delta_pull(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+            &mut source,
+            &mut target,
+        )
+        .unwrap();
+
+        assert_eq!(source.content_gets, 0);
+        assert_eq!(
+            activation,
+            LogicalDeltaActivation::Activated { revision: 8 }
+        );
+        assert_eq!(target.events, ["begin", "database", "activate"]);
+    }
+
+    #[test]
+    fn verified_payloads_stage_before_database_and_atomic_base_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"remote-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(payload_hash.clone(), payload)]),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+
+        let activation = execute_logical_delta_pull(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash.clone(), b"remote-payload".len() as u64)]),
+            &mut source,
+            &mut target,
+        )
+        .unwrap();
+
+        assert_eq!(
+            activation,
+            LogicalDeltaActivation::Activated { revision: 8 }
+        );
+        assert_eq!(source.content_gets, 1);
+        assert_eq!(
+            target.events,
+            [
+                "begin".to_owned(),
+                format!("payload:{payload_hash}"),
+                "database".to_owned(),
+                "activate".to_owned(),
+            ]
+        );
+        assert_eq!(target.active_revision, 8);
+        assert_eq!(target.active_base, "2".repeat(64));
+        assert_eq!(target.aborts, 0);
+    }
+
+    #[test]
+    fn corrupt_payload_aborts_before_database_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let expected_payload = b"expected-payload";
+        let payload_hash = hash(expected_payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(payload_hash.clone(), b"corrupt-payload!".to_vec())]),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+
+        let error = execute_logical_delta_pull(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash, expected_payload.len() as u64)]),
+            &mut source,
+            &mut target,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PeerSyncError::WholeObjectHashMismatch { .. }
+        ));
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.active_base, "1".repeat(64));
+        assert_eq!(target.aborts, 1);
+        assert!(!target.events.iter().any(|event| event == "database"));
+        assert_eq!(target.events.last().map(String::as_str), Some("abort"));
+    }
+
+    #[test]
+    fn staging_failure_aborts_and_preserves_complete_old_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let payload = b"remote-payload".to_vec();
+        let payload_hash = hash(&payload);
+        let plan = ready_plan(
+            vec![put("r1:asset:WyJhIl0", payload_hash.clone(), vec![])],
+            vec![payload_hash.clone()],
+        );
+        let mut source = FixtureSource {
+            objects: BTreeMap::from([(payload_hash.clone(), payload)]),
+            content_gets: 0,
+        };
+        let mut target = FixtureTarget::new();
+        target.fail_database_stage = true;
+
+        let error = execute_logical_delta_pull(
+            &plan,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::from([(payload_hash, b"remote-payload".len() as u64)]),
+            &mut source,
+            &mut target,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PeerSyncError::Storage(message) if message.contains("staging")));
+        assert_eq!(target.active_revision, 7);
+        assert_eq!(target.active_base, "1".repeat(64));
+        assert_eq!(target.aborts, 1);
+        assert_eq!(target.events.last().map(String::as_str), Some("abort"));
+    }
+
+    #[test]
+    fn changed_revision_or_base_aborts_without_exposing_staged_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let plan = ready_plan(vec![], vec![]);
+        for (actual_revision, actual_base) in [(8, "1".repeat(64)), (7, "9".repeat(64))] {
+            let mut source = FixtureSource {
+                objects: BTreeMap::new(),
+                content_gets: 0,
+            };
+            let mut target = FixtureTarget::new();
+            target.active_revision = actual_revision;
+            target.active_base = actual_base.clone();
+
+            let activation = execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &BTreeMap::new(),
+                &mut source,
+                &mut target,
+            )
+            .unwrap();
+
+            assert_eq!(
+                activation,
+                LogicalDeltaActivation::Conflict {
+                    actual_revision,
+                    actual_base_manifest_hash: actual_base.clone(),
+                }
+            );
+            assert_eq!(target.active_revision, actual_revision);
+            assert_eq!(target.active_base, actual_base);
+            assert_eq!(target.aborts, 1);
+            assert_eq!(target.events.last().map(String::as_str), Some("abort"));
+        }
+    }
+}

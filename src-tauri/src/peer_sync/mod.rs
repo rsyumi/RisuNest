@@ -8,6 +8,7 @@ pub(crate) mod commands;
 mod host;
 mod http_stream;
 mod lan;
+mod logical_delta_transfer;
 #[cfg(desktop)]
 mod production;
 mod protocol;
@@ -31,6 +32,11 @@ pub use host::LoopbackCloneHost;
 pub use lan::LanCloneClient;
 #[cfg(desktop)]
 pub use lan::{LanCloneHost, LanDevice, LanPairing};
+pub use logical_delta_transfer::{
+    execute_logical_delta_pull, select_missing_logical_delta_objects, LogicalDeltaActivation,
+    LogicalDeltaApplyOperation, LogicalDeltaObject, LogicalDeltaObjectSource,
+    LogicalDeltaStagedTarget, LogicalDeltaTransferSelection, ReadyLogicalDeltaPlan,
+};
 #[cfg(desktop)]
 pub(crate) use production::{prepare_lossless_clone_session, LosslessCloneTargetAdapter};
 pub use protocol::{
