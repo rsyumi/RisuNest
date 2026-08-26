@@ -88,7 +88,7 @@ import {
 } from "./storage/persistentStorageRuntime";
 import {
     acknowledgeRecoveredNativeRestores,
-    reconcileNativeRestoresBeforeBootstrap,
+    reconcileNativeFileJobsBeforeBootstrap,
     shouldReconcileNativeFileJobs,
 } from "./storage/nativeFileJobRecovery";
 import { registerAndroidRisuSaveRoute } from "./storage/androidRisuSaveRouteProduction.svelte";
@@ -123,6 +123,11 @@ import {
     NativeFileJobError,
     runNativeOfficialAccountSnapshotRestore,
 } from "./storage/nativeFileJobs";
+import { createNativeOfficialPublicationJobPublisher } from "./storage/sync/nativeOfficialPublicationJob";
+import {
+    createNativeOfficialPublicationRecovery,
+    type NativeOfficialPublicationRecovery,
+} from "./storage/sync/nativeOfficialPublicationRecovery";
 export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
@@ -180,13 +185,20 @@ export async function loadData() {
         }
 
         await initializePersistentStorage()
-        const recoveredNativeRestoreJobs = shouldReconcileNativeFileJobs(
-            isTauriDesktop,
-            isTauriAndroid,
-            isAndroidSafFileJobsEnabled(),
-        )
-            ? await reconcileNativeRestoresBeforeBootstrap()
-            : []
+        const recoveredNativeFileJobs = isTauri
+            ? await reconcileNativeFileJobsBeforeBootstrap(undefined, {
+                reconcileRestores: shouldReconcileNativeFileJobs(
+                    isTauriDesktop,
+                    isTauriAndroid,
+                    isAndroidSafFileJobsEnabled(),
+                ),
+            })
+            : {
+                pendingRestoreAcknowledgements: [],
+                pendingOfficialPublications: [],
+            }
+        const recoveredNativeRestoreJobs =
+            recoveredNativeFileJobs.pendingRestoreAcknowledgements
         const runtime = getPersistentDataRuntime()
         const resolvePersistentWorkingSet = () => bootstrapPersistentDatabase({
             store: runtime.store,
@@ -307,6 +319,23 @@ export async function loadData() {
             ledgerStorage,
             () => getDatabase().account?.id,
         )
+        const flushNativeOfficialMetadata = async () => {
+            await nativeAssociation?.flush()
+            await nativeAssetLedger?.flush()
+        }
+        let nativePublicationRecovery: NativeOfficialPublicationRecovery | null = null
+        const nativeDatabasePublisher = isTauri
+            ? createNativeOfficialPublicationJobPublisher({
+                account: accountStorage,
+                baseUrl: hubURL,
+                reconcilePendingPublications: async () => {
+                    if (!nativePublicationRecovery) {
+                        throw new Error('Native official publication recovery is not configured')
+                    }
+                    await nativePublicationRecovery.reconcile()
+                },
+            })
+            : undefined
         const officialAdapter = new OfficialAccountSnapshotAdapter({
             store: runtime.store,
             resolveBlobs: resolveBlobStore,
@@ -324,6 +353,10 @@ export async function loadData() {
             markPublished: () => undefined,
             ledger: officialAssetLedger,
             association: createOfficialAssociationMarkers(associationStorage),
+            nativeDatabasePublisher,
+            flushPublicationMetadata: nativeDatabasePublisher
+                ? flushNativeOfficialMetadata
+                : undefined,
             conflict: {
                 resolve: async ({ remote, syncedAt }) => {
                     const lease = await runtime.store.acquireRevision(runtime.revision)
@@ -423,10 +456,7 @@ export async function loadData() {
                     configurePersistentDataRuntime({ officialPublisher: null })
                     configureOfficialAccountAssetReader(credential ? assetReader : null)
                 },
-                flushMetadata: async () => {
-                    await nativeAssociation?.flush()
-                    await nativeAssetLedger?.flush()
-                },
+                flushMetadata: flushNativeOfficialMetadata,
                 resetMetadata: () => {
                     nativeAssociation?.reset()
                     nativeAssetLedger?.reset()
@@ -475,6 +505,16 @@ export async function loadData() {
             nativeOfficialFlow = service.flow
             snapshotRequestReauthentication = service.snapshotRequestReauthentication
             configureNativeOfficialAccountFlow(service.flow)
+            nativePublicationRecovery = createNativeOfficialPublicationRecovery(
+                recoveredNativeFileJobs.pendingOfficialPublications,
+                {
+                    activeAccountId: () => getDatabase().account?.id ?? null,
+                    account: accountStorage,
+                    adapter: officialAdapter,
+                    flushMetadata: flushNativeOfficialMetadata,
+                },
+            )
+            await nativePublicationRecovery.reconcile()
         } else {
             configureNativeOfficialAccountFlow(null)
         }
