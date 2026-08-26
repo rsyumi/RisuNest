@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -7,12 +8,13 @@ import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import { createRoadmap14Result, requireRealmDisabled } from './result.mjs'
+import { getRoadmap14Scenario } from './scenarios.mjs'
 
 export function convertExistingWindowsMeasurements({
     phase3,
     tauri,
-    canonicalOutputSha256,
-    buildIdentity,
+    sourceRevision,
+    artifactHashes,
     platformIdentity,
     appVersion,
     recordedAt,
@@ -32,6 +34,39 @@ export function convertExistingWindowsMeasurements({
     if (!Array.isArray(phase3.samples) || phase3.samples.length === 0) {
         throw new Error('Phase 3 result has no retained samples')
     }
+    if (
+        !sourceRevision
+        || phase3.sourceRevision !== sourceRevision
+        || tauri.build?.sourceRevision !== sourceRevision
+        || !tauri.build?.identifier?.includes(`.r${sourceRevision.slice(0, 12)}.`)
+    ) {
+        throw new Error('Windows measurement revisions and embedded Tauri identifier must match Git HEAD')
+    }
+
+    const descriptor = getRoadmap14Scenario('save-large').descriptor
+    const expectedShape = {
+        characters: descriptor.characters,
+        totalConversations: descriptor.characters * descriptor.chatsPerCharacter + 1,
+        totalMessages: descriptor.characters * descriptor.chatsPerCharacter
+            * descriptor.turnsPerChat + descriptor.stressChat.turns,
+    }
+    if (
+        tauri.fixture?.kind !== 'phase3-step5-save-large'
+        || tauri.fixture.serializedSha256 !== phase3.fixture?.sha256
+        || tauri.fixture.serializedBytes !== phase3.fixture?.serializedBytes
+        || Object.entries(expectedShape).some(([name, value]) => (
+            phase3.fixture?.[name] !== value || tauri.fixture?.[name] !== value
+        ))
+    ) {
+        throw new Error('Windows measurements must use the same frozen save-large fixture')
+    }
+
+    const canonicalHashes = new Set(
+        phase3.samples.map((sample) => sample.exportTraversalSha256),
+    )
+    if (canonicalHashes.size !== 1 || !/^[0-9a-f]{64}$/.test([...canonicalHashes][0] ?? '')) {
+        throw new Error('Phase 3 samples must agree on the exported canonical output SHA-256')
+    }
 
     const memorySamples = [
         tauri.boot?.memory,
@@ -45,8 +80,8 @@ export function convertExistingWindowsMeasurements({
         status: 'completed',
         recordedAt,
         build: {
-            identity: buildIdentity,
-            sourceRevision: phase3.sourceRevision ?? null,
+            identity: `${sourceRevision}-windows-release`,
+            sourceRevision,
             profile: 'release',
             target: 'x86_64-pc-windows-msvc',
             appVersion,
@@ -72,29 +107,55 @@ export function convertExistingWindowsMeasurements({
             liveUrlCount: tauri.ui?.liveUrlCount ?? null,
         },
         latency: {
-            saveMs: phase3.samples.map((sample) => sample.appendCommitUs / 1000),
-            importMs: phase3.samples.map((sample) => sample.importUs / 1000),
-            exportMs: phase3.samples.map((sample) => sample.exportTotalUs / 1000),
-            operationMs: phase3.samples.map((sample) => sample.snapshotUs / 1000),
+            samples: [
+                {
+                    name: 'staged-replace-import',
+                    valuesMs: phase3.samples.map((sample) => sample.importUs / 1000),
+                },
+                {
+                    name: 'append-commit',
+                    valuesMs: phase3.samples.map((sample) => sample.appendCommitUs / 1000),
+                },
+                {
+                    name: 'export-traversal',
+                    valuesMs: phase3.samples.map((sample) => sample.exportTotalUs / 1000),
+                },
+                {
+                    name: 'snapshot-create',
+                    valuesMs: phase3.samples.map((sample) => sample.snapshotUs / 1000),
+                },
+            ],
         },
         bytes: {
-            fixtureBytes: phase3.fixture.serializedBytes,
-            savedBytes: lastSample.snapshotBytes,
-            importedBytes: phase3.fixture.serializedBytes,
-            exportedBytes: lastSample.exportTraversalJsonBytes,
+            artifacts: [
+                { name: 'fixture-serialized-json', bytes: phase3.fixture.serializedBytes },
+                { name: 'export-traversal-json', bytes: lastSample.exportTraversalJsonBytes },
+                { name: 'snapshot-file', bytes: lastSample.snapshotBytes },
+            ],
         },
-        canonicalOutputSha256: canonicalOutputSha256 ?? phase3.fixture.sha256,
+        canonicalOutput: {
+            sha256: [...canonicalHashes][0],
+            provenance: 'phase3-export-traversal-after-append',
+        },
         source: {
-            runner: 'roadmap14-windows-v1',
+            runner: 'roadmap14-windows-v2',
             measurements: [
-                'phase3-step5-persistent-store',
-                'phase3-windows-tauri-cdp',
+                'persistent-store-staged-replace-import',
+                'persistent-store-append-commit',
+                'persistent-store-export-traversal',
+                'persistent-store-snapshot-create',
+                'tauri-save-large-memory-and-ui',
+            ],
+            artifacts: [
+                { name: 'save-large-fixture-json', sha256: phase3.fixture.sha256 },
+                { name: 'phase3-result-json', sha256: artifactHashes.phase3Result },
+                { name: 'tauri-cdp-result-json', sha256: artifactHashes.tauriResult },
             ],
         },
         notes: [
             'Phase 3 save-large timings are native SQLite measurements in a release Rust test process.',
             'Heap and RSS samples come from the isolated release Tauri CDP measurement.',
-            'The Tauri staged import uses deterministic root padding and is not public picker automation.',
+            'The Tauri staged import uses the same serialized save-large fixture as the Rust measurement.',
             'Live RisuRealm is intentionally not exercised.',
         ],
     })
@@ -107,8 +168,6 @@ export function parseArguments(argumentsList) {
         output: null,
         runExisting: false,
         rawOutputDirectory: null,
-        canonicalOutputSha256: null,
-        buildIdentity: null,
         platformIdentity: null,
         recordedAt: null,
     }
@@ -123,10 +182,6 @@ export function parseArguments(argumentsList) {
         } else if (argument === '--run-existing') options.runExisting = true
         else if (argument === '--raw-output-dir') {
             options.rawOutputDirectory = requiredValue(argumentsList, ++index, argument)
-        } else if (argument === '--canonical-output-sha256') {
-            options.canonicalOutputSha256 = requiredValue(argumentsList, ++index, argument)
-        } else if (argument === '--build-identity') {
-            options.buildIdentity = requiredValue(argumentsList, ++index, argument)
         } else if (argument === '--platform-identity') {
             options.platformIdentity = requiredValue(argumentsList, ++index, argument)
         } else if (argument === '--recorded-at') {
@@ -175,11 +230,13 @@ async function runExistingMeasurements(repositoryRoot, rawOutputDirectory, sourc
     if (process.platform !== 'win32') throw new Error('The existing release runner supports Windows only')
     await mkdir(rawOutputDirectory, { recursive: true })
     const phase3Result = path.join(rawOutputDirectory, 'phase3-save-large.json')
+    const phase3Fixture = path.join(rawOutputDirectory, 'phase3-save-large-fixture.json')
     const tauriResult = path.join(rawOutputDirectory, 'phase3-tauri-cdp.json')
     const environment = {
         ...process.env,
         VITE_DISABLE_REALM: 'true',
         RISUNEST_PHASE3_BENCH_OUTPUT: phase3Result,
+        RISUNEST_PHASE3_FIXTURE_OUTPUT: phase3Fixture,
         RISUNEST_PHASE3_BENCH_REVISION: sourceRevision,
     }
     await runCommand(
@@ -202,7 +259,13 @@ async function runExistingMeasurements(repositoryRoot, rawOutputDirectory, sourc
     )
     await runCommand(
         process.execPath,
-        [path.join(repositoryRoot, 'benchmarks', 'phase3', 'tauri-cdp.mjs'), '--output', tauriResult],
+        [
+            path.join(repositoryRoot, 'benchmarks', 'phase3', 'tauri-cdp.mjs'),
+            '--save-large-fixture',
+            phase3Fixture,
+            '--output',
+            tauriResult,
+        ],
         { cwd: repositoryRoot, env: environment },
     )
     return { phase3Result, tauriResult }
@@ -216,8 +279,6 @@ function usage() {
         '  --run-existing                    Run the existing Phase 3 Rust and Tauri CDP measurements.',
         '  --phase3-result <path>             Reuse a Phase 3 save-large JSON result.',
         '  --tauri-result <path>              Reuse a Phase 3 Tauri CDP JSON result.',
-        '  --canonical-output-sha256 <hash>   Override the Phase 3 fixture SHA-256.',
-        '  --build-identity <value>           Optional build identity.',
         '  --platform-identity <value>        Optional stable reference-host identity.',
         '  --recorded-at <ISO date>           Optional stable timestamp.',
         '  --raw-output-dir <path>            Existing measurement output directory.',
@@ -249,17 +310,19 @@ async function main() {
     if (!phase3Result || !tauriResult) {
         throw new Error('Provide --run-existing or both --phase3-result and --tauri-result')
     }
-    const [phase3, tauri, packageJson] = await Promise.all([
-        readJson(phase3Result),
-        readJson(tauriResult),
+    const [phase3Artifact, tauriArtifact, packageJson] = await Promise.all([
+        readArtifact(phase3Result),
+        readArtifact(tauriResult),
         readJson(path.join(repositoryRoot, 'package.json')),
     ])
-    const measurementRevision = phase3.sourceRevision ?? sourceRevision
     const result = convertExistingWindowsMeasurements({
-        phase3,
-        tauri,
-        canonicalOutputSha256: options.canonicalOutputSha256 ?? phase3.fixture.sha256,
-        buildIdentity: options.buildIdentity ?? `${measurementRevision}-windows-release`,
+        phase3: phase3Artifact.value,
+        tauri: tauriArtifact.value,
+        sourceRevision,
+        artifactHashes: {
+            phase3Result: phase3Artifact.sha256,
+            tauriResult: tauriArtifact.sha256,
+        },
         platformIdentity: options.platformIdentity ?? `windows-${os.arch()}-${os.release()}`,
         appVersion: packageJson.version,
         recordedAt: options.recordedAt ?? new Date().toISOString(),
@@ -277,6 +340,14 @@ async function main() {
 
 async function readJson(filePath) {
     return JSON.parse(await readFile(path.resolve(filePath), 'utf8'))
+}
+
+async function readArtifact(filePath) {
+    const bytes = await readFile(path.resolve(filePath))
+    return {
+        value: JSON.parse(bytes.toString('utf8')),
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+    }
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {

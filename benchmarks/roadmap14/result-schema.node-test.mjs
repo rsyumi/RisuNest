@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { loadRoadmap14ResultSchema, validateRoadmap14Result } from './result-schema.mjs'
+import {
+    loadRoadmap14ResultSchema,
+    validateRoadmap14JsonSchema,
+    validateRoadmap14Result,
+} from './result-schema.mjs'
 import {
     fixtureIdentity,
     getRoadmap14Scenario,
@@ -11,12 +15,77 @@ import {
     createPendingAndroidResults,
     validateAndroidInstrumentationResults,
 } from './android.mjs'
-import { convertExistingWindowsMeasurements } from './windows.mjs'
+import { convertExistingWindowsMeasurements, parseArguments as parseWindowsArguments } from './windows.mjs'
+
+test('the version 2 contract names measured operations and canonical output provenance', async () => {
+    const [result] = createPendingAndroidResults({
+        sourceRevision: '742fb370',
+        appVersion: '1.0.0',
+        recordedAt: '2026-08-26T00:00:00.000Z',
+    })
+    const schema = await loadRoadmap14ResultSchema()
+
+    assert.equal(schema.$id, 'https://risunest.local/schemas/roadmap14-platform-result-v2.json')
+    assert.equal(result.schemaVersion, 2)
+    assert.deepEqual(result.latency, { samples: [] })
+    assert.deepEqual(result.bytes, { artifacts: [] })
+    assert.equal(result.canonicalOutput, null)
+    assert.deepEqual(result.source.artifacts, [])
+})
+
+function completedAndroidResults() {
+    return createPendingAndroidResults({
+        sourceRevision: '742fb370742fb370742fb370742fb370742fb370',
+        appVersion: '1.0.0',
+        recordedAt: '2026-08-26T00:00:00.000Z',
+    }).map((result) => ({
+        ...result,
+        status: 'completed',
+        build: {
+            ...result.build,
+            identity: '742fb370742fb370742fb370742fb370742fb370-android-release',
+        },
+        platform: {
+            ...result.platform,
+            identity: 'pixel-8-pro-serial-1234',
+            osVersion: 'Android 16',
+            architecture: 'arm64-v8a',
+            webViewVersion: 'WebView 151',
+            deviceModel: 'Pixel 8 Pro',
+        },
+        memory: {
+            measurement: 'android-pss',
+            heapUsedBytes: [],
+            rssBytes: [],
+            pssBytes: [100],
+        },
+        ui: {
+            domNodeCount: 10,
+            mountedMessageCount: 2,
+            liveUrlCount: 1,
+        },
+        latency: {
+            samples: [{ name: 'scenario-operation', valuesMs: [1] }],
+        },
+        bytes: {
+            artifacts: [{ name: 'scenario-output', bytes: 900 }],
+        },
+        canonicalOutput: {
+            sha256: 'd'.repeat(64),
+            provenance: 'physical-device-instrumentation-output',
+        },
+        source: {
+            runner: 'roadmap14-android-instrumentation-v2',
+            measurements: ['physical-device-instrumentation'],
+            artifacts: [{ name: 'instrumentation-result', sha256: 'e'.repeat(64) }],
+        },
+    }))
+}
 
 test('the shared schema accepts a completed Windows result', () => {
     const saveLarge = getRoadmap14Scenario('save-large')
     const result = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: 'risunest-roadmap14-platform-result',
         status: 'completed',
         scenario: 'save-large',
@@ -29,7 +98,7 @@ test('the shared schema accepts a completed Windows result', () => {
         },
         build: {
             identity: '742fb370-release',
-            sourceRevision: '742fb370',
+            sourceRevision: '742fb370742fb370742fb370742fb370742fb370',
             profile: 'release',
             target: 'x86_64-pc-windows-msvc',
             appVersion: '1.0.0',
@@ -55,21 +124,27 @@ test('the shared schema accepts a completed Windows result', () => {
             liveUrlCount: 1,
         },
         latency: {
-            saveMs: [1],
-            importMs: [2],
-            exportMs: [3],
-            operationMs: [4],
+            samples: [
+                { name: 'staged-replace-import', valuesMs: [2] },
+                { name: 'append-commit', valuesMs: [1] },
+                { name: 'export-traversal', valuesMs: [3] },
+                { name: 'snapshot-create', valuesMs: [4] },
+            ],
         },
         bytes: {
-            fixtureBytes: 1000,
-            savedBytes: 900,
-            importedBytes: 1000,
-            exportedBytes: 900,
+            artifacts: [
+                { name: 'fixture-serialized-json', bytes: 1000 },
+                { name: 'export-traversal-json', bytes: 900 },
+            ],
         },
-        canonicalOutputSha256: 'b'.repeat(64),
+        canonicalOutput: {
+            sha256: 'b'.repeat(64),
+            provenance: 'phase3-export-traversal-after-append',
+        },
         source: {
-            runner: 'roadmap14-windows-v1',
+            runner: 'roadmap14-windows-v2',
             measurements: ['phase3-step5-persistent-store'],
+            artifacts: [{ name: 'phase3-result', sha256: 'c'.repeat(64) }],
         },
         notes: [],
     }
@@ -79,7 +154,7 @@ test('the shared schema accepts a completed Windows result', () => {
 
 test('a completed result cannot silently omit required measurement evidence', () => {
     const result = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: 'risunest-roadmap14-platform-result',
         status: 'completed',
         scenario: 'library-many',
@@ -118,34 +193,28 @@ test('a completed result cannot silently omit required measurement evidence', ()
             liveUrlCount: null,
         },
         latency: {
-            saveMs: [],
-            importMs: [],
-            exportMs: [],
-            operationMs: [],
+            samples: [],
         },
         bytes: {
-            fixtureBytes: null,
-            savedBytes: null,
-            importedBytes: null,
-            exportedBytes: null,
+            artifacts: [],
         },
-        canonicalOutputSha256: null,
-        source: { runner: 'test', measurements: [] },
+        canonicalOutput: null,
+        source: { runner: 'test', measurements: [], artifacts: [] },
         notes: [],
     }
 
     const errors = validateRoadmap14Result(result)
-    assert.ok(errors.includes('$.canonicalOutputSha256 is required when status is completed'))
-    assert.ok(errors.includes('$.ui.domNodeCount is required when status is completed'))
-    assert.ok(errors.includes('$.memory requires heap, RSS, or PSS samples when status is completed'))
-    assert.ok(errors.includes('$.latency requires at least one sample when status is completed'))
-    assert.ok(errors.includes('$.bytes.fixtureBytes is required when status is completed'))
+    assert.ok(errors.includes('$.canonicalOutput must be object'))
+    assert.ok(errors.includes('$.ui.domNodeCount must be integer'))
+    assert.ok(errors.includes('$.memory must match at least one allowed schema'))
+    assert.ok(errors.includes('$.latency.samples must contain at least 1 item(s)'))
+    assert.ok(errors.includes('$.bytes.artifacts must contain at least 1 item(s)'))
 })
 
 test('the checked-in JSON schema requires every cross-platform measurement field', async () => {
     const schema = await loadRoadmap14ResultSchema()
 
-    assert.equal(schema.$id, 'https://risunest.local/schemas/roadmap14-platform-result-v1.json')
+    assert.equal(schema.$id, 'https://risunest.local/schemas/roadmap14-platform-result-v2.json')
     assert.deepEqual(schema.properties.scenario.enum, [
         'library-many',
         'save-large',
@@ -165,22 +234,22 @@ test('the checked-in JSON schema requires every cross-platform measurement field
         'ui',
         'latency',
         'bytes',
-        'canonicalOutputSha256',
+        'canonicalOutput',
         'source',
         'notes',
     ])
 
     const errors = validateRoadmap14Result({
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: 'risunest-roadmap14-platform-result',
         status: 'pending',
         scenario: 'asset-library',
     })
-    assert.ok(errors.includes('$.fixture must be an object'))
-    assert.ok(errors.includes('$.memory must be an object'))
-    assert.ok(errors.includes('$.ui must be an object'))
-    assert.ok(errors.includes('$.latency must be an object'))
-    assert.ok(errors.includes('$.bytes must be an object'))
+    assert.ok(errors.includes('$.fixture is required'))
+    assert.ok(errors.includes('$.memory is required'))
+    assert.ok(errors.includes('$.ui is required'))
+    assert.ok(errors.includes('$.latency is required'))
+    assert.ok(errors.includes('$.bytes is required'))
 })
 
 test('fixture identity uses stable sorted-key JSON bytes', () => {
@@ -235,8 +304,8 @@ test('the Android entry point emits schema-valid pending physical-device results
         assert.equal(result.platform.family, 'android')
         assert.equal(result.platform.identity, 'physical-device-pending')
         assert.equal(result.memory.measurement, 'pending')
-        assert.equal(result.canonicalOutputSha256, null)
-        assert.deepEqual(result.latency.operationMs, [])
+        assert.equal(result.canonicalOutput, null)
+        assert.deepEqual(result.latency.samples, [])
         assert.match(result.notes.join(' '), /physical Android device/i)
     }
 })
@@ -257,6 +326,21 @@ test('schema validation rejects unknown fields and malformed timestamps', () => 
     assert.ok(errors.includes('$.memory.unexpected is not allowed'))
 })
 
+test('runtime result validation is structurally driven by the checked-in JSON Schema', () => {
+    const [result] = createPendingAndroidResults({
+        sourceRevision: '742fb370',
+        appVersion: '1.0.0',
+        recordedAt: '2026-08-26T00:00:00.000Z',
+    })
+
+    assert.deepEqual(validateRoadmap14JsonSchema(result), [])
+    assert.deepEqual(validateRoadmap14Result(result), [])
+
+    result.source.artifacts = [{ name: 'bad-hash', sha256: 'not-a-hash' }]
+    assert.ok(validateRoadmap14JsonSchema(result).length > 0)
+    assert.ok(validateRoadmap14Result(result).length > 0)
+})
+
 test('schema validation rejects a descriptor that does not match its fixture identity', () => {
     const [result] = createPendingAndroidResults({
         sourceRevision: '742fb370',
@@ -272,14 +356,79 @@ test('schema validation rejects a descriptor that does not match its fixture ide
     )
 })
 
-test('the Android invocation contract rejects non-Android or incomplete scenario sets', () => {
-    const results = createPendingAndroidResults({
+test('schema validation rejects a self-consistent fixture that differs from the frozen scenario', () => {
+    const [result] = createPendingAndroidResults({
+        sourceRevision: '742fb370',
+        appVersion: '1.0.0',
+        recordedAt: '2026-08-26T00:00:00.000Z',
+    })
+    result.fixture.descriptor.characters += 1
+    result.fixture.identitySha256 = fixtureIdentity({
+        name: result.fixture.name,
+        version: result.fixture.version,
+        descriptor: result.fixture.descriptor,
+    })
+
+    assert.ok(
+        validateRoadmap14Result(result).includes(
+            '$.fixture must match the frozen scenario definition',
+        ),
+    )
+})
+
+test('the Android instrumentation contract accepts only completed submissions', () => {
+    const pending = createPendingAndroidResults({
         sourceRevision: '742fb370',
         appVersion: '1.0.0',
         recordedAt: '2026-08-26T00:00:00.000Z',
     })
 
-    assert.deepEqual(validateAndroidInstrumentationResults(results), results)
+    assert.throws(
+        () => validateAndroidInstrumentationResults(pending),
+        /must have status completed/,
+    )
+
+    const completed = completedAndroidResults()
+    assert.deepEqual(validateAndroidInstrumentationResults(completed), completed)
+})
+
+test('the Android instrumentation contract rejects emulator evidence', () => {
+    const results = completedAndroidResults()
+    results.forEach((result) => {
+        result.platform.identity = 'emulator-5554'
+        result.platform.deviceModel = 'sdk_gphone64_x86_64'
+    })
+
+    assert.throws(
+        () => validateAndroidInstrumentationResults(results),
+        /must identify a physical device/,
+    )
+})
+
+test('the Android instrumentation contract requires one physical device', () => {
+    const results = completedAndroidResults()
+    results[1].platform.identity = 'pixel-9-pro-serial-5678'
+    results[1].platform.deviceModel = 'Pixel 9 Pro'
+
+    assert.throws(
+        () => validateAndroidInstrumentationResults(results),
+        /must come from one physical device/,
+    )
+})
+
+test('the Android instrumentation contract requires one build revision', () => {
+    const results = completedAndroidResults()
+    results[2].build.sourceRevision = 'abcdefabcdefabcdefabcdefabcdefabcdefabcd'
+
+    assert.throws(
+        () => validateAndroidInstrumentationResults(results),
+        /must use one build and source revision/,
+    )
+})
+
+test('the Android invocation contract rejects non-Android or incomplete scenario sets', () => {
+    const results = completedAndroidResults()
+
     assert.throws(
         () => validateAndroidInstrumentationResults(results.slice(1)),
         /exactly one result for each scenario/,
@@ -293,17 +442,25 @@ test('the Android invocation contract rejects non-Android or incomplete scenario
 })
 
 test('the Windows runner converts existing Phase 3 measurements into the shared schema', () => {
+    const sourceRevision = '742fb370742fb370742fb370742fb370742fb370'
     const phase3 = {
         schemaVersion: 1,
         benchmark: 'phase3-step5-persistent-store',
-        sourceRevision: '742fb370',
-        fixture: { serializedBytes: 1000, sha256: 'c'.repeat(64) },
+        sourceRevision,
+        fixture: {
+            characters: 500,
+            totalConversations: 5001,
+            totalMessages: 510000,
+            serializedBytes: 1000,
+            sha256: 'c'.repeat(64),
+        },
         samples: [
             {
                 importUs: 2000,
                 appendCommitUs: 1000,
                 exportTotalUs: 3000,
                 exportTraversalJsonBytes: 900,
+                exportTraversalSha256: 'd'.repeat(64),
                 snapshotUs: 4000,
                 snapshotBytes: 1200,
             },
@@ -312,6 +469,7 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
                 appendCommitUs: 1500,
                 exportTotalUs: 3500,
                 exportTraversalJsonBytes: 900,
+                exportTraversalSha256: 'd'.repeat(64),
                 snapshotUs: 4500,
                 snapshotBytes: 1200,
             },
@@ -320,7 +478,20 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
     const tauri = {
         schemaVersion: 1,
         platform: { webViewUserAgent: 'WebView2 test' },
-        build: { release: true, realmDisabled: true },
+        build: {
+            release: true,
+            realmDisabled: true,
+            sourceRevision,
+            identifier: 'co.aiclient.risu.phase3benchmark.r742fb370742f.run123',
+        },
+        fixture: {
+            kind: 'phase3-step5-save-large',
+            serializedBytes: 1000,
+            serializedSha256: 'c'.repeat(64),
+            characters: 500,
+            totalConversations: 5001,
+            totalMessages: 510000,
+        },
         boot: {
             memory: {
                 jsHeap: { usedBytes: 10 },
@@ -342,7 +513,11 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
     const result = convertExistingWindowsMeasurements({
         phase3,
         tauri,
-        buildIdentity: '742fb370-release',
+        sourceRevision,
+        artifactHashes: {
+            phase3Result: 'e'.repeat(64),
+            tauriResult: 'f'.repeat(64),
+        },
         platformIdentity: 'windows-reference-host',
         appVersion: '1.0.0',
         recordedAt: '2026-08-26T00:00:00.000Z',
@@ -352,22 +527,86 @@ test('the Windows runner converts existing Phase 3 measurements into the shared 
 
     assert.deepEqual(validateRoadmap14Result(result), [])
     assert.equal(result.status, 'completed')
-    assert.equal(result.canonicalOutputSha256, 'c'.repeat(64))
-    assert.deepEqual(result.latency.importMs, [2, 2.5])
-    assert.deepEqual(result.latency.saveMs, [1, 1.5])
-    assert.deepEqual(result.latency.exportMs, [3, 3.5])
-    assert.deepEqual(result.latency.operationMs, [4, 4.5])
+    assert.equal(result.build.identity, `${sourceRevision}-windows-release`)
+    assert.deepEqual(result.canonicalOutput, {
+        sha256: 'd'.repeat(64),
+        provenance: 'phase3-export-traversal-after-append',
+    })
+    assert.deepEqual(result.latency.samples, [
+        { name: 'staged-replace-import', valuesMs: [2, 2.5] },
+        { name: 'append-commit', valuesMs: [1, 1.5] },
+        { name: 'export-traversal', valuesMs: [3, 3.5] },
+        { name: 'snapshot-create', valuesMs: [4, 4.5] },
+    ])
     assert.deepEqual(result.memory.heapUsedBytes, [10, 30])
     assert.deepEqual(result.memory.rssBytes, [20, 40])
     assert.deepEqual(result.bytes, {
-        fixtureBytes: 1000,
-        savedBytes: 1200,
-        importedBytes: 1000,
-        exportedBytes: 900,
+        artifacts: [
+            { name: 'fixture-serialized-json', bytes: 1000 },
+            { name: 'export-traversal-json', bytes: 900 },
+            { name: 'snapshot-file', bytes: 1200 },
+        ],
     })
     assert.deepEqual(result.ui, {
         domNodeCount: 50,
         mountedMessageCount: 6,
         liveUrlCount: 2,
     })
+    assert.deepEqual(result.source.artifacts, [
+        { name: 'save-large-fixture-json', sha256: 'c'.repeat(64) },
+        { name: 'phase3-result-json', sha256: 'e'.repeat(64) },
+        { name: 'tauri-cdp-result-json', sha256: 'f'.repeat(64) },
+    ])
+
+    assert.throws(
+        () => convertExistingWindowsMeasurements({
+            phase3,
+            tauri: {
+                ...tauri,
+                build: { ...tauri.build, sourceRevision: 'different-revision' },
+            },
+            sourceRevision,
+            artifactHashes: {
+                phase3Result: 'e'.repeat(64),
+                tauriResult: 'f'.repeat(64),
+            },
+            platformIdentity: 'windows-reference-host',
+            appVersion: '1.0.0',
+            recordedAt: '2026-08-26T00:00:00.000Z',
+            osVersion: 'Windows 11 test',
+            architecture: 'x64',
+        }),
+        /must match Git HEAD/,
+    )
+    assert.throws(
+        () => convertExistingWindowsMeasurements({
+            phase3,
+            tauri: {
+                ...tauri,
+                fixture: { ...tauri.fixture, serializedSha256: '0'.repeat(64) },
+            },
+            sourceRevision,
+            artifactHashes: {
+                phase3Result: 'e'.repeat(64),
+                tauriResult: 'f'.repeat(64),
+            },
+            platformIdentity: 'windows-reference-host',
+            appVersion: '1.0.0',
+            recordedAt: '2026-08-26T00:00:00.000Z',
+            osVersion: 'Windows 11 test',
+            architecture: 'x64',
+        }),
+        /same frozen save-large fixture/,
+    )
+})
+
+test('the Windows live runner does not accept build or hash provenance overrides', () => {
+    assert.throws(
+        () => parseWindowsArguments(['--build-identity', 'spoofed']),
+        /Unknown argument: --build-identity/,
+    )
+    assert.throws(
+        () => parseWindowsArguments(['--canonical-output-sha256', 'a'.repeat(64)]),
+        /Unknown argument: --canonical-output-sha256/,
+    )
 })

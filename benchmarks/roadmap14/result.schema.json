@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://risunest.local/schemas/roadmap14-platform-result-v1.json",
+  "$id": "https://risunest.local/schemas/roadmap14-platform-result-v2.json",
   "title": "RisuNest Roadmap 14 platform result",
   "type": "object",
   "additionalProperties": false,
@@ -17,12 +17,12 @@
     "ui",
     "latency",
     "bytes",
-    "canonicalOutputSha256",
+    "canonicalOutput",
     "source",
     "notes"
   ],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "kind": { "const": "risunest-roadmap14-platform-result" },
     "status": { "enum": ["completed", "pending", "failed"] },
     "scenario": {
@@ -41,9 +41,9 @@
     "ui": { "$ref": "#/$defs/ui" },
     "latency": { "$ref": "#/$defs/latency" },
     "bytes": { "$ref": "#/$defs/bytes" },
-    "canonicalOutputSha256": {
+    "canonicalOutput": {
       "anyOf": [
-        { "$ref": "#/$defs/sha256" },
+        { "$ref": "#/$defs/canonicalOutput" },
         { "type": "null" }
       ]
     },
@@ -61,7 +61,12 @@
       },
       "then": {
         "properties": {
-          "canonicalOutputSha256": { "$ref": "#/$defs/sha256" },
+          "build": {
+            "properties": {
+              "sourceRevision": { "$ref": "#/$defs/gitRevision" }
+            }
+          },
+          "canonicalOutput": { "$ref": "#/$defs/canonicalOutput" },
           "memory": {
             "properties": {
               "measurement": { "enum": ["js-heap-and-rss", "android-pss"] }
@@ -80,19 +85,15 @@
             }
           },
           "latency": {
-            "anyOf": [
-              { "properties": { "saveMs": { "minItems": 1 } } },
-              { "properties": { "importMs": { "minItems": 1 } } },
-              { "properties": { "exportMs": { "minItems": 1 } } },
-              { "properties": { "operationMs": { "minItems": 1 } } }
-            ]
+            "properties": { "samples": { "minItems": 1 } }
           },
           "bytes": {
+            "properties": { "artifacts": { "minItems": 1 } }
+          },
+          "source": {
             "properties": {
-              "fixtureBytes": { "type": "integer", "minimum": 0 },
-              "savedBytes": { "type": "integer", "minimum": 0 },
-              "importedBytes": { "type": "integer", "minimum": 0 },
-              "exportedBytes": { "type": "integer", "minimum": 0 }
+              "measurements": { "minItems": 1 },
+              "artifacts": { "minItems": 1 }
             }
           }
         }
@@ -103,6 +104,10 @@
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "gitRevision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
     },
     "nullableString": {
       "type": ["string", "null"]
@@ -199,37 +204,82 @@
         "liveUrlCount": { "$ref": "#/$defs/nullableCount" }
       }
     },
+    "latencySample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "valuesMs"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "valuesMs": {
+          "allOf": [
+            { "$ref": "#/$defs/samples" },
+            { "minItems": 1 }
+          ]
+        }
+      }
+    },
     "latency": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["saveMs", "importMs", "exportMs", "operationMs"],
+      "required": ["samples"],
       "properties": {
-        "saveMs": { "$ref": "#/$defs/samples" },
-        "importMs": { "$ref": "#/$defs/samples" },
-        "exportMs": { "$ref": "#/$defs/samples" },
-        "operationMs": { "$ref": "#/$defs/samples" }
+        "samples": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/latencySample" }
+        }
+      }
+    },
+    "byteArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "bytes"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "bytes": { "type": "integer", "minimum": 0 }
       }
     },
     "bytes": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["fixtureBytes", "savedBytes", "importedBytes", "exportedBytes"],
+      "required": ["artifacts"],
       "properties": {
-        "fixtureBytes": { "$ref": "#/$defs/nullableCount" },
-        "savedBytes": { "$ref": "#/$defs/nullableCount" },
-        "importedBytes": { "$ref": "#/$defs/nullableCount" },
-        "exportedBytes": { "$ref": "#/$defs/nullableCount" }
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/byteArtifact" }
+        }
+      }
+    },
+    "canonicalOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "provenance"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "provenance": { "type": "string", "minLength": 1 }
+      }
+    },
+    "sourceArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sha256"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["runner", "measurements"],
+      "required": ["runner", "measurements", "artifacts"],
       "properties": {
         "runner": { "type": "string", "minLength": 1 },
         "measurements": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sourceArtifact" }
         }
       }
     }

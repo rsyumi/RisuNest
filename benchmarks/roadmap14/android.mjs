@@ -43,21 +43,16 @@ export function createPendingAndroidResults({ sourceRevision, appVersion, record
                 liveUrlCount: null,
             },
             latency: {
-                saveMs: [],
-                importMs: [],
-                exportMs: [],
-                operationMs: [],
+                samples: [],
             },
             bytes: {
-                fixtureBytes: null,
-                savedBytes: null,
-                importedBytes: null,
-                exportedBytes: null,
+                artifacts: [],
             },
-            canonicalOutputSha256: null,
+            canonicalOutput: null,
             source: {
-                runner: 'roadmap14-android-v1',
+                runner: 'roadmap14-android-v2',
                 measurements: [],
+                artifacts: [],
             },
             notes: [
                 'Physical Android device measurement is pending.',
@@ -88,8 +83,50 @@ export function validateAndroidInstrumentationResults(results) {
         if (result.platform.family !== 'android') {
             throw new Error(`Android instrumentation result ${index} must use platform.family android`)
         }
+        if (result.status !== 'completed') {
+            throw new Error(`Android instrumentation result ${index} must have status completed`)
+        }
+        const physicalIdentity = [result.platform.identity, result.platform.deviceModel]
+            .filter(Boolean)
+            .join(' ')
+        if (
+            result.build.target !== 'android-physical-device'
+            || result.platform.deviceModel === null
+            || /(?:emulator|avd|sdk_gphone|pending)/i.test(physicalIdentity)
+        ) {
+            throw new Error(`Android instrumentation result ${index} must identify a physical device`)
+        }
     })
+    const deviceFields = [
+        'family',
+        'identity',
+        'osVersion',
+        'architecture',
+        'webViewVersion',
+        'deviceModel',
+    ]
+    if (results.some((result) => !sameFields(result.platform, results[0].platform, deviceFields))) {
+        throw new Error('Android instrumentation results must come from one physical device')
+    }
+    const buildFields = [
+        'identity',
+        'sourceRevision',
+        'profile',
+        'target',
+        'appVersion',
+        'realmDisabled',
+    ]
+    if (
+        !/^[0-9a-f]{40}$/.test(results[0].build.sourceRevision ?? '')
+        || results.some((result) => !sameFields(result.build, results[0].build, buildFields))
+    ) {
+        throw new Error('Android instrumentation results must use one build and source revision')
+    }
     return results
+}
+
+function sameFields(left, right, fields) {
+    return fields.every((name) => left[name] === right[name])
 }
 
 function parseArguments(argumentsList) {

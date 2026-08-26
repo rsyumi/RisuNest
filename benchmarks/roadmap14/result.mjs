@@ -11,13 +11,13 @@ export function createRoadmap14Result({
     ui,
     latency,
     bytes,
-    canonicalOutputSha256,
+    canonicalOutput,
     source,
     notes = [],
 }) {
     const scenario = getRoadmap14Scenario(scenarioName)
     const result = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: 'risunest-roadmap14-platform-result',
         status,
         scenario: scenario.name,
@@ -34,7 +34,7 @@ export function createRoadmap14Result({
         ui,
         latency,
         bytes,
-        canonicalOutputSha256,
+        canonicalOutput,
         source,
         notes,
     }

@@ -1,6 +1,6 @@
 # Roadmap 14 platform baseline
 
-This directory defines the version 1 result contract and the four synthetic
+This directory defines the version 2 result contract and the four synthetic
 blocking scenarios used by Windows and Android measurements. Every command must
 run with `VITE_DISABLE_REALM=true`. The fixtures are local and synthetic.
 
@@ -16,12 +16,12 @@ repository-local validator used by the runners. A result always includes:
   model
 - heap, Windows RSS, or Android PSS samples
 - DOM node, mounted message, and live resource URL counts
-- save, import, export, and operation latency samples
-- fixture, save, import, and export byte counts
-- an independent canonical output SHA-256
+- named latency sample series and named byte artifacts
+- a canonical output SHA-256 with exact provenance
+- SHA-256 identities for every raw measurement artifact
 
-Completed results cannot use pending memory or omit the canonical hash, UI
-counts, all memory samples, or all latency samples. Pending and failed results
+Completed results cannot use pending memory or omit canonical output provenance,
+UI counts, all memory samples, all latency samples, or raw artifact identities. Pending and failed results
 keep the same fields and use null or empty measurements where no honest value
 exists.
 
@@ -55,9 +55,10 @@ identity.
 
 The current reusable Windows path covers `save-large`. It invokes the existing
 release Phase 3 Rust measurement and isolated release Tauri CDP measurement,
-then converts both artifacts into the shared schema. The Rust fixture now emits
-its deterministic SHA-256. The CDP measurement now records DOM, mounted message,
-and live resource URL counts.
+then converts both artifacts into the shared schema. The Rust benchmark writes
+its exact deterministic serialized fixture for the Tauri measurement to stage
+through the same native commands. The CDP measurement records memory, DOM,
+mounted message, and live resource URL counts for that same fixture.
 
 ```powershell
 $env:VITE_DISABLE_REALM = 'true'
@@ -78,9 +79,11 @@ node benchmarks/roadmap14/windows.mjs `
   --output <windows-save-large.json>
 ```
 
-Only raw results produced after this contract was added contain the required
-fixture SHA-256 and UI evidence. The runner rejects older or incomplete inputs
-instead of filling missing measurements.
+The runner requires both raw results and the embedded Tauri identifier to match
+the current Git HEAD. It also requires matching fixture bytes, SHA-256, and
+500-character, 5,001-conversation, 510,000-message shape. The canonical output
+hash is the framed post-append export traversal digest, not the input fixture
+hash. Raw artifact hashes are calculated from the files and cannot be overridden.
 
 The other three descriptors are ready for their workstream-specific release
 measurement adapters. They must use the same result schema. No Windows result is
@@ -97,8 +100,10 @@ node benchmarks/roadmap14/android.mjs `
   --output src-tauri/target/roadmap14-baseline/android-pending.json
 ```
 
-Physical-device instrumentation must emit a JSON array with exactly one shared
-schema result for each scenario. It records Android PSS in `memory.pssBytes`,
+Physical-device instrumentation must emit a completed JSON array with exactly
+one shared schema result for each scenario. Every result must use the same build,
+source revision, and physical-device identity. Pending records and emulator
+identities are rejected. It records Android PSS in `memory.pssBytes`,
 WebView JavaScript heap when available, device and WebView identity, the three UI
 counts, operation samples, bytes, and canonical output SHA-256. Validate and copy
 the device output with:

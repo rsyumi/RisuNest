@@ -1,71 +1,27 @@
-import { readFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 
-import { fixtureIdentity } from './scenarios.mjs'
+import { fixtureIdentity, getRoadmap14Scenario } from './scenarios.mjs'
 
-const SHA256_PATTERN = /^[0-9a-f]{64}$/
-const SCENARIOS = new Set([
-    'library-many',
-    'save-large',
-    'stream-postprocess',
-    'asset-library',
-])
-
-const schemaUrl = new URL('./result.schema.json', import.meta.url)
+const RESULT_SCHEMA = JSON.parse(
+    readFileSync(new URL('./result.schema.json', import.meta.url), 'utf8'),
+)
 
 export async function loadRoadmap14ResultSchema() {
-    return JSON.parse(await readFile(schemaUrl, 'utf8'))
+    return structuredClone(RESULT_SCHEMA)
+}
+
+export function validateRoadmap14JsonSchema(result) {
+    return validateSchemaValue(result, RESULT_SCHEMA, '$', RESULT_SCHEMA)
 }
 
 export function validateRoadmap14Result(result) {
-    const errors = []
+    const errors = validateRoadmap14JsonSchema(result)
+    if (!isRecord(result)) return errors
 
-    if (!isRecord(result)) return ['$ must be an object']
-    expectAllowedKeys(errors, result, [
-        'schemaVersion',
-        'kind',
-        'status',
-        'scenario',
-        'recordedAt',
-        'fixture',
-        'build',
-        'platform',
-        'memory',
-        'ui',
-        'latency',
-        'bytes',
-        'canonicalOutputSha256',
-        'source',
-        'notes',
-    ], '$')
-    expectEqual(errors, result.schemaVersion, 1, '$.schemaVersion')
-    expectEqual(errors, result.kind, 'risunest-roadmap14-platform-result', '$.kind')
-    expectOneOf(errors, result.status, ['completed', 'pending', 'failed'], '$.status')
-    expectOneOf(errors, result.scenario, [...SCENARIOS], '$.scenario')
-    expectString(errors, result.recordedAt, '$.recordedAt')
-    if (typeof result.recordedAt === 'string' && Number.isNaN(Date.parse(result.recordedAt))) {
-        errors.push('$.recordedAt must be an ISO 8601 date-time')
-    }
-    expectRecord(errors, result.fixture, '$.fixture')
-    expectRecord(errors, result.build, '$.build')
-    expectRecord(errors, result.platform, '$.platform')
-    expectRecord(errors, result.memory, '$.memory')
-    expectRecord(errors, result.ui, '$.ui')
-    expectRecord(errors, result.latency, '$.latency')
-    expectRecord(errors, result.bytes, '$.bytes')
-    expectRecord(errors, result.source, '$.source')
-    expectArray(errors, result.notes, '$.notes')
-
-    if (isRecord(result.fixture)) {
-        expectAllowedKeys(
-            errors,
-            result.fixture,
-            ['name', 'version', 'identitySha256', 'descriptor'],
-            '$.fixture',
-        )
-        expectEqual(errors, result.fixture.name, result.scenario, '$.fixture.name')
-        expectPositiveInteger(errors, result.fixture.version, '$.fixture.version')
-        expectSha256(errors, result.fixture.identitySha256, '$.fixture.identitySha256')
-        expectRecord(errors, result.fixture.descriptor, '$.fixture.descriptor')
+    if (isRecord(result.fixture) && typeof result.scenario === 'string') {
+        if (result.fixture.name !== result.scenario) {
+            errors.push('$.fixture.name must equal $.scenario')
+        }
         if (isRecord(result.fixture.descriptor)) {
             const actualIdentity = fixtureIdentity({
                 name: result.fixture.name,
@@ -75,208 +31,160 @@ export function validateRoadmap14Result(result) {
             if (result.fixture.identitySha256 !== actualIdentity) {
                 errors.push('$.fixture.identitySha256 does not match the fixture descriptor')
             }
+            try {
+                const frozen = getRoadmap14Scenario(result.scenario)
+                if (
+                    result.fixture.version !== frozen.version
+                    || actualIdentity !== frozen.identitySha256
+                ) {
+                    errors.push('$.fixture must match the frozen scenario definition')
+                }
+            } catch {
+                // The JSON Schema reports unknown scenario names.
+            }
         }
-    }
-    if (isRecord(result.build)) {
-        expectAllowedKeys(errors, result.build, [
-            'identity',
-            'sourceRevision',
-            'profile',
-            'target',
-            'appVersion',
-            'realmDisabled',
-        ], '$.build')
-        expectString(errors, result.build.identity, '$.build.identity')
-        expectNullableString(errors, result.build.sourceRevision, '$.build.sourceRevision')
-        expectOneOf(errors, result.build.profile, ['release', 'profile', 'debug'], '$.build.profile')
-        expectString(errors, result.build.target, '$.build.target')
-        expectString(errors, result.build.appVersion, '$.build.appVersion')
-        expectEqual(errors, result.build.realmDisabled, true, '$.build.realmDisabled')
-    }
-    if (isRecord(result.platform)) {
-        expectAllowedKeys(errors, result.platform, [
-            'family',
-            'identity',
-            'osVersion',
-            'architecture',
-            'webViewVersion',
-            'deviceModel',
-        ], '$.platform')
-        expectOneOf(errors, result.platform.family, ['windows', 'android'], '$.platform.family')
-        expectString(errors, result.platform.identity, '$.platform.identity')
-        expectString(errors, result.platform.osVersion, '$.platform.osVersion')
-        expectString(errors, result.platform.architecture, '$.platform.architecture')
-        expectNullableString(errors, result.platform.webViewVersion, '$.platform.webViewVersion')
-        expectNullableString(errors, result.platform.deviceModel, '$.platform.deviceModel')
-    }
-    if (isRecord(result.memory)) {
-        expectAllowedKeys(
-            errors,
-            result.memory,
-            ['measurement', 'heapUsedBytes', 'rssBytes', 'pssBytes'],
-            '$.memory',
-        )
-        expectOneOf(
-            errors,
-            result.memory.measurement,
-            ['js-heap-and-rss', 'android-pss', 'pending'],
-            '$.memory.measurement',
-        )
-        expectNumberArray(errors, result.memory.heapUsedBytes, '$.memory.heapUsedBytes')
-        expectNumberArray(errors, result.memory.rssBytes, '$.memory.rssBytes')
-        expectNumberArray(errors, result.memory.pssBytes, '$.memory.pssBytes')
-    }
-    if (isRecord(result.ui)) {
-        expectAllowedKeys(
-            errors,
-            result.ui,
-            ['domNodeCount', 'mountedMessageCount', 'liveUrlCount'],
-            '$.ui',
-        )
-        expectNullableNonNegativeInteger(errors, result.ui.domNodeCount, '$.ui.domNodeCount')
-        expectNullableNonNegativeInteger(
-            errors,
-            result.ui.mountedMessageCount,
-            '$.ui.mountedMessageCount',
-        )
-        expectNullableNonNegativeInteger(errors, result.ui.liveUrlCount, '$.ui.liveUrlCount')
-    }
-    if (isRecord(result.latency)) {
-        expectAllowedKeys(
-            errors,
-            result.latency,
-            ['saveMs', 'importMs', 'exportMs', 'operationMs'],
-            '$.latency',
-        )
-        expectNumberArray(errors, result.latency.saveMs, '$.latency.saveMs')
-        expectNumberArray(errors, result.latency.importMs, '$.latency.importMs')
-        expectNumberArray(errors, result.latency.exportMs, '$.latency.exportMs')
-        expectNumberArray(errors, result.latency.operationMs, '$.latency.operationMs')
-    }
-    if (isRecord(result.bytes)) {
-        expectAllowedKeys(
-            errors,
-            result.bytes,
-            ['fixtureBytes', 'savedBytes', 'importedBytes', 'exportedBytes'],
-            '$.bytes',
-        )
-        for (const name of ['fixtureBytes', 'savedBytes', 'importedBytes', 'exportedBytes']) {
-            expectNullableNonNegativeInteger(errors, result.bytes[name], `$.bytes.${name}`)
-        }
-    }
-    if (result.canonicalOutputSha256 !== null) {
-        expectSha256(errors, result.canonicalOutputSha256, '$.canonicalOutputSha256')
-    }
-    if (isRecord(result.source)) {
-        expectAllowedKeys(errors, result.source, ['runner', 'measurements'], '$.source')
-        expectString(errors, result.source.runner, '$.source.runner')
-        expectArray(errors, result.source.measurements, '$.source.measurements')
-        if (Array.isArray(result.source.measurements)) {
-            result.source.measurements.forEach((value, index) =>
-                expectString(errors, value, `$.source.measurements[${index}]`))
-        }
-    }
-    if (Array.isArray(result.notes)) {
-        result.notes.forEach((value, index) => expectString(errors, value, `$.notes[${index}]`))
     }
 
-    if (result.status === 'completed') {
-        if (result.canonicalOutputSha256 === null) {
-            errors.push('$.canonicalOutputSha256 is required when status is completed')
+    requireUniqueNames(errors, result.latency?.samples, '$.latency.samples')
+    requireUniqueNames(errors, result.bytes?.artifacts, '$.bytes.artifacts')
+    requireUniqueNames(errors, result.source?.artifacts, '$.source.artifacts')
+
+    return errors
+}
+
+function validateSchemaValue(value, schema, path, rootSchema) {
+    if (schema === true) return []
+    if (schema === false) return [`${path} is not allowed`]
+    if (!isRecord(schema)) return [`${path} has an invalid schema`]
+
+    const errors = []
+    if (typeof schema.$ref === 'string') {
+        errors.push(...validateSchemaValue(value, resolveReference(rootSchema, schema.$ref), path, rootSchema))
+    }
+    if (Array.isArray(schema.allOf)) {
+        for (const branch of schema.allOf) {
+            errors.push(...validateSchemaValue(value, branch, path, rootSchema))
         }
-        if (isRecord(result.ui)) {
-            for (const name of ['domNodeCount', 'mountedMessageCount', 'liveUrlCount']) {
-                if (result.ui[name] === null) {
-                    errors.push(`$.ui.${name} is required when status is completed`)
-                }
+    }
+    if (Array.isArray(schema.anyOf)) {
+        const matches = schema.anyOf.some(
+            (branch) => validateSchemaValue(value, branch, path, rootSchema).length === 0,
+        )
+        if (!matches) errors.push(`${path} must match at least one allowed schema`)
+    }
+    if (isRecord(schema.if)) {
+        const conditionMatches = validateSchemaValue(value, schema.if, path, rootSchema).length === 0
+        if (conditionMatches && isRecord(schema.then)) {
+            errors.push(...validateSchemaValue(value, schema.then, path, rootSchema))
+        } else if (!conditionMatches && isRecord(schema.else)) {
+            errors.push(...validateSchemaValue(value, schema.else, path, rootSchema))
+        }
+    }
+
+    if ('const' in schema && !deepEqual(value, schema.const)) {
+        errors.push(`${path} must equal ${JSON.stringify(schema.const)}`)
+    }
+    if (Array.isArray(schema.enum) && !schema.enum.some((entry) => deepEqual(value, entry))) {
+        errors.push(`${path} must be one of ${schema.enum.join(', ')}`)
+    }
+    if (schema.type !== undefined && !matchesType(value, schema.type)) {
+        errors.push(`${path} must be ${describeType(schema.type)}`)
+        return errors
+    }
+
+    if (isRecord(value)) {
+        const properties = isRecord(schema.properties) ? schema.properties : {}
+        if (Array.isArray(schema.required)) {
+            for (const name of schema.required) {
+                if (!(name in value)) errors.push(`${path}.${name} is required`)
             }
         }
-        if (isRecord(result.memory)) {
-            const memorySampleCount = ['heapUsedBytes', 'rssBytes', 'pssBytes']
-                .reduce((total, name) => total + (result.memory[name]?.length ?? 0), 0)
-            if (memorySampleCount === 0) {
-                errors.push('$.memory requires heap, RSS, or PSS samples when status is completed')
-            }
-            if (result.memory.measurement === 'pending') {
-                errors.push('$.memory.measurement cannot be pending when status is completed')
+        if (schema.additionalProperties === false) {
+            for (const name of Object.keys(value)) {
+                if (!(name in properties)) errors.push(`${path}.${name} is not allowed`)
             }
         }
-        if (isRecord(result.latency)) {
-            const latencySampleCount = ['saveMs', 'importMs', 'exportMs', 'operationMs']
-                .reduce((total, name) => total + (result.latency[name]?.length ?? 0), 0)
-            if (latencySampleCount === 0) {
-                errors.push('$.latency requires at least one sample when status is completed')
+        for (const [name, propertySchema] of Object.entries(properties)) {
+            if (name in value) {
+                errors.push(...validateSchemaValue(value[name], propertySchema, `${path}.${name}`, rootSchema))
             }
         }
-        if (isRecord(result.bytes)) {
-            for (const name of ['fixtureBytes', 'savedBytes', 'importedBytes', 'exportedBytes']) {
-                if (result.bytes[name] === null) {
-                    errors.push(`$.bytes.${name} is required when status is completed`)
-                }
-            }
+    }
+
+    if (Array.isArray(value)) {
+        if (Number.isSafeInteger(schema.minItems) && value.length < schema.minItems) {
+            errors.push(`${path} must contain at least ${schema.minItems} item(s)`)
         }
+        if (schema.items !== undefined) {
+            value.forEach((entry, index) => {
+                errors.push(...validateSchemaValue(entry, schema.items, `${path}[${index}]`, rootSchema))
+            })
+        }
+    }
+
+    if (typeof value === 'string') {
+        if (Number.isSafeInteger(schema.minLength) && value.length < schema.minLength) {
+            errors.push(`${path} must contain at least ${schema.minLength} character(s)`)
+        }
+        if (typeof schema.pattern === 'string' && !new RegExp(schema.pattern).test(value)) {
+            errors.push(`${path} must match ${schema.pattern}`)
+        }
+        if (schema.format === 'date-time' && Number.isNaN(Date.parse(value))) {
+            errors.push(`${path} must be an ISO 8601 date-time`)
+        }
+    }
+
+    if (typeof value === 'number' && Number.isFinite(schema.minimum) && value < schema.minimum) {
+        errors.push(`${path} must be at least ${schema.minimum}`)
     }
 
     return errors
+}
+
+function resolveReference(rootSchema, reference) {
+    if (!reference.startsWith('#/')) throw new Error(`Unsupported JSON Schema reference: ${reference}`)
+    return reference.slice(2).split('/').reduce((value, segment) => {
+        const key = segment.replaceAll('~1', '/').replaceAll('~0', '~')
+        return value[key]
+    }, rootSchema)
+}
+
+function matchesType(value, type) {
+    const types = Array.isArray(type) ? type : [type]
+    return types.some((candidate) => {
+        if (candidate === 'null') return value === null
+        if (candidate === 'array') return Array.isArray(value)
+        if (candidate === 'object') return isRecord(value)
+        if (candidate === 'integer') return Number.isSafeInteger(value)
+        if (candidate === 'number') return typeof value === 'number' && Number.isFinite(value)
+        return typeof value === candidate
+    })
+}
+
+function describeType(type) {
+    return (Array.isArray(type) ? type : [type]).join(' or ')
+}
+
+function requireUniqueNames(errors, entries, path) {
+    if (!Array.isArray(entries)) return
+    const names = entries.map((entry) => entry?.name).filter((name) => typeof name === 'string')
+    if (new Set(names).size !== names.length) errors.push(`${path} names must be unique`)
 }
 
 function isRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function expectRecord(errors, value, path) {
-    if (!isRecord(value)) errors.push(`${path} must be an object`)
-}
-
-function expectArray(errors, value, path) {
-    if (!Array.isArray(value)) errors.push(`${path} must be an array`)
-}
-
-function expectAllowedKeys(errors, value, allowedKeys, path) {
-    const allowed = new Set(allowedKeys)
-    for (const key of Object.keys(value)) {
-        if (!allowed.has(key)) errors.push(`${path}.${key} is not allowed`)
+function deepEqual(left, right) {
+    if (Object.is(left, right)) return true
+    if (Array.isArray(left) && Array.isArray(right)) {
+        return left.length === right.length && left.every((value, index) => deepEqual(value, right[index]))
     }
-}
-
-function expectString(errors, value, path) {
-    if (typeof value !== 'string' || value.length === 0) errors.push(`${path} must be a non-empty string`)
-}
-
-function expectNullableString(errors, value, path) {
-    if (value !== null) expectString(errors, value, path)
-}
-
-function expectEqual(errors, value, expected, path) {
-    if (value !== expected) errors.push(`${path} must equal ${JSON.stringify(expected)}`)
-}
-
-function expectOneOf(errors, value, choices, path) {
-    if (!choices.includes(value)) errors.push(`${path} must be one of ${choices.join(', ')}`)
-}
-
-function expectPositiveInteger(errors, value, path) {
-    if (!Number.isSafeInteger(value) || value <= 0) errors.push(`${path} must be a positive integer`)
-}
-
-function expectNullableNonNegativeInteger(errors, value, path) {
-    if (value !== null && (!Number.isSafeInteger(value) || value < 0)) {
-        errors.push(`${path} must be null or a non-negative integer`)
+    if (isRecord(left) && isRecord(right)) {
+        const leftKeys = Object.keys(left)
+        const rightKeys = Object.keys(right)
+        return leftKeys.length === rightKeys.length
+            && leftKeys.every((key) => key in right && deepEqual(left[key], right[key]))
     }
-}
-
-function expectNumberArray(errors, value, path) {
-    expectArray(errors, value, path)
-    if (!Array.isArray(value)) return
-    value.forEach((entry, index) => {
-        if (typeof entry !== 'number' || !Number.isFinite(entry) || entry < 0) {
-            errors.push(`${path}[${index}] must be a non-negative finite number`)
-        }
-    })
-}
-
-function expectSha256(errors, value, path) {
-    if (typeof value !== 'string' || !SHA256_PATTERN.test(value)) {
-        errors.push(`${path} must be a lowercase SHA-256 hex string`)
-    }
+    return false
 }
