@@ -1167,6 +1167,50 @@ mod tests {
     }
 
     #[test]
+    fn same_length_payload_mutation_is_rejected_before_any_upload() {
+        let (directory, payload) = publication_payload();
+        let payload_path = std::fs::read_dir(directory.path().join("exports"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "risudat")
+            })
+            .expect("managed publication payload");
+        let mut mutated = std::fs::read(&payload_path).unwrap();
+        mutated[0] ^= 0xff;
+        std::fs::write(&payload_path, &mutated).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+
+        let error = tauri::async_runtime::block_on(upload_attempt(
+            &build_client().unwrap(),
+            &payload,
+            &base_url,
+            "account-1",
+            Some("session".to_owned()),
+            "date",
+            &OfficialPublicationCredential::RisuAuth {
+                token: "token".to_owned(),
+            },
+            running_job(),
+        ))
+        .expect_err("same-length payload mutation must be rejected");
+
+        assert_eq!(error.code, "invalid-source");
+        assert_eq!(
+            error.message,
+            "official publication payload content changed"
+        );
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        payload.cleanup().unwrap();
+    }
+
+    #[test]
     fn repeated_ordinary_403_reuses_exact_payload_with_fresh_private_headers() {
         let (_directory, payload) = publication_payload();
         let (base_url, server) = mock_server(vec![
