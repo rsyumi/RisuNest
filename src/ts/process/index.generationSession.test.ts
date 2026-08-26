@@ -18,6 +18,9 @@ vi.mock('../tokenizer', () => ({
         async tokenizeChat() {
             return 1
         }
+        async tokenizeChats(chats: unknown[]) {
+            return chats.length
+        }
     },
     tokenize: vi.fn(async () => {
         mocks.events.push('tokenize-result')

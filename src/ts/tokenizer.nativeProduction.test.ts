@@ -2,10 +2,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const harness = vi.hoisted(() => ({
     nativeBatch: vi.fn(),
+    nativeCountBatch: vi.fn(),
+    useTokenizerCaching: false,
 }))
 
 vi.mock('./tokenizer/nativeTokenizerProduction', () => ({
     tryNativeTokenizerIdsBatch: harness.nativeBatch,
+    tryNativeTokenizerCountBatch: harness.nativeCountBatch,
 }))
 
 vi.mock('./storage/database.svelte', () => ({
@@ -15,7 +18,7 @@ vi.mock('./storage/database.svelte', () => ({
         currentPluginProvider: '',
         customTokenizer: 'tik',
         googleClaudeTokenizing: false,
-        useTokenizerCaching: false,
+        useTokenizerCaching: harness.useTokenizerCaching,
     }),
 }))
 
@@ -48,7 +51,54 @@ vi.mock('./plugins/plugins.svelte', () => ({
     pluginV2: { providerOptions: new Map() },
 }))
 
-import { strongBan } from './tokenizer'
+import { ChatTokenizer, strongBan } from './tokenizer'
+
+describe('chat tokenizer native count batching', () => {
+    beforeEach(() => {
+        harness.nativeCountBatch.mockReset()
+        harness.useTokenizerCaching = false
+    })
+
+    it('counts a large homogeneous prompt batch with one native invocation', async () => {
+        const chats = Array.from({ length: 100 }, (_, index) => ({
+            role: 'user' as const,
+            content: `content-${index}`,
+            name: `name-${index}`,
+        }))
+        harness.nativeCountBatch.mockImplementation(async (candidate) => {
+            const texts = candidate.buildTexts()
+            expect(candidate.itemCount).toBe(200)
+            expect(texts).toHaveLength(200)
+            return texts.map((text: string) => text.startsWith('name-') ? 2 : 5)
+        })
+
+        const result = await new ChatTokenizer(3, 'name').tokenizeChats(chats)
+
+        expect(result).toBe(1_100)
+        expect(harness.nativeCountBatch).toHaveBeenCalledTimes(1)
+        expect(harness.nativeCountBatch.mock.calls[0][1]).toEqual({
+            isTauri: expect.any(Boolean),
+            aiModel: 'gpt-4',
+            customTokenizer: 'tik',
+            modelTokenizerId: 'cl100k_base',
+            pluginTokenizer: undefined,
+        })
+    })
+
+    it('keeps tokenizer-cache users on the existing JavaScript path', async () => {
+        harness.useTokenizerCaching = true
+        harness.nativeCountBatch.mockResolvedValue(Array.from({ length: 100 }, () => 99))
+        const chats = Array.from({ length: 100 }, () => ({
+            role: 'user' as const,
+            content: '',
+        }))
+
+        const result = await new ChatTokenizer(3, 'name').tokenizeChats(chats)
+
+        expect(result).toBe(300)
+        expect(harness.nativeCountBatch).not.toHaveBeenCalled()
+    })
+})
 
 describe('strong ban native batch routing', () => {
     beforeEach(() => {

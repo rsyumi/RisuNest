@@ -63,6 +63,10 @@ vi.mock('../tokenizer', () => ({
             await testState.onTokenizeChat?.()
             return 1
         }
+        async tokenizeChats(chats: unknown[]): Promise<number> {
+            for(const _chat of chats) await testState.onTokenizeChat?.()
+            return chats.length
+        }
     },
     tokenize: vi.fn(async () => 1),
     tokenizeNum: vi.fn(async () => 1),

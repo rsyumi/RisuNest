@@ -9,11 +9,13 @@ export const NATIVE_TOKENIZER_MIN_BATCH_ITEMS = 100
 export const NATIVE_TOKENIZER_MAX_BATCH_ITEMS = 1_000
 export const NATIVE_TOKENIZER_MAX_AGGREGATE_INPUT_BYTES = 1_048_576
 
-export type NativeTokenizerIdsBatchCandidate = {
+export type NativeTokenizerBatchCandidate = {
     itemCount: number
     aggregateInputBytes: () => number
     buildTexts: () => string[]
 }
+
+export type NativeTokenizerIdsBatchCandidate = NativeTokenizerBatchCandidate
 
 export type ProductionNativeTokenizerContext = {
     isTauri: boolean
@@ -42,11 +44,12 @@ export function resolveProductionNativeTokenizerId(
     return context.modelTokenizerId
 }
 
-export async function tryNativeTokenizerIdsBatch(
-    candidate: NativeTokenizerIdsBatchCandidate,
+async function tryNativeTokenizerBatch(
+    candidate: NativeTokenizerBatchCandidate,
     context: ProductionNativeTokenizerContext,
+    mode: 'count' | 'ids',
     invokeCommand?: NativeTokenizerInvoke,
-): Promise<number[][] | null> {
+): Promise<number[] | number[][] | null> {
     if (
         candidate.itemCount < NATIVE_TOKENIZER_MIN_BATCH_ITEMS ||
         candidate.itemCount > NATIVE_TOKENIZER_MAX_BATCH_ITEMS
@@ -65,6 +68,22 @@ export async function tryNativeTokenizerIdsBatch(
         return null
     }
     const texts = candidate.buildTexts()
-    const response = await invokeNativeTokenizerBatch(route, texts, 'ids', invokeCommand)
-    return response.mode === 'ids' ? response.ids : null
+    const response = await invokeNativeTokenizerBatch(route, texts, mode, invokeCommand)
+    return response.mode === 'count' ? response.counts : response.ids
+}
+
+export async function tryNativeTokenizerCountBatch(
+    candidate: NativeTokenizerBatchCandidate,
+    context: ProductionNativeTokenizerContext,
+    invokeCommand?: NativeTokenizerInvoke,
+): Promise<number[] | null> {
+    return await tryNativeTokenizerBatch(candidate, context, 'count', invokeCommand) as number[] | null
+}
+
+export async function tryNativeTokenizerIdsBatch(
+    candidate: NativeTokenizerIdsBatchCandidate,
+    context: ProductionNativeTokenizerContext,
+    invokeCommand?: NativeTokenizerInvoke,
+): Promise<number[][] | null> {
+    return await tryNativeTokenizerBatch(candidate, context, 'ids', invokeCommand) as number[][] | null
 }

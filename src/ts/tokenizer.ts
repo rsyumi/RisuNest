@@ -11,7 +11,10 @@ import { pluginV2 } from "./plugins/plugins.svelte";
 import type { GemmaTokenizer } from "@huggingface/transformers";
 import { LRUMap } from 'mnemonist';
 import { isTauri } from './platform';
-import { tryNativeTokenizerIdsBatch } from './tokenizer/nativeTokenizerProduction';
+import {
+    tryNativeTokenizerCountBatch,
+    tryNativeTokenizerIdsBatch,
+} from './tokenizer/nativeTokenizerProduction';
 
 const MAX_CACHE_SIZE = 1500;
 
@@ -440,6 +443,73 @@ export class ChatTokenizer {
         return encoded
     }
     async tokenizeChats(data:OpenAIChat[]){
+        const db = getDatabase()
+        if(!db.useTokenizerCaching){
+            let itemCount = data.length
+            for(const chat of data){
+                if(chat.name && this.useName === 'name'){
+                    itemCount++
+                }
+            }
+            const candidate = {
+                itemCount,
+                aggregateInputBytes: () => {
+                    const encoder = new TextEncoder()
+                    let bytes = 0
+                    for(const chat of data){
+                        bytes += encoder.encode(chat.content).byteLength
+                        if(chat.name && this.useName === 'name'){
+                            bytes += encoder.encode(chat.name).byteLength
+                        }
+                    }
+                    return bytes
+                },
+                buildTexts: () => {
+                    const texts:string[] = []
+                    for(const chat of data){
+                        texts.push(chat.content)
+                        if(chat.name && this.useName === 'name'){
+                            texts.push(chat.name)
+                        }
+                    }
+                    return texts
+                },
+            }
+            const modelInfo = getModelInfo(db.aiModel)
+            const modelTokenizerId = modelInfo.tokenizer === LLMTokenizer.tiktokenCl100kBase
+                ? 'cl100k_base'
+                : modelInfo.tokenizer === LLMTokenizer.tiktokenO200Base
+                    ? 'o200k_base'
+                    : null
+            try {
+                const counts = await tryNativeTokenizerCountBatch(candidate, {
+                    isTauri,
+                    aiModel: db.aiModel,
+                    customTokenizer: db.customTokenizer,
+                    modelTokenizerId,
+                    pluginTokenizer: pluginV2.providerOptions.get(db.currentPluginProvider)?.tokenizer,
+                })
+                if(counts){
+                    let encoded = 0
+                    let index = 0
+                    for(const chat of data){
+                        encoded += counts[index++] + this.chatAdditionalTokens
+                        if(chat.name && this.useName === 'name'){
+                            encoded += counts[index++] + 1
+                        }
+                        if(chat.multimodals && chat.multimodals.length > 0){
+                            for(const multimodal of chat.multimodals){
+                                encoded += this.tokenizeMultiModal(multimodal)
+                            }
+                        }
+                    }
+                    return encoded
+                }
+            }
+            catch {
+                // Preserve the existing JavaScript tokenizer on native capability failures.
+            }
+        }
         let encoded = 0
         for(const chat of data){
             encoded += await this.tokenizeChat(chat)

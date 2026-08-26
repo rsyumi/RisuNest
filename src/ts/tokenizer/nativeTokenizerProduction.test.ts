@@ -4,6 +4,7 @@ import {
     NATIVE_TOKENIZER_MAX_BATCH_ITEMS,
     NATIVE_TOKENIZER_MIN_BATCH_ITEMS,
     resolveProductionNativeTokenizerId,
+    tryNativeTokenizerCountBatch,
     tryNativeTokenizerIdsBatch,
     type NativeTokenizerIdsBatchCandidate,
     type ProductionNativeTokenizerContext,
@@ -173,6 +174,32 @@ describe('production native tokenizer eligibility', () => {
                 tokenizer_id: 'cl100k_base',
                 artifact_fingerprint: NATIVE_TOKENIZER_FINGERPRINTS.cl100k_base,
                 mode: 'ids',
+                texts,
+            },
+        })
+    })
+
+    it('invokes one ordered count batch at the measured threshold', async () => {
+        const texts = Array.from(
+            { length: NATIVE_TOKENIZER_MIN_BATCH_ITEMS },
+            (_, index) => `count-segment-${index}`,
+        )
+        const counts = texts.map((_, index) => index + 1)
+        const invoke = vi.fn(async () => ({
+            mode: 'count',
+            artifact_fingerprint: NATIVE_TOKENIZER_FINGERPRINTS.cl100k_base,
+            counts,
+        }))
+
+        await expect(
+            tryNativeTokenizerCountBatch(candidate(texts), cl100kContext, invoke),
+        ).resolves.toEqual(counts)
+        expect(invoke).toHaveBeenCalledTimes(1)
+        expect(invoke).toHaveBeenCalledWith('tokenize_batch', {
+            request: {
+                tokenizer_id: 'cl100k_base',
+                artifact_fingerprint: NATIVE_TOKENIZER_FINGERPRINTS.cl100k_base,
+                mode: 'count',
                 texts,
             },
         })

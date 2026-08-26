@@ -104,6 +104,9 @@ vi.mock('../tokenizer', () => ({
         async tokenizeChat() {
             return 1
         }
+        async tokenizeChats(chats: unknown[]) {
+            return chats.length
+        }
     },
     tokenize: harness.tokenize,
     tokenizeNum: harness.tokenizeNum,

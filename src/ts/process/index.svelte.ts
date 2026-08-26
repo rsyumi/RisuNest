@@ -740,10 +740,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         const template = promptTemplate
 
         async function tokenizeChatArray(chats:OpenAIChat[]){
-            for(const chat of chats){
-                const tokens = await tokenizer.tokenizeChat(chat)
-                currentTokens += tokens
-            }
+            currentTokens += await tokenizer.tokenizeChats(chats)
         }
 
         for(const card of template){
@@ -885,17 +882,13 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     else{
         for(const key in unformated){
             const chats = unformated[key] as OpenAIChat[]
-            for(const chat of chats){
-                currentTokens += await tokenizer.tokenizeChat(chat)
-            }
+            currentTokens += await tokenizer.tokenizeChats(chats)
         }
     }
     
     const examples = exampleMessage(currentChar, getUserName())
 
-    for(const example of examples){
-        currentTokens += await tokenizer.tokenizeChat(example)
-    }
+    currentTokens += await tokenizer.tokenizeChats(examples)
 
     let chats:OpenAIChat[] = examples
 
