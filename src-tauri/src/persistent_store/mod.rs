@@ -36,6 +36,8 @@ pub(crate) use sync_device_registry::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "native-official-publication")]
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -898,6 +900,27 @@ pub(crate) struct PreparedRisuSaveExport {
     reader: Option<RevisionReadLease>,
 }
 
+#[cfg(feature = "native-official-publication")]
+pub(crate) struct PreparedOfficialPublication {
+    pub(crate) revision: i64,
+    lease: String,
+    snapshots_dir: PathBuf,
+    database_path: PathBuf,
+    reader: Option<RevisionReadLease>,
+}
+
+#[cfg(feature = "native-official-publication")]
+pub(crate) struct OfficialPublicationPayload {
+    path: PathBuf,
+    snapshots_dir: PathBuf,
+    lease: String,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
+    pub(crate) character_count: u64,
+    pub(crate) preset_count: u64,
+    armed: bool,
+}
+
 impl PreparedRisuSaveExport {
     pub(crate) fn take_reader(&mut self) -> StoreResult<RevisionReadLease> {
         self.reader.take().ok_or_else(|| StoreError::Validation {
@@ -914,6 +937,114 @@ impl PreparedRisuSaveExport {
     pub(crate) fn cleanup_file(&self, path: &Path) -> StoreResult<()> {
         export::cleanup(&self.snapshots_dir, path)
     }
+}
+
+#[cfg(feature = "native-official-publication")]
+impl PreparedOfficialPublication {
+    pub(crate) fn create_payload(
+        mut self,
+        expected_account_id: &str,
+        replacements: &HashMap<String, String>,
+        is_cancelled: impl Fn() -> bool,
+        on_progress: impl FnMut(u64, u64, u64),
+    ) -> StoreResult<OfficialPublicationPayload> {
+        let reader = self.reader.as_ref().ok_or(StoreError::SnapshotReleased)?;
+        let exported = export::create_projected_controlled_for_account(
+            &reader.connection,
+            &self.snapshots_dir,
+            &reader.target,
+            &self.lease,
+            expected_account_id,
+            replacements,
+            is_cancelled,
+            on_progress,
+        );
+        let exported = match exported {
+            Ok(exported) => exported,
+            Err(error) => {
+                let _ = self.release_reader();
+                return Err(error);
+            }
+        };
+        let path = PathBuf::from(&exported.path);
+        let sha256 = match hash_exact_file(&path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                let _ = self.release_reader();
+                let _ = export::cleanup(&self.snapshots_dir, &path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.release_reader() {
+            let _ = export::cleanup(&self.snapshots_dir, &path);
+            return Err(error);
+        }
+        Ok(OfficialPublicationPayload {
+            path,
+            snapshots_dir: self.snapshots_dir.clone(),
+            lease: self.lease.clone(),
+            bytes: exported.bytes,
+            sha256,
+            character_count: exported.character_count,
+            preset_count: exported.preset_count,
+            armed: true,
+        })
+    }
+
+    fn release_reader(&mut self) -> StoreResult<()> {
+        let Some(reader) = self.reader.take() else {
+            return Ok(());
+        };
+        let active_readers = reader.active_readers();
+        snapshot::close_revision(reader)?;
+        checkpoint_after_detached_release(&self.database_path, &active_readers)
+    }
+}
+
+#[cfg(feature = "native-official-publication")]
+impl Drop for PreparedOfficialPublication {
+    fn drop(&mut self) {
+        let _ = self.release_reader();
+    }
+}
+
+#[cfg(feature = "native-official-publication")]
+impl OfficialPublicationPayload {
+    pub(crate) fn open(&self) -> StoreResult<(std::fs::File, u64)> {
+        export::open_owned_for_upload(&self.snapshots_dir, &self.path, &self.lease)
+    }
+
+    pub(crate) fn cleanup(mut self) -> StoreResult<()> {
+        export::cleanup(&self.snapshots_dir, &self.path)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "native-official-publication")]
+impl Drop for OfficialPublicationPayload {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = export::cleanup(&self.snapshots_dir, &self.path);
+        }
+    }
+}
+
+#[cfg(feature = "native-official-publication")]
+fn hash_exact_file(path: &Path) -> StoreResult<String> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 impl PreparedReplaceCommit {
@@ -1492,6 +1623,42 @@ impl PersistentStore {
         Ok(PreparedRisuSaveExport {
             revision,
             lease,
+            snapshots_dir: self.snapshots_dir.clone(),
+            database_path: self.database_path.clone(),
+            reader: Some(reader),
+        })
+    }
+
+    #[cfg(feature = "native-official-publication")]
+    pub(crate) fn prepare_official_publication(
+        &mut self,
+        lease: &str,
+        expected_revision: i64,
+    ) -> StoreResult<PreparedOfficialPublication> {
+        if !lease.starts_with("snapshot-") {
+            return Err(StoreError::Validation {
+                message: "revision lease must be a snapshot lease".to_owned(),
+            });
+        }
+        let reader = self
+            .revision_leases
+            .remove(lease)
+            .ok_or(StoreError::SnapshotReleased)?;
+        if reader.target.revision != expected_revision {
+            let actual = reader.target.revision;
+            self.revision_leases.insert(lease.to_owned(), reader);
+            return Err(StoreError::RevisionConflict {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        if let Err(error) = reader.publish_detached_asset_roots() {
+            self.revision_leases.insert(lease.to_owned(), reader);
+            return Err(error);
+        }
+        Ok(PreparedOfficialPublication {
+            revision: reader.target.revision,
+            lease: lease.to_owned(),
             snapshots_dir: self.snapshots_dir.clone(),
             database_path: self.database_path.clone(),
             reader: Some(reader),

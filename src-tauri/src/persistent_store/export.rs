@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fs::{self, File};
-#[cfg(feature = "official-publication-upload-pilot")]
+#[cfg(feature = "native-official-publication")]
 use std::io::Read;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ const MODULES: u8 = 5;
 const PLUGINS: u8 = 9;
 const LOADOUTS: u8 = 10;
 const PLUGIN_STORAGE: u8 = 11;
-#[cfg(feature = "official-publication-upload-pilot")]
+#[cfg(feature = "native-official-publication")]
 const MAX_EXPORT_OWNERSHIP_BYTES: u64 = 4096;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -87,6 +87,7 @@ pub(crate) fn create_controlled(
         lease,
         omit_account,
         None,
+        None,
         is_cancelled,
         on_progress,
     )
@@ -109,6 +110,31 @@ pub(crate) fn create_projected_controlled(
         lease,
         omit_account,
         Some(replacements),
+        None,
+        is_cancelled,
+        on_progress,
+    )
+}
+
+#[cfg(feature = "native-official-publication")]
+pub(crate) fn create_projected_controlled_for_account(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    target: &ReadTarget,
+    lease: &str,
+    expected_account_id: &str,
+    replacements: &HashMap<String, String>,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(u64, u64, u64),
+) -> StoreResult<ExportedRisuSave> {
+    create_controlled_inner(
+        connection,
+        snapshots_dir,
+        target,
+        lease,
+        false,
+        Some(replacements),
+        Some(expected_account_id),
         is_cancelled,
         on_progress,
     )
@@ -121,6 +147,7 @@ fn create_controlled_inner(
     lease: &str,
     omit_account: bool,
     replacements: Option<&HashMap<String, String>>,
+    expected_account_id: Option<&str>,
     is_cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(u64, u64, u64),
 ) -> StoreResult<ExportedRisuSave> {
@@ -160,6 +187,9 @@ fn create_controlled_inner(
         serde_json::from_str(&root)?,
         "Persistent root must be an object",
     )?;
+    if let Some(expected_account_id) = expected_account_id {
+        validate_pinned_account(&root, expected_account_id)?;
+    }
     owner_projector.project_root(&mut root)?;
     if let Some(replacements) = replacements {
         project_root_resources(&mut root, replacements);
@@ -410,7 +440,7 @@ pub(super) fn cleanup(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
     }
 }
 
-#[cfg(feature = "official-publication-upload-pilot")]
+#[cfg(feature = "native-official-publication")]
 fn open_regular_file_no_follow(path: &Path) -> StoreResult<(File, u64)> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -435,7 +465,7 @@ fn open_regular_file_no_follow(path: &Path) -> StoreResult<(File, u64)> {
     Ok((file, metadata.len()))
 }
 
-#[cfg(feature = "official-publication-upload-pilot")]
+#[cfg(feature = "native-official-publication")]
 fn read_bounded_ownership(file: File, size_hint: u64) -> StoreResult<ExportOwnership> {
     let mut bytes = Vec::with_capacity(size_hint.min(MAX_EXPORT_OWNERSHIP_BYTES) as usize);
     file.take(MAX_EXPORT_OWNERSHIP_BYTES + 1)
@@ -479,6 +509,40 @@ pub(super) fn open_for_upload(
         });
     }
     Ok((source, source_len, ownership.lease))
+}
+
+#[cfg(feature = "native-official-publication")]
+pub(super) fn open_owned_for_upload(
+    snapshots_dir: &Path,
+    path: &Path,
+    expected_lease: &str,
+) -> StoreResult<(File, u64)> {
+    let exports_dir = export_directory(snapshots_dir)?;
+    let Some((id, ManagedFileKind::Completed)) = managed_file(path) else {
+        return Err(StoreError::Validation {
+            message: "Official publication source is not a managed RisuSave export".to_owned(),
+        });
+    };
+    if path.parent() != Some(exports_dir.as_path()) {
+        return Err(StoreError::Validation {
+            message: "Official publication source is outside the export directory".to_owned(),
+        });
+    }
+    let (source, source_len) = open_regular_file_no_follow(path)?;
+    let ownership_path = exports_dir.join(format!("risusave-{id}.lease"));
+    let (ownership_file, ownership_len) = open_regular_file_no_follow(&ownership_path)?;
+    if ownership_len > MAX_EXPORT_OWNERSHIP_BYTES {
+        return Err(StoreError::Validation {
+            message: "Official publication source has no valid ownership marker".to_owned(),
+        });
+    }
+    let ownership = read_bounded_ownership(ownership_file, ownership_len)?;
+    if ownership.export_id != id || ownership.lease != expected_lease {
+        return Err(StoreError::Validation {
+            message: "Official publication source ownership does not match its lease".to_owned(),
+        });
+    }
+    Ok((source, source_len))
 }
 
 pub(super) fn sweep_abandoned(snapshots_dir: &Path) -> StoreResult<()> {
@@ -930,6 +994,24 @@ fn replace_mapped_string(value: Option<&mut Value>, replacements: &HashMap<Strin
     }
 }
 
+#[cfg(feature = "native-official-publication")]
+fn validate_pinned_account(
+    root: &Map<String, Value>,
+    expected_account_id: &str,
+) -> StoreResult<()> {
+    let account_id = root
+        .get("account")
+        .and_then(Value::as_object)
+        .and_then(|account| account.get("id"))
+        .and_then(Value::as_str);
+    if account_id != Some(expected_account_id) {
+        return Err(StoreError::Validation {
+            message: "Pinned official publication account does not match the request".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn into_object(value: Value, message: &str) -> StoreResult<Map<String, Value>> {
     match value {
         Value::Object(object) => Ok(object),
@@ -1346,6 +1428,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native-official-publication")]
     #[test]
     fn projected_publication_validates_the_pinned_account_during_root_projection() {
         let (_directory, store, _revision, lease) = fixture();

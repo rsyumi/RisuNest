@@ -2072,9 +2072,10 @@ fn official_publication_transfers_only_the_exact_expected_revision_lease() {
         .expect("acquire publication lease")
         .lease;
 
-    let mismatch = store
-        .prepare_official_publication(&lease, 2)
-        .expect_err("reject revision mismatch");
+    let mismatch = match store.prepare_official_publication(&lease, 2) {
+        Err(error) => error,
+        Ok(_) => panic!("accepted revision mismatch"),
+    };
     assert!(matches!(mismatch, StoreError::RevisionConflict { .. }));
     assert_eq!(
         store
