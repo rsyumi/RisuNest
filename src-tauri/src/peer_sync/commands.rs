@@ -316,7 +316,8 @@ impl PeerCloneCommandState {
     }
 
     pub fn source_status(&self) -> Result<PeerCloneSourceStatus, PeerSyncError> {
-        source_status(&self.lock_runtime()?)
+        let runtime = self.lock_runtime()?;
+        source_status(&runtime)
     }
 
     pub fn source_bind_address(&self) -> Result<Option<SocketAddr>, PeerSyncError> {
