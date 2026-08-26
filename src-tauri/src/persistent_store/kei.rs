@@ -540,7 +540,7 @@ async fn upload_payload_for_job(
     let file = tokio::fs::File::open(&payload.path).await?;
     let body = Body::wrap_stream(ReaderStream::new(JobPayloadReader {
         file,
-        job,
+        job: Arc::clone(&job),
         completed: 0,
         total: payload.bytes,
     }));
@@ -1728,8 +1728,10 @@ mod tests {
         let job = registry
             .create(JobKind::KeiBackupUpload)
             .expect("create progress job");
-        job.start(JobPhase::PublishingDestination)
+        job.start(JobPhase::WritingExport)
             .expect("start progress job");
+        job.set_phase(JobPhase::PublishingDestination)
+            .expect("advance progress job to upload");
         let progress_job = job.clone();
 
         let result = tauri::async_runtime::block_on(await_upload_with_job_control(
@@ -1760,8 +1762,9 @@ mod tests {
         let job = registry
             .create(JobKind::KeiBackupUpload)
             .expect("create idle job");
-        job.start(JobPhase::PublishingDestination)
-            .expect("start idle job");
+        job.start(JobPhase::WritingExport).expect("start idle job");
+        job.set_phase(JobPhase::PublishingDestination)
+            .expect("advance idle job to upload");
 
         let result = tauri::async_runtime::block_on(await_upload_with_job_control(
             async {
