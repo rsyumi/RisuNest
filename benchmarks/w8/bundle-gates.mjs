@@ -35,7 +35,7 @@ export function percentileNearestRank(samples, percentile) {
 export function decideHighlightGate({ baselineGzipBytes, candidateGzipBytes, firstUseP95Ms }) {
     const savedGzipBytes = baselineGzipBytes - candidateGzipBytes
     const savedPercent = baselineGzipBytes === 0 ? 0 : savedGzipBytes / baselineGzipBytes * 100
-    const sizeGatePassed = savedGzipBytes >= 30_000 || savedPercent >= 2
+    const sizeGatePassed = savedGzipBytes >= 30 * 1024 || savedPercent >= 2
     const latencyGatePassed = firstUseP95Ms < 100
     return {
         adopt: sizeGatePassed && latencyGatePassed,

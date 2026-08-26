@@ -58,16 +58,34 @@ test('percentileNearestRank returns the observed P95 sample', () => {
     assert.equal(percentileNearestRank(samples, 0.95), 19)
 })
 
-test('highlight gate accepts either required gzip saving when P95 is below 100 ms', () => {
-    assert.deepEqual(
-        decideHighlightGate({ baselineGzipBytes: 1_000_000, candidateGzipBytes: 970_000, firstUseP95Ms: 99.9 }),
-        {
-            adopt: true,
-            savedGzipBytes: 30_000,
-            savedPercent: 3,
-            sizeGatePassed: true,
-            latencyGatePassed: true,
-        },
+test('highlight byte gate rejects 30,719 bytes when the percentage gate also fails', () => {
+    const result = decideHighlightGate({
+        baselineGzipBytes: 2_000_000,
+        candidateGzipBytes: 1_969_281,
+        firstUseP95Ms: 99.9,
+    })
+
+    assert.equal(result.savedGzipBytes, 30_719)
+    assert.equal(result.sizeGatePassed, false)
+    assert.equal(result.adopt, false)
+})
+
+test('highlight byte gate accepts 30 KiB at 30,720 bytes when P95 is below 100 ms', () => {
+    const result = decideHighlightGate({
+        baselineGzipBytes: 2_000_000,
+        candidateGzipBytes: 1_969_280,
+        firstUseP95Ms: 99.9,
+    })
+
+    assert.equal(result.savedGzipBytes, 30_720)
+    assert.equal(result.sizeGatePassed, true)
+    assert.equal(result.adopt, true)
+})
+
+test('highlight gate accepts a two percent saving below 30 KiB', () => {
+    assert.equal(
+        decideHighlightGate({ baselineGzipBytes: 1_000_000, candidateGzipBytes: 980_000, firstUseP95Ms: 99.9 }).adopt,
+        true,
     )
 })
 

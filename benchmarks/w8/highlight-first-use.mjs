@@ -7,6 +7,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
+import { pathToFileURL } from 'node:url'
 
 import { percentileNearestRank } from './bundle-gates.mjs'
 
@@ -84,6 +85,15 @@ async function findBrowser() {
         } catch {}
     }
     throw new Error('No supported Edge or Chrome executable was found')
+}
+
+export async function discoverBrowserThenCreateProfile({
+    discoverBrowser = findBrowser,
+    createProfile = () => mkdtemp(path.join(os.tmpdir(), TEMP_PREFIX)),
+} = {}) {
+    const executable = await discoverBrowser()
+    const profile = await createProfile()
+    return { executable, profile }
 }
 
 function serve(directory) {
@@ -172,16 +182,13 @@ async function main() {
     const sampleCount = samplesIndex === -1 ? 20 : Number(args[samplesIndex + 1])
     if (!Number.isSafeInteger(sampleCount) || sampleCount < 2) throw new Error('--samples must be at least 2')
 
-    const [serverPort, debugPort, executable, profile] = await Promise.all([
-        getFreePort(),
-        getFreePort(),
-        findBrowser(),
-        mkdtemp(path.join(os.tmpdir(), TEMP_PREFIX)),
-    ])
-    const server = serve(distDirectory)
+    const [serverPort, debugPort] = await Promise.all([getFreePort(), getFreePort()])
+    const { executable, profile } = await discoverBrowserThenCreateProfile()
+    let server
     let browser
     let client
     try {
+        server = serve(distDirectory)
         server.listen(serverPort, HOST)
         await once(server, 'listening')
         const pageUrl = `http://${HOST}:${serverPort}/benchmarks/w8/highlight-first-use.html`
@@ -223,14 +230,16 @@ async function main() {
         }, null, 2)}\n`)
     } finally {
         client?.close()
-        server.close()
+        server?.close()
         await stopProcess(browser)
         assertSafeProfile(profile)
         await rm(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
     }
 }
 
-main().catch((error) => {
-    process.stderr.write(`${error.stack ?? error}\n`)
-    process.exitCode = 1
-})
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+    main().catch((error) => {
+        process.stderr.write(`${error.stack ?? error}\n`)
+        process.exitCode = 1
+    })
+}

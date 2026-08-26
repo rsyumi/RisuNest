@@ -1,0 +1,296 @@
+diff --git a/src/lib/Others/AlertComp.svelte b/src/lib/Others/AlertComp.svelte
+index 84b2ace8..33c03593 100644
+--- a/src/lib/Others/AlertComp.svelte
++++ b/src/lib/Others/AlertComp.svelte
+@@ -11,8 +11,7 @@
+     import { aiLawApplies, openURL, getFetchLogs } from 'src/ts/globalApi.svelte';
+     import Button from '../UI/GUI/Button.svelte';
+     import { XIcon, ChevronDownIcon, ChevronUpIcon, CopyIcon, CheckIcon } from "@lucide/svelte";
+-    import hljs from 'highlight.js/lib/core';
+-    import json from 'highlight.js/lib/languages/json';
++    import type { HLJSApi } from 'highlight.js';
+     import SelectInput from "../UI/GUI/SelectInput.svelte";
+     import OptionInput from "../UI/GUI/OptionInput.svelte";
+     import { language } from 'src/lang';
+@@ -28,6 +27,7 @@
+     import { getDetailedOSLabel, getFallbackOSLabel, getRisuEnvironmentLabel } from "src/ts/platform";
+     import versionData from "../../../version.json";
+     import { isExpectedHubMessage } from "src/ts/storage/officialAccountMessage";
++    import { loadHighlightLanguage } from "src/ts/parser/highlightLoader";
+ 
+     let showDetails = $state(false);
+     let translatedStackTrace = $state('');
+@@ -76,19 +76,23 @@
+     let allExpanded = $state(false)
+     let copiedKey: string | null = $state(null)
+     let loginIframe = $state<HTMLIFrameElement>()
+-
+-    // Register JSON language for syntax highlighting
+-    if (!hljs.getLanguage('json')) {
+-        hljs.registerLanguage('json', json)
+-    }
++    let jsonHighlighter = $state<HLJSApi | null>(null)
+ 
+     $effect(() => {
+         void loadDetailedOSLabel();
+     });
+ 
++    $effect(() => {
++        if ($alertStore.type !== 'requestlogs' || jsonHighlighter) return
++        void loadHighlightLanguage('json', () => import('highlight.js/lib/languages/json')).then((highlighter) => {
++            jsonHighlighter = highlighter
++        })
++    });
++
+     function highlightJson(code: string): string {
++        if (!jsonHighlighter) return code.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+         try {
+-            return hljs.highlight(code, { language: 'json' }).value
++            return jsonHighlighter.highlight(code, { language: 'json' }).value
+         } catch {
+             return code.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+         }
+diff --git a/src/ts/parser/parser.svelte.ts b/src/ts/parser/parser.svelte.ts
+index f793a870..f7b4f505 100644
+--- a/src/ts/parser/parser.svelte.ts
++++ b/src/ts/parser/parser.svelte.ts
+@@ -14,7 +14,6 @@ import { findCharacterbyId, getPersonaPrompt, getUserIcon, getUserName, pickHash
+ import { getInlayAssetMetadata } from '../process/files/inlays';
+ import { DeferredInlayMarkerRegistry, getInlayRenderSources, renderDeferredInlaySourceMarkup, renderInlaySourceMarkup, type InlayRenderSource } from '../process/files/inlayRenderSource';
+ import { getModuleAssets, getModuleLorebooks, getModules } from '../process/modules';
+-import hljs from 'highlight.js/lib/core'
+ import 'highlight.js/styles/atom-one-dark.min.css'
+ import { language } from 'src/lang';
+ import katex from 'katex'
+@@ -28,6 +27,7 @@ import {
+     resolveEmotionAsset,
+     type AssetLookupIndex,
+ } from './assetLookup';
++import { getHighlightCore, loadHighlightLanguage, type HighlightLanguageImporter } from './highlightLoader';
+ 
+ export { getAssetDistance as getDistance } from './assetLookup';
+ 
+@@ -220,6 +220,8 @@ async function renderHighlightableMarkdown(data:string) {
+         return rendered
+     }
+ 
++    const hljs = await getHighlightCore()
++
+     for (const placeholder of highlightPlaceholders){
+         try {
+             let lang = placeholder.match(/lang="(.+?)"/)?.[1]
+@@ -229,7 +231,7 @@ async function renderHighlightableMarkdown(data:string) {
+             }
+             //import language if not already loaded
+             //we do not refactor this to a function because we want to keep vite to only import the languages that are needed
+-            let languageModule: typeof import('highlight.js/lib/languages/*')|null = null
++            let languageImporter: HighlightLanguageImporter|null = null
+             let fileExt = ''
+ 
+             switch(lang){
+@@ -237,7 +239,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'sh'
+                     lang = 'bash'
+                     if(!hljs.getLanguage('bash')){
+-                        languageModule = await import('highlight.js/lib/languages/bash')
++                        languageImporter = () => import('highlight.js/lib/languages/bash')
+                     }
+                     break
+                 }
+@@ -246,7 +248,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = lang
+                     lang = 'cpp'
+                     if(!hljs.getLanguage('cpp')){
+-                        languageModule = await import('highlight.js/lib/languages/cpp')
++                        languageImporter = () => import('highlight.js/lib/languages/cpp')
+                     }
+                     break
+                 }
+@@ -255,7 +257,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'cs'
+                     lang = 'csharp'
+                     if(!hljs.getLanguage('csharp')){
+-                        languageModule = await import('highlight.js/lib/languages/csharp')
++                        languageImporter = () => import('highlight.js/lib/languages/csharp')
+                     }
+                     break
+                 }
+@@ -263,7 +265,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'css'
+                     lang = 'css'
+                     if(!hljs.getLanguage('css')){
+-                        languageModule = await import('highlight.js/lib/languages/css')
++                        languageImporter = () => import('highlight.js/lib/languages/css')
+                     }
+                     break
+                 }
+@@ -271,7 +273,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'dart'
+                     lang = 'dart'
+                     if(!hljs.getLanguage('dart')){
+-                        languageModule = await import('highlight.js/lib/languages/dart')
++                        languageImporter = () => import('highlight.js/lib/languages/dart')
+                     }
+                     break
+                 }
+@@ -281,7 +283,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = lang
+                     lang = 'xml'
+                     if(!hljs.getLanguage('xml')){
+-                        languageModule = await import('highlight.js/lib/languages/xml')
++                        languageImporter = () => import('highlight.js/lib/languages/xml')
+                     }
+                     break
+                 }
+@@ -289,7 +291,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'java'
+                     lang = 'java'
+                     if(!hljs.getLanguage('java')){
+-                        languageModule = await import('highlight.js/lib/languages/java')
++                        languageImporter = () => import('highlight.js/lib/languages/java')
+                     }
+                     break
+                 }
+@@ -299,7 +301,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'js'
+                     lang = 'javascript'
+                     if(!hljs.getLanguage('javascript')){
+-                        languageModule = await import('highlight.js/lib/languages/javascript')
++                        languageImporter = () => import('highlight.js/lib/languages/javascript')
+                     }
+                     break
+                 }
+@@ -307,7 +309,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'json'
+                     lang = 'json'
+                     if(!hljs.getLanguage('json')){
+-                        languageModule = await import('highlight.js/lib/languages/json')
++                        languageImporter = () => import('highlight.js/lib/languages/json')
+                     }
+                     break
+                 }
+@@ -315,7 +317,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'lua'
+                     lang = 'lua'
+                     if(!hljs.getLanguage('lua')){
+-                        languageModule = await import('highlight.js/lib/languages/lua')
++                        languageImporter = () => import('highlight.js/lib/languages/lua')
+                     }
+                     break
+                 }
+@@ -324,7 +326,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'md'
+                     lang = 'markdown'
+                     if(!hljs.getLanguage('markdown')){
+-                        languageModule = await import('highlight.js/lib/languages/markdown')
++                        languageImporter = () => import('highlight.js/lib/languages/markdown')
+                     }
+                     break
+                 }
+@@ -333,7 +335,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'py'
+                     lang = 'python'
+                     if(!hljs.getLanguage('python')){
+-                        languageModule = await import('highlight.js/lib/languages/python')
++                        languageImporter = () => import('highlight.js/lib/languages/python')
+                     }
+                     break
+                 }
+@@ -341,7 +343,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'rs'
+                     lang = 'rust'
+                     if(!hljs.getLanguage('rust')){
+-                        languageModule = await import('highlight.js/lib/languages/rust')
++                        languageImporter = () => import('highlight.js/lib/languages/rust')
+                     }
+                     break
+                 }
+@@ -349,7 +351,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'sh'
+                     lang = 'shell'
+                     if(!hljs.getLanguage('shell')){
+-                        languageModule = await import('highlight.js/lib/languages/shell')
++                        languageImporter = () => import('highlight.js/lib/languages/shell')
+                     }
+                     break
+                 }
+@@ -359,7 +361,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'ts'
+                     lang = 'typescript'
+                     if(!hljs.getLanguage('typescript')){
+-                        languageModule = await import('highlight.js/lib/languages/typescript')
++                        languageImporter = () => import('highlight.js/lib/languages/typescript')
+                     }
+                     break
+                 }
+@@ -368,7 +370,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = lang
+                     lang = 'plaintext'
+                     if(!hljs.getLanguage('plaintext')){
+-                        languageModule = await import('highlight.js/lib/languages/plaintext')
++                        languageImporter = () => import('highlight.js/lib/languages/plaintext')
+                     }
+                     break
+                 }
+@@ -376,7 +378,7 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'yml'
+                     lang = 'yaml'
+                     if(!hljs.getLanguage('yaml')){
+-                        languageModule = await import('highlight.js/lib/languages/yaml')
++                        languageImporter = () => import('highlight.js/lib/languages/yaml')
+                     }
+                     break
+                 }
+@@ -390,8 +392,8 @@ async function renderHighlightableMarkdown(data:string) {
+                     fileExt = 'none'
+                 }
+             }
+-            if(languageModule){
+-                hljs.registerLanguage(lang, languageModule.default)
++            if(languageImporter){
++                await loadHighlightLanguage(lang, languageImporter)
+             }
+             if(lang === 'none'){
+                 rendered = rendered.replace(placeholder, `<pre><code>${md.utils.escapeHtml(code)}</code></pre>`)
+diff --git a/src/ts/parser/highlightLoader.ts b/src/ts/parser/highlightLoader.ts
+new file mode 100644
+index 00000000..9e0f2132
+--- /dev/null
++++ b/src/ts/parser/highlightLoader.ts
+@@ -0,0 +1,36 @@
++import type { HLJSApi, LanguageFn } from 'highlight.js'
++
++export type HighlightLanguageImporter = () => Promise<{ default: LanguageFn }>
++
++let corePromise: Promise<HLJSApi> | null = null
++const languagePromises = new Map<string, Promise<void>>()
++
++export function getHighlightCore(): Promise<HLJSApi> {
++    corePromise ??= import('highlight.js/lib/core').then((module) => module.default)
++    return corePromise
++}
++
++export async function loadHighlightLanguage(
++    languageName: string,
++    importer: HighlightLanguageImporter,
++): Promise<HLJSApi> {
++    const highlighter = await getHighlightCore()
++    if (highlighter.getLanguage(languageName)) return highlighter
++
++    let pending = languagePromises.get(languageName)
++    if (!pending) {
++        pending = importer().then((module) => {
++            if (!highlighter.getLanguage(languageName)) {
++                highlighter.registerLanguage(languageName, module.default)
++            }
++        })
++        languagePromises.set(languageName, pending)
++    }
++    try {
++        await pending
++    } catch (error) {
++        languagePromises.delete(languageName)
++        throw error
++    }
++    return highlighter
++}
