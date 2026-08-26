@@ -34,6 +34,18 @@
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
     import { getActiveConversationSession } from '../../ts/storage/persistentDataRuntime.svelte';
     import {
+        appendConversationMessage,
+        captureConversationMutationTarget,
+        isConversationMutationTargetCurrent,
+        type ConversationMutationTarget,
+    } from '../../ts/conversationMutations';
+    import {
+        applyConversationRerollTail,
+        captureConversationRerollTail,
+        replaceConversationRerollLastData,
+        truncateConversationForReroll,
+    } from '../../ts/conversationReroll';
+    import {
         LatestChatScrollRequestGuard,
         resolveChatMessageTarget,
         type CapturedChatMessageTarget,
@@ -65,6 +77,27 @@
     let currentCharacter = $derived(DBState.db.characters[$selectedCharID])
     let currentChat = $derived(currentCharacter?.chats[currentCharacter.chatPage]?.message ?? [])
     const scrollRequestGuard = new LatestChatScrollRequestGuard()
+
+    function captureCurrentConversationTarget(): ConversationMutationTarget | null {
+        const character = DBState.db.characters[$selectedCharID]
+        const conversation = character?.chats[character.chatPage]
+        if (!character || !conversation) return null
+        return captureConversationMutationTarget(
+            character,
+            conversation,
+            getActiveConversationSession(),
+        )
+    }
+
+    function conversationTargetIsCurrent(target: ConversationMutationTarget): boolean {
+        const character = DBState.db.characters[$selectedCharID]
+        return isConversationMutationTargetCurrent(
+            target,
+            character,
+            character?.chats[character.chatPage],
+            getActiveConversationSession(),
+        )
+    }
 
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
@@ -186,7 +219,6 @@
     }
 
     async function sendMain(continueResponse:boolean) {
-        let selectedChar = $selectedCharID
         if($doingChat){
             return
         }
@@ -194,8 +226,10 @@
             rerolls = []
             rerollid = -1
         }
-
-        let cha = DBState.db.characters[selectedChar].chats[DBState.db.characters[selectedChar].chatPage].message
+        const mutationTarget = captureCurrentConversationTarget()
+        if (!mutationTarget) return
+        const character = mutationTarget.character
+        let messages = mutationTarget.conversation.message
 
         if(messageInput.startsWith('/')){
             const commandProcessed = await processMultiCommand(messageInput)
@@ -203,6 +237,7 @@
                 messageInput = ''
                 return
             }
+            if (!conversationTargetIsCurrent(mutationTarget)) return
         }
 
         if(fileInput.length > 0){
@@ -213,10 +248,10 @@
         }
 
         if(messageInput === ''){
-            if(DBState.db.characters[selectedChar].type !== 'group'){
-                if(cha.length === 0 || cha[cha.length - 1].role !== 'user'){
+            if(character.type !== 'group'){
+                if(messages.length === 0 || messages[messages.length - 1].role !== 'user'){
                     if(DBState.db.useSayNothing){
-                        cha.push({
+                        appendConversationMessage(mutationTarget, {
                             role: 'user',
                             data: '*says nothing*',
                             name: $ConnectionOpenStore ? DBState.db.username : null
@@ -226,22 +261,23 @@
             }
         }
         else{
-            const char = DBState.db.characters[selectedChar]
-            if(char.type === 'character'){
-                let triggerResult = await runTrigger(char,'input', {chat: char.chats[char.chatPage]})
+            if(character.type === 'character'){
+                let triggerResult = await runTrigger(character,'input', {chat: mutationTarget.conversation})
+                if (!conversationTargetIsCurrent(mutationTarget)) return
                 if(triggerResult){
-                    cha = triggerResult.chat.message
+                    messages = triggerResult.chat.message
                 }
-
-                cha.push({
+                const processedInput = await processScript(character,messageInput,'editinput')
+                if (!conversationTargetIsCurrent(mutationTarget)) return
+                appendConversationMessage(mutationTarget, {
                     role: 'user',
-                    data: await processScript(char,messageInput,'editinput'),
+                    data: processedInput,
                     time: Date.now(),
                     name: $ConnectionOpenStore ? DBState.db.username : null
-                })
+                }, messages)
             }
             else{
-                cha.push({
+                appendConversationMessage(mutationTarget, {
                     role: 'user',
                     data: messageInput,
                     time: Date.now(),
@@ -251,9 +287,9 @@
         }
         messageInput = ''
         messageInputTranslate = ''
-        DBState.db.characters[selectedChar].chats[DBState.db.characters[selectedChar].chatPage].message = cha
         rerolls = []
         await sleep(10)
+        if (!conversationTargetIsCurrent(mutationTarget)) return
         updateInputSizeAll()
         await sendChatMain(continueResponse)
 
@@ -267,50 +303,32 @@
             rerolls = []
             rerollid = -1
         }
-        const genId = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.at(-1)?.generationInfo?.generationId
+        const mutationTarget = captureCurrentConversationTarget()
+        if (!mutationTarget) return
+        const genId = mutationTarget.conversation.message.at(-1)?.generationInfo?.generationId
         if(genId){
             const r = Prereroll(genId)
             if(r){
-                DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length - 1].data = r
+                replaceConversationRerollLastData(mutationTarget, r, 'reroll')
                 return
             }
         }
         if(rerollid < rerolls.length - 1){
             if(Array.isArray(rerolls[rerollid + 1])){
                 rerollid += 1
-                let rerollData = safeStructuredClone(rerolls[rerollid])
-                let msgs = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message
-                for(let i = 0; i < rerollData.length; i++){
-                    msgs[msgs.length - rerollData.length + i] = rerollData[i]
-                }
-                DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = msgs
+                applyConversationRerollTail(mutationTarget, rerolls[rerollid], 'reroll')
             }
             return
         }
         if(rerolls.length === 0){
-            rerolls.push(safeStructuredClone([DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.at(-1)]))
+            const messages = mutationTarget.conversation.message
+            rerolls.push(messages.length > 0
+                ? captureConversationRerollTail(mutationTarget, messages.length - 1)
+                : [undefined as Message])
             rerollid = rerolls.length - 1
         }
-        let cha = safeStructuredClone(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message)
-        if(cha.length === 0 ){
-            return
-        }
+        if (!truncateConversationForReroll(mutationTarget)) return
         openMenu = false
-        const saying = cha[cha.length - 1].saying
-        let sayingQu = 2
-        while(cha[cha.length - 1].role !== 'user'){
-            if(cha[cha.length - 1].saying === saying){
-                sayingQu -= 1
-                if(sayingQu === 0){
-                    break
-                }
-            }
-            let msg = cha.pop()
-            if(!msg){
-                return
-            }
-        }
-        DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = cha
         await sendChatMain()
     }
 
@@ -322,11 +340,13 @@
             rerolls = []
             rerollid = -1
         }
-        const genId = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.at(-1)?.generationInfo?.generationId
+        const mutationTarget = captureCurrentConversationTarget()
+        if (!mutationTarget) return
+        const genId = mutationTarget.conversation.message.at(-1)?.generationInfo?.generationId
         if(genId){
             const r = PreUnreroll(genId)
             if(r){
-                DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length - 1].data = r
+                replaceConversationRerollLastData(mutationTarget, r, 'unreroll')
                 return
             }
         }
@@ -335,20 +355,17 @@
         }
         if(Array.isArray(rerolls[rerollid - 1])){
             rerollid -= 1
-            let rerollData = safeStructuredClone(rerolls[rerollid])
-            let msgs = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message
-            for(let i = 0; i < rerollData.length; i++){
-                msgs[msgs.length - rerollData.length + i] = rerollData[i]
-            }
-            DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message = msgs
+            applyConversationRerollTail(mutationTarget, rerolls[rerollid], 'unreroll')
         }
     }
 
     let abortController:null|AbortController = null
 
     async function sendChatMain(continued:boolean = false) {
-
-        let previousLength = DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length
+        const selectedCharacterIndex = $selectedCharID
+        const mutationTarget = captureCurrentConversationTarget()
+        if (!mutationTarget) return
+        const previousLength = mutationTarget.conversation.message.length
         messageInput = ''
         abortController = new AbortController()
         try {
@@ -356,15 +373,18 @@
                 signal:abortController.signal,
                 continue:continued
             })
-            if(previousLength < DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message.length){
-                rerolls.push(safeStructuredClone(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message).slice(previousLength))
+            if (
+                conversationTargetIsCurrent(mutationTarget) &&
+                previousLength < mutationTarget.conversation.message.length
+            ) {
+                rerolls.push(captureConversationRerollTail(mutationTarget, previousLength))
                 rerollid = rerolls.length - 1
             }
         } catch (error) {
             console.error(error)
             alertError(error)
         }
-        lastCharId = $selectedCharID
+        if (conversationTargetIsCurrent(mutationTarget)) lastCharId = selectedCharacterIndex
         $doingChat = false
         if(DBState.db.playMessage){
             const audio = new Audio(sendSound);
@@ -740,18 +760,13 @@
                             role: 'char',
                             data: ''
                         } as Message
-                        const session = getActiveConversationSession()
-                        if (
-                            session?.characterId === character.chaId &&
-                            session.conversationId === chat.id &&
-                            session.materializeCompatibilityArray() === chat.message
-                        ) {
-                            session.append(message)
-                        }
-                        else {
-                            chat.message.push(message)
-                            character.chats[character.chatPage] = chat
-                        }
+                        const target = captureConversationMutationTarget(
+                            character,
+                            chat,
+                            getActiveConversationSession(),
+                        )
+                        appendConversationMessage(target, message)
+                        if (!target.session) character.chats[character.chatPage] = chat
                     }}
                          class="peer-focus:border-textcolor mr-2 flex border-y border-r border-darkborderc justify-center items-center text-textcolor p-3 rounded-r-md hover:bg-blue-500 hover:text-white transition-colors"
                          style:height={inputHeight}

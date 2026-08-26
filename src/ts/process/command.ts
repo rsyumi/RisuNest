@@ -7,6 +7,16 @@ import { risuChatParser } from "../parser/parser.svelte";
 import { sendChat } from "./index.svelte";
 import { loadLoreBookV3Prompt } from "./lorebook.svelte";
 import { runTrigger } from "./triggers";
+import { getActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
+import {
+    appendConversationComment,
+    appendConversationMessage,
+    captureConversationMutationTarget,
+    cutConversationMessages,
+    isConversationMutationTargetCurrent,
+    resetConversationWithMessage,
+    retainConversationDeleteSlice,
+} from '../conversationMutations'
 
 export async function processMultiCommand(command:string) {
     let pipe = ''
@@ -41,8 +51,25 @@ export async function processMultiCommand(command:string) {
 
 async function processCommand(command:string, pipe:string):Promise<false | string>{
     const db = getDatabase()
-    const currentChar = db.characters[get(selectedCharID)]
+    const selectedCharacterIndex = get(selectedCharID)
+    const currentChar = db.characters[selectedCharacterIndex]
     const currentChat = currentChar.chats[currentChar.chatPage]
+    const mutationTarget = captureConversationMutationTarget(
+        currentChar,
+        currentChat,
+        getActiveConversationSession(),
+    )
+    const mutationTargetIsCurrent = () => {
+        const currentDatabase = getDatabase()
+        const currentIndex = get(selectedCharID)
+        const character = currentDatabase.characters[currentIndex]
+        return isConversationMutationTargetCurrent(
+            mutationTarget,
+            character,
+            character?.chats[character.chatPage],
+            getActiveConversationSession(),
+        )
+    }
     let {commandName, arg, namedArg} = commandParser(command, pipe)
 
     if(!arg){
@@ -102,7 +129,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
             return pipe
         }
         case 'send': {
-            currentChat.message.push({
+            appendConversationMessage(mutationTarget, {
                 role: "user",
                 data: arg
             })
@@ -111,7 +138,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
         }
         case 'sendas': {
             //name not implemented
-            currentChat.message.push({
+            appendConversationMessage(mutationTarget, {
                 role: "char",
                 data: arg
             })
@@ -121,34 +148,18 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
         case 'comment': {
             //works differently, but its close enough
             const addition = `<Comment>\n${arg}\n</Comment>`
-            currentChat.message[currentChat.message.length-1].data += addition
+            appendConversationComment(mutationTarget, addition)
             setDatabase(db)
             return pipe
         }
         case 'cut':{
-            if(arg.includes('-')){
-                const [start, end] = arg.split('-')
-                currentChat.message = currentChat.message.slice(parseInt(start), parseInt(end))
-                setDatabase(db)
-            }
-            else if(!isNaN(parseInt(arg))){
-                const index = parseInt(arg)
-                currentChat.message = currentChat.message.splice(index, 1)
-                setDatabase(db)
-            }
-            else{ //For risu, doesn'ts work for STScript
-                const id = arg
-                currentChat.message = currentChat.message.filter((e)=>e.chatId !== id)
-                setDatabase(db)
-            }
+            cutConversationMessages(mutationTarget, arg)
+            setDatabase(db)
             return pipe
         }
         case 'del': {
-            const size = parseInt(arg)
-            if(!isNaN(size)){
-                currentChat.message = currentChat.message.slice(currentChat.message.length-size)
-                setDatabase(db)
-            }
+            retainConversationDeleteSlice(mutationTarget, arg)
+            if(!isNaN(parseInt(arg))) setDatabase(db)
             return pipe
         }
         case 'len':{
@@ -168,14 +179,15 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 splited.shift()
             }
             for(const e of splited){
-                if(clearMode){
-                    currentChat.message = []
-                }
-                currentChat.message.push({
+                if (!mutationTargetIsCurrent()) return false
+                const message = {
                     role: 'user',
                     data: e
-                })
+                } as const
+                if(clearMode) resetConversationWithMessage(mutationTarget, message)
+                else appendConversationMessage(mutationTarget, message)
                 await sendChat(-1)
+                if (!mutationTargetIsCurrent()) return false
             }
             return ''
         }

@@ -1,4 +1,3 @@
-import { getDatabase, setDatabase } from 'src/ts/storage/database.svelte';
 import { DBState, selectedCharID } from 'src/ts/stores.svelte';
 import { get } from 'svelte/store';
 import { doingChat, sendChat } from '../index.svelte';
@@ -7,6 +6,12 @@ import { isTauri } from "src/ts/platform"
 import { HypaProcesser } from '../memory/hypamemory';
 import { BufferToText as BufferToText, selectMultipleFile } from 'src/ts/util';
 import { postInlayAsset } from './inlays';
+import { getActiveConversationSession } from 'src/ts/storage/persistentDataRuntime.svelte';
+import {
+    appendConversationMessage,
+    captureConversationMutationTarget,
+    isConversationMutationTargetCurrent,
+} from 'src/ts/conversationMutations';
 
 type sendFileArg = {
     file:string
@@ -20,8 +25,23 @@ async function sendPofile(arg:sendFileArg){
     let note = ''
     let speaker = ''
     let parseMode = 0
-    let currentChar = DBState.db.characters[get(selectedCharID)]
-    let currentChat = currentChar.chats[currentChar.chatPage]
+    const selectedCharacterIndex = get(selectedCharID)
+    const currentCharacter = DBState.db.characters[selectedCharacterIndex]
+    const currentConversation = currentCharacter.chats[currentCharacter.chatPage]
+    const mutationTarget = captureConversationMutationTarget(
+        currentCharacter,
+        currentConversation,
+        getActiveConversationSession(),
+    )
+    const mutationTargetIsCurrent = () => {
+        const character = DBState.db.characters[get(selectedCharID)]
+        return isConversationMutationTargetCurrent(
+            mutationTarget,
+            character,
+            character?.chats[character.chatPage],
+            getActiveConversationSession(),
+        )
+    }
     const lines = arg.file.split('\n')
     for(let i=0;i<lines.length;i++){
         console.log(i)
@@ -38,17 +58,15 @@ async function sendPofile(arg:sendFileArg){
             if(note !== ''){
                 text = `Note: ${note}\n${text}`
             }
-            currentChat.message.push({
+            if (!mutationTargetIsCurrent()) return
+            appendConversationMessage(mutationTarget, {
                 role: 'user',
                 data: text
             })
-            currentChar.chats[currentChar.chatPage] = currentChat
-            DBState.db.characters[get(selectedCharID)] = currentChar
             doingChat.set(false)
             await sendChat(-1);
-            currentChar = DBState.db.characters[get(selectedCharID)]
-            currentChat = currentChar.chats[currentChar.chatPage]
-            const res = currentChat.message[currentChat.message.length-1]
+            if (!mutationTargetIsCurrent()) return
+            const res = currentConversation.message[currentConversation.message.length-1]
             const msgStr = res.data.split('\n').filter((a) => {
                 return a !== ''
             }).map((str) => {
