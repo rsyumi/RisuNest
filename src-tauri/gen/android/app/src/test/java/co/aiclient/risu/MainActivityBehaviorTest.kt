@@ -7,6 +7,11 @@ import org.junit.Test
 
 class MainActivityBehaviorTest {
   @Test
+  fun `SAF file jobs stay disabled until physical lifecycle validation`() {
+    assertEquals(false, BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS)
+  }
+
+  @Test
   fun `web view provider must meet the Vite 8 Chrome 111 baseline`() {
     assertEquals(
       WebViewProviderStatus.SUPPORTED,

@@ -331,8 +331,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     super.onWebViewCreate(webView)
     lifecycleWebView = webView
     webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
-    webView.addJavascriptInterface(SafBridge(), SAF_BRIDGE_NAME)
-    injectOpenedFiles(webView)
+    if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      webView.addJavascriptInterface(SafBridge(), SAF_BRIDGE_NAME)
+      injectOpenedFiles(webView)
+    }
 
     val contentRoot = findViewById<ViewGroup>(android.R.id.content)
     ViewCompat.setOnApplyWindowInsetsListener(contentRoot) { _, windowInsets ->
@@ -388,7 +390,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
     setIntent(intent)
-    lifecycleWebView?.let { injectOpenedFiles(it, intent) }
+    if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      lifecycleWebView?.let { injectOpenedFiles(it, intent) }
+    }
   }
 
   override fun onDestroy() {

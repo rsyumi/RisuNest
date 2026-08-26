@@ -12,6 +12,10 @@ val tauriProperties = Properties().apply {
         propFile.inputStream().use { load(it) }
     }
 }
+val enableExperimentalSafFileJobs = providers
+    .gradleProperty("risuEnableExperimentalSafFileJobs")
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
 
 android {
     compileSdk = 36
@@ -24,6 +28,11 @@ android {
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        buildConfigField(
+            "boolean",
+            "ENABLE_EXPERIMENTAL_SAF_FILE_JOBS",
+            enableExperimentalSafFileJobs.get().toString(),
+        )
     }
     buildTypes {
         getByName("debug") {
