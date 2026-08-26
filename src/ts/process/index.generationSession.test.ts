@@ -140,6 +140,7 @@ vi.mock('../plugins/plugins.svelte', () => ({
 }))
 vi.mock('./presetChain', () => ({ activatePresetChainForRequest: vi.fn(async () => undefined) }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
+    acknowledgeGenerationCompletion: vi.fn(async () => undefined),
     getActiveConversationSession: () => mocks.session,
     invalidateActiveConversationSession: () => {
         mocks.events.push('invalidate-session')

@@ -181,6 +181,8 @@ vi.mock('./presetChain', () => ({
 vi.mock('./generationState', () => ({ doingChat: harness.doingChat }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     acknowledgeGenerationCompletion: harness.acknowledge,
+    getActiveConversationSession: () => null,
+    invalidateActiveConversationSession: vi.fn(),
 }))
 
 import { sendChat } from './index.svelte'
