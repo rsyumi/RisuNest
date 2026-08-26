@@ -1,0 +1,1751 @@
+use super::{logical_schema, read_target, PersistentStore, StoreError, StoreResult};
+use crate::{
+    asset_repository::PayloadCas,
+    peer_sync::logical_delta::{
+        build_indexed_logical_manifest, decode_logical_record_key, encode_logical_record,
+        encode_logical_record_key, encode_message_page, BuiltIndexedLogicalManifest,
+        EncodedLogicalObject, IndexedLogicalManifestBuilderInput, IndexedLogicalRecord,
+        LogicalManifestObject, LogicalOwnerHead, LogicalOwnerLocator, LogicalRecordEnvelope,
+        LogicalRecordLocator, LOGICAL_MESSAGE_PAGE_SIZE,
+    },
+};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const RECORD_KIND_ROOT: &str = "root";
+const RECORD_KIND_PRESET: &str = "preset";
+const RECORD_KIND_PLUGIN: &str = "plugin";
+const RECORD_KIND_CHARACTER: &str = "character";
+const RECORD_KIND_CONVERSATION: &str = "conversation";
+const RECORD_KIND_ASSET: &str = "asset";
+const RECORD_KIND_INLAY: &str = "inlay";
+const RECORD_KIND_COLD: &str = "cold";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LogicalIndexBuildRequest {
+    pub(crate) library_id: String,
+    pub(crate) generation_id: String,
+    pub(crate) generation_sequence: String,
+    pub(crate) parent_generation_id: Option<String>,
+    pub(crate) lease: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PageSource {
+    page_index: u64,
+    first_message_index: u64,
+    message_count: u64,
+    object: LogicalManifestObject,
+}
+
+#[derive(Debug)]
+struct LogicalGenerationMetadata {
+    library_id: String,
+    generation_id: String,
+    generation_sequence: String,
+    parent_generation_id: Option<String>,
+    source_revision: i64,
+    state: String,
+    manifest_hash: Option<String>,
+}
+
+impl PersistentStore {
+    pub(crate) fn rebuild_logical_index(
+        &mut self,
+        cas: &PayloadCas,
+        request: LogicalIndexBuildRequest,
+    ) -> StoreResult<BuiltIndexedLogicalManifest> {
+        logical_schema::create_logical_schema(&self.connection).map_err(schema_error)?;
+        logical_schema::validate_logical_schema(&self.connection).map_err(schema_error)?;
+        validate_pds_projection_contract(&self.connection)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let target = read_target(&transaction, request.lease.as_deref())?;
+        nonnegative_u64(target.revision, "source revision")?;
+        let already_exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_sync_generations
+                WHERE library_id = ?1 AND generation_id = ?2
+             )",
+            params![request.library_id, request.generation_id],
+            |row| row.get(0),
+        )?;
+        if already_exists {
+            return validation("logical generation index already exists");
+        }
+        if let Some(parent_generation_id) = &request.parent_generation_id {
+            let parent_complete: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM logical_sync_generations
+                    WHERE library_id = ?1 AND generation_id = ?2 AND state = 'complete'
+                 )",
+                params![request.library_id, parent_generation_id],
+                |row| row.get(0),
+            )?;
+            if !parent_complete {
+                return validation("logical parent generation is absent or incomplete");
+            }
+        }
+
+        let created_at = unix_millis()?;
+        transaction.execute(
+            "INSERT INTO logical_sync_generations (
+                library_id, generation_id, generation_sequence, parent_generation_id,
+                pds_generation, source_revision, state, manifest_hash, created_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'building', NULL, ?7, NULL)",
+            params![
+                request.library_id,
+                request.generation_id,
+                request.generation_sequence,
+                request.parent_generation_id,
+                target.generation,
+                target.revision,
+                created_at,
+            ],
+        )?;
+
+        project_root(
+            &transaction,
+            cas,
+            &request.library_id,
+            &request.generation_id,
+            &target.generation,
+        )?;
+        project_presets(
+            &transaction,
+            &request.library_id,
+            &request.generation_id,
+            &target.generation,
+        )?;
+        project_plugins(
+            &transaction,
+            &request.library_id,
+            &request.generation_id,
+            &target.generation,
+        )?;
+        project_characters(
+            &transaction,
+            cas,
+            &request.library_id,
+            &request.generation_id,
+            &target.generation,
+        )?;
+        project_conversations(
+            &transaction,
+            &request.library_id,
+            &request.generation_id,
+            &target.generation,
+        )?;
+        project_asset_aliases(
+            &transaction,
+            cas,
+            &request.library_id,
+            &request.generation_id,
+            &target.generation,
+        )?;
+        project_cold_aliases(
+            &transaction,
+            cas,
+            &request.library_id,
+            &request.generation_id,
+            &target.generation,
+        )?;
+        if let Some(parent_generation_id) = &request.parent_generation_id {
+            project_tombstones(
+                &transaction,
+                &request.library_id,
+                &request.generation_id,
+                parent_generation_id,
+                &request.generation_sequence,
+            )?;
+        }
+
+        let built = scan_compact_manifest(
+            &transaction,
+            &request.library_id,
+            &request.generation_id,
+            false,
+        )?;
+        let prepared_manifest = cas.prepare_bytes(&built.manifest_bytes)?;
+        if prepared_manifest.content_hash != built.manifest_hash
+            || prepared_manifest.byte_size != built.manifest_bytes.len() as u64
+        {
+            return validation(
+                "prepared logical manifest object does not match its canonical bytes",
+            );
+        }
+        let completed_at = unix_millis()?.max(created_at);
+        transaction.execute(
+            "UPDATE logical_sync_generations
+             SET state = 'complete', manifest_hash = ?3, completed_at = ?4
+             WHERE library_id = ?1 AND generation_id = ?2 AND state = 'building'",
+            params![
+                request.library_id,
+                request.generation_id,
+                built.manifest_hash,
+                completed_at,
+            ],
+        )?;
+        logical_schema::validate_logical_schema(&transaction).map_err(schema_error)?;
+        transaction.commit()?;
+        Ok(built)
+    }
+
+    pub(crate) fn build_indexed_logical_manifest(
+        &self,
+        library_id: &str,
+        generation_id: &str,
+    ) -> StoreResult<BuiltIndexedLogicalManifest> {
+        scan_compact_manifest(&self.connection, library_id, generation_id, true)
+    }
+
+    pub(crate) fn reconstruct_logical_object(
+        &self,
+        cas: &PayloadCas,
+        library_id: &str,
+        generation_id: &str,
+        object_hash: &str,
+    ) -> StoreResult<Vec<u8>> {
+        let pds_generation =
+            require_complete_generation(&self.connection, library_id, generation_id)?;
+        let expected_size =
+            referenced_object_size(&self.connection, library_id, generation_id, object_hash)?;
+
+        let record_key: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT record_key FROM logical_record_heads
+                 WHERE library_id = ?1 AND generation_id = ?2
+                   AND state = 'live' AND object_hash = ?3
+                 ORDER BY record_key ASC LIMIT 1",
+                params![library_id, generation_id, object_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let bytes = if let Some(record_key) = record_key {
+            reconstruct_record(
+                &self.connection,
+                cas,
+                library_id,
+                generation_id,
+                &pds_generation,
+                &record_key,
+            )?
+        } else {
+            let page: Option<(String, i64, i64)> = self
+                .connection
+                .query_row(
+                    "SELECT record_key, first_message_index, message_count
+                     FROM logical_message_page_sources
+                     WHERE library_id = ?1 AND generation_id = ?2 AND object_hash = ?3
+                     ORDER BY record_key ASC, page_index ASC LIMIT 1",
+                    params![library_id, generation_id, object_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((record_key, first_message_index, message_count)) = page {
+                reconstruct_page(
+                    &self.connection,
+                    &pds_generation,
+                    &record_key,
+                    nonnegative_u64(first_message_index, "message page first index")?,
+                    nonnegative_u64(message_count, "message page count")?,
+                )?
+            } else {
+                cas.read_object(object_hash)?
+                    .ok_or_else(|| StoreError::Validation {
+                        message: format!("referenced CAS object {object_hash} is missing"),
+                    })?
+            }
+        };
+        verify_object_bytes(&bytes, object_hash, expected_size)?;
+        Ok(bytes)
+    }
+}
+
+fn validate_pds_projection_contract(connection: &Connection) -> StoreResult<()> {
+    let asset_columns = table_columns(connection, "asset_aliases")?;
+    for required in [
+        "generation",
+        "logical_key",
+        "object_hash",
+        "kind",
+        "size",
+        "metadata",
+    ] {
+        if !asset_columns.contains_key(required) {
+            return validation(format!(
+                "logical projection requires J2 asset_aliases column {required}"
+            ));
+        }
+    }
+    let expected_asset_pk = [("generation", 1_i64), ("kind", 2), ("logical_key", 3)];
+    if expected_asset_pk
+        .iter()
+        .any(|(name, position)| asset_columns.get(*name) != Some(position))
+    {
+        return validation(
+            "logical projection requires asset_aliases primary key (generation, kind, logical_key)",
+        );
+    }
+
+    let cold_columns = table_columns(connection, "cold_aliases")?;
+    for required in ["generation", "key", "object_hash", "size", "metadata"] {
+        if !cold_columns.contains_key(required) {
+            return validation(format!(
+                "logical projection requires J2 cold_aliases column {required}"
+            ));
+        }
+    }
+    if cold_columns.get("generation") != Some(&1) || cold_columns.get("key") != Some(&2) {
+        return validation(
+            "logical projection requires cold_aliases primary key (generation, key)",
+        );
+    }
+    Ok(())
+}
+
+fn table_columns(connection: &Connection, table: &str) -> StoreResult<BTreeMap<String, i64>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(columns)
+}
+
+fn project_root(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+) -> StoreResult<()> {
+    let raw: String = transaction.query_row(
+        "SELECT value FROM root WHERE generation = ?1",
+        [pds_generation],
+        |row| row.get(0),
+    )?;
+    let owner_heads = load_owner_heads(transaction, cas, pds_generation, None)?;
+    let dependencies = owner_dependencies(cas, &owner_heads)?;
+    insert_live_record(
+        transaction,
+        library_id,
+        generation_id,
+        encode_logical_record_key(&LogicalRecordLocator::Root).map_err(codec_error)?,
+        RECORD_KIND_ROOT,
+        LogicalRecordEnvelope::Root {
+            value: serde_json::from_str(&raw)?,
+            owner_heads,
+        },
+        dependencies,
+        &[],
+    )
+}
+
+fn project_presets(
+    transaction: &Transaction<'_>,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+) -> StoreResult<()> {
+    let mut statement = transaction.prepare(
+        "SELECT preset_id, configured_index, value FROM bot_presets
+         WHERE generation = ?1 ORDER BY preset_id ASC",
+    )?;
+    let mut rows = statement.query([pds_generation])?;
+    while let Some(row) = rows.next()? {
+        let preset_id: String = row.get(0)?;
+        let configured_index = nonnegative_u64(row.get(1)?, "preset configured index")?;
+        let raw: String = row.get(2)?;
+        insert_live_record(
+            transaction,
+            library_id,
+            generation_id,
+            encode_logical_record_key(&LogicalRecordLocator::Preset { preset_id })
+                .map_err(codec_error)?,
+            RECORD_KIND_PRESET,
+            LogicalRecordEnvelope::Preset {
+                configured_index,
+                value: serde_json::from_str(&raw)?,
+            },
+            Vec::new(),
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_plugins(
+    transaction: &Transaction<'_>,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+) -> StoreResult<()> {
+    let mut statement = transaction.prepare(
+        "SELECT storage_key, ordinal, value FROM plugin_storage
+         WHERE generation = ?1 ORDER BY storage_key ASC",
+    )?;
+    let mut rows = statement.query([pds_generation])?;
+    while let Some(row) = rows.next()? {
+        let storage_key: String = row.get(0)?;
+        let ordinal = nonnegative_u64(row.get(1)?, "plugin storage ordinal")?;
+        let raw: String = row.get(2)?;
+        insert_live_record(
+            transaction,
+            library_id,
+            generation_id,
+            encode_logical_record_key(&LogicalRecordLocator::Plugin { storage_key })
+                .map_err(codec_error)?,
+            RECORD_KIND_PLUGIN,
+            LogicalRecordEnvelope::Plugin {
+                ordinal,
+                value: serde_json::from_str(&raw)?,
+            },
+            Vec::new(),
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_characters(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+) -> StoreResult<()> {
+    let mut statement = transaction.prepare(
+        "SELECT character_id, configured_index, detail FROM characters
+         WHERE generation = ?1 ORDER BY character_id ASC",
+    )?;
+    let mut rows = statement.query([pds_generation])?;
+    while let Some(row) = rows.next()? {
+        let character_id: String = row.get(0)?;
+        let configured_index = nonnegative_u64(row.get(1)?, "character configured index")?;
+        let raw: String = row.get(2)?;
+        let owner_heads = load_owner_heads(transaction, cas, pds_generation, Some(&character_id))?;
+        let dependencies = owner_dependencies(cas, &owner_heads)?;
+        insert_live_record(
+            transaction,
+            library_id,
+            generation_id,
+            encode_logical_record_key(&LogicalRecordLocator::Character { character_id })
+                .map_err(codec_error)?,
+            RECORD_KIND_CHARACTER,
+            LogicalRecordEnvelope::Character {
+                configured_index,
+                detail: serde_json::from_str(&raw)?,
+                owner_heads,
+            },
+            dependencies,
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_conversations(
+    transaction: &Transaction<'_>,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+) -> StoreResult<()> {
+    let mut statement = transaction.prepare(
+        "SELECT character_id, conversation_id, configured_index, recent_at, detail, message_count
+         FROM conversations WHERE generation = ?1
+         ORDER BY character_id ASC, conversation_id ASC",
+    )?;
+    let mut rows = statement.query([pds_generation])?;
+    while let Some(row) = rows.next()? {
+        let character_id: String = row.get(0)?;
+        let conversation_id: String = row.get(1)?;
+        let configured_index = nonnegative_u64(row.get(2)?, "conversation configured index")?;
+        let recent_at: i64 = row.get(3)?;
+        let raw: String = row.get(4)?;
+        let expected_count = nonnegative_u64(row.get(5)?, "conversation message count")?;
+        let key = encode_logical_record_key(&LogicalRecordLocator::Conversation {
+            character_id: character_id.clone(),
+            conversation_id: conversation_id.clone(),
+        })
+        .map_err(codec_error)?;
+        let pages = project_message_pages(
+            transaction,
+            pds_generation,
+            &character_id,
+            &conversation_id,
+            expected_count,
+        )?;
+        let dependencies = pages.iter().map(|page| page.object.clone()).collect();
+        let message_page_hashes = pages.iter().map(|page| page.object.hash.clone()).collect();
+        insert_live_record(
+            transaction,
+            library_id,
+            generation_id,
+            key,
+            RECORD_KIND_CONVERSATION,
+            LogicalRecordEnvelope::Conversation {
+                configured_index,
+                recent_at,
+                detail: serde_json::from_str(&raw)?,
+                message_page_hashes,
+            },
+            dependencies,
+            &pages,
+        )?;
+    }
+    Ok(())
+}
+
+fn project_message_pages(
+    transaction: &Transaction<'_>,
+    pds_generation: &str,
+    character_id: &str,
+    conversation_id: &str,
+    expected_count: u64,
+) -> StoreResult<Vec<PageSource>> {
+    let (stored_count, first_index, last_index): (i64, Option<i64>, Option<i64>) = transaction
+        .query_row(
+            "SELECT COUNT(*), MIN(message_index), MAX(message_index) FROM messages
+             WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+            params![pds_generation, character_id, conversation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let stored_count = nonnegative_u64(stored_count, "stored message count")?;
+    let first_index = first_index
+        .map(|value| nonnegative_u64(value, "first message index"))
+        .transpose()?;
+    let last_index = last_index
+        .map(|value| nonnegative_u64(value, "last message index"))
+        .transpose()?;
+    let expected_first = (expected_count > 0).then_some(0);
+    let expected_last = expected_count.checked_sub(1);
+    if stored_count != expected_count
+        || first_index != expected_first
+        || last_index != expected_last
+    {
+        return validation("conversation message count or index range is inconsistent");
+    }
+    let mut pages = Vec::new();
+    let mut next_index = 0_u64;
+    while next_index < expected_count {
+        let mut statement = transaction.prepare(
+            "SELECT message_index, value FROM messages
+             WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3
+               AND message_index >= ?4
+             ORDER BY message_index ASC LIMIT ?5",
+        )?;
+        let mut rows = statement.query(params![
+            pds_generation,
+            character_id,
+            conversation_id,
+            sqlite_i64(next_index, "message page start index")?,
+            LOGICAL_MESSAGE_PAGE_SIZE as i64,
+        ])?;
+        let first_message_index = next_index;
+        let mut messages = Vec::with_capacity(LOGICAL_MESSAGE_PAGE_SIZE);
+        while let Some(row) = rows.next()? {
+            let message_index = nonnegative_u64(row.get(0)?, "message index")?;
+            if message_index != next_index {
+                return validation("conversation messages are not contiguous");
+            }
+            let raw: String = row.get(1)?;
+            messages.push(serde_json::from_str(&raw)?);
+            next_index += 1;
+        }
+        if messages.is_empty() {
+            return validation("conversation message count exceeds stored messages");
+        }
+        let encoded = encode_message_page(&messages).map_err(codec_error)?;
+        pages.push(PageSource {
+            page_index: u64::try_from(pages.len()).map_err(|_| StoreError::Validation {
+                message: "conversation page index overflow".to_owned(),
+            })?,
+            first_message_index,
+            message_count: u64::try_from(messages.len()).map_err(|_| StoreError::Validation {
+                message: "conversation page message count overflow".to_owned(),
+            })?,
+            object: manifest_object(&encoded),
+        });
+    }
+    Ok(pages)
+}
+
+fn project_asset_aliases(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+) -> StoreResult<()> {
+    let mut statement = transaction.prepare(
+        "SELECT kind, logical_key, object_hash, size, metadata FROM asset_aliases
+         WHERE generation = ?1 ORDER BY kind ASC, logical_key ASC",
+    )?;
+    let mut rows = statement.query([pds_generation])?;
+    while let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        let logical_key: String = row.get(1)?;
+        let object_hash: Option<String> = row.get(2)?;
+        let size = nonnegative_u64(row.get(3)?, "asset alias size")?;
+        let metadata: String = row.get(4)?;
+        let dependencies = payload_dependency(cas, object_hash.as_deref(), size)?;
+        let metadata: Value = serde_json::from_str(&metadata)?;
+        let (locator, record_kind, envelope) = match kind.as_str() {
+            RECORD_KIND_ASSET => (
+                LogicalRecordLocator::Asset { logical_key },
+                RECORD_KIND_ASSET,
+                LogicalRecordEnvelope::Asset {
+                    object_hash,
+                    size,
+                    metadata,
+                },
+            ),
+            RECORD_KIND_INLAY => (
+                LogicalRecordLocator::Inlay { logical_key },
+                RECORD_KIND_INLAY,
+                LogicalRecordEnvelope::Inlay {
+                    object_hash,
+                    size,
+                    metadata,
+                },
+            ),
+            _ => return validation("asset alias kind is unsupported"),
+        };
+        insert_live_record(
+            transaction,
+            library_id,
+            generation_id,
+            encode_logical_record_key(&locator).map_err(codec_error)?,
+            record_kind,
+            envelope,
+            dependencies,
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_cold_aliases(
+    transaction: &Transaction<'_>,
+    cas: &PayloadCas,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+) -> StoreResult<()> {
+    let mut statement = transaction.prepare(
+        "SELECT key, object_hash, size, metadata FROM cold_aliases
+         WHERE generation = ?1 ORDER BY key ASC",
+    )?;
+    let mut rows = statement.query([pds_generation])?;
+    while let Some(row) = rows.next()? {
+        let logical_key: String = row.get(0)?;
+        let object_hash: Option<String> = row.get(1)?;
+        let size = nonnegative_u64(row.get(2)?, "cold alias size")?;
+        let metadata: String = row.get(3)?;
+        let dependencies = payload_dependency(cas, object_hash.as_deref(), size)?;
+        insert_live_record(
+            transaction,
+            library_id,
+            generation_id,
+            encode_logical_record_key(&LogicalRecordLocator::Cold { logical_key })
+                .map_err(codec_error)?,
+            RECORD_KIND_COLD,
+            LogicalRecordEnvelope::Cold {
+                object_hash,
+                size,
+                metadata: serde_json::from_str(&metadata)?,
+            },
+            dependencies,
+            &[],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_owner_heads(
+    connection: &Connection,
+    cas: &PayloadCas,
+    pds_generation: &str,
+    character_id: Option<&str>,
+) -> StoreResult<Vec<LogicalOwnerHead>> {
+    let (sql, locator): (&str, Option<&str>) = match character_id {
+        Some(character_id) => (
+            "SELECT owner_kind, owner_locator, present, manifest_hash, entry_count
+             FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind = 'character-additional-assets'
+               AND owner_locator = ?2
+             ORDER BY owner_kind ASC, owner_locator ASC",
+            Some(character_id),
+        ),
+        None => (
+            "SELECT owner_kind, owner_locator, present, manifest_hash, entry_count
+             FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind IN (
+                'root-module-assets', 'persona-embedded-module-assets'
+             )
+             ORDER BY owner_kind ASC, CAST(owner_locator AS INTEGER) ASC",
+            None,
+        ),
+    };
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = match locator {
+        Some(locator) => statement.query(params![pds_generation, locator])?,
+        None => statement.query([pds_generation])?,
+    };
+    let mut heads = Vec::new();
+    while let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        let locator: String = row.get(1)?;
+        let present: bool = row.get(2)?;
+        let manifest_hash: Option<String> = row.get(3)?;
+        let entry_count = nonnegative_u64(row.get(4)?, "owner entry count")?;
+        let owner = match kind.as_str() {
+            "character-additional-assets" => LogicalOwnerLocator::CharacterAdditional {
+                character_id: locator,
+            },
+            "root-module-assets" => LogicalOwnerLocator::RootModule {
+                index: parse_owner_index(&locator)?,
+            },
+            "persona-embedded-module-assets" => LogicalOwnerLocator::PersonaEmbeddedModule {
+                index: parse_owner_index(&locator)?,
+            },
+            _ => return validation("asset owner kind is unsupported"),
+        };
+        let head = if present {
+            let hash = manifest_hash.ok_or_else(|| StoreError::Validation {
+                message: "present owner head has no manifest hash".to_owned(),
+            })?;
+            require_cas_size(cas, &hash)?;
+            LogicalOwnerHead::present(owner, hash, entry_count).map_err(codec_error)?
+        } else {
+            if manifest_hash.is_some() || entry_count != 0 {
+                return validation("absent owner head contains manifest data");
+            }
+            LogicalOwnerHead::absent(owner)
+        };
+        heads.push(head);
+    }
+    Ok(heads)
+}
+
+fn owner_dependencies(
+    cas: &PayloadCas,
+    heads: &[LogicalOwnerHead],
+) -> StoreResult<Vec<LogicalManifestObject>> {
+    heads
+        .iter()
+        .filter_map(|head| head.manifest_hash.as_deref())
+        .map(|hash| {
+            Ok(LogicalManifestObject {
+                hash: hash.to_owned(),
+                size: require_cas_size(cas, hash)?,
+            })
+        })
+        .collect()
+}
+
+fn payload_dependency(
+    cas: &PayloadCas,
+    object_hash: Option<&str>,
+    declared_size: u64,
+) -> StoreResult<Vec<LogicalManifestObject>> {
+    let Some(hash) = object_hash else {
+        if declared_size != 0 {
+            return validation("payload alias without an object must have size zero");
+        }
+        return Ok(Vec::new());
+    };
+    let actual_size = require_cas_size(cas, hash)?;
+    if actual_size != declared_size {
+        return validation(format!(
+            "payload alias size {declared_size} does not match CAS size {actual_size}"
+        ));
+    }
+    Ok(vec![LogicalManifestObject {
+        hash: hash.to_owned(),
+        size: actual_size,
+    }])
+}
+
+fn require_cas_size(cas: &PayloadCas, hash: &str) -> StoreResult<u64> {
+    cas.stat_object(hash)?
+        .ok_or_else(|| StoreError::Validation {
+            message: format!("referenced CAS object {hash} is missing"),
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_live_record(
+    transaction: &Transaction<'_>,
+    library_id: &str,
+    generation_id: &str,
+    record_key: String,
+    record_kind: &str,
+    envelope: LogicalRecordEnvelope,
+    dependencies: Vec<LogicalManifestObject>,
+    pages: &[PageSource],
+) -> StoreResult<()> {
+    let encoded = encode_logical_record(&envelope).map_err(codec_error)?;
+    transaction.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind, state,
+            object_hash, object_size, deleted_generation_sequence
+         ) VALUES (?1, ?2, ?3, ?4, 'live', ?5, ?6, NULL)",
+        params![
+            library_id,
+            generation_id,
+            record_key,
+            record_kind,
+            encoded.hash,
+            sqlite_i64(encoded.size, "logical record object size")?,
+        ],
+    )?;
+    let mut unique = BTreeMap::new();
+    for dependency in dependencies {
+        if let Some(existing) = unique.insert(dependency.hash.clone(), dependency.size) {
+            if existing != dependency.size {
+                return validation("logical dependency hash has conflicting sizes");
+            }
+        }
+    }
+    for (hash, size) in unique {
+        transaction.execute(
+            "INSERT INTO logical_record_dependencies (
+                library_id, generation_id, record_key, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                library_id,
+                generation_id,
+                record_key,
+                hash,
+                sqlite_i64(size, "logical dependency object size")?
+            ],
+        )?;
+    }
+    for page in pages {
+        transaction.execute(
+            "INSERT INTO logical_message_page_sources (
+                library_id, generation_id, record_key, page_index,
+                first_message_index, message_count, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                library_id,
+                generation_id,
+                record_key,
+                sqlite_i64(page.page_index, "logical message page index")?,
+                sqlite_i64(page.first_message_index, "logical message first index")?,
+                sqlite_i64(page.message_count, "logical message page count")?,
+                page.object.hash,
+                sqlite_i64(page.object.size, "logical message page object size")?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_tombstones(
+    transaction: &Transaction<'_>,
+    library_id: &str,
+    generation_id: &str,
+    parent_generation_id: &str,
+    deleted_generation_sequence: &str,
+) -> StoreResult<()> {
+    transaction.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind, state,
+            object_hash, object_size, deleted_generation_sequence
+         )
+         SELECT parent.library_id, ?2, parent.record_key, parent.record_kind, 'tombstone',
+                NULL, 0,
+                CASE WHEN parent.state = 'tombstone'
+                     THEN parent.deleted_generation_sequence ELSE ?4 END
+         FROM logical_record_heads AS parent
+         WHERE parent.library_id = ?1 AND parent.generation_id = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM logical_record_heads AS current
+               WHERE current.library_id = ?1 AND current.generation_id = ?2
+                 AND current.record_key = parent.record_key
+           )",
+        params![
+            library_id,
+            generation_id,
+            parent_generation_id,
+            deleted_generation_sequence,
+        ],
+    )?;
+    Ok(())
+}
+
+fn scan_compact_manifest(
+    connection: &Connection,
+    library_id: &str,
+    generation_id: &str,
+    require_complete: bool,
+) -> StoreResult<BuiltIndexedLogicalManifest> {
+    let metadata = logical_generation_metadata(connection, library_id, generation_id)?;
+    if require_complete && metadata.state != "complete" {
+        return validation("logical generation index is not complete");
+    }
+    let mut statement = connection.prepare(
+        "SELECT record_key, state, object_hash, object_size, deleted_generation_sequence
+         FROM logical_record_heads
+         WHERE library_id = ?1 AND generation_id = ?2 ORDER BY record_key ASC",
+    )?;
+    let mut rows = statement.query(params![library_id, generation_id])?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let state: String = row.get(1)?;
+        if state == "live" {
+            let hash: String = row.get(2)?;
+            let size = nonnegative_u64(row.get(3)?, "indexed logical object size")?;
+            let mut dependency_statement = connection.prepare(
+                "SELECT object_hash, object_size FROM logical_record_dependencies
+                 WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
+                 ORDER BY object_hash ASC",
+            )?;
+            let dependencies = dependency_statement
+                .query_map(params![library_id, generation_id, key], |dependency| {
+                    Ok(LogicalManifestObject {
+                        hash: dependency.get(0)?,
+                        size: nonnegative_u64(
+                            dependency.get(1)?,
+                            "indexed logical dependency size",
+                        )
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            records.push(IndexedLogicalRecord::live(
+                key,
+                LogicalManifestObject { hash, size },
+                dependencies,
+            ));
+        } else if state == "tombstone" {
+            records.push(IndexedLogicalRecord::tombstone(key, row.get(4)?));
+        } else {
+            return validation("logical record head state is invalid");
+        }
+    }
+    let built = build_indexed_logical_manifest(IndexedLogicalManifestBuilderInput {
+        library_id: metadata.library_id,
+        generation: metadata.generation_id,
+        generation_sequence: metadata.generation_sequence,
+        parent_generation: metadata.parent_generation_id,
+        source_revision: nonnegative_u64(metadata.source_revision, "logical source revision")?,
+        records,
+    })
+    .map_err(codec_error)?;
+    if require_complete && metadata.manifest_hash.as_deref() != Some(&built.manifest_hash) {
+        return validation("complete logical index manifest hash does not match compact metadata");
+    }
+    Ok(built)
+}
+
+fn logical_generation_metadata(
+    connection: &Connection,
+    library_id: &str,
+    generation_id: &str,
+) -> StoreResult<LogicalGenerationMetadata> {
+    connection
+        .query_row(
+            "SELECT library_id, generation_id, generation_sequence, parent_generation_id,
+                    source_revision, state, manifest_hash
+             FROM logical_sync_generations
+             WHERE library_id = ?1 AND generation_id = ?2",
+            params![library_id, generation_id],
+            |row| {
+                Ok(LogicalGenerationMetadata {
+                    library_id: row.get(0)?,
+                    generation_id: row.get(1)?,
+                    generation_sequence: row.get(2)?,
+                    parent_generation_id: row.get(3)?,
+                    source_revision: row.get(4)?,
+                    state: row.get(5)?,
+                    manifest_hash: row.get(6)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::Validation {
+            message: "logical generation index does not exist".to_owned(),
+        })
+}
+
+fn require_complete_generation(
+    connection: &Connection,
+    library_id: &str,
+    generation_id: &str,
+) -> StoreResult<String> {
+    connection
+        .query_row(
+            "SELECT pds_generation FROM logical_sync_generations
+             WHERE library_id = ?1 AND generation_id = ?2 AND state = 'complete'
+               AND manifest_hash IS NOT NULL",
+            params![library_id, generation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::Validation {
+            message: "logical generation index is absent or incomplete".to_owned(),
+        })
+}
+
+fn referenced_object_size(
+    connection: &Connection,
+    library_id: &str,
+    generation_id: &str,
+    object_hash: &str,
+) -> StoreResult<u64> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT object_size FROM (
+            SELECT object_size FROM logical_record_heads
+            WHERE library_id = ?1 AND generation_id = ?2 AND object_hash = ?3
+            UNION ALL
+            SELECT object_size FROM logical_record_dependencies
+            WHERE library_id = ?1 AND generation_id = ?2 AND object_hash = ?3
+         ) ORDER BY object_size ASC",
+    )?;
+    let sizes = statement
+        .query_map(params![library_id, generation_id, object_hash], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<Result<Vec<i64>, _>>()?
+        .into_iter()
+        .map(|size| nonnegative_u64(size, "indexed object size"))
+        .collect::<StoreResult<Vec<_>>>()?;
+    match sizes.as_slice() {
+        [size] => Ok(*size),
+        [] => validation("requested object is not referenced by the logical generation"),
+        _ => validation("requested object hash has conflicting indexed sizes"),
+    }
+}
+
+fn reconstruct_record(
+    connection: &Connection,
+    cas: &PayloadCas,
+    library_id: &str,
+    generation_id: &str,
+    pds_generation: &str,
+    record_key: &str,
+) -> StoreResult<Vec<u8>> {
+    let locator = decode_logical_record_key(record_key).map_err(codec_error)?;
+    let envelope = match locator {
+        LogicalRecordLocator::Root => {
+            let raw = required_text(
+                connection,
+                "SELECT value FROM root WHERE generation = ?1",
+                params![pds_generation],
+                "root record source is missing",
+            )?;
+            LogicalRecordEnvelope::Root {
+                value: serde_json::from_str(&raw)?,
+                owner_heads: load_owner_heads(connection, cas, pds_generation, None)?,
+            }
+        }
+        LogicalRecordLocator::Preset { preset_id } => {
+            let (configured_index, raw): (i64, String) = connection
+                .query_row(
+                    "SELECT configured_index, value FROM bot_presets
+                     WHERE generation = ?1 AND preset_id = ?2",
+                    params![pds_generation, preset_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| missing_source("preset"))?;
+            LogicalRecordEnvelope::Preset {
+                configured_index: nonnegative_u64(configured_index, "preset configured index")?,
+                value: serde_json::from_str(&raw)?,
+            }
+        }
+        LogicalRecordLocator::Plugin { storage_key } => {
+            let (ordinal, raw): (i64, String) = connection
+                .query_row(
+                    "SELECT ordinal, value FROM plugin_storage
+                     WHERE generation = ?1 AND storage_key = ?2",
+                    params![pds_generation, storage_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| missing_source("plugin"))?;
+            LogicalRecordEnvelope::Plugin {
+                ordinal: nonnegative_u64(ordinal, "plugin storage ordinal")?,
+                value: serde_json::from_str(&raw)?,
+            }
+        }
+        LogicalRecordLocator::Character { character_id } => {
+            let (configured_index, raw): (i64, String) = connection
+                .query_row(
+                    "SELECT configured_index, detail FROM characters
+                     WHERE generation = ?1 AND character_id = ?2",
+                    params![pds_generation, character_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| missing_source("character"))?;
+            LogicalRecordEnvelope::Character {
+                configured_index: nonnegative_u64(configured_index, "character configured index")?,
+                detail: serde_json::from_str(&raw)?,
+                owner_heads: load_owner_heads(
+                    connection,
+                    cas,
+                    pds_generation,
+                    Some(&character_id),
+                )?,
+            }
+        }
+        LogicalRecordLocator::Conversation {
+            character_id,
+            conversation_id,
+        } => {
+            let (configured_index, recent_at, raw): (i64, i64, String) = connection
+                .query_row(
+                    "SELECT configured_index, recent_at, detail FROM conversations
+                     WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3",
+                    params![pds_generation, character_id, conversation_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| missing_source("conversation"))?;
+            let mut statement = connection.prepare(
+                "SELECT object_hash FROM logical_message_page_sources
+                 WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3
+                 ORDER BY page_index ASC",
+            )?;
+            let message_page_hashes = statement
+                .query_map(params![library_id, generation_id, record_key], |row| {
+                    row.get(0)
+                })?
+                .collect::<Result<Vec<String>, _>>()?;
+            LogicalRecordEnvelope::Conversation {
+                configured_index: nonnegative_u64(
+                    configured_index,
+                    "conversation configured index",
+                )?,
+                recent_at,
+                detail: serde_json::from_str(&raw)?,
+                message_page_hashes,
+            }
+        }
+        LogicalRecordLocator::Asset { logical_key } => {
+            reconstruct_asset_alias(connection, pds_generation, RECORD_KIND_ASSET, &logical_key)?
+        }
+        LogicalRecordLocator::Inlay { logical_key } => {
+            reconstruct_asset_alias(connection, pds_generation, RECORD_KIND_INLAY, &logical_key)?
+        }
+        LogicalRecordLocator::Cold { logical_key } => {
+            let (object_hash, size, metadata): (Option<String>, i64, String) = connection
+                .query_row(
+                    "SELECT object_hash, size, metadata FROM cold_aliases
+                     WHERE generation = ?1 AND key = ?2",
+                    params![pds_generation, logical_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| missing_source("cold"))?;
+            LogicalRecordEnvelope::Cold {
+                object_hash,
+                size: nonnegative_u64(size, "cold alias size")?,
+                metadata: serde_json::from_str(&metadata)?,
+            }
+        }
+    };
+    Ok(encode_logical_record(&envelope).map_err(codec_error)?.bytes)
+}
+
+fn reconstruct_asset_alias(
+    connection: &Connection,
+    pds_generation: &str,
+    kind: &str,
+    logical_key: &str,
+) -> StoreResult<LogicalRecordEnvelope> {
+    let (object_hash, size, metadata): (Option<String>, i64, String) = connection
+        .query_row(
+            "SELECT object_hash, size, metadata FROM asset_aliases
+             WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
+            params![pds_generation, kind, logical_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| missing_source(kind))?;
+    let size = nonnegative_u64(size, "asset alias size")?;
+    let metadata = serde_json::from_str(&metadata)?;
+    Ok(if kind == RECORD_KIND_ASSET {
+        LogicalRecordEnvelope::Asset {
+            object_hash,
+            size,
+            metadata,
+        }
+    } else {
+        LogicalRecordEnvelope::Inlay {
+            object_hash,
+            size,
+            metadata,
+        }
+    })
+}
+
+fn reconstruct_page(
+    connection: &Connection,
+    pds_generation: &str,
+    record_key: &str,
+    first_message_index: u64,
+    message_count: u64,
+) -> StoreResult<Vec<u8>> {
+    let LogicalRecordLocator::Conversation {
+        character_id,
+        conversation_id,
+    } = decode_logical_record_key(record_key).map_err(codec_error)?
+    else {
+        return validation("message page source does not reference a conversation");
+    };
+    let end = first_message_index
+        .checked_add(message_count)
+        .ok_or_else(|| StoreError::Validation {
+            message: "message page range overflow".to_owned(),
+        })?;
+    let mut statement = connection.prepare(
+        "SELECT message_index, value FROM messages
+         WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3
+           AND message_index >= ?4 AND message_index < ?5
+         ORDER BY message_index ASC",
+    )?;
+    let mut rows = statement.query(params![
+        pds_generation,
+        character_id,
+        conversation_id,
+        sqlite_i64(first_message_index, "message page first index")?,
+        sqlite_i64(end, "message page end index")?,
+    ])?;
+    let mut messages = Vec::with_capacity(message_count as usize);
+    let mut expected = first_message_index;
+    while let Some(row) = rows.next()? {
+        let index = nonnegative_u64(row.get(0)?, "message index")?;
+        if index != expected {
+            return validation("message page source is no longer contiguous");
+        }
+        let raw: String = row.get(1)?;
+        messages.push(serde_json::from_str(&raw)?);
+        expected += 1;
+    }
+    if expected != end {
+        return validation("message page source is incomplete");
+    }
+    Ok(encode_message_page(&messages).map_err(codec_error)?.bytes)
+}
+
+fn required_text(
+    connection: &Connection,
+    sql: &str,
+    parameters: impl rusqlite::Params,
+    message: &str,
+) -> StoreResult<String> {
+    connection
+        .query_row(sql, parameters, |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| StoreError::Validation {
+            message: message.to_owned(),
+        })
+}
+
+fn manifest_object(encoded: &EncodedLogicalObject) -> LogicalManifestObject {
+    LogicalManifestObject {
+        hash: encoded.hash.clone(),
+        size: encoded.size,
+    }
+}
+
+fn parse_owner_index(value: &str) -> StoreResult<u64> {
+    let parsed = value.parse::<u64>().map_err(|_| StoreError::Validation {
+        message: "asset owner locator is not a nonnegative integer".to_owned(),
+    })?;
+    if parsed.to_string() != value {
+        return validation("asset owner locator is not canonical");
+    }
+    Ok(parsed)
+}
+
+fn verify_object_bytes(bytes: &[u8], hash: &str, size: u64) -> StoreResult<()> {
+    if bytes.len() as u64 != size || hex::encode(Sha256::digest(bytes)) != hash {
+        return validation("reconstructed logical object failed hash or size verification");
+    }
+    Ok(())
+}
+
+fn nonnegative_u64(value: i64, description: &str) -> StoreResult<u64> {
+    u64::try_from(value).map_err(|_| StoreError::Validation {
+        message: format!("{description} must be nonnegative"),
+    })
+}
+
+fn sqlite_i64(value: u64, description: &str) -> StoreResult<i64> {
+    i64::try_from(value).map_err(|_| StoreError::Validation {
+        message: format!("{description} exceeds the SQLite integer range"),
+    })
+}
+
+fn unix_millis() -> StoreResult<i64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StoreError::Store {
+            message: "system clock is before the Unix epoch".to_owned(),
+        })?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| StoreError::Store {
+        message: "system clock exceeds SQLite timestamp range".to_owned(),
+    })
+}
+
+fn schema_error(error: logical_schema::LogicalSchemaError) -> StoreError {
+    StoreError::Validation {
+        message: error.to_string(),
+    }
+}
+
+fn codec_error(error: impl std::fmt::Display) -> StoreError {
+    StoreError::Validation {
+        message: error.to_string(),
+    }
+}
+
+fn missing_source(kind: &str) -> StoreError {
+    StoreError::Validation {
+        message: format!("{kind} logical record source is missing"),
+    }
+}
+
+fn validation<T>(message: impl Into<String>) -> StoreResult<T> {
+    Err(StoreError::Validation {
+        message: message.into(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer_sync::logical_delta::{
+        decode_logical_record, decode_message_page, LogicalManifestRecord,
+    };
+    use rusqlite::params;
+    use serde_json::json;
+
+    fn open_j2_fixture() -> (tempfile::TempDir, PersistentStore, PayloadCas) {
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let store = PersistentStore::open(directory.path()).expect("open store");
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX asset_aliases_generation;
+                 DROP TABLE asset_aliases;
+                 CREATE TABLE asset_aliases (
+                    generation TEXT NOT NULL,
+                    logical_key TEXT NOT NULL,
+                    object_hash TEXT,
+                    kind TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mime TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    ext TEXT NOT NULL DEFAULT '',
+                    inlay_type TEXT,
+                    width INTEGER,
+                    height INTEGER,
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (generation, kind, logical_key)
+                 );
+                 CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
+                 CREATE TABLE cold_aliases (
+                    generation TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    object_hash TEXT,
+                    size INTEGER NOT NULL,
+                    metadata TEXT NOT NULL,
+                    PRIMARY KEY (generation, key)
+                 );",
+            )
+            .expect("install anticipated J2 contract");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        (directory, store, cas)
+    }
+
+    fn seed_all_record_families(store: &PersistentStore, cas: &PayloadCas) -> (String, String) {
+        let asset = cas
+            .prepare_bytes(b"ordinary asset bytes")
+            .expect("store asset");
+        let inlay = cas
+            .prepare_bytes(b"original inlay bytes")
+            .expect("store inlay");
+        let cold = cas.prepare_bytes(b"cold bytes").expect("store cold");
+        let owner = cas
+            .prepare_bytes(b"owner manifest bytes")
+            .expect("store owner manifest");
+        store
+            .connection
+            .execute(
+                "UPDATE root SET value = ?1 WHERE generation = 'revision-0'",
+                [r#"{"theme":"dark"}"#],
+            )
+            .expect("seed root");
+        store.connection.execute(
+            "INSERT INTO bot_presets (generation, preset_id, configured_index, name, image, value)
+             VALUES ('revision-0', 'preset', 4, 'Preset', NULL, ?1)",
+            [r#"{"name":"Preset"}"#],
+        ).expect("seed preset");
+        store
+            .connection
+            .execute(
+                "INSERT INTO plugin_storage (generation, storage_key, byte_size, ordinal, value)
+             VALUES ('revision-0', 'plugin', 7, 3, ?1)",
+                [r#"{"x":1}"#],
+            )
+            .expect("seed plugin");
+        store.connection.execute(
+            "INSERT INTO characters (
+                generation, character_id, configured_index, recent_at, trashed, name, image,
+                conversation_count, type, creator_notes, trash_time, detail
+             ) VALUES ('revision-0', 'char', 2, 10, 0, 'Char', NULL, 1, 'character', NULL, NULL, ?1)",
+            [r#"{"name":"Char"}"#],
+        ).expect("seed character");
+        store
+            .connection
+            .execute(
+                "INSERT INTO conversations (
+                generation, character_id, conversation_id, configured_index, recent_at,
+                name, message_count, detail
+             ) VALUES ('revision-0', 'char', 'chat', 1, 20, 'Chat', 129, ?1)",
+                [r#"{"name":"Chat"}"#],
+            )
+            .expect("seed conversation");
+        for index in 0..129_i64 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO messages (
+                    generation, character_id, conversation_id, message_index, message_id, value
+                 ) VALUES ('revision-0', 'char', 'chat', ?1, ?2, ?3)",
+                    params![
+                        index,
+                        format!("m{index}"),
+                        json!({"id": format!("m{index}")}).to_string()
+                    ],
+                )
+                .expect("seed message");
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO asset_owner_heads (
+                generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+             ) VALUES ('revision-0', 'character-additional-assets', 'char', 1, ?1, 1)",
+                [owner.content_hash],
+            )
+            .expect("seed owner head");
+        store
+            .connection
+            .execute(
+                "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, metadata
+             ) VALUES ('revision-0', 'same', ?1, 'asset', ?2, ?3),
+                      ('revision-0', 'same', ?4, 'inlay', ?5, ?6)",
+                params![
+                    asset.content_hash,
+                    i64::try_from(asset.byte_size).unwrap(),
+                    r#"{"mime":"application/octet-stream"}"#,
+                    inlay.content_hash,
+                    i64::try_from(inlay.byte_size).unwrap(),
+                    r#"{"inlayType":"image"}"#,
+                ],
+            )
+            .expect("seed asset and Inlay aliases");
+        store
+            .connection
+            .execute(
+                "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+             VALUES ('revision-0', 'cold', ?1, ?2, ?3)",
+                params![
+                    cold.content_hash,
+                    i64::try_from(cold.byte_size).unwrap(),
+                    r#"{"scope":"module"}"#
+                ],
+            )
+            .expect("seed cold alias");
+        (asset.content_hash, inlay.content_hash)
+    }
+
+    #[test]
+    fn rebuild_projects_every_family_and_reconstructs_pages_and_exact_payloads() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        let (asset_hash, inlay_hash) = seed_all_record_families(&store, &cas);
+        let built = store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "generation-0".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .expect("build logical index");
+
+        let kinds: Vec<&str> = built
+            .manifest
+            .records
+            .iter()
+            .map(
+                |record| match decode_logical_record_key(record.key()).unwrap() {
+                    LogicalRecordLocator::Root => RECORD_KIND_ROOT,
+                    LogicalRecordLocator::Preset { .. } => RECORD_KIND_PRESET,
+                    LogicalRecordLocator::Plugin { .. } => RECORD_KIND_PLUGIN,
+                    LogicalRecordLocator::Character { .. } => RECORD_KIND_CHARACTER,
+                    LogicalRecordLocator::Conversation { .. } => RECORD_KIND_CONVERSATION,
+                    LogicalRecordLocator::Asset { .. } => RECORD_KIND_ASSET,
+                    LogicalRecordLocator::Inlay { .. } => RECORD_KIND_INLAY,
+                    LogicalRecordLocator::Cold { .. } => RECORD_KIND_COLD,
+                },
+            )
+            .collect();
+        for expected in [
+            RECORD_KIND_ROOT,
+            RECORD_KIND_PRESET,
+            RECORD_KIND_PLUGIN,
+            RECORD_KIND_CHARACTER,
+            RECORD_KIND_CONVERSATION,
+            RECORD_KIND_ASSET,
+            RECORD_KIND_INLAY,
+            RECORD_KIND_COLD,
+        ] {
+            assert!(kinds.contains(&expected), "missing {expected}");
+        }
+        let page_rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_message_page_sources
+                 WHERE library_id = 'library' AND generation_id = 'generation-0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(page_rows, 2);
+        assert_eq!(
+            cas.read_object(&built.manifest_hash).unwrap().unwrap(),
+            built.manifest_bytes,
+        );
+
+        let conversation = built
+            .manifest
+            .records
+            .iter()
+            .find_map(|record| match record {
+                LogicalManifestRecord::Live(record)
+                    if matches!(
+                        decode_logical_record_key(&record.key).unwrap(),
+                        LogicalRecordLocator::Conversation { .. }
+                    ) =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let record_bytes = store
+            .reconstruct_logical_object(&cas, "library", "generation-0", &conversation.object_hash)
+            .expect("reconstruct conversation record");
+        let LogicalRecordEnvelope::Conversation {
+            message_page_hashes,
+            ..
+        } = decode_logical_record(&record_bytes).unwrap()
+        else {
+            panic!("expected conversation envelope");
+        };
+        assert_eq!(message_page_hashes.len(), 2);
+        assert_eq!(
+            decode_message_page(
+                &store
+                    .reconstruct_logical_object(
+                        &cas,
+                        "library",
+                        "generation-0",
+                        &message_page_hashes[0],
+                    )
+                    .unwrap()
+            )
+            .unwrap()
+            .len(),
+            LOGICAL_MESSAGE_PAGE_SIZE,
+        );
+        assert_eq!(
+            store
+                .reconstruct_logical_object(&cas, "library", "generation-0", &asset_hash)
+                .unwrap(),
+            b"ordinary asset bytes",
+        );
+        assert_eq!(
+            store
+                .reconstruct_logical_object(&cas, "library", "generation-0", &inlay_hash)
+                .unwrap(),
+            b"original inlay bytes",
+        );
+        assert_eq!(
+            store
+                .build_indexed_logical_manifest("library", "generation-0")
+                .unwrap()
+                .manifest_hash,
+            built.manifest_hash,
+        );
+    }
+
+    #[test]
+    fn child_index_carries_explicit_tombstones_from_the_complete_parent() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "generation-0".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .unwrap();
+        clone_pds_generation(&store.connection, "revision-0", "revision-1");
+        store
+            .connection
+            .execute(
+                "DELETE FROM bot_presets WHERE generation = 'revision-1' AND preset_id = 'preset'",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "UPDATE meta SET value = '1' WHERE key = 'currentRevision';
+                 UPDATE meta SET value = '\"revision-1\"' WHERE key = 'activeGeneration';",
+            )
+            .unwrap();
+
+        let child = store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "generation-1".to_owned(),
+                    generation_sequence: "1".to_owned(),
+                    parent_generation_id: Some("generation-0".to_owned()),
+                    lease: None,
+                },
+            )
+            .unwrap();
+        let preset_key = encode_logical_record_key(&LogicalRecordLocator::Preset {
+            preset_id: "preset".to_owned(),
+        })
+        .unwrap();
+        assert!(child.manifest.records.iter().any(|record| matches!(
+            record,
+            LogicalManifestRecord::Tombstone(tombstone)
+                if tombstone.key == preset_key && tombstone.deleted_generation_sequence == "1"
+        )));
+    }
+
+    #[test]
+    fn projection_and_reads_fail_closed_for_old_or_incomplete_index_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut old_store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let error = old_store
+            .rebuild_logical_index(
+                &cas,
+                LogicalIndexBuildRequest {
+                    library_id: "library".to_owned(),
+                    generation_id: "generation".to_owned(),
+                    generation_sequence: "0".to_owned(),
+                    parent_generation_id: None,
+                    lease: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("J2 asset_aliases column metadata"));
+
+        let (_directory, store, cas) = open_j2_fixture();
+        logical_schema::create_logical_schema(&store.connection).unwrap();
+        store.connection.execute(
+            "INSERT INTO logical_sync_generations (
+                library_id, generation_id, generation_sequence, parent_generation_id,
+                pds_generation, source_revision, state, manifest_hash, created_at, completed_at
+             ) VALUES ('library', 'building', '0', NULL, 'revision-0', 0, 'building', NULL, 0, NULL)",
+            [],
+        ).unwrap();
+        assert!(store
+            .build_indexed_logical_manifest("library", "building")
+            .is_err());
+        assert!(store
+            .reconstruct_logical_object(&cas, "library", "building", &"11".repeat(32),)
+            .is_err());
+    }
+
+    fn clone_pds_generation(connection: &Connection, from: &str, to: &str) {
+        for (table, columns) in [
+            ("root", "value"),
+            (
+                "bot_presets",
+                "preset_id, configured_index, name, image, value",
+            ),
+            (
+                "plugin_storage",
+                "storage_key, byte_size, ordinal, value",
+            ),
+            (
+                "characters",
+                "character_id, configured_index, recent_at, trashed, name, image, conversation_count, type, creator_notes, trash_time, detail",
+            ),
+            (
+                "conversations",
+                "character_id, conversation_id, configured_index, recent_at, name, message_count, detail",
+            ),
+            (
+                "messages",
+                "character_id, conversation_id, message_index, message_id, value",
+            ),
+            (
+                "asset_aliases",
+                "logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata",
+            ),
+            (
+                "asset_owner_heads",
+                "owner_kind, owner_locator, present, manifest_hash, entry_count",
+            ),
+            ("cold_aliases", "key, object_hash, size, metadata"),
+        ] {
+            connection
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} (generation, {columns}) \
+                         SELECT ?2, {columns} FROM {table} WHERE generation = ?1"
+                    ),
+                    params![from, to],
+                )
+                .unwrap();
+        }
+    }
+}
