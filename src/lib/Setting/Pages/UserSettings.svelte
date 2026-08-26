@@ -7,7 +7,7 @@
     import Check from "src/lib/UI/GUI/CheckInput.svelte";
     import { alertConfirm, alertError, alertNormal, alertSelect } from "src/ts/alert";
     import { forageStorage } from "src/ts/globalApi.svelte";
-    import { isTauri, isNodeServer, isTauriDesktop } from "src/ts/platform"
+    import { isTauri, isNodeServer, isTauriAndroid, isTauriDesktop } from "src/ts/platform"
     import { unMigrationAccount } from "src/ts/storage/accountStorage";
     import { checkDriver } from "src/ts/drive/drive";
     import { LoadLocalBackup, SaveLocalBackup, SavePartialLocalBackup } from "src/ts/drive/backuplocal";
@@ -39,6 +39,7 @@
     import { cancelActiveNativeFileOperation } from "src/ts/storage/nativeFileJobManager";
     import { onDestroy } from "svelte";
     import PeerCloneSettings from "./PeerCloneSettings.svelte";
+    import PeerCloneAndroidSettings from "./PeerCloneAndroidSettings.svelte";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     const drivePopup = createHubPopupController()
@@ -233,6 +234,8 @@
 
 {#if isTauriDesktop}
     <PeerCloneSettings />
+{:else if isTauriAndroid}
+    <PeerCloneAndroidSettings />
 {/if}
 
 <Button
