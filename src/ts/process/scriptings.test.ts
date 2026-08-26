@@ -70,6 +70,7 @@ vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))
 
 let runScripted: typeof import('./scriptings').runScripted
+let jsonLuaSource = ''
 
 function operationCharacterFixture(
   suffix: string,
@@ -83,6 +84,8 @@ function operationCharacterFixture(
   const char = {
     type: 'character',
     chaId: `lua-metadata-character-${suffix}`,
+    name: 'name-before',
+    desc: 'description-before',
     chatPage: 0,
     chats: [chat],
     firstMessage: 'first-before',
@@ -114,8 +117,8 @@ function installOperationCharacterFixture(
 }
 
 beforeAll(async () => {
-  const jsonLua = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
-  vi.stubGlobal('fetch', vi.fn(async () => new Response(jsonLua, { status: 200 })))
+  jsonLuaSource = await readFile(resolve(process.cwd(), 'public/lua/json.lua'), 'utf8')
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(jsonLuaSource, { status: 200 })))
   const scriptings = await import('./scriptings')
   runScripted = scriptings.runScripted
 })
@@ -132,6 +135,60 @@ test('rejects Python scripting on Tauri mobile before creating a Worker', async 
   })).rejects.toThrow(/Python scripting is unavailable on Tauri mobile/)
 
   expect(worker).not.toHaveBeenCalled()
+})
+
+test('captures field ownership before the Lua factory wait and rejects navigation', async () => {
+  const original = operationCharacterFixture('factory-owner-original')
+  const replacement = operationCharacterFixture('factory-owner-replacement')
+  installOperationCharacterFixture(original)
+  const originalFetch = globalThis.fetch
+  let releaseFetch!: () => void
+  const fetchGate = new Promise<void>((resolve) => {
+    releaseFetch = resolve
+  })
+  const delayedFetch = vi.fn(async () => {
+    await fetchGate
+    return new Response(jsonLuaSource, { status: 200 })
+  })
+  vi.stubGlobal('fetch', delayedFetch)
+
+  try {
+    const pending = runScripted(`
+      listenEdit('editInput', function(id, value, meta)
+        setName(id, 'stale-name')
+        setDescription(id, 'stale-description')
+        setCharacterFirstMessage(id, 'stale-first')
+        setBackgroundEmbedding(id, 'stale-background')
+        return value
+      end)
+    `, {
+      char: original.char,
+      chat: original.chat,
+      data: 'input',
+      mode: 'editInput',
+    })
+    await vi.waitFor(() => expect(delayedFetch).toHaveBeenCalled(), {
+      timeout: 5_000,
+    })
+    DBState.db = replacement.database as never
+    vi.mocked(getDatabase).mockReturnValue(replacement.database as never)
+    scriptingSelectionState.index = 0
+    releaseFetch()
+    await pending
+
+    expect(original.char.name).toBe('name-before')
+    expect(original.char.desc).toBe('description-before')
+    expect(original.char.firstMessage).toBe('first-before')
+    expect(original.char.backgroundHTML).toBe('background-before')
+    expect(replacement.char.name).toBe('name-before')
+    expect(replacement.char.desc).toBe('description-before')
+    expect(replacement.char.firstMessage).toBe('first-before')
+    expect(replacement.char.backgroundHTML).toBe('background-before')
+  } finally {
+    releaseFetch()
+    vi.stubGlobal('fetch', originalFetch)
+    installOperationCharacterFixture(original)
+  }
 })
 
 test('does not stop generation when setStateChanged is a no-op', async () => {
@@ -367,7 +424,11 @@ test('does not retain an editDisplay access ID after its handler returns', async
 
 test('revokes the character image URL once after the inlay write succeeds', async () => {
   vi.mocked(getDatabase).mockReturnValue({
-    characters: [{ type: 'character', image: 'character.jpg' }],
+    characters: [{
+      type: 'character',
+      chaId: 'remaining-character-image-success',
+      image: 'character.jpg',
+    }],
   } as never)
   vi.mocked(readImage).mockResolvedValue(new Uint8Array([1, 2, 3]))
   vi.mocked(asBuffer).mockReturnValue(new ArrayBuffer(3))
@@ -401,7 +462,11 @@ test('revokes the character image URL once after the inlay write succeeds', asyn
 
 test('revokes the character image URL once when the inlay write fails', async () => {
   vi.mocked(getDatabase).mockReturnValue({
-    characters: [{ type: 'character', image: 'character.jpg' }],
+    characters: [{
+      type: 'character',
+      chaId: 'remaining-character-image-failure',
+      image: 'character.jpg',
+    }],
   } as never)
   vi.mocked(readImage).mockResolvedValue(new Uint8Array([1, 2, 3]))
   vi.mocked(asBuffer).mockReturnValue(new ArrayBuffer(3))
@@ -863,6 +928,8 @@ test('updates only captured live character fields without installing the project
 
   const result = await runScripted(`
     listenEdit('editInput', function(id, value, meta)
+      setName(id, 'name-after')
+      setDescription(id, 'description-after')
       return {
         first = setCharacterFirstMessage(id, 'first-after'),
         background = setBackgroundEmbedding(id, 'background-after')
@@ -877,6 +944,8 @@ test('updates only captured live character fields without installing the project
   expect(result.res).toEqual({ first: true, background: true })
   expect(fixture.database.characters[0]).toBe(liveCharacter)
   expect(fixture.database.characters[0].chats[0]).toBe(liveChat)
+  expect(liveCharacter.name).toBe('name-after')
+  expect(liveCharacter.desc).toBe('description-after')
   expect(liveCharacter.firstMessage).toBe('first-after')
   expect(liveCharacter.backgroundHTML).toBe('background-after')
   expect(fixture.session.version).toBe(0)
@@ -902,6 +971,8 @@ test('re-finds the captured character after an awaited character array reorder',
   const pending = runScripted(`
     captured_field_reorder = async(function(id)
       LLM(id, {{ role = 'user', content = 'wait' }})
+      setName(id, 'reordered-name')
+      setDescription(id, 'reordered-description')
       return {
         first = setCharacterFirstMessage(id, 'reordered-first'),
         background = setBackgroundEmbedding(id, 'reordered-background')
@@ -921,12 +992,121 @@ test('re-finds the captured character after an awaited character array reorder',
   await expect(pending).resolves.toEqual(expect.objectContaining({
     res: { first: true, background: true },
   }))
+  expect(fixture.char.name).toBe('reordered-name')
+  expect(fixture.char.desc).toBe('reordered-description')
   expect(fixture.char.firstMessage).toBe('reordered-first')
   expect(fixture.char.backgroundHTML).toBe('reordered-background')
+  expect(replacement.char.name).toBe('name-before')
+  expect(replacement.char.desc).toBe('description-before')
   expect(replacement.char.firstMessage).toBe('first-before')
   expect(replacement.char.backgroundHTML).toBe('background-before')
   expect(fixture.database.characters[1]).toBe(fixture.char)
   operationContext.release()
+  vi.mocked(requestChatData).mockReset()
+})
+
+test('rejects all captured field writes after a same-ID database replacement', async () => {
+  const original = operationCharacterFixture('same-id-owner-original')
+  const replacement = operationCharacterFixture('same-id-owner-replacement')
+  replacement.char.chaId = original.char.chaId
+  installOperationCharacterFixture(original)
+  let resolveRequest!: (value: unknown) => void
+  const pendingRequest = new Promise<unknown>((resolve) => {
+    resolveRequest = resolve
+  })
+  vi.mocked(requestChatData).mockReset()
+  vi.mocked(requestChatData).mockReturnValueOnce(pendingRequest as never)
+
+  const pending = runScripted(`
+    same_id_field_owner = async(function(id)
+      LLM(id, {{ role = 'user', content = 'wait' }})
+      setName(id, 'stale-name')
+      setDescription(id, 'stale-description')
+      return {
+        first = setCharacterFirstMessage(id, 'stale-first'),
+        background = setBackgroundEmbedding(id, 'stale-background')
+      }
+    end)
+  `, {
+    char: original.char,
+    chat: original.chat,
+    lowLevelAccess: true,
+    mode: 'same_id_field_owner',
+  })
+  await vi.waitFor(() => expect(requestChatData).toHaveBeenCalledOnce())
+  original.database.characters[0] = replacement.char
+  resolveRequest({ type: 'success', result: 'done' })
+
+  await expect(pending).resolves.toEqual(expect.objectContaining({
+    res: { first: false, background: false },
+  }))
+  expect(original.char.name).toBe('name-before')
+  expect(original.char.desc).toBe('description-before')
+  expect(original.char.firstMessage).toBe('first-before')
+  expect(original.char.backgroundHTML).toBe('background-before')
+  expect(replacement.char.name).toBe('name-before')
+  expect(replacement.char.desc).toBe('description-before')
+  expect(replacement.char.firstMessage).toBe('first-before')
+  expect(replacement.char.backgroundHTML).toBe('background-before')
+  vi.mocked(requestChatData).mockReset()
+})
+
+test('does not fall back to another selection after waiting for the Lua mutex', async () => {
+  const original = operationCharacterFixture('mutex-owner-original')
+  const replacement = operationCharacterFixture('mutex-owner-replacement')
+  original.database.characters.push(replacement.char)
+  installOperationCharacterFixture(original)
+  let resolveRequest!: (value: unknown) => void
+  const pendingRequest = new Promise<unknown>((resolve) => {
+    resolveRequest = resolve
+  })
+  vi.mocked(requestChatData).mockReset()
+  vi.mocked(requestChatData).mockReturnValueOnce(pendingRequest as never)
+  const code = `
+    mutex_owner_calls = 0
+    mutex_field_owner = async(function(id)
+      mutex_owner_calls = mutex_owner_calls + 1
+      if mutex_owner_calls == 1 then
+        LLM(id, {{ role = 'user', content = 'wait' }})
+        return 'holder'
+      end
+      setName(id, 'stale-name')
+      setDescription(id, 'stale-description')
+      setCharacterFirstMessage(id, 'stale-first')
+      setBackgroundEmbedding(id, 'stale-background')
+      return 'writer'
+    end)
+  `
+
+  const holder = runScripted(code, {
+    char: original.char,
+    chat: original.chat,
+    lowLevelAccess: true,
+    mode: 'mutex_field_owner',
+  })
+  await vi.waitFor(() => expect(requestChatData).toHaveBeenCalledOnce())
+  const waiter = runScripted(code, {
+    char: original.char,
+    chat: original.chat,
+    lowLevelAccess: true,
+    mode: 'mutex_field_owner',
+  })
+  original.database.characters = [replacement.char]
+  scriptingSelectionState.index = 0
+  resolveRequest({ type: 'success', result: 'done' })
+
+  await expect(Promise.all([holder, waiter])).resolves.toEqual([
+    expect.objectContaining({ res: 'holder' }),
+    expect.objectContaining({ res: 'writer' }),
+  ])
+  expect(original.char.name).toBe('name-before')
+  expect(original.char.desc).toBe('description-before')
+  expect(original.char.firstMessage).toBe('first-before')
+  expect(original.char.backgroundHTML).toBe('background-before')
+  expect(replacement.char.name).toBe('name-before')
+  expect(replacement.char.desc).toBe('description-before')
+  expect(replacement.char.firstMessage).toBe('first-before')
+  expect(replacement.char.backgroundHTML).toBe('background-before')
   vi.mocked(requestChatData).mockReset()
 })
 
@@ -947,6 +1127,8 @@ test('rejects awaited captured field writes after a concurrent update', async ()
   const pending = runScripted(`
     captured_field_cas = async(function(id)
       LLM(id, {{ role = 'user', content = 'wait' }})
+      setName(id, 'stale-name')
+      setDescription(id, 'stale-description')
       return {
         first = setCharacterFirstMessage(id, 'stale-first'),
         background = setBackgroundEmbedding(id, 'stale-background')
@@ -959,6 +1141,8 @@ test('rejects awaited captured field writes after a concurrent update', async ()
     operationContext,
   })
   await vi.waitFor(() => expect(requestChatData).toHaveBeenCalledOnce())
+  fixture.char.name = 'concurrent-name'
+  fixture.char.desc = 'concurrent-description'
   fixture.char.firstMessage = 'concurrent-first'
   fixture.char.backgroundHTML = 'concurrent-background'
   resolveRequest({ type: 'success', result: 'done' })
@@ -966,6 +1150,8 @@ test('rejects awaited captured field writes after a concurrent update', async ()
   await expect(pending).resolves.toEqual(expect.objectContaining({
     res: { first: false, background: false },
   }))
+  expect(fixture.char.name).toBe('concurrent-name')
+  expect(fixture.char.desc).toBe('concurrent-description')
   expect(fixture.char.firstMessage).toBe('concurrent-first')
   expect(fixture.char.backgroundHTML).toBe('concurrent-background')
   expect(fixture.database.characters[0]).toBe(fixture.char)

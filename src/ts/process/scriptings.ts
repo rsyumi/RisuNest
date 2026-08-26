@@ -40,6 +40,14 @@ let ScriptingLowLevelIds = new Set<string>()
 let lastRequestResetTime = 0
 let lastRequestsCount = 0
 
+type CapturedCharacterField = 'name'|'desc'|'firstMessage'|'backgroundHTML'
+
+interface CapturedCharacterOwner {
+    database: Database
+    character: character|groupChat
+    fields: Record<CapturedCharacterField, string|undefined>
+}
+
 interface BasicScriptingEngineState {
     code?: string;
     mutex: Mutex;
@@ -52,10 +60,7 @@ interface BasicScriptingEngineState {
     operationDatabase?: ReturnType<ConversationOperationContext['createDatabaseView']>
     operationCharacter?: character|groupChat|simpleCharacterArgument
     selectedCharacterId?: string
-    capturedCharacterFields?: {
-        firstMessage: string
-        backgroundHTML: string|undefined
-    }
+    capturedCharacterOwner?: CapturedCharacterOwner
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -95,6 +100,27 @@ export async function runScripted(code:string, arg:{
         throw new Error('Python scripting is unavailable on Tauri mobile')
     }
     const char = arg.char ?? getCurrentCharacter()
+    const selectedCharacterId = arg.operationContext?.characterId ?? char?.chaId
+    const capturedDatabase = DBState.db
+    const capturedCharacter = selectedCharacterId === undefined
+        ? undefined
+        : capturedDatabase.characters?.find(
+            (candidate) => candidate.chaId === selectedCharacterId,
+        )
+    const capturedCharacterOwner: CapturedCharacterOwner|undefined = capturedCharacter
+        ? {
+            database: capturedDatabase,
+            character: capturedCharacter,
+            fields: {
+                name: capturedCharacter.name,
+                desc: capturedCharacter.type === 'group'
+                    ? undefined
+                    : capturedCharacter.desc,
+                firstMessage: capturedCharacter.firstMessage,
+                backgroundHTML: capturedCharacter.backgroundHTML,
+            },
+        }
+        : undefined
     const data = arg.data ?? ''
     const operationDatabase = arg.operationContext?.createDatabaseView(getDatabase())
     const setVar = arg.setVar ?? (arg.operationContext
@@ -134,18 +160,8 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.getVar = getVar
         ScriptingEngineState.operationCharacter = char
         ScriptingEngineState.operationDatabase = operationDatabase
-        ScriptingEngineState.selectedCharacterId = arg.operationContext?.characterId ?? char?.chaId
-        const capturedCharacter = ScriptingEngineState.selectedCharacterId === undefined
-            ? undefined
-            : DBState.db.characters?.find(
-                (candidate) => candidate.chaId === ScriptingEngineState.selectedCharacterId,
-            )
-        ScriptingEngineState.capturedCharacterFields = capturedCharacter
-            ? {
-                firstMessage: capturedCharacter.firstMessage,
-                backgroundHTML: capturedCharacter.backgroundHTML,
-            }
-            : undefined
+        ScriptingEngineState.selectedCharacterId = selectedCharacterId
+        ScriptingEngineState.capturedCharacterOwner = capturedCharacterOwner
         if (code !== ScriptingEngineState.code) {
             try {
             let declareAPI:(name: string, func:Function) => void
@@ -171,10 +187,9 @@ export async function runScripted(code:string, arg:{
                 ScriptingEngineState.operationDatabase ?? getDatabase()
             const getScriptingCharacterIndex = (db: Database) => {
                 if (ScriptingEngineState.selectedCharacterId !== undefined) {
-                    const capturedIndex = db.characters.findIndex(
+                    return db.characters.findIndex(
                         (candidate) => candidate.chaId === ScriptingEngineState.selectedCharacterId,
                     )
-                    if (capturedIndex !== -1) return capturedIndex
                 }
                 return get(selectedCharID)
             }
@@ -183,26 +198,37 @@ export async function runScripted(code:string, arg:{
                 return db.characters[getScriptingCharacterIndex(db)]
             }
             const updateCapturedCharacterField = (
-                field: 'firstMessage'|'backgroundHTML',
+                field: CapturedCharacterField,
                 value: string,
             ) => {
-                const capturedId = ScriptingEngineState.selectedCharacterId
-                const baseline = ScriptingEngineState.capturedCharacterFields
-                if (capturedId === undefined || baseline === undefined) return false
+                const owner = ScriptingEngineState.capturedCharacterOwner
+                if (!owner || DBState.db !== owner.database) return false
 
                 const liveCharacter = DBState.db.characters?.find(
-                    (candidate) => candidate.chaId === capturedId,
+                    (candidate) => candidate.chaId === owner.character.chaId,
                 )
-                if (!liveCharacter || !Object.is(liveCharacter[field], baseline[field])) {
+                if (liveCharacter !== owner.character) return false
+
+                const liveRecord = liveCharacter as unknown as Record<
+                    CapturedCharacterField,
+                    string|undefined
+                >
+                if (!Object.is(liveRecord[field], owner.fields[field])) {
                     return false
                 }
 
-                liveCharacter[field] = value
-                baseline[field] = value
+                liveRecord[field] = value
+                owner.fields[field] = value
                 const projectedCharacter = ScriptingEngineState.operationDatabase
-                    ?.characters.find((candidate) => candidate.chaId === capturedId)
+                    ?.characters.find(
+                        (candidate) => candidate.chaId === owner.character.chaId,
+                    )
                 if (projectedCharacter && projectedCharacter !== liveCharacter) {
-                    projectedCharacter[field] = value
+                    const projectedRecord = projectedCharacter as unknown as Record<
+                        CapturedCharacterField,
+                        string|undefined
+                    >
+                    projectedRecord[field] = value
                 }
                 return true
             }
@@ -779,11 +805,10 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                const selectedChar = getScriptingCharacterIndex(DBState.db)
                 if(typeof name !== 'string'){
                     throw('Invalid data type')
                 }
-                DBState.db.characters[selectedChar].name = name
+                updateCapturedCharacterField('name', name)
             })
 
             declareAPI('getDescription', (id:string) => {
@@ -802,16 +827,13 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                const selectedChar = getScriptingCharacterIndex(DBState.db)
-                const char = DBState.db.characters[selectedChar]
                 if(typeof data !== 'string'){
                     throw('Invalid data type')
                 }
-                if(char.type === 'group'){
+                if(ScriptingEngineState.capturedCharacterOwner?.character.type === 'group'){
                     throw('Character is a group')
                 }
-                char.desc = desc
-                DBState.db.characters[selectedChar] = char
+                updateCapturedCharacterField('desc', desc)
             })
 
             declareAPI('getCharacterFirstMessage', (id:string) => {
