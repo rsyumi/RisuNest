@@ -43,6 +43,8 @@ pub struct TransferCancellation {
     cancelled: Arc<AtomicBool>,
     #[cfg(test)]
     pause_after_hash_read: Arc<Mutex<Option<Arc<Barrier>>>>,
+    #[cfg(test)]
+    pause_after_cas_read: Arc<Mutex<Option<Arc<Barrier>>>>,
 }
 
 impl TransferCancellation {
@@ -66,6 +68,19 @@ impl TransferCancellation {
     #[cfg(test)]
     fn pause_after_hash_read_for_test_if_requested(&self) {
         if let Some(pause) = self.pause_after_hash_read.lock().unwrap().take() {
+            pause.wait();
+            pause.wait();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_cas_read_for_test(&self, pause: Arc<Barrier>) {
+        *self.pause_after_cas_read.lock().unwrap() = Some(pause);
+    }
+
+    #[cfg(test)]
+    fn pause_after_cas_read_for_test_if_requested(&self) {
+        if let Some(pause) = self.pause_after_cas_read.lock().unwrap().take() {
             pause.wait();
             pause.wait();
         }
@@ -123,6 +138,29 @@ struct HttpCloneTransport {
     http: Client,
     ranges: HttpRangeStream,
     bearer: Option<String>,
+}
+
+struct CancellableCasReader<'a, R> {
+    reader: &'a mut R,
+    cancellation: &'a TransferCancellation,
+}
+
+impl<R: Read> Read for CancellableCasReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "peer clone transfer cancelled",
+            ));
+        }
+        let read = self.reader.read(buffer)?;
+        #[cfg(test)]
+        if read > 0 {
+            self.cancellation
+                .pause_after_cas_read_for_test_if_requested();
+        }
+        Ok(read)
+    }
 }
 
 impl HttpCloneTransport {
@@ -301,6 +339,7 @@ impl LoopbackCloneClient {
                 continue;
             }
             if !self.verify_local_object(hash, object.size, Some(cancellation))? {
+                self.discard_local_object(hash)?;
                 self.record_object_progress(hash, 0, false)?;
                 all_verified = false;
             }
@@ -468,6 +507,7 @@ impl LoopbackCloneClient {
             self.report_verified_progress(manifest, Some(object_hash))?;
             return Ok(());
         }
+        self.discard_local_object(object_hash)?;
         if current.verified {
             self.record_object_progress(object_hash, 0, false)?;
         }
@@ -579,10 +619,17 @@ impl LoopbackCloneClient {
         }
         file.seek(SeekFrom::Start(0))?;
         let cas = PayloadCas::new(&self.root)?;
-        let prepared = cas.prepare_reader(&mut file)?;
-        if cancellation.is_cancelled() {
-            return Err(PeerSyncError::Cancelled);
-        }
+        let mut reader = CancellableCasReader {
+            reader: &mut file,
+            cancellation,
+        };
+        let prepared = cas.prepare_reader(&mut reader).map_err(|error| {
+            if cancellation.is_cancelled() {
+                PeerSyncError::Cancelled
+            } else {
+                error.into()
+            }
+        })?;
         if prepared.content_hash != object_hash || prepared.byte_size != descriptor.size {
             return Err(PeerSyncError::WholeObjectHashMismatch {
                 object: object_hash.to_owned(),
@@ -716,6 +763,10 @@ impl LoopbackCloneClient {
             .join("objects")
             .join(&object_hash[..2])
             .join(&object_hash[2..])
+    }
+
+    fn discard_local_object(&self, object_hash: &str) -> Result<(), PeerSyncError> {
+        remove_file_if_exists(&self.object_path(object_hash))
     }
 
     fn record_object_progress(

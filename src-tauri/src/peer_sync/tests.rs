@@ -1649,6 +1649,24 @@ fn cancels_local_verification_and_reconciles_corrupt_verified_progress() {
     assert!(verified_after < total_bytes);
 
     let requests_before = host.total_range_requests(&hash);
+    let cancellation = TransferCancellation::new();
+    let cas_pause = Arc::new(Barrier::new(2));
+    cancellation.pause_after_cas_read_for_test(Arc::clone(&cas_pause));
+    let worker_cancellation = cancellation.clone();
+    let promotion = thread::spawn(move || {
+        let result = client.download(&worker_cancellation);
+        (client, result)
+    });
+    cas_pause.wait();
+    cancellation.cancel();
+    cas_pause.wait();
+    let (mut client, result) = promotion.join().unwrap();
+    assert_eq!(result.unwrap_err(), PeerSyncError::Cancelled);
+    assert!(fs::read_dir(client_root.path().join("assets-v2/staging"))
+        .unwrap()
+        .next()
+        .is_none());
+
     client.download(&TransferCancellation::new()).unwrap();
     assert!(host.total_range_requests(&hash) > requests_before);
     assert_eq!(
