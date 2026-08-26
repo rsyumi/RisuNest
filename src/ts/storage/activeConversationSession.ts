@@ -1,8 +1,17 @@
 import type { Chat, Message } from './database.svelte'
 import { CONVERSATION_RANGE_MAX_LIMIT, type DataRevision } from './persistentDataStore'
 import { safeStructuredClone } from '../polyfill'
+import {
+    SegmentedConversationResidency,
+    type ConversationDirtyMutation,
+    type ConversationPersistenceAttempt,
+    type ConversationRangePin,
+    type ConversationResidentInterval,
+} from './segmentedConversationResidency'
 
 export type ActiveConversationPinReason =
+    | 'viewport'
+    | 'editor'
     | 'dirty'
     | 'pending-save'
     | 'streaming'
@@ -141,7 +150,29 @@ export interface ActiveConversationSessionOptions {
     conversationId: string
     conversation: Chat | null
     storeRevision: DataRevision
+    maxResidentBytes?: number
+    measureMessage?(message: Message): number
     onMutation?(event: ActiveConversationMutationEvent): void
+}
+
+export class ActiveConversationCompatibilitySnapshot {
+    private disposed = false
+
+    constructor(
+        readonly messages: Message[],
+        private readonly onDispose: () => void,
+    ) {}
+
+    get residentMessageCount(): number {
+        return this.messages.length
+    }
+
+    dispose(): void {
+        if (this.disposed) return
+        this.disposed = true
+        this.messages.splice(0)
+        this.onDispose()
+    }
 }
 
 interface MessageLocatorIdentity {
@@ -355,6 +386,10 @@ function validateCount(value: number): void {
             `Conversation range limit cannot exceed ${CONVERSATION_RANGE_MAX_LIMIT}`,
         )
     }
+}
+
+function estimateMessageBytes(message: Message): number {
+    return JSON.stringify(message).length * 2
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -968,13 +1003,17 @@ export class ActiveConversationSession {
 
     private readonly conversation: Chat
     private readonly onMutation?: (event: ActiveConversationMutationEvent) => void
+    private readonly residency: SegmentedConversationResidency
+    private readonly residentReadsEnabled: boolean
     private readonly pins = new Map<ActiveConversationPinReason, number>()
+    private readonly residencyRangePins = new Map<ActiveConversationPinReason, number>()
     private locatorRegistry = new ConversationLocatorRegistry()
     private sessionVersion = 0
     private persistedSessionVersion = 0
     private currentStoreRevision: DataRevision
     private transactionActive = false
     private active = true
+    private compatibilityFallback = false
 
     constructor(options: ActiveConversationSessionOptions) {
         if (!options.conversation) {
@@ -985,6 +1024,13 @@ export class ActiveConversationSession {
         this.conversation = options.conversation
         this.currentStoreRevision = options.storeRevision
         this.onMutation = options.onMutation
+        this.residentReadsEnabled = options.maxResidentBytes !== undefined
+        this.residency = new SegmentedConversationResidency({
+            revision: options.storeRevision,
+            totalMessages: options.conversation.message.length,
+            maxResidentBytes: options.maxResidentBytes ?? 0,
+            measureMessage: options.measureMessage ?? estimateMessageBytes,
+        })
     }
 
     get storeRevision(): DataRevision {
@@ -1006,6 +1052,25 @@ export class ActiveConversationSession {
     get totalMessages(): number {
         this.assertActive()
         return this.conversation.message.length
+    }
+
+    get residentBytes(): number {
+        this.assertActive()
+        return this.compatibilityFallback ? 0 : this.residency.residentBytes
+    }
+
+    get residentIntervals(): ConversationResidentInterval[] {
+        this.assertActive()
+        return this.compatibilityFallback ? [] : this.residency.residentIntervals
+    }
+
+    get pendingMutations(): ConversationDirtyMutation[] {
+        this.assertActive()
+        return this.compatibilityFallback ? [] : this.residency.pendingMutations
+    }
+
+    get residencyFallbackActive(): boolean {
+        return this.compatibilityFallback
     }
 
     get activePinReasons(): ActiveConversationPinReason[] {
@@ -1120,7 +1185,7 @@ export class ActiveConversationSession {
 
     readRange(startIndex: number, limit: number): ActiveConversationWindow {
         this.assertActive()
-        return readRange(
+        const window = readRange(
             this.characterId,
             this.conversationId,
             this.conversation.message,
@@ -1130,6 +1195,8 @@ export class ActiveConversationSession {
             startIndex,
             limit,
         )
+        this.populateResidentRange(window.startIndex, window.endIndex)
+        return window
     }
 
     scanBackward(
@@ -1140,6 +1207,8 @@ export class ActiveConversationSession {
         validateIndex(startIndexExclusive, 'Backward scan startIndex')
         validateCount(limit)
         const start = Math.min(this.totalMessages, startIndexExclusive)
+        const rangeStart = Math.max(0, start - limit)
+        this.populateResidentRange(rangeStart, start)
         const entries: BackwardConversationEntry[] = []
         for (let absoluteIndex = start - 1; absoluteIndex >= 0 && entries.length < limit; absoluteIndex--) {
             entries.push({
@@ -1536,6 +1605,49 @@ export class ActiveConversationSession {
 
     acquirePin(reason: ActiveConversationPinReason): ActiveConversationPin {
         this.assertActive()
+        if (this.totalMessages > 0) {
+            return this.acquireRangePin(0, this.totalMessages, reason)
+        }
+        return this.trackPin(reason)
+    }
+
+    acquireRangePin(
+        startIndex: number,
+        endIndex: number,
+        reason: ActiveConversationPinReason,
+    ): ActiveConversationPin {
+        this.assertActive()
+        validateIndex(startIndex, 'Conversation pin startIndex')
+        validateIndex(endIndex, 'Conversation pin endIndex')
+        if (endIndex <= startIndex) {
+            throw new RangeError('Conversation pin range must not be empty')
+        }
+        if (endIndex > this.totalMessages) {
+            throw new RangeError('Conversation pin range exceeds the current message count')
+        }
+        if (this.compatibilityFallback) return this.trackPin(reason)
+        const residencyPin = this.residency.pinRange(startIndex, endIndex, reason)
+        this.residencyRangePins.set(
+            reason,
+            (this.residencyRangePins.get(reason) ?? 0) + 1,
+        )
+        const tracked = this.trackPin(reason)
+        let released = false
+        return {
+            reason,
+            release: () => {
+                if (released) return
+                released = true
+                residencyPin.release()
+                const rangeCount = this.residencyRangePins.get(reason) ?? 0
+                if (rangeCount <= 1) this.residencyRangePins.delete(reason)
+                else this.residencyRangePins.set(reason, rangeCount - 1)
+                tracked.release()
+            },
+        }
+    }
+
+    private trackPin(reason: ActiveConversationPinReason): ActiveConversationPin {
         this.pins.set(reason, (this.pins.get(reason) ?? 0) + 1)
         let released = false
         return {
@@ -1551,11 +1663,77 @@ export class ActiveConversationSession {
     }
 
     pinCount(reason: ActiveConversationPinReason): number {
-        return this.pins.get(reason) ?? 0
+        const explicit = this.pins.get(reason) ?? 0
+        if (this.compatibilityFallback) return explicit
+        const residencyExplicit = this.residencyRangePins.get(reason) ?? 0
+        const automatic = Math.max(
+            0,
+            this.residency.pinCount(reason) - residencyExplicit,
+        )
+        return explicit + automatic
     }
 
     ownsSessionToken(sessionToken: ConversationSessionToken): boolean {
         return this.active && sessionToken === this.locatorRegistry.sessionToken
+    }
+
+    beginPersistence(sessionVersion: number): ConversationPersistenceAttempt {
+        this.assertActive()
+        if (this.compatibilityFallback) {
+            validateIndex(sessionVersion, 'Conversation persistence session version')
+            if (sessionVersion <= this.persistedSessionVersion) {
+                throw new RangeError('Conversation persistence version is already acknowledged')
+            }
+            if (sessionVersion > this.sessionVersion) {
+                throw new RangeError('Conversation persistence version exceeds the current session version')
+            }
+            const pin = this.trackPin('pending-save')
+            let released = false
+            return {
+                sessionVersion,
+                acknowledge: (revision) => {
+                    if (released) return
+                    try {
+                        this.acknowledgePersisted(
+                            this.locatorRegistry.sessionToken,
+                            sessionVersion,
+                            revision,
+                        )
+                    } finally {
+                        released = true
+                        pin.release()
+                    }
+                },
+                release: () => {
+                    if (released) return
+                    released = true
+                    pin.release()
+                },
+            }
+        }
+        const attempt = this.residency.beginPersistence(sessionVersion)
+        let released = false
+        return {
+            sessionVersion,
+            acknowledge: (revision) => {
+                if (released) return
+                try {
+                    this.acknowledgePersisted(
+                        this.locatorRegistry.sessionToken,
+                        sessionVersion,
+                        revision,
+                    )
+                } finally {
+                    released = true
+                    attempt.release()
+                }
+            },
+            release: () => {
+                if (released) return
+                released = true
+                attempt.release()
+            },
+        }
     }
 
     acknowledgePersisted(
@@ -1579,9 +1757,31 @@ export class ActiveConversationSession {
         ) {
             throw new RangeError('Conversation persisted data revision did not advance')
         }
+        if (!this.compatibilityFallback) {
+            try {
+                this.residency.acknowledgePersisted(sessionVersion, revision)
+            } catch {
+                this.compatibilityFallback = true
+            }
+        }
         this.persistedSessionVersion = sessionVersion
         this.currentStoreRevision = revision
         return true
+    }
+
+    materializeCompatibilitySnapshot(): ActiveConversationCompatibilitySnapshot {
+        this.assertActive()
+        const pin = this.acquirePin('compatibility')
+        try {
+            this.populateAllResidentMessages()
+            return new ActiveConversationCompatibilitySnapshot(
+                safeStructuredClone(this.conversation.message),
+                () => pin.release(),
+            )
+        } catch (error) {
+            pin.release()
+            throw error
+        }
     }
 
     materializeCompatibilityArray(): Message[] {
@@ -1593,7 +1793,57 @@ export class ActiveConversationSession {
         if (!this.active) return
         this.active = false
         this.pins.clear()
+        this.residencyRangePins.clear()
         this.locatorRegistry.clear()
+    }
+
+    private populateResidentRange(startIndex: number, endIndex: number): void {
+        if (
+            this.compatibilityFallback ||
+            !this.residentReadsEnabled ||
+            endIndex <= startIndex
+        ) return
+        let pin: ConversationRangePin
+        try {
+            pin = this.residency.pinRange(startIndex, endIndex, 'background')
+        } catch {
+            this.compatibilityFallback = true
+            return
+        }
+        try {
+            const missing = this.residency.missingPersistentRanges(
+                startIndex,
+                endIndex - startIndex,
+            )
+            for (const range of missing) {
+                this.residency.storeRange({
+                    revision: range.revision,
+                    startIndex: range.persistentStartIndex,
+                    totalMessages: this.residency.persistentTotalMessages,
+                    messages: this.conversation.message.slice(
+                        range.currentStartIndex,
+                        range.currentEndIndex,
+                    ),
+                })
+            }
+        } catch {
+            this.compatibilityFallback = true
+        } finally {
+            pin.release()
+        }
+    }
+
+    private populateAllResidentMessages(): void {
+        for (
+            let startIndex = 0;
+            startIndex < this.totalMessages;
+            startIndex += CONVERSATION_RANGE_MAX_LIMIT
+        ) {
+            this.populateResidentRange(
+                startIndex,
+                Math.min(this.totalMessages, startIndex + CONVERSATION_RANGE_MAX_LIMIT),
+            )
+        }
     }
 
     private assertActive(): void {
@@ -1605,7 +1855,7 @@ export class ActiveConversationSession {
         commands: readonly ActiveConversationCommandName[],
         mutations: readonly ActiveConversationMutationRange[] = [],
     ): void {
-        this.onMutation?.({
+        const event: ActiveConversationMutationEvent = {
             characterId: this.characterId,
             conversationId: this.conversationId,
             sessionToken: this.locatorRegistry.sessionToken,
@@ -1614,7 +1864,37 @@ export class ActiveConversationSession {
             commands: [...commands],
             mutations: safeStructuredClone(mutations),
             conversation: cloneConversationMetadata(this.conversation),
-        })
+        }
+        if (!this.compatibilityFallback && !this.canApplyResidentMutations(event.mutations)) {
+            this.compatibilityFallback = true
+        }
+        this.onMutation?.(event)
+        if (!this.compatibilityFallback) {
+            try {
+                for (const mutation of event.mutations) {
+                    this.residency.recordReplaceRange(mutation)
+                }
+            } catch {
+                this.compatibilityFallback = true
+            }
+        }
+    }
+
+    private canApplyResidentMutations(
+        mutations: readonly ActiveConversationMutationRange[],
+    ): boolean {
+        let messageCount = this.residency.totalMessages
+        let version = this.residency.sessionVersion
+        for (const mutation of mutations) {
+            if (
+                mutation.sessionVersion !== version + 1 ||
+                mutation.start > messageCount ||
+                mutation.deleteCount > messageCount - mutation.start
+            ) return false
+            messageCount += mutation.messages.length - mutation.deleteCount
+            version = mutation.sessionVersion
+        }
+        return messageCount === this.conversation.message.length
     }
 }
 

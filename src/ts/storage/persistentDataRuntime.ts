@@ -469,6 +469,8 @@ export function createPersistentDataRuntime(
         clock: dependencies.clock,
         now: dependencies.now,
         onLocalRevision: dependencies.onLocalRevision,
+        onConversationMutationPersistenceStarted: (event) =>
+            workingSet.beginConversationMutationPersistence(event),
         onConversationMutationPersisted: (event) => {
             workingSet.acknowledgeConversationMutationPersisted(event)
         },

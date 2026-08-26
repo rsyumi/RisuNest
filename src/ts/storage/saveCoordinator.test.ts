@@ -3073,6 +3073,8 @@ describe('SaveCoordinator', () => {
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: (event) =>
+                session.beginPersistence(event.sessionVersion),
             onConversationMutationPersisted: (event) => {
                 session.acknowledgePersisted(
                     event.sessionToken,
@@ -3087,6 +3089,8 @@ describe('SaveCoordinator', () => {
             conversationId: 'two',
             conversation: database.characters[0].chats[1],
             storeRevision: 2,
+            maxResidentBytes: 0,
+            measureMessage: () => 1,
             onMutation: (event) => coordinator.recordActiveConversationMutation(event),
         })
 
@@ -3199,6 +3203,8 @@ describe('SaveCoordinator', () => {
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: (event) =>
+                session.beginPersistence(event.sessionVersion),
             onConversationMutationPersisted: (event) => {
                 session.acknowledgePersisted(
                     event.sessionToken,
@@ -3213,6 +3219,8 @@ describe('SaveCoordinator', () => {
             conversationId: 'two',
             conversation: database.characters[0].chats[1],
             storeRevision: 2,
+            maxResidentBytes: 0,
+            measureMessage: () => 1,
             onMutation: (event) => coordinator.recordActiveConversationMutation(event),
         })
 
@@ -3221,6 +3229,9 @@ describe('SaveCoordinator', () => {
             'range write failed',
         )
         expect(session.persistedVersion).toBe(0)
+        expect(session.pinCount('pending-save')).toBe(0)
+        expect(session.pinCount('dirty')).toBe(1)
+        expect(session.residentBytes).toBe(1)
         expect(coordinator.pendingBytes).toBeGreaterThanOrEqual(0)
 
         await coordinator.flushPendingData('retry-attempt')
@@ -3231,6 +3242,61 @@ describe('SaveCoordinator', () => {
         )
         expect(session.persistedVersion).toBe(1)
         expect(session.storeRevision).toBe(3)
+        expect(session.pinCount('pending-save')).toBe(0)
+        expect(session.pinCount('dirty')).toBe(0)
+        expect(session.residentBytes).toBe(0)
+    })
+
+    it('pins only covered session commands while their store commit is in flight', async () => {
+        const database = makeChattyDatabase()
+        let finishCommit!: () => void
+        const commitGate = new Promise<void>((resolve) => {
+            finishCommit = resolve
+        })
+        const commit = vi.fn(async ({ expectedRevision }) => {
+            await commitGate
+            return { revision: expectedRevision + 1 }
+        })
+        let session!: ActiveConversationSession
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: (event) =>
+                session.beginPersistence(event.sessionVersion),
+            onConversationMutationPersisted: (event) => {
+                session.acknowledgePersisted(
+                    event.sessionToken,
+                    event.sessionVersion,
+                    event.revision,
+                )
+            },
+        })
+        coordinator.initialize(2)
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation: database.characters[0].chats[1],
+            storeRevision: 2,
+            maxResidentBytes: 0,
+            measureMessage: () => 1,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+
+        session.append({ role: 'user', data: 'pending exact range' })
+        const flushing = coordinator.flushPendingData('pending-save-pin')
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+
+        expect(session.pinCount('dirty')).toBe(1)
+        expect(session.pinCount('pending-save')).toBe(1)
+
+        finishCommit()
+        await flushing
+
+        expect(session.pinCount('dirty')).toBe(0)
+        expect(session.pinCount('pending-save')).toBe(0)
+        expect(session.persistedVersion).toBe(1)
     })
 
     it('keeps strict replacement evidence across a session-token rollover before flush', async () => {
@@ -3319,11 +3385,13 @@ describe('SaveCoordinator', () => {
         const database = makeChattyDatabase()
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
         const onPersisted = vi.fn()
+        const onPersistenceStarted = vi.fn(() => null)
         const coordinator = new SaveCoordinator({
             store: makeStore(commit),
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: onPersistenceStarted,
             onConversationMutationPersisted: onPersisted,
         })
         coordinator.initialize(2)
@@ -3347,6 +3415,7 @@ describe('SaveCoordinator', () => {
                 conversationId: 'one',
             }),
         ])
+        expect(onPersistenceStarted).not.toHaveBeenCalled()
         expect(onPersisted).not.toHaveBeenCalled()
     })
 
@@ -3355,6 +3424,7 @@ describe('SaveCoordinator', () => {
         const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
         let coveredSession!: ActiveConversationSession
         let uncoveredSession!: ActiveConversationSession
+        const onPersistenceStarted = vi.fn(() => null)
         const onPersisted = vi.fn((event) => {
             if (coveredSession.ownsSessionToken(event.sessionToken)) {
                 coveredSession.acknowledgePersisted(
@@ -3375,6 +3445,7 @@ describe('SaveCoordinator', () => {
             captureRoot: () => captureRoot(database),
             captureSelectedCharacter: () => database.characters[0],
             replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: onPersistenceStarted,
             onConversationMutationPersisted: onPersisted,
         })
         coordinator.initialize(2)
@@ -3412,6 +3483,11 @@ describe('SaveCoordinator', () => {
             ],
         })
         expect(onPersisted).toHaveBeenCalledOnce()
+        expect(onPersistenceStarted).toHaveBeenCalledOnce()
+        expect(onPersistenceStarted).toHaveBeenCalledWith(expect.objectContaining({
+            sessionToken: coveredSession.locate(2).sessionToken,
+            sessionVersion: 1,
+        }))
         expect(onPersisted).toHaveBeenCalledWith(expect.objectContaining({
             sessionToken: coveredSession.locate(2).sessionToken,
             sessionVersion: 1,

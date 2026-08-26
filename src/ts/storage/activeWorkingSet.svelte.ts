@@ -88,6 +88,18 @@ export class ActiveWorkingSet {
         return this.activeSession
     }
 
+    beginConversationMutationPersistence(event: ActiveConversationMutationEvent) {
+        const session = this.activeSession
+        if (
+            !session ||
+            !session.isActive ||
+            session.characterId !== event.characterId ||
+            session.conversationId !== event.conversationId ||
+            !session.ownsSessionToken(event.sessionToken)
+        ) return null
+        return session.beginPersistence(event.sessionVersion)
+    }
+
     acknowledgeConversationMutationPersisted(
         event: PersistedConversationMutationEvent,
     ): boolean {

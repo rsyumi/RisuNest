@@ -123,12 +123,15 @@ export class ConversationOperationContext {
         this.mode = pinReason === 'transaction' ? 'prefetched' : 'compatibility'
         this.pin = session.acquirePin(pinReason)
 
+        const compatibilitySnapshot = this.mode === 'compatibility'
+            ? session.materializeCompatibilitySnapshot()
+            : null
         try {
             const messages = totalMessages === 0
                 ? []
                 : this.mode === 'prefetched'
                     ? session.readRange(0, totalMessages).messages
-                    : safeStructuredClone(session.materializeCompatibilityArray())
+                    : safeStructuredClone(compatibilitySnapshot!.messages)
             if (session.version !== this.baseVersion) {
                 throw new ConversationSessionStaleError(this.baseVersion, session.version)
             }
@@ -142,6 +145,8 @@ export class ConversationOperationContext {
             this.pin.release()
             this.released = true
             throw error
+        } finally {
+            compatibilitySnapshot?.dispose()
         }
     }
 

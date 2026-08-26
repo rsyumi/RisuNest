@@ -915,4 +915,201 @@ describe('ActiveConversationSession', () => {
         secondDirty.release()
         expect(session.activePinReasons).toEqual(reasons.slice(1))
     })
+
+    it('bounds detached absolute interval residency and evicts least-recent unpinned ranges', () => {
+        const messages = Array.from(
+            { length: 10 },
+            (_, index) => message(`message-${index}`, `message-${index}`),
+        )
+        const conversation = chat(messages)
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            maxResidentBytes: 2,
+            measureMessage: () => 1,
+        })
+
+        expect(session.readRange(0, 2).messages).toEqual(messages.slice(0, 2))
+        expect(session.residentIntervals).toMatchObject([{
+            startIndex: 0,
+            endIndex: 2,
+            byteSize: 2,
+        }])
+
+        expect(session.readRange(8, 2).messages).toEqual(messages.slice(8))
+        expect(session.residentBytes).toBe(2)
+        expect(session.residentIntervals).toMatchObject([{
+            startIndex: 8,
+            endIndex: 10,
+            byteSize: 2,
+        }])
+    })
+
+    it('keeps counted absolute range pins resident until their idempotent release', () => {
+        const messages = Array.from(
+            { length: 5 },
+            (_, index) => message(`message-${index}`, `message-${index}`),
+        )
+        const conversation = chat(messages)
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            maxResidentBytes: 1,
+            measureMessage: () => 1,
+        })
+        const first = session.acquireRangePin(0, 1, 'viewport')
+        const second = session.acquireRangePin(0, 1, 'viewport')
+
+        session.readRange(0, 1)
+        session.readRange(4, 1)
+
+        expect(session.pinCount('viewport')).toBe(2)
+        expect(session.residentIntervals).toMatchObject([{
+            startIndex: 0,
+            endIndex: 1,
+        }])
+
+        first.release()
+        first.release()
+        expect(session.pinCount('viewport')).toBe(1)
+        second.release()
+        expect(session.pinCount('viewport')).toBe(0)
+
+        session.readRange(4, 1)
+        expect(session.residentIntervals).toMatchObject([{
+            startIndex: 4,
+            endIndex: 5,
+        }])
+    })
+
+    it('retains dirty and pending-save payloads across failure until exact acknowledgement', () => {
+        const conversation = chat([])
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            maxResidentBytes: 0,
+            measureMessage: () => 1,
+        })
+
+        session.append(message('dirty', 'dirty'))
+        const failed = session.beginPersistence(1)
+
+        expect(session.pinCount('dirty')).toBe(1)
+        expect(session.pinCount('pending-save')).toBe(1)
+        expect(session.residentBytes).toBe(1)
+
+        failed.release()
+        expect(session.pinCount('pending-save')).toBe(0)
+        expect(session.pinCount('dirty')).toBe(1)
+        expect(session.residentBytes).toBe(1)
+
+        const retry = session.beginPersistence(1)
+        retry.acknowledge(8)
+        retry.acknowledge(8)
+
+        expect(session.storeRevision).toBe(8)
+        expect(session.persistedVersion).toBe(1)
+        expect(session.pinCount('dirty')).toBe(0)
+        expect(session.pinCount('pending-save')).toBe(0)
+        expect(session.residentBytes).toBe(0)
+    })
+
+    it('accepts ordered session acknowledgements covered by one store revision', () => {
+        const { session } = createSession(chat([]))
+        const first = session.append(message('first', 'first'))
+        session.edit(first, message('first', 'edited'))
+        const sessionToken = first.sessionToken
+
+        expect(session.acknowledgePersisted(sessionToken, 1, 8)).toBe(true)
+        expect(() => session.acknowledgePersisted(sessionToken, 2, 8)).not.toThrow()
+        expect(session.persistedVersion).toBe(2)
+        expect(session.storeRevision).toBe(8)
+        expect(session.pendingMutations).toEqual([])
+    })
+
+    it('falls back to the complete owner when an untracked structural mutation precedes a command', () => {
+        const { conversation, onMutation, session } = createSession(chat([
+            message('first', 'first'),
+        ]))
+        conversation.message.push(message('legacy', 'legacy direct append'))
+
+        expect(() => session.append(message('session', 'session append'))).not.toThrow()
+
+        expect(conversation.message.map((entry) => entry.data)).toEqual([
+            'first',
+            'legacy direct append',
+            'session append',
+        ])
+        expect(onMutation).toHaveBeenCalledOnce()
+        expect(session.residencyFallbackActive).toBe(true)
+        const event = onMutation.mock.calls[0][0]
+        expect(session.acknowledgePersisted(event.sessionToken, 1, 8)).toBe(true)
+        expect(session.persistedVersion).toBe(1)
+        expect(session.materializeCompatibilityArray()).toBe(conversation.message)
+        expect(session.evictionEnabled).toBe(false)
+    })
+
+    it('preserves complete reads when resident measurement rejects a cache entry', () => {
+        const conversation = chat([message('first', 'first')])
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            maxResidentBytes: 1,
+            measureMessage: () => -1,
+        })
+
+        expect(() => session.readRange(0, 1)).not.toThrow()
+        expect(session.readRange(0, 1).messages).toEqual(conversation.message)
+        expect(session.residencyFallbackActive).toBe(true)
+        expect(session.residentIntervals).toEqual([])
+        expect(session.materializeCompatibilityArray()).toBe(conversation.message)
+    })
+
+    it('materializes a detached complete compatibility snapshot and releases it to budget', () => {
+        const messages = Array.from(
+            { length: 10 },
+            (_, index) => message(`message-${index}`, `message-${index}`),
+        )
+        const conversation = chat(messages)
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            maxResidentBytes: 2,
+            measureMessage: () => 1,
+        })
+        session.readLatest(2)
+
+        const snapshot = session.materializeCompatibilitySnapshot()
+
+        expect(snapshot.messages).toEqual(messages)
+        expect(snapshot.messages).not.toBe(conversation.message)
+        expect(snapshot.residentMessageCount).toBe(10)
+        expect(session.pinCount('compatibility')).toBe(1)
+        expect(session.residentBytes).toBe(10)
+
+        snapshot.messages[0].data = 'detached mutation'
+        expect(conversation.message[0].data).toBe('message-0')
+
+        snapshot.dispose()
+        snapshot.dispose()
+
+        expect(snapshot.residentMessageCount).toBe(0)
+        expect(session.pinCount('compatibility')).toBe(0)
+        expect(session.residentBytes).toBe(2)
+        expect(session.residentIntervals).toHaveLength(1)
+        expect(session.residentIntervals[0].endIndex -
+            session.residentIntervals[0].startIndex).toBe(2)
+        expect(session.evictionEnabled).toBe(false)
+        expect(session.materializeCompatibilityArray()).toBe(conversation.message)
+    })
 })

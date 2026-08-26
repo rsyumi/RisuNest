@@ -1070,6 +1070,9 @@ describe('ActiveWorkingSet', () => {
             }),
         )
         const mutation = coordinator.recordActiveConversationMutation.mock.calls[0][0]
+        const persistence = workingSet.beginConversationMutationPersistence(mutation)
+        expect(persistence).not.toBeNull()
+        expect(session.pinCount('pending-save')).toBe(1)
         expect(workingSet.acknowledgeConversationMutationPersisted({
             characterId: 'char-a',
             conversationId: 'chat-b',
@@ -1077,6 +1080,8 @@ describe('ActiveWorkingSet', () => {
             sessionVersion: 1,
             revision: 2,
         })).toBe(true)
+        persistence!.release()
+        expect(session.pinCount('pending-save')).toBe(0)
         expect(session.persistedVersion).toBe(1)
         const edited = session.edit(appended, {
             role: 'char',

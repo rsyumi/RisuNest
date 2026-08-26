@@ -63,6 +63,9 @@ export interface SaveCoordinatorDependencies {
     clock?: SaveCoordinatorClock
     now?(): number
     onLocalRevision?(revision: DataRevision): void
+    onConversationMutationPersistenceStarted?(
+        event: ActiveConversationMutationEvent,
+    ): ConversationMutationPersistenceHandle | null | undefined
     onConversationMutationPersisted?(event: PersistedConversationMutationEvent): void
     onFlushPromise?(promise: Promise<void> | null): void
     onBackgroundError?(error: unknown): void
@@ -112,6 +115,10 @@ interface PendingResidentCompensation {
 
 interface PendingConversationMutation {
     event: ActiveConversationMutationEvent
+}
+
+export interface ConversationMutationPersistenceHandle {
+    release(): void
 }
 
 interface ConversationMutationProjection {
@@ -1950,35 +1957,6 @@ export class SaveCoordinator {
                 commit.addCharacter ||
                 commit.conversations
             ) {
-                const committed = await this.dependencies.store.commit(commit)
-                this.currentRevision = committed.revision
-                if (commit.root) this.rootBaseline = captured.rootCanonical
-                if (commit.pluginStorage) {
-                    this.pluginStorageBaseline = captured.pluginStorageCanonical
-                }
-                if (commit.replacePresets) this.presetsBaseline = captured.presetsCanonical
-                if (commit.replaceCharacter && !replacementIsAddition) {
-                    if (detached && captured.character) {
-                        this.characterBaseline = detached.canonical
-                        this.characterBaselineId = detached.character.chaId
-                    } else {
-                        this.setCharacterBaseline(captured)
-                    }
-                    if (
-                        addition &&
-                        commit.replaceCharacter.chaId === addition.pending.characterId
-                    ) {
-                        addition.pending.baseline = detached
-                            ? detached.canonical
-                            : captured.characterCanonical!
-                    }
-                }
-                if (commit.conversations && captured.character) {
-                    this.setCharacterBaseline(captured)
-                    if (addition && captured.character.chaId === addition.pending.characterId) {
-                        addition.pending.baseline = captured.characterCanonical!
-                    }
-                }
                 const committedConversationKeys = new Set(
                     (commit.conversations ?? []).map(
                         (mutation) => `${mutation.characterId}\u0000${mutation.conversationId}`,
@@ -1992,23 +1970,72 @@ export class SaveCoordinator {
                             `${event.characterId}\u0000${event.conversationId}`,
                         ),
                     ) ?? []
-                if (persistedConversationMutations.length > 0) {
-                    this.acknowledgeConversationMutations(
-                        persistedConversationMutations,
-                        committed.revision,
-                    )
+                const persistenceHandles: ConversationMutationPersistenceHandle[] = []
+                for (const { event } of persistedConversationMutations) {
+                    try {
+                        const handle =
+                            this.dependencies.onConversationMutationPersistenceStarted?.(event)
+                        if (handle) persistenceHandles.push(handle)
+                    } catch (error) {
+                        this.reportBackgroundError(error)
+                    }
                 }
-                if (replacementIsAddition && addition) {
-                    addition.pending.baseline = addition.canonical
-                }
-                if (commit.addCharacter && addition) {
-                    addition.pending.locallyAdded = true
-                    addition.pending.baseline = addition.canonical
-                }
-                this.dependencies.onLocalRevision?.(committed.revision)
-                if (this.dependencies.officialPublisher) {
-                    if (publishOfficial) await this.stagePublication(committed.revision)
-                    else this.deferPublication(committed.revision)
+                try {
+                    const committed = await this.dependencies.store.commit(commit)
+                    this.currentRevision = committed.revision
+                    if (commit.root) this.rootBaseline = captured.rootCanonical
+                    if (commit.pluginStorage) {
+                        this.pluginStorageBaseline = captured.pluginStorageCanonical
+                    }
+                    if (commit.replacePresets) this.presetsBaseline = captured.presetsCanonical
+                    if (commit.replaceCharacter && !replacementIsAddition) {
+                        if (detached && captured.character) {
+                            this.characterBaseline = detached.canonical
+                            this.characterBaselineId = detached.character.chaId
+                        } else {
+                            this.setCharacterBaseline(captured)
+                        }
+                        if (
+                            addition &&
+                            commit.replaceCharacter.chaId === addition.pending.characterId
+                        ) {
+                            addition.pending.baseline = detached
+                                ? detached.canonical
+                                : captured.characterCanonical!
+                        }
+                    }
+                    if (commit.conversations && captured.character) {
+                        this.setCharacterBaseline(captured)
+                        if (addition && captured.character.chaId === addition.pending.characterId) {
+                            addition.pending.baseline = captured.characterCanonical!
+                        }
+                    }
+                    if (persistedConversationMutations.length > 0) {
+                        this.acknowledgeConversationMutations(
+                            persistedConversationMutations,
+                            committed.revision,
+                        )
+                    }
+                    if (replacementIsAddition && addition) {
+                        addition.pending.baseline = addition.canonical
+                    }
+                    if (commit.addCharacter && addition) {
+                        addition.pending.locallyAdded = true
+                        addition.pending.baseline = addition.canonical
+                    }
+                    this.dependencies.onLocalRevision?.(committed.revision)
+                    if (this.dependencies.officialPublisher) {
+                        if (publishOfficial) await this.stagePublication(committed.revision)
+                        else this.deferPublication(committed.revision)
+                    }
+                } finally {
+                    for (const handle of persistenceHandles) {
+                        try {
+                            handle.release()
+                        } catch (error) {
+                            this.reportBackgroundError(error)
+                        }
+                    }
                 }
             }
 

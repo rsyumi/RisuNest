@@ -554,8 +554,11 @@ export class SegmentedConversationResidency {
         if (sessionVersion > this.currentSessionVersion) {
             throw new RangeError('Conversation persisted version exceeds the current session version')
         }
-        if (revision <= this.baseRevision) {
-            throw new RangeError('Conversation persisted data revision must advance')
+        if (
+            revision < this.baseRevision ||
+            (revision === this.baseRevision && this.acknowledgedVersion === 0)
+        ) {
+            throw new RangeError('Conversation persisted data revision did not advance')
         }
         let nextBaseMessageCount = this.baseMessageCount
         for (const dirty of this.dirtyRecords) {

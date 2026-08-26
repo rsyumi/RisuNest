@@ -57,15 +57,20 @@ test('marks an oversized full-history consumer as an explicit compatibility snap
     )
     const conversation = chat(messages)
     const session = createSession(conversation)
+    const snapshotSpy = vi.spyOn(session, 'materializeCompatibilitySnapshot')
 
     const operation = createConversationOperationContext(session, conversation)
+    const snapshot = snapshotSpy.mock.results[0]?.value
 
     expect(operation.mode).toBe('compatibility')
     expect(operation.chat.message).toHaveLength(4097)
+    expect(snapshotSpy).toHaveBeenCalledOnce()
+    expect(snapshot.residentMessageCount).toBe(0)
     expect(session.pinCount('compatibility')).toBe(1)
 
     operation.release()
     expect(session.pinCount('compatibility')).toBe(0)
+    expect(session.residentBytes).toBe(0)
 })
 
 test('uses compatibility mode when a small message count exceeds the prefetch byte cap', () => {
