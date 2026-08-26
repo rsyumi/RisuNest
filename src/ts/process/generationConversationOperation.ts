@@ -138,6 +138,7 @@ function captureFullArrayFallback(
         target = safeStructuredClone(options.append)
         absoluteIndex = chat.message.length
         chat.message.push(target)
+        target = chat.message[absoluteIndex]
         options.onFallbackMutation?.()
     } else if (options.continueLast) {
         absoluteIndex = chat.message.length - 1
@@ -176,8 +177,8 @@ function captureFullArrayFallback(
         },
         commitMessage(message) {
             if (!operation.isOwned()) return false
-            target = safeStructuredClone(message)
-            chat.message[absoluteIndex] = target
+            chat.message[absoluteIndex] = safeStructuredClone(message)
+            target = chat.message[absoluteIndex]
             currentMessageId = target.chatId
             options.onFallbackMutation?.()
             return true

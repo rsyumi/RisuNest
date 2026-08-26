@@ -38,7 +38,10 @@ import { doingChat } from './generationState'
 import {
     consumeStreamingDisplayStream,
 } from './streamingDisplayStream'
-import { getActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
+import {
+    getActiveConversationSession,
+    invalidateActiveConversationSession,
+} from '../storage/persistentDataRuntime.svelte'
 import {
     captureGenerationConversationOperation,
     type GenerationConversationOperation,
@@ -1570,6 +1573,44 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     let outputTarget: GenerationConversationOperation | null = null
+    let generationHadOperation = false
+    const generationCharacter = nowChatroom
+    const getGenerationChat = () => DBState.db.characters[selectedChar]?.chats[selectedChat]
+    const isGenerationOwnerCurrent = () => get(selectedCharID) === selectedChar
+        && DBState.db.characters[selectedChar] === generationCharacter
+        && generationCharacter.chatPage === selectedChat
+    const legacyFallbackChat = getGenerationChat()
+    const legacyFallbackIndex = (legacyFallbackChat?.message.length ?? 0) - 1
+    let legacyFallbackMessage = legacyFallbackChat?.message[legacyFallbackIndex]
+    const isLegacyFallbackOwned = () => !generationHadOperation
+        && isGenerationOwnerCurrent()
+        && getGenerationChat() === legacyFallbackChat
+        && legacyFallbackChat?.message[legacyFallbackIndex] === legacyFallbackMessage
+    const readGeneratedOutput = (): Message | null | undefined => {
+        if(outputTarget){
+            return outputTarget.snapshot()
+        }
+        return isLegacyFallbackOwned() ? legacyFallbackMessage : null
+    }
+    const updateGeneratedOutput = (update: (message: Message) => Message): boolean => {
+        if(outputTarget){
+            const message = outputTarget.snapshot()
+            return message !== null && outputTarget.commitMessage(update(message))
+        }
+        if(!isLegacyFallbackOwned() || !legacyFallbackChat || !legacyFallbackMessage){
+            return false
+        }
+        legacyFallbackChat.message[legacyFallbackIndex] = update(legacyFallbackMessage)
+        legacyFallbackMessage = legacyFallbackChat.message[legacyFallbackIndex]
+        return true
+    }
+    const hasGeneratedOutputOwnership = () => outputTarget
+        ? outputTarget.isOwned()
+        : isLegacyFallbackOwned()
+    const releaseOutputTarget = () => {
+        outputTarget?.release()
+        outputTarget = null
+    }
     try {
     let result = ''
     let emoChanged = false
@@ -1592,7 +1633,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             getCurrentSession: getActiveConversationSession,
             chat: targetChat,
             getCurrentChat: getTargetChat,
-            isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+            isOwnerCurrent: isGenerationOwnerCurrent,
             ...(arg.continue ? { continueLast: true } : {
                 append: {
                 role: 'char',
@@ -1605,6 +1646,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 },
             }),
         })
+        generationHadOperation = true
         const initialOutput = outputTarget.snapshot()
         if(initialOutput === null){
             return false
@@ -1679,21 +1721,33 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         targetCharacter.chats[selectedChat] = runCurrentChatFunction(targetChat)
         currentChat = targetCharacter.chats[selectedChat]
+        if(!outputTarget.refresh()){
+            return false
+        }
         const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
+        if(!outputTarget.isOwned()){
+            return false
+        }
         if(triggerResult && triggerResult.chat){
             currentChat = triggerResult.chat
         }
         if(triggerResult && triggerResult.sendAIprompt){
             resendChat = true
         }
-        if(!outputTarget.refresh()){
-            return false
-        }
-        targetCharacter.chats[selectedChat] = currentChat
         outputTarget.release()
         if(!outputMessageId){
             return false
         }
+        const previousChat = targetChat
+        if(currentChat !== previousChat){
+            invalidateActiveConversationSession()
+        }
+        targetCharacter.chats[selectedChat] = currentChat
+        const publishedChat = getTargetChat()
+        if(!publishedChat || !isGenerationOwnerCurrent()){
+            return false
+        }
+        currentChat = publishedChat
         const replacementOutputIndex = currentChat.message.findIndex(
             (message) => message.chatId === outputMessageId,
         )
@@ -1702,10 +1756,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             getCurrentSession: getActiveConversationSession,
             chat: currentChat,
             getCurrentChat: getTargetChat,
-            isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+            isOwnerCurrent: isGenerationOwnerCurrent,
             messageId: outputMessageId,
         })
-        if(outputTarget && !outputTarget.isOwned()){
+        if(!outputTarget || !outputTarget.isOwned()){
             return false
         }
         const outputMessage = outputTarget?.snapshot()
@@ -1722,14 +1776,18 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             }
         }
         currentChat = targetCharacter.chats[selectedChat]
-        if(outputTarget ? outputTarget.isOwned() : getTargetChat() === currentChat){
-            await runChatOutputListeners(
-                currentChar,
-                currentChat,
-                selectedChar,
-                selectedChat,
-                outputTarget?.absoluteIndex ?? -1,
-            )
+        if(!outputTarget.isOwned()){
+            return false
+        }
+        await runChatOutputListeners(
+            currentChar,
+            currentChat,
+            selectedChar,
+            selectedChat,
+            outputTarget.absoluteIndex,
+        )
+        if(!outputTarget.isOwned()){
+            return false
         }
         if(DBState.db.ttsAutoSpeech){
             await sayTTS(currentChar, result)
@@ -1747,7 +1805,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             let msg = msgs[i]
             let mess = msg[1]
             const operationChat = getTargetChat()
-            if(!operationChat || DBState.db.characters[selectedChar] !== targetCharacter){
+            if(!operationChat || !isGenerationOwnerCurrent()){
                 return false
             }
             let msgIndex = operationChat.message.length
@@ -1757,9 +1815,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     getCurrentSession: getActiveConversationSession,
                     chat: operationChat,
                     getCurrentChat: getTargetChat,
-                    isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+                    isOwnerCurrent: isGenerationOwnerCurrent,
                     continueLast: true,
                 })
+                generationHadOperation = true
             }
             let result2 = await processScriptFull(nowChatroom, reformatContent(mess), 'editoutput', msgIndex)
             if(i === 0 && arg.continue){
@@ -1798,7 +1857,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 outputMessageId = outputTarget.messageId
             }
             else if(i===0){
-                if(getTargetChat() !== operationChat || DBState.db.characters[selectedChar] !== targetCharacter){
+                if(getTargetChat() !== operationChat || !isGenerationOwnerCurrent()){
                     return false
                 }
                 outputTarget = captureGenerationConversationOperation({
@@ -1806,7 +1865,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     getCurrentSession: getActiveConversationSession,
                     chat: operationChat,
                     getCurrentChat: getTargetChat,
-                    isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+                    isOwnerCurrent: isGenerationOwnerCurrent,
                     append: {
                         role: msg[0],
                         data: result,
@@ -1817,6 +1876,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                         chatId: generationId,
                     },
                 })
+                generationHadOperation = true
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
                     if(!outputTarget.commitData(p)){
@@ -1840,7 +1900,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
 
         const outputChat = getTargetChat()
-        if(!outputChat || DBState.db.characters[selectedChar] !== targetCharacter){
+        if(!outputChat || !isGenerationOwnerCurrent()){
             return false
         }
         if(outputTarget && !outputTarget.isOwned()){
@@ -1848,18 +1908,29 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         targetCharacter.chats[selectedChat] = runCurrentChatFunction(outputChat)
         currentChat = targetCharacter.chats[selectedChat]
-
-        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
-        if(triggerResult && triggerResult.sendAIprompt){
-            resendChat = true
-        }
         if(outputTarget && !outputTarget.refresh()){
             return false
         }
-        currentChat = triggerResult?.chat ?? currentChat
-        targetCharacter.chats[selectedChat] = currentChat
-        if(outputTarget){
-            outputTarget.release()
+        const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
+        if(outputTarget ? !outputTarget.isOwned() : !isLegacyFallbackOwned()){
+            return false
+        }
+        if(triggerResult && triggerResult.sendAIprompt){
+            resendChat = true
+        }
+        const previousChat = currentChat
+        const nextChat = triggerResult?.chat ?? currentChat
+        outputTarget?.release()
+        if(nextChat !== previousChat){
+            invalidateActiveConversationSession()
+        }
+        targetCharacter.chats[selectedChat] = nextChat
+        const publishedChat = getTargetChat()
+        if(!publishedChat || !isGenerationOwnerCurrent()){
+            return false
+        }
+        currentChat = publishedChat
+        if(generationHadOperation){
             if(!outputMessageId){
                 return false
             }
@@ -1871,49 +1942,33 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     getCurrentSession: getActiveConversationSession,
                     chat: currentChat,
                     getCurrentChat: getTargetChat,
-                    isOwnerCurrent: () => DBState.db.characters[selectedChar] === targetCharacter,
+                    isOwnerCurrent: isGenerationOwnerCurrent,
                     messageId: outputMessageId,
                 })
+            if(!outputTarget || !outputTarget.isOwned()){
+                return false
+            }
             await runChatOutputListeners(
                 currentChar,
                 currentChat,
                 selectedChar,
                 selectedChat,
-                outputTarget?.absoluteIndex ?? -1,
+                outputTarget.absoluteIndex,
             )
+            if(!outputTarget.isOwned()){
+                return false
+            }
         }
     }
 
-    const readGeneratedOutputFallback = (): Message | undefined => {
-        const fallbackChat = DBState.db.characters[selectedChar]?.chats[selectedChat]
-        const fallbackIndex = (fallbackChat?.message.length ?? 0) - 1
-        return fallbackChat?.message[fallbackIndex]
+    if(!hasGeneratedOutputOwnership()){
+        return false
     }
-    const readGeneratedOutput = (): Message | null | undefined => outputTarget
-        ? outputTarget.snapshot()
-        : readGeneratedOutputFallback()
-    const updateGeneratedOutput = (update: (message: Message) => Message): boolean => {
-        if(outputTarget){
-            const message = outputTarget.snapshot()
-            return message !== null && outputTarget.commitMessage(update(message))
-        }
-
-        const fallbackChat = DBState.db.characters[selectedChar]?.chats[selectedChat]
-        const fallbackIndex = (fallbackChat?.message.length ?? 0) - 1
-        const fallbackMessage = fallbackChat?.message[fallbackIndex]
-        if(!fallbackChat || !fallbackMessage){
-            return false
-        }
-        fallbackChat.message[fallbackIndex] = update(fallbackMessage)
-        return true
-    }
-    const releaseOutputTarget = () => {
-        outputTarget?.release()
-        outputTarget = null
-    }
-
     let needsAutoContinue = false
     const resultTokens = await tokenize(result) + (arg.usedContinueTokens || 0)
+    if(!hasGeneratedOutputOwnership()){
+        return false
+    }
     if(DBState.db.autoContinueMinTokens > 0 && resultTokens < DBState.db.autoContinueMinTokens){
         needsAutoContinue = true
     }
@@ -1960,6 +2015,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     stageTimings.stage4Start = Date.now()
 
     if(resendChat){
+        if(!hasGeneratedOutputOwnership()){
+            return false
+        }
         stageTimings.stage4Duration = Date.now() - stageTimings.stage4Start
         
         if(generationInfo.stageTiming) {
@@ -2239,6 +2297,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         generationInfo.stageTiming.stage4 = stageTimings.stage4Duration
     }
     
+    if(!hasGeneratedOutputOwnership()){
+        return false
+    }
     const currentOutput = readGeneratedOutput()
     if(currentOutput?.generationInfo && !updateGeneratedOutput((message) => ({
         ...message,
