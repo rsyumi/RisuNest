@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { ColdPayloadAuthorityState } from './persistentDataStore'
 import { createLegacyNodeColdPayloadStore, createLegacyOpfsColdPayloadStore, createLegacyTauriColdPayloadStore } from './platformColdPayloadStore'
 import { migrateLegacyColdPayloads } from './coldPayloadMigration'
 
@@ -26,6 +27,7 @@ function migrationHarness(platform: 'tauri' | 'node' | 'opfs') {
             ? createLegacyNodeColdPayloadStore(backend)
             : createLegacyOpfsColdPayloadStore(backend)
     const release = vi.fn(async () => undefined)
+    let pinnedAuthority: ColdPayloadAuthorityState = { format: 'legacy' }
     const catalog = {
         readColdPayloadAuthority: vi.fn(async () => ({
             revision: 3,
@@ -35,7 +37,7 @@ function migrationHarness(platform: 'tauri' | 'node' | 'opfs') {
             revision: 3,
             readColdPayloadAuthority: async () => ({
                 revision: 3,
-                value: { format: 'legacy' as const },
+                value: pinnedAuthority,
             }),
             release,
         })),
@@ -57,7 +59,17 @@ function migrationHarness(platform: 'tauri' | 'node' | 'opfs') {
         readObjectRange: vi.fn(),
         statObject: vi.fn(),
     }
-    return { backend, legacy, catalog, cas, prepared, release }
+    return {
+        backend,
+        legacy,
+        catalog,
+        cas,
+        prepared,
+        release,
+        setPinnedAuthority(value: ColdPayloadAuthorityState) {
+            pinnedAuthority = value
+        },
+    }
 }
 
 describe.each(['tauri', 'node', 'opfs'] as const)('legacy %s cold migration', (platform) => {
@@ -119,17 +131,10 @@ describe('cold payload migration failure boundary', () => {
 
     it('requires the pinned generation to remain legacy before doing any payload work', async () => {
         const fixture = migrationHarness('tauri')
-        fixture.catalog.acquireRevision.mockResolvedValueOnce({
-            revision: 3,
-            readColdPayloadAuthority: async () => ({
-                revision: 3,
-                value: {
-                    format: 'v2' as const,
-                    migrationId: 'other',
-                    compatibilityHash: 'ab'.repeat(32),
-                },
-            }),
-            release: fixture.release,
+        fixture.setPinnedAuthority({
+            format: 'v2',
+            migrationId: 'other',
+            compatibilityHash: 'ab'.repeat(32),
         })
 
         await expect(migrateLegacyColdPayloads({

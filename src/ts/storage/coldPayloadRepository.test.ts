@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RevisionConflictError } from './persistentDataStore'
-import type { ColdAlias } from './persistentDataStore'
+import type { ColdAlias, PersistentRoot } from './persistentDataStore'
 import { createCompleteColdPayloadStore } from './coldPayloadRepository'
 
 function alias(overrides: Partial<ColdAlias> = {}): ColdAlias {
@@ -19,7 +19,7 @@ function harness(initial?: ColdAlias) {
     const objects = new Map<string, Uint8Array>()
     if (initial?.objectHash) objects.set(initial.objectHash, Uint8Array.of(1, 2, 3))
     const catalog = {
-        readRoot: vi.fn(async () => ({ revision, value: {} })),
+        readRoot: vi.fn(async () => ({ revision, value: {} as PersistentRoot })),
         readColdAlias: vi.fn(async (key: string) => current?.key === key
             ? { revision, value: structuredClone(current) }
             : null),
