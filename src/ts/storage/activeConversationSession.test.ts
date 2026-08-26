@@ -7,6 +7,8 @@ import {
     ConversationSessionStaleError,
     MessageLocatorMismatchError,
     MessageLocatorNotFoundError,
+    requireCurrentConversationSession,
+    type ActiveConversationTransaction,
     type ActiveConversationPinReason,
 } from './activeConversationSession'
 
@@ -111,6 +113,36 @@ describe('ActiveConversationSession', () => {
         ])
     })
 
+    it('returns detached message snapshots from every read API', () => {
+        const messages = ['range', 'backward', 'branch'].map((id, index) => ({
+            ...message(id, id),
+            generationInfo: {
+                stageTiming: { stage1: index + 1 },
+            },
+        }))
+        const { conversation, session } = createSession(chat(messages))
+
+        const range = session.readRange(0, 1)
+        const backward = session.scanBackward(2, 1)
+        const branch = session.readBranchSource(session.locate(2))
+        range.messages[0].generationInfo!.stageTiming!.stage1 = 100
+        backward.entries[0].message.generationInfo!.stageTiming!.stage1 = 200
+        branch.messages[2].generationInfo!.stageTiming!.stage1 = 300
+
+        session.transaction((transaction) => {
+            const transactionRange = transaction.readRange(0, 1)
+            transactionRange.messages[0].generationInfo!.stageTiming!.stage1 = 400
+            transaction.append(message('append', 'append'))
+        })
+
+        expect(conversation.message.slice(0, 3).map(
+            (item) => item.generationInfo?.stageTiming?.stage1,
+        )).toEqual([1, 2, 3])
+        expect(range.messages[0]).not.toBe(conversation.message[0])
+        expect(backward.entries[0].message).not.toBe(conversation.message[1])
+        expect(branch.messages[2]).not.toBe(conversation.message[2])
+    })
+
     it('strictly validates read indices and bounded counts', () => {
         const { session } = createSession()
 
@@ -200,6 +232,38 @@ describe('ActiveConversationSession', () => {
         )
     })
 
+    it('rejects locators after direct replacement even when IDs cannot detect retargeting', () => {
+        const duplicateCase = createSession()
+        const duplicate = duplicateCase.session.locate(0)
+        duplicateCase.conversation.message[0] = duplicateCase.conversation.message[2]
+        expect(() => duplicateCase.session.edit(
+            duplicate,
+            message('duplicate', 'must not retarget duplicate'),
+        )).toThrow(MessageLocatorMismatchError)
+
+        const missingCase = createSession()
+        const missing = missingCase.session.locate(1)
+        missingCase.conversation.message[1] = message(undefined, 'different missing ID')
+        expect(() => missingCase.session.delete(missing)).toThrow(MessageLocatorMismatchError)
+
+        const sameIdCase = createSession()
+        const sameId = sameIdCase.session.locate(3)
+        sameIdCase.conversation.message[3] = message('tail', 'different object with same ID')
+        expect(() => sameIdCase.session.edit(
+            sameId,
+            message('tail', 'must not retarget replacement'),
+        )).toThrow(MessageLocatorMismatchError)
+
+        const arrayCase = createSession()
+        const arrayLocator = arrayCase.session.locate(0)
+        const arrayPosition = arrayCase.session.positionAt(2)
+        arrayCase.conversation.message = arrayCase.conversation.message.slice()
+        expect(() => arrayCase.session.delete(arrayLocator)).toThrow(MessageLocatorMismatchError)
+        expect(() => arrayCase.session.replaceTail(arrayPosition, [])).toThrow(
+            MessageLocatorMismatchError,
+        )
+    })
+
     it('publishes a successful transaction once and rolls back the whole draft after any failure', () => {
         const { conversation, onMutation, session } = createSession()
         const original = structuredClone(conversation.message)
@@ -231,6 +295,135 @@ describe('ActiveConversationSession', () => {
             sessionVersion: 2,
             commands: ['edit', 'append'],
         }))
+    })
+
+    it('isolates nested draft message state when a transaction throws', () => {
+        const nested = message('nested', 'original')
+        nested.generationInfo = {
+            stageTiming: { stage1: 1 },
+        }
+        nested.promptInfo = {
+            promptToggles: [{ key: 'mode', value: 'original' }],
+        }
+        const { conversation, onMutation, session } = createSession(chat([nested]))
+        const originalArray = conversation.message
+
+        expect(() => session.transaction((transaction) => {
+            transaction.messages[0].generationInfo!.stageTiming!.stage1 = 99
+            transaction.messages[0].promptInfo!.promptToggles![0].value = 'changed'
+            throw new Error('abort nested changes')
+        })).toThrow('abort nested changes')
+
+        expect(conversation.message).toBe(originalArray)
+        expect(conversation.message[0].generationInfo?.stageTiming?.stage1).toBe(1)
+        expect(conversation.message[0].promptInfo?.promptToggles?.[0].value).toBe('original')
+        expect(session.version).toBe(0)
+        expect(onMutation).not.toHaveBeenCalled()
+    })
+
+    it('does not expose committed state through retained drafts or command inputs', () => {
+        const original = message('nested', 'original')
+        original.generationInfo = { stageTiming: { stage1: 1 } }
+        const appended = message('append', 'appended')
+        appended.generationInfo = { stageTiming: { stage1: 2 } }
+        const { conversation, session } = createSession(chat([original]))
+        let retainedDraft!: Message[]
+        let retainedTransaction!: ActiveConversationTransaction
+
+        session.transaction((transaction) => {
+            retainedTransaction = transaction
+            retainedDraft = transaction.messages
+            transaction.append(appended)
+        })
+
+        retainedDraft[0].generationInfo!.stageTiming!.stage1 = 100
+        appended.generationInfo!.stageTiming!.stage1 = 200
+
+        expect(conversation.message.map(
+            (item) => item.generationInfo?.stageTiming?.stage1,
+        )).toEqual([1, 2])
+        expect(() => retainedTransaction.append(message('late', 'late'))).toThrow(/closed/)
+    })
+
+    it('rejects async callbacks without publishing mutations before or after await', async () => {
+        const { conversation, onMutation, session } = createSession()
+        const original = structuredClone(conversation.message)
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+            release = resolve
+        })
+        let callbackResult!: Promise<void>
+        let afterAwaitError: unknown
+        let thrown: unknown
+
+        try {
+            session.transaction((transaction) => {
+                callbackResult = (async () => {
+                    transaction.edit(
+                        transaction.locate(0),
+                        message('duplicate', 'before await'),
+                    )
+                    await gate
+                    try {
+                        transaction.append(message('late', 'after await'))
+                    } catch (error) {
+                        afterAwaitError = error
+                    }
+                    throw new Error('late transaction rejection')
+                })()
+                return callbackResult
+            })
+        } catch (error) {
+            thrown = error
+        }
+
+        expect(thrown).toBeInstanceOf(TypeError)
+        expect(conversation.message).toEqual(original)
+        expect(session.version).toBe(0)
+        expect(onMutation).not.toHaveBeenCalled()
+
+        release()
+        await expect(callbackResult).rejects.toThrow('late transaction rejection')
+        expect(afterAwaitError).toBeInstanceOf(Error)
+        expect((afterAwaitError as Error).message).toContain('closed')
+        expect(conversation.message).toEqual(original)
+        expect(session.version).toBe(0)
+        expect(onMutation).not.toHaveBeenCalled()
+    })
+
+    it('rolls back the published array and version when mutation notification throws', () => {
+        const conversation = chat()
+        const originalArray = conversation.message
+        const original = structuredClone(originalArray)
+        const session = new ActiveConversationSession({
+            characterId: 'character-a',
+            conversationId: 'conversation-a',
+            conversation,
+            storeRevision: 7,
+            onMutation: () => {
+                throw new Error('mutation observer failed')
+            },
+        })
+
+        expect(() => session.edit(
+            session.locate(0),
+            message('duplicate', 'must roll back'),
+        )).toThrow('mutation observer failed')
+
+        expect(conversation.message).toBe(originalArray)
+        expect(conversation.message).toEqual(original)
+        expect(session.version).toBe(0)
+    })
+
+    it('requires an awaited consumer to reacquire the same active session', () => {
+        const expected = createSession().session
+        const replacement = createSession().session
+
+        expect(requireCurrentConversationSession(expected, expected)).toBe(expected)
+        expect(() => requireCurrentConversationSession(expected, replacement)).toThrow(/inactive/)
+        expected.invalidate()
+        expect(() => requireCurrentConversationSession(expected, expected)).toThrow(/inactive/)
+        expect(() => requireCurrentConversationSession(expected, null)).toThrow(/inactive/)
     })
 
     it('tracks the C1 pin reason contract without enabling eviction', () => {

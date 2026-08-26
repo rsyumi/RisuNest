@@ -106,7 +106,7 @@ export class ActiveWorkingSet {
 
     invalidateNavigation(): void {
         this.navigationGeneration++
-        this.activeSession = null
+        this.clearActiveConversationSession()
     }
 
     async deactivate(): Promise<boolean> {
@@ -126,7 +126,7 @@ export class ActiveWorkingSet {
             (id) => this.dependencies.canDeactivateCharacter?.(id) === false,
         )) return false
         this.activeIds = new Set()
-        this.activeSession = null
+        this.clearActiveConversationSession()
         for (const id of activeIds) this.dependencies.releaseInactiveCharacter?.(id)
         return true
     }
@@ -141,7 +141,7 @@ export class ActiveWorkingSet {
             ? database.characters.find((character) => character.chaId === selectedId)
             : undefined
         const conversation = selected?.chats[selected.chatPage ?? 0]
-        this.activeSession = null
+        this.clearActiveConversationSession()
         if (selected && conversation) {
             this.publishActiveConversationSession(selected.chaId, conversation, root.revision)
         }
@@ -258,7 +258,7 @@ export class ActiveWorkingSet {
         const selectedConversation = characterValue.chats[characterValue.chatPage ?? 0]
         if (selectedConversation) {
             this.publishActiveConversationSession(id, selectedConversation, revision)
-        } else this.activeSession = null
+        } else this.clearActiveConversationSession()
         const nextActiveIds = new Set([id, ...relatedIds])
         this.activeIds = nextActiveIds
         for (const previousId of previousActiveIds) {
@@ -358,6 +358,7 @@ export class ActiveWorkingSet {
             (candidate) => candidate.id === fallbackConversation.id,
         ) ?? fallbackConversation
         const conversationId = conversation.id ?? fallbackConversation.id
+        this.clearActiveConversationSession()
         if (!conversationId) return
         this.activeSession = new ActiveConversationSession({
             characterId,
@@ -365,6 +366,11 @@ export class ActiveWorkingSet {
             conversation,
             storeRevision,
         })
+    }
+
+    private clearActiveConversationSession(): void {
+        this.activeSession?.invalidate()
+        this.activeSession = null
     }
 
     private async hydrateCharacter(

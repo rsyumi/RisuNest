@@ -1,5 +1,6 @@
 import type { Chat, Message } from './database.svelte'
 import { CONVERSATION_RANGE_MAX_LIMIT, type DataRevision } from './persistentDataStore'
+import { safeStructuredClone } from '../polyfill'
 
 export type ActiveConversationPinReason =
     | 'dirty'
@@ -89,6 +90,31 @@ export interface ActiveConversationSessionOptions {
     onMutation?(event: ActiveConversationMutationEvent): void
 }
 
+interface MessageLocatorIdentity {
+    messages: readonly Message[]
+    message: Message
+}
+
+interface ConversationPositionIdentity {
+    messages: readonly Message[]
+    before?: Message
+    after?: Message
+}
+
+const messageLocatorIdentities = new WeakMap<MessageLocator, MessageLocatorIdentity>()
+const conversationPositionIdentities = new WeakMap<
+    ConversationPosition,
+    ConversationPositionIdentity
+>()
+const finishConversationTransaction = Symbol('finishConversationTransaction')
+const abortConversationTransaction = Symbol('abortConversationTransaction')
+
+interface CompletedConversationTransaction {
+    messages: Message[]
+    version: number
+    commands: readonly ActiveConversationCommandName[]
+}
+
 export class ConversationNotFoundError extends Error {
     constructor(characterId: string, conversationId: string) {
         super(`Conversation ${conversationId} was not found for ${characterId}`)
@@ -100,6 +126,13 @@ export class ConversationSessionStaleError extends Error {
     constructor(expectedVersion: number, actualVersion: number) {
         super(`Expected conversation session version ${expectedVersion}, but current version is ${actualVersion}`)
         this.name = 'ConversationSessionStaleError'
+    }
+}
+
+export class ConversationSessionInactiveError extends Error {
+    constructor() {
+        super('Conversation session is inactive')
+        this.name = 'ConversationSessionInactiveError'
     }
 }
 
@@ -134,6 +167,13 @@ function validateCount(value: number): void {
     }
 }
 
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+    return (
+        (typeof value === 'object' && value !== null) ||
+        typeof value === 'function'
+    ) && typeof (value as PromiseLike<unknown>).then === 'function'
+}
+
 function createLocator(
     conversationId: string,
     messages: readonly Message[],
@@ -143,12 +183,37 @@ function createLocator(
     validateIndex(absoluteIndex, 'Message locator index')
     const message = messages[absoluteIndex]
     if (!message) throw new MessageLocatorNotFoundError(absoluteIndex)
-    return {
+    const locator: MessageLocator = {
         conversationId,
         absoluteIndex,
         ...(message.chatId === undefined ? {} : { expectedMessageId: message.chatId }),
         sessionVersion,
     }
+    messageLocatorIdentities.set(locator, { messages, message })
+    return locator
+}
+
+function createPosition(
+    conversationId: string,
+    messages: readonly Message[],
+    absoluteIndex: number,
+    sessionVersion: number,
+): ConversationPosition {
+    validateIndex(absoluteIndex, 'Conversation position index')
+    if (absoluteIndex > messages.length) {
+        throw new MessageLocatorNotFoundError(absoluteIndex)
+    }
+    const position: ConversationPosition = {
+        conversationId,
+        absoluteIndex,
+        sessionVersion,
+    }
+    conversationPositionIdentities.set(position, {
+        messages,
+        before: messages[absoluteIndex - 1],
+        after: messages[absoluteIndex],
+    })
+    return position
 }
 
 function validateLocator(
@@ -156,6 +221,7 @@ function validateLocator(
     messages: readonly Message[],
     sessionVersion: number,
     locator: MessageLocator,
+    sourceMessages?: readonly Message[],
 ): Message {
     if (locator.conversationId !== conversationId) {
         throw new MessageLocatorMismatchError(
@@ -168,6 +234,17 @@ function validateLocator(
     validateIndex(locator.absoluteIndex, 'Message locator index')
     const message = messages[locator.absoluteIndex]
     if (!message) throw new MessageLocatorNotFoundError(locator.absoluteIndex)
+    const identity = messageLocatorIdentities.get(locator)
+    const matchesCurrent = identity?.messages === messages && identity.message === message
+    const matchesSource =
+        sourceMessages !== undefined &&
+        identity?.messages === sourceMessages &&
+        identity.message === sourceMessages[locator.absoluteIndex]
+    if (!matchesCurrent && !matchesSource) {
+        throw new MessageLocatorMismatchError(
+            `Message locator identity changed at index ${locator.absoluteIndex}`,
+        )
+    }
     if (
         locator.expectedMessageId !== undefined &&
         message.chatId !== locator.expectedMessageId
@@ -184,6 +261,7 @@ function validatePosition(
     messages: readonly Message[],
     sessionVersion: number,
     position: ConversationPosition,
+    sourceMessages?: readonly Message[],
 ): void {
     if (position.conversationId !== conversationId) {
         throw new MessageLocatorMismatchError(
@@ -196,6 +274,17 @@ function validatePosition(
     validateIndex(position.absoluteIndex, 'Conversation position index')
     if (position.absoluteIndex > messages.length) {
         throw new MessageLocatorNotFoundError(position.absoluteIndex)
+    }
+    const identity = conversationPositionIdentities.get(position)
+    const matches = (candidate: readonly Message[] | undefined) =>
+        candidate !== undefined &&
+        identity?.messages === candidate &&
+        identity.before === candidate[position.absoluteIndex - 1] &&
+        identity.after === candidate[position.absoluteIndex]
+    if (!matches(messages) && !matches(sourceMessages)) {
+        throw new MessageLocatorMismatchError(
+            `Conversation position identity changed at index ${position.absoluteIndex}`,
+        )
     }
 }
 
@@ -216,7 +305,7 @@ function readRange(
     return {
         characterId,
         conversationId,
-        messages: selected,
+        messages: safeStructuredClone(selected),
         locators: selected.map((_message, offset) =>
             createLocator(conversationId, messages, startIndex + offset, sessionVersion),
         ),
@@ -232,27 +321,31 @@ export class ActiveConversationTransaction {
     private currentMessages: Message[]
     private currentVersion: number
     private readonly commandNames: ActiveConversationCommandName[] = []
+    private closed = false
 
     constructor(
         private readonly characterId: string,
         private readonly conversationId: string,
-        messages: readonly Message[],
+        private readonly sourceMessages: readonly Message[],
         private readonly storeRevision: DataRevision,
         sessionVersion: number,
     ) {
-        this.currentMessages = messages.slice()
+        this.currentMessages = safeStructuredClone([...sourceMessages])
         this.currentVersion = sessionVersion
     }
 
     get version(): number {
+        this.assertOpen()
         return this.currentVersion
     }
 
     get totalMessages(): number {
+        this.assertOpen()
         return this.currentMessages.length
     }
 
     locate(absoluteIndex: number): MessageLocator {
+        this.assertOpen()
         return createLocator(
             this.conversationId,
             this.currentMessages,
@@ -262,18 +355,17 @@ export class ActiveConversationTransaction {
     }
 
     positionAt(absoluteIndex: number): ConversationPosition {
-        validateIndex(absoluteIndex, 'Conversation position index')
-        if (absoluteIndex > this.currentMessages.length) {
-            throw new MessageLocatorNotFoundError(absoluteIndex)
-        }
-        return {
-            conversationId: this.conversationId,
+        this.assertOpen()
+        return createPosition(
+            this.conversationId,
+            this.currentMessages,
             absoluteIndex,
-            sessionVersion: this.currentVersion,
-        }
+            this.currentVersion,
+        )
     }
 
     readRange(startIndex: number, limit: number): ActiveConversationWindow {
+        this.assertOpen()
         return readRange(
             this.characterId,
             this.conversationId,
@@ -286,32 +378,37 @@ export class ActiveConversationTransaction {
     }
 
     append(message: Message): MessageLocator {
+        this.assertOpen()
         const absoluteIndex = this.currentMessages.length
-        this.currentMessages = [...this.currentMessages, message]
+        this.currentMessages = [...this.currentMessages, safeStructuredClone(message)]
         this.record('append')
         return this.locate(absoluteIndex)
     }
 
     edit(locator: MessageLocator, message: Message): MessageLocator {
+        this.assertOpen()
         validateLocator(
             this.conversationId,
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.sourceMessages,
         )
         const nextMessages = this.currentMessages.slice()
-        nextMessages[locator.absoluteIndex] = message
+        nextMessages[locator.absoluteIndex] = safeStructuredClone(message)
         this.currentMessages = nextMessages
         this.record('edit')
         return this.locate(locator.absoluteIndex)
     }
 
     delete(locator: MessageLocator): void {
+        this.assertOpen()
         validateLocator(
             this.conversationId,
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.sourceMessages,
         )
         this.currentMessages = [
             ...this.currentMessages.slice(0, locator.absoluteIndex),
@@ -321,36 +418,42 @@ export class ActiveConversationTransaction {
     }
 
     truncate(locator: MessageLocator): void {
+        this.assertOpen()
         validateLocator(
             this.conversationId,
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.sourceMessages,
         )
         this.currentMessages = this.currentMessages.slice(0, locator.absoluteIndex)
         this.record('truncate')
     }
 
     replaceTail(position: ConversationPosition, messages: readonly Message[]): void {
+        this.assertOpen()
         this.replaceTailAs('replace-tail', position, messages)
     }
 
     reroll(position: ConversationPosition, messages: readonly Message[]): void {
+        this.assertOpen()
         this.replaceTailAs('reroll', position, messages)
     }
 
     readBranchSource(locator: MessageLocator): ActiveConversationBranchSource {
+        this.assertOpen()
         validateLocator(
             this.conversationId,
             this.currentMessages,
             this.currentVersion,
             locator,
+            this.sourceMessages,
         )
         const endIndex = locator.absoluteIndex + 1
         return {
             characterId: this.characterId,
             conversationId: this.conversationId,
-            messages: this.currentMessages.slice(0, endIndex),
+            messages: safeStructuredClone(this.currentMessages.slice(0, endIndex)),
             startIndex: 0,
             endIndex,
             totalMessages: this.currentMessages.length,
@@ -360,15 +463,32 @@ export class ActiveConversationTransaction {
     }
 
     get changed(): boolean {
+        this.assertOpen()
         return this.commandNames.length > 0
     }
 
     get messages(): Message[] {
-        return this.currentMessages
+        this.assertOpen()
+        return safeStructuredClone(this.currentMessages)
     }
 
     get commands(): readonly ActiveConversationCommandName[] {
-        return this.commandNames
+        this.assertOpen()
+        return this.commandNames.slice()
+    }
+
+    [finishConversationTransaction](): CompletedConversationTransaction {
+        this.assertOpen()
+        this.closed = true
+        return {
+            messages: this.currentMessages,
+            version: this.currentVersion,
+            commands: this.commandNames.slice(),
+        }
+    }
+
+    [abortConversationTransaction](): void {
+        this.closed = true
     }
 
     private replaceTailAs(
@@ -381,10 +501,11 @@ export class ActiveConversationTransaction {
             this.currentMessages,
             this.currentVersion,
             position,
+            this.sourceMessages,
         )
         this.currentMessages = [
             ...this.currentMessages.slice(0, position.absoluteIndex),
-            ...messages,
+            ...safeStructuredClone(messages),
         ]
         this.record(command)
     }
@@ -392,6 +513,10 @@ export class ActiveConversationTransaction {
     private record(command: ActiveConversationCommandName): void {
         this.currentVersion += 1
         this.commandNames.push(command)
+    }
+
+    private assertOpen(): void {
+        if (this.closed) throw new Error('Conversation session transaction is closed')
     }
 }
 
@@ -406,6 +531,7 @@ export class ActiveConversationSession {
     private readonly pins = new Map<ActiveConversationPinReason, number>()
     private sessionVersion = 0
     private transactionActive = false
+    private active = true
 
     constructor(options: ActiveConversationSessionOptions) {
         if (!options.conversation) {
@@ -422,7 +548,12 @@ export class ActiveConversationSession {
         return this.sessionVersion
     }
 
+    get isActive(): boolean {
+        return this.active
+    }
+
     get totalMessages(): number {
+        this.assertActive()
         return this.conversation.message.length
     }
 
@@ -431,6 +562,7 @@ export class ActiveConversationSession {
     }
 
     locate(absoluteIndex: number): MessageLocator {
+        this.assertActive()
         return createLocator(
             this.conversationId,
             this.conversation.message,
@@ -440,23 +572,23 @@ export class ActiveConversationSession {
     }
 
     positionAt(absoluteIndex: number): ConversationPosition {
-        validateIndex(absoluteIndex, 'Conversation position index')
-        if (absoluteIndex > this.totalMessages) {
-            throw new MessageLocatorNotFoundError(absoluteIndex)
-        }
-        return {
-            conversationId: this.conversationId,
+        this.assertActive()
+        return createPosition(
+            this.conversationId,
+            this.conversation.message,
             absoluteIndex,
-            sessionVersion: this.sessionVersion,
-        }
+            this.sessionVersion,
+        )
     }
 
     readLatest(limit: number): ActiveConversationWindow {
+        this.assertActive()
         validateCount(limit)
         return this.readRange(Math.max(0, this.totalMessages - limit), limit)
     }
 
     readRange(startIndex: number, limit: number): ActiveConversationWindow {
+        this.assertActive()
         return readRange(
             this.characterId,
             this.conversationId,
@@ -472,6 +604,7 @@ export class ActiveConversationSession {
         startIndexExclusive = this.totalMessages,
         limit = CONVERSATION_RANGE_MAX_LIMIT,
     ): ActiveConversationBackwardScan {
+        this.assertActive()
         validateIndex(startIndexExclusive, 'Backward scan startIndex')
         validateCount(limit)
         const start = Math.min(this.totalMessages, startIndexExclusive)
@@ -479,7 +612,7 @@ export class ActiveConversationSession {
         for (let absoluteIndex = start - 1; absoluteIndex >= 0 && entries.length < limit; absoluteIndex--) {
             entries.push({
                 absoluteIndex,
-                message: this.conversation.message[absoluteIndex],
+                message: safeStructuredClone(this.conversation.message[absoluteIndex]),
                 locator: this.locate(absoluteIndex),
             })
         }
@@ -495,30 +628,37 @@ export class ActiveConversationSession {
     }
 
     append(message: Message): MessageLocator {
+        this.assertActive()
         return this.transaction((transaction) => transaction.append(message))
     }
 
     edit(locator: MessageLocator, message: Message): MessageLocator {
+        this.assertActive()
         return this.transaction((transaction) => transaction.edit(locator, message))
     }
 
     delete(locator: MessageLocator): void {
+        this.assertActive()
         this.transaction((transaction) => transaction.delete(locator))
     }
 
     truncate(locator: MessageLocator): void {
+        this.assertActive()
         this.transaction((transaction) => transaction.truncate(locator))
     }
 
     replaceTail(position: ConversationPosition, messages: readonly Message[]): void {
+        this.assertActive()
         this.transaction((transaction) => transaction.replaceTail(position, messages))
     }
 
     reroll(position: ConversationPosition, messages: readonly Message[]): void {
+        this.assertActive()
         this.transaction((transaction) => transaction.reroll(position, messages))
     }
 
     readBranchSource(locator: MessageLocator): ActiveConversationBranchSource {
+        this.assertActive()
         validateLocator(
             this.conversationId,
             this.conversation.message,
@@ -529,7 +669,7 @@ export class ActiveConversationSession {
         return {
             characterId: this.characterId,
             conversationId: this.conversationId,
-            messages: this.conversation.message.slice(0, endIndex),
+            messages: safeStructuredClone(this.conversation.message.slice(0, endIndex)),
             startIndex: 0,
             endIndex,
             totalMessages: this.totalMessages,
@@ -539,6 +679,7 @@ export class ActiveConversationSession {
     }
 
     transaction<T>(run: (transaction: ActiveConversationTransaction) => T): T {
+        this.assertActive()
         if (this.transactionActive) throw new Error('Nested conversation session transactions are not supported')
         this.transactionActive = true
         const previousVersion = this.sessionVersion
@@ -551,24 +692,39 @@ export class ActiveConversationSession {
         )
         try {
             const result = run(transaction)
-            if (transaction.changed) {
-                this.conversation.message = transaction.messages
-                this.sessionVersion = transaction.version
-                this.onMutation?.({
-                    characterId: this.characterId,
-                    conversationId: this.conversationId,
-                    previousVersion,
-                    sessionVersion: this.sessionVersion,
-                    commands: transaction.commands,
-                })
+            if (isThenable(result)) {
+                transaction[abortConversationTransaction]()
+                void Promise.resolve(result).catch(() => undefined)
+                throw new TypeError('Conversation session transactions must be synchronous')
+            }
+            const completed = transaction[finishConversationTransaction]()
+            if (completed.commands.length > 0) {
+                const previousMessages = this.conversation.message
+                this.conversation.message = completed.messages
+                this.sessionVersion = completed.version
+                try {
+                    this.onMutation?.({
+                        characterId: this.characterId,
+                        conversationId: this.conversationId,
+                        previousVersion,
+                        sessionVersion: this.sessionVersion,
+                        commands: completed.commands,
+                    })
+                } catch (error) {
+                    this.conversation.message = previousMessages
+                    this.sessionVersion = previousVersion
+                    throw error
+                }
             }
             return result
         } finally {
+            transaction[abortConversationTransaction]()
             this.transactionActive = false
         }
     }
 
     acquirePin(reason: ActiveConversationPinReason): ActiveConversationPin {
+        this.assertActive()
         this.pins.set(reason, (this.pins.get(reason) ?? 0) + 1)
         let released = false
         return {
@@ -588,6 +744,27 @@ export class ActiveConversationSession {
     }
 
     materializeCompatibilityArray(): Message[] {
+        this.assertActive()
         return this.conversation.message
     }
+
+    invalidate(): void {
+        if (!this.active) return
+        this.active = false
+        this.pins.clear()
+    }
+
+    private assertActive(): void {
+        if (!this.active) throw new ConversationSessionInactiveError()
+    }
+}
+
+export function requireCurrentConversationSession(
+    expected: ActiveConversationSession,
+    current: ActiveConversationSession | null,
+): ActiveConversationSession {
+    if (!expected.isActive || current !== expected) {
+        throw new ConversationSessionInactiveError()
+    }
+    return expected
 }

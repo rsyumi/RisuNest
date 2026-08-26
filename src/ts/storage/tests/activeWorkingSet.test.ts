@@ -1065,6 +1065,20 @@ describe('ActiveWorkingSet', () => {
         expect(resident.chats[1].message.at(-1)?.data).toBe('session edit')
         session.delete(edited)
         expect(resident.chats[1].message).toEqual(chatB.message)
+
+        await expect(workingSet.activateConversation('chat-b')).resolves.toBe(true)
+        expect(workingSet.activeConversationSession).not.toBe(session)
+        expect(session.isActive).toBe(false)
+        expect(() => session.append({ role: 'char', data: 'detached navigation write' })).toThrow(
+            /inactive/,
+        )
+
+        const releasedSession = workingSet.activeConversationSession!
+        await expect(workingSet.deactivate()).resolves.toBe(true)
+        expect(releasedSession.isActive).toBe(false)
+        expect(() => releasedSession.append({ role: 'char', data: 'detached release write' })).toThrow(
+            /inactive/,
+        )
     })
 
     it('keeps the previous body resident when its pending save fails', async () => {

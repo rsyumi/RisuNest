@@ -28,6 +28,7 @@
     import { DeferredInlayMarkerRegistry, withResolvedDeferredInlaySources } from "src/ts/process/files/inlayRenderSource"
     import { copyImageSourceToDataUrl } from "src/ts/process/files/chatCopyInlays"
     import { getActiveConversationSession } from "../../ts/storage/persistentDataRuntime.svelte"
+    import { requireCurrentConversationSession } from "../../ts/storage/activeConversationSession"
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -104,7 +105,8 @@
         const currentCharacter = DBState.db.characters[selIdState.selId]
         const currentChat = currentCharacter?.chats[currentCharacter.chatPage]
         const session = getActiveConversationSession()
-        return session?.characterId === currentCharacter?.chaId &&
+        return session?.isActive &&
+            session.characterId === currentCharacter?.chaId &&
             session.conversationId === currentChat?.id &&
             session.materializeCompatibilityArray() === currentChat.message
             ? session
@@ -112,16 +114,26 @@
     }
 
     async function rm(e:MouseEvent, rec?:boolean){
-        const chat = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]
         const session = currentConversationSession()
         const locator = session?.locate(idx)
         const truncate = () => {
-            if (session && locator) session.truncate(locator)
-            else chat.message = chat.message.slice(0, idx)
+            if (session && locator) {
+                requireCurrentConversationSession(session, currentConversationSession()).truncate(locator)
+            }
+            else {
+                const character = DBState.db.characters[selIdState.selId]
+                const chat = character?.chats[character.chatPage]
+                if (chat) chat.message = chat.message.slice(0, idx)
+            }
         }
         const remove = () => {
-            if (session && locator) session.delete(locator)
+            if (session && locator) {
+                requireCurrentConversationSession(session, currentConversationSession()).delete(locator)
+            }
             else {
+                const character = DBState.db.characters[selIdState.selId]
+                const chat = character?.chats[character.chatPage]
+                if (!chat) return
                 chat.message.splice(idx, 1)
                 chat.message = chat.message
             }
