@@ -6,7 +6,11 @@ import { encodeLegacyConversationProjection } from './conversationCompatibility.
 import { captureConversationMutationTarget } from './conversationMutations'
 import {
     applyConversationRerollTail,
+    appendConversationRerollHistory,
     captureConversationRerollTail,
+    captureConversationRerollTransition,
+    createConversationRerollHistory,
+    moveConversationRerollHistory,
     replaceConversationRerollLastData,
     truncateConversationForReroll,
 } from './conversationReroll'
@@ -67,7 +71,10 @@ describe('conversation reroll mutations', () => {
         })
         const target = captureConversationMutationTarget(character, conversation, session)
 
-        applyConversationRerollTail(target, tail, 'reroll')
+        applyConversationRerollTail(
+            target,
+            captureConversationRerollTransition(target, tail, 'reroll'),
+        )
 
         expect(conversation.message).toEqual(expected)
         expect(encodeLegacyConversationProjection({ message: conversation.message })).toEqual(
@@ -202,7 +209,14 @@ describe('conversation reroll mutations', () => {
         })
         const target = captureConversationMutationTarget(character, conversation, session)
 
-        applyConversationRerollTail(target, messages('restored'), 'unreroll')
+        applyConversationRerollTail(
+            target,
+            captureConversationRerollTransition(
+                target,
+                messages('restored'),
+                'unreroll',
+            ),
+        )
 
         expect(conversation.message.map((message) => message.data)).toEqual([
             'zero',
@@ -212,5 +226,230 @@ describe('conversation reroll mutations', () => {
         expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
             commands: ['replace-tail'],
         }))
+    })
+
+    it('rejects history after switching conversations within the same character', () => {
+        const conversationA = createConversation(messages('a-user', 'a-old'))
+        const conversationB = {
+            ...createConversation(messages('b-user', 'b-current')),
+            id: 'conversation-b',
+        }
+        const character = createCharacter(conversationA)
+        character.chats.push(conversationB)
+        const sessionA = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversationA.id,
+            conversation: conversationA,
+            storeRevision: 1,
+        })
+        const oldTarget = captureConversationMutationTarget(character, conversationA, sessionA)
+        let history = createConversationRerollHistory(
+            oldTarget,
+            captureConversationRerollTail(oldTarget, 1),
+        )
+        sessionA.reroll(sessionA.positionAt(1), [{ role: 'char', data: 'a-current' }])
+        const currentTarget = captureConversationMutationTarget(
+            character,
+            conversationA,
+            sessionA,
+        )
+        history = appendConversationRerollHistory(
+            history,
+            currentTarget,
+            captureConversationRerollTail(currentTarget, 1),
+        )
+
+        character.chatPage = 1
+        const sessionB = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversationB.id,
+            conversation: conversationB,
+            storeRevision: 1,
+        })
+        const switchedTarget = captureConversationMutationTarget(
+            character,
+            conversationB,
+            sessionB,
+        )
+
+        expect(moveConversationRerollHistory(
+            history,
+            switchedTarget,
+            'unreroll',
+        )).toBeNull()
+        expect(conversationA.message.map((message) => message.data)).toEqual([
+            'a-user',
+            'a-current',
+        ])
+        expect(conversationB.message.map((message) => message.data)).toEqual([
+            'b-user',
+            'b-current',
+        ])
+    })
+
+    it('rejects history after leaving and returning to the same conversation session', () => {
+        const conversation = createConversation(messages('user', 'old'))
+        const character = createCharacter(conversation)
+        const firstSession = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        const oldTarget = captureConversationMutationTarget(character, conversation, firstSession)
+        let history = createConversationRerollHistory(
+            oldTarget,
+            captureConversationRerollTail(oldTarget, 1),
+        )
+        firstSession.reroll(firstSession.positionAt(1), [{ role: 'char', data: 'current' }])
+        const currentTarget = captureConversationMutationTarget(
+            character,
+            conversation,
+            firstSession,
+        )
+        history = appendConversationRerollHistory(
+            history,
+            currentTarget,
+            captureConversationRerollTail(currentTarget, 1),
+        )
+        firstSession.invalidate()
+        const returnedSession = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        const returnedTarget = captureConversationMutationTarget(
+            character,
+            conversation,
+            returnedSession,
+        )
+
+        expect(moveConversationRerollHistory(
+            history,
+            returnedTarget,
+            'unreroll',
+        )).toBeNull()
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'user',
+            'current',
+        ])
+    })
+
+    it('rejects a stored tail position after an unmigrated direct tail replacement', () => {
+        const conversation = createConversation(messages('user', 'old'))
+        const character = createCharacter(conversation)
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        const oldTarget = captureConversationMutationTarget(character, conversation, session)
+        let history = createConversationRerollHistory(
+            oldTarget,
+            captureConversationRerollTail(oldTarget, 1),
+        )
+        session.reroll(session.positionAt(1), [{ role: 'char', data: 'current' }])
+        const currentTarget = captureConversationMutationTarget(character, conversation, session)
+        history = appendConversationRerollHistory(
+            history,
+            currentTarget,
+            captureConversationRerollTail(currentTarget, 1),
+        )
+        conversation.message[1] = { role: 'char', data: 'direct replacement' }
+        const directlyMutatedTarget = captureConversationMutationTarget(
+            character,
+            conversation,
+            session,
+        )
+
+        expect(moveConversationRerollHistory(
+            history,
+            directlyMutatedTarget,
+            'unreroll',
+        )).toBeNull()
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'user',
+            'direct replacement',
+        ])
+    })
+
+    it('rejects history after the same session version advances', () => {
+        const conversation = createConversation(messages('user', 'old'))
+        const character = createCharacter(conversation)
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        const oldTarget = captureConversationMutationTarget(character, conversation, session)
+        let history = createConversationRerollHistory(
+            oldTarget,
+            captureConversationRerollTail(oldTarget, 1),
+        )
+        session.reroll(session.positionAt(1), [{ role: 'char', data: 'current' }])
+        const currentTarget = captureConversationMutationTarget(character, conversation, session)
+        history = appendConversationRerollHistory(
+            history,
+            currentTarget,
+            captureConversationRerollTail(currentTarget, 1),
+        )
+        session.append({ role: 'char', data: 'newer session message' })
+        const advancedTarget = captureConversationMutationTarget(character, conversation, session)
+
+        expect(moveConversationRerollHistory(
+            history,
+            advancedTarget,
+            'unreroll',
+        )).toBeNull()
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'user',
+            'current',
+            'newer session message',
+        ])
+    })
+
+    it('preserves end-relative overlay behavior across undo and forward history', () => {
+        const conversation = createConversation(messages('base', 'old-a', 'old-b'))
+        const character = createCharacter(conversation)
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        const oldTarget = captureConversationMutationTarget(character, conversation, session)
+        let history = createConversationRerollHistory(
+            oldTarget,
+            captureConversationRerollTail(oldTarget, 1),
+        )
+        session.reroll(session.positionAt(1), [{ role: 'char', data: 'new-only' }])
+        let currentTarget = captureConversationMutationTarget(character, conversation, session)
+        history = appendConversationRerollHistory(
+            history,
+            currentTarget,
+            captureConversationRerollTail(currentTarget, 1),
+        )
+        const beforeUndo = structuredClone(conversation.message)
+
+        const undone = moveConversationRerollHistory(history, currentTarget, 'unreroll')
+
+        expect(undone).not.toBeNull()
+        expect(conversation.message).toEqual(legacyTailOverlay(
+            beforeUndo,
+            history.entries[0],
+        ))
+        currentTarget = captureConversationMutationTarget(character, conversation, session)
+        const beforeForward = structuredClone(conversation.message)
+
+        const forwarded = moveConversationRerollHistory(undone!, currentTarget, 'reroll')
+
+        expect(forwarded?.index).toBe(1)
+        expect(conversation.message).toEqual(legacyTailOverlay(
+            beforeForward,
+            history.entries[1],
+        ))
     })
 })

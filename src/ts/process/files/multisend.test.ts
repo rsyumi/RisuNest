@@ -94,4 +94,27 @@ describe('postChatFile PO append', () => {
         expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({ commands: ['append'] }))
         expect(mocks.sendChat).toHaveBeenCalledTimes(1)
     })
+
+    it('refreshes the target between owned PO session appends', async () => {
+        const character = mocks.dbState.db!.characters[0]
+        const conversation = character.chats[0]
+        mocks.session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        const input = new TextEncoder().encode(
+            'msgid "first"\nmsgstr ""\n\nmsgid "second"\nmsgstr ""\n\n',
+        )
+
+        await postChatFile({ name: 'input.po', data: input })
+
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'before',
+            'first',
+            'second',
+        ])
+        expect(mocks.sendChat).toHaveBeenCalledTimes(2)
+    })
 })

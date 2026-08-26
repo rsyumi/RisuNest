@@ -36,14 +36,22 @@
     import {
         appendConversationMessage,
         captureConversationMutationTarget,
+        isConversationMutationOwnerCurrent,
         isConversationMutationTargetCurrent,
+        refreshConversationMutationTarget,
         type ConversationMutationTarget,
     } from '../../ts/conversationMutations';
+    import { appendDefaultChatInput } from './defaultChatInput';
     import {
-        applyConversationRerollTail,
+        appendConversationRerollHistory,
         captureConversationRerollTail,
+        createConversationRerollHistory,
+        isConversationRerollHistoryCurrent,
+        moveConversationRerollHistory,
+        refreshConversationRerollHistory,
         replaceConversationRerollLastData,
         truncateConversationForReroll,
+        type ConversationRerollHistory,
     } from '../../ts/conversationReroll';
     import {
         LatestChatScrollRequestGuard,
@@ -64,9 +72,7 @@
     let openMenu = $state(false)
     let loadPages = $state(getInitialChatLoadPages(DBState.db))
     let autoMode = $state(false)
-    let rerolls:Message[][] = []
-    let rerollid = -1
-    let lastCharId = -1
+    let rerollHistory:ConversationRerollHistory|null = null
     let doingChatInputTranslate = false
     let toggleStickers:boolean = $state(false)
     let fileInput:string[] = $state([])
@@ -97,6 +103,46 @@
             character?.chats[character.chatPage],
             getActiveConversationSession(),
         )
+    }
+
+    function conversationOwnerIsCurrent(target: ConversationMutationTarget): boolean {
+        const character = DBState.db.characters[$selectedCharID]
+        return isConversationMutationOwnerCurrent(
+            target,
+            character,
+            character?.chats[character.chatPage],
+            getActiveConversationSession(),
+        )
+    }
+
+    function refreshCurrentConversationTarget(
+        target: ConversationMutationTarget,
+    ): ConversationMutationTarget | null {
+        const character = DBState.db.characters[$selectedCharID]
+        return refreshConversationMutationTarget(
+            target,
+            character,
+            character?.chats[character.chatPage],
+            getActiveConversationSession(),
+        )
+    }
+
+    function getCurrentRerollHistory(
+        target: ConversationMutationTarget,
+    ): ConversationRerollHistory | null {
+        if (!rerollHistory) return null
+        if (!isConversationRerollHistoryCurrent(rerollHistory, target)) {
+            rerollHistory = null
+            return null
+        }
+        return rerollHistory
+    }
+
+    function refreshRerollHistoryAfterOwnedMutation(
+        target: ConversationMutationTarget,
+    ): void {
+        if (!rerollHistory) return
+        rerollHistory = refreshConversationRerollHistory(rerollHistory, target)
     }
 
     function scrollToBottom() {
@@ -222,11 +268,7 @@
         if($doingChat){
             return
         }
-        if(lastCharId !== $selectedCharID){
-            rerolls = []
-            rerollid = -1
-        }
-        const mutationTarget = captureCurrentConversationTarget()
+        let mutationTarget = captureCurrentConversationTarget()
         if (!mutationTarget) return
         const character = mutationTarget.character
         let messages = mutationTarget.conversation.message
@@ -262,19 +304,23 @@
         }
         else{
             if(character.type === 'character'){
-                let triggerResult = await runTrigger(character,'input', {chat: mutationTarget.conversation})
-                if (!conversationTargetIsCurrent(mutationTarget)) return
-                if(triggerResult){
-                    messages = triggerResult.chat.message
-                }
-                const processedInput = await processScript(character,messageInput,'editinput')
-                if (!conversationTargetIsCurrent(mutationTarget)) return
-                appendConversationMessage(mutationTarget, {
-                    role: 'user',
-                    data: processedInput,
-                    time: Date.now(),
-                    name: $ConnectionOpenStore ? DBState.db.username : null
-                }, messages)
+                const appended = await appendDefaultChatInput({
+                    target: mutationTarget,
+                    runInputTrigger: () => runTrigger(
+                        character,
+                        'input',
+                        { chat: mutationTarget.conversation },
+                    ),
+                    processInput: () => processScript(character, messageInput, 'editinput'),
+                    isTargetCurrent: () => conversationTargetIsCurrent(mutationTarget),
+                    createMessage: (data) => ({
+                        role: 'user',
+                        data,
+                        time: Date.now(),
+                        name: $ConnectionOpenStore ? DBState.db.username : null
+                    }),
+                })
+                if (!appended) return
             }
             else{
                 appendConversationMessage(mutationTarget, {
@@ -287,7 +333,10 @@
         }
         messageInput = ''
         messageInputTranslate = ''
-        rerolls = []
+        rerollHistory = null
+        const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
+        if (!refreshedTarget) return
+        mutationTarget = refreshedTarget
         await sleep(10)
         if (!conversationTargetIsCurrent(mutationTarget)) return
         updateInputSizeAll()
@@ -299,35 +348,44 @@
         if($doingChat){
             return
         }
-        if(lastCharId !== $selectedCharID){
-            rerolls = []
-            rerollid = -1
-        }
         const mutationTarget = captureCurrentConversationTarget()
         if (!mutationTarget) return
+        let history = getCurrentRerollHistory(mutationTarget)
         const genId = mutationTarget.conversation.message.at(-1)?.generationInfo?.generationId
         if(genId){
             const r = Prereroll(genId)
             if(r){
                 replaceConversationRerollLastData(mutationTarget, r, 'reroll')
+                const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
+                if (refreshedTarget) refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
+                else rerollHistory = null
                 return
             }
         }
-        if(rerollid < rerolls.length - 1){
-            if(Array.isArray(rerolls[rerollid + 1])){
-                rerollid += 1
-                applyConversationRerollTail(mutationTarget, rerolls[rerollid], 'reroll')
-            }
+        if(history?.forward){
+            rerollHistory = moveConversationRerollHistory(
+                history,
+                mutationTarget,
+                'reroll',
+            )
             return
         }
-        if(rerolls.length === 0){
+        if(!history){
             const messages = mutationTarget.conversation.message
-            rerolls.push(messages.length > 0
+            const tail = messages.length > 0
                 ? captureConversationRerollTail(mutationTarget, messages.length - 1)
-                : [undefined as Message])
-            rerollid = rerolls.length - 1
+                : [undefined as Message]
+            history = createConversationRerollHistory(mutationTarget, tail)
+            rerollHistory = history
         }
         if (!truncateConversationForReroll(mutationTarget)) return
+        const truncatedTarget = refreshCurrentConversationTarget(mutationTarget)
+        if (!truncatedTarget) {
+            rerollHistory = null
+            return
+        }
+        rerollHistory = refreshConversationRerollHistory(history, truncatedTarget)
+        if (!rerollHistory) return
         openMenu = false
         await sendChatMain()
     }
@@ -336,33 +394,34 @@
         if($doingChat){
             return
         }
-        if(lastCharId !== $selectedCharID){
-            rerolls = []
-            rerollid = -1
-        }
         const mutationTarget = captureCurrentConversationTarget()
         if (!mutationTarget) return
+        const history = getCurrentRerollHistory(mutationTarget)
+        if (!history) return
         const genId = mutationTarget.conversation.message.at(-1)?.generationInfo?.generationId
         if(genId){
             const r = PreUnreroll(genId)
             if(r){
                 replaceConversationRerollLastData(mutationTarget, r, 'unreroll')
+                const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
+                if (refreshedTarget) refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
+                else rerollHistory = null
                 return
             }
         }
-        if(rerollid <= 0){
+        if(history.index <= 0){
             return
         }
-        if(Array.isArray(rerolls[rerollid - 1])){
-            rerollid -= 1
-            applyConversationRerollTail(mutationTarget, rerolls[rerollid], 'unreroll')
-        }
+        rerollHistory = moveConversationRerollHistory(
+            history,
+            mutationTarget,
+            'unreroll',
+        )
     }
 
     let abortController:null|AbortController = null
 
     async function sendChatMain(continued:boolean = false) {
-        const selectedCharacterIndex = $selectedCharID
         const mutationTarget = captureCurrentConversationTarget()
         if (!mutationTarget) return
         const previousLength = mutationTarget.conversation.message.length
@@ -373,18 +432,27 @@
                 signal:abortController.signal,
                 continue:continued
             })
+            const refreshedTarget = conversationOwnerIsCurrent(mutationTarget)
+                ? refreshCurrentConversationTarget(mutationTarget)
+                : null
             if (
-                conversationTargetIsCurrent(mutationTarget) &&
-                previousLength < mutationTarget.conversation.message.length
+                refreshedTarget &&
+                previousLength < refreshedTarget.conversation.message.length
             ) {
-                rerolls.push(captureConversationRerollTail(mutationTarget, previousLength))
-                rerollid = rerolls.length - 1
+                const tail = captureConversationRerollTail(refreshedTarget, previousLength)
+                const refreshedHistory = rerollHistory
+                    ? refreshConversationRerollHistory(rerollHistory, refreshedTarget)
+                    : null
+                rerollHistory = refreshedHistory
+                    ? appendConversationRerollHistory(refreshedHistory, refreshedTarget, tail)
+                    : createConversationRerollHistory(refreshedTarget, tail)
+            } else if (refreshedTarget) {
+                refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
             }
         } catch (error) {
             console.error(error)
             alertError(error)
         }
-        if (conversationTargetIsCurrent(mutationTarget)) lastCharId = selectedCharacterIndex
         $doingChat = false
         if(DBState.db.playMessage){
             const audio = new Audio(sendSound);

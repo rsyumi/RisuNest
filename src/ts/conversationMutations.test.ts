@@ -7,6 +7,7 @@ import {
     appendConversationComment,
     appendConversationMessage,
     captureConversationMutationTarget,
+    ConversationMutationTargetStaleError,
     cutConversationMessages,
     isConversationMutationTargetCurrent,
     resetConversationWithMessage,
@@ -253,5 +254,36 @@ describe('conversation mutations', () => {
         expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
             commands: ['replace-tail', 'append'],
         }))
+    })
+
+    it('rejects an awaited append after the same session version advances', () => {
+        const conversation = createConversation([{ role: 'user', data: 'before trigger' }])
+        const character = createCharacter(conversation)
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+        const target = captureConversationMutationTarget(character, conversation, session)
+        const triggerMessages: Message[] = [{ role: 'char', data: 'stale trigger result' }]
+
+        session.append({ role: 'char', data: 'newer session message' })
+
+        expect(isConversationMutationTargetCurrent(
+            target,
+            character,
+            conversation,
+            session,
+        )).toBe(false)
+        expect(() => appendConversationMessage(
+            target,
+            { role: 'user', data: 'stale input' },
+            triggerMessages,
+        )).toThrow(ConversationMutationTargetStaleError)
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'before trigger',
+            'newer session message',
+        ])
     })
 })

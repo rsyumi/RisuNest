@@ -11,6 +11,7 @@ import {
     appendConversationMessage,
     captureConversationMutationTarget,
     isConversationMutationTargetCurrent,
+    refreshConversationMutationTarget,
 } from 'src/ts/conversationMutations';
 
 type sendFileArg = {
@@ -28,7 +29,7 @@ async function sendPofile(arg:sendFileArg){
     const selectedCharacterIndex = get(selectedCharID)
     const currentCharacter = DBState.db.characters[selectedCharacterIndex]
     const currentConversation = currentCharacter.chats[currentCharacter.chatPage]
-    const mutationTarget = captureConversationMutationTarget(
+    let mutationTarget = captureConversationMutationTarget(
         currentCharacter,
         currentConversation,
         getActiveConversationSession(),
@@ -41,6 +42,18 @@ async function sendPofile(arg:sendFileArg){
             character?.chats[character.chatPage],
             getActiveConversationSession(),
         )
+    }
+    const refreshMutationTarget = () => {
+        const character = DBState.db.characters[get(selectedCharID)]
+        const refreshedTarget = refreshConversationMutationTarget(
+            mutationTarget,
+            character,
+            character?.chats[character.chatPage],
+            getActiveConversationSession(),
+        )
+        if (!refreshedTarget) return false
+        mutationTarget = refreshedTarget
+        return true
     }
     const lines = arg.file.split('\n')
     for(let i=0;i<lines.length;i++){
@@ -63,9 +76,10 @@ async function sendPofile(arg:sendFileArg){
                 role: 'user',
                 data: text
             })
+            if (!refreshMutationTarget()) return
             doingChat.set(false)
             await sendChat(-1);
-            if (!mutationTargetIsCurrent()) return
+            if (!refreshMutationTarget()) return
             const res = currentConversation.message[currentConversation.message.length-1]
             const msgStr = res.data.split('\n').filter((a) => {
                 return a !== ''

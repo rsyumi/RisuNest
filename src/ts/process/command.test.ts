@@ -129,6 +129,26 @@ describe('processMultiCommand conversation mutations', () => {
         expect(mocks.sendChat).toHaveBeenCalledTimes(1)
     })
 
+    it('refreshes the target after each owned session multisend mutation', async () => {
+        const character = mocks.database!.characters[0]
+        const conversation = character.chats[0]
+        mocks.session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+        })
+
+        await expect(processMultiCommand('/multisend "first|||second"')).resolves.toBe('')
+
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'before',
+            '"first',
+            'second"',
+        ])
+        expect(mocks.sendChat).toHaveBeenCalledTimes(2)
+    })
+
     it.each([
         ['/cut 1-3', ['one', 'two']],
         ['/cut 1', ['one']],

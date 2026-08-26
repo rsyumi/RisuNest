@@ -14,6 +14,7 @@ import {
     captureConversationMutationTarget,
     cutConversationMessages,
     isConversationMutationTargetCurrent,
+    refreshConversationMutationTarget,
     resetConversationWithMessage,
     retainConversationDeleteSlice,
 } from '../conversationMutations'
@@ -54,7 +55,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
     const selectedCharacterIndex = get(selectedCharID)
     const currentChar = db.characters[selectedCharacterIndex]
     const currentChat = currentChar.chats[currentChar.chatPage]
-    const mutationTarget = captureConversationMutationTarget(
+    let mutationTarget = captureConversationMutationTarget(
         currentChar,
         currentChat,
         getActiveConversationSession(),
@@ -69,6 +70,20 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
             character?.chats[character.chatPage],
             getActiveConversationSession(),
         )
+    }
+    const refreshMutationTarget = () => {
+        const currentDatabase = getDatabase()
+        const currentIndex = get(selectedCharID)
+        const character = currentDatabase.characters[currentIndex]
+        const refreshedTarget = refreshConversationMutationTarget(
+            mutationTarget,
+            character,
+            character?.chats[character.chatPage],
+            getActiveConversationSession(),
+        )
+        if (!refreshedTarget) return false
+        mutationTarget = refreshedTarget
+        return true
     }
     let {commandName, arg, namedArg} = commandParser(command, pipe)
 
@@ -186,8 +201,9 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
                 } as const
                 if(clearMode) resetConversationWithMessage(mutationTarget, message)
                 else appendConversationMessage(mutationTarget, message)
+                if (!refreshMutationTarget()) return false
                 await sendChat(-1)
-                if (!mutationTargetIsCurrent()) return false
+                if (!refreshMutationTarget()) return false
             }
             return ''
         }

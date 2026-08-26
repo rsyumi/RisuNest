@@ -1,4 +1,7 @@
-import type { ActiveConversationSession } from './storage/activeConversationSession'
+import type {
+    ActiveConversationSession,
+    ConversationPosition,
+} from './storage/activeConversationSession'
 import type { Chat, Database, Message } from './storage/database.svelte'
 
 type ConversationCharacter = Database['characters'][number]
@@ -6,7 +9,18 @@ type ConversationCharacter = Database['characters'][number]
 export interface ConversationMutationTarget {
     character: ConversationCharacter
     conversation: Chat
+    messages: Message[]
+    messageCount: number
     session: ActiveConversationSession | null
+    sessionVersion: number | null
+    startPosition: ConversationPosition | null
+}
+
+export class ConversationMutationTargetStaleError extends Error {
+    constructor() {
+        super('Conversation mutation target is stale')
+        this.name = 'ConversationMutationTargetStaleError'
+    }
 }
 
 export function captureConversationMutationTarget(
@@ -15,10 +29,32 @@ export function captureConversationMutationTarget(
     candidateSession: ActiveConversationSession | null,
 ): ConversationMutationTarget {
     const session = getMatchingConversationSession(character, conversation, candidateSession)
-    return { character, conversation, session }
+    return {
+        character,
+        conversation,
+        messages: conversation.message,
+        messageCount: conversation.message.length,
+        session,
+        sessionVersion: session?.version ?? null,
+        startPosition: session?.positionAt(0) ?? null,
+    }
 }
 
 export function isConversationMutationTargetCurrent(
+    target: ConversationMutationTarget,
+    character: ConversationCharacter | undefined,
+    conversation: Chat | undefined,
+    candidateSession: ActiveConversationSession | null,
+): boolean {
+    return isConversationMutationOwnerCurrent(
+        target,
+        character,
+        conversation,
+        candidateSession,
+    ) && isConversationMutationTargetStateCurrent(target)
+}
+
+export function isConversationMutationOwnerCurrent(
     target: ConversationMutationTarget,
     character: ConversationCharacter | undefined,
     conversation: Chat | undefined,
@@ -29,17 +65,33 @@ export function isConversationMutationTargetCurrent(
         getMatchingConversationSession(character, conversation, candidateSession) === target.session
 }
 
+export function refreshConversationMutationTarget(
+    target: ConversationMutationTarget,
+    character: ConversationCharacter | undefined,
+    conversation: Chat | undefined,
+    candidateSession: ActiveConversationSession | null,
+): ConversationMutationTarget | null {
+    if (!character || !conversation || !isConversationMutationOwnerCurrent(
+        target,
+        character,
+        conversation,
+        candidateSession,
+    )) return null
+    return captureConversationMutationTarget(character, conversation, candidateSession)
+}
+
 export function appendConversationMessage(
     target: ConversationMutationTarget,
     message: Message,
-    baseMessages: Message[] = target.conversation.message,
+    baseMessages: Message[] = target.messages,
 ): void {
+    assertConversationMutationTargetCurrent(target)
     if (target.session) {
-        if (baseMessages === target.conversation.message) {
+        if (baseMessages === target.messages) {
             target.session.append(message)
         } else {
             target.session.transaction((transaction) => {
-                transaction.replaceTail(transaction.positionAt(0), baseMessages)
+                transaction.replaceTail(target.startPosition!, baseMessages)
                 transaction.append(message)
             })
         }
@@ -55,6 +107,7 @@ export function appendConversationComment(
     target: ConversationMutationTarget,
     addition: string,
 ): void {
+    assertConversationMutationTargetCurrent(target)
     const absoluteIndex = target.conversation.message.length - 1
     const message = target.conversation.message[absoluteIndex]
     if (!message) throw new TypeError("Cannot read properties of undefined (reading 'data')")
@@ -72,6 +125,7 @@ export function cutConversationMessages(
     target: ConversationMutationTarget,
     argument: string,
 ): void {
+    assertConversationMutationTargetCurrent(target)
     if (argument.includes('-')) {
         const [start, end] = argument.split('-')
         replaceConversationMessages(
@@ -96,6 +150,7 @@ export function retainConversationDeleteSlice(
     target: ConversationMutationTarget,
     argument: string,
 ): void {
+    assertConversationMutationTargetCurrent(target)
     const size = parseInt(argument)
     if (isNaN(size)) return
     replaceConversationMessages(
@@ -108,9 +163,10 @@ export function resetConversationWithMessage(
     target: ConversationMutationTarget,
     message: Message,
 ): void {
+    assertConversationMutationTargetCurrent(target)
     if (target.session) {
         target.session.transaction((transaction) => {
-            transaction.replaceTail(transaction.positionAt(0), [])
+            transaction.replaceTail(target.startPosition!, [])
             transaction.append(message)
         })
     } else {
@@ -123,11 +179,27 @@ function replaceConversationMessages(
     target: ConversationMutationTarget,
     messages: readonly Message[],
 ): void {
+    assertConversationMutationTargetCurrent(target)
     if (target.session) {
-        target.session.replaceTail(target.session.positionAt(0), messages)
+        target.session.replaceTail(target.startPosition!, messages)
     } else {
         target.conversation.message = [...messages]
     }
+}
+
+export function assertConversationMutationTargetCurrent(target: ConversationMutationTarget): void {
+    if (!isConversationMutationTargetStateCurrent(target)) {
+        throw new ConversationMutationTargetStaleError()
+    }
+}
+
+function isConversationMutationTargetStateCurrent(target: ConversationMutationTarget): boolean {
+    if (target.conversation.message !== target.messages) return false
+    if (target.conversation.message.length !== target.messageCount) return false
+    if (!target.session) return target.sessionVersion === null && target.startPosition === null
+    return target.session.isActive &&
+        target.session.version === target.sessionVersion &&
+        target.session.materializeCompatibilityArray() === target.messages
 }
 
 function getMatchingConversationSession(
