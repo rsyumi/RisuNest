@@ -228,9 +228,6 @@ pub(crate) fn preflight_zip(
         return Ok(None);
     }
 
-    if disk_number != 0 || central_disk != 0 {
-        return Ok(None);
-    }
     let locator_index = eocd_index.checked_sub(ZIP64_LOCATOR_BYTES);
     if locator_index
         .is_some_and(|index| tail.get(index..index + 4) == Some(ZIP64_LOCATOR_SIGNATURE))
@@ -245,6 +242,9 @@ pub(crate) fn preflight_zip(
             max_directory_bytes,
             cancelled,
         );
+    }
+    if disk_number != 0 || central_disk != 0 {
+        return Ok(None);
     }
     if disk_entries != total_entries {
         return Ok(None);

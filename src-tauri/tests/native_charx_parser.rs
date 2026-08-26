@@ -107,6 +107,15 @@ fn local_offset(archive: &[u8], central_offset: usize) -> usize {
     ) as usize
 }
 
+fn local_extra_offset(archive: &[u8], local_offset: usize) -> usize {
+    let name_length = u16::from_le_bytes(
+        archive[local_offset + 26..local_offset + 28]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    local_offset + 30 + name_length
+}
+
 fn card_json_with_data(data: &str) -> String {
     format!(r#"{{"spec":"chara_card_v3","spec_version":"3.0","data":{data}}}"#)
 }
@@ -123,7 +132,7 @@ fn stored_zip_with_data_descriptors(entries: &[(&str, &[u8])]) -> Vec<u8> {
 
         archive.extend_from_slice(b"PK\x03\x04");
         archive.extend_from_slice(&20_u16.to_le_bytes());
-        archive.extend_from_slice(&0x000c_u16.to_le_bytes());
+        archive.extend_from_slice(&0x0008_u16.to_le_bytes());
         archive.extend_from_slice(&0_u16.to_le_bytes());
         archive.extend_from_slice(&0_u16.to_le_bytes());
         archive.extend_from_slice(&0_u16.to_le_bytes());
@@ -146,7 +155,7 @@ fn stored_zip_with_data_descriptors(entries: &[(&str, &[u8])]) -> Vec<u8> {
         archive.extend_from_slice(b"PK\x01\x02");
         archive.extend_from_slice(&20_u16.to_le_bytes());
         archive.extend_from_slice(&20_u16.to_le_bytes());
-        archive.extend_from_slice(&0x000c_u16.to_le_bytes());
+        archive.extend_from_slice(&0x0008_u16.to_le_bytes());
         archive.extend_from_slice(&0_u16.to_le_bytes());
         archive.extend_from_slice(&0_u16.to_le_bytes());
         archive.extend_from_slice(&0_u16.to_le_bytes());
@@ -165,6 +174,60 @@ fn stored_zip_with_data_descriptors(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let directory_size = u32::try_from(archive.len()).unwrap() - directory_offset;
     let count = u16::try_from(entries.len()).unwrap();
     archive.extend_from_slice(&classic_eocd(count, directory_size, directory_offset));
+    archive
+}
+
+fn aes_method_zip_with_clear_encryption_flag(name: &str, data: &[u8]) -> Vec<u8> {
+    let name = name.as_bytes();
+    let name_length = u16::try_from(name.len()).unwrap();
+    let size = u32::try_from(data.len()).unwrap();
+    let crc = crc32(data);
+    let mut aes_extra = Vec::new();
+    aes_extra.extend_from_slice(&0x9901_u16.to_le_bytes());
+    aes_extra.extend_from_slice(&7_u16.to_le_bytes());
+    aes_extra.extend_from_slice(&2_u16.to_le_bytes());
+    aes_extra.extend_from_slice(&0x4541_u16.to_le_bytes());
+    aes_extra.push(1);
+    aes_extra.extend_from_slice(&0_u16.to_le_bytes());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(b"PK\x03\x04");
+    archive.extend_from_slice(&51_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&99_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&crc.to_le_bytes());
+    archive.extend_from_slice(&size.to_le_bytes());
+    archive.extend_from_slice(&size.to_le_bytes());
+    archive.extend_from_slice(&name_length.to_le_bytes());
+    archive.extend_from_slice(&u16::try_from(aes_extra.len()).unwrap().to_le_bytes());
+    archive.extend_from_slice(name);
+    archive.extend_from_slice(&aes_extra);
+    archive.extend_from_slice(data);
+
+    let directory_offset = u32::try_from(archive.len()).unwrap();
+    archive.extend_from_slice(b"PK\x01\x02");
+    archive.extend_from_slice(&51_u16.to_le_bytes());
+    archive.extend_from_slice(&51_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&99_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&crc.to_le_bytes());
+    archive.extend_from_slice(&size.to_le_bytes());
+    archive.extend_from_slice(&size.to_le_bytes());
+    archive.extend_from_slice(&name_length.to_le_bytes());
+    archive.extend_from_slice(&u16::try_from(aes_extra.len()).unwrap().to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(name);
+    archive.extend_from_slice(&aes_extra);
+    let directory_size = u32::try_from(archive.len()).unwrap() - directory_offset;
+    archive.extend_from_slice(&classic_eocd(1, directory_size, directory_offset));
     archive
 }
 
@@ -761,6 +824,23 @@ fn zip64_locator_is_authoritative_and_invalid_offsets_do_not_escape_the_archive_
 }
 
 #[test]
+fn zip64_record_accepts_classic_disk_sentinels_then_proves_single_disk_authoritatively() {
+    let mut archive = promote_classic_zip_to_zip64(zip_bytes(&valid_entries(), false));
+    let eocd = archive.len() - 22;
+    archive[eocd + 4..eocd + 6].copy_from_slice(&u16::MAX.to_le_bytes());
+    archive[eocd + 6..eocd + 8].copy_from_slice(&u16::MAX.to_le_bytes());
+
+    let (_directory, inspection) = parse_card(
+        "classic-disk-sentinels.charx",
+        &archive,
+        CharXLimits::default(),
+    )
+    .expect("the authoritative ZIP64 locator and record prove a single-disk archive");
+
+    assert!(matches!(inspection, CharXInspection::Card(_)));
+}
+
+#[test]
 fn rejects_classic_and_zip64_multi_disk_fields() {
     let classic = zip_bytes(&valid_entries(), false);
     let eocd = classic.len() - 22;
@@ -882,6 +962,70 @@ fn rejects_central_disk_symlink_and_local_header_disagreements() {
         CharXLimits::default(),
         CharXParseErrorCode::InvalidArchive,
     );
+
+    for flag in [1_u16 << 1, 1_u16 << 2] {
+        let archive = zip_bytes(&valid_entries(), false);
+        let central = central_entry_offsets(&archive)[0];
+        let local = local_offset(&archive, central);
+        let mut stored_reserved_flag = archive;
+        stored_reserved_flag[central + 8..central + 10].copy_from_slice(&flag.to_le_bytes());
+        stored_reserved_flag[local + 6..local + 8].copy_from_slice(&flag.to_le_bytes());
+        expect_error(
+            "stored-reserved-compression-flag.charx",
+            &stored_reserved_flag,
+            CharXLimits::default(),
+            CharXParseErrorCode::InvalidArchive,
+        );
+    }
+}
+
+#[test]
+fn rejects_missing_or_inconsistent_local_zip64_size_extra_values() {
+    let archive = zip_bytes(&valid_entries(), true);
+    let central = central_entry_offsets(&archive)[0];
+    let local = local_offset(&archive, central);
+    assert_eq!(
+        u32::from_le_bytes(archive[local + 18..local + 22].try_into().unwrap()),
+        u32::MAX
+    );
+    assert_eq!(
+        u32::from_le_bytes(archive[local + 22..local + 26].try_into().unwrap()),
+        u32::MAX
+    );
+    let extra = local_extra_offset(&archive, local);
+    assert_eq!(&archive[extra..extra + 2], &1_u16.to_le_bytes());
+
+    let mut missing = archive.clone();
+    missing[extra..extra + 2].copy_from_slice(&2_u16.to_le_bytes());
+    expect_error(
+        "missing-local-zip64-extra.charx",
+        &missing,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+
+    let mut inconsistent = archive;
+    let decoded = u64::from_le_bytes(inconsistent[extra + 4..extra + 12].try_into().unwrap());
+    inconsistent[extra + 4..extra + 12].copy_from_slice(&(decoded + 1).to_le_bytes());
+    expect_error(
+        "inconsistent-local-zip64-extra.charx",
+        &inconsistent,
+        CharXLimits::default(),
+        CharXParseErrorCode::InvalidArchive,
+    );
+}
+
+#[test]
+fn rejects_raw_aes_method_without_panicking_when_zip_rewrites_the_effective_method() {
+    let card = card_json_with_data(r#"{"name":"aes","extensions":{},"assets":[]}"#);
+    let archive = aes_method_zip_with_clear_encryption_flag("card.json", card.as_bytes());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_card("aes.charx", &archive, CharXLimits::default())
+    }));
+
+    let parse_result = result.expect("hostile AES metadata must never reach a zip reader panic");
+    let error = parse_result.expect_err("raw method 99 must be rejected before decoded access");
+    assert_eq!(error.code(), CharXParseErrorCode::InvalidArchive);
 }
 
 #[test]

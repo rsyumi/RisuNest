@@ -22,6 +22,9 @@ const CENTRAL_DIRECTORY_HEADER_BYTES: usize = 46;
 const LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
 const LOCAL_FILE_HEADER_BYTES: usize = 30;
 const DATA_DESCRIPTOR_SIGNATURE: u32 = 0x0807_4b50;
+const ZIP64_EXTRA_FIELD_KIND: u16 = 0x0001;
+const AES_COMPRESSION_METHOD: u16 = 99;
+const DEFLATE_COMPRESSION_METHOD: u16 = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CharXLimits {
@@ -878,11 +881,22 @@ where
             "CharX local and central compression methods differ",
         ));
     }
+    if central_method == AES_COMPRESSION_METHOD {
+        return Err(invalid_archive(
+            "AES-encrypted CharX entries are unsupported",
+        ));
+    }
     if central_flags & 1 != 0 {
         return Err(invalid_archive("encrypted CharX entries are unsupported"));
     }
-    const SUPPORTED_FLAGS: u16 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 11);
-    if central_flags & !SUPPORTED_FLAGS != 0 {
+    let compression_flags = central_flags & ((1 << 1) | (1 << 2));
+    if compression_flags != 0 && central_method != DEFLATE_COMPRESSION_METHOD {
+        return Err(invalid_archive(
+            "CharX compression-option flags do not apply to this method",
+        ));
+    }
+    const COMMON_SUPPORTED_FLAGS: u16 = (1 << 3) | (1 << 11);
+    if central_flags & !(COMMON_SUPPORTED_FLAGS | compression_flags) != 0 {
         return Err(invalid_archive(
             "CharX entry uses unsupported general-purpose flags",
         ));
@@ -917,6 +931,18 @@ where
         ));
     }
 
+    let extra_start = name_start
+        .checked_add(name_length)
+        .ok_or_else(|| invalid_archive("CharX local extra offset overflowed"))?;
+    let local_extra = read_bytes_at(
+        source_path,
+        extra_start,
+        usize::try_from(extra_length)
+            .map_err(|_| invalid_archive("CharX local extra length does not fit memory"))?,
+        cancellation,
+        "local ZIP extra data",
+    )?;
+
     let data_end = data_start
         .checked_add(entry.compressed_size())
         .ok_or_else(|| invalid_archive("CharX compressed data extent overflowed"))?;
@@ -925,6 +951,13 @@ where
     let local_decoded = read_u32(&local, 22).unwrap();
     let central_compressed = read_u32(&central, 20).unwrap();
     let central_decoded = read_u32(&central, 24).unwrap();
+    validate_local_zip64_sizes(
+        &local_extra,
+        local_compressed,
+        local_decoded,
+        entry.compressed_size(),
+        entry.size(),
+    )?;
     let descriptor_uses_zip64 = local_compressed == u32::MAX
         || local_decoded == u32::MAX
         || central_compressed == u32::MAX
@@ -987,6 +1020,58 @@ where
         central_start: central_relative_start,
         central_end,
     })
+}
+
+fn validate_local_zip64_sizes(
+    extra: &[u8],
+    local_compressed: u32,
+    local_decoded: u32,
+    expected_compressed: u64,
+    expected_decoded: u64,
+) -> Result<(), CharXParseError> {
+    if local_compressed != u32::MAX && local_decoded != u32::MAX {
+        return Ok(());
+    }
+
+    let mut offset = 0_usize;
+    let mut zip64_values = None;
+    while offset < extra.len() {
+        let kind = read_u16(extra, offset)
+            .ok_or_else(|| invalid_archive("CharX local extra field header is truncated"))?;
+        let length = usize::from(
+            read_u16(extra, offset + 2)
+                .ok_or_else(|| invalid_archive("CharX local extra field header is truncated"))?,
+        );
+        let value_start = offset
+            .checked_add(4)
+            .ok_or_else(|| invalid_archive("CharX local extra field offset overflowed"))?;
+        let value_end = value_start
+            .checked_add(length)
+            .filter(|end| *end <= extra.len())
+            .ok_or_else(|| invalid_archive("CharX local extra field is truncated"))?;
+        if kind == ZIP64_EXTRA_FIELD_KIND
+            && zip64_values
+                .replace(&extra[value_start..value_end])
+                .is_some()
+        {
+            return Err(invalid_archive(
+                "CharX local header has duplicate ZIP64 extra fields",
+            ));
+        }
+        offset = value_end;
+    }
+
+    let values = zip64_values
+        .ok_or_else(|| invalid_archive("CharX local ZIP64 sizes have no ZIP64 extra field"))?;
+    if values.len() < 16
+        || read_u64(values, 0) != Some(expected_decoded)
+        || read_u64(values, 8) != Some(expected_compressed)
+    {
+        return Err(invalid_archive(
+            "CharX local ZIP64 size values differ from the central directory",
+        ));
+    }
+    Ok(())
 }
 
 fn descriptor_placeholder_matches(value: u32, expected: u32) -> bool {
