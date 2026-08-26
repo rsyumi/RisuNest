@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import type { customscript } from '../storage/database.svelte'
-import { executeRegexPlanSync, getRegexExecutionPlan } from './regexExecutionPlan'
+import { roadmap14Corpus } from '../storage/tests/roadmap14/losslessCorpus'
+import {
+    canExecuteRegexPlanInWorker,
+    executeRegexPlanSync,
+    getRegexExecutionPlan,
+} from './regexExecutionPlan'
 import { classifyRegexSafePlan, tokenizeRegexReplacement } from './regexSafePlan'
 import { fnv1a, makeRegexFixture } from './tests/phase1Fixtures'
 
@@ -242,6 +247,34 @@ describe('Rust regex safe-plan classifier', () => {
             expect(authority.errors).toEqual([])
         },
     )
+
+    it('keeps Rust-safe eligibility above the gate for current project fixtures', () => {
+        const compatibilityScripts = roadmap14Corpus.database.characters.flatMap(
+            (character) => character.customscript ?? [],
+        )
+        const fixtures = [
+            ...([20, 100, 500] as const).map((ruleCount) => makeRegexFixture(ruleCount)),
+            { scripts: compatibilityScripts, input: 'fixture' },
+            { scripts: [script('(?=a)a')], input: 'a' },
+            { scripts: [script('(a)\\1')], input: 'aa' },
+            { scripts: [script('(?<named>a)')], input: 'a' },
+            { scripts: [script('a', 'x', 'y')], input: 'a' },
+            { scripts: [script('[')], input: 'a' },
+        ]
+        const workerEligible = fixtures
+            .map(({ scripts, input }) => ({
+                plan: getRegexExecutionPlan(scripts, 'editoutput'),
+                input,
+            }))
+            .filter(({ plan, input }) => canExecuteRegexPlanInWorker(plan, input))
+        const rustSafe = workerEligible.filter(
+            ({ plan, input }) => classifyRegexSafePlan(plan, input).accepted,
+        )
+
+        expect(workerEligible).toHaveLength(9)
+        expect(rustSafe).toHaveLength(4)
+        expect(rustSafe.length / workerEligible.length).toBeGreaterThanOrEqual(0.25)
+    })
 
     it('rejects every generated forbidden-AST mutation', () => {
         const safePatterns = ['a', '[A-Z]', '(a|b)', '(?:x|y){1,3}']
