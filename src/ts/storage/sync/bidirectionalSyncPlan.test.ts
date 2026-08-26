@@ -252,6 +252,137 @@ describe('planBidirectionalSync', () => {
         })
     })
 
+    it('requires both descendants to retain or tombstone a live common-base record', async () => {
+        const liveBase = manifest({
+            generation: 'live-base',
+            sequence: '1',
+            sourceRevision: 1,
+            records: [live(keys.preset, hashes.baseRoot)],
+        })
+        const retained = manifest({
+            generation: 'live-retained',
+            sequence: '2',
+            sourceRevision: 2,
+            records: liveBase.records,
+        })
+        const omitted = manifest({
+            generation: 'live-omitted',
+            sequence: '2',
+            sourceRevision: 2,
+            records: [],
+        })
+
+        await expect(plan({ base: liveBase, local: omitted, remote: retained }))
+            .rejects.toThrow(`base record ${keys.preset}`)
+        await expect(plan({ base: liveBase, local: retained, remote: omitted }))
+            .rejects.toThrow(`base record ${keys.preset}`)
+    })
+
+    it('requires both descendants to retain a common-base tombstone', async () => {
+        const base = manifest({
+            generation: 'tombstone-base',
+            sequence: '1',
+            sourceRevision: 1,
+            records: [tombstone(keys.preset, '1')],
+        })
+        const retained = manifest({
+            generation: 'tombstone-retained',
+            sequence: '2',
+            sourceRevision: 2,
+            records: base.records,
+        })
+        const omitted = manifest({
+            generation: 'tombstone-omitted',
+            sequence: '2',
+            sourceRevision: 2,
+            records: [],
+        })
+
+        await expect(plan({ base, local: omitted, remote: retained }))
+            .rejects.toThrow(`retain tombstone ${keys.preset}`)
+        await expect(plan({ base, local: retained, remote: omitted }))
+            .rejects.toThrow(`retain tombstone ${keys.preset}`)
+    })
+
+    it.each(['local', 'remote'] as const)(
+        'rejects resurrection of a common-base tombstone by the %s descendant',
+        async (side) => {
+            const base = manifest({
+                generation: 'tombstone-base',
+                sequence: '1',
+                sourceRevision: 1,
+                records: [tombstone(keys.preset, '1')],
+            })
+            const local = manifest({
+                generation: 'local',
+                sequence: '2',
+                sourceRevision: 2,
+                records: side === 'local'
+                    ? [live(keys.preset, hashes.localRoot)]
+                    : base.records,
+            })
+            const remote = manifest({
+                generation: 'remote',
+                sequence: '2',
+                sourceRevision: 8,
+                records: side === 'remote'
+                    ? [live(keys.preset, hashes.remoteRoot)]
+                    : base.records,
+            })
+
+            await expect(plan({ base, local, remote }))
+                .rejects.toThrow(`retain tombstone ${keys.preset}`)
+        },
+    )
+
+    it('rejects one generation ID bound to different manifest hashes', async () => {
+        const base = manifest({
+            generation: 'base',
+            sequence: '1',
+            sourceRevision: 1,
+            records: [live(keys.root, hashes.baseRoot)],
+        })
+        const local = manifest({
+            generation: 'reused-generation',
+            sequence: '2',
+            sourceRevision: 2,
+            records: [live(keys.root, hashes.localRoot)],
+        })
+        const remote = manifest({
+            generation: 'reused-generation',
+            sequence: '3',
+            sourceRevision: 8,
+            records: [live(keys.root, hashes.remoteRoot)],
+        })
+
+        await expect(plan({ base, local, remote }))
+            .rejects.toThrow('generation ID is bound to different manifest hashes')
+    })
+
+    it('rejects reuse of the common-base generation ID at a later sequence', async () => {
+        const base = manifest({
+            generation: 'base',
+            sequence: '1',
+            sourceRevision: 1,
+            records: [live(keys.root, hashes.baseRoot)],
+        })
+        const local = manifest({
+            generation: 'base',
+            sequence: '2',
+            sourceRevision: 2,
+            records: [live(keys.root, hashes.localRoot)],
+        })
+        const remote = manifest({
+            generation: 'remote',
+            sequence: '2',
+            sourceRevision: 8,
+            records: [live(keys.root, hashes.baseRoot)],
+        })
+
+        await expect(plan({ base, local, remote }))
+            .rejects.toThrow('generation ID is bound to different manifest hashes')
+    })
+
     it('accounts identical logical state as a zero-content no-op', async () => {
         const records = [
             live(keys.root, hashes.baseRoot, [hashes.sharedDependency]),

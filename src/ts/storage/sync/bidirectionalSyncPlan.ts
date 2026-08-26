@@ -139,6 +139,19 @@ function validateDescendant(
     }
 }
 
+function validateSameGenerationIdentity(
+    left: LogicalManifest,
+    leftHash: string,
+    right: LogicalManifest,
+    rightHash: string,
+): void {
+    if (left.generation === right.generation && leftHash !== rightHash) {
+        throw new TypeError(
+            'Bidirectional sync generation ID is bound to different manifest hashes',
+        )
+    }
+}
+
 function validateObjectSizeParity(manifests: readonly LogicalManifest[]): void {
     const sizes = new Map<string, number>()
     for (const manifest of manifests) {
@@ -268,6 +281,9 @@ export async function planBidirectionalSync(input: {
         hashLogicalManifest(local),
         hashLogicalManifest(remote),
     ])
+    validateSameGenerationIdentity(base, baseManifestHash, local, localManifestHash)
+    validateSameGenerationIdentity(base, baseManifestHash, remote, remoteManifestHash)
+    validateSameGenerationIdentity(local, localManifestHash, remote, remoteManifestHash)
     validateDescendant(base, local, localManifestHash, baseManifestHash, 'local')
     validateDescendant(base, remote, remoteManifestHash, baseManifestHash, 'remote')
     validateObjectSizeParity([base, local, remote])
@@ -281,13 +297,15 @@ export async function planBidirectionalSync(input: {
     const remoteObjects = objectMap(remote)
 
     for (const records of recordUnion(base.records, local.records, remote.records)) {
-        if (
-            records.base?.state === 'live'
-            && (records.local === undefined || records.remote === undefined)
-        ) {
-            throw new TypeError(
-                `Bidirectional sync descendant must tombstone deleted base record ${records.key}`,
-            )
+        if (records.base !== undefined && (
+            records.base.state === 'tombstone'
+                ? records.local?.state !== 'tombstone' || records.remote?.state !== 'tombstone'
+                : records.local === undefined || records.remote === undefined
+        )) {
+            const requirement = records.base.state === 'tombstone'
+                ? 'retain tombstone'
+                : 'tombstone deleted base record'
+            throw new TypeError(`Bidirectional sync descendant must ${requirement} ${records.key}`)
         }
         const localChanged = !recordsEqual(records.local, records.base)
         const remoteChanged = !recordsEqual(records.remote, records.base)
