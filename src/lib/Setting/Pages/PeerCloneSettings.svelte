@@ -16,8 +16,20 @@
         subscribePeerCloneUri,
     } from 'src/ts/storage/sync/peerCloneDeepLink'
     import Button from 'src/lib/UI/GUI/Button.svelte'
+    import {
+        acquireDestructiveReplacementFence,
+        capturePersistentMutationToken,
+        flushPendingData,
+    } from 'src/ts/storage/persistentDataRuntime.svelte'
 
-    const facade = createPeerCloneFacade({ platform: 'desktop' })
+    const facade = createPeerCloneFacade({
+        platform: 'desktop',
+        runtime: {
+            flushPendingData,
+            capturePersistentMutationToken,
+            acquireDestructiveReplacementFence,
+        },
+    })
     let capabilities = $state<PeerCloneNativeCapabilities>()
     let sourceStatus = $state<PeerCloneSourceStatus>({ phase: 'idle', devices: [] })
     let cloneState = $state<PeerCloneState>(initialPeerCloneState)
