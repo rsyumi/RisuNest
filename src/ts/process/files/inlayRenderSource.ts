@@ -61,6 +61,7 @@ export function renderDeferredInlaySourceMarkup(
 function startDeferredInlaySources(
     root: ParentNode,
     registry?: DeferredInlayMarkerRegistry,
+    options: { rejectOnError?: boolean } = {},
 ): { cleanup: () => void, settled: Promise<void> } {
     let disposed = false
     const urls = new Set<string>()
@@ -121,8 +122,9 @@ function startDeferredInlaySources(
             if (attached === 0) URL.revokeObjectURL(url)
             else urls.add(url)
         }
-        catch {
+        catch (error) {
             if (url && !urls.has(url)) URL.revokeObjectURL(url)
+            if (options.rejectOnError) throw error
         }
     })).then(() => undefined)
     const cleanup = () => {
@@ -147,10 +149,17 @@ export function mountDeferredInlaySources(
 export async function resolveDeferredInlaySources(
     root: ParentNode,
     registry?: DeferredInlayMarkerRegistry,
+    options: { rejectOnError?: boolean } = {},
 ): Promise<() => void> {
-    const mounted = startDeferredInlaySources(root, registry)
-    await mounted.settled
-    return mounted.cleanup
+    const mounted = startDeferredInlaySources(root, registry, options)
+    try {
+        await mounted.settled
+        return mounted.cleanup
+    }
+    catch (error) {
+        mounted.cleanup()
+        throw error
+    }
 }
 
 export async function withResolvedDeferredInlaySources<T>(

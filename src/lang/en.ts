@@ -995,7 +995,7 @@ export const languageEnglish = {
     screenshotRangeOrder: "Start must not be after end.",
     screenshotConversationStartNote: "The greeting is not counted as a turn.",
     screenshotFailed: "Screenshot failed: {error}",
-    screenshotLongAndroidUnavailable: "Long screenshot ZIP export is not available on Android yet.",
+    screenshotLongNativeUnavailable: "Long screenshot ZIP export is not available in native apps yet.",
     createBotwithAI: "Create Bot from AI",
     changeFolderName: "Input the new folder name (blank to cancel)",
     cancel: "Cancel",

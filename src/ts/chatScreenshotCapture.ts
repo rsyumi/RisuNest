@@ -1,10 +1,11 @@
 import type { StreamingScreenshotArchive } from './chatScreenshotArchive'
-import type { ChatScreenshotJob } from './chatScreenshotRange'
+import type { ChatScreenshotJob, FrozenChatScreenshotRenderContext } from './chatScreenshotRange'
 
 export const CHAT_SCREENSHOT_WIDTH = 960
 export const CHAT_SCREENSHOT_PAGE_HEIGHT = 8_000
 export const CHAT_SCREENSHOT_BATCH_SIZE = 8
 export const CHAT_SCREENSHOT_RESOURCE_TIMEOUT_MS = 5_000
+export const CHAT_SCREENSHOT_PARSE_TIMEOUT_MS = 10_000
 
 type ScreenshotMessage = ChatScreenshotJob['messages'][number]
 
@@ -12,6 +13,7 @@ export interface ChatScreenshotSurface {
     mountBatch(
         messages: readonly ScreenshotMessage[],
         firstTurn: number,
+        renderContext: FrozenChatScreenshotRenderContext,
         signal: AbortSignal,
     ): Promise<HTMLElement>
     unmountBatch(): void | Promise<void>
@@ -29,7 +31,7 @@ export interface ChatScreenshotEncoder {
 }
 
 export interface ChatScreenshotOutput {
-    publishPng(page: Blob): Promise<void>
+    publishPng(page: Blob): Promise<boolean>
     createArchive(): Promise<StreamingScreenshotArchive>
 }
 
@@ -45,6 +47,10 @@ export type ChatScreenshotResult = Readonly<{
 
 function throwIfAborted(signal: AbortSignal) {
     if (signal.aborted) throw new DOMException('Screenshot capture was cancelled', 'AbortError')
+}
+
+export function canExportLongScreenshotArchive(isNative: boolean) {
+    return !isNative
 }
 
 export async function captureChatScreenshot(
@@ -76,7 +82,12 @@ export async function captureChatScreenshot(
             try {
                 throwIfAborted(signal)
                 batchStarted = true
-                const root = await surface.mountBatch(batch, job.start + batchStart, signal)
+                const root = await surface.mountBatch(
+                    batch,
+                    job.start + batchStart,
+                    job.renderContext,
+                    signal,
+                )
                 throwIfAborted(signal)
                 await encoder.prepare(root, signal)
                 throwIfAborted(signal)
@@ -105,8 +116,12 @@ export async function captureChatScreenshot(
                     if (archive) {
                         await archive.addPage(pageNumber, page)
                     } else {
-                        await output.publishPng(page)
+                        const published = await output.publishPng(page)
+                        if (!published) {
+                            throw new DOMException('Screenshot export was cancelled', 'AbortError')
+                        }
                     }
+                    throwIfAborted(signal)
                 }
                 onProgress?.({
                     completedTurns: Math.min(batchStart + batch.length, job.messages.length),
@@ -117,7 +132,9 @@ export async function captureChatScreenshot(
             }
         }
 
-        if (archive) await archive.close()
+        throwIfAborted(signal)
+        if (archive) await archive.close(signal)
+        throwIfAborted(signal)
         return { kind: archive ? 'zip' : 'png', pages: pageNumber }
     } catch (error) {
         if (archive) await archive.abort()

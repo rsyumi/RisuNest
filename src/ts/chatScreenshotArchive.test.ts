@@ -76,4 +76,19 @@ describe('streaming screenshot archive', () => {
         expect(writer.abort).toHaveBeenCalledOnce()
         expect(writer.close).not.toHaveBeenCalled()
     })
+
+    it('aborts instead of completing when cancellation arrives during close', async () => {
+        const controller = new AbortController()
+        const writer = {
+            write: vi.fn(async () => {}),
+            close: vi.fn(async () => controller.abort()),
+            abort: vi.fn(async () => {}),
+        }
+        const archive = createStreamingScreenshotArchive(writer)
+
+        await archive.addPage(1, blob('page'))
+        await expect(archive.close(controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(writer.abort).toHaveBeenCalledOnce()
+    })
 })

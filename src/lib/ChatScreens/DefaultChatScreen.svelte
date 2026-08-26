@@ -61,9 +61,10 @@
     import ChatScreenshotDialog from './ChatScreenshotDialog.svelte';
     import ChatScreenshotCaptureSurface from './ChatScreenshotCaptureSurface.svelte';
     import { createChatScreenshotJob } from 'src/ts/chatScreenshotRange';
-    import { captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
+    import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
-    import { isTauriMobile } from 'src/ts/platform';
+    import { isTauri } from 'src/ts/platform';
+    import { getModuleAssets, getModuleRegexScripts } from 'src/ts/process/modules';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -157,13 +158,6 @@
     let screenshotError = $state('')
     let screenshotController: AbortController | null = null
     let screenshotSurface: ChatScreenshotSurface | undefined
-    let screenshotCharacter = $state<ReturnType<typeof createSimpleCharacter>>(null)
-    let screenshotCharacterName = $state('')
-    let screenshotCharacterImage = $state('')
-    let screenshotCharacterLargePortrait = $state(false)
-    let screenshotUsername = $state('')
-    let screenshotUserImage = $state('')
-    let screenshotUserLargePortrait = $state(false)
 
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
@@ -617,31 +611,48 @@
         screenshotCompletedTurns = 0
         screenshotError = ''
 
-        const characterSnapshot = $state.snapshot(currentCharacter)
-        const characterImageSource = characterSnapshot.image
-        const userImageSource = userIcon
-        screenshotCharacter = createSimpleCharacter(characterSnapshot)
-        screenshotCharacterName = characterSnapshot.name
-        screenshotCharacterLargePortrait = characterSnapshot.type === 'group'
-            ? false
-            : characterSnapshot.largePortrait ?? false
-        screenshotUsername = currentUsername
-        screenshotUserLargePortrait = userIconPortrait ?? false
-
         try {
             const job = createChatScreenshotJob({
-                characterId: characterSnapshot.chaId,
-                chatId: selectedChat.id ?? `${characterSnapshot.chaId}:${characterSnapshot.chatPage}`,
+                characterId: currentCharacter.chaId,
+                chatId: selectedChat.id ?? `${currentCharacter.chaId}:${currentCharacter.chatPage}`,
                 messages: selectedChat.message,
                 start,
                 end,
+                renderContext: {
+                    character: createSimpleCharacter(currentCharacter),
+                    characterName: currentCharacter.name,
+                    characterImageSource: currentCharacter.image,
+                    characterLargePortrait: currentCharacter.type === 'group'
+                        ? false
+                        : currentCharacter.largePortrait ?? false,
+                    userName: currentUsername,
+                    userImageSource: userIcon,
+                    userLargePortrait: userIconPortrait ?? false,
+                    moduleAssets: getModuleAssets(),
+                    presetRegex: DBState.db.presetRegex ?? [],
+                    moduleRegexScripts: getModuleRegexScripts(),
+                    assetStyle: currentCharacter.prebuiltAssetStyle ?? '',
+                    settings: {
+                        autoTranslate: DBState.db.autoTranslate,
+                        autoTranslateCachedOnly: DBState.db.autoTranslateCachedOnly,
+                        translatorType: DBState.db.translatorType,
+                        translateBeforeHTMLFormatting: DBState.db.translateBeforeHTMLFormatting,
+                        legacyTranslation: DBState.db.legacyTranslation,
+                        showTranslationLoading: DBState.db.showTranslationLoading,
+                        newImageHandlingBeta: DBState.db.newImageHandlingBeta ?? false,
+                        assetWidth: DBState.db.assetWidth,
+                        hideAllImages: DBState.db.hideAllImages ?? false,
+                        iconSize: DBState.db.iconsize,
+                        zoomSize: DBState.db.zoomsize,
+                        lineHeight: DBState.db.lineHeight ?? 1.25,
+                        dynamicAssets: DBState.db.dynamicAssets,
+                        dynamicAssetsEditDisplay: DBState.db.dynamicAssetsEditDisplay,
+                        legacyMediaFindings: DBState.db.legacyMediaFindings ?? false,
+                        assetMaxDifference: DBState.db.assetMaxDifference,
+                    },
+                },
             })
             screenshotTotalTurns = job.totalTurns
-            ;[screenshotCharacterImage, screenshotUserImage] = await Promise.all([
-                getCharImage(characterImageSource, 'css'),
-                getCharImage(userImageSource, 'css'),
-            ])
-            await tick()
 
             const fileBase = `chat-${crypto.randomUUID()}`
             await captureChatScreenshot(job, {
@@ -653,11 +664,11 @@
                 },
                 output: {
                     async publishPng(page) {
-                        await downloadFile(`${fileBase}.png`, new Uint8Array(await page.arrayBuffer()))
+                        return downloadFile(`${fileBase}.png`, new Uint8Array(await page.arrayBuffer()))
                     },
                     async createArchive() {
-                        if (isTauriMobile) {
-                            throw new Error(language.screenshotLongAndroidUnavailable)
+                        if (!canExportLongScreenshotArchive(isTauri)) {
+                            throw new Error(language.screenshotLongNativeUnavailable)
                         }
                         const writer = new LocalWriter()
                         const selected = await writer.init('ZIP', ['zip'], `${fileBase}.zip`)
@@ -666,6 +677,9 @@
                     },
                 },
             })
+            if (controller.signal.aborted) {
+                throw new DOMException('Screenshot capture was cancelled', 'AbortError')
+            }
             alertNormal(language.screenshotSaved)
             screenshotDialogOpen = false
         } catch (error) {
@@ -693,17 +707,7 @@
 <div class="w-full h-full relative" style={customStyle} onclick={() => {
     openMenu = false
 }}>
-    <ChatScreenshotCaptureSurface
-        bind:this={screenshotSurface}
-        totalTurns={screenshotTotalTurns}
-        character={screenshotCharacter}
-        characterName={screenshotCharacterName}
-        characterImage={screenshotCharacterImage}
-        characterLargePortrait={screenshotCharacterLargePortrait}
-        currentUsername={screenshotUsername}
-        userImage={screenshotUserImage}
-        userLargePortrait={screenshotUserLargePortrait}
-    />
+    <ChatScreenshotCaptureSurface bind:this={screenshotSurface} />
 
     {#if screenshotDialogOpen}
         <ChatScreenshotDialog

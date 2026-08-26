@@ -1,35 +1,14 @@
 <script lang="ts">
     import type { Message } from 'src/ts/storage/database.svelte'
-    import type { ChatScreenshotJob } from 'src/ts/chatScreenshotRange'
-    import type { simpleCharacterArgument } from 'src/ts/parser/parser.svelte'
+    import type { ChatScreenshotJob, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
+    import { getFileSrc } from 'src/ts/globalApi.svelte'
     import { onDestroy, tick } from 'svelte'
-    import Chat from './Chat.svelte'
-    import { CHAT_SCREENSHOT_WIDTH } from 'src/ts/chatScreenshotCapture'
-
-    interface Props {
-        totalTurns: number
-        character?: simpleCharacterArgument | string | null
-        characterName: string
-        characterImage?: string
-        characterLargePortrait?: boolean
-        currentUsername: string
-        userImage?: string
-        userLargePortrait?: boolean
-    }
-
-    let {
-        totalTurns,
-        character = null,
-        characterName,
-        characterImage = '',
-        characterLargePortrait = false,
-        currentUsername,
-        userImage = '',
-        userLargePortrait = false,
-    }: Props = $props()
+    import ChatScreenshotMessage from './ChatScreenshotMessage.svelte'
+    import { CHAT_SCREENSHOT_PARSE_TIMEOUT_MS, CHAT_SCREENSHOT_WIDTH } from 'src/ts/chatScreenshotCapture'
 
     type BatchItem = {
         key: string
+        generation: number
         turn: number
         message: Message
     }
@@ -41,20 +20,39 @@
         reject: (error: unknown) => void
         signal: AbortSignal
         abort: () => void
+        timeout: ReturnType<typeof setTimeout>
     }
 
     let viewport: HTMLDivElement
     let batch = $state<BatchItem[]>([])
+    let renderContext = $state<FrozenChatScreenshotRenderContext | null>(null)
+    let characterImage = $state('')
+    let userImage = $state('')
     let generation = 0
     let readiness: Readiness | null = null
     let destroyed = false
+
+    async function resolvePortrait(source: string, hideAllImages: boolean) {
+        if (hideAllImages || !source) return ''
+        return `background: url("${await getFileSrc(source)}");background-size: cover;`
+    }
 
     function cancelReadiness(message: string) {
         const current = readiness
         if (!current) return
         readiness = null
+        clearTimeout(current.timeout)
         current.signal.removeEventListener('abort', current.abort)
         current.reject(new DOMException(message, 'AbortError'))
+    }
+
+    function reportError(batchGeneration: number, error: unknown) {
+        const current = readiness
+        if (!current || current.generation !== batchGeneration) return
+        readiness = null
+        clearTimeout(current.timeout)
+        current.signal.removeEventListener('abort', current.abort)
+        current.reject(error)
     }
 
     function reportSettled(batchGeneration: number, key: string) {
@@ -63,6 +61,7 @@
         current.remaining.delete(key)
         if (current.remaining.size !== 0) return
         readiness = null
+        clearTimeout(current.timeout)
         current.signal.removeEventListener('abort', current.abort)
         current.resolve(viewport)
     }
@@ -70,6 +69,7 @@
     export async function mountBatch(
         messages: ChatScreenshotJob['messages'],
         firstTurn: number,
+        context: FrozenChatScreenshotRenderContext,
         signal: AbortSignal,
     ): Promise<HTMLElement> {
         await unmountBatch()
@@ -78,8 +78,17 @@
         }
 
         const batchGeneration = ++generation
+        renderContext = context
+        ;[characterImage, userImage] = await Promise.all([
+            resolvePortrait(context.characterImageSource, context.settings.hideAllImages),
+            resolvePortrait(context.userImageSource, context.settings.hideAllImages),
+        ])
+        if (destroyed || signal.aborted) {
+            throw new DOMException('Screenshot capture was cancelled', 'AbortError')
+        }
         batch = messages.map((message, index) => ({
             key: `${batchGeneration}:${index}`,
+            generation: batchGeneration,
             turn: firstTurn + index,
             message: message as Message,
         }))
@@ -93,18 +102,23 @@
                 reject,
                 signal,
                 abort,
+                timeout: setTimeout(
+                    () => reportError(
+                        batchGeneration,
+                        new Error('Screenshot message parsing timed out'),
+                    ),
+                    CHAT_SCREENSHOT_PARSE_TIMEOUT_MS,
+                ),
             }
             signal.addEventListener('abort', abort, { once: true })
         })
 
         await tick()
-        for (const item of batch) {
-            if (item.message.isComment) reportSettled(batchGeneration, item.key)
-        }
         if (batch.length === 0) {
             const current = readiness
             if (current?.generation === batchGeneration) {
                 readiness = null
+                clearTimeout(current.timeout)
                 current.signal.removeEventListener('abort', current.abort)
                 current.resolve(viewport)
             }
@@ -115,6 +129,9 @@
     export async function unmountBatch() {
         cancelReadiness('Screenshot capture surface was unmounted')
         batch = []
+        renderContext = null
+        characterImage = ''
+        userImage = ''
         await tick()
     }
 
@@ -140,22 +157,16 @@
     aria-hidden="true"
 >
     <div data-screenshot-content>
-        {#each batch as item (item.key)}
-            <Chat
-                message={item.message.data}
-                isLastMemory={false}
-                idx={item.turn - 1}
-                totalLength={totalTurns}
-                img={item.message.role === 'user' ? userImage : characterImage}
-                character={character}
-                largePortrait={item.message.role === 'user' ? userLargePortrait : characterLargePortrait}
-                messageGenerationInfo={item.message.generationInfo}
-                role={item.message.role}
-                name={item.message.role === 'user' ? currentUsername : characterName}
-                isComment={item.message.isComment ?? false}
-                disabled={item.message.disabled ?? false}
-                onCaptureSettled={() => reportSettled(generation, item.key)}
-            />
-        {/each}
+        {#if renderContext}
+            {#each batch as item (item.key)}
+                <ChatScreenshotMessage
+                    {item}
+                    context={renderContext}
+                    portraitStyle={item.message.role === 'user' ? userImage : characterImage}
+                    onCaptureSettled={() => reportSettled(item.generation, item.key)}
+                    onCaptureError={(_generation, error) => reportError(item.generation, error)}
+                />
+            {/each}
+        {/if}
     </div>
 </div>

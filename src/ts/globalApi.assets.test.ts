@@ -3,12 +3,13 @@ import { setRuntimePerformanceProfile } from './runtimePerformanceProfile'
 
 const state = vi.hoisted(() => ({
     isTauri: false,
+    isTauriMobile: false,
     blobStore: null as any,
 }))
 
 vi.mock('./platform', () => ({
     get isTauri() { return state.isTauri },
-    get isTauriMobile() { return false },
+    get isTauriMobile() { return state.isTauriMobile },
     isNodeServer: false,
 }))
 vi.mock('./storage/platformBlobStore', () => ({
@@ -114,8 +115,9 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
 vi.mock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: vi.fn(() => ({})) }))
 vi.mock('@tauri-apps/plugin-http', () => ({ fetch: vi.fn() }))
 
-import { createThrottledSizeEstimator, forageStorage, getFileSrc, LocalWriter, saveAsset, TauriWriter } from './globalApi.svelte'
+import { createThrottledSizeEstimator, downloadFile, forageStorage, getFileSrc, LocalWriter, saveAsset, TauriWriter } from './globalApi.svelte'
 import { remove, writeFile } from '@tauri-apps/plugin-fs'
+import { save } from '@tauri-apps/plugin-dialog'
 
 function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime: string } }) {
     return {
@@ -132,6 +134,9 @@ function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime:
 }
 
 beforeEach(() => {
+    vi.clearAllMocks()
+    state.isTauri = false
+    state.isTauriMobile = false
     setRuntimePerformanceProfile('normal')
     state.isTauri = false
     ;(forageStorage as any).isAccount = false
@@ -300,7 +305,7 @@ describe('LocalWriter streamed backup entries', () => {
         expect(abort).toHaveBeenCalledOnce()
     })
 
-    test('discards buffered bytes and removes a partially flushed Tauri destination', async () => {
+    test('discards buffered bytes without deleting a pre-existing Tauri destination', async () => {
         const writer = new TauriWriter('partial.zip')
 
         await writer.write(new Uint8Array(4 * 1024 * 1024))
@@ -308,17 +313,27 @@ describe('LocalWriter streamed backup entries', () => {
         await writer.abort()
 
         expect(writeFile).toHaveBeenCalledOnce()
-        expect(remove).toHaveBeenCalledWith('partial.zip')
+        expect(remove).not.toHaveBeenCalled()
     })
 
-    test('removes a Tauri destination after the first flush rejects', async () => {
+    test('does not delete a pre-existing Tauri destination after a failed flush', async () => {
         vi.mocked(writeFile).mockRejectedValueOnce(new Error('write failed'))
         const writer = new TauriWriter('failed.zip')
 
         await expect(writer.write(new Uint8Array(4 * 1024 * 1024))).rejects.toThrow('write failed')
         await writer.abort()
 
-        expect(remove).toHaveBeenCalledWith('failed.zip')
+        expect(remove).not.toHaveBeenCalled()
+    })
+
+    test('reports native picker cancellation without writing', async () => {
+        state.isTauri = true
+        state.isTauriMobile = true
+        vi.mocked(save).mockResolvedValueOnce(null)
+
+        await expect(downloadFile('capture.png', Uint8Array.of(1))).resolves.toBe(false)
+
+        expect(writeFile).not.toHaveBeenCalled()
     })
 
     test('writes the legacy length-prefixed entry without joining payload chunks', async () => {

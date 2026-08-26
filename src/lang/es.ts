@@ -1485,7 +1485,7 @@ export const languageSpanish = {
     screenshotRangeOrder: "El inicio no puede estar después del fin.",
     screenshotConversationStartNote: "El saludo no cuenta como turno.",
     screenshotFailed: "Error de captura: {error}",
-    screenshotLongAndroidUnavailable: "La exportación ZIP de capturas largas aún no está disponible en Android.",
+    screenshotLongNativeUnavailable: "La exportación ZIP de capturas largas aún no está disponible en aplicaciones nativas.",
 
     nanoGPTSelectFromList: "Seleccionar de la lista",
     nanoGPTManualInput: "Entrada manual",

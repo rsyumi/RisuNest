@@ -218,6 +218,22 @@ describe('getInlayRenderSource', () => {
         expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:web-preview')
     })
 
+    test('rejects capture readiness when object URL resolution fails', async () => {
+        const error = new Error('blob read failed')
+        inlayMocks.getInlayAssetBlob.mockRejectedValueOnce(error)
+        const registry = new DeferredInlayMarkerRegistry()
+        const clear = vi.spyOn(registry, 'clear')
+        const doc = document.implementation.createHTMLDocument()
+        doc.body.innerHTML = renderDeferredInlaySourceMarkup('broken', {
+            url: '', mime: 'image/png', type: 'image', name: 'broken.png', size: 1, objectUrl: false,
+        }, registry)
+
+        await expect(
+            resolveDeferredInlaySources(doc, registry, { rejectOnError: true }),
+        ).rejects.toBe(error)
+        expect(clear).toHaveBeenCalled()
+    })
+
     test('does not let a copied slot authorize another ID', async () => {
         inlayMocks.getInlayAssetBlob.mockResolvedValue({ data: new Blob(['x']), type: 'image', name: 'x' })
         const registry = new DeferredInlayMarkerRegistry()

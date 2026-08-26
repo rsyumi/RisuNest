@@ -2,18 +2,23 @@
     import { onMount } from 'svelte'
 
     let {
-        message = '',
-        idx = -1,
+        item,
+        context,
         onCaptureSettled,
+        onCaptureError,
     }: {
-        message?: string
-        idx?: number
+        item: { turn: number; message: { data: string; time?: number } }
+        context: { characterName: string }
         onCaptureSettled?: (generation: number) => void
+        onCaptureError?: (generation: number, error: unknown) => void
     } = $props()
 
     onMount(() => {
-        if (message !== 'pending') onCaptureSettled?.(1)
+        if (item.message.data === 'error') onCaptureError?.(1, new Error('parse failed'))
+        else if (item.message.data !== 'pending') onCaptureSettled?.(1)
     })
 </script>
 
-<div data-capture-probe={message} data-index={idx}>{message}</div>
+<div data-capture-probe={item.message.data} data-index={item.turn - 1}>{item.message.data}</div>
+<span data-character-name>{context.characterName}</span>
+<span data-message-time>{item.message.time}</span>

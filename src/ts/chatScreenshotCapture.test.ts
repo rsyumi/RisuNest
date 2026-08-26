@@ -6,6 +6,7 @@ import {
     CHAT_SCREENSHOT_WIDTH,
     captureChatScreenshot,
     createDomScreenshotEncoder,
+    canExportLongScreenshotArchive,
     replaceCaptureMedia,
 } from './chatScreenshotCapture'
 import type { ChatScreenshotJob } from './chatScreenshotRange'
@@ -29,6 +30,37 @@ function job(count: number): ChatScreenshotJob {
             role: index % 2 ? 'char' : 'user',
             data: `message-${index + 1}`,
         })) as readonly Message[],
+        renderContext: {
+            character: null,
+            characterName: 'Character',
+            characterImageSource: '',
+            characterLargePortrait: false,
+            userName: 'User',
+            userImageSource: '',
+            userLargePortrait: false,
+            moduleAssets: [],
+            presetRegex: [],
+            moduleRegexScripts: [],
+            assetStyle: '',
+            settings: {
+                autoTranslate: false,
+                autoTranslateCachedOnly: false,
+                translatorType: 'google',
+                translateBeforeHTMLFormatting: false,
+                legacyTranslation: false,
+                showTranslationLoading: false,
+                newImageHandlingBeta: false,
+                assetWidth: -1,
+                hideAllImages: false,
+                iconSize: 100,
+                zoomSize: 100,
+                lineHeight: 1.25,
+                dynamicAssets: false,
+                dynamicAssetsEditDisplay: false,
+                legacyMediaFindings: false,
+                assetMaxDifference: 0.5,
+            },
+        },
     }
 }
 
@@ -38,7 +70,7 @@ function harness(options: { height?: number; encodeError?: Error } = {}) {
     const batches: string[][] = []
     const archive = {
         addPage: vi.fn(async (_pageNumber: number, _page: Blob) => {}),
-        close: vi.fn(async () => {}),
+        close: vi.fn(async (_signal?: AbortSignal) => {}),
         abort: vi.fn(async () => {}),
     }
     const surface = {
@@ -64,7 +96,7 @@ function harness(options: { height?: number; encodeError?: Error } = {}) {
         }),
     }
     const output = {
-        publishPng: vi.fn(async () => {}),
+        publishPng: vi.fn(async () => true),
         createArchive: vi.fn(async () => archive),
     }
     return {
@@ -83,6 +115,10 @@ function harness(options: { height?: number; encodeError?: Error } = {}) {
 }
 
 describe('bounded chat screenshot capture', () => {
+    it('fails closed for long archive export on every native runtime', () => {
+        expect(canExportLongScreenshotArchive(true)).toBe(false)
+        expect(canExportLongScreenshotArchive(false)).toBe(true)
+    })
     it('exports a short bounded batch as one PNG in chronological order', async () => {
         const deps = harness()
         const progress = vi.fn()
@@ -95,6 +131,12 @@ describe('bounded chat screenshot capture', () => {
 
         expect(result).toEqual({ kind: 'png', pages: 1 })
         expect(deps.batches).toEqual([['message-1', 'message-2', 'message-3']])
+        expect(deps.surface.mountBatch).toHaveBeenCalledWith(
+            job(3).messages,
+            11,
+            job(3).renderContext,
+            expect.any(AbortSignal),
+        )
         expect(deps.maxMounted).toBeLessThanOrEqual(CHAT_SCREENSHOT_BATCH_SIZE)
         expect(deps.output.publishPng).toHaveBeenCalledOnce()
         expect(deps.output.createArchive).not.toHaveBeenCalled()
@@ -142,6 +184,51 @@ describe('bounded chat screenshot capture', () => {
         expect(deps.surface.unmountBatch).toHaveBeenCalledOnce()
         expect(deps.surface.dispose).toHaveBeenCalledOnce()
         expect(deps.mounted).toBe(false)
+    })
+
+    it('treats native picker cancellation as capture cancellation', async () => {
+        const deps = harness()
+        deps.output.publishPng.mockResolvedValueOnce(false)
+
+        await expect(
+            captureChatScreenshot(job(1), {
+                ...deps,
+                signal: new AbortController().signal,
+            }),
+        ).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(deps.surface.dispose).toHaveBeenCalledOnce()
+    })
+
+    it('checks cancellation after publishing a page and through archive close', async () => {
+        const pngDeps = harness()
+        const pngController = new AbortController()
+        pngDeps.output.publishPng.mockImplementationOnce(async () => {
+            pngController.abort()
+            return true
+        })
+
+        await expect(
+            captureChatScreenshot(job(1), {
+                ...pngDeps,
+                signal: pngController.signal,
+            }),
+        ).rejects.toMatchObject({ name: 'AbortError' })
+
+        const zipDeps = harness()
+        const zipController = new AbortController()
+        zipDeps.archive.close.mockImplementationOnce(async (signal?: AbortSignal) => {
+            expect(signal).toBe(zipController.signal)
+            zipController.abort()
+        })
+
+        await expect(
+            captureChatScreenshot(job(CHAT_SCREENSHOT_BATCH_SIZE + 1), {
+                ...zipDeps,
+                signal: zipController.signal,
+            }),
+        ).rejects.toMatchObject({ name: 'AbortError' })
+        expect(zipDeps.archive.abort).toHaveBeenCalledOnce()
     })
 
     it('aborts partial output and cleans the surface after encoder failure', async () => {

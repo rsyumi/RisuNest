@@ -8,8 +8,22 @@ export interface ScreenshotArchiveWriter {
 
 export interface StreamingScreenshotArchive {
     addPage(pageNumber: number, page: Blob): Promise<void>
-    close(): Promise<void>
+    close(signal?: AbortSignal): Promise<void>
     abort(): Promise<void>
+}
+
+function cancellationError() {
+    return new DOMException('Screenshot capture was cancelled', 'AbortError')
+}
+
+async function waitForClose(promise: Promise<void>, signal?: AbortSignal) {
+    if (!signal) return promise
+    if (signal.aborted) throw cancellationError()
+    await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(cancellationError())
+        signal.addEventListener('abort', abort, { once: true })
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+    })
 }
 
 export function createStreamingScreenshotArchive(
@@ -66,15 +80,17 @@ export function createStreamingScreenshotArchive(
             }
         },
 
-        async close() {
+        async close(signal) {
             if (state === 'aborted') throw new Error('Screenshot archive was aborted')
             if (state === 'closed') return
             try {
+                if (signal?.aborted) throw cancellationError()
                 zip.end()
-                await finalChunk
-                await writeChain
+                await waitForClose(finalChunk, signal)
+                await waitForClose(writeChain, signal)
                 if (streamError) throw streamError
-                await writer.close()
+                await waitForClose(writer.close(), signal)
+                if (signal?.aborted) throw cancellationError()
                 state = 'closed'
             } catch (error) {
                 return fail(error)

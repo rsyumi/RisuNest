@@ -1486,7 +1486,7 @@ export const languageVietnamese = {
     screenshotRangeOrder: "Lượt bắt đầu không được sau lượt kết thúc.",
     screenshotConversationStartNote: "Lời chào không được tính là một lượt.",
     screenshotFailed: "Chụp màn hình thất bại: {error}",
-    screenshotLongAndroidUnavailable: "Xuất ZIP ảnh chụp dài chưa khả dụng trên Android.",
+    screenshotLongNativeUnavailable: "Xuất ZIP ảnh chụp dài chưa khả dụng trong ứng dụng gốc.",
 
     nanoGPTSelectFromList: "Chọn từ danh sách",
     nanoGPTManualInput: "Nhập thủ công",

@@ -5,7 +5,7 @@ import { DBState, selIdState } from '../stores.svelte';
 import { aiWatermarkingLawApplies, getFileSrc } from '../globalApi.svelte';
 import { isTauri, isNodeServer } from "src/ts/platform"
 import { getChatVar, setChatVar, getGlobalChatVar } from './chatVar.svelte';
-import { processScriptFull } from '../process/scripts';
+import { processScriptFull, type ProcessScriptCaptureContext } from '../process/scripts';
 import { get } from 'svelte/store';
 import css, { type CssAtRuleAST } from '@adobe/css-tools'
 import { selectedCharID } from '../stores.svelte';
@@ -468,27 +468,31 @@ $effect.root(() => {
 const imageCBS = ['img', 'image', 'emotion', 'asset', 'bg', 'raw', 'path']
 const videoExtensions = ['mp4', 'webm', 'avi', 'm4p', 'm4v']
 
-async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|character, mode:'normal'|'back', arg:{ch:number}){
-    const assetWidthString = (DBState.db.assetWidth && DBState.db.assetWidth !== -1 || DBState.db.assetWidth === 0) ? `max-width:${DBState.db.assetWidth}rem;` : ''
+async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|character, mode:'normal'|'back', arg:{ch:number}, renderContext:ParseMarkdownRenderContext = {}){
+    const assetWidth = renderContext.assetWidth ?? DBState.db.assetWidth
+    const assetWidthString = (assetWidth && assetWidth !== -1 || assetWidth === 0) ? `max-width:${assetWidth}rem;` : ''
 
     const characterAssets = char.additionalAssets ?? []
     const emotionAssets = char.emotionImages ?? []
-    const selectedIndex = selIdState.selId
-    const selectedCharacter = DBState.db.characters?.[selectedIndex]
-    const selectedOwnerToken = `${selectedIndex}:${char.chaId}`
-    const canUseSelectedCache = selectedCharacter?.type === 'character'
-        && selectedCharacter.chaId === char.chaId
-        && selectedCharacter.additionalAssets === char.additionalAssets
-        && selectedCharacter.emotionImages === char.emotionImages
-        && selectedAssetLookupCache?.ownerToken === selectedOwnerToken
-        && selectedAssetLookupCache.characterAssets === characterAssets
-        && selectedAssetLookupCache.emotionAssets === emotionAssets
+    let canUseSelectedCache = false
+    if (!renderContext.moduleAssets) {
+        const selectedIndex = selIdState.selId
+        const selectedCharacter = DBState.db.characters?.[selectedIndex]
+        const selectedOwnerToken = `${selectedIndex}:${char.chaId}`
+        canUseSelectedCache = selectedCharacter?.type === 'character'
+            && selectedCharacter.chaId === char.chaId
+            && selectedCharacter.additionalAssets === char.additionalAssets
+            && selectedCharacter.emotionImages === char.emotionImages
+            && selectedAssetLookupCache?.ownerToken === selectedOwnerToken
+            && selectedAssetLookupCache.characterAssets === characterAssets
+            && selectedAssetLookupCache.emotionAssets === emotionAssets
+    }
     const assetLookup = canUseSelectedCache
         ? selectedAssetLookupCache.index
         : createAssetLookupIndex({
             characterAssets,
             emotionAssets,
-            moduleAssets: getModuleAssets(),
+            moduleAssets: renderContext.moduleAssets ?? getModuleAssets(),
         })
 
     let needsSourceAccess = false
@@ -499,7 +503,7 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
 
         // Skip image-related assets when hideAllImages is enabled
         // raw and path are also included as they're used in CSS background-image
-        if(DBState.db.hideAllImages && imageCBS.includes(type)){
+        if((renderContext.hideAllImages ?? DBState.db.hideAllImages) && imageCBS.includes(type)){
             return ''  // Hide the image asset
         }
 
@@ -524,11 +528,11 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
             }
         }
 
-        const exactOnly = DBState.db.legacyMediaFindings === true
+        const exactOnly = (renderContext.legacyMediaFindings ?? DBState.db.legacyMediaFindings) === true
         const match = resolveAdditionalAsset(
             assetLookup,
             name,
-            exactOnly ? -1 : DBState.db.assetMaxDifference,
+            exactOnly ? -1 : (renderContext.assetMaxDifference ?? DBState.db.assetMaxDifference),
             getAssetDistance,
         )
         if(!match){
@@ -579,15 +583,27 @@ async function parseAdditionalAssets(data:string, char:simpleCharacterArgument|c
     })
 
     if(needsSourceAccess){
-        const chara = getCurrentCharacter()
-        if(chara.image){}
-        data = data.replace(/\uE9b4CHAR\uE9b4/g,
-            chara.image ? (await getFileSrc(chara.image)) : ''
-        )
-
-        data = data.replace(/\uE9b4USER\uE9b4/g,
-            getUserIcon() ? (await getFileSrc(getUserIcon())) : ''
-        )
+        if (renderContext.characterImageSource !== undefined) {
+            data = data.replace(/\uE9b4CHAR\uE9b4/g,
+                renderContext.characterImageSource
+                    ? await getFileSrc(renderContext.characterImageSource)
+                    : '',
+            )
+            data = data.replace(/\uE9b4USER\uE9b4/g,
+                renderContext.userImageSource
+                    ? await getFileSrc(renderContext.userImageSource)
+                    : '',
+            )
+        }
+        else {
+            const chara = getCurrentCharacter()
+            data = data.replace(/\uE9b4CHAR\uE9b4/g,
+                chara.image ? (await getFileSrc(chara.image)) : '',
+            )
+            data = data.replace(/\uE9b4USER\uE9b4/g,
+                getUserIcon() ? (await getFileSrc(getUserIcon())) : '',
+            )
+        }
     }
     
     return data
@@ -657,6 +673,14 @@ export interface simpleCharacterArgument{
 
 export interface ParseMarkdownRenderContext {
     deferredInlays?: DeferredInlayMarkerRegistry
+    moduleAssets?: readonly (readonly string[])[]
+    assetWidth?: number
+    hideAllImages?: boolean
+    legacyMediaFindings?: boolean
+    assetMaxDifference?: number
+    characterImageSource?: string
+    userImageSource?: string
+    scriptContext?: ProcessScriptCaptureContext
 }
 
 function parseThoughtsAndTools(data:string){
@@ -697,18 +721,20 @@ export async function ParseMarkdown(
     if(char && char.type !== 'group'){
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
-        })
+        }, renderContext)
         firstParsed = data
     }
 
     if(char){
-        data = (await processScriptFull(char, data, 'editdisplay', chatID, cbsConditions)).data
+        data = (await processScriptFull(char, data, 'editdisplay', chatID, cbsConditions, {
+            captureContext: renderContext.scriptContext,
+        })).data
     }
 
     if(firstParsed !== data && char && char.type !== 'group'){
         data = await parseAdditionalAssets(data, char, additionalAssetMode, {
             ch: chatID
-        })
+        }, renderContext)
     }
 
     data = await parseInlayAssets(data ?? '', renderContext.deferredInlays)

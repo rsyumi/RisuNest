@@ -29,6 +29,10 @@ const mocks = vi.hoisted(() => {
         },
     }
 })
+const moduleMocks = vi.hoisted(() => ({
+    getModuleAssets: vi.fn(() => []),
+    getModuleRegexScripts: vi.fn(() => []),
+}))
 
 vi.mock('svelte/store', () => ({
     get: (store: unknown) => store === mocks.charEmotionStore ? mocks.state.emotions : 0,
@@ -62,10 +66,7 @@ vi.mock('src/ts/parser/parser.svelte', () => ({
         return data
     },
 }))
-vi.mock('src/ts/process/modules', () => ({
-    getModuleAssets: () => [],
-    getModuleRegexScripts: () => [],
-}))
+vi.mock('src/ts/process/modules', () => moduleMocks)
 vi.mock('src/ts/process/memory/hypamemory', () => ({ HypaProcesser: class {} }))
 vi.mock('src/ts/process/scriptings', () => ({
     runLuaEditTrigger: async (_char: unknown, _mode: unknown, data: string) => data,
@@ -93,6 +94,7 @@ vi.mock('./regexWorkerClient', async (importOriginal) => {
 
 const { processScriptFull, resetScriptCache } = await import('./scripts')
 const { RegexExecutionTimeoutError } = await import('./regexWorkerClient')
+const { getCurrentCharacter, getCurrentChat } = await import('../storage/database.svelte')
 
 function makeScript(input: string, output: string, flag = 'g'): customscript {
     return {
@@ -113,6 +115,25 @@ function makeCharacter(scripts: customscript[]): character {
         emotionImages: [['happy', 'happy.png']],
     } as character
 }
+
+it('uses frozen capture script inputs without reading the live selected conversation or modules', async () => {
+    const character = makeCharacter([])
+
+    await processScriptFull(character, 'frozen', 'editdisplay', 0, { chatRole: 'char' }, {
+        captureContext: {
+            presetRegex: [],
+            moduleRegexScripts: [],
+            moduleAssets: [],
+            dynamicAssets: false,
+            dynamicAssetsEditDisplay: false,
+        },
+    })
+
+    expect(getCurrentCharacter).not.toHaveBeenCalled()
+    expect(getCurrentChat).not.toHaveBeenCalled()
+    expect(moduleMocks.getModuleAssets).not.toHaveBeenCalled()
+    expect(moduleMocks.getModuleRegexScripts).not.toHaveBeenCalled()
+})
 
 const emptyResultWithAction = [
     makeScript('x', ''),

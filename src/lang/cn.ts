@@ -1486,7 +1486,7 @@ export const languageChinese = {
     screenshotRangeOrder: "开始轮次不能晚于结束轮次。",
     screenshotConversationStartNote: "开场问候不计入轮次。",
     screenshotFailed: "截图失败：{error}",
-    screenshotLongAndroidUnavailable: "Android 暂不支持长截图 ZIP 导出。",
+    screenshotLongNativeUnavailable: "原生应用暂不支持长截图 ZIP 导出。",
 
     nanoGPTSelectFromList: "从列表中选择",
     nanoGPTManualInput: "手动输入",

@@ -34,6 +34,37 @@ describe('chat screenshot ranges', () => {
             messages,
             start: 1,
             end: 2,
+            renderContext: {
+                character: null,
+                characterName: 'Character',
+                characterImageSource: 'character.png',
+                characterLargePortrait: false,
+                userName: 'User',
+                userImageSource: 'user.png',
+                userLargePortrait: false,
+                moduleAssets: [['Module asset', 'module.png', 'png']],
+                presetRegex: [],
+                moduleRegexScripts: [],
+                assetStyle: 'default',
+                settings: {
+                    autoTranslate: false,
+                    autoTranslateCachedOnly: false,
+                    translatorType: 'google',
+                    translateBeforeHTMLFormatting: false,
+                    legacyTranslation: false,
+                    showTranslationLoading: false,
+                    newImageHandlingBeta: true,
+                    assetWidth: 12,
+                    hideAllImages: false,
+                    iconSize: 100,
+                    zoomSize: 100,
+                    lineHeight: 1.25,
+                    dynamicAssets: false,
+                    dynamicAssetsEditDisplay: false,
+                    legacyMediaFindings: false,
+                    assetMaxDifference: 0.5,
+                },
+            },
         })
 
         messages[0].data = 'edited'
@@ -53,6 +84,7 @@ describe('chat screenshot ranges', () => {
         ])
         expect(Object.isFrozen(job)).toBe(true)
         expect(Object.isFrozen(job.messages[0].generationInfo)).toBe(true)
+        expect(Object.isFrozen(job.renderContext.moduleAssets)).toBe(true)
     })
 
     it('snapshots live proxy-backed messages', () => {
@@ -67,6 +99,37 @@ describe('chat screenshot ranges', () => {
             messages: [message],
             start: 1,
             end: 1,
+            renderContext: {
+                character: null,
+                characterName: 'Character',
+                characterImageSource: '',
+                characterLargePortrait: false,
+                userName: 'User',
+                userImageSource: '',
+                userLargePortrait: false,
+                moduleAssets: [],
+                presetRegex: [],
+                moduleRegexScripts: [],
+                assetStyle: '',
+                settings: {
+                    autoTranslate: false,
+                    autoTranslateCachedOnly: false,
+                    translatorType: 'google',
+                    translateBeforeHTMLFormatting: false,
+                    legacyTranslation: false,
+                    showTranslationLoading: false,
+                    newImageHandlingBeta: false,
+                    assetWidth: -1,
+                    hideAllImages: false,
+                    iconSize: 100,
+                    zoomSize: 100,
+                    lineHeight: 1.25,
+                    dynamicAssets: false,
+                    dynamicAssetsEditDisplay: false,
+                    legacyMediaFindings: false,
+                    assetMaxDifference: 0.5,
+                },
+            },
         })
 
         expect(job.messages).toEqual([

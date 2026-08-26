@@ -18,6 +18,11 @@ const parserMocks = vi.hoisted(() => ({
 }))
 
 const chatState = vi.hoisted(() => ({ db: {} as Record<string, unknown> }))
+const liveRenderMocks = vi.hoisted(() => ({
+    getModuleAssets: vi.fn(() => []),
+    getCurrentCharacter: vi.fn(() => ({})),
+    getFileSrc: vi.fn(async (source: string) => `asset://${source}`),
+}))
 
 vi.mock('src/ts/process/files/inlays', () => inlayMocks)
 vi.mock('src/ts/parser/parser.svelte', () => parserMocks)
@@ -27,9 +32,9 @@ vi.mock('src/ts/translator/translator', () => ({
     getLLMCache: vi.fn(),
     translateHTML: vi.fn(),
 }))
-vi.mock('src/ts/process/modules', () => ({ getModuleAssets: () => [] }))
-vi.mock('src/ts/storage/database.svelte', () => ({ getCurrentCharacter: () => ({}) }))
-vi.mock('src/ts/globalApi.svelte', () => ({ getFileSrc: vi.fn() }))
+vi.mock('src/ts/process/modules', () => ({ getModuleAssets: liveRenderMocks.getModuleAssets }))
+vi.mock('src/ts/storage/database.svelte', () => ({ getCurrentCharacter: liveRenderMocks.getCurrentCharacter }))
+vi.mock('src/ts/globalApi.svelte', () => ({ getFileSrc: liveRenderMocks.getFileSrc }))
 vi.mock('src/ts/alert', () => ({ alertError: vi.fn() }))
 
 import {
@@ -79,6 +84,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
         mounted = undefined
         document.body.replaceChildren()
         vi.unstubAllGlobals()
+        vi.useRealTimers()
     })
 
     test('revokes mounted URLs exactly once on parsed rerender, raw switch, and later destroy', async () => {
@@ -152,6 +158,13 @@ describe('ChatBody deferred inlay lifecycle', () => {
             expect(target.querySelector('[src="blob:first"]')).toBeNull()
             expect(createObjectURL.mock.calls.filter(([blob]) => blob.size === 5)).toHaveLength(0)
             expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first')).toHaveLength(0)
+            if (cleanupKind === 'rerender') {
+                expect(target.querySelector('[src="blob:second"]')).not.toBeNull()
+                expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:second')).toHaveLength(0)
+                await unmount(mounted!)
+                mounted = undefined
+                expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:second')).toHaveLength(1)
+            }
         },
     )
 
@@ -223,6 +236,92 @@ describe('ChatBody deferred inlay lifecycle', () => {
 
         mounted = mount(ChatBodyInlayHarness, { target, props: { onCaptureSettled } })
         await vi.waitFor(() => expect(onCaptureSettled).toHaveBeenCalledOnce())
+    })
+
+    test('uses frozen capture character, role, settings, and assets without live lookups', async () => {
+        parserMocks.ParseMarkdown.mockResolvedValue('<img src="frozen.png">')
+        const onCaptureSettled = vi.fn()
+        const captureContext = {
+            character: {
+                type: 'simple' as const,
+                chaId: 'frozen-character',
+                customscript: [],
+                additionalAssets: [['Frozen', 'frozen.png', 'png']] as [string, string, string][],
+            },
+            characterName: 'Frozen Character',
+            characterImageSource: '',
+            characterLargePortrait: false,
+            userName: 'Frozen User',
+            userImageSource: '',
+            userLargePortrait: false,
+            moduleAssets: [] as [string, string, string][],
+            presetRegex: [],
+            moduleRegexScripts: [],
+            assetStyle: 'frozen-style',
+            settings: {
+                autoTranslate: false,
+                autoTranslateCachedOnly: false,
+                translatorType: 'mock',
+                translateBeforeHTMLFormatting: false,
+                legacyTranslation: false,
+                showTranslationLoading: false,
+                newImageHandlingBeta: true,
+                assetWidth: -1,
+                hideAllImages: false,
+                iconSize: 100,
+                zoomSize: 100,
+                lineHeight: 1.25,
+                dynamicAssets: false,
+                dynamicAssetsEditDisplay: false,
+                legacyMediaFindings: false,
+                assetMaxDifference: 0.5,
+            },
+        }
+
+        mounted = mount(ChatBodyInlayHarness, {
+            target,
+            props: { onCaptureSettled, captureContext },
+        })
+        await vi.waitFor(() => expect(onCaptureSettled).toHaveBeenCalledOnce())
+
+        const parseCall = parserMocks.ParseMarkdown.mock.calls[0]
+        expect(parseCall[1]).toMatchObject({ chaId: 'frozen-character' })
+        expect(parseCall[4]).toMatchObject({ chatRole: 'char' })
+        expect(parseCall[5]).toMatchObject({
+            moduleAssets: [],
+            scriptContext: expect.objectContaining({ moduleAssets: [] }),
+        })
+        expect(liveRenderMocks.getModuleAssets).not.toHaveBeenCalled()
+        expect(liveRenderMocks.getCurrentCharacter).not.toHaveBeenCalled()
+        expect(liveRenderMocks.getFileSrc).toHaveBeenCalledWith('frozen.png')
+    })
+
+    test('waits for the translated active generation instead of settling intermediate empty markup', async () => {
+        vi.useFakeTimers()
+        chatState.db = {
+            autoTranslate: true,
+            autoTranslateCachedOnly: false,
+            translatorType: 'mock',
+            translateBeforeHTMLFormatting: false,
+            legacyTranslation: false,
+            showTranslationLoading: false,
+            newImageHandlingBeta: false,
+        }
+        parserMocks.ParseMarkdown.mockResolvedValue('<span>parsed</span>')
+        const { translateHTML } = await import('src/ts/translator/translator')
+        vi.mocked(translateHTML).mockResolvedValue('<span>translated</span>')
+        const onCaptureSettled = vi.fn()
+
+        mounted = mount(ChatBodyInlayHarness, { target, props: { onCaptureSettled } })
+        await Promise.resolve(); await tick()
+
+        expect(onCaptureSettled).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(10)
+        await tick()
+        await vi.runAllTimersAsync()
+        await tick()
+        expect(translateHTML).toHaveBeenCalled()
+        expect(onCaptureSettled).toHaveBeenCalledOnce()
     })
 
     test('does not report capture settled after a pending body is destroyed', async () => {

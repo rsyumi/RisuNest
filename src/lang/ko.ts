@@ -1552,7 +1552,7 @@ export const languageKorean = {
     screenshotRangeOrder: "시작 번호는 끝 번호보다 클 수 없습니다.",
     screenshotConversationStartNote: "첫 인사말은 턴 수에 포함되지 않습니다.",
     screenshotFailed: "스크린샷 실패: {error}",
-    screenshotLongAndroidUnavailable: "긴 스크린샷 ZIP 내보내기는 아직 Android에서 사용할 수 없습니다.",
+    screenshotLongNativeUnavailable: "긴 스크린샷 ZIP 내보내기는 아직 네이티브 앱에서 사용할 수 없습니다.",
 
     nanoGPTSelectFromList: "목록에서 선택",
     nanoGPTManualInput: "수동 입력",

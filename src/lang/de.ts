@@ -1486,7 +1486,7 @@ export const languageGerman = {
     screenshotRangeOrder: "Der Start darf nicht nach dem Ende liegen.",
     screenshotConversationStartNote: "Die Begrüßung zählt nicht als Nachricht.",
     screenshotFailed: "Screenshot fehlgeschlagen: {error}",
-    screenshotLongAndroidUnavailable: "Der ZIP-Export langer Screenshots ist auf Android noch nicht verfügbar.",
+    screenshotLongNativeUnavailable: "Der ZIP-Export langer Screenshots ist in nativen Apps noch nicht verfügbar.",
 
     nanoGPTSelectFromList: "Aus der Liste auswählen",
     nanoGPTManualInput: "Manuelle Eingabe",

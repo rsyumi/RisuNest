@@ -10,6 +10,7 @@
     import { getFileSrc } from "src/ts/globalApi.svelte";
     import { DeferredInlayMarkerRegistry, mountDeferredInlaySources, resolveDeferredInlaySources } from "src/ts/process/files/inlayRenderSource";
     import { onDestroy, tick } from 'svelte'
+    import type { FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
 
     interface Props {
         character?: simpleCharacterArgument|string|null
@@ -26,6 +27,8 @@
         renderRawStreaming?: boolean
         rawStreamingText?: string
         onCaptureSettled?: (generation: number) => void
+        onCaptureError?: (generation: number, error: unknown) => void
+        captureContext?: FrozenChatScreenshotRenderContext
     }
 
     let {
@@ -42,6 +45,8 @@
         renderRawStreaming = false,
         rawStreamingText = '',
         onCaptureSettled,
+        onCaptureError,
+        captureContext,
     }: Props =  $props()
 
     // svelte-ignore non_reactive_update
@@ -49,7 +54,6 @@
     let lastCharArg:string|simpleCharacterArgument = null
     let lastChatId = -10
     let renderRoot = $state<HTMLElement | undefined>(undefined)
-    let releaseObjectUrls = () => {}
     let destroyed = false
 
     interface ChatBodyParseJob {
@@ -58,6 +62,9 @@
         disposed: boolean
         generation: number
         settledNotified: boolean
+        errorNotified: boolean
+        transitional: boolean
+        releaseObjectUrls: () => void
     }
 
     let activeParseJob: ChatBodyParseJob|null = null
@@ -83,7 +90,23 @@
 
     const markParsing = async (data: string, charArg: string | simpleCharacterArgument, chatID: number, job:ChatBodyParseJob, tries?:number):Promise<string> => {
         const parseForRender = (value:string, mode:'normal'|'back'|'pretranslate'|'notrim') => (
-            ParseMarkdown(value, charArg, mode, chatID, getCbsCondition(), { deferredInlays: job.deferredInlays })
+            ParseMarkdown(value, charArg, mode, chatID, getCbsCondition(), {
+                deferredInlays: job.deferredInlays,
+                moduleAssets: captureContext?.moduleAssets,
+                assetWidth: captureContext?.settings.assetWidth,
+                hideAllImages: captureContext?.settings.hideAllImages,
+                legacyMediaFindings: captureContext?.settings.legacyMediaFindings,
+                assetMaxDifference: captureContext?.settings.assetMaxDifference,
+                characterImageSource: captureContext?.characterImageSource,
+                userImageSource: captureContext?.userImageSource,
+                scriptContext: captureContext ? {
+                    presetRegex: captureContext.presetRegex,
+                    moduleRegexScripts: captureContext.moduleRegexScripts,
+                    moduleAssets: captureContext.moduleAssets,
+                    dynamicAssets: captureContext.settings.dynamicAssets,
+                    dynamicAssetsEditDisplay: captureContext.settings.dynamicAssetsEditDisplay,
+                } : undefined,
+            })
         )
         // track 'translated' and 'retranslate' state
         translated;
@@ -97,13 +120,14 @@
                 lastChatId = chatID
                 let translateText = false
                 try {
-                    if(DBState.db.autoTranslate){
-                        if(DBState.db.autoTranslateCachedOnly && DBState.db.translatorType === 'llm'){
-                            const cache = DBState.db.translateBeforeHTMLFormatting
+                    const settings = captureContext?.settings ?? DBState.db
+                    if(settings.autoTranslate){
+                        if(settings.autoTranslateCachedOnly && settings.translatorType === 'llm'){
+                            const cache = settings.translateBeforeHTMLFormatting
                             ? await getLLMCache(data)
-                            : !DBState.db.legacyTranslation
-                            ? await getLLMCache(await ParseMarkdown(data, charArg, 'pretranslate', chatID, getCbsCondition()))
-                            : await getLLMCache(await ParseMarkdown(data, charArg, mode, chatID, getCbsCondition()))
+                            : !settings.legacyTranslation
+                            ? await getLLMCache(await parseForRender(data, 'pretranslate'))
+                            : await getLLMCache(await parseForRender(data, mode))
                   
                             translateText = cache !== null
                         }
@@ -121,6 +145,7 @@
                     // State change of `translated` triggers markParsing again,
                     // causing redundant translation attempts
                     if (lastTranslated !== translateText) {
+                        job.transitional = true
                         return ''
                     }
                 } catch (error) {
@@ -128,13 +153,14 @@
                 }
             }
             if(retranslate || translated){
-                if (DBState.db.showTranslationLoading) {
+                const settings = captureContext?.settings ?? DBState.db
+                if (settings.showTranslationLoading) {
                     lastParsed = `<div style="display:flex;justify-content:center;align-items:center;height:48px;"><div style="animation: spin 1s linear infinite; border-radius: 50%; height: 32px; width: 32px; border: 2px solid #3b82f6; border-top: 2px solid transparent;"></div></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style>`
                 }
 
                 let transResult
                 
-                if(DBState.db.translatorType === 'llm' && DBState.db.translateBeforeHTMLFormatting){
+                if(settings.translatorType === 'llm' && settings.translateBeforeHTMLFormatting){
                     await sleep(100)
                     translating = true
                     data = await translateHTML(data, false, charArg, chatID, retranslate)
@@ -144,7 +170,7 @@
                     lastCharArg = charArg
                     transResult = marked
                 }
-                else if(!DBState.db.legacyTranslation){
+                else if(!settings.legacyTranslation){
                     const marked = await parseForRender(data, 'pretranslate')
                     translating = true
                     const translated = await postTranslationParse(await translateHTML(marked, false, charArg, chatID, retranslate))
@@ -194,15 +220,18 @@
     }
 
     const checkImg = async (job: ChatBodyParseJob) => {
-        if(!DBState.db.newImageHandlingBeta || !bodyRoot){
+        const settings = captureContext?.settings ?? DBState.db
+        if(!settings.newImageHandlingBeta || !bodyRoot){
             return
         }
         const imgs = bodyRoot.querySelectorAll('img:not([src^="data:"]):not([src^="http:"]):not([src^="https:"]):not([src^="blob:"]):not([src^="file:"]):not([src^="tauri:"]):not([noimage])') as NodeListOf<HTMLImageElement>
         
         if (imgs.length > 0) {
-            const currentCharacter = getCurrentCharacter()
-            const styl = currentCharacter.prebuiltAssetStyle
-            const assets = getModuleAssets().concat(currentCharacter.additionalAssets ?? [])
+            const currentCharacter = captureContext ? null : getCurrentCharacter()
+            const styl = captureContext?.assetStyle ?? currentCharacter?.prebuiltAssetStyle ?? ''
+            const assets = captureContext
+                ? [...captureContext.moduleAssets, ...(captureContext.character?.additionalAssets ?? [])]
+                : getModuleAssets().concat(currentCharacter?.additionalAssets ?? [])
             const normalizedAssets = assets.map((asset) => {
                 return {
                     name: asset[0].toLocaleLowerCase(),
@@ -280,6 +309,9 @@
             disposed: false,
             generation: ++parseGeneration,
             settledNotified: false,
+            errorNotified: false,
+            transitional: false,
+            releaseObjectUrls: () => {},
         }
         job.promise = markParsing(msgDisplay, character, idx, job)
         return job
@@ -288,6 +320,8 @@
     function disposeParseJob(job:ChatBodyParseJob|null) {
         if (!job || job.disposed) return
         job.disposed = true
+        job.releaseObjectUrls()
+        job.releaseObjectUrls = () => {}
         job.deferredInlays.clear()
     }
 
@@ -296,6 +330,7 @@
     async function syncObjectUrls(job: ChatBodyParseJob) {
         try {
             await job.promise
+            if (job.transitional) return
             if (destroyed || job.disposed || job !== markParsingResult) {
                 disposeParseJob(job)
                 return
@@ -305,32 +340,33 @@
                 disposeParseJob(job)
                 return
             }
-            releaseObjectUrls()
+            let releaseObjectUrls = () => {}
             if (renderRoot) {
                 releaseObjectUrls = onCaptureSettled
-                    ? await resolveDeferredInlaySources(renderRoot, job.deferredInlays)
+                    ? await resolveDeferredInlaySources(renderRoot, job.deferredInlays, { rejectOnError: true })
                     : mountDeferredInlaySources(renderRoot, job.deferredInlays)
             }
             else disposeParseJob(job)
             if (destroyed || job.disposed || job !== activeParseJob) {
                 releaseObjectUrls()
-                releaseObjectUrls = () => {}
                 return
             }
+            job.releaseObjectUrls = releaseObjectUrls
             await checkImg(job)
             await tick()
             if (destroyed || job.disposed || job !== activeParseJob || job.settledNotified) return
             job.settledNotified = true
             onCaptureSettled?.(job.generation)
         }
-        catch {
-            // markParsing handles its own failures
+        catch (error) {
+            if (destroyed || job.disposed || job !== activeParseJob || job.errorNotified) return
+            job.errorNotified = true
+            onCaptureError?.(job.generation, error)
         }
     }
 
     onDestroy(() => {
         destroyed = true
-        releaseObjectUrls()
         disposeParseJob(activeParseJob)
     })
 
@@ -341,8 +377,8 @@
             activeParseJob = result
         }
         if(shouldRenderRawStreaming){
-            releaseObjectUrls()
-            releaseObjectUrls = () => {}
+            disposeParseJob(activeParseJob)
+            activeParseJob = null
             return
         }
         if (!result) return

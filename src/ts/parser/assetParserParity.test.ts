@@ -5,17 +5,19 @@ const parserMocks = vi.hoisted(() => ({
     characters: [] as unknown[],
     selIdState: { selId: -1 },
     getModuleAssets: vi.fn((): [string, string, string][] => [['Theme', 'theme.mp3', 'mp3']]),
+    getCurrentCharacter: vi.fn(() => ({ image: 'live.png' })),
+    getFileSrc: vi.fn((path: string) => Promise.resolve(`resolved:${path}`)),
 }))
 
 vi.mock(import('../storage/database.svelte'), () => ({
     appVer: '1.0.0',
-    getCurrentCharacter: () => ({ image: '' }),
+    getCurrentCharacter: parserMocks.getCurrentCharacter,
     getDatabase: () => ({}),
 } as unknown as typeof import('../storage/database.svelte')))
 
 vi.mock(import('../globalApi.svelte'), () => ({
     aiWatermarkingLawApplies: () => false,
-    getFileSrc: (path: string) => Promise.resolve(`resolved:${path}`),
+    getFileSrc: parserMocks.getFileSrc,
 }))
 
 vi.mock(import('../stores.svelte'), () => ({
@@ -109,5 +111,32 @@ describe('parser asset resolution parity', () => {
 
         parserMocks.characters.length = 0
         parserMocks.selIdState.selId = -1
+    })
+
+    it('uses frozen module and source assets without selected-character lookups', async () => {
+        parserMocks.getCurrentCharacter.mockClear()
+        parserMocks.getModuleAssets.mockClear()
+        parserMocks.getFileSrc.mockClear()
+
+        const result = await ParseMarkdown(
+            '{{source::char}}|{{source::user}}|{{raw::capture-module}}',
+            character,
+            'back',
+            7,
+            {},
+            {
+                moduleAssets: [['capture-module', 'capture.png', 'png']],
+                characterImageSource: 'frozen-char.png',
+                userImageSource: 'frozen-user.png',
+                assetWidth: -1,
+                hideAllImages: false,
+                legacyMediaFindings: false,
+                assetMaxDifference: 1,
+            },
+        )
+
+        expect(result).toBe('resolved:frozen-char.png|resolved:frozen-user.png|resolved:capture.png')
+        expect(parserMocks.getCurrentCharacter).not.toHaveBeenCalled()
+        expect(parserMocks.getModuleAssets).not.toHaveBeenCalled()
     })
 })

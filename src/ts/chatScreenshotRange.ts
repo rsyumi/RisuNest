@@ -1,4 +1,5 @@
-import type { Message } from './storage/database.svelte'
+import type { Message, customscript } from './storage/database.svelte'
+import type { simpleCharacterArgument } from './parser/parser.svelte'
 import rfdc from 'rfdc'
 
 const cloneScreenshotData = rfdc()
@@ -12,13 +13,49 @@ export type ScreenshotRangeValidation =
           reason: 'empty' | 'integer' | 'bounds' | 'order'
       }>
 
-type DeepReadonly<T> = T extends (...args: never[]) => unknown
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown
     ? T
-    : T extends readonly (infer U)[]
-      ? readonly DeepReadonly<U>[]
+    : T extends readonly unknown[]
+      ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
       : T extends object
         ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
         : T
+
+export interface ChatScreenshotRenderSettings {
+    autoTranslate: boolean
+    autoTranslateCachedOnly: boolean
+    translatorType: string
+    translateBeforeHTMLFormatting: boolean
+    legacyTranslation: boolean
+    showTranslationLoading: boolean
+    newImageHandlingBeta: boolean
+    assetWidth: number
+    hideAllImages: boolean
+    iconSize: number
+    zoomSize: number
+    lineHeight: number
+    dynamicAssets: boolean
+    dynamicAssetsEditDisplay: boolean
+    legacyMediaFindings: boolean
+    assetMaxDifference: number
+}
+
+export interface ChatScreenshotRenderContext {
+    character: simpleCharacterArgument | null
+    characterName: string
+    characterImageSource: string
+    characterLargePortrait: boolean
+    userName: string
+    userImageSource: string
+    userLargePortrait: boolean
+    moduleAssets: [string, string, string][]
+    presetRegex: customscript[]
+    moduleRegexScripts: customscript[]
+    assetStyle: string
+    settings: ChatScreenshotRenderSettings
+}
+
+export type FrozenChatScreenshotRenderContext = DeepReadonly<ChatScreenshotRenderContext>
 
 export interface ChatScreenshotJob {
     readonly characterId: string
@@ -27,6 +64,7 @@ export interface ChatScreenshotJob {
     readonly start: number
     readonly end: number
     readonly messages: readonly DeepReadonly<Message>[]
+    readonly renderContext: FrozenChatScreenshotRenderContext
 }
 
 export function validateScreenshotRange(
@@ -67,6 +105,7 @@ export function createChatScreenshotJob(input: {
     messages: Message[]
     start: number
     end: number
+    renderContext: ChatScreenshotRenderContext
 }): ChatScreenshotJob {
     const validation = validateScreenshotRange(input.messages.length, input.start, input.end)
     if (validation.ok === false) throw new Error(`Invalid screenshot range: ${validation.reason}`)
@@ -81,5 +120,6 @@ export function createChatScreenshotJob(input: {
         start: validation.start,
         end: validation.end,
         messages: selectedMessages,
+        renderContext: cloneScreenshotData(input.renderContext),
     })
 }

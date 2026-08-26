@@ -23,6 +23,15 @@ export interface ProcessScriptOptions {
     signal?: AbortSignal
     /** true forces the Worker path, false opts out, undefined offloads whenever a Worker is available. */
     regexWorker?: boolean
+    captureContext?: ProcessScriptCaptureContext
+}
+
+export interface ProcessScriptCaptureContext {
+    presetRegex: readonly customscript[]
+    moduleRegexScripts: readonly customscript[]
+    moduleAssets: readonly (readonly [string, string, string])[]
+    dynamicAssets: boolean
+    dynamicAssetsEditDisplay: boolean
 }
 
 export async function processScript(char:character|groupChat, data:string, mode:ScriptMode, cbsConditions:CbsConditions = {}){
@@ -108,10 +117,13 @@ export function resetScriptCache(){
 
 export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     let db = getDatabase()
+    const captureContext = options.captureContext
     let emoChanged = false
-    data = await runLuaEditTrigger(char, mode, data, { index:chatID })
+    if (!captureContext) {
+        data = await runLuaEditTrigger(char, mode, data, { index:chatID })
+    }
 
-    if(mode === 'editdisplay'){
+    if(mode === 'editdisplay' && !captureContext){
         const currentChar = getCurrentCharacter()
         if(currentChar.type !== 'group'){
             try{
@@ -131,7 +143,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
     }
 
-    if(pluginV2[mode].size > 0){
+    if(!captureContext && pluginV2[mode].size > 0){
         for(const plugin of pluginV2[mode]){
             const res = await plugin(data)
             if(res !== null && res !== undefined){
@@ -141,7 +153,11 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
     }
 
     data = risuChatParser(data, { chatID: chatID, cbsConditions })
-    const scripts = (db.presetRegex ?? []).concat(char.customscript).concat(getModuleRegexScripts())
+    const scripts = [
+        ...(captureContext?.presetRegex ?? db.presetRegex ?? []),
+        ...char.customscript,
+        ...(captureContext?.moduleRegexScripts ?? getModuleRegexScripts()),
+    ]
     const useResultCache = options.cache !== 'bypass'
     const hash = useResultCache ? generateScriptCacheKey(scripts, data, mode, chatID, cbsConditions) : undefined
     if(!useResultCache){
@@ -218,8 +234,10 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                         }
                     }
                     else if((outScript.startsWith('@@inject') || entry.actions.includes('inject')) && chatID !== -1){
-                        const selchar = db.characters[get(selectedCharID)]
-                        selchar.chats[selchar.chatPage].message[chatID].data = data
+                        if (!captureContext) {
+                            const selchar = db.characters[get(selectedCharID)]
+                            selchar.chats[selchar.chatPage].message[chatID].data = data
+                        }
                         reg.lastIndex = 0
                         data = data.replace(reg, "")
                     }
@@ -267,6 +285,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
                 }
                 else{
                     if((outScript.startsWith('@@repeat_back') || entry.actions.includes('repeat_back'))  && chatID !== -1){
+                        if (captureContext) return
                         const v = outScript.split(' ', 2)[1]
                         const selchar = db.characters[get(selectedCharID)]
                         const chat = selchar.chats[selchar.chatPage]
@@ -343,8 +362,10 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
 
     
 
-    if(db.dynamicAssets && (char.type === 'simple' || char.type === 'character') && char.additionalAssets && char.additionalAssets.length > 0){
-        if((!db.dynamicAssetsEditDisplay && mode === 'editdisplay')
+    const dynamicAssets = captureContext?.dynamicAssets ?? db.dynamicAssets
+    const dynamicAssetsEditDisplay = captureContext?.dynamicAssetsEditDisplay ?? db.dynamicAssetsEditDisplay
+    if(dynamicAssets && (char.type === 'simple' || char.type === 'character') && char.additionalAssets && char.additionalAssets.length > 0){
+        if((!dynamicAssetsEditDisplay && mode === 'editdisplay')
             || mode === 'editinput' || mode === 'editprocess'){
             if(hash !== undefined){
                 cacheScript(hash, data)
@@ -353,7 +374,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
         const assetNames = char.additionalAssets.map((v) => v[0])
 
-        const moduleAssets = getModuleAssets()
+        const moduleAssets = captureContext?.moduleAssets ?? getModuleAssets()
         if(moduleAssets.length > 0){
             for(const asset of moduleAssets){
                 assetNames.push(asset[0])

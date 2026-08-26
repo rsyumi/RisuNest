@@ -4,8 +4,7 @@ import {
     readFile,
     exists,
     mkdir,
-    readDir,
-    remove
+    readDir
 } from "@tauri-apps/plugin-fs"
 import { changeFullscreen, sleep } from "./util"
 import { convertFileSrc } from "@tauri-apps/api/core"
@@ -97,7 +96,7 @@ interface fetchLog {
 
 let fetchLog: fetchLog[] = []
 
-export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string) {
+export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer | string): Promise<boolean> {
     if (typeof (dat) === 'string') {
         dat = Buffer.from(dat, 'utf-8')
     }
@@ -121,7 +120,7 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
             filters: [{ name: extension.toUpperCase(), extensions: [extension] }],
         })
         if (!target) {
-            return
+            return false
         }
         await writeFile(target, data)
     }
@@ -137,9 +136,8 @@ export async function downloadFile(name: string, dat: Uint8Array | ArrayBuffer |
         setTimeout(() => {
             URL.revokeObjectURL(url)
         }, 10000)
-
-
     }
+    return true
 }
 
 let fileCache: {
@@ -1019,7 +1017,6 @@ export class TauriWriter {
     private pending: Uint8Array[] = []
     private pendingBytes = 0
     private aborted = false
-    private destinationTouched = false
 
     /**
      * Creates an instance of TauriWriter.
@@ -1054,7 +1051,6 @@ export class TauriWriter {
         this.aborted = true
         this.pending = []
         this.pendingBytes = 0
-        if (this.destinationTouched) await remove(this.path)
     }
 
     private async flush() {
@@ -1067,7 +1063,6 @@ export class TauriWriter {
         }
         this.pending = []
         this.pendingBytes = 0
-        this.destinationTouched = true
         await writeFile(this.path, block, { append: !this.firstWrite })
         this.firstWrite = false
     }

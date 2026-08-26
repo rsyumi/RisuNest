@@ -1523,7 +1523,7 @@ export const languageChineseTraditional = {
     screenshotRangeOrder: "開始輪次不能晚於結束輪次。",
     screenshotConversationStartNote: "開場問候不計入輪次。",
     screenshotFailed: "截圖失敗：{error}",
-    screenshotLongAndroidUnavailable: "Android 暫不支援長截圖 ZIP 匯出。",
+    screenshotLongNativeUnavailable: "原生應用程式暫不支援長截圖 ZIP 匯出。",
 
     "nanoGPTSelectFromList": "從列表中選擇",
     "nanoGPTManualInput": "手動輸入",
