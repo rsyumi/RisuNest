@@ -202,7 +202,7 @@ export async function planLogicalDeltaPull(input: {
 
     for (const records of recordUnion(base.records, local.records, remote.records)) {
         if (records.base?.state === 'tombstone') {
-            if (records.local === undefined || records.remote === undefined) {
+            if (records.local?.state !== 'tombstone' || records.remote?.state !== 'tombstone') {
                 throw new TypeError(
                     `Logical delta descendant must retain tombstone ${records.key}`,
                 )

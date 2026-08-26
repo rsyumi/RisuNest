@@ -178,6 +178,21 @@ describe('logical delta pull planner', () => {
         },
     )
 
+    it.each(['local', 'remote'] as const)(
+        'rejects resurrection of a common-base tombstone by the %s descendant',
+        async (side) => {
+            const base = manifest('generation-1', '1', [tombstone(keys.preset, '1')], 1)
+            const local = manifest('local-2', '2', [tombstone(keys.preset, '1')], 2)
+            const remote = manifest('generation-2', '2', [tombstone(keys.preset, '1')], 8)
+            const resurrected = live(keys.preset, hashes.local)
+            const descendant = side === 'local' ? local : remote
+            descendant.records = [resurrected]
+            descendant.objects = [{ hash: hashes.local, size: 8 }]
+
+            await expect(plan({ base, local, remote })).rejects.toThrow('retain tombstone')
+        },
+    )
+
     it('rejects a reused remote generation ID with different content', async () => {
         const base = manifest('shared-generation', '1', [live(keys.root, hashes.base)], 1)
         const local = manifest('local-2', '2', [live(keys.root, hashes.base)], 2)

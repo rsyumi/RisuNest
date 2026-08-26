@@ -1642,6 +1642,14 @@ fn derive_exact_three_way_plan(
             }
         }
         let [base_record, local_record, remote_record] = triple;
+        if matches!(base_record, Some(LogicalManifestRecord::Tombstone(_)))
+            && (!matches!(local_record, Some(LogicalManifestRecord::Tombstone(_)))
+                || !matches!(remote_record, Some(LogicalManifestRecord::Tombstone(_))))
+        {
+            return validation(format!(
+                "logical delta descendant must retain base tombstone {key}"
+            ));
+        }
         if base_record.is_some() && (local_record.is_none() || remote_record.is_none()) {
             return validation(format!(
                 "logical delta descendant must retain or tombstone base record {key}"
@@ -3288,7 +3296,7 @@ mod tests {
             source_revision: 1,
             records: vec![LogicalManifestRecord::Tombstone(
                 LogicalManifestTombstoneRecord {
-                    key,
+                    key: key.clone(),
                     state: "tombstone".to_owned(),
                     deleted_generation_sequence: "1".to_owned(),
                 },
@@ -3303,6 +3311,29 @@ mod tests {
 
         assert!(matches!(
             derive_exact_three_way_plan(&base, &local, &remote),
+            Err(PeerSyncError::Validation(_))
+        ));
+
+        let resurrected = LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+            key,
+            state: "live".to_owned(),
+            object_hash: "a".repeat(64),
+            dependencies: vec![],
+        });
+        let mut local = base.clone();
+        local.generation = "local-live".to_owned();
+        local.generation_sequence = "2".to_owned();
+        local.records = vec![resurrected.clone()];
+        assert!(matches!(
+            derive_exact_three_way_plan(&base, &local, &base),
+            Err(PeerSyncError::Validation(_))
+        ));
+        let mut remote = base.clone();
+        remote.generation = "remote-live".to_owned();
+        remote.generation_sequence = "2".to_owned();
+        remote.records = vec![resurrected];
+        assert!(matches!(
+            derive_exact_three_way_plan(&base, &base, &remote),
             Err(PeerSyncError::Validation(_))
         ));
 
