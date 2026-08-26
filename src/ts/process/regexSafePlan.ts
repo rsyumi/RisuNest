@@ -45,6 +45,10 @@ export type RegexSafePlanClassification =
     | { accepted: true; plan: RegexSafePlan }
     | { accepted: false; category: string; sourceIndex?: number }
 
+export interface RegexSafePlanClassifierOptions {
+    minInputBytes?: number
+}
+
 class UnsafeRegexError extends Error {
     constructor(readonly category: string) {
         super(category)
@@ -341,12 +345,17 @@ function lowerEntry(entry: RegexExecutionPlanEntry): RegexSafePlanEntry {
 export function classifyRegexSafePlan(
     executionPlan: RegexExecutionPlan,
     input: string,
+    options: RegexSafePlanClassifierOptions = {},
 ): RegexSafePlanClassification {
     if (!isWellFormedUtf16(input)) {
         return { accepted: false, category: 'regex_safe_input_utf16' }
     }
-    if (utf8Encoder.encode(input).byteLength > 1_048_576) {
+    const inputBytes = utf8Encoder.encode(input).byteLength
+    if (inputBytes > 1_048_576) {
         return { accepted: false, category: 'regex_safe_input_limit' }
+    }
+    if (inputBytes < (options.minInputBytes ?? 0)) {
+        return { accepted: false, category: 'regex_safe_input_minimum' }
     }
     if (
         executionPlan.mode !== 'editoutput'

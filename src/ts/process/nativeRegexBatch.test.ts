@@ -4,8 +4,12 @@ import type { RegexSafePlan } from './regexSafePlan'
 import {
     NativeRegexBatchRejectedError,
     executeNativeRegexBatch,
+    tryExecuteNativeRegexBatch,
     type NativeRegexBatchDependencies,
+    type NativeRegexBatchRouteDependencies,
 } from './nativeRegexBatch'
+import { getRegexExecutionPlan } from './regexExecutionPlan'
+import { makeRegexFixture } from './tests/phase1Fixtures'
 
 const safePlan: RegexSafePlan = {
     version: 1,
@@ -99,5 +103,63 @@ describe('native regex batch adapter', () => {
         resolveInvoke({ data: 'bbb', errors: [] })
 
         await expect(pending).rejects.toThrow('cancelled during native regex')
+    })
+
+    it('routes only the measured 500-rule and 256 KiB Windows Tauri boundary', async () => {
+        const fixture = makeRegexFixture(500, 256 * 1024)
+        const input = fixture.input.slice(0, 256 * 1024)
+        const plan = getRegexExecutionPlan(fixture.scripts, 'editoutput')
+        const invoke = vi.fn(async () => ({ data: 'native-output', errors: [] }))
+        const routeDependencies: NativeRegexBatchRouteDependencies = {
+            isWindowsTauri: () => true,
+            invoke,
+        }
+
+        await expect(tryExecuteNativeRegexBatch(
+            plan,
+            input,
+            {},
+            routeDependencies,
+        )).resolves.toEqual({ data: 'native-output', errors: [] })
+        expect(invoke).toHaveBeenCalledOnce()
+    })
+
+    it.each([
+        ['20 rules', 20, 256 * 1024, true],
+        ['100 rules', 100, 256 * 1024, true],
+        ['500 rules and 32 KiB', 500, 32 * 1024, true],
+        ['Web', 500, 256 * 1024, false],
+    ] as const)('keeps measured losing or unsupported %s batches on the Worker', async (
+        _name,
+        ruleCount,
+        inputBytes,
+        isWindowsTauri,
+    ) => {
+        const fixture = makeRegexFixture(ruleCount, inputBytes)
+        const plan = getRegexExecutionPlan(fixture.scripts, 'editoutput')
+        const invoke = vi.fn()
+
+        await expect(tryExecuteNativeRegexBatch(
+            plan,
+            fixture.input.slice(0, inputBytes),
+            {},
+            { isWindowsTauri: () => isWindowsTauri, invoke },
+        )).resolves.toBeUndefined()
+        expect(invoke).not.toHaveBeenCalled()
+    })
+
+    it('keeps a mixed 500-rule plan on the Worker when any rule is not Rust-safe', async () => {
+        const fixture = makeRegexFixture(500, 256 * 1024)
+        fixture.scripts[499].in = '(?=rule-499)rule-499'
+        const plan = getRegexExecutionPlan(fixture.scripts, 'editoutput')
+        const invoke = vi.fn()
+
+        await expect(tryExecuteNativeRegexBatch(
+            plan,
+            fixture.input.slice(0, 256 * 1024),
+            {},
+            { isWindowsTauri: () => true, invoke },
+        )).resolves.toBeUndefined()
+        expect(invoke).not.toHaveBeenCalled()
     })
 })

@@ -13,6 +13,12 @@ const mocks = vi.hoisted(() => {
         workerCalls: 0,
         workerAvailable: false,
         workerData: 'worker-output',
+        workerErrors: [] as Array<{ sourceIndex: number; error: Error }>,
+        workerInput: null as string | null,
+        nativeFailure: null as unknown,
+        nativeCalls: 0,
+        nativeData: undefined as string | undefined,
+        nativeInput: null as string | null,
         currentChat: null as Chat | null,
         session: null as ActiveConversationSession | null,
         selectedCharIndex: 0,
@@ -98,16 +104,29 @@ vi.mock('./regexWorkerClient', async (importOriginal) => {
         ...original,
         isRegexWorkerAvailable: () => mocks.state.workerAvailable,
         getSharedRegexWorkerClient: () => ({
-            execute: async () => {
+            execute: async (_plan: unknown, input: string) => {
                 mocks.state.workerCalls++
+                mocks.state.workerInput = input
                 if(mocks.state.workerFailure !== null){
                     throw mocks.state.workerFailure
                 }
-                return { data: mocks.state.workerData, errors: [] }
+                return { data: mocks.state.workerData, errors: mocks.state.workerErrors }
             },
         }),
     }
 })
+vi.mock('./nativeRegexBatch', () => ({
+    tryExecuteNativeRegexBatch: async (_plan: unknown, input: string) => {
+        mocks.state.nativeCalls++
+        mocks.state.nativeInput = input
+        if(mocks.state.nativeFailure !== null){
+            throw mocks.state.nativeFailure
+        }
+        return mocks.state.nativeData === undefined
+            ? undefined
+            : { data: mocks.state.nativeData, errors: [] }
+    },
+}))
 
 const {
     createPromptScriptOperationScope,
@@ -185,6 +204,12 @@ describe('processScriptFull result caching', () => {
         mocks.state.workerCalls = 0
         mocks.state.workerAvailable = false
         mocks.state.workerData = 'worker-output'
+        mocks.state.workerErrors = []
+        mocks.state.workerInput = null
+        mocks.state.nativeFailure = null
+        mocks.state.nativeCalls = 0
+        mocks.state.nativeData = undefined
+        mocks.state.nativeInput = null
         mocks.state.currentChat = null
         mocks.state.session = null
         mocks.state.selectedCharIndex = 0
@@ -295,6 +320,75 @@ describe('processScriptFull result caching', () => {
         expect(second.data).toBe('worker-output')
     })
 
+    it('publishes a complete eligible native batch before consulting the Worker', async () => {
+        const character = makeCharacter([makeScript('cat', 'dog')])
+        mocks.state.workerAvailable = true
+        mocks.state.nativeData = 'native-output'
+
+        const result = await processScriptFull(
+            character,
+            'a cat here',
+            'editoutput',
+            -1,
+            {},
+            { cache: 'bypass' },
+        )
+
+        expect(mocks.state.nativeCalls).toBe(1)
+        expect(mocks.state.workerCalls).toBe(0)
+        expect(result.data).toBe('native-output')
+    })
+
+    it('falls back on the untouched input and preserves ordered Worker errors', async () => {
+        const character = makeCharacter([makeScript('cat', 'dog')])
+        const firstError = new Error('first JavaScript regex error')
+        const secondError = new Error('second JavaScript regex error')
+        mocks.state.workerAvailable = true
+        mocks.state.nativeFailure = Object.assign(new Error('native transport failed'), {
+            partialData: 'must-not-be-published',
+        })
+        mocks.state.workerData = 'javascript-authority-output'
+        mocks.state.workerErrors = [
+            { sourceIndex: 7, error: firstError },
+            { sourceIndex: 3, error: secondError },
+        ]
+        const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+        const result = await processScriptFull(
+            character,
+            'a cat here',
+            'editoutput',
+            -1,
+            {},
+            { cache: 'bypass' },
+        )
+
+        expect(mocks.state.nativeInput).toBe('a cat here')
+        expect(mocks.state.workerInput).toBe('a cat here')
+        expect(result.data).toBe('javascript-authority-output')
+        expect(errorLog.mock.calls.slice(-2)).toEqual([[firstError], [secondError]])
+        errorLog.mockRestore()
+    })
+
+    it('does not fall back after native cancellation', async () => {
+        const character = makeCharacter([makeScript('cat', 'dog')])
+        const controller = new AbortController()
+        const cancelled = new Error('cancel native regex')
+        controller.abort(cancelled)
+        mocks.state.workerAvailable = true
+        mocks.state.nativeFailure = cancelled
+
+        await expect(processScriptFull(
+            character,
+            'a cat here',
+            'editoutput',
+            -1,
+            {},
+            { cache: 'bypass', signal: controller.signal },
+        )).rejects.toBe(cancelled)
+        expect(mocks.state.workerCalls).toBe(0)
+    })
+
     it('keeps the UI thread when the caller opts out of the Worker', async () => {
         const character = makeCharacter([makeScript('cat', 'dog')])
         mocks.state.workerAvailable = true
@@ -309,6 +403,7 @@ describe('processScriptFull result caching', () => {
         )
 
         expect(mocks.state.workerCalls).toBe(0)
+        expect(mocks.state.nativeCalls).toBe(0)
         expect(result.data).toBe('a dog here')
     })
 

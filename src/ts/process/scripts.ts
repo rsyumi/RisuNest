@@ -14,6 +14,7 @@ import { runTrigger } from "./triggers";
 import { ByteBudgetLru } from "../util/byteBudgetLru";
 import { canExecuteRegexPlanInWorker, executeRegexPlanSync, getRegexExecutionPlan, type RegexExecutionPlanEntry, type RegexExecutionResult } from "./regexExecutionPlan";
 import { RegexExecutionTimeoutError, getSharedRegexWorkerClient, isRegexWorkerAvailable } from "./regexWorkerClient";
+import { tryExecuteNativeRegexBatch } from "./nativeRegexBatch";
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from "../runtimePerformanceProfile";
 import { createConversationOperationContext, type ConversationOperationContext } from "./conversationOperationContext";
 import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
@@ -778,17 +779,27 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
     }
     else if((options.regexWorker ?? isRegexWorkerAvailable()) && mode === 'editoutput' && canExecuteRegexPlanInWorker(plan, data)){
-        let result: RegexExecutionResult
+        let result: RegexExecutionResult | undefined
         try {
-            result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })
+            result = await tryExecuteNativeRegexBatch(plan, data, { signal: options.signal })
         } catch (error) {
-            // A pathological ruleset must not be retried on the UI thread, and a cancelled
-            // generation must stay cancelled. Anything else means the Worker is unusable here.
-            if(error instanceof RegexExecutionTimeoutError || options.signal?.aborted){
+            if(options.signal?.aborted){
                 throw error
             }
             console.error(error)
-            result = executeRegexPlanSync(plan, data, parse)
+        }
+        if(result === undefined){
+            try {
+                result = await getSharedRegexWorkerClient().execute(plan, data, { signal: options.signal })
+            } catch (error) {
+                // A pathological ruleset must not be retried on the UI thread, and a cancelled
+                // generation must stay cancelled. Anything else means the Worker is unusable here.
+                if(error instanceof RegexExecutionTimeoutError || options.signal?.aborted){
+                    throw error
+                }
+                console.error(error)
+                result = executeRegexPlanSync(plan, data, parse)
+            }
         }
         data = result.data
         for(const error of result.errors){

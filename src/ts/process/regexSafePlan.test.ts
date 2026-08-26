@@ -62,6 +62,15 @@ describe('Rust regex safe-plan classifier', () => {
         })
     })
 
+    it('rejects an input below a route minimum before lowering rules', () => {
+        const executionPlan = getRegexExecutionPlan([script('é')], 'editoutput')
+
+        expect(classifyRegexSafePlan(executionPlan, 'a', { minInputBytes: 2 })).toEqual({
+            accepted: false,
+            category: 'regex_safe_input_minimum',
+        })
+    })
+
     it('rejects plans over the aggregate pattern limit', () => {
         const scripts = Array.from({ length: 17 }, (_value, index) => (
             script(`${String.fromCharCode(65 + index)}${'a'.repeat(4_095)}`)

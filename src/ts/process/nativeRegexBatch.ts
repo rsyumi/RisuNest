@@ -1,7 +1,10 @@
 import { invoke } from '@tauri-apps/api/core'
 
-import type { RegexExecutionResult } from './regexExecutionPlan'
-import type { RegexSafePlan } from './regexSafePlan'
+import type { RegexExecutionPlan, RegexExecutionResult } from './regexExecutionPlan'
+import { classifyRegexSafePlan, type RegexSafePlan } from './regexSafePlan'
+
+const NATIVE_REGEX_BATCH_RULES = 500
+const NATIVE_REGEX_BATCH_MIN_INPUT_BYTES = 256 * 1024
 
 export interface NativeRegexBatchRuleError {
     sourceIndex: number
@@ -24,8 +27,19 @@ export interface NativeRegexBatchDependencies {
     ): Promise<unknown>
 }
 
+export interface NativeRegexBatchRouteDependencies extends NativeRegexBatchDependencies {
+    isWindowsTauri(): boolean
+}
+
 const productionDependencies: NativeRegexBatchDependencies = {
     invoke: (command, args) => invoke(command, args),
+}
+
+const productionRouteDependencies: NativeRegexBatchRouteDependencies = {
+    ...productionDependencies,
+    isWindowsTauri: () => Boolean(
+        (globalThis as typeof globalThis & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__,
+    ) && typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent),
 }
 
 export class NativeRegexBatchRejectedError extends Error {
@@ -89,4 +103,26 @@ export async function executeNativeRegexBatch(
         throw new NativeRegexBatchRejectedError(result.errors)
     }
     return { data: result.data, errors: [] }
+}
+
+export async function tryExecuteNativeRegexBatch(
+    executionPlan: RegexExecutionPlan,
+    input: string,
+    options: NativeRegexBatchOptions = {},
+    dependencies: NativeRegexBatchRouteDependencies = productionRouteDependencies,
+): Promise<RegexExecutionResult | undefined> {
+    if (
+        !dependencies.isWindowsTauri()
+        || executionPlan.entries.length !== NATIVE_REGEX_BATCH_RULES
+    ) {
+        return undefined
+    }
+
+    const classification = classifyRegexSafePlan(executionPlan, input, {
+        minInputBytes: NATIVE_REGEX_BATCH_MIN_INPUT_BYTES,
+    })
+    if (classification.accepted === false) {
+        return undefined
+    }
+    return executeNativeRegexBatch(classification.plan, input, options, dependencies)
 }
