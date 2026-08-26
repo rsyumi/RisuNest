@@ -27,7 +27,7 @@
     import Chats from './Chats.svelte';
     import Button from '../UI/GUI/Button.svelte';
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
-    import { getActiveConversationSession } from '../../ts/storage/persistentDataRuntime.svelte';
+    import { getActiveConversationSession, getPersistentDataRuntime } from '../../ts/storage/persistentDataRuntime.svelte';
     import {
         appendConversationMessage,
         captureConversationMutationTarget,
@@ -58,12 +58,14 @@
     import ChatScreenshotDialog from './ChatScreenshotDialog.svelte';
     import ChatScreenshotCaptureSurface from './ChatScreenshotCaptureSurface.svelte';
     import {
-        createChatScreenshotDialogSnapshot,
-        createChatScreenshotJobFromDialogSnapshot,
         snapshotChatScreenshotCharacter,
         type ChatScreenshotDialogSnapshot,
         type ChatScreenshotRenderContext,
     } from 'src/ts/chatScreenshotRange';
+    import {
+        openChatScreenshotSourceLease,
+        type ChatScreenshotSourceLease,
+    } from 'src/ts/chatScreenshotSourceLease';
     import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
     import { createNativeScreenshotArchiveWriter } from 'src/ts/nativeScreenshotArchiveWriter';
@@ -164,6 +166,9 @@
     let screenshotController: AbortController | null = null
     let screenshotSurface: ChatScreenshotSurface | undefined
     let screenshotDialogSnapshot: ChatScreenshotDialogSnapshot | null = null
+    let screenshotSourceLease: ChatScreenshotSourceLease | null = null
+    let screenshotOpenGeneration = 0
+    let screenshotOpening = false
 
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
@@ -532,31 +537,63 @@
         })
     }
 
-    function openScreenshotDialog() {
+    async function openScreenshotDialog() {
+        if (screenshotOpening || screenshotRunning) return
         screenshotError = ''
         screenshotCompletedTurns = 0
         const source = currentCharacter
         const chat = source?.chats[source.chatPage]
-        screenshotDialogSnapshot = source && chat
-            ? createChatScreenshotDialogSnapshot({
+        if (!source || !chat) return
+
+        const openGeneration = ++screenshotOpenGeneration
+        screenshotOpening = true
+        try {
+            const runtime = getPersistentDataRuntime()
+            const lease = await openChatScreenshotSourceLease({
                 characterId: source.chaId,
                 chatId: chat.id ?? `${source.chaId}:${source.chatPage}`,
-                messages: chat.message,
                 renderContext: createScreenshotRenderContext(source, chat),
+            }, {
+                store: runtime.store,
+                flushPendingData: (reason) => runtime.flushPendingData(reason),
+                getNavigationGeneration: () => runtime.getNavigationGeneration(),
+                getActiveConversationSession: () => runtime.getActiveConversationSession(),
             })
-            : null
-        screenshotTotalTurns = screenshotDialogSnapshot?.totalTurns ?? 0
-        screenshotDialogOpen = true
+            if (openGeneration !== screenshotOpenGeneration) {
+                await lease.close()
+                return
+            }
+            screenshotSourceLease = lease
+            screenshotDialogSnapshot = lease.snapshot
+            screenshotTotalTurns = lease.snapshot.totalTurns
+            screenshotDialogOpen = true
+        } catch (error) {
+            if (!(error instanceof DOMException && error.name === 'AbortError')) {
+                const detail = error instanceof Error ? error.message : String(error)
+                screenshotError = language.screenshotFailed.replace('{error}', detail)
+                alertError(screenshotError)
+            }
+        } finally {
+            if (openGeneration === screenshotOpenGeneration) screenshotOpening = false
+        }
     }
 
     function cancelScreenshot() {
         screenshotController?.abort()
     }
 
+    function releaseScreenshotSource() {
+        const source = screenshotSourceLease
+        screenshotSourceLease = null
+        if (source) void source.close().catch(console.error)
+    }
+
     function closeScreenshotDialog() {
+        screenshotOpenGeneration += 1
         cancelScreenshot()
         screenshotDialogOpen = false
         screenshotDialogSnapshot = null
+        releaseScreenshotSource()
     }
 
     function captureVariables(source: character | groupChat, chat: ChatRecord) {
@@ -573,14 +610,9 @@
     function createCaptureParserContext(
         source: character | groupChat,
         chat: ChatRecord,
-        start: number,
-        end: number,
     ) {
         const character = snapshotChatScreenshotCharacter(source, chat)
         const memberIds = new Set(source.type === 'group' ? source.characters : [])
-        for (const message of chat.message.slice(Math.max(0, start - 2), end)) {
-            if (message.saying) memberIds.add(message.saying)
-        }
         const members = DBState.db.characters
             .filter((candidate) => candidate !== source && memberIds.has(candidate.chaId))
             .map((candidate) => snapshotChatScreenshotCharacter(
@@ -649,7 +681,7 @@
             presetRegex: DBState.db.presetRegex ?? [],
             moduleRegexScripts: getModuleRegexScripts(),
             assetStyle: source.prebuiltAssetStyle ?? '',
-            parserContext: createCaptureParserContext(source, chat, 1, chat.message.length),
+            parserContext: createCaptureParserContext(source, chat),
             settings: {
                 autoTranslate: DBState.db.autoTranslate,
                 autoTranslateCachedOnly: DBState.db.autoTranslateCachedOnly,
@@ -689,7 +721,13 @@
 
     async function startScreenshot(start: number, end: number) {
         const dialogSnapshot = screenshotDialogSnapshot
-        if (screenshotRunning || !dialogSnapshot || !screenshotSurface) return
+        const sourceLease = screenshotSourceLease
+        if (
+            screenshotRunning
+            || !dialogSnapshot
+            || !sourceLease
+            || !screenshotSurface
+        ) return
 
         const controller = new AbortController()
         screenshotController = controller
@@ -698,7 +736,8 @@
         screenshotError = ''
 
         try {
-            const job = createChatScreenshotJobFromDialogSnapshot(dialogSnapshot, start, end)
+            const job = await sourceLease.createJob(start, end, controller.signal)
+            if (screenshotSourceLease === sourceLease) screenshotSourceLease = null
             screenshotTotalTurns = job.totalTurns
 
             const fileBase = `chat-${crypto.randomUUID()}`
@@ -735,6 +774,10 @@
             screenshotDialogOpen = false
             screenshotDialogSnapshot = null
         } catch (error) {
+            if (screenshotSourceLease === sourceLease) screenshotSourceLease = null
+            await sourceLease.close().catch(console.error)
+            screenshotDialogOpen = false
+            screenshotDialogSnapshot = null
             if (!(error instanceof DOMException && error.name === 'AbortError')) {
                 console.error(error)
                 const detail = error instanceof Error ? error.message : String(error)
@@ -747,7 +790,11 @@
         }
     }
 
-    onDestroy(cancelScreenshot)
+    onDestroy(() => {
+        screenshotOpenGeneration += 1
+        cancelScreenshot()
+        releaseScreenshotSource()
+    })
 
     
 </script>

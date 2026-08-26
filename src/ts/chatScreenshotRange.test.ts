@@ -6,7 +6,26 @@ import {
     fullScreenshotRange,
     recentScreenshotRange,
     validateScreenshotRange,
+    type ChatScreenshotRangeReader,
+    type ChatScreenshotRenderContext,
 } from './chatScreenshotRange'
+import type { Message, character } from './storage/database.svelte'
+
+function rangeReader(messages: Message[]) {
+    const frozen = structuredClone(messages)
+    const reads: Array<{ startIndex: number; limit: number }> = []
+    const reader: ChatScreenshotRangeReader = {
+        characterId: 'open-character',
+        chatId: 'open-chat',
+        revision: 7,
+        totalTurns: frozen.length,
+        async readRange(startIndex, limit) {
+            reads.push({ startIndex, limit })
+            return structuredClone(frozen.slice(startIndex, startIndex + limit))
+        },
+    }
+    return { reader, reads }
+}
 
 function parserContext() {
     const character = {
@@ -28,6 +47,41 @@ function parserContext() {
         chatVariables: {},
         globalChatVariables: {},
         currentTime: 1,
+    }
+}
+
+function renderContext(): ChatScreenshotRenderContext {
+    return {
+        character: null,
+        characterName: 'Character',
+        characterImageSource: '',
+        characterLargePortrait: false,
+        userName: 'User',
+        userImageSource: '',
+        userLargePortrait: false,
+        moduleAssets: [],
+        presetRegex: [],
+        moduleRegexScripts: [],
+        assetStyle: '',
+        parserContext: parserContext(),
+        settings: {
+            autoTranslate: false,
+            autoTranslateCachedOnly: false,
+            translatorType: 'google',
+            translateBeforeHTMLFormatting: false,
+            legacyTranslation: false,
+            showTranslationLoading: false,
+            newImageHandlingBeta: false,
+            assetWidth: -1,
+            hideAllImages: false,
+            iconSize: 100,
+            zoomSize: 100,
+            lineHeight: 1.25,
+            dynamicAssets: false,
+            dynamicAssetsEditDisplay: false,
+            legacyMediaFindings: false,
+            assetMaxDifference: 0.5,
+        },
     }
 }
 
@@ -164,17 +218,20 @@ describe('chat screenshot ranges', () => {
         ])
     })
 
-    it('keeps dialog-open identity and messages after the live source changes', () => {
+    it('keeps only dialog-open identity, revision, count, and render context', async () => {
         const messages = [
             { role: 'user' as const, data: 'open-time first' },
             { role: 'char' as const, data: 'open-time second' },
         ]
+        const { reader } = rangeReader(messages)
         const context = parserContext()
         context.userName = 'Open User'
         const dialogSnapshot = createChatScreenshotDialogSnapshot({
             characterId: 'open-character',
             chatId: 'open-chat',
-            messages,
+            revision: 7,
+            sessionVersion: 3,
+            totalTurns: messages.length,
             renderContext: {
                 character: null,
                 characterName: 'Open Character',
@@ -213,7 +270,12 @@ describe('chat screenshot ranges', () => {
         messages.push({ role: 'char', data: 'changed third' })
         context.userName = 'Changed User'
 
-        const job = createChatScreenshotJobFromDialogSnapshot(dialogSnapshot, 1, 2)
+        const job = await createChatScreenshotJobFromDialogSnapshot(
+            dialogSnapshot,
+            reader,
+            1,
+            2,
+        )
 
         expect(job).toMatchObject({
             characterId: 'open-character',
@@ -225,7 +287,134 @@ describe('chat screenshot ranges', () => {
             'open-time second',
         ])
         expect(job.renderContext.parserContext.userName).toBe('Open User')
-        expect(Object.isFrozen(dialogSnapshot.messages[0])).toBe(true)
+        expect(dialogSnapshot).toMatchObject({ revision: 7, sessionVersion: 3 })
+        expect('messages' in dialogSnapshot).toBe(false)
+    })
+
+    it('pages only the selected range and exact bounded parser prefix', async () => {
+        const messages = Array.from({ length: 100 }, (_, index) => ({
+            role: index % 2 === 0 ? 'char' as const : 'user' as const,
+            data: `turn ${index + 1}`,
+        }))
+        const { reader, reads } = rangeReader(messages)
+        const dialogSnapshot = createChatScreenshotDialogSnapshot({
+            characterId: reader.characterId,
+            chatId: reader.chatId,
+            revision: reader.revision,
+            sessionVersion: 1,
+            totalTurns: reader.totalTurns,
+            renderContext: renderContext(),
+        })
+
+        const job = await createChatScreenshotJobFromDialogSnapshot(
+            dialogSnapshot,
+            reader,
+            100,
+            100,
+        )
+
+        expect(job.renderContext.historyStartIndex).toBe(95)
+        expect(job.renderContext.parserContext.character.chats[0].message).toHaveLength(5)
+        expect(job.messages).toHaveLength(1)
+        expect(reads[0]).toEqual({ startIndex: 99, limit: 1 })
+        expect(reads).not.toContainEqual({ startIndex: 0, limit: 100 })
+        expect(reads.at(-1)).toEqual({ startIndex: 95, limit: 4 })
+    })
+
+    it('pages the full pinned history only when parser semantics require it', async () => {
+        const messages = Array.from({ length: 5_000 }, (_, index) => ({
+            role: index % 2 === 0 ? 'char' as const : 'user' as const,
+            data: index === 2_499 ? '{{lastmessage}}' : `turn ${index + 1}`,
+        }))
+        const { reader, reads } = rangeReader(messages)
+        const dialogSnapshot = createChatScreenshotDialogSnapshot({
+            characterId: reader.characterId,
+            chatId: reader.chatId,
+            revision: reader.revision,
+            sessionVersion: 1,
+            totalTurns: reader.totalTurns,
+            renderContext: renderContext(),
+        })
+
+        const job = await createChatScreenshotJobFromDialogSnapshot(
+            dialogSnapshot,
+            reader,
+            2_500,
+            2_500,
+        )
+
+        expect(job.renderContext.historyStartIndex).toBe(0)
+        expect(job.renderContext.parserContext.character.chats[0].message).toHaveLength(5_000)
+        expect(reads[0]).toEqual({ startIndex: 2_499, limit: 1 })
+        expect(reads.slice(1)).toEqual([
+            { startIndex: 0, limit: 2_499 },
+            { startIndex: 2_500, limit: 2_500 },
+        ])
+    })
+
+    it('extends the pinned projection for previouschatlog without rereading the selection', async () => {
+        const messages = Array.from({ length: 100 }, (_, index) => ({
+            role: index % 2 === 0 ? 'char' as const : 'user' as const,
+            data: index === 89 ? '{{previouschatlog::10}}' : `turn ${index + 1}`,
+        }))
+        const { reader, reads } = rangeReader(messages)
+        const dialogSnapshot = createChatScreenshotDialogSnapshot({
+            characterId: reader.characterId,
+            chatId: reader.chatId,
+            revision: reader.revision,
+            sessionVersion: 1,
+            totalTurns: reader.totalTurns,
+            renderContext: renderContext(),
+        })
+
+        const job = await createChatScreenshotJobFromDialogSnapshot(
+            dialogSnapshot,
+            reader,
+            90,
+            90,
+        )
+
+        expect(job.renderContext.historyStartIndex).toBe(10)
+        expect(job.renderContext.firstParserMessageIndex).toBe(79)
+        expect(job.renderContext.parserContext.character.chats[0].message).toHaveLength(80)
+        expect(reads[0]).toEqual({ startIndex: 89, limit: 1 })
+        expect(reads.at(-1)).toEqual({ startIndex: 10, limit: 79 })
+    })
+
+    it('hydrates only speaker characters referenced by the pinned parser projection', async () => {
+        const { reader } = rangeReader([
+            { role: 'char', data: 'member response', saying: 'member-1' },
+        ])
+        const member = {
+            type: 'character',
+            chaId: 'member-1',
+            name: 'Member',
+            chats: [],
+            chatPage: 0,
+        } as character
+        reader.readCharacter = async (characterId) =>
+            characterId === member.chaId ? structuredClone(member) : null
+        const dialogSnapshot = createChatScreenshotDialogSnapshot({
+            characterId: reader.characterId,
+            chatId: reader.chatId,
+            revision: reader.revision,
+            sessionVersion: 1,
+            totalTurns: reader.totalTurns,
+            renderContext: renderContext(),
+        })
+
+        const job = await createChatScreenshotJobFromDialogSnapshot(
+            dialogSnapshot,
+            reader,
+            1,
+            1,
+        )
+
+        expect(
+            job.renderContext.parserContext.database.characters.map(
+                (candidate) => candidate.chaId,
+            ),
+        ).toEqual(['character-1', 'member-1'])
     })
 
     it('keeps the selected messages and the derived frozen history window needed by CBS', () => {

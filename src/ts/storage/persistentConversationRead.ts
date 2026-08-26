@@ -78,7 +78,7 @@ function assertCurrent(
     }
 }
 
-async function acquireCurrentRevision(
+export async function acquireCurrentPersistentRevision(
     dependencies: PersistentConversationReadDependencies,
     generation: number,
     signal?: AbortSignal,
@@ -119,7 +119,7 @@ export async function readPinnedSelectedConversationWindow(
     assertCurrent(dependencies, generation, input.signal)
     await dependencies.store.open()
     assertCurrent(dependencies, generation, input.signal)
-    const lease = await acquireCurrentRevision(dependencies, generation, input.signal)
+    const lease = await acquireCurrentPersistentRevision(dependencies, generation, input.signal)
 
     return withPersistentRevisionLease(lease, async (reader) => {
         assertCurrent(dependencies, generation, input.signal)
