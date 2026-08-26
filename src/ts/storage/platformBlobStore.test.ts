@@ -62,6 +62,25 @@ describe('platform BlobStore', () => {
         ])
     })
 
+    test('Tauri new Inlay image writes invoke the native encoder with owned bytes', async () => {
+        const { backend } = memoryBackend()
+        const metadata = {
+            key: 'image-id', kind: 'inlay' as const, size: 7, mime: 'image/webp',
+            name: 'source.png', ext: 'webp', inlayType: 'image' as const, width: 5, height: 3,
+        }
+        const invoke = vi.fn(async () => metadata)
+        const store = createTauriBlobStore(backend, invoke)
+        const source = Uint8Array.of(1, 2, 3)
+
+        const pending = store.putNewInlayImage!('image-id', source, { name: 'source.png' })
+        source[0] = 9
+
+        await expect(pending).resolves.toEqual(metadata)
+        expect(invoke).toHaveBeenCalledWith('native_media_write_inlay_image', {
+            id: 'image-id', data: [1, 2, 3], name: 'source.png',
+        })
+    })
+
     test('gates writes and removals while leaving reads ungated', async () => {
         const { backend } = memoryBackend()
         const events: string[] = []
@@ -108,6 +127,32 @@ describe('platform BlobStore', () => {
 
         await pending
         expect(await backing.read('assets/a')).toEqual(new Uint8Array([1]))
+    })
+
+    test('gates native Inlay image writes and owns their inputs', async () => {
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const optimized = vi.fn(async (key: string, data: Uint8Array, input: { name: string }) => ({
+            key, kind: 'inlay' as const, size: data.byteLength, mime: 'image/webp',
+            name: input.name, ext: 'webp', inlayType: 'image' as const, width: 1, height: 1,
+        }))
+        const store = {
+            ...createBackedBlobStore(memoryBackend().backend),
+            putNewInlayImage: optimized,
+        }
+        const gated = createGatedBlobStore(store, {
+            async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
+        })
+        const source = Uint8Array.of(4, 5)
+        const input = { name: 'original.png' }
+
+        const pending = gated.putNewInlayImage!('owned', source, input)
+        source[0] = 8
+        input.name = 'mutated.png'
+        release()
+        await pending
+
+        expect(optimized).toHaveBeenCalledWith('owned', Uint8Array.of(4, 5), { name: 'original.png' })
     })
 
     test('preserves legacy paths and encodes raw inlay ids', () => {

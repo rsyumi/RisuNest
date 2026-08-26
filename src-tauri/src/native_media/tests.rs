@@ -1,6 +1,9 @@
-use super::{decode_physical_key, respond};
+use super::{
+    decode_physical_key, recover_inlay_writes, respond, write_inlay_image, InlayImageMetadata,
+};
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::json;
-use std::{fs, path::Path};
+use std::{fs, io::Cursor, path::Path};
 use tauri::http::{header, Method, Request, StatusCode};
 use tempfile::TempDir;
 
@@ -266,4 +269,233 @@ fn ignores_thumbnail_queries_and_serves_the_original_without_creating_a_cache() 
     assert_eq!(response.headers()[header::CONTENT_TYPE], "image/custom");
     assert_eq!(response.body(), original);
     assert!(!temp.path().join("blobstore/thumbnails").exists());
+}
+
+fn encoded_fixture(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
+    let image = DynamicImage::ImageRgba8(RgbaImage::from_fn(width, height, |x, y| {
+        Rgba([(x * 17) as u8, (y * 29) as u8, 91, 255])
+    }));
+    let mut output = Cursor::new(Vec::new());
+    image.write_to(&mut output, format).unwrap();
+    output.into_inner()
+}
+
+#[test]
+fn writes_png_inlay_as_full_dimension_webp_with_truthful_metadata() {
+    let temp = TempDir::new().unwrap();
+    let source = encoded_fixture(ImageFormat::Png, 7, 3);
+
+    let metadata = write_inlay_image(temp.path(), "new-image", &source, "photo.png").unwrap();
+
+    assert_eq!(metadata.key, "new-image");
+    assert_eq!(metadata.kind, "inlay");
+    assert_eq!(metadata.inlay_type, "image");
+    assert_eq!(metadata.mime, "image/webp");
+    assert_eq!(metadata.ext, "webp");
+    assert_eq!(metadata.name, "photo.png");
+    assert_eq!((metadata.width, metadata.height), (7, 3));
+
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{}.bin", hex("new-image")));
+    let payload = fs::read(payload_path).unwrap();
+    let source_rgba = image::load_from_memory_with_format(&source, ImageFormat::Png)
+        .unwrap()
+        .to_rgba8();
+    let expected = webp::Encoder::from_rgba(
+        source_rgba.as_raw(),
+        source_rgba.width(),
+        source_rgba.height(),
+    )
+    .encode(85.0);
+    assert_eq!(payload.as_slice(), std::ops::Deref::deref(&expected));
+    let decoded = image::load_from_memory_with_format(&payload, ImageFormat::WebP).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (7, 3));
+
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{}.json", hex("new-image")));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(metadata_path).unwrap()).unwrap(),
+        serde_json::to_value(metadata).unwrap()
+    );
+}
+
+fn with_exif_orientation(jpeg: Vec<u8>, orientation: u8) -> Vec<u8> {
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+    let mut exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+    exif.extend_from_slice(&[orientation, 0, 0, 0, 0, 0, 0, 0]);
+    let length = (exif.len() + 2) as u16;
+    let mut oriented = Vec::with_capacity(jpeg.len() + exif.len() + 4);
+    oriented.extend_from_slice(&jpeg[..2]);
+    oriented.extend_from_slice(&[0xff, 0xe1]);
+    oriented.extend_from_slice(&length.to_be_bytes());
+    oriented.extend_from_slice(&exif);
+    oriented.extend_from_slice(&jpeg[2..]);
+    oriented
+}
+
+#[test]
+fn records_display_dimensions_after_applying_jpeg_orientation() {
+    let temp = TempDir::new().unwrap();
+    let source = with_exif_orientation(encoded_fixture(ImageFormat::Jpeg, 8, 3), 6);
+
+    let metadata = write_inlay_image(temp.path(), "oriented", &source, "oriented.jpg").unwrap();
+
+    assert_eq!((metadata.width, metadata.height), (3, 8));
+}
+
+#[test]
+fn writes_jpeg_and_webp_sources_once_at_quality_85_without_resizing() {
+    for (id, source, width, height) in [
+        ("jpeg", encoded_fixture(ImageFormat::Jpeg, 9, 4), 9, 4),
+        ("webp", encoded_fixture(ImageFormat::WebP, 5, 8), 5, 8),
+    ] {
+        let temp = TempDir::new().unwrap();
+
+        let metadata = write_inlay_image(temp.path(), id, &source, "source").unwrap();
+        let payload = fs::read(
+            temp.path()
+                .join("blobstore/inlays")
+                .join(format!("{}.bin", hex(id))),
+        )
+        .unwrap();
+        let decoded = image::load_from_memory_with_format(&payload, ImageFormat::WebP).unwrap();
+
+        assert_eq!((metadata.width, metadata.height), (width, height));
+        assert_eq!((decoded.width(), decoded.height()), (width, height));
+    }
+}
+
+#[test]
+fn rejects_unsupported_gif_avif_and_corrupt_new_images_without_mutating_prior_data() {
+    let temp = TempDir::new().unwrap();
+    let original = encoded_fixture(ImageFormat::Png, 3, 2);
+    let original_metadata =
+        write_inlay_image(temp.path(), "stable", &original, "stable.png").unwrap();
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{}.bin", hex("stable")));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{}.json", hex("stable")));
+    let prior_payload = fs::read(&payload_path).unwrap();
+    let prior_metadata = fs::read(&metadata_path).unwrap();
+    let gif = encoded_fixture(ImageFormat::Gif, 2, 1);
+    let avif = b"\0\0\0\x18ftypavif\0\0\0\0avifmif1";
+
+    assert!(
+        write_inlay_image(temp.path(), "stable", &gif, "animated.gif")
+            .unwrap_err()
+            .contains("unsupported new Inlay image format")
+    );
+    assert!(
+        write_inlay_image(temp.path(), "stable", avif, "source.avif")
+            .unwrap_err()
+            .contains("unsupported new Inlay image format")
+    );
+    assert!(
+        write_inlay_image(temp.path(), "stable", b"not an image", "broken.png")
+            .unwrap_err()
+            .contains("unsupported Inlay image format")
+    );
+
+    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
+    assert_eq!(
+        serde_json::from_slice::<InlayImageMetadata>(&prior_metadata).unwrap(),
+        original_metadata
+    );
+}
+
+#[test]
+fn overwrites_payload_and_metadata_as_one_recoverable_pair() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "replace",
+        &encoded_fixture(ImageFormat::Png, 2, 7),
+        "first.png",
+    )
+    .unwrap();
+
+    let second = write_inlay_image(
+        temp.path(),
+        "replace",
+        &encoded_fixture(ImageFormat::Jpeg, 11, 3),
+        "second.jpg",
+    )
+    .unwrap();
+    let payload = fs::read(
+        temp.path()
+            .join("blobstore/inlays")
+            .join(format!("{}.bin", hex("replace"))),
+    )
+    .unwrap();
+    let decoded = image::load_from_memory_with_format(&payload, ImageFormat::WebP).unwrap();
+
+    assert_eq!(second.name, "second.jpg");
+    assert_eq!((second.width, second.height), (11, 3));
+    assert_eq!((decoded.width(), decoded.height()), (11, 3));
+    assert!(!temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{}.bin.replace-previous", hex("replace")))
+        .exists());
+}
+
+#[test]
+fn startup_recovery_restores_the_prior_pair_after_interrupted_promotion() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "crash",
+        &encoded_fixture(ImageFormat::Png, 4, 6),
+        "prior.png",
+    )
+    .unwrap();
+    let encoded_id = hex("crash");
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{encoded_id}.bin"));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{encoded_id}.json"));
+    let prior_payload = fs::read(&payload_path).unwrap();
+    let prior_metadata = fs::read(&metadata_path).unwrap();
+    fs::rename(
+        &payload_path,
+        payload_path.with_extension("bin.replace-previous"),
+    )
+    .unwrap();
+    fs::rename(
+        &metadata_path,
+        metadata_path.with_extension("json.replace-previous"),
+    )
+    .unwrap();
+    fs::write(&payload_path, b"interrupted-new-payload").unwrap();
+    let transaction_dir = temp.path().join("blobstore/inlay-transactions");
+    fs::write(
+        transaction_dir.join(format!("{encoded_id}.json")),
+        serde_json::to_vec(&json!({
+            "id": "crash",
+            "suffix": "simulated",
+            "hadPayload": true,
+            "hadMetadata": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
+    assert_eq!(fs::read_dir(transaction_dir).unwrap().count(), 0);
 }

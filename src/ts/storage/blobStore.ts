@@ -38,6 +38,11 @@ export interface BlobListQuery {
 
 export interface BlobStore {
     put(key: string, data: Uint8Array, metadata: BlobWriteMetadata): Promise<BlobMetadata>
+    putNewInlayImage?(
+        key: string,
+        data: Uint8Array,
+        input: { name: string },
+    ): Promise<InlayBlobMetadata>
     read(key: string, range?: BlobReadRange): Promise<Uint8Array | null>
     stat(key: string): Promise<BlobMetadata | null>
     list(query?: BlobListQuery): Promise<BlobMetadata[]>

@@ -24,13 +24,16 @@ import { createBackedBlobStore } from 'src/ts/storage/platformBlobStore'
 const fakeCtx = {
     drawImage: vi.fn(),
 }
+let canvasOutputMime = 'image/webp'
+let loadedImageWidth = 100
+let loadedImageHeight = 100
 const origCreateElement = document.createElement.bind(document)
 vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: any) => {
     const el = origCreateElement(tag, options)
     if (tag === 'canvas') {
         ;(el as HTMLCanvasElement).getContext = (() => fakeCtx) as any
         ;(el as HTMLCanvasElement).toBlob = ((cb: BlobCallback) => {
-            cb(new Blob(['fake-png'], { type: 'image/png' }))
+            cb(new Blob(['fake-image'], { type: canvasOutputMime }))
         }) as any
     }
     return el
@@ -113,6 +116,8 @@ function makeImage(w: number, h: number): HTMLImageElement {
     const img = new Image()
     Object.defineProperty(img, 'width', { get: () => w })
     Object.defineProperty(img, 'height', { get: () => h })
+    Object.defineProperty(img, 'naturalWidth', { get: () => w })
+    Object.defineProperty(img, 'naturalHeight', { get: () => h })
     Object.defineProperty(img, 'onload', {
         set(fn: () => void) {
             fn?.()
@@ -132,9 +137,51 @@ beforeEach(() => {
     payloadReads = 0
     legacyReads = 0
     legacyKeyLists = 0
+    canvasOutputMime = 'image/webp'
+    loadedImageWidth = 100
+    loadedImageHeight = 100
+    vi.stubGlobal('Image', class {
+        naturalWidth = loadedImageWidth
+        naturalHeight = loadedImageHeight
+        width = loadedImageWidth
+        height = loadedImageHeight
+        onload: (() => void) | null = null
+        onerror: (() => void) | null = null
+        set src(_value: string) { queueMicrotask(() => this.onload?.()) }
+    })
 })
 
 describe('setInlayAsset', () => {
+    test('optimizes direct browser image writes at decoded natural dimensions', async () => {
+        vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:direct-image')
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+        loadedImageWidth = 300
+        loadedImageHeight = 150
+
+        await setInlayAsset('direct-image', {
+            data: new Blob([Uint8Array.of(1, 2, 3)], { type: 'image/png' }),
+            ext: 'png', height: 1, width: 1, name: 'direct.png', type: 'image',
+        })
+
+        const stored = await getInlayAssetBlob('direct-image')
+        expect(stored).toMatchObject({ ext: 'webp', height: 150, width: 300 })
+        expect(stored!.data.type).toBe('image/webp')
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:direct-image')
+    })
+
+    test.each([
+        ['GIF', Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]), 'gif', 'image/gif'],
+        ['AVIF', new TextEncoder().encode('\0\0\0\x18ftypavif'), 'avif', 'image/avif'],
+        ['animated WebP', new TextEncoder().encode('RIFF\x0c\0\0\0WEBPANIM\0\0\0\0'), 'webp', 'image/webp'],
+    ])('rejects new %s input rather than flattening it', async (_label, bytes, ext, mime) => {
+        await expect(setInlayAsset('unsupported-image', {
+            data: new Blob([bytes], { type: mime }),
+            ext, name: `unsupported.${ext}`, type: 'image',
+        })).rejects.toThrow(/unsupported/i)
+
+        expect(await getInlayAssetBlob('unsupported-image')).toBeNull()
+    })
+
     test('stores an asset in the storage', async () => {
         const asset: InlayAsset = {
             data: new Blob(['hello'], { type: 'text/plain' }),
@@ -148,7 +195,7 @@ describe('setInlayAsset', () => {
         await setInlayAsset('asset-1', asset)
 
         expect(await getInlayAssetBlob('asset-1')).toMatchObject({
-            ext: 'png', height: 100, name: 'test.png', type: 'image', width: 100,
+            ext: 'webp', height: 100, name: 'test.png', type: 'image', width: 100,
         })
     })
 
@@ -170,7 +217,11 @@ describe('setInlayAsset', () => {
             width: 20,
         }
 
+        loadedImageWidth = 10
+        loadedImageHeight = 10
         await setInlayAsset('id-1', first)
+        loadedImageWidth = 20
+        loadedImageHeight = 20
         await setInlayAsset('id-1', second)
 
         expect(await getInlayAssetBlob('id-1')).toMatchObject({
@@ -551,12 +602,13 @@ describe('writeInlayImage', () => {
         const stored = await getInlayAssetBlob('custom-id')
         expect(stored).toMatchObject({
             data: expect.any(Blob),
-            ext: 'png',
+            ext: 'webp',
             height: 100,
             name: 'photo.jpg',
             type: 'image',
             width: 200,
         })
+        expect(stored!.data.type).toBe('image/webp')
     })
 
     test('generates uuid when no id is provided', async () => {
@@ -569,54 +621,23 @@ describe('writeInlayImage', () => {
         expect(stored!.name).toBe('test-uuid-1234')
     })
 
-    test('output pixels never exceed 1024 * 1024', async () => {
-        await fc.assert(
-            fc.asyncProperty(fc.integer({ min: 1, max: 10000 }), fc.integer({ min: 1, max: 10000 }), async (w, h) => {
-                store.clear()
-                const img = makeImage(w, h)
-                await writeInlayImage(img, { id: 'prop-img' })
-                const stored = await getInlayAssetBlob('prop-img')
+    test('preserves natural dimensions above the former pixel cap', async () => {
+        await writeInlayImage(makeImage(4096, 2048), { id: 'full-size' })
 
-                expect(stored!.width! * stored!.height!).toBeLessThanOrEqual(1024 * 1024)
-                expect(stored!.width).toBeGreaterThan(0)
-                expect(stored!.height).toBeGreaterThan(0)
-            }),
-        )
+        expect(await getInlayAssetBlob('full-size')).toMatchObject({
+            height: 2048,
+            width: 4096,
+        })
     })
 
-    test('preserves aspect ratio when downscaling', async () => {
-        await fc.assert(
-            fc.asyncProperty(
-                fc.integer({ min: 1025, max: 10000 }),
-                fc.integer({ min: 1025, max: 10000 }),
-                async (w, h) => {
-                    store.clear()
-                    const img = makeImage(w, h)
-                    await writeInlayImage(img, { id: 'ratio-img' })
-                    const stored = await getInlayAssetBlob('ratio-img')
+    test('uses the actual browser encoder MIME and extension when WebP is unavailable', async () => {
+        canvasOutputMime = 'image/png'
 
-                    const originalRatio = w / h
-                    const storedRatio = stored!.width! / stored!.height!
-                    expect(Math.abs(originalRatio - storedRatio) / originalRatio).toBeLessThan(0.01)
-                },
-            ),
-        )
-    })
+        await writeInlayImage(makeImage(80, 40), { id: 'png-fallback' })
 
-    test('does not resize images within pixel budget', async () => {
-        await fc.assert(
-            fc.asyncProperty(fc.integer({ min: 1, max: 1024 }), fc.integer({ min: 1, max: 1024 }), async (w, h) => {
-                store.clear()
-                const img = makeImage(w, h)
-                await writeInlayImage(img, { id: 'small-img' })
-
-                const stored = await getInlayAssetBlob('small-img')
-                expect(stored).toMatchObject({
-                    height: h,
-                    width: w,
-                })
-            }),
-        )
+        const stored = await getInlayAssetBlob('png-fallback')
+        expect(stored).toMatchObject({ ext: 'png', height: 40, width: 80 })
+        expect(stored!.data.type).toBe('image/png')
     })
 })
 
@@ -631,6 +652,8 @@ describe('set -> get round-trip', () => {
                 fc.nat({ max: 5000 }),
                 async (id, name, ext, width, height) => {
                     store.clear()
+                    loadedImageWidth = width
+                    loadedImageHeight = height
                     const blob = new Blob(['data'], { type: 'application/octet-stream' })
                     const asset: InlayAsset = {
                         data: blob,
@@ -646,7 +669,7 @@ describe('set -> get round-trip', () => {
                     const result = await getInlayAsset(id)
                     expect(result).toMatchObject({
                         data: expect.any(String),
-                        ext: ext.replace(/^\.+/, '').toLowerCase(),
+                        ext: 'webp',
                         height,
                         width,
                         name,
@@ -663,6 +686,8 @@ describe('set -> remove -> get', () => {
         await fc.assert(
             fc.asyncProperty(fc.string({ minLength: 1, maxLength: 20 }), async (id) => {
                 store.clear()
+                loadedImageWidth = 1
+                loadedImageHeight = 1
                 const asset: InlayAsset = {
                     data: new Blob(['x']),
                     ext: 'png',
@@ -707,17 +732,25 @@ describe('BlobStore inlay compatibility', () => {
         expect(await readLegacyInlayPayload('missing')).toBeNull()
     })
 
-    test('round trips image, audio, video, and signature bytes', async () => {
+    test('optimizes new images and round trips audio, video, and signature bytes', async () => {
         const fixtures: [string, InlayAsset, Uint8Array][] = [
             ['image', { data: new Blob([new Uint8Array([1, 2])], { type: 'image/png' }), ext: 'png', name: 'a.png', type: 'image', width: 2, height: 1 }, new Uint8Array([1, 2])],
             ['audio', { data: new Blob([new Uint8Array([3])], { type: 'audio/mpeg' }), ext: 'mp3', name: 'a.mp3', type: 'audio' }, new Uint8Array([3])],
             ['video', { data: new Blob([new Uint8Array([4, 5])], { type: 'video/webm' }), ext: 'webm', name: 'a.webm', type: 'video' }, new Uint8Array([4, 5])],
         ]
         for (const [id, asset, bytes] of fixtures) {
+            if (asset.type === 'image') {
+                loadedImageWidth = asset.width!
+                loadedImageHeight = asset.height!
+            }
             await setInlayAsset(id, asset)
             const loaded = await getInlayAssetBlob(id)
-            expect(new Uint8Array(await loaded!.data.arrayBuffer())).toEqual(bytes)
-            expect(loaded).toMatchObject({ name: asset.name, ext: asset.ext, type: asset.type })
+            if (asset.type === 'image') {
+                expect(loaded).toMatchObject({ name: asset.name, ext: 'webp', type: 'image' })
+            } else {
+                expect(new Uint8Array(await loaded!.data.arrayBuffer())).toEqual(bytes)
+                expect(loaded).toMatchObject({ name: asset.name, ext: asset.ext, type: asset.type })
+            }
         }
 
         const signature = { signatures: [{ type: 'text' as const, content: 'synthetic' }], sourceFormat: 0 as any, source: 'local' }

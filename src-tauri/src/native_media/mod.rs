@@ -1,17 +1,22 @@
-use serde::Deserialize;
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
+use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    fs::{self, File, OpenOptions},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::http::{
     header::{self, HeaderValue},
     Method, Request, Response, StatusCode,
 };
+use tauri::{AppHandle, Manager};
 
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const EXPOSED_HEADERS: &str = "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag";
+static INLAY_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Deserialize)]
 struct BlobMetadata {
@@ -19,6 +24,29 @@ struct BlobMetadata {
     kind: String,
     size: u64,
     mime: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InlayImageMetadata {
+    key: String,
+    kind: String,
+    size: u64,
+    mime: String,
+    name: String,
+    ext: String,
+    inlay_type: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InlayWriteTransaction {
+    id: String,
+    suffix: String,
+    had_payload: bool,
+    had_metadata: bool,
 }
 
 struct ResolvedBlob {
@@ -128,6 +156,312 @@ fn etag(modified: SystemTime, size: u64) -> String {
         elapsed.subsec_nanos(),
         size
     )
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn rollback_inlay_pair(
+    payload_path: &Path,
+    metadata_path: &Path,
+    previous_payload: &Path,
+    previous_metadata: &Path,
+) -> std::io::Result<()> {
+    if previous_payload.exists() {
+        remove_file_if_exists(payload_path)?;
+        fs::rename(previous_payload, payload_path)?;
+    }
+    if previous_metadata.exists() {
+        remove_file_if_exists(metadata_path)?;
+        fs::rename(previous_metadata, metadata_path)?;
+    }
+    Ok(())
+}
+
+fn inlay_paths(root: &Path, id: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let encoded_id = hex::encode(id.as_bytes());
+    (
+        root.join("blobstore/inlays")
+            .join(format!("{encoded_id}.bin")),
+        root.join("blobstore/metadata")
+            .join(format!("{encoded_id}.json")),
+        root.join("blobstore/inlay-transactions")
+            .join(format!("{encoded_id}.json")),
+    )
+}
+
+fn metadata_matches_payload(metadata_path: &Path, payload_path: &Path, id: &str) -> bool {
+    let Ok(metadata_bytes) = fs::read(metadata_path) else {
+        return false;
+    };
+    let Ok(metadata) = serde_json::from_slice::<InlayImageMetadata>(&metadata_bytes) else {
+        return false;
+    };
+    let Ok(payload_metadata) = fs::metadata(payload_path) else {
+        return false;
+    };
+    metadata.key == id
+        && metadata.kind == "inlay"
+        && metadata.inlay_type == "image"
+        && metadata.mime == "image/webp"
+        && metadata.ext == "webp"
+        && metadata.size == payload_metadata.len()
+}
+
+fn recover_inlay_transaction(root: &Path, transaction_path: &Path) -> Result<(), String> {
+    let transaction: InlayWriteTransaction = serde_json::from_slice(
+        &fs::read(transaction_path)
+            .map_err(|error| format!("failed to read Inlay transaction: {error}"))?,
+    )
+    .map_err(|error| format!("failed to decode Inlay transaction: {error}"))?;
+    let (payload_path, metadata_path, expected_transaction_path) =
+        inlay_paths(root, &transaction.id);
+    if expected_transaction_path != transaction_path {
+        return Err("Inlay transaction id does not match its path".to_owned());
+    }
+    let previous_payload = payload_path.with_extension("bin.replace-previous");
+    let previous_metadata = metadata_path.with_extension("json.replace-previous");
+    let encoded_id = hex::encode(transaction.id.as_bytes());
+    let next_payload = payload_path.parent().unwrap().join(format!(
+        ".{encoded_id}.{}.bin.replace-next",
+        transaction.suffix
+    ));
+    let next_metadata = metadata_path.parent().unwrap().join(format!(
+        ".{encoded_id}.{}.json.replace-next",
+        transaction.suffix
+    ));
+
+    if !metadata_matches_payload(&metadata_path, &payload_path, &transaction.id) {
+        if previous_payload.exists() {
+            remove_file_if_exists(&payload_path).map_err(|error| error.to_string())?;
+            fs::rename(&previous_payload, &payload_path)
+                .map_err(|error| format!("failed to restore prior Inlay payload: {error}"))?;
+        } else if !transaction.had_payload {
+            remove_file_if_exists(&payload_path).map_err(|error| error.to_string())?;
+        }
+        if previous_metadata.exists() {
+            remove_file_if_exists(&metadata_path).map_err(|error| error.to_string())?;
+            fs::rename(&previous_metadata, &metadata_path)
+                .map_err(|error| format!("failed to restore prior Inlay metadata: {error}"))?;
+        } else if !transaction.had_metadata {
+            remove_file_if_exists(&metadata_path).map_err(|error| error.to_string())?;
+        }
+    }
+
+    remove_file_if_exists(&previous_payload).map_err(|error| error.to_string())?;
+    remove_file_if_exists(&previous_metadata).map_err(|error| error.to_string())?;
+    remove_file_if_exists(&next_payload).map_err(|error| error.to_string())?;
+    remove_file_if_exists(&next_metadata).map_err(|error| error.to_string())?;
+    remove_file_if_exists(transaction_path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) fn recover_inlay_writes(root: &Path) -> Result<(), String> {
+    let transaction_dir = root.join("blobstore/inlay-transactions");
+    let entries = match fs::read_dir(&transaction_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("failed to read Inlay transactions: {error}")),
+    };
+    let _guard = INLAY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("failed to read Inlay transaction entry: {error}"))?;
+        if entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        {
+            recover_inlay_transaction(root, &entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn promote_inlay_pair(
+    payload_path: &Path,
+    metadata_path: &Path,
+    next_payload: &Path,
+    next_metadata: &Path,
+) -> Result<(), String> {
+    let previous_payload = payload_path.with_extension("bin.replace-previous");
+    let previous_metadata = metadata_path.with_extension("json.replace-previous");
+    remove_file_if_exists(&previous_payload).map_err(|error| error.to_string())?;
+    remove_file_if_exists(&previous_metadata).map_err(|error| error.to_string())?;
+
+    if payload_path.exists() {
+        fs::rename(payload_path, &previous_payload)
+            .map_err(|error| format!("failed to preserve prior Inlay payload: {error}"))?;
+    }
+    if metadata_path.exists() {
+        if let Err(error) = fs::rename(metadata_path, &previous_metadata) {
+            let _ = rollback_inlay_pair(
+                payload_path,
+                metadata_path,
+                &previous_payload,
+                &previous_metadata,
+            );
+            return Err(format!("failed to preserve prior Inlay metadata: {error}"));
+        }
+    }
+
+    let promotion = fs::rename(next_payload, payload_path)
+        .map_err(|error| format!("failed to activate Inlay payload: {error}"))
+        .and_then(|()| {
+            fs::rename(next_metadata, metadata_path)
+                .map_err(|error| format!("failed to activate Inlay metadata: {error}"))
+        });
+    if let Err(error) = promotion {
+        let rollback = rollback_inlay_pair(
+            payload_path,
+            metadata_path,
+            &previous_payload,
+            &previous_metadata,
+        );
+        let _ = remove_file_if_exists(next_payload);
+        let _ = remove_file_if_exists(next_metadata);
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(format!(
+                "{error}; failed to roll back prior Inlay: {rollback_error}"
+            )),
+        };
+    }
+
+    let _ = remove_file_if_exists(&previous_payload);
+    let _ = remove_file_if_exists(&previous_metadata);
+    Ok(())
+}
+
+pub(crate) fn write_inlay_image(
+    root: &Path,
+    id: &str,
+    data: &[u8],
+    name: &str,
+) -> Result<InlayImageMetadata, String> {
+    if id.is_empty() || id.starts_with("assets/") {
+        return Err("invalid Inlay image id".to_owned());
+    }
+    let format = image::guess_format(data)
+        .map_err(|error| format!("unsupported Inlay image format: {error}"))?;
+    if !matches!(
+        format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
+    ) {
+        return Err(format!("unsupported new Inlay image format: {format:?}"));
+    }
+    if format == ImageFormat::WebP
+        && webp::BitstreamFeatures::new(data).is_some_and(|features| features.has_animation())
+    {
+        return Err("animated WebP Inlay images are unsupported".to_owned());
+    }
+
+    let reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| format!("failed to inspect Inlay image: {error}"))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut decoded = DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
+    decoded.apply_orientation(orientation);
+    let rgba = decoded.to_rgba8();
+    let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height()).encode(85.0);
+    let metadata = InlayImageMetadata {
+        key: id.to_owned(),
+        kind: "inlay".to_owned(),
+        size: encoded.len() as u64,
+        mime: "image/webp".to_owned(),
+        name: name.to_owned(),
+        ext: "webp".to_owned(),
+        inlay_type: "image".to_owned(),
+        width: rgba.width(),
+        height: rgba.height(),
+    };
+    let metadata_bytes = serde_json::to_vec(&metadata)
+        .map_err(|error| format!("failed to encode Inlay metadata: {error}"))?;
+    let encoded_id = hex::encode(id.as_bytes());
+    let payload_dir = root.join("blobstore/inlays");
+    let metadata_dir = root.join("blobstore/metadata");
+    let transaction_dir = root.join("blobstore/inlay-transactions");
+    fs::create_dir_all(&payload_dir)
+        .map_err(|error| format!("failed to create Inlay payload directory: {error}"))?;
+    fs::create_dir_all(&metadata_dir)
+        .map_err(|error| format!("failed to create Inlay metadata directory: {error}"))?;
+    fs::create_dir_all(&transaction_dir)
+        .map_err(|error| format!("failed to create Inlay transaction directory: {error}"))?;
+    let (payload_path, metadata_path, transaction_path) = inlay_paths(root, id);
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let next_payload = payload_dir.join(format!(".{encoded_id}.{suffix}.bin.replace-next"));
+    let next_metadata = metadata_dir.join(format!(".{encoded_id}.{suffix}.json.replace-next"));
+
+    let _guard = INLAY_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if transaction_path.exists() {
+        recover_inlay_transaction(root, &transaction_path)?;
+    }
+    let transaction = InlayWriteTransaction {
+        id: id.to_owned(),
+        suffix,
+        had_payload: payload_path.exists(),
+        had_metadata: metadata_path.exists(),
+    };
+    let transaction_bytes = serde_json::to_vec(&transaction)
+        .map_err(|error| format!("failed to encode Inlay transaction: {error}"))?;
+    if let Err(error) = write_synced(&transaction_path, &transaction_bytes) {
+        return Err(format!("failed to persist Inlay transaction: {error}"));
+    }
+    if let Err(error) = write_synced(&next_payload, encoded.as_ref()) {
+        let _ = recover_inlay_transaction(root, &transaction_path);
+        return Err(format!("failed to stage Inlay payload: {error}"));
+    }
+    if let Err(error) = write_synced(&next_metadata, &metadata_bytes) {
+        let _ = recover_inlay_transaction(root, &transaction_path);
+        return Err(format!("failed to stage Inlay metadata: {error}"));
+    }
+    if let Err(error) =
+        promote_inlay_pair(&payload_path, &metadata_path, &next_payload, &next_metadata)
+    {
+        let _ = recover_inlay_transaction(root, &transaction_path);
+        return Err(error);
+    }
+    let _ = recover_inlay_transaction(root, &transaction_path);
+    Ok(metadata)
+}
+
+#[tauri::command(async)]
+pub(crate) async fn native_media_write_inlay_image(
+    app: AppHandle,
+    id: String,
+    data: Vec<u8>,
+    name: String,
+) -> Result<InlayImageMetadata, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("failed to resolve application data directory: {error}"))?;
+    tauri::async_runtime::spawn_blocking(move || write_inlay_image(&root, &id, &data, &name))
+        .await
+        .map_err(|error| format!("failed to join native Inlay image writer: {error}"))?
 }
 
 fn parse_range(value: Option<&HeaderValue>, size: u64) -> Option<RequestedRange> {

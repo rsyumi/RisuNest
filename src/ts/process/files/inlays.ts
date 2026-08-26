@@ -41,19 +41,16 @@ export async function postInlayAsset(img:{
 }){
 
     const extention = img.name.split('.').at(-1)
-    const imgObj = new Image()
 
     if(inlayImageExts.includes(extention)){
-        const url = URL.createObjectURL(new Blob([asBuffer(img.data)], {type: `image/${extention}`}))
-        try {
-            return await writeInlayImage(imgObj, {
-                name: img.name,
-                ext: extention
-            }, url)
-        }
-        finally {
-            URL.revokeObjectURL(url)
-        }
+        const imgid = v4()
+        await setInlayAsset(imgid, {
+            name: img.name,
+            data: new Blob([asBuffer(img.data)], {type: `image/${extention}`}),
+            ext: extention,
+            type: 'image',
+        })
+        return imgid
     }
 
     if(inlayAudioExts.includes(extention)){
@@ -88,6 +85,18 @@ export async function postInlayAsset(img:{
 }
 
 export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string, ext?:string, id?:string} = {}, sourceUrl?: string) {
+    const imgid = arg.id ?? v4()
+    if (isTauri) {
+        const source = sourceUrl || imgObj.currentSrc || imgObj.src
+        if (!source) throw new Error('Native Inlay image source is unavailable')
+        const response = await fetch(source)
+        if (!response.ok) throw new Error(`Failed to read native Inlay image source: ${response.status}`)
+        const data = new Uint8Array(await response.arrayBuffer())
+        const blobStore = await resolveBlobStore()
+        if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
+        await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid })
+        return imgid
+    }
 
     let drawHeight = 0
     let drawWidth = 0
@@ -95,39 +104,37 @@ export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string
     const ctx = canvas.getContext('2d')
     await new Promise<void>((resolve, reject) => {
         imgObj.onload = () => {
-            drawHeight = imgObj.height
-            drawWidth = imgObj.width
-
-            //resize image to fit inlay, if total pixels exceed 1024*1024
-            const maxPixels = 1024 * 1024
-            const currentPixels = drawHeight * drawWidth
-            
-            if(currentPixels > maxPixels){
-                const scaleFactor = Math.sqrt(maxPixels / currentPixels)
-                drawWidth = Math.floor(drawWidth * scaleFactor)
-                drawHeight = Math.floor(drawHeight * scaleFactor)
-            }
+            drawHeight = imgObj.naturalHeight || imgObj.height
+            drawWidth = imgObj.naturalWidth || imgObj.width
 
             canvas.width = drawWidth
             canvas.height = drawHeight
+            if (!ctx) {
+                reject(new Error('Image canvas is unavailable'))
+                return
+            }
             ctx.drawImage(imgObj, 0, 0, drawWidth, drawHeight)
             resolve(null)
         }
         imgObj.onerror = () => reject(new Error('Failed to load image'))
         if (sourceUrl) imgObj.src = sourceUrl
     })
-    const imageBlob = await new Promise<Blob>((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/png'));
+    const imageBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Failed to encode Inlay image')), 'image/webp', 0.85)
+    })
+    const output = imageBlob.type.toLowerCase() === 'image/webp'
+        ? { mime: 'image/webp', ext: 'webp' }
+        : imageBlob.type.toLowerCase() === 'image/png'
+            ? { mime: 'image/png', ext: 'png' }
+            : imageBlob.type.toLowerCase() === 'image/jpeg'
+                ? { mime: 'image/jpeg', ext: 'jpg' }
+                : null
+    if (!output) throw new Error(`Unsupported browser Inlay encoder MIME: ${imageBlob.type || '(empty)'}`)
 
 
-    const imgid = arg.id ?? v4()
-
-    await setInlayAsset(imgid, {
-        name: arg.name ?? imgid,
-        data: imageBlob,
-        ext: 'png',
-        height: drawHeight,
-        width: drawWidth,
-        type: 'image'
+    await (await resolveBlobStore()).put(imgid, new Uint8Array(await imageBlob.arrayBuffer()), {
+        kind: 'inlay', inlayType: 'image', mime: output.mime,
+        name: arg.name ?? imgid, ext: output.ext, height: drawHeight, width: drawWidth,
     })
 
     return `${imgid}`
@@ -354,9 +361,55 @@ export async function getInlayAssetRenderUrl(
     return url
 }
 
+function isAnimatedWebP(data: Uint8Array): boolean {
+    if (data.byteLength < 12
+        || new TextDecoder().decode(data.subarray(0, 4)) !== 'RIFF'
+        || new TextDecoder().decode(data.subarray(8, 12)) !== 'WEBP') return false
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    for (let offset = 12; offset + 8 <= data.byteLength;) {
+        const type = new TextDecoder().decode(data.subarray(offset, offset + 4))
+        if (type === 'ANIM' || type === 'ANMF') return true
+        const length = view.getUint32(offset + 4, true)
+        offset += 8 + length + (length % 2)
+    }
+    return false
+}
+
+function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): void {
+    const normalizedExt = ext.replace(/^\.+/, '').toLowerCase()
+    const normalizedMime = mime.toLowerCase()
+    const gifSignature = data.byteLength >= 6
+        && new TextDecoder().decode(data.subarray(0, 6)).startsWith('GIF8')
+    if (normalizedExt === 'gif' || normalizedMime === 'image/gif' || gifSignature) {
+        throw new Error('New GIF Inlay images are unsupported because animation cannot be preserved')
+    }
+    const avifSignature = data.byteLength >= 12
+        && new TextDecoder().decode(data.subarray(4, 12)).startsWith('ftypavif')
+    if (normalizedExt === 'avif' || normalizedMime === 'image/avif' || avifSignature) {
+        throw new Error('New AVIF Inlay images are unsupported')
+    }
+    if (isAnimatedWebP(data)) throw new Error('Animated WebP Inlay images are unsupported')
+}
+
 export async function setInlayAsset(id: string, img: InlayAsset){
     const { bytes, mime } = await inlayBytes(img)
-    await (await resolveBlobStore()).put(id, bytes, {
+    const blobStore = await resolveBlobStore()
+    if (img.type === 'image') validateNewInlayImage(bytes, mime, img.ext)
+    if (isTauri && img.type === 'image') {
+        if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
+        await blobStore.putNewInlayImage(id, bytes, { name: img.name })
+        return
+    }
+    if (img.type === 'image') {
+        const sourceUrl = URL.createObjectURL(new Blob([asBuffer(bytes)], { type: mime }))
+        try {
+            await writeInlayImage(new Image(), { id, name: img.name, ext: img.ext }, sourceUrl)
+        } finally {
+            URL.revokeObjectURL(sourceUrl)
+        }
+        return
+    }
+    await blobStore.put(id, bytes, {
         kind: 'inlay',
         inlayType: img.type,
         mime,

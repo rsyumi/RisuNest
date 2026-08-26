@@ -2,11 +2,12 @@ import localforage from 'localforage'
 import {
     BaseDirectory, SeekMode, exists, mkdir, open, readDir, readFile, remove, stat, writeFile,
 } from '@tauri-apps/plugin-fs'
-import { convertFileSrc } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../platform'
 import {
     createKeyValueBlobStore,
     type BlobKeyValueBackend,
+    type InlayBlobMetadata,
     type BlobPhysicalKeyMapper,
     type BlobReadRange,
     type BlobStore,
@@ -45,12 +46,22 @@ export function createBackedBlobStore(backend: BlobKeyValueBackend): BlobStore {
 
 export function createTauriBlobStore(
     backend: BlobKeyValueBackend,
+    invokeCommand: (command: string, args?: Record<string, unknown>) => Promise<unknown> = invoke,
 ): BlobStore {
-    return createBackedBlobStore(backend)
+    return {
+        ...createBackedBlobStore(backend),
+        async putNewInlayImage(key, data, input) {
+            return await invokeCommand('native_media_write_inlay_image', {
+                id: key,
+                data: Array.from(data),
+                name: input.name,
+            }) as InlayBlobMetadata
+        },
+    }
 }
 
 export function createGatedBlobStore(store: BlobStore, gate: StorageMutationGate): BlobStore {
-    return {
+    const gated: BlobStore = {
         async put(key, data, metadata) {
             const ownedData = data.slice()
             const ownedMetadata = { ...metadata }
@@ -62,6 +73,14 @@ export function createGatedBlobStore(store: BlobStore, gate: StorageMutationGate
         remove: (key) => gate.runWrite(() => store.remove(key)),
         resolveUrl: (key) => store.resolveUrl(key),
     }
+    if (store.putNewInlayImage) {
+        gated.putNewInlayImage = (key, data, input) => {
+            const ownedData = data.slice()
+            const ownedInput = { ...input }
+            return gate.runWrite(() => store.putNewInlayImage!(key, ownedData, ownedInput))
+        }
+    }
+    return gated
 }
 
 export type KeyValueStorage = {
@@ -272,6 +291,11 @@ async function createProductionStore(): Promise<BlobStore> {
 /** Defers backend selection so callers can hold a store before storage is initialized. */
 const deferredStore: BlobStore = {
     async put(key, data, metadata) { return (await openProductionStore()).put(key, data, metadata) },
+    async putNewInlayImage(key, data, input) {
+        const store = await openProductionStore()
+        if (!store.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
+        return store.putNewInlayImage(key, data, input)
+    },
     async read(key, range) { return (await openProductionStore()).read(key, range) },
     async stat(key) { return (await openProductionStore()).stat(key) },
     async list(query) { return (await openProductionStore()).list(query) },

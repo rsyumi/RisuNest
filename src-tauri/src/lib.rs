@@ -447,6 +447,11 @@ pub fn run() {
     }
 
     builder
+        .setup(|app| {
+            let root = app.path().app_data_dir()?;
+            native_media::recover_inlay_writes(&root).map_err(std::io::Error::other)?;
+            Ok(())
+        })
         .register_asynchronous_uri_scheme_protocol("risuasset", |context, request, responder| {
             let root = context.app_handle().path().app_data_dir();
             tauri::async_runtime::spawn_blocking(move || {
@@ -482,6 +487,7 @@ pub fn run() {
             #[cfg(desktop)]
             install_py_dependencies,
             oauth_login,
+            native_media::native_media_write_inlay_image,
             persistent_store::commands::pds_open,
             persistent_store::commands::pds_read_root,
             persistent_store::commands::pds_query_presets,
