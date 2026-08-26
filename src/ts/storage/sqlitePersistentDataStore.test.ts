@@ -54,6 +54,7 @@ describe('SqlitePersistentDataStore', () => {
             name: 'Native',
             ext: 'bin',
         }
+        const owner = { kind: 'root-module-assets' as const, index: 0 }
 
         await store.open()
         await store.readRoot()
@@ -67,6 +68,7 @@ describe('SqlitePersistentDataStore', () => {
         await store.queryPluginStorage()
         await store.readPluginStorage('memory')
         await store.readAssetAlias(alias.key)
+        await store.readAssetOwnerHead(owner)
         await store.commitAssetAlias(alias, 8)
         await store.commit(commit)
         await store.materializeDatabase(9)
@@ -87,6 +89,7 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_query_plugin_storage', {}],
             ['pds_read_plugin_storage', { key: 'memory' }],
             ['pds_read_asset_alias', { key: alias.key }],
+            ['pds_read_asset_owner_head', { owner }],
             ['pds_commit_asset_alias', { alias, expectedRevision: 8 }],
             ['pds_commit', { commit }],
             ['pds_materialize', { revision: 9 }],
@@ -276,6 +279,7 @@ describe('SqlitePersistentDataStore', () => {
         await lease.queryPluginStorage()
         await lease.readPluginStorage('memory')
         await lease.readAssetAlias('assets/pinned.bin')
+        await lease.readAssetOwnerHead({ kind: 'root-module-assets', index: 0 })
         await lease.release()
         await lease.release()
 
@@ -310,10 +314,14 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_query_plugin_storage', { lease: 'lease-7' }],
             ['pds_read_plugin_storage', { key: 'memory', lease: 'lease-7' }],
             ['pds_read_asset_alias', { key: 'assets/pinned.bin', lease: 'lease-7' }],
+            [
+                'pds_read_asset_owner_head',
+                { owner: { kind: 'root-module-assets', index: 0 }, lease: 'lease-7' },
+            ],
             ['pds_release_revision', { lease: 'lease-7' }],
         ])
         await expect(lease.readRoot()).rejects.toBeInstanceOf(SnapshotReleasedError)
-        expect(mocks.invoke).toHaveBeenCalledTimes(13)
+        expect(mocks.invoke).toHaveBeenCalledTimes(14)
     })
 
     it('keeps a lease active and retries native cleanup after release fails', async () => {

@@ -2,10 +2,10 @@ use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
 use super::{
-    AssetAlias, CharacterPage, CharacterQuery, CheckpointMode, ConversationPage, ConversationQuery,
-    ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore,
-    PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated, SnapshotInfo,
-    StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
+    AssetAlias, AssetOwnerHead, AssetOwnerLocator, CharacterPage, CharacterQuery, CheckpointMode,
+    ConversationPage, ConversationQuery, ConversationWindow, ConversationWindowQuery, LeaseResult,
+    PersistentStore, PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated,
+    SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -215,6 +215,17 @@ pub(crate) fn pds_read_asset_alias(
 ) -> Result<Option<Versioned<AssetAlias>>, StoreError> {
     with_store(state, |store| {
         store.read_asset_alias(&key, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_asset_owner_head(
+    state: State<'_, PersistentStoreState>,
+    owner: AssetOwnerLocator,
+    lease: Option<String>,
+) -> Result<Option<Versioned<AssetOwnerHead>>, StoreError> {
+    with_store(state, |store| {
+        store.read_asset_owner_head(&owner, lease.as_deref())
     })
 }
 

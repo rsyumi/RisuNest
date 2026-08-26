@@ -1,6 +1,8 @@
 import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
     AssetAlias,
+    AssetOwnerHead,
+    AssetOwnerLocator,
     CharacterDetail,
     CharacterPage,
     CharacterQuery,
@@ -26,10 +28,12 @@ import {
     RevisionConflictError,
     SnapshotReleasedError,
     validateAssetAlias,
+    assetOwnerLocatorKey,
     validateConversationWindowQuery,
+    validateAssetOwnerHead,
 } from './persistentDataStore'
 
-const DATABASE_VERSION = 8
+const DATABASE_VERSION = 9
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
@@ -43,6 +47,7 @@ const INDEXED_GENERATION_STORE_NAMES = [
     'pluginStorage',
     'pluginStorageMetadata',
     'assetAliases',
+    'assetOwnerHeads',
 ] as const
 const DATA_STORE_NAMES = ['root', ...INDEXED_GENERATION_STORE_NAMES] as const
 const STORE_NAMES = ['meta', ...DATA_STORE_NAMES] as const
@@ -82,6 +87,67 @@ interface StoredPluginStorageMetadata {
     storageKey: string
     byteSize: number
     ordinal: number
+}
+
+function ownArrayProperty(value: object, key: string): unknown[] | undefined {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) return undefined
+    const property = (value as Record<string, unknown>)[key]
+    if (!Array.isArray(property)) {
+        throw new TypeError(`Asset owner ${key} property must be an array when present`)
+    }
+    return property
+}
+
+function commitCharacterParents(input: WorkingSetCommit): Map<string, CharacterDetail> {
+    const parents = new Map<string, CharacterDetail>()
+    for (const character of [
+        input.character,
+        ...(input.characterDetails ?? []),
+        input.replaceCharacter,
+        input.addCharacter,
+    ]) {
+        if (!character) continue
+        parents.set(character.chaId, character)
+    }
+    return parents
+}
+
+function validateOwnerHeadsForCommit(input: WorkingSetCommit): void {
+    const heads = input.assetOwnerHeads ?? []
+    const keys = new Set<string>()
+    const characterParents = commitCharacterParents(input)
+    for (const head of heads) {
+        validateAssetOwnerHead(head)
+        const key = assetOwnerLocatorKey(head.owner)
+        if (keys.has(key)) throw new TypeError(`Duplicate asset owner head ${key}`)
+        keys.add(key)
+
+        let entries: unknown[] | undefined
+        if (head.owner.kind === 'character-additional-assets') {
+            const parent = characterParents.get(head.owner.characterId)
+            if (!parent) {
+                throw new TypeError('Character asset owner head requires its parent mutation')
+            }
+            entries = ownArrayProperty(parent, 'additionalAssets')
+        } else {
+            if (!input.root) throw new TypeError('Root asset owner head requires its parent root')
+            if (head.owner.kind === 'root-module-assets') {
+                const module = input.root.modules?.[head.owner.index]
+                if (!module) throw new TypeError('Root module asset owner occurrence does not exist')
+                entries = ownArrayProperty(module, 'assets')
+            } else {
+                const module = input.root.personas?.[head.owner.index]?.embeddedModule
+                if (!module) throw new TypeError('Persona module asset owner occurrence does not exist')
+                entries = ownArrayProperty(module, 'assets')
+            }
+        }
+        if (head.present !== (entries !== undefined)) {
+            throw new TypeError('Asset owner head property presence does not match its parent')
+        }
+        if (head.present && head.entryCount !== entries?.length) {
+            throw new TypeError('Asset owner head entryCount does not match its parent')
+        }
+    }
 }
 
 const textEncoder = new TextEncoder()
@@ -282,6 +348,11 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 'generation',
             )
             this.createIndex(transaction.objectStore('assetAliases'), 'byGeneration', 'generation')
+            this.createIndex(
+                transaction.objectStore('assetOwnerHeads'),
+                'byGeneration',
+                'generation',
+            )
             if (event.oldVersion < 7) {
                 this.backfillCharacterSummaries(transaction)
                 this.backfillOrderKeys<StoredConversation>(
@@ -400,6 +471,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.readAssetAliasFromTransaction(transaction, revision, generation, key)
     }
 
+    async readAssetOwnerHead(
+        owner: AssetOwnerLocator,
+    ): Promise<Versioned<AssetOwnerHead> | null> {
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'assetOwnerHeads'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readAssetOwnerHeadFromTransaction(transaction, revision, generation, owner)
+    }
+
     async commitAssetAlias(
         alias: AssetAlias,
         expectedRevision: DataRevision,
@@ -455,6 +537,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     input.deleteCharacterId,
                 )
             }
+            validateOwnerHeadsForCommit(input)
 
             const revision = active.revision + 1
             const generation = await this.ensureWritableGeneration(
@@ -483,6 +566,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             for (const mutation of input.pluginStorage ?? []) {
                 await this.applyPluginStorageMutation(transaction, generation, mutation)
             }
+            await this.replaceChangedOwnerHeads(transaction, generation, input)
             this.setActive(transaction, revision, generation)
             await transactionDone(transaction)
             return { revision }
@@ -802,6 +886,20 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     key,
                 )
             },
+            readAssetOwnerHead: async (owner) => {
+                assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'assetOwnerHeads'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                return this.readAssetOwnerHeadFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                    owner,
+                )
+            },
             release: async () => {
                 if (releasePromise) return releasePromise
                 releasePromise = this.releaseSnapshotLease(lease).then(
@@ -865,6 +963,64 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
         validateAssetAlias(record.value)
         return { revision, value: structuredClone(record.value) }
+    }
+
+    private async readAssetOwnerHeadFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+        owner: AssetOwnerLocator,
+    ): Promise<Versioned<AssetOwnerHead> | null> {
+        const ownerKey = assetOwnerLocatorKey(owner)
+        const record = (await requestResult(
+            transaction.objectStore('assetOwnerHeads').get(
+                this.assetOwnerHeadKey(generation, ownerKey),
+            ),
+        )) as StoredRecord<AssetOwnerHead> | undefined
+        await transactionDone(transaction)
+        if (!record) return null
+        if (record.generation !== generation) {
+            throw new TypeError('Asset owner head stored generation does not match its lookup key')
+        }
+        if (assetOwnerLocatorKey(record.value.owner) !== ownerKey) {
+            throw new TypeError('Asset owner head stored locator does not match its lookup key')
+        }
+        validateAssetOwnerHead(record.value)
+        return { revision, value: structuredClone(record.value) }
+    }
+
+    private async replaceChangedOwnerHeads(
+        transaction: IDBTransaction,
+        generation: string,
+        input: WorkingSetCommit,
+    ): Promise<void> {
+        const changedCharacters = new Set(commitCharacterParents(input).keys())
+        if (input.deleteCharacterId) changedCharacters.add(input.deleteCharacterId)
+        if (input.root || changedCharacters.size > 0) {
+            const records = (await requestResult(
+                transaction.objectStore('assetOwnerHeads').index('byGeneration').getAll(generation),
+            )) as Array<StoredRecord<AssetOwnerHead>>
+            for (const record of records) {
+                const owner = record.value.owner
+                if (
+                    (input.root && owner.kind !== 'character-additional-assets')
+                    || (
+                        owner.kind === 'character-additional-assets'
+                        && changedCharacters.has(owner.characterId)
+                    )
+                ) {
+                    transaction.objectStore('assetOwnerHeads').delete(record.key)
+                }
+            }
+        }
+        for (const head of input.assetOwnerHeads ?? []) {
+            const ownerKey = assetOwnerLocatorKey(head.owner)
+            transaction.objectStore('assetOwnerHeads').put({
+                key: this.assetOwnerHeadKey(generation, ownerKey),
+                generation,
+                value: structuredClone(head),
+            } satisfies StoredRecord<AssetOwnerHead>)
+        }
     }
 
     private async queryPluginStorageFromTransaction(
@@ -2252,5 +2408,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     private assetAliasKey(generation: string, key: string): string {
         return `${generation}:asset-alias:${key}`
+    }
+
+    private assetOwnerHeadKey(generation: string, ownerKey: string): string {
+        return `${generation}:asset-owner-head:${ownerKey}`
     }
 }

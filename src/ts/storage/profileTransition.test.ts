@@ -194,6 +194,7 @@ function createReader(
             ? { revision, value: clone(pluginCustomStorage[key]) }
             : null,
         readAssetAlias: async () => null,
+        readAssetOwnerHead: async () => null,
         release: onRelease,
     }
     return reader

@@ -2,7 +2,7 @@ use super::{StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -19,12 +19,13 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => create_v6(connection),
+        0 => create_v7(connection),
         1 => migrate_v1(connection),
         2 => migrate_v2(connection),
         3 => migrate_v3(connection),
         4 => migrate_v4(connection),
         5 => migrate_v5(connection),
+        6 => migrate_v6(connection),
         SCHEMA_VERSION => Ok(()),
         _ => Err(StoreError::Store {
             message: format!("unsupported persistent schema version {version}"),
@@ -32,7 +33,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     }
 }
 
-fn create_v6(connection: &mut Connection) -> StoreResult<()> {
+fn create_v7(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
         "
         BEGIN IMMEDIATE;
@@ -133,16 +134,48 @@ fn create_v6(connection: &mut Connection) -> StoreResult<()> {
             PRIMARY KEY (generation, logical_key)
         );
         CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
-        PRAGMA user_version = 6;
+        CREATE TABLE asset_owner_heads (
+            generation TEXT NOT NULL,
+            owner_kind TEXT NOT NULL CHECK (owner_kind IN (
+                'character-additional-assets',
+                'root-module-assets',
+                'persona-embedded-module-assets'
+            )),
+            owner_locator TEXT NOT NULL,
+            present INTEGER NOT NULL CHECK (present IN (0, 1)),
+            manifest_hash TEXT CHECK (
+                manifest_hash IS NULL OR (
+                    length(manifest_hash) = 64
+                    AND manifest_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+            CHECK (
+                (present = 0 AND manifest_hash IS NULL AND entry_count = 0)
+                OR (present = 1 AND manifest_hash IS NOT NULL)
+            ),
+            PRIMARY KEY (generation, owner_kind, owner_locator)
+        );
+        CREATE INDEX asset_owner_heads_generation ON asset_owner_heads (generation);
+        PRAGMA user_version = 7;
         COMMIT;
         ",
     )?;
     Ok(())
 }
 
+fn migrate_v6(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    create_asset_owner_heads(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn migrate_v5(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     create_asset_aliases(&transaction)?;
+    create_asset_owner_heads(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -182,6 +215,37 @@ fn create_asset_aliases(transaction: &Transaction<'_>) -> StoreResult<()> {
     Ok(())
 }
 
+fn create_asset_owner_heads(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        "
+        CREATE TABLE asset_owner_heads (
+            generation TEXT NOT NULL,
+            owner_kind TEXT NOT NULL CHECK (owner_kind IN (
+                'character-additional-assets',
+                'root-module-assets',
+                'persona-embedded-module-assets'
+            )),
+            owner_locator TEXT NOT NULL,
+            present INTEGER NOT NULL CHECK (present IN (0, 1)),
+            manifest_hash TEXT CHECK (
+                manifest_hash IS NULL OR (
+                    length(manifest_hash) = 64
+                    AND manifest_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+            CHECK (
+                (present = 0 AND manifest_hash IS NULL AND entry_count = 0)
+                OR (present = 1 AND manifest_hash IS NOT NULL)
+            ),
+            PRIMARY KEY (generation, owner_kind, owner_locator)
+        );
+        CREATE INDEX asset_owner_heads_generation ON asset_owner_heads (generation);
+        ",
+    )?;
+    Ok(())
+}
+
 fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -213,6 +277,7 @@ fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     backfill_characters(&transaction)?;
     migrate_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
+    create_asset_owner_heads(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -235,6 +300,7 @@ fn migrate_v2(connection: &mut Connection) -> StoreResult<()> {
     migrate_plugin_storage(&transaction)?;
     migrate_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
+    create_asset_owner_heads(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -245,6 +311,7 @@ fn migrate_v3(connection: &mut Connection) -> StoreResult<()> {
     ensure_plugin_storage(&transaction)?;
     ensure_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
+    create_asset_owner_heads(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -255,6 +322,7 @@ fn migrate_v4(connection: &mut Connection) -> StoreResult<()> {
     ensure_plugin_storage(&transaction)?;
     ensure_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
+    create_asset_owner_heads(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

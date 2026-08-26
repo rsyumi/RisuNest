@@ -48,6 +48,68 @@ export type AssetAlias = AssetAliasBase & (
     }
 )
 
+export type AssetOwnerLocator =
+    | { kind: 'character-additional-assets'; characterId: string }
+    | { kind: 'root-module-assets'; index: number }
+    | { kind: 'persona-embedded-module-assets'; index: number }
+
+export type AssetOwnerHead = { owner: AssetOwnerLocator } & (
+    | {
+        present: false
+        manifestHash: null
+        entryCount: 0
+    }
+    | {
+        present: true
+        manifestHash: string
+        entryCount: number
+    }
+)
+
+export function assetOwnerLocatorKey(owner: AssetOwnerLocator): string {
+    validateAssetOwnerLocator(owner)
+    return owner.kind === 'character-additional-assets'
+        ? `${owner.kind}:${owner.characterId}`
+        : `${owner.kind}:${owner.index}`
+}
+
+export function validateAssetOwnerLocator(owner: AssetOwnerLocator): void {
+    if (owner.kind === 'character-additional-assets') {
+        if (typeof owner.characterId !== 'string' || owner.characterId.length === 0) {
+            throw new TypeError('Character asset owner requires a nonempty characterId')
+        }
+        return
+    }
+    if (
+        owner.kind !== 'root-module-assets'
+        && owner.kind !== 'persona-embedded-module-assets'
+    ) {
+        throw new TypeError('Asset owner kind is invalid')
+    }
+    if (!Number.isSafeInteger(owner.index) || owner.index < 0) {
+        throw new TypeError('Asset owner occurrence index must be a nonnegative safe integer')
+    }
+}
+
+export function validateAssetOwnerHead(head: AssetOwnerHead): void {
+    validateAssetOwnerLocator(head.owner)
+    if (typeof head.present !== 'boolean') {
+        throw new TypeError('Asset owner head present must be a boolean')
+    }
+    if (!Number.isSafeInteger(head.entryCount) || head.entryCount < 0) {
+        throw new TypeError('Asset owner head entryCount must be a nonnegative safe integer')
+    }
+    if (!head.present) {
+        if (head.manifestHash !== null || head.entryCount !== 0) {
+            throw new TypeError('Absent asset owner property cannot reference a manifest')
+        }
+        return
+    }
+    if (!/^[0-9a-f]{64}$/.test(head.manifestHash)) {
+        throw new TypeError('Present asset owner property requires a lowercase SHA-256 manifestHash')
+    }
+}
+
 export function validateAssetAlias(alias: AssetAlias): void {
     const inlayMetadata = alias as unknown as {
         inlayType?: unknown
@@ -240,6 +302,7 @@ export interface WorkingSetCommit {
     conversations?: ConversationMutation[]
     deleteCharacterId?: string
     pluginStorage?: PluginStorageMutation[]
+    assetOwnerHeads?: AssetOwnerHead[]
 }
 
 export class RevisionConflictError extends Error {
@@ -276,6 +339,7 @@ export interface PersistentRevisionReader {
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
     readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null>
+    readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
 }
 
 export interface PersistentRevisionLease extends PersistentRevisionReader {
@@ -297,6 +361,7 @@ export interface PersistentDataStore {
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
     readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null>
+    readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
     commitAssetAlias(alias: AssetAlias, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
     replaceFromDatabase(

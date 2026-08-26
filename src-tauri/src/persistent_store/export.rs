@@ -894,6 +894,7 @@ mod tests {
                 add_character: None,
                 conversations: None,
                 delete_character_id: None,
+                asset_owner_heads: None,
                 plugin_storage: Some(vec![
                     PluginStorageMutation::Clear,
                     PluginStorageMutation::Set {

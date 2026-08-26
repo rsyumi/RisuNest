@@ -1,7 +1,9 @@
 use super::{
-    active_generation, current_revision, AssetAlias, ConversationMutation, PluginStorageMutation,
-    RevisionResult, StagingResult, StoreError, StoreResult, WorkingSetCommit, GENERATION_TABLES,
+    active_generation, current_revision, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
+    ConversationMutation, PluginStorageMutation, RevisionResult, StagingResult, StoreError,
+    StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
+use std::collections::HashSet;
 
 pub(super) fn commit_asset_alias(
     connection: &mut Connection,
@@ -57,6 +59,7 @@ pub(super) fn commit(
             input.delete_character_id.as_deref(),
         )?;
     }
+    validate_owner_heads_for_commit(input)?;
     let revision = actual_revision + 1;
     let generation = writable_generation(&transaction, &active, revision)?;
     if let Some(root) = &input.root {
@@ -92,10 +95,156 @@ pub(super) fn commit(
     for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
         apply_plugin_storage_mutation(&transaction, &generation, mutation)?;
     }
+    replace_changed_owner_heads(&transaction, &generation, input)?;
 
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })
+}
+
+fn owner_entries<'a>(
+    input: &'a WorkingSetCommit,
+    owner: &AssetOwnerLocator,
+) -> StoreResult<Option<&'a Vec<Value>>> {
+    let parent = match owner {
+        AssetOwnerLocator::CharacterAdditionalAssets { character_id } => {
+            let values = input
+                .character
+                .iter()
+                .chain(input.character_details.iter().flatten())
+                .chain(input.replace_character.iter())
+                .chain(input.add_character.iter());
+            values
+                .filter_map(Value::as_object)
+                .find(|value| value.get("chaId").and_then(Value::as_str) == Some(character_id))
+                .ok_or_else(|| {
+                    validation("Character asset owner head requires its parent mutation")
+                })?
+        }
+        AssetOwnerLocator::RootModuleAssets { index } => input
+            .root
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|root| root.get("modules"))
+            .and_then(Value::as_array)
+            .and_then(|modules| modules.get(*index as usize))
+            .and_then(Value::as_object)
+            .ok_or_else(|| validation("Root module asset owner occurrence does not exist"))?,
+        AssetOwnerLocator::PersonaEmbeddedModuleAssets { index } => input
+            .root
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|root| root.get("personas"))
+            .and_then(Value::as_array)
+            .and_then(|personas| personas.get(*index as usize))
+            .and_then(Value::as_object)
+            .and_then(|persona| persona.get("embeddedModule"))
+            .and_then(Value::as_object)
+            .ok_or_else(|| validation("Persona module asset owner occurrence does not exist"))?,
+    };
+    parent
+        .get(match owner {
+            AssetOwnerLocator::CharacterAdditionalAssets { .. } => "additionalAssets",
+            _ => "assets",
+        })
+        .map(|entries| {
+            entries
+                .as_array()
+                .ok_or_else(|| validation("Asset owner property must be an array when present"))
+        })
+        .transpose()
+}
+
+fn validate_owner_heads_for_commit(input: &WorkingSetCommit) -> StoreResult<()> {
+    let mut identities = HashSet::new();
+    for head in input.asset_owner_heads.as_deref().unwrap_or_default() {
+        head.validate()?;
+        let identity = head.owner.storage_identity();
+        if !identities.insert(identity) {
+            return Err(validation("Duplicate asset owner head"));
+        }
+        let entries = owner_entries(input, &head.owner)?;
+        if head.present != entries.is_some() {
+            return Err(validation(
+                "Asset owner head property presence does not match its parent",
+            ));
+        }
+        if head.present && head.entry_count != entries.map_or(0, |value| value.len() as i64) {
+            return Err(validation(
+                "Asset owner head entryCount does not match its parent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_changed_owner_heads(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    input: &WorkingSetCommit,
+) -> StoreResult<()> {
+    if input.root.is_some() {
+        transaction.execute(
+            "DELETE FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind IN (
+                 'root-module-assets', 'persona-embedded-module-assets'
+             )",
+            [generation],
+        )?;
+    }
+    let mut character_ids = HashSet::new();
+    for character in input
+        .character
+        .iter()
+        .chain(input.character_details.iter().flatten())
+        .chain(input.replace_character.iter())
+        .chain(input.add_character.iter())
+    {
+        if let Some(character_id) = character.get("chaId").and_then(Value::as_str) {
+            character_ids.insert(character_id.to_owned());
+        }
+    }
+    if let Some(character_id) = &input.delete_character_id {
+        character_ids.insert(character_id.clone());
+    }
+    for character_id in character_ids {
+        transaction.execute(
+            "DELETE FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind = 'character-additional-assets'
+               AND owner_locator = ?2",
+            params![generation, character_id],
+        )?;
+    }
+    for head in input.asset_owner_heads.as_deref().unwrap_or_default() {
+        put_asset_owner_head(transaction, generation, head)?;
+    }
+    Ok(())
+}
+
+fn put_asset_owner_head(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    head: &AssetOwnerHead,
+) -> StoreResult<()> {
+    let (owner_kind, owner_locator) = head.owner.storage_identity();
+    transaction.execute(
+        "INSERT INTO asset_owner_heads (
+            generation, owner_kind, owner_locator, present, manifest_hash, entry_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(generation, owner_kind, owner_locator) DO UPDATE SET
+            present = excluded.present,
+            manifest_hash = excluded.manifest_hash,
+            entry_count = excluded.entry_count",
+        params![
+            generation,
+            owner_kind,
+            owner_locator,
+            head.present,
+            head.manifest_hash,
+            head.entry_count,
+        ],
+    )?;
+    Ok(())
 }
 
 pub(super) fn replace_begin(connection: &mut Connection) -> StoreResult<StagingResult> {

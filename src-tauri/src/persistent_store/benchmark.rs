@@ -613,6 +613,7 @@ fn run_sample(database: &Value, root: &Value) -> Sample {
                     configured_index: None,
                 }]),
                 delete_character_id: None,
+                asset_owner_heads: None,
                 plugin_storage: None,
             })
             .expect("append benchmark message")
@@ -856,6 +857,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                     add_character: None,
                     conversations: None,
                     delete_character_id: None,
+                    asset_owner_heads: None,
                     plugin_storage: Some(vec![PluginStorageMutation::Set {
                         key: "benchmark-plugin".to_owned(),
                         value: json!(deterministic_text(run, 1024)),
@@ -879,6 +881,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                     add_character: None,
                     conversations: None,
                     delete_character_id: None,
+                    asset_owner_heads: None,
                     plugin_storage: None,
                 },
                 "root",
@@ -905,6 +908,7 @@ fn run_post_lease_commit_benchmark(database: &Value) -> Vec<PostLeaseCommitSampl
                         configured_index: None,
                     }]),
                     delete_character_id: None,
+                    asset_owner_heads: None,
                     plugin_storage: None,
                 },
                 "message",

@@ -1,6 +1,7 @@
 import type { Database } from './database.svelte'
 import type {
     AssetAlias,
+    AssetOwnerLocator,
     CharacterPage,
     CharacterQuery,
     ConversationPage,
@@ -39,6 +40,7 @@ export function createMutationGatedPersistentDataStore(
         queryPluginStorage: () => store.queryPluginStorage(),
         readPluginStorage: (key: string) => store.readPluginStorage(key),
         readAssetAlias: (key: string) => store.readAssetAlias(key),
+        readAssetOwnerHead: (owner: AssetOwnerLocator) => store.readAssetOwnerHead(owner),
         commitAssetAlias: (alias: AssetAlias, expectedRevision: DataRevision) =>
             gate.runWrite(() => store.commitAssetAlias(alias, expectedRevision)),
         commit: (input: WorkingSetCommit) => gate.runWrite(() => store.commit(input)),

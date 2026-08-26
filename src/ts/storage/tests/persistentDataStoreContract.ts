@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { Database, groupChat } from '../database.svelte'
-import type { AssetAlias, PersistentDataStore } from '../persistentDataStore'
+import type {
+    AssetAlias,
+    AssetOwnerHead,
+    PersistentDataStore,
+} from '../persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
 
@@ -11,6 +15,210 @@ export interface PersistentDataStoreHarness {
 
 export function persistentDataStoreContract(createHarness: () => Promise<PersistentDataStoreHarness>): void {
     describe('PersistentDataStore contract', () => {
+        it('isolates occurrence-located owner heads across a pinned root reorder', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [
+                {
+                    id: 'duplicate-module',
+                    name: 'First duplicate',
+                    description: '',
+                    assets: [
+                        ['first', 'assets/first.bin', 'BIN'],
+                        ['first', 'assets/first.bin', 'BIN'],
+                    ],
+                },
+                {
+                    id: 'duplicate-module',
+                    name: 'Second duplicate',
+                    description: '',
+                    assets: [],
+                },
+            ]
+            database.personas = [
+                {
+                    name: 'Missing ID and absent assets',
+                    personaPrompt: '',
+                    icon: '',
+                    embeddedModule: {
+                        id: '',
+                        name: 'Absent assets',
+                        description: '',
+                    },
+                },
+                {
+                    name: 'Missing ID and present assets',
+                    personaPrompt: '',
+                    icon: '',
+                    embeddedModule: {
+                        id: '',
+                        name: 'Present assets',
+                        description: '',
+                        assets: [['persona', 'assets/persona.bin', 'OddExt']],
+                    },
+                },
+            ]
+            const imported = await store.replaceFromDatabase(database)
+            const root = (await store.readRoot()).value
+            const originalHeads: AssetOwnerHead[] = [
+                {
+                    owner: { kind: 'root-module-assets', index: 0 },
+                    present: true,
+                    manifestHash: '11'.repeat(32),
+                    entryCount: 2,
+                },
+                {
+                    owner: { kind: 'root-module-assets', index: 1 },
+                    present: true,
+                    manifestHash: '22'.repeat(32),
+                    entryCount: 0,
+                },
+                {
+                    owner: { kind: 'persona-embedded-module-assets', index: 0 },
+                    present: false,
+                    manifestHash: null,
+                    entryCount: 0,
+                },
+                {
+                    owner: { kind: 'persona-embedded-module-assets', index: 1 },
+                    present: true,
+                    manifestHash: '33'.repeat(32),
+                    entryCount: 1,
+                },
+            ]
+            const shadowed = await store.commit({
+                expectedRevision: imported.revision,
+                root,
+                assetOwnerHeads: originalHeads,
+            })
+            const lease = await store.acquireRevision(shadowed.revision)
+            const reorderedRoot = structuredClone(root)
+            reorderedRoot.modules.reverse()
+            const reorderedHeads: AssetOwnerHead[] = [
+                {
+                    owner: { kind: 'root-module-assets', index: 0 },
+                    present: true,
+                    manifestHash: '22'.repeat(32),
+                    entryCount: 0,
+                },
+                {
+                    owner: { kind: 'root-module-assets', index: 1 },
+                    present: true,
+                    manifestHash: '11'.repeat(32),
+                    entryCount: 2,
+                },
+            ]
+
+            const reordered = await store.commit({
+                expectedRevision: shadowed.revision,
+                root: reorderedRoot,
+                assetOwnerHeads: reorderedHeads,
+            })
+
+            expect(await store.readAssetOwnerHead({
+                kind: 'root-module-assets',
+                index: 0,
+            })).toEqual({ revision: reordered.revision, value: reorderedHeads[0] })
+            expect(await lease.readAssetOwnerHead({
+                kind: 'root-module-assets',
+                index: 0,
+            })).toEqual({ revision: shadowed.revision, value: originalHeads[0] })
+            expect(await lease.readAssetOwnerHead({
+                kind: 'persona-embedded-module-assets',
+                index: 0,
+            })).toEqual({ revision: shadowed.revision, value: originalHeads[2] })
+            await lease.release()
+        })
+
+        it('rejects stale or invalid owner-head commits without changing parent data', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [{
+                id: 'module',
+                name: 'Module',
+                description: '',
+                assets: [['kept', 'assets/kept.bin', 'BIN']],
+            }]
+            const imported = await store.replaceFromDatabase(database)
+            const originalRoot = (await store.readRoot()).value
+            const validHead: AssetOwnerHead = {
+                owner: { kind: 'root-module-assets', index: 0 },
+                present: true,
+                manifestHash: '44'.repeat(32),
+                entryCount: 1,
+            }
+            const committed = await store.commit({
+                expectedRevision: imported.revision,
+                root: originalRoot,
+                assetOwnerHeads: [validHead],
+            })
+            const invalidRoot = structuredClone(originalRoot)
+            invalidRoot.username = 'must not commit'
+            const invalidHead = {
+                ...validHead,
+                manifestHash: 'INVALID',
+            } as unknown as AssetOwnerHead
+
+            await expect(store.commit({
+                expectedRevision: committed.revision,
+                root: invalidRoot,
+                assetOwnerHeads: [invalidHead],
+            })).rejects.toThrow('manifestHash')
+            await expect(store.commit({
+                expectedRevision: imported.revision,
+                root: invalidRoot,
+                assetOwnerHeads: [validHead],
+            })).rejects.toBeInstanceOf(RevisionConflictError)
+
+            expect(await store.readRoot()).toEqual({
+                revision: committed.revision,
+                value: originalRoot,
+            })
+            expect(await store.readAssetOwnerHead(validHead.owner)).toEqual({
+                revision: committed.revision,
+                value: validHead,
+            })
+        })
+
+        it('invalidates a character shadow head when its parent changes without a replacement', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.characters[0].additionalAssets = [
+                ['duplicate', 'assets/duplicate.bin', 'BIN'],
+                ['duplicate', 'assets/duplicate.bin', 'BIN'],
+            ]
+            const imported = await store.replaceFromDatabase(database)
+            const detail = (await store.readCharacter(database.characters[0].chaId))!.value
+            const head: AssetOwnerHead = {
+                owner: {
+                    kind: 'character-additional-assets',
+                    characterId: database.characters[0].chaId,
+                },
+                present: true,
+                manifestHash: '55'.repeat(32),
+                entryCount: 2,
+            }
+            const shadowed = await store.commit({
+                expectedRevision: imported.revision,
+                character: detail,
+                assetOwnerHeads: [head],
+            })
+
+            expect(await store.readAssetOwnerHead(head.owner)).toEqual({
+                revision: shadowed.revision,
+                value: head,
+            })
+            const changed = await store.commit({
+                expectedRevision: shadowed.revision,
+                character: { ...detail, name: 'Changed through the legacy path' },
+            })
+
+            expect(await store.readAssetOwnerHead(head.owner)).toBeNull()
+            expect((await store.readCharacter(database.characters[0].chaId))!.revision).toBe(
+                changed.revision,
+            )
+        })
+
         it('isolates exact asset alias metadata across a pinned overwrite', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

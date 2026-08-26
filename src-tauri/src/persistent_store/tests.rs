@@ -1,7 +1,7 @@
 use super::{
-    AssetAlias, CharacterQuery, CheckpointMode, ConversationMutation, ConversationPage,
-    ConversationQuery, ConversationWindowQuery, PersistentStore, PluginStorageMutation, QueryOrder,
-    StoreError, WorkingSetCommit,
+    AssetAlias, AssetOwnerHead, AssetOwnerLocator, CharacterQuery, CheckpointMode,
+    ConversationMutation, ConversationPage, ConversationQuery, ConversationWindowQuery,
+    PersistentStore, PluginStorageMutation, QueryOrder, StoreError, WorkingSetCommit,
 };
 use serde_json::{json, Value};
 use std::{
@@ -60,6 +60,307 @@ fn open_fixture() -> (tempfile::TempDir, PersistentStore, Value) {
         1
     );
     (directory, store, database)
+}
+
+#[test]
+fn asset_owner_occurrences_are_isolated_by_revision_lease() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut first_root = root(&database);
+    first_root["modules"] = json!([
+        {
+            "id": "duplicate-module",
+            "name": "First duplicate",
+            "description": "",
+            "assets": [
+                ["first", "assets/first.bin", "BIN"],
+                ["first", "assets/first.bin", "BIN"]
+            ]
+        },
+        {
+            "id": "duplicate-module",
+            "name": "Second duplicate",
+            "description": "",
+            "assets": []
+        }
+    ]);
+    first_root["personas"] = json!([
+        {
+            "name": "Missing ID and absent assets",
+            "personaPrompt": "",
+            "icon": "",
+            "embeddedModule": { "id": "", "name": "Absent assets", "description": "" }
+        },
+        {
+            "name": "Missing ID and present assets",
+            "personaPrompt": "",
+            "icon": "",
+            "embeddedModule": {
+                "id": "",
+                "name": "Present assets",
+                "description": "",
+                "assets": [["persona", "assets/persona.bin", "OddExt"]]
+            }
+        }
+    ]);
+    let original_heads = vec![
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "11".repeat(32),
+            2,
+        ),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 1 },
+            "22".repeat(32),
+            0,
+        ),
+        AssetOwnerHead::absent(AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 }),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 1 },
+            "33".repeat(32),
+            1,
+        ),
+    ];
+    let shadowed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(first_root.clone()),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(original_heads.clone()),
+        })
+        .expect("commit original owner heads");
+    let lease = store
+        .acquire_revision(shadowed.revision)
+        .expect("acquire owner-head revision");
+    let mut reordered_root = first_root;
+    reordered_root["modules"]
+        .as_array_mut()
+        .expect("module array")
+        .reverse();
+    let reordered_heads = vec![
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "22".repeat(32),
+            0,
+        ),
+        AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 1 },
+            "11".repeat(32),
+            2,
+        ),
+    ];
+    let reordered = store
+        .commit(&WorkingSetCommit {
+            expected_revision: shadowed.revision,
+            root: Some(reordered_root),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(reordered_heads.clone()),
+        })
+        .expect("commit reordered owner heads");
+
+    assert_eq!(
+        store
+            .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+            .expect("read current owner head"),
+        Some(super::Versioned {
+            revision: reordered.revision,
+            value: reordered_heads[0].clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(
+                &AssetOwnerLocator::RootModuleAssets { index: 0 },
+                Some(&lease.lease),
+            )
+            .expect("read leased owner head"),
+        Some(super::Versioned {
+            revision: shadowed.revision,
+            value: original_heads[0].clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(
+                &AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 },
+                Some(&lease.lease),
+            )
+            .expect("read leased absent owner head"),
+        Some(super::Versioned {
+            revision: shadowed.revision,
+            value: original_heads[2].clone(),
+        })
+    );
+}
+
+#[test]
+fn invalid_or_stale_owner_head_commit_preserves_parent_and_revision() {
+    let (_directory, mut store, database) = open_fixture();
+    let mut original_root = root(&database);
+    original_root["modules"] = json!([{
+        "id": "module",
+        "name": "Module",
+        "description": "",
+        "assets": [["kept", "assets/kept.bin", "BIN"]]
+    }]);
+    let valid_head = AssetOwnerHead::present(
+        AssetOwnerLocator::RootModuleAssets { index: 0 },
+        "44".repeat(32),
+        1,
+    );
+    let committed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(original_root.clone()),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![valid_head.clone()]),
+        })
+        .expect("commit valid owner head");
+    let mut rejected_root = original_root.clone();
+    rejected_root["username"] = json!("must not commit");
+    let invalid_head = AssetOwnerHead {
+        owner: valid_head.owner.clone(),
+        present: true,
+        manifest_hash: Some("INVALID".to_owned()),
+        entry_count: 1,
+    };
+
+    assert!(matches!(
+        store.commit(&WorkingSetCommit {
+            expected_revision: committed.revision,
+            root: Some(rejected_root.clone()),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![invalid_head]),
+        }),
+        Err(StoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        store.commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(rejected_root),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![valid_head.clone()]),
+        }),
+        Err(StoreError::RevisionConflict { .. })
+    ));
+    assert!(matches!(
+        store.read_asset_owner_head(
+            &AssetOwnerLocator::RootModuleAssets {
+                index: super::JAVASCRIPT_MAX_SAFE_INTEGER + 1,
+            },
+            None,
+        ),
+        Err(StoreError::Validation { .. })
+    ));
+
+    assert_eq!(store.revision().expect("read revision"), committed.revision);
+    assert_eq!(
+        store.read_root(None).expect("read root").value,
+        original_root
+    );
+    assert_eq!(
+        store
+            .read_asset_owner_head(&valid_head.owner, None)
+            .expect("read owner head")
+            .expect("owner head exists")
+            .value,
+        valid_head
+    );
+}
+
+#[test]
+fn character_parent_change_invalidates_omitted_owner_head() {
+    let (_directory, mut store, _) = open_fixture();
+    let mut detail = store
+        .read_character("char-a", None)
+        .expect("read character")
+        .expect("character exists")
+        .value;
+    detail["additionalAssets"] = json!([
+        ["duplicate", "assets/duplicate.bin", "BIN"],
+        ["duplicate", "assets/duplicate.bin", "BIN"]
+    ]);
+    let owner = AssetOwnerLocator::CharacterAdditionalAssets {
+        character_id: "char-a".to_owned(),
+    };
+    let head = AssetOwnerHead::present(owner.clone(), "55".repeat(32), 2);
+    let shadowed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: None,
+            replace_presets: None,
+            character: Some(detail.clone()),
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: Some(vec![head]),
+        })
+        .expect("commit character owner head");
+    assert!(store
+        .read_asset_owner_head(&owner, None)
+        .expect("read owner head")
+        .is_some());
+    detail["name"] = json!("Changed through legacy path");
+    let changed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: shadowed.revision,
+            root: None,
+            replace_presets: None,
+            character: Some(detail),
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+            asset_owner_heads: None,
+        })
+        .expect("commit legacy character change");
+
+    assert_eq!(store.revision().expect("read revision"), changed.revision);
+    assert_eq!(
+        store
+            .read_asset_owner_head(&owner, None)
+            .expect("read invalidated owner head"),
+        None
+    );
 }
 
 #[test]
@@ -486,6 +787,7 @@ fn preset_catalog_reads_and_materializes_in_configured_order() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("replace presets");
@@ -585,6 +887,7 @@ fn plugin_storage_is_revisioned_per_key_and_lease_isolated() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: Some(vec![
                 PluginStorageMutation::Set {
                     key: "alpha".to_owned(),
@@ -679,6 +982,7 @@ fn plugin_storage_preserves_legacy_object_key_order_across_reopen() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: Some(vec![
                 PluginStorageMutation::Set {
                     key: "zeta".to_owned(),
@@ -762,6 +1066,7 @@ fn ordinary_root_commits_do_not_replace_plugin_records_and_empty_materializes() 
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("commit ordinary root");
@@ -790,6 +1095,7 @@ fn commit(store: &mut PersistentStore, revision: i64, mutation: ConversationMuta
             add_character: None,
             conversations: Some(vec![mutation]),
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("commit conversation mutation")
@@ -915,6 +1221,7 @@ fn character_search_uses_rust_unicode_lowercase_matching() {
             })),
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("add character with Unicode name");
@@ -1304,6 +1611,7 @@ fn replace_range_creates_conversation_at_explicit_configured_position() {
                 configured_index: Some(0),
             }]),
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         }),
         Err(StoreError::Validation { .. })
@@ -1324,6 +1632,7 @@ fn cas_conflict_preserves_current_revision() {
         add_character: None,
         conversations: None,
         delete_character_id: None,
+        asset_owner_heads: None,
         plugin_storage: None,
     });
 
@@ -1372,6 +1681,7 @@ fn selected_character_replacement_is_atomic_and_preserves_catalog_order() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("replace selected character")
@@ -1447,6 +1757,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
             add_character: None,
             conversations: None,
             delete_character_id: Some("char-a".to_owned()),
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("delete middle configured character");
@@ -1472,6 +1783,7 @@ fn replacement_uses_the_greatest_configured_index_after_a_gap() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("add replacement after configured gap");
@@ -1516,6 +1828,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         }),
         Err(StoreError::Validation { .. })
@@ -1542,6 +1855,7 @@ fn invalid_character_replacements_leave_revision_and_data_unchanged() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         }),
         Err(StoreError::RevisionConflict { .. })
@@ -1639,6 +1953,7 @@ fn revision_leases_are_isolated_then_released() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("commit changed root");
@@ -1671,6 +1986,7 @@ fn revision_acquire_reuses_generation_records() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "counted-zero".to_owned(),
                 value: json!(0),
@@ -1720,6 +2036,7 @@ fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "pinned-zero".to_owned(),
                 value: json!(0),
@@ -1746,6 +2063,7 @@ fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
                 configured_index: None,
             }]),
             delete_character_id: Some("char-b".to_owned()),
+            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "pinned-zero".to_owned(),
                 value: json!(1),
@@ -1880,6 +2198,7 @@ fn character_detail_update_preserves_index_and_conversations() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("commit character detail update");
@@ -1947,6 +2266,7 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "zero".to_owned(),
                 value: json!(0),
@@ -2003,6 +2323,7 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
         add_character: None,
         conversations: None,
         delete_character_id: Some("char-a".to_owned()),
+        asset_owner_heads: None,
         plugin_storage: None,
     });
 
@@ -2043,6 +2364,7 @@ fn batch_character_details_delete_atomically_and_preserve_plugin_zero() {
             add_character: None,
             conversations: None,
             delete_character_id: Some("char-a".to_owned()),
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("commit batch delete");
@@ -2157,6 +2479,7 @@ fn invalid_batch_character_detail_ids_leave_every_character_row_unchanged() {
             add_character: None,
             conversations: None,
             delete_character_id,
+            asset_owner_heads: None,
             plugin_storage: None,
         });
 
@@ -2288,6 +2611,7 @@ fn summary_recent_at_falls_back_to_message_time_then_zero() {
             add_character: Some(json!({ "chaId": "char-zero", "name": "Zero", "chats": [] })),
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("add character without lastInteraction");
@@ -2477,6 +2801,7 @@ fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: Some(vec![PluginStorageMutation::Set {
                 key: "ttl-zero".to_owned(),
                 value: json!(0),
@@ -2495,6 +2820,7 @@ fn expired_leases_are_swept_on_reopen_while_fresh_leases_survive() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("fork active generation");
@@ -2747,14 +3073,18 @@ fn create_v2_database_with_lease(path: &Path) {
 }
 
 #[test]
-fn schema_v6_adds_only_an_empty_asset_alias_table_to_v5() {
+fn schema_v7_adds_only_empty_asset_tables_to_v5() {
     let directory = tempfile::tempdir().expect("create v5 migration directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
     drop(store);
     let database_path = directory.path().join("persistent/persistent.db");
     let connection = rusqlite::Connection::open(&database_path).expect("open migration fixture");
     connection
-        .execute_batch("DROP TABLE asset_aliases; PRAGMA user_version = 5;")
+        .execute_batch(
+            "DROP TABLE asset_owner_heads;
+             DROP TABLE asset_aliases;
+             PRAGMA user_version = 5;",
+        )
         .expect("downgrade fixture schema marker");
     drop(connection);
 
@@ -2767,9 +3097,16 @@ fn schema_v6_adds_only_an_empty_asset_alias_table_to_v5() {
         .connection
         .query_row("SELECT COUNT(*) FROM asset_aliases", [], |row| row.get(0))
         .expect("count migrated aliases");
+    let head_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM asset_owner_heads", [], |row| {
+            row.get(0)
+        })
+        .expect("count migrated owner heads");
 
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(alias_count, 0);
+    assert_eq!(head_count, 0);
     assert_eq!(
         store.read_root(None).expect("read migrated root").revision,
         0
@@ -2777,7 +3114,39 @@ fn schema_v6_adds_only_an_empty_asset_alias_table_to_v5() {
 }
 
 #[test]
-fn schema_v6_migrates_v2_snapshot_lease_and_plugin_records() {
+fn schema_v7_adds_only_an_empty_owner_head_table_to_v6() {
+    let directory = tempfile::tempdir().expect("create v6 migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    drop(store);
+    let database_path = directory.path().join("persistent/persistent.db");
+    let connection = rusqlite::Connection::open(&database_path).expect("open migration fixture");
+    connection
+        .execute_batch("DROP TABLE asset_owner_heads; PRAGMA user_version = 6;")
+        .expect("downgrade fixture schema marker");
+    drop(connection);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate v6 store");
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read migrated schema version");
+    let head_count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM asset_owner_heads", [], |row| {
+            row.get(0)
+        })
+        .expect("count migrated owner heads");
+
+    assert_eq!(version, 7);
+    assert_eq!(head_count, 0);
+    assert_eq!(
+        store.read_root(None).expect("read migrated root").revision,
+        0
+    );
+}
+
+#[test]
+fn schema_v7_migrates_v2_snapshot_lease_and_plugin_records() {
     let directory = tempfile::tempdir().expect("create v2 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database_with_lease(&database_path);
@@ -2808,7 +3177,7 @@ fn schema_v6_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     store
         .release_revision("snapshot-7-v2fixture")
@@ -2941,7 +3310,7 @@ fn create_task4_v4_database(path: &Path) {
 }
 
 #[test]
-fn schema_v6_migrates_snapshot_v3_without_plugin_table() {
+fn schema_v7_migrates_snapshot_v3_without_plugin_table() {
     let directory = tempfile::tempdir().expect("create snapshot v3 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_snapshot_v3_database(&database_path);
@@ -2960,7 +3329,7 @@ fn schema_v6_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        6
+        7
     );
     store
         .release_revision("snapshot-v3fixture")
@@ -2976,7 +3345,7 @@ fn schema_v6_migrates_snapshot_v3_without_plugin_table() {
 }
 
 #[test]
-fn schema_v6_migrates_task4_v4_lease_with_plugin_ordinal() {
+fn schema_v7_migrates_task4_v4_lease_with_plugin_ordinal() {
     let directory = tempfile::tempdir().expect("create Task 4 v4 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_task4_v4_database(&database_path);
@@ -2995,7 +3364,7 @@ fn schema_v6_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        6
+        7
     );
     store
         .release_revision("snapshot-7-task4v4")
@@ -3014,7 +3383,7 @@ fn schema_v6_migrates_task4_v4_lease_with_plugin_ordinal() {
 }
 
 #[test]
-fn schema_v6_migrates_existing_v2_plugin_storage() {
+fn schema_v7_migrates_existing_v2_plugin_storage() {
     let directory = tempfile::tempdir().expect("create v2 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database(&database_path);
@@ -3039,11 +3408,11 @@ fn schema_v6_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
-fn schema_v6_adds_durable_plugin_ordinals_to_task4_v3() {
+fn schema_v7_adds_durable_plugin_ordinals_to_task4_v3() {
     let directory = tempfile::tempdir().expect("create v3 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v3_database(&database_path);
@@ -3064,11 +3433,11 @@ fn schema_v6_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
-fn schema_v6_migrates_large_retained_roots_one_generation_at_a_time() {
+fn schema_v7_migrates_large_retained_roots_one_generation_at_a_time() {
     let directory = tempfile::tempdir().expect("create retained root migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database(&database_path);
@@ -3114,7 +3483,7 @@ fn schema_v6_migrates_large_retained_roots_one_generation_at_a_time() {
 }
 
 #[test]
-fn schema_v6_migrates_records_for_every_v1_generation() {
+fn schema_v7_migrates_records_for_every_v1_generation() {
     let directory = tempfile::tempdir().expect("create migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -3202,11 +3571,11 @@ fn schema_v6_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
-fn schema_v6_rolls_back_when_v1_bot_presets_is_not_an_array() {
+fn schema_v7_rolls_back_when_v1_bot_presets_is_not_an_array() {
     let directory = tempfile::tempdir().expect("create migration rollback directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -3268,7 +3637,7 @@ fn schema_v6_rolls_back_when_v1_bot_presets_is_not_an_array() {
 }
 
 #[test]
-fn schema_v6_rolls_back_when_v1_plugin_storage_is_not_an_object() {
+fn schema_v7_rolls_back_when_v1_plugin_storage_is_not_an_object() {
     let directory = tempfile::tempdir().expect("create plugin migration rollback directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -3317,7 +3686,7 @@ fn schema_v6_rolls_back_when_v1_plugin_storage_is_not_an_object() {
 }
 
 #[test]
-fn pending_v1_snapshot_restores_then_migrates_to_v6() {
+fn pending_v1_snapshot_restores_then_migrates_to_v7() {
     let directory = tempfile::tempdir().expect("create restore directory");
     let store = PersistentStore::open(directory.path()).expect("open current v5 store");
     let candidate = directory
@@ -3344,7 +3713,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v6() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -3362,6 +3731,7 @@ fn invalid_pending_v1_snapshot_preserves_live_database_and_restore_marker() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("seed live database");
@@ -3427,6 +3797,7 @@ fn semantically_invalid_pending_v1_snapshot_preserves_live_database_and_restore_
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("seed semantic live database");
@@ -3488,7 +3859,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 6);
+    assert_eq!(integer_pragma("user_version"), 7);
 }
 
 #[test]
@@ -3512,6 +3883,7 @@ fn snapshots_create_list_and_restore_on_reopen() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("change database after snapshot");
@@ -3682,6 +4054,7 @@ fn pending_restore_target_and_pre_restore_snapshot_survive_rotation() {
             add_character: None,
             conversations: None,
             delete_character_id: None,
+            asset_owner_heads: None,
             plugin_storage: None,
         })
         .expect("change current data");
@@ -3745,6 +4118,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
                 add_character: None,
                 conversations: None,
                 delete_character_id: None,
+                asset_owner_heads: None,
                 plugin_storage: None,
             })
             .expect("change current data");
@@ -3759,7 +4133,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 7;")
+                .execute_batch("PRAGMA user_version = 8;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");

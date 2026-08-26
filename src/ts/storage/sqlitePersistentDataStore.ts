@@ -10,6 +10,8 @@ import {
     SnapshotReleasedError,
     validateConversationWindowQuery,
     type AssetAlias,
+    type AssetOwnerHead,
+    type AssetOwnerLocator,
     type CharacterDetail,
     type CharacterPage,
     type CharacterQuery,
@@ -152,6 +154,12 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_read_asset_alias', { key })
     }
 
+    readAssetOwnerHead(
+        owner: AssetOwnerLocator,
+    ): Promise<Versioned<AssetOwnerHead> | null> {
+        return invokeStore('pds_read_asset_owner_head', { owner })
+    }
+
     commitAssetAlias(
         alias: AssetAlias,
         expectedRevision: DataRevision,
@@ -267,6 +275,10 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             readAssetAlias: async (key) => {
                 assertActive()
                 return invokeStore('pds_read_asset_alias', { key, lease })
+            },
+            readAssetOwnerHead: async (owner) => {
+                assertActive()
+                return invokeStore('pds_read_asset_owner_head', { owner, lease })
             },
             release: () => {
                 if (releasePromise) return releasePromise

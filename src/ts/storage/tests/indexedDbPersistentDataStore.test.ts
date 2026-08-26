@@ -68,6 +68,7 @@ async function countPersistentDataRecords(
         'pluginStorage',
         'pluginStorageMetadata',
         'assetAliases',
+        'assetOwnerHeads',
     ]
     const database = await openDatabase(indexedDB, databaseName)
     const transaction = database.transaction(storeNames, 'readonly')
@@ -317,6 +318,26 @@ async function createVersion7Database(
     database.close()
 }
 
+async function createVersion8Database(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    await createVersion7Database(indexedDB, databaseName)
+    const openRequest = indexedDB.open(databaseName, 8)
+    openRequest.onupgradeneeded = () => {
+        const aliases = openRequest.result.createObjectStore('assetAliases', { keyPath: 'key' })
+        aliases.createIndex('byGeneration', 'generation')
+    }
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        openRequest.onsuccess = () => resolve(openRequest.result)
+        openRequest.onerror = () => reject(openRequest.error)
+    })
+    const transaction = database.transaction('meta', 'readwrite')
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 8 })
+    await completeTransaction(transaction)
+    database.close()
+}
+
 persistentDataStoreContract(async () => {
     const indexedDB = new IDBFactory()
     const databaseName = `persistent-store-contract-${databaseSequence++}`
@@ -350,7 +371,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         })
     }
 
-    it('upgrades version 7 by creating only the empty asset alias store and index', async () => {
+    it('upgrades version 7 with empty asset alias and owner-head stores without scans', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `version-7-asset-alias-schema-${databaseSequence++}`
         await createVersion7Database(indexedDB, databaseName)
@@ -374,12 +395,56 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(8)
-        const transaction = database.transaction('assetAliases', 'readonly')
+        expect(database.version).toBe(9)
+        const transaction = database.transaction(['assetAliases', 'assetOwnerHeads'], 'readonly')
         const aliases = transaction.objectStore('assetAliases')
         expect(aliases.indexNames.contains('byGeneration')).toBe(true)
         await expect(new Promise<number>((resolve, reject) => {
             const request = aliases.count()
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })).resolves.toBe(0)
+        const heads = transaction.objectStore('assetOwnerHeads')
+        expect(heads.indexNames.contains('byGeneration')).toBe(true)
+        await expect(new Promise<number>((resolve, reject) => {
+            const request = heads.count()
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+        })).resolves.toBe(0)
+        await completeTransaction(transaction)
+        database.close()
+    })
+
+    it('upgrades version 8 by creating only the empty owner-head store and index', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-8-owner-head-schema-${databaseSequence++}`
+        await createVersion8Database(indexedDB, databaseName)
+        const originalOpenCursor = IDBObjectStore.prototype.openCursor
+        const cursorSpy = vi.spyOn(IDBObjectStore.prototype, 'openCursor')
+            .mockImplementation(function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore['openCursor']>
+            ) {
+                if (this.name !== 'meta') {
+                    throw new Error('version 8 owner-head schema upgrade must not scan records')
+                }
+                return originalOpenCursor.apply(this, args)
+            })
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        try {
+            await store.open()
+        } finally {
+            cursorSpy.mockRestore()
+        }
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(9)
+        const transaction = database.transaction('assetOwnerHeads', 'readonly')
+        const heads = transaction.objectStore('assetOwnerHeads')
+        expect(heads.indexNames.contains('byGeneration')).toBe(true)
+        await expect(new Promise<number>((resolve, reject) => {
+            const request = heads.count()
             request.onsuccess = () => resolve(request.result)
             request.onerror = () => reject(request.error)
         })).resolves.toBe(0)

@@ -47,6 +47,10 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
         "asset_aliases",
         "logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height",
     ),
+    (
+        "asset_owner_heads",
+        "owner_kind, owner_locator, present, manifest_hash, entry_count",
+    ),
 ];
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -273,6 +277,120 @@ impl AssetAlias {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum AssetOwnerLocator {
+    CharacterAdditionalAssets { character_id: String },
+    RootModuleAssets { index: i64 },
+    PersonaEmbeddedModuleAssets { index: i64 },
+}
+
+impl AssetOwnerLocator {
+    fn validate(&self) -> StoreResult<()> {
+        match self {
+            Self::CharacterAdditionalAssets { character_id } if character_id.is_empty() => {
+                Err(StoreError::Validation {
+                    message: "Character asset owner requires a nonempty characterId".to_owned(),
+                })
+            }
+            Self::RootModuleAssets { index } | Self::PersonaEmbeddedModuleAssets { index }
+                if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(index) =>
+            {
+                Err(StoreError::Validation {
+                    message: "Asset owner occurrence index must be a nonnegative safe integer"
+                        .to_owned(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn storage_identity(&self) -> (&'static str, String) {
+        match self {
+            Self::CharacterAdditionalAssets { character_id } => {
+                ("character-additional-assets", character_id.clone())
+            }
+            Self::RootModuleAssets { index } => ("root-module-assets", index.to_string()),
+            Self::PersonaEmbeddedModuleAssets { index } => {
+                ("persona-embedded-module-assets", index.to_string())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetOwnerHead {
+    pub(crate) owner: AssetOwnerLocator,
+    pub(crate) present: bool,
+    pub(crate) manifest_hash: Option<String>,
+    pub(crate) entry_count: i64,
+}
+
+impl AssetOwnerHead {
+    #[cfg(test)]
+    pub(crate) fn present(
+        owner: AssetOwnerLocator,
+        manifest_hash: String,
+        entry_count: i64,
+    ) -> Self {
+        Self {
+            owner,
+            present: true,
+            manifest_hash: Some(manifest_hash),
+            entry_count,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn absent(owner: AssetOwnerLocator) -> Self {
+        Self {
+            owner,
+            present: false,
+            manifest_hash: None,
+            entry_count: 0,
+        }
+    }
+
+    pub(super) fn validate(&self) -> StoreResult<()> {
+        self.owner.validate()?;
+        if self.entry_count < 0 {
+            return Err(StoreError::Validation {
+                message: "Asset owner head entryCount must be nonnegative".to_owned(),
+            });
+        }
+        if !self.present {
+            if self.manifest_hash.is_some() || self.entry_count != 0 {
+                return Err(StoreError::Validation {
+                    message: "Absent asset owner property cannot reference a manifest".to_owned(),
+                });
+            }
+            return Ok(());
+        }
+        let Some(hash) = &self.manifest_hash else {
+            return Err(StoreError::Validation {
+                message: "Present asset owner property requires a lowercase SHA-256 manifestHash"
+                    .to_owned(),
+            });
+        };
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(StoreError::Validation {
+                message: "Present asset owner property requires a lowercase SHA-256 manifestHash"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 fn plugin_storage_array_index(key: &str) -> Option<u32> {
     let value = key.parse::<u32>().ok()?;
     (value < u32::MAX && value.to_string() == key).then_some(value)
@@ -430,6 +548,8 @@ pub(crate) struct WorkingSetCommit {
     pub(crate) delete_character_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) plugin_storage: Option<Vec<PluginStorageMutation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) asset_owner_heads: Option<Vec<AssetOwnerHead>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -632,6 +752,14 @@ impl PersistentStore {
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<AssetAlias>>> {
         query::read_asset_alias(&self.connection, key, lease)
+    }
+
+    pub(crate) fn read_asset_owner_head(
+        &self,
+        owner: &AssetOwnerLocator,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<Versioned<AssetOwnerHead>>> {
+        query::read_asset_owner_head(&self.connection, owner, lease)
     }
 
     pub(crate) fn materialize(&self, revision: Option<i64>) -> StoreResult<Value> {

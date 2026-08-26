@@ -1,9 +1,10 @@
 use super::{
     active_generation, compare_plugin_storage_keys, current_revision, read_target, AssetAlias,
-    CharacterPage, CharacterQuery, CharacterSummary, ConversationPage, ConversationQuery,
-    ConversationSummary, ConversationWindow, ConversationWindowQuery, PluginStorageCatalog,
-    PluginStorageSummary, PresetCatalog, PresetSummary, QueryOrder, StoreError, StoreResult,
-    Versioned, CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
+    AssetOwnerHead, AssetOwnerLocator, CharacterPage, CharacterQuery, CharacterSummary,
+    ConversationPage, ConversationQuery, ConversationSummary, ConversationWindow,
+    ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary, PresetCatalog,
+    PresetSummary, QueryOrder, StoreError, StoreResult, Versioned, CONVERSATION_RANGE_MAX_LIMIT,
+    JAVASCRIPT_MAX_SAFE_INTEGER,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
@@ -151,6 +152,41 @@ pub(super) fn read_asset_alias(
                     inlay_type: row.get(7)?,
                     width: row.get(8)?,
                     height: row.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            value.validate()?;
+            Ok(Versioned {
+                revision: target.revision,
+                value,
+            })
+        })
+        .transpose()
+}
+
+pub(super) fn read_asset_owner_head(
+    connection: &Connection,
+    owner: &AssetOwnerLocator,
+    lease: Option<&str>,
+) -> StoreResult<Option<Versioned<AssetOwnerHead>>> {
+    owner.validate()?;
+    let target = read_target(connection, lease)?;
+    let (owner_kind, owner_locator) = owner.storage_identity();
+    let value = connection
+        .query_row(
+            "SELECT present, manifest_hash, entry_count
+             FROM asset_owner_heads
+             WHERE generation = ?1 AND owner_kind = ?2 AND owner_locator = ?3",
+            params![target.generation, owner_kind, owner_locator],
+            |row| {
+                Ok(AssetOwnerHead {
+                    owner: owner.clone(),
+                    present: row.get(0)?,
+                    manifest_hash: row.get(1)?,
+                    entry_count: row.get(2)?,
                 })
             },
         )
