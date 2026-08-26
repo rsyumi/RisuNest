@@ -7,6 +7,7 @@ mod local_backup;
 mod lossless_backup;
 pub mod native_file_jobs;
 mod native_media;
+mod native_tokenizer;
 #[cfg(desktop)]
 #[allow(dead_code, unused_imports)]
 mod peer_sync;
@@ -508,6 +509,7 @@ pub fn run() {
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_capabilities,
             oauth_login,
+            native_tokenizer::tokenize_batch,
             native_media::native_media_write_inlay_image,
             native_file_jobs::native_file_job_start,
             native_file_jobs::native_file_job_status,
