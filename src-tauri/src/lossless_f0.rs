@@ -1176,7 +1176,7 @@ fn reference_graph_sha256(references: &[F0Reference]) -> Result<String, F0Error>
     for reference in references {
         let edge = reference_graph_value(reference);
         hasher.update(canonical_length(&edge)?.to_be_bytes());
-        hash_canonical(&edge, &mut hasher)?;
+        hash_canonical(&edge, &mut hasher, ObjectKeyOrder::Iteration)?;
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -1386,10 +1386,27 @@ fn invalid_database(message: impl Into<String>) -> F0Error {
 }
 
 fn canonical_sha256(value: &Value) -> Result<String, F0Error> {
+    canonical_sha256_with_order(value, ObjectKeyOrder::Sorted)
+}
+
+pub(crate) fn legacy_canonical_database_sha256_v1(value: &Value) -> Result<String, F0Error> {
+    canonical_sha256_with_order(value, ObjectKeyOrder::Iteration)
+}
+
+fn canonical_sha256_with_order(
+    value: &Value,
+    object_key_order: ObjectKeyOrder,
+) -> Result<String, F0Error> {
     canonical_length(value)?;
     let mut hasher = Sha256::new();
-    hash_canonical(value, &mut hasher)?;
+    hash_canonical(value, &mut hasher, object_key_order)?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[derive(Clone, Copy)]
+enum ObjectKeyOrder {
+    Iteration,
+    Sorted,
 }
 
 fn canonical_length(value: &Value) -> Result<u32, F0Error> {
@@ -1421,7 +1438,11 @@ fn canonical_length(value: &Value) -> Result<u32, F0Error> {
     u32::try_from(length).map_err(|_| canonical_too_large())
 }
 
-fn hash_canonical(value: &Value, hasher: &mut Sha256) -> Result<(), F0Error> {
+fn hash_canonical(
+    value: &Value,
+    hasher: &mut Sha256,
+    object_key_order: ObjectKeyOrder,
+) -> Result<(), F0Error> {
     match value {
         Value::Null => hasher.update(b"N"),
         Value::Bool(true) => hasher.update(b"T"),
@@ -1451,21 +1472,41 @@ fn hash_canonical(value: &Value, hasher: &mut Sha256) -> Result<(), F0Error> {
             hash_count(hasher, items.len())?;
             for item in items {
                 hasher.update(canonical_length(item)?.to_be_bytes());
-                hash_canonical(item, hasher)?;
+                hash_canonical(item, hasher, object_key_order)?;
             }
         }
         Value::Object(entries) => {
             hasher.update(b"O");
             hash_count(hasher, entries.len())?;
-            for (key, item) in entries {
-                hash_length_delimiter(hasher, key.len())?;
-                hasher.update(key.as_bytes());
-                hasher.update(canonical_length(item)?.to_be_bytes());
-                hash_canonical(item, hasher)?;
+            match object_key_order {
+                ObjectKeyOrder::Iteration => {
+                    for (key, item) in entries {
+                        hash_canonical_object_entry(key, item, hasher, object_key_order)?;
+                    }
+                }
+                ObjectKeyOrder::Sorted => {
+                    let mut keys = entries.keys().collect::<Vec<_>>();
+                    keys.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+                    for key in keys {
+                        hash_canonical_object_entry(key, &entries[key], hasher, object_key_order)?;
+                    }
+                }
             }
         }
     }
     Ok(())
+}
+
+fn hash_canonical_object_entry(
+    key: &str,
+    item: &Value,
+    hasher: &mut Sha256,
+    object_key_order: ObjectKeyOrder,
+) -> Result<(), F0Error> {
+    hash_length_delimiter(hasher, key.len())?;
+    hasher.update(key.as_bytes());
+    hasher.update(canonical_length(item)?.to_be_bytes());
+    hash_canonical(item, hasher, object_key_order)
 }
 
 fn hash_count(hasher: &mut Sha256, count: usize) -> Result<(), F0Error> {
@@ -1528,6 +1569,39 @@ mod tests {
         assert_ne!(
             compact_result.canonical_database_sha256,
             changed_result.canonical_database_sha256
+        );
+    }
+
+    #[test]
+    fn canonical_database_hash_sorts_object_keys_recursively() {
+        let original_value: Value = serde_json::from_str(
+            r#"{"characters":[],"botPresets":[],"modules":[{"zeta":0,"alpha":1}],"tail":{"zeta":false,"alpha":true},"sequence":[0,1]}"#,
+        )
+        .unwrap();
+        let reordered_value: Value = serde_json::from_str(
+            r#"{"sequence":[0,1],"tail":{"alpha":true,"zeta":false},"modules":[{"alpha":1,"zeta":0}],"botPresets":[],"characters":[]}"#,
+        )
+        .unwrap();
+
+        let original = validate_f0_v1(&original_value, &[], &[]).unwrap();
+        let reordered = validate_f0_v1(&reordered_value, &[], &[]).unwrap();
+
+        assert_eq!(
+            original.canonical_database_sha256,
+            reordered.canonical_database_sha256
+        );
+        assert_ne!(
+            legacy_canonical_database_sha256_v1(&original_value).unwrap(),
+            legacy_canonical_database_sha256_v1(&reordered_value).unwrap()
+        );
+
+        let mut changed_array = reordered_value;
+        changed_array["sequence"] = json!([1, 0]);
+        assert_ne!(
+            original.canonical_database_sha256,
+            validate_f0_v1(&changed_array, &[], &[])
+                .unwrap()
+                .canonical_database_sha256
         );
     }
 

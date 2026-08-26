@@ -5,8 +5,9 @@ use crate::{
     },
     local_backup::CancellationProbe,
     lossless_f0::{
-        rebuild_f0_v1, validate_f0_v1, F0Error, F0ErrorCode, F0ExpectedMissing,
-        F0PayloadDescriptor, F0PayloadKind, F0Reference, F0ReferenceStatus, F0Validation,
+        legacy_canonical_database_sha256_v1, rebuild_f0_v1, validate_f0_v1, F0Error, F0ErrorCode,
+        F0ExpectedMissing, F0PayloadDescriptor, F0PayloadKind, F0Reference, F0ReferenceStatus,
+        F0Validation,
     },
     native_file_jobs::{
         restore::{self as block_restore, ReplacementSink, RestoreControl},
@@ -938,7 +939,10 @@ fn validate_staged_f0(
         })
         .collect::<Vec<_>>();
     let validation = validate_f0_v1(database, &payloads, &expected_missing).map_err(f0_error)?;
-    if validation.canonical_database_sha256 != manifest.compatibility.canonical_database_sha256 {
+    if validation.canonical_database_sha256 != manifest.compatibility.canonical_database_sha256
+        && legacy_canonical_database_sha256_v1(database).map_err(f0_error)?
+            != manifest.compatibility.canonical_database_sha256
+    {
         return Err(LosslessError::new(
             LosslessErrorCode::HashMismatch,
             "lossless package canonical database hash differs from decoded database",
@@ -2808,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    fn production_block_decoder_discloses_the_wire_representable_w0_order_gap() {
+    fn production_block_decoder_preserves_semantics_across_the_w0_wire_order_gap() {
         let encoded = STANDARD
             .decode(
                 include_str!(
@@ -2868,7 +2872,7 @@ mod tests {
         let source_validation = validate_f0_v1(&expected, &[], &expected_missing)
             .expect("validate the frozen W0 expectation through F0");
         assert_eq!(
-            source_validation.canonical_database_sha256,
+            legacy_canonical_database_sha256_v1(&expected).unwrap(),
             "9a8f355262eba1a3163b51e9c12e22802765305299c4f60eb4834d0d1122eec6"
         );
         let validation = validate_f0_v1(&decoded, &[], &expected_missing)
@@ -2886,8 +2890,12 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            validation.canonical_database_sha256,
+            legacy_canonical_database_sha256_v1(&decoded).unwrap(),
             "55195e4a86e010d50bb37c502802f2180c769d508f210f4dc4846a89935a80f7"
+        );
+        assert_eq!(
+            validation.canonical_database_sha256,
+            source_validation.canonical_database_sha256
         );
         assert_eq!(validation.references, source_validation.references);
         assert_eq!(
@@ -2916,6 +2924,37 @@ mod tests {
         store
             .replace_abort(&staging_id)
             .expect("abort verified W0 staging generation");
+    }
+
+    #[test]
+    fn staged_f0_verification_accepts_a_legacy_iteration_order_database_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path().join("repository")).unwrap();
+        let database: Value = serde_json::from_str(
+            r#"{"zeta":0,"characters":[],"botPresets":[],"alpha":{"zeta":false,"alpha":true}}"#,
+        )
+        .unwrap();
+        let validation = validate_f0_v1(&database, &[], &[]).unwrap();
+        let legacy_hash = legacy_canonical_database_sha256_v1(&database).unwrap();
+        assert_ne!(legacy_hash, validation.canonical_database_sha256);
+        let manifest = LosslessManifest {
+            version: FORMAT_VERSION,
+            compatibility: LosslessCompatibility {
+                oracle_version: FORMAT_VERSION,
+                canonical_database_sha256: legacy_hash,
+                reference_graph_sha256: validation.reference_graph_sha256,
+            },
+            entries: Vec::new(),
+            references: validation
+                .references
+                .iter()
+                .map(lossless_reference)
+                .collect(),
+            warnings: Vec::new(),
+            extensions: json!({}),
+        };
+
+        validate_staged_f0(&manifest, &[], &database, &cas).unwrap();
     }
 
     #[test]
@@ -3058,6 +3097,50 @@ mod tests {
                 .any(|entry| entry.kind == kind));
         }
         assert_eq!(store.revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn pinned_source_export_accepts_a_root_member_after_split_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("source-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let output = directory.path().join("peer-source.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Source", b"source");
+        let mut root = store.read_root(None).unwrap().value;
+        root.as_object_mut()
+            .unwrap()
+            .insert("trailingRootMember".to_owned(), json!({ "nested": true }));
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root: Some(root),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+
+        create_and_verify_lossless_backup_v1(
+            &output,
+            &staging,
+            &cas,
+            &mut store,
+            2,
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(store.revision().unwrap(), 2);
     }
 
     #[test]
