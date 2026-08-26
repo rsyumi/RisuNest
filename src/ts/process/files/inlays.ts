@@ -86,12 +86,13 @@ export async function postInlayAsset(img:{
 
 export async function writeInlayImage(imgObj:HTMLImageElement, arg:{name?:string, ext?:string, id?:string} = {}, sourceUrl?: string) {
     const imgid = arg.id ?? v4()
+    const source = sourceUrl || imgObj.currentSrc || imgObj.src
+    if (!source) throw new Error('Inlay image source is unavailable')
+    const response = await fetch(source)
+    if (!response.ok) throw new Error(`Failed to read Inlay image source: ${response.status}`)
+    const data = new Uint8Array(await response.arrayBuffer())
+    validateNewInlayImage(data, response.headers.get('Content-Type') ?? '', arg.ext ?? '')
     if (isTauri) {
-        const source = sourceUrl || imgObj.currentSrc || imgObj.src
-        if (!source) throw new Error('Native Inlay image source is unavailable')
-        const response = await fetch(source)
-        if (!response.ok) throw new Error(`Failed to read native Inlay image source: ${response.status}`)
-        const data = new Uint8Array(await response.arrayBuffer())
         const blobStore = await resolveBlobStore()
         if (!blobStore.putNewInlayImage) throw new Error('Native Inlay image writer is unavailable')
         await blobStore.putNewInlayImage(imgid, data, { name: arg.name ?? imgid })
@@ -375,6 +376,22 @@ function isAnimatedWebP(data: Uint8Array): boolean {
     return false
 }
 
+function isAnimatedPng(data: Uint8Array): boolean {
+    const pngSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+    if (data.byteLength < pngSignature.length
+        || !pngSignature.every((value, index) => data[index] === value)) return false
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+    for (let offset = 8; offset + 12 <= data.byteLength;) {
+        const length = view.getUint32(offset)
+        const chunkEnd = offset + 12 + length
+        if (chunkEnd > data.byteLength) return false
+        const type = new TextDecoder().decode(data.subarray(offset + 4, offset + 8))
+        if (type === 'acTL') return true
+        offset = chunkEnd
+    }
+    return false
+}
+
 function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): void {
     const normalizedExt = ext.replace(/^\.+/, '').toLowerCase()
     const normalizedMime = mime.toLowerCase()
@@ -389,6 +406,7 @@ function validateNewInlayImage(data: Uint8Array, mime: string, ext: string): voi
         throw new Error('New AVIF Inlay images are unsupported')
     }
     if (isAnimatedWebP(data)) throw new Error('Animated WebP Inlay images are unsupported')
+    if (isAnimatedPng(data)) throw new Error('APNG Inlay images are unsupported')
 }
 
 export async function setInlayAsset(id: string, img: InlayAsset){

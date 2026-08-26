@@ -112,12 +112,24 @@ const supportedVideoExts = ['webm', 'mp4', 'mkv'] as const
 const supportedImageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif'] as const
 const allSupportedExts = [...supportedAudioExts, ...supportedVideoExts, ...supportedImageExts]
 
+function apngBytes(): Uint8Array {
+    return Uint8Array.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0, 0, 0, 8, 0x61, 0x63, 0x54, 0x4c,
+        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    ])
+}
+
 function makeImage(w: number, h: number): HTMLImageElement {
     const img = new Image()
     Object.defineProperty(img, 'width', { get: () => w })
     Object.defineProperty(img, 'height', { get: () => h })
     Object.defineProperty(img, 'naturalWidth', { get: () => w })
     Object.defineProperty(img, 'naturalHeight', { get: () => h })
+    Object.defineProperty(img, 'currentSrc', {
+        configurable: true,
+        get: () => 'data:image/png;base64,iVBORw0KGgo=',
+    })
     Object.defineProperty(img, 'onload', {
         set(fn: () => void) {
             fn?.()
@@ -140,6 +152,10 @@ beforeEach(() => {
     canvasOutputMime = 'image/webp'
     loadedImageWidth = 100
     loadedImageHeight = 100
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+        Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        { headers: { 'Content-Type': 'image/png' } },
+    )))
     vi.stubGlobal('Image', class {
         naturalWidth = loadedImageWidth
         naturalHeight = loadedImageHeight
@@ -173,9 +189,10 @@ describe('setInlayAsset', () => {
         ['GIF', Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]), 'gif', 'image/gif'],
         ['AVIF', new TextEncoder().encode('\0\0\0\x18ftypavif'), 'avif', 'image/avif'],
         ['animated WebP', new TextEncoder().encode('RIFF\x0c\0\0\0WEBPANIM\0\0\0\0'), 'webp', 'image/webp'],
+        ['APNG', apngBytes(), 'png', 'image/png'],
     ])('rejects new %s input rather than flattening it', async (_label, bytes, ext, mime) => {
         await expect(setInlayAsset('unsupported-image', {
-            data: new Blob([bytes], { type: mime }),
+            data: new Blob([bytes.slice().buffer as ArrayBuffer], { type: mime }),
             ext, name: `unsupported.${ext}`, type: 'image',
         })).rejects.toThrow(/unsupported/i)
 
@@ -588,6 +605,26 @@ describe('reencodeImage temporary object URLs', () => {
 })
 
 describe('writeInlayImage', () => {
+    test.each([
+        ['GIF', Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]), 'image/gif'],
+        ['AVIF', new TextEncoder().encode('\0\0\0\x18ftypavif'), 'image/avif'],
+        ['animated WebP', new TextEncoder().encode('RIFF\x0c\0\0\0WEBPANIM\0\0\0\0'), 'image/webp'],
+        ['APNG', apngBytes(), 'image/png'],
+    ])('validates direct %s sources before drawing them to canvas', async (_label, bytes, mime) => {
+        const source = `data:${mime};base64,fixture`
+        vi.stubGlobal('fetch', vi.fn(async () => new Response(bytes.slice().buffer as ArrayBuffer, {
+            headers: { 'Content-Type': mime },
+        })))
+        const image = makeImage(20, 10)
+        Object.defineProperty(image, 'currentSrc', { get: () => source })
+
+        await expect(writeInlayImage(image, { id: 'direct-unsupported' }))
+            .rejects.toThrow(/unsupported/i)
+
+        expect(fakeCtx.drawImage).not.toHaveBeenCalled()
+        expect(await getInlayAssetBlob('direct-unsupported')).toBeNull()
+    })
+
     test('stores image asset with correct metadata and returns id', async () => {
         const imgObj = makeImage(200, 100)
 

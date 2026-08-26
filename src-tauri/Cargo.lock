@@ -3995,6 +3995,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tauri",
  "tauri-build",
@@ -4013,6 +4014,7 @@ dependencies = [
  "url",
  "uuid",
  "webp",
+ "windows-sys 0.61.2",
  "zip 0.6.6",
 ]
 

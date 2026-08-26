@@ -31,6 +31,51 @@ describe('storage mutation gate', () => {
         expect(events).toEqual(['write-1-start', 'write-2', 'write-1-end'])
     })
 
+    test('serializes keyed writes for the same Inlay across clients', async () => {
+        const locks = createInRealmStorageLockManager()
+        const first = createStorageMutationGate({ locks })
+        const second = createStorageMutationGate({ locks })
+        const firstRelease = deferred()
+        const events: string[] = []
+
+        const firstWrite = first.runKeyedWrite('inlay-a', async () => {
+            events.push('first-start')
+            await firstRelease.promise
+            events.push('first-end')
+        })
+        const secondWrite = second.runKeyedWrite('inlay-a', async () => {
+            events.push('second')
+        })
+
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(events).toEqual(['first-start'])
+        firstRelease.resolve()
+        await Promise.all([firstWrite, secondWrite])
+        expect(events).toEqual(['first-start', 'first-end', 'second'])
+    })
+
+    test('lets keyed writes for different Inlays overlap', async () => {
+        const locks = createInRealmStorageLockManager()
+        const gate = createStorageMutationGate({ locks })
+        const firstRelease = deferred()
+        const events: string[] = []
+
+        const firstWrite = gate.runKeyedWrite('inlay-a', async () => {
+            events.push('first-start')
+            await firstRelease.promise
+        })
+        const secondWrite = gate.runKeyedWrite('inlay-b', async () => {
+            events.push('second')
+        })
+
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(events).toEqual(['first-start', 'second'])
+        firstRelease.resolve()
+        await Promise.all([firstWrite, secondWrite])
+    })
+
     test('releases the lock when a write throws synchronously', async () => {
         const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
         const error = new Error('synchronous failure')

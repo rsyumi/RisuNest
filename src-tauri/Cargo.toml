@@ -17,6 +17,7 @@ tauri = { version = "2.11.5", features = ["protocol-asset", "devtools"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
 tiktoken-rs = "0.4.0"
 base64 = "0.21.0"
 darling = "0.20.3"
@@ -51,6 +52,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = { version = "2.4.3", features = ["deep-link"] }
 tauri-plugin-updater = "2.10.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 reqwest = { version = "0.11.16", default-features = false, features = ["json", "rustls-tls"] }

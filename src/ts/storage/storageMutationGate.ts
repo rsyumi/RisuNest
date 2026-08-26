@@ -1,5 +1,6 @@
 export interface StorageMutationGate {
     runWrite<T>(operation: () => Promise<T>): Promise<T>
+    runKeyedWrite<T>(key: string, operation: () => Promise<T>): Promise<T>
 }
 
 export interface StorageLockManager {
@@ -18,41 +19,43 @@ type QueuedOperation<T = unknown> = {
 }
 
 export function createInRealmStorageLockManager(): StorageLockManager {
-    const queue: QueuedOperation[] = []
-    let sharedCount = 0
-    let exclusive = false
+    type LockState = { queue: QueuedOperation[]; sharedCount: number; exclusive: boolean }
+    const states = new Map<string, LockState>()
 
-    const finish = (job: QueuedOperation, succeeded: boolean, value: unknown) => {
-        if (job.mode === 'shared') sharedCount--
-        else exclusive = false
+    const finish = (name: string, state: LockState, job: QueuedOperation, succeeded: boolean, value: unknown) => {
+        if (job.mode === 'shared') state.sharedCount--
+        else state.exclusive = false
         if (succeeded) job.resolve(value)
         else job.reject(value)
-        pump()
+        pump(name, state)
+        if (!state.exclusive && state.sharedCount === 0 && state.queue.length === 0) states.delete(name)
     }
 
-    const start = (job: QueuedOperation) => {
-        if (job.mode === 'shared') sharedCount++
-        else exclusive = true
+    const start = (name: string, state: LockState, job: QueuedOperation) => {
+        if (job.mode === 'shared') state.sharedCount++
+        else state.exclusive = true
         void Promise.resolve().then(job.operation).then(
-            (value) => finish(job, true, value),
-            (error) => finish(job, false, error),
+            (value) => finish(name, state, job, true, value),
+            (error) => finish(name, state, job, false, error),
         )
     }
 
-    const pump = () => {
-        if (exclusive || queue.length === 0) return
-        if (queue[0].mode === 'exclusive') {
-            if (sharedCount === 0) start(queue.shift()!)
+    const pump = (name: string, state: LockState) => {
+        if (state.exclusive || state.queue.length === 0) return
+        if (state.queue[0].mode === 'exclusive') {
+            if (state.sharedCount === 0) start(name, state, state.queue.shift()!)
             return
         }
-        while (queue[0]?.mode === 'shared' && !exclusive) start(queue.shift()!)
+        while (state.queue[0]?.mode === 'shared' && !state.exclusive) start(name, state, state.queue.shift()!)
     }
 
     return {
-        request<T>(_name: string, options: { mode: 'shared' | 'exclusive' }, operation: () => Promise<T>) {
+        request<T>(name: string, options: { mode: 'shared' | 'exclusive' }, operation: () => Promise<T>) {
             return new Promise<T>((resolve, reject) => {
-                queue.push({ mode: options.mode, operation, resolve, reject } as QueuedOperation)
-                pump()
+                const state = states.get(name) ?? { queue: [], sharedCount: 0, exclusive: false }
+                states.set(name, state)
+                state.queue.push({ mode: options.mode, operation, resolve, reject } as QueuedOperation)
+                pump(name, state)
             })
         },
     }
@@ -73,5 +76,8 @@ export function createStorageMutationGate(options: {
     return {
         runWrite: (operation) =>
             locks.request('risuai-persistent-storage', { mode: 'shared' }, operation),
+        runKeyedWrite: (key, operation) =>
+            locks.request('risuai-persistent-storage', { mode: 'shared' }, () =>
+                locks.request(`risuai-blob:${key}`, { mode: 'exclusive' }, operation)),
     }
 }

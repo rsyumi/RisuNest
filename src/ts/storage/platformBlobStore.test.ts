@@ -12,6 +12,7 @@ import {
     readBlobForFacade,
 } from './platformBlobStore'
 import { SeekMode } from '@tauri-apps/plugin-fs'
+import { createInRealmStorageLockManager, createStorageMutationGate } from './storageMutationGate'
 
 function memoryBackend() {
     const values = new Map<string, Uint8Array>()
@@ -24,6 +25,12 @@ function memoryBackend() {
             remove: async (key: string) => void values.delete(key),
         },
     }
+}
+
+function deferred() {
+    let resolve!: () => void
+    const promise = new Promise<void>((done) => { resolve = done })
+    return { promise, resolve }
 }
 
 describe('platform BlobStore', () => {
@@ -89,6 +96,10 @@ describe('platform BlobStore', () => {
                 events.push('lock')
                 return operation()
             },
+            async runKeyedWrite<T>(_key: string, operation: () => Promise<T>) {
+                events.push('lock')
+                return operation()
+            },
         }
         const store = createGatedBlobStore(createBackedBlobStore(backend), gate)
         const metadata = { kind: 'asset' as const, mime: 'application/octet-stream', name: 'a', ext: '' }
@@ -115,6 +126,7 @@ describe('platform BlobStore', () => {
         const blocked = new Promise<void>((resolve) => { release = resolve })
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
+            async runKeyedWrite<T>(_key: string, operation: () => Promise<T>) { await blocked; return operation() },
         }
         const backing = createBackedBlobStore(backend)
         const store = createGatedBlobStore(backing, gate)
@@ -142,6 +154,7 @@ describe('platform BlobStore', () => {
         }
         const gated = createGatedBlobStore(store, {
             async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
+            async runKeyedWrite<T>(_key: string, operation: () => Promise<T>) { await blocked; return operation() },
         })
         const source = Uint8Array.of(4, 5)
         const input = { name: 'original.png' }
@@ -153,6 +166,43 @@ describe('platform BlobStore', () => {
         await pending
 
         expect(optimized).toHaveBeenCalledWith('owned', Uint8Array.of(4, 5), { name: 'original.png' })
+    })
+
+    test('prevents native optimization from interleaving with opaque restore for the same Inlay', async () => {
+        const opaqueRelease = deferred()
+        const events: string[] = []
+        const store = {
+            ...createBackedBlobStore(memoryBackend().backend),
+            async put(key: string, data: Uint8Array, metadata: any) {
+                events.push('opaque-start')
+                await opaqueRelease.promise
+                events.push('opaque-end')
+                return { ...metadata, key, size: data.byteLength }
+            },
+            async putNewInlayImage(key: string, data: Uint8Array, input: { name: string }) {
+                events.push('optimized')
+                return {
+                    key, kind: 'inlay' as const, size: data.byteLength, mime: 'image/webp',
+                    name: input.name, ext: 'webp', inlayType: 'image' as const, width: 1, height: 1,
+                }
+            },
+        }
+        const gated = createGatedBlobStore(
+            store,
+            createStorageMutationGate({ locks: createInRealmStorageLockManager() }),
+        )
+
+        const opaque = gated.put('same-id', Uint8Array.of(1), {
+            kind: 'inlay', mime: 'image/png', name: 'restore.png', ext: 'png', inlayType: 'image',
+        })
+        const optimized = gated.putNewInlayImage!('same-id', Uint8Array.of(2), { name: 'new.png' })
+
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(events).toEqual(['opaque-start'])
+        opaqueRelease.resolve()
+        await Promise.all([opaque, optimized])
+        expect(events).toEqual(['opaque-start', 'opaque-end', 'optimized'])
     })
 
     test('preserves legacy paths and encodes raw inlay ids', () => {

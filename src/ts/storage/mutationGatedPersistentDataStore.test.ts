@@ -33,6 +33,7 @@ describe('createMutationGatedPersistentDataStore', () => {
                 calls.push('gate')
                 return operation()
             }),
+            runKeyedWrite: vi.fn(async <T>(_key: string, operation: () => Promise<T>) => operation()),
         } as StorageMutationGate
         const commit = {
             expectedRevision: 3,
@@ -85,7 +86,10 @@ describe('createMutationGatedPersistentDataStore', () => {
         const store = makeStore()
         const failure = new Error('commit failed')
         vi.mocked(store.commit).mockRejectedValue(failure)
-        const gate = { runWrite: <T>(operation: () => Promise<T>) => operation() }
+        const gate = {
+            runWrite: <T>(operation: () => Promise<T>) => operation(),
+            runKeyedWrite: <T>(_key: string, operation: () => Promise<T>) => operation(),
+        }
         const gated = createMutationGatedPersistentDataStore(store, gate)
 
         await expect(gated.commit({ expectedRevision: 1 })).rejects.toBe(failure)

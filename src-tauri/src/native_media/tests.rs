@@ -1,5 +1,6 @@
 use super::{
-    decode_physical_key, recover_inlay_writes, respond, write_inlay_image, InlayImageMetadata,
+    decode_physical_key, recover_inlay_writes, respond, sha256_hex, write_inlay_image,
+    write_inlay_image_with_suffix, InlayImageMetadata,
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::json;
@@ -280,6 +281,33 @@ fn encoded_fixture(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
     output.into_inner()
 }
 
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut value = u32::MAX;
+    for byte in bytes {
+        value ^= u32::from(*byte);
+        for _ in 0..8 {
+            value = (value >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(value & 1)));
+        }
+    }
+    !value
+}
+
+fn apng_fixture() -> Vec<u8> {
+    let png = encoded_fixture(ImageFormat::Png, 2, 1);
+    let insert_at = 8 + 12 + u32::from_be_bytes(png[8..12].try_into().unwrap()) as usize;
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(&8u32.to_be_bytes());
+    chunk.extend_from_slice(b"acTL");
+    chunk.extend_from_slice(&1u32.to_be_bytes());
+    chunk.extend_from_slice(&0u32.to_be_bytes());
+    chunk.extend_from_slice(&crc32(&chunk[4..]).to_be_bytes());
+    let mut apng = Vec::with_capacity(png.len() + chunk.len());
+    apng.extend_from_slice(&png[..insert_at]);
+    apng.extend_from_slice(&chunk);
+    apng.extend_from_slice(&png[insert_at..]);
+    apng
+}
+
 #[test]
 fn writes_png_inlay_as_full_dimension_webp_with_truthful_metadata() {
     let temp = TempDir::new().unwrap();
@@ -413,6 +441,31 @@ fn rejects_unsupported_gif_avif_and_corrupt_new_images_without_mutating_prior_da
 }
 
 #[test]
+fn rejects_apng_without_mutating_prior_data() {
+    let temp = TempDir::new().unwrap();
+    let original = encoded_fixture(ImageFormat::Png, 3, 2);
+    write_inlay_image(temp.path(), "stable-apng", &original, "stable.png").unwrap();
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{}.bin", hex("stable-apng")));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{}.json", hex("stable-apng")));
+    let prior_payload = fs::read(&payload_path).unwrap();
+    let prior_metadata = fs::read(&metadata_path).unwrap();
+
+    assert!(
+        write_inlay_image(temp.path(), "stable-apng", &apng_fixture(), "animated.png")
+            .unwrap_err()
+            .contains("APNG")
+    );
+    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
+}
+
+#[test]
 fn overwrites_payload_and_metadata_as_one_recoverable_pair() {
     let temp = TempDir::new().unwrap();
     write_inlay_image(
@@ -488,6 +541,8 @@ fn startup_recovery_restores_the_prior_pair_after_interrupted_promotion() {
             "suffix": "simulated",
             "hadPayload": true,
             "hadMetadata": true,
+            "payloadSha256": "unused-for-incomplete-pair",
+            "metadataSha256": "unused-for-incomplete-pair",
         }))
         .unwrap(),
     )
@@ -498,4 +553,231 @@ fn startup_recovery_restores_the_prior_pair_after_interrupted_promotion() {
     assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
     assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
     assert_eq!(fs::read_dir(transaction_dir).unwrap().count(), 0);
+}
+
+#[test]
+fn startup_recovery_rejects_a_same_length_corrupt_new_pair() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "same-length",
+        &encoded_fixture(ImageFormat::Png, 4, 4),
+        "prior.png",
+    )
+    .unwrap();
+    let encoded_id = hex("same-length");
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{encoded_id}.bin"));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{encoded_id}.json"));
+    let prior_payload = fs::read(&payload_path).unwrap();
+    let prior_metadata = fs::read(&metadata_path).unwrap();
+    fs::rename(
+        &payload_path,
+        payload_path.with_extension("bin.replace-previous"),
+    )
+    .unwrap();
+    fs::rename(
+        &metadata_path,
+        metadata_path.with_extension("json.replace-previous"),
+    )
+    .unwrap();
+    fs::write(&payload_path, vec![0; prior_payload.len()]).unwrap();
+    fs::write(&metadata_path, &prior_metadata).unwrap();
+    let transaction_dir = temp.path().join("blobstore/inlay-transactions");
+    fs::write(
+        transaction_dir.join(format!("{encoded_id}.json")),
+        serde_json::to_vec(&json!({
+            "id": "same-length",
+            "suffix": "simulated",
+            "hadPayload": true,
+            "hadMetadata": true,
+            "payloadSha256": "expected-new-payload-hash",
+            "metadataSha256": "expected-new-metadata-hash",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
+}
+
+#[test]
+fn startup_recovery_keeps_an_intact_pair_and_cleans_partial_journal_and_stage_files() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "partial-journal",
+        &encoded_fixture(ImageFormat::Png, 3, 5),
+        "prior.png",
+    )
+    .unwrap();
+    let encoded_id = hex("partial-journal");
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{encoded_id}.bin"));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{encoded_id}.json"));
+    let prior_payload = fs::read(&payload_path).unwrap();
+    let prior_metadata = fs::read(&metadata_path).unwrap();
+    let transaction_dir = temp.path().join("blobstore/inlay-transactions");
+    let journal = transaction_dir.join(format!("{encoded_id}.json"));
+    let journal_temp = transaction_dir.join(format!(".{encoded_id}.partial.json.replace-next"));
+    let payload_temp = payload_path
+        .parent()
+        .unwrap()
+        .join(format!(".{encoded_id}.partial.bin.replace-next"));
+    let metadata_temp = metadata_path
+        .parent()
+        .unwrap()
+        .join(format!(".{encoded_id}.partial.json.replace-next"));
+    fs::write(&journal, br#"{"id":"partial"#).unwrap();
+    fs::write(&journal_temp, b"partial journal temp").unwrap();
+    fs::write(&payload_temp, b"partial payload").unwrap();
+    fs::write(&metadata_temp, b"partial metadata").unwrap();
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
+    assert!(!journal.exists());
+    assert!(!journal_temp.exists());
+    assert!(!payload_temp.exists());
+    assert!(!metadata_temp.exists());
+}
+
+#[test]
+fn simulated_disk_full_while_staging_restores_the_prior_pair() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "disk-full",
+        &encoded_fixture(ImageFormat::Png, 2, 3),
+        "prior.png",
+    )
+    .unwrap();
+    let encoded_id = hex("disk-full");
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{encoded_id}.bin"));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{encoded_id}.json"));
+    let prior_payload = fs::read(&payload_path).unwrap();
+    let prior_metadata = fs::read(&metadata_path).unwrap();
+    let suffix = "disk-full-stage";
+    let blocked_stage = payload_path
+        .parent()
+        .unwrap()
+        .join(format!(".{encoded_id}.{suffix}.bin.replace-next"));
+    fs::write(&blocked_stage, b"simulated exhausted write target").unwrap();
+
+    let error = write_inlay_image_with_suffix(
+        temp.path(),
+        "disk-full",
+        &encoded_fixture(ImageFormat::Jpeg, 8, 4),
+        "new.jpg",
+        suffix.to_owned(),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("stage Inlay payload"));
+    assert_eq!(fs::read(payload_path).unwrap(), prior_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), prior_metadata);
+    assert!(!blocked_stage.exists());
+    assert_eq!(
+        fs::read_dir(temp.path().join("blobstore/inlay-transactions"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn process_kill_after_complete_pair_promotion_keeps_the_hash_valid_new_pair() {
+    let temp = TempDir::new().unwrap();
+    write_inlay_image(
+        temp.path(),
+        "crash-complete",
+        &encoded_fixture(ImageFormat::Png, 2, 2),
+        "prior.png",
+    )
+    .unwrap();
+    write_inlay_image(
+        temp.path(),
+        "new-fixture",
+        &encoded_fixture(ImageFormat::Jpeg, 7, 5),
+        "new.jpg",
+    )
+    .unwrap();
+    let encoded_id = hex("crash-complete");
+    let payload_path = temp
+        .path()
+        .join("blobstore/inlays")
+        .join(format!("{encoded_id}.bin"));
+    let metadata_path = temp
+        .path()
+        .join("blobstore/metadata")
+        .join(format!("{encoded_id}.json"));
+    let fixture_payload = fs::read(
+        temp.path()
+            .join("blobstore/inlays")
+            .join(format!("{}.bin", hex("new-fixture"))),
+    )
+    .unwrap();
+    let fixture_metadata_value: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            temp.path()
+                .join("blobstore/metadata")
+                .join(format!("{}.json", hex("new-fixture"))),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut new_metadata = fixture_metadata_value;
+    new_metadata["key"] = json!("crash-complete");
+    let new_metadata = serde_json::to_vec(&new_metadata).unwrap();
+    fs::rename(
+        &payload_path,
+        payload_path.with_extension("bin.replace-previous"),
+    )
+    .unwrap();
+    fs::rename(
+        &metadata_path,
+        metadata_path.with_extension("json.replace-previous"),
+    )
+    .unwrap();
+    fs::write(&payload_path, &fixture_payload).unwrap();
+    fs::write(&metadata_path, &new_metadata).unwrap();
+    let transaction_dir = temp.path().join("blobstore/inlay-transactions");
+    fs::write(
+        transaction_dir.join(format!("{encoded_id}.json")),
+        serde_json::to_vec(&json!({
+            "id": "crash-complete",
+            "suffix": "process-kill",
+            "hadPayload": true,
+            "hadMetadata": true,
+            "payloadSha256": sha256_hex(&fixture_payload),
+            "metadataSha256": sha256_hex(&new_metadata),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    recover_inlay_writes(temp.path()).unwrap();
+
+    assert_eq!(fs::read(payload_path).unwrap(), fixture_payload);
+    assert_eq!(fs::read(metadata_path).unwrap(), new_metadata);
 }

@@ -65,19 +65,19 @@ export function createGatedBlobStore(store: BlobStore, gate: StorageMutationGate
         async put(key, data, metadata) {
             const ownedData = data.slice()
             const ownedMetadata = { ...metadata }
-            return gate.runWrite(() => store.put(key, ownedData, ownedMetadata))
+            return gate.runKeyedWrite(key, () => store.put(key, ownedData, ownedMetadata))
         },
         read: (key, range) => store.read(key, range),
         stat: (key) => store.stat(key),
         list: (query) => store.list(query),
-        remove: (key) => gate.runWrite(() => store.remove(key)),
+        remove: (key) => gate.runKeyedWrite(key, () => store.remove(key)),
         resolveUrl: (key) => store.resolveUrl(key),
     }
     if (store.putNewInlayImage) {
         gated.putNewInlayImage = (key, data, input) => {
             const ownedData = data.slice()
             const ownedInput = { ...input }
-            return gate.runWrite(() => store.putNewInlayImage!(key, ownedData, ownedInput))
+            return gate.runKeyedWrite(key, () => store.putNewInlayImage!(key, ownedData, ownedInput))
         }
     }
     return gated
