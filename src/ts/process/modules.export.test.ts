@@ -23,27 +23,25 @@ vi.mock('../alert', () => ({
     alertWait: vi.fn(),
 }))
 vi.mock('../storage/database.svelte', () => ({
-    appSubVer: '',
-    appVer: '0.0.0',
-    defaultSdDataFunc: () => [],
     getCurrentCharacter: vi.fn(),
     getCurrentChat: vi.fn(),
     getDatabase: vi.fn(),
     setCurrentCharacter: vi.fn(),
     setDatabase: vi.fn(),
 }))
-vi.mock('../globalApi.svelte', async (importOriginal) => {
-    const actual = await importOriginal<typeof import('../globalApi.svelte')>()
+vi.mock('../globalApi.svelte', async () => {
+    const { AppendableBuffer } = await import('../appendableBuffer')
     return {
-        ...actual,
+        AppendableBuffer,
         downloadFile: vi.fn(),
         forageStorage: {},
+        LocalWriter: class {},
         readImage: mocks.readImage,
         saveAsset: mocks.saveAsset,
+        VirtualWriter: class {},
     }
 })
 vi.mock('../util', () => ({
-    changeFullscreen: vi.fn(),
     checkPersonaBinded: vi.fn(),
     selectSingleFile: vi.fn(),
     sleep: vi.fn(),
@@ -52,91 +50,19 @@ vi.mock('uuid', () => ({ v4: () => 'roundtrip-module-id' }))
 vi.mock('./lorebook.svelte', () => ({ convertExternalLorebook: vi.fn() }))
 vi.mock('../media', () => ({ compressImage: mocks.compressImage }))
 vi.mock('../stores.svelte', () => ({
-    bodyIntercepterStore: [],
-    botMakerMode: { set: vi.fn() },
     DBState: { db: { modules: [] } },
     HideIconStore: { set: vi.fn() },
-    loadedStore: { set: vi.fn() },
-    LoadingStatusState: {},
-    MobileGUI: { set: vi.fn() },
     moduleBackgroundEmbedding: { set: vi.fn() },
     ReloadGUIPointer: { set: vi.fn() },
-    selectedCharID: { set: vi.fn() },
-    selIdState: { selId: 0 },
 }))
 vi.mock('../interchangeability', () => ({
     convertCharacterToModule: vi.fn(),
     convertModuleToCharacter: vi.fn(),
 }))
 vi.mock('../characterCards', () => ({
-    characterURLImport: vi.fn(),
     exportCharacterCard: vi.fn(),
-    hubURL: 'https://hub.invalid',
     importCharacterProcess: vi.fn(),
 }))
-vi.mock('../parser/parser.svelte', () => ({ hasher: vi.fn(async () => 'hashed') }))
-vi.mock('../gui/colorscheme', () => ({
-    updateColorScheme: vi.fn(),
-    updateTextThemeAndCSS: vi.fn(),
-}))
-vi.mock('../platform', () => ({ isNodeServer: false, isTauri: false, isTauriMobile: false }))
-vi.mock('../storage/platformBlobStore', () => ({
-    configureBlobStoreStorageProvider: vi.fn(),
-    readBlobForFacade: vi.fn(),
-    resolveBlobStore: vi.fn(),
-}))
-vi.mock('../storage/autoStorage', () => ({
-    AutoStorage: class {
-        realStorage = {}
-        async Init() {}
-    },
-}))
-vi.mock('../plugins/plugins.svelte', () => ({ loadPlugins: vi.fn() }))
-vi.mock('../drive/drive', () => ({ checkDriverInit: vi.fn() }))
-vi.mock('../drive/accounter', () => ({ loadRisuAccountData: vi.fn() }))
-vi.mock('../update', () => ({ checkRisuUpdate: vi.fn() }))
-vi.mock('../observer.svelte', () => ({ startObserveDom: vi.fn() }))
-vi.mock('../characters', () => ({ updateLorebooks: vi.fn() }))
-vi.mock('../hotkey', () => ({ initMobileGesture: vi.fn() }))
-vi.mock('../gui/animation', () => ({ updateAnimationSpeed: vi.fn() }))
-vi.mock('../gui/guisize', () => ({ updateGuisize: vi.fn() }))
-vi.mock('../kei/backup', () => ({ saveDbKei: vi.fn() }))
-vi.mock('../storage/risuSave', () => ({ decodeRisuSave: vi.fn() }))
-vi.mock('../storage/defaultPrompts', () => ({
-    defaultJailbreak: '',
-    defaultMainPrompt: '',
-    oldJailbreak: '',
-    oldMainPrompt: '',
-}))
-vi.mock('./coldstorage.svelte', () => ({ getColdStorageItem: vi.fn(), makeColdData: vi.fn() }))
-vi.mock('./coldstorageData', () => ({
-    listCharacterResources: vi.fn(() => []),
-    listDatabaseRootResources: vi.fn(() => []),
-    replaceCharacterResources: vi.fn(),
-    replaceDatabaseRootResources: vi.fn(),
-}))
-vi.mock('../storage/persistentDataRuntime.svelte', () => ({
-    activateConversation: vi.fn(),
-    configurePersistentDataRuntime: vi.fn(),
-    markPersistentDataDirty: vi.fn(),
-    replacePersistentDatabase: vi.fn(),
-}))
-vi.mock('../storage/persistentSaveNotifications', () => ({
-    createPersistentSaveObserverInstallation: () => ({ install: vi.fn() }),
-    installPersistentSaveNotifications: vi.fn(),
-}))
-vi.mock('../storage/nodeStorage', () => ({ getNodeServerProxyAuth: vi.fn() }))
-vi.mock('../storage/databasePreparation', () => ({ checkCharOrder: vi.fn() }))
-vi.mock('../storage/accountAssetAccess', () => ({
-    readActiveAsset: vi.fn(),
-    storeActiveAsset: vi.fn(),
-}))
-vi.mock('../chatMessageUi', () => ({
-    captureChatMessageTarget: vi.fn(),
-    captureChatMessageTargetById: vi.fn(),
-    resolveRetainedChatMessageTarget: vi.fn(),
-}))
-vi.mock('../network/tauriHttpStream', () => ({ fetchTauriHttpStream: vi.fn() }))
 
 import { exportModuleLegacy, readModule, type RisuModule } from './modules'
 
