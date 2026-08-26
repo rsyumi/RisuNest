@@ -132,7 +132,10 @@ pub(crate) fn parse_legacy_local_backup_v1(
         let Some(name_length) = read_entry_name_length(&mut source, cancellation)? else {
             break;
         };
-        if name_length == 0 || name_length > MAX_NAME_BYTES {
+        if name_length > MAX_NAME_BYTES {
+            return Err(name_length_error());
+        }
+        if name_length == 0 {
             return Err(LocalBackupError::new(
                 LocalBackupErrorCode::InvalidPath,
                 "legacy backup entry name length is invalid",
@@ -420,6 +423,9 @@ fn read_exact_checked(
 }
 
 fn normalize_logical_name(name: &str) -> Result<String, LocalBackupError> {
+    if name.len() > MAX_NAME_BYTES as usize {
+        return Err(name_length_error());
+    }
     if name.contains('\0') {
         return invalid_path("legacy backup path contains NUL");
     }
@@ -443,6 +449,13 @@ fn normalize_logical_name(name: &str) -> Result<String, LocalBackupError> {
         }
     }
     Ok(normalized)
+}
+
+fn name_length_error() -> LocalBackupError {
+    LocalBackupError::new(
+        LocalBackupErrorCode::LengthOverflow,
+        "legacy backup entry name exceeds the bounded v1 name limit",
+    )
 }
 
 fn is_windows_drive_prefix(component: &str) -> bool {
@@ -907,6 +920,33 @@ mod tests {
         let mut restore = RestoreSpy::default();
         let error = parse_staging(&bytes, &mut restore).expect_err("body is truncated");
         assert_eq!(error.code, LocalBackupErrorCode::TruncatedInput);
+    }
+
+    #[test]
+    fn applies_the_same_bounded_name_limit_to_parser_and_writer() {
+        let declared_name_length = MAX_NAME_BYTES + 1;
+        let parser_error = parse_staging(
+            &declared_name_length.to_le_bytes(),
+            &mut RestoreSpy::default(),
+        )
+        .expect_err("oversized parser name must fail before allocation");
+
+        let directory = tempfile::tempdir().expect("temporary sources");
+        let database = directory.path().join("database.bin");
+        fs::write(&database, b"db").expect("database source");
+        let writer_entries = vec![
+            LegacyBackupWriteEntry {
+                logical_name: "x".repeat(declared_name_length as usize),
+                source: LegacyBackupWriteSource::MissingReference,
+            },
+            file_entry("database.risudat", &database),
+        ];
+        let writer_error =
+            write_legacy_local_backup_v1(&mut Vec::new(), &writer_entries, &NeverCancelled)
+                .expect_err("oversized writer name must fail");
+
+        assert_eq!(parser_error.code, LocalBackupErrorCode::LengthOverflow);
+        assert_eq!(writer_error.code, LocalBackupErrorCode::LengthOverflow);
     }
 
     #[test]
