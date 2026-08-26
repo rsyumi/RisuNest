@@ -262,6 +262,9 @@ fn parse_and_stage_compressed_legacy<R: Read>(
     limits: RestoreLimits,
 ) -> Result<ParsedCounts, NativeJobError> {
     let remaining = reader.total.saturating_sub(reader.completed);
+    if remaining > limits.max_encoded_block_bytes {
+        return Err(invalid("encoded legacy RisuSave limit exceeded"));
+    }
     let source = RemainingSourceReader { reader, remaining };
     let buffered = BufReader::with_capacity(READ_CHUNK_BYTES, source);
     let decoder = GzDecoder::new(buffered);
@@ -1560,6 +1563,45 @@ mod tests {
         assert_eq!(error.code, "invalid-input");
         assert!(error.message.contains("decoded block limit"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn compressed_legacy_preflights_encoded_size_for_both_kinds() {
+        let encoded = GzBuilder::new()
+            .mtime(0)
+            .comment(vec![b'x'; 512])
+            .write(Vec::new(), Compression::default())
+            .finish()
+            .unwrap();
+
+        for kind in [8, 9] {
+            let (directory, sink) = fixture();
+            let source = directory
+                .path()
+                .join(format!("encoded-overflow-{kind}.risudat"));
+            fs::write(&source, legacy_wire(kind, &encoded)).unwrap();
+            let job = JobRegistry::default()
+                .create(JobKind::RestoreBlockRisuSave)
+                .unwrap();
+
+            let error = restore_risu_save_with_limits(
+                &source,
+                1,
+                &job,
+                &sink,
+                RestoreLimits {
+                    max_encoded_block_bytes: 64,
+                    max_decoded_block_bytes: 1024,
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code, "invalid-input");
+            assert!(error
+                .message
+                .contains("encoded legacy RisuSave limit exceeded"));
+            assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+        }
     }
 
     #[test]
