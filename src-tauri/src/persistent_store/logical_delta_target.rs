@@ -3964,9 +3964,9 @@ mod tests {
                     generation, character_id, configured_index, recent_at, trashed,
                     name, image, conversation_count, type, creator_notes, trash_time, detail
                  ) VALUES
-                    ('staging-logical-order', 'a', 8, 0, 0, 'A', NULL, 0, NULL, NULL, NULL,
+                    ('staging-logical-order', 'a', 8, 0, 0, 'A', NULL, 0, 'character', NULL, NULL,
                      '{\"chaId\":\"a\",\"name\":\"A\"}'),
-                    ('staging-logical-order', 'b', 8, 0, 0, 'B', NULL, 0, NULL, NULL, NULL,
+                    ('staging-logical-order', 'b', 8, 0, 0, 'B', NULL, 0, 'character', NULL, NULL,
                      '{\"chaId\":\"b\",\"name\":\"B\"}');",
             )
             .unwrap();
@@ -4452,6 +4452,13 @@ mod tests {
             .unwrap();
         store
             .connection
+            .execute("DELETE FROM logical_library_head WHERE singleton = 1", [])
+            .unwrap();
+        store
+            .prune_logical_generation("library", "base-projection")
+            .unwrap();
+        store
+            .connection
             .execute(
                 "UPDATE root SET value = ?1 WHERE generation = 'revision-0'",
                 [json!({"theme":"local"}).to_string()],
@@ -4558,6 +4565,13 @@ mod tests {
                  ) VALUES ('peer', 'library', 'remote-0', ?1, '12', 0)",
                 [&base_hash],
             )
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM logical_library_head WHERE singleton = 1", [])
+            .unwrap();
+        store
+            .prune_logical_generation("library", "base-projection")
             .unwrap();
         store
             .connection
