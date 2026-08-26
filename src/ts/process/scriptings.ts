@@ -16,7 +16,7 @@ import { getModuleLorebooks, getModuleTriggers } from "./modules";
 import { Mutex } from "../mutex";
 import { tokenize } from "../tokenizer";
 import { fetchNative, readImage } from "../globalApi.svelte";
-import { loadLoreBookV3Prompt } from './lorebook.svelte';
+import { loadLoreBookV3PromptFromCompatibilitySnapshot } from './lorebook.svelte';
 import { getPersonaPrompt, getUserName, getUserIcon } from '../util';
 import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
@@ -859,7 +859,7 @@ export async function runScripted(code:string, arg:{
                     return
                 }
 
-                const fullLoreBooks = (await loadLoreBookV3Prompt()).actives
+                const fullLoreBooks = (await loadLoreBookV3PromptFromCompatibilitySnapshot()).actives
                 const maxContext = db.maxContext - reserve
                 if (maxContext < 0) {
                     return JSON.stringify([])

@@ -5,7 +5,7 @@ import { alertInput, alertMd, alertNormal, alertSelect } from "../alert";
 import { sayTTS } from "./tts";
 import { risuChatParser } from "../parser/parser.svelte";
 import { sendChat } from "./index.svelte";
-import { loadLoreBookV3Prompt } from "./lorebook.svelte";
+import { loadLoreBookV3PromptFromCompatibilitySnapshot } from "./lorebook.svelte";
 import { runTrigger } from "./triggers";
 import { getActiveConversationSession } from '../storage/persistentDataRuntime.svelte'
 import {
@@ -245,7 +245,7 @@ async function processCommand(command:string, pipe:string):Promise<false | strin
             return pipe
         }
         case 'test_lorebook':{
-            const p = await loadLoreBookV3Prompt()
+            const p = await loadLoreBookV3PromptFromCompatibilitySnapshot()
             console.log(p)
             alertNormal(p.actives.map((e)=>e.prompt).join('§'))
             return JSON.stringify(p)

@@ -17,7 +17,7 @@
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import { applyChatTemplate, chatTemplates } from "src/ts/process/templates/chatTemplate";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
-  import { loadLoreBookV3Prompt } from "src/ts/process/lorebook.svelte";
+  import { loadLoreBookV3PromptFromCompatibilitySnapshot } from "src/ts/process/lorebook.svelte";
   import { getModules } from "src/ts/process/modules";
 
     let previewMode = $state('chat')
@@ -269,7 +269,7 @@
 
 <Accordion styled name={"Preview Lorebook"}>
     <Button className="mt-2" onclick={async () => {
-        const lorebookResult = await loadLoreBookV3Prompt()
+        const lorebookResult = await loadLoreBookV3PromptFromCompatibilitySnapshot()
         const html = `
         ${lorebookResult.actives.map((v) => {
             return `## ${v.source}\n\n\`\`\`\n${v.prompt}\n\`\`\`\n`
@@ -278,7 +278,7 @@
         alertMd(html)
     }}>Test Lore</Button>
     <Button className="mt-2" onclick={async () => {
-        const lorebookResult = await loadLoreBookV3Prompt()
+        const lorebookResult = await loadLoreBookV3PromptFromCompatibilitySnapshot()
         const html = `
         <table>
             <thead>

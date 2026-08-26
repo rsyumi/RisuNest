@@ -46,6 +46,16 @@ import {
     captureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
+import {
+    beginPinnedConversationHistoryOperation,
+    createCompatibilityConversationHistorySnapshot,
+    type ConversationHistoryOperation,
+} from '../storage/conversationHistoryOperation'
+import {
+    ensurePromptHistoryMessageIds,
+    iteratePromptHistory,
+    selectPromptHistory,
+} from './promptHistory'
 
 export { doingChat } from './generationState'
 
@@ -101,6 +111,22 @@ export const abortChat = writable(false)
 export let requestTokenParts:{[key:string]:requestTokenPart[]} = {}
 export let previewFormated:OpenAIChat[] = []
 export let previewBody:string = ''
+
+function beginPromptHistoryOperation(
+    owner: character | groupChat,
+    chat: Chat,
+): ConversationHistoryOperation {
+    const session = getActiveConversationSession()
+    if (session?.matchesConversation(owner.chaId, chat)) {
+        return beginPinnedConversationHistoryOperation(session)
+    }
+    return createCompatibilityConversationHistorySnapshot({
+        characterId: owner.chaId,
+        conversationId: chat.id ?? 'compatibility-current-conversation',
+        messages: chat.message,
+        storeRevision: session?.storeRevision ?? 0,
+    })
+}
 
 export async function sendChat(chatProcessIndex = -1,arg:{
     chatAdditonalTokens?:number,
@@ -490,7 +516,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    const lorepmt = await loadLoreBookV3Prompt()
+    const loreHistory = beginPromptHistoryOperation(nowChatroom, currentChat)
+    const lorepmt = await (async () => {
+        try {
+            return await loadLoreBookV3Prompt(loreHistory)
+        } finally {
+            loreHistory.dispose()
+        }
+    })()
 
     const positionRegex = /{{position::(.+?)}}/g
     const replaceposition = (text:string):{text:string, replaced:boolean} => {
@@ -840,27 +873,16 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     
-    let msReseted = false
-    const makeMs = (currentChat:Chat) => {
-        let mss:Message[] = []
-        msReseted = false
-        for(let i=currentChat.message.length -1;i>=0;i--){
-            const d = currentChat.message[i]
-            if(d.disabled === true){
-                continue
-            }
-            if(d.disabled === 'allBefore'){
-                msReseted = true
-                break
-            }
-            mss.unshift(d)
+    const greetingHistory = beginPromptHistoryOperation(nowChatroom, currentChat)
+    const greetingHistorySelection = (() => {
+        try {
+            return selectPromptHistory(greetingHistory)
+        } finally {
+            greetingHistory.dispose()
         }
-        return mss
-    }
+    })()
 
-    let ms:Message[] = makeMs(currentChat)
-
-    if(nowChatroom.type !== 'group' && !msReseted){
+    if(nowChatroom.type !== 'group' && !greetingHistorySelection.resetByAllBefore){
         const firstMsg = currentChat.fmIndex === -1 ? nowChatroom.firstMessage : nowChatroom.alternateGreetings[currentChat.fmIndex]
 
         const chat:OpenAIChat = {
@@ -878,13 +900,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         currentTokens += await tokenizer.tokenizeChat(chat)
     }
     
-    console.log('Prepared messages for token calculation:', ms)
-
     const triggerResult = await runTrigger(currentChar, 'start', {chat: currentChat})
     if(triggerResult){
         currentChat = triggerResult.chat
         setCurrentChat(currentChat)
-        ms = makeMs(currentChat)
         currentTokens += triggerResult.tokens
         if(triggerResult.stopSending){
             doingChat.set(false)
@@ -892,8 +911,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
     }
 
-    let index = 0
-    for(const msg of ms){
+    ensurePromptHistoryMessageIds(currentChat.message, v4)
+    const promptHistory = beginPromptHistoryOperation(nowChatroom, currentChat)
+    try {
+    const promptHistorySelection = selectPromptHistory(promptHistory)
+    for(const { message: msg, relativeIndex: index } of iteratePromptHistory(
+        promptHistory,
+        promptHistorySelection,
+    )){
         let formatedChat = (await processScriptFull(nowChatroom,risuChatParser(msg.data, {chara: currentChar, role: msg.role}), 'editprocess', index, {
             chatRole: msg.role,
         })).data
@@ -996,7 +1021,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         let thoughts:string[] = []
         const maxThoughtDepth = DBState.db.promptSettings?.maxThoughtTagDepth ?? -1
         formatedChat = formatedChat.replace(/<Thoughts>(.+)<\/Thoughts>/gms, (match, p1) => {
-            if(maxThoughtDepth === -1 || (maxThoughtDepth - ms.length) <= index){
+            if(maxThoughtDepth === -1 || (maxThoughtDepth - promptHistorySelection.messageCount) <= index){
                 thoughts.push(p1)
             }
             return ''
@@ -1044,7 +1069,9 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         chats.push(chat)
         currentTokens += await tokenizer.tokenizeChat(chat)
-        index++
+    }
+    } finally {
+        promptHistory.dispose()
     }
     console.log(JSON.stringify(chats, null, 2))
 

@@ -37,7 +37,7 @@ vi.mock('../stores.svelte', () => ({
 }))
 vi.mock('./modules', () => ({ getModuleLorebooks: vi.fn(() => []), getModuleTriggers: vi.fn(() => []) }))
 vi.mock('./files/inlays', () => ({ getInlayAsset: vi.fn(), writeInlayImage: vi.fn() }))
-vi.mock('./lorebook.svelte', () => ({ loadLoreBookV3Prompt: vi.fn() }))
+vi.mock('./lorebook.svelte', () => ({ loadLoreBookV3PromptFromCompatibilitySnapshot: vi.fn() }))
 vi.mock('./memory/hypamemory', () => ({ HypaProcesser: vi.fn() }))
 vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))

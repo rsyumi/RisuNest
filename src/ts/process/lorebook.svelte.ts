@@ -12,6 +12,9 @@ import { downloadFile } from "../globalApi.svelte";
 import { getModuleLorebooks } from "./modules";
 import { CCardLib } from "@risuai/ccardlib";
 import { v4 } from "uuid";
+import type { ConversationHistoryOperation } from "../storage/conversationHistoryOperation";
+import { createCompatibilityConversationHistorySnapshot } from "../storage/conversationHistoryOperation";
+import { CONVERSATION_RANGE_MAX_LIMIT } from "../storage/persistentDataStore";
 
 export function addLorebook(type:number) {
     const selectedID = get(selectedCharID)
@@ -72,7 +75,7 @@ export function addLorebookFolder(type:number) {
     }
 }
 
-export async function loadLoreBookV3Prompt(){
+export async function loadLoreBookV3Prompt(history: ConversationHistoryOperation){
     const selectedID = get(selectedCharID)
     const char = DBState.db.characters[selectedID]
     const page = char.chatPage
@@ -80,11 +83,10 @@ export async function loadLoreBookV3Prompt(){
     const chatLore = char.chats[page].localLore ?? []
     const moduleLorebook = getModuleLorebooks()
     const fullLore = safeStructuredClone(characterLore.concat(chatLore).concat(moduleLorebook))
-    const currentChat = char.chats[page].message
     const loreDepth = char.loreSettings?.scanDepth ?? DBState.db.loreBookDepth
     const loreToken = char.loreSettings?.tokenBudget ?? DBState.db.loreBookToken
     const fullWordMatchingSetting = char.loreSettings?.fullWordMatching ?? false
-    const chatLength = currentChat.length + 1 //includes first message
+    const chatLength = history.totalMessages + 1 //includes first message
     const recursiveScanning = char.loreSettings?.recursiveScanning ?? true
     type SearchKey = {
         raw: string
@@ -156,13 +158,42 @@ export async function loadLoreBookV3Prompt(){
         }
     }
 
+    const getSliceStart = (length: number, searchDepth: number) => {
+        const requestedStart = length - searchDepth
+        if (Number.isNaN(requestedStart)) return 0
+        const integerStart = requestedStart < 0
+            ? Math.ceil(requestedStart)
+            : Math.floor(requestedStart)
+        if (integerStart < 0) return Math.max(length + integerStart, 0)
+        return Math.min(integerStart, length)
+    }
+    const readLatestMessages = (searchDepth: number): Message[] => {
+        const startIndex = getSliceStart(history.totalMessages, searchDepth)
+        const count = history.totalMessages - startIndex
+        if (count === 0) return []
+        if (count <= CONVERSATION_RANGE_MAX_LIMIT) {
+            return history.readLatest(count).messages
+        }
+        const messages: Message[] = []
+        for (let start = startIndex; start < history.totalMessages;) {
+            const window = history.readRange(
+                start,
+                Math.min(CONVERSATION_RANGE_MAX_LIMIT, history.totalMessages - start),
+            )
+            if (window.messages.length === 0) break
+            messages.push(...window.messages)
+            start = window.endIndex
+        }
+        history.assertCurrent()
+        return messages
+    }
     const baseMessageViewsByDepth = new Map<number, MessageView[]>()
-    const getBaseMessageViews = (messages: Message[], searchDepth: number) => {
+    const getBaseMessageViews = (searchDepth: number) => {
         let views = baseMessageViewsByDepth.get(searchDepth)
         if (views) {
             return views
         }
-        const sliced = messages.slice(messages.length - searchDepth, messages.length)
+        const sliced = readLatestMessages(searchDepth)
         views = sliced.map((msg, i) => {
             if (msg.role === 'user') {
                 return createMessageView(
@@ -204,7 +235,7 @@ export async function loadLoreBookV3Prompt(){
         activated: string
     }[] = []
 
-    const searchMatch = (messages:Message[],arg:{
+    const searchMatch = (arg:{
         keys:SearchKey[],
         searchDepth:number,
         regex:boolean
@@ -212,7 +243,7 @@ export async function loadLoreBookV3Prompt(){
         all?:boolean
         dontSearchWhenRecursive: boolean
     }) => {
-        const mList = getBaseMessageViews(messages, arg.searchDepth).concat(
+        const mList = getBaseMessageViews(arg.searchDepth).concat(
             arg.dontSearchWhenRecursive ? [] : recursivePrompt,
         )
 
@@ -599,7 +630,7 @@ export async function loadLoreBookV3Prompt(){
                 }
     
                 for(const query of searchQueries){
-                    const result = searchMatch(currentChat, {
+                    const result = searchMatch({
                         keys: query.keys,
                         searchDepth: scanDepth,
                         regex: fullLore[i].useRegex,
@@ -725,11 +756,29 @@ export async function loadLoreBookV3Prompt(){
         }
     }
 
+    history.assertCurrent()
     return {
         actives: activesResorted.reverse(),
         matchLog: matchLog,
     }
 
+}
+
+export async function loadLoreBookV3PromptFromCompatibilitySnapshot(){
+    const selectedID = get(selectedCharID)
+    const char = DBState.db.characters[selectedID]
+    const chat = char.chats[char.chatPage]
+    const history = createCompatibilityConversationHistorySnapshot({
+        characterId: char.chaId,
+        conversationId: chat.id ?? 'compatibility-current-conversation',
+        messages: chat.message,
+        storeRevision: 0,
+    })
+    try {
+        return await loadLoreBookV3Prompt(history)
+    } finally {
+        history.dispose()
+    }
 }
 
 export async function importLoreBook(mode:'global'|'local'|'sglobal'){

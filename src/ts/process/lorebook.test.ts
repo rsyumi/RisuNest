@@ -35,6 +35,12 @@ vi.mock('../globalApi.svelte', () => ({ downloadFile: vi.fn(), saveAsset: vi.fn(
 vi.mock('./modules', () => ({ getModuleLorebooks: vi.fn(() => []) }))
 
 import { DBState } from '../stores.svelte'
+import type { Chat } from '../storage/database.svelte'
+import { ActiveConversationSession } from '../storage/activeConversationSession'
+import {
+    beginPinnedConversationHistoryOperation,
+    createCompatibilityConversationHistorySnapshot,
+} from '../storage/conversationHistoryOperation'
 import { loadLoreBookV3Prompt } from './lorebook.svelte'
 
 type Lore = {
@@ -74,8 +80,19 @@ function setLorebook(lore: Lore[], messages = [{ role: 'user', data: '' }], toke
 }
 
 async function activePrompts() {
-    const result = await loadLoreBookV3Prompt()
-    return result.actives.map((active) => active.prompt)
+    const character = DBState.db.characters[0]
+    const operation = createCompatibilityConversationHistorySnapshot({
+        characterId: character.chaId ?? 'character-test',
+        conversationId: character.chats[0].id ?? 'conversation-test',
+        messages: character.chats[0].message,
+        storeRevision: 0,
+    })
+    try {
+        const result = await loadLoreBookV3Prompt(operation)
+        return result.actives.map((active) => active.prompt)
+    } finally {
+        operation.dispose()
+    }
 }
 
 beforeEach(() => {
@@ -193,5 +210,44 @@ describe('loadLoreBookV3Prompt characterization', () => {
 
         await expect(activePrompts()).resolves.toEqual(['three', 'two', 'one'])
         expect(constructorCalls).toBe(1)
+    })
+
+    test('reads lore depth from the pinned operation instead of the live DBState array', async () => {
+        setLorebook(
+            [{ key: 'pinned', content: 'matched-pinned-history' }],
+            [{ role: 'user', data: 'live value does not match' }],
+        )
+        DBState.db.characters[0].loreSettings.scanDepth = 2
+        const conversation: Chat = {
+            id: 'conversation-pinned',
+            name: 'Pinned',
+            note: '',
+            localLore: [],
+            message: [
+                { role: 'user', data: 'older' },
+                { role: 'char', data: 'pinned' },
+            ],
+        }
+        const session = new ActiveConversationSession({
+            characterId: 'character-pinned',
+            conversationId: 'conversation-pinned',
+            conversation,
+            storeRevision: 8,
+        })
+        const readLatest = vi.spyOn(session, 'readLatest')
+        const operation = beginPinnedConversationHistoryOperation(session)
+
+        try {
+            const result = await loadLoreBookV3Prompt(operation)
+            expect(result.actives.map((active) => active.prompt)).toEqual([
+                'matched-pinned-history',
+            ])
+            expect(readLatest).toHaveBeenCalledTimes(1)
+            expect(readLatest).toHaveBeenCalledWith(2)
+            expect(session.pinCount('prompt')).toBe(1)
+        } finally {
+            operation.dispose()
+        }
+        expect(session.pinCount('prompt')).toBe(0)
     })
 })
