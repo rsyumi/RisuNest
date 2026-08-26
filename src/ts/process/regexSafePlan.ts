@@ -244,24 +244,28 @@ export function tokenizeRegexReplacement(
             tokens.push({ kind: 'suffix' })
             index += 2
         }
-        else if (next >= '1' && next <= '9') {
-            let captureIndex = Number(next)
-            let consumed = 2
+        else if (next >= '0' && next <= '9') {
+            let captureIndex: number | undefined
+            let consumed = 0
             const second = replacement[index + 2]
             if (second >= '0' && second <= '9') {
-                const twoDigitIndex = captureIndex * 10 + Number(second)
-                if (twoDigitIndex <= captureCount) {
+                const twoDigitIndex = Number(next) * 10 + Number(second)
+                if (twoDigitIndex > 0 && twoDigitIndex <= captureCount) {
                     captureIndex = twoDigitIndex
                     consumed = 3
                 }
             }
-            if (captureIndex <= captureCount) {
+            if (captureIndex === undefined && next !== '0' && Number(next) <= captureCount) {
+                captureIndex = Number(next)
+                consumed = 2
+            }
+            if (captureIndex !== undefined) {
                 tokens.push({ kind: 'capture', index: captureIndex })
                 index += consumed
             }
             else {
-                pushLiteral(tokens, `$${next}`)
-                index += 2
+                pushLiteral(tokens, '$')
+                index++
             }
         }
         else {

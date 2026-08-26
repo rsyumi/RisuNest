@@ -143,7 +143,9 @@ describe('Rust regex safe-plan classifier', () => {
             { kind: 'capture', index: 10 },
             { kind: 'literal', value: '|' },
             { kind: 'capture', index: 9 },
-            { kind: 'literal', value: '9|$01|$<name>' },
+            { kind: 'literal', value: '9|' },
+            { kind: 'capture', index: 1 },
+            { kind: 'literal', value: '|$<name>' },
         ])
     })
 
