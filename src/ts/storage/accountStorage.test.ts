@@ -477,6 +477,22 @@ describe('AccountStorage structured wire contract', () => {
         expect(settled).toBe(false)
     })
 
+    it('returns native capability unavailability without retrying or changing session state', async () => {
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'native-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+        const attempt = vi.fn(async () => null)
+
+        await expect(storage.writeOfficialDatabaseFromNative(attempt)).resolves.toBeNull()
+
+        expect(attempt).toHaveBeenCalledOnce()
+    })
+
     it('writes with the exact session and save-date headers', async () => {
         mocks.fetchProtectedResource
             .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 42 }), 200, {

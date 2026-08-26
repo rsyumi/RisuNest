@@ -72,7 +72,7 @@ export type AccountNativeOfficialWriteResult<T> =
 
 export type AccountNativeOfficialWriteAttempt<T> = (
     context: AccountNativeOfficialWriteAttemptContext,
-) => Promise<AccountNativeOfficialWriteAttemptResult<T>>
+) => Promise<AccountNativeOfficialWriteAttemptResult<T> | null>
 
 export interface AccountStorageCache {
     getItem(key: string): Promise<unknown | null>
@@ -245,6 +245,7 @@ export class AccountStorage{
                 saveDate: Date.now().toFixed(0),
                 signal: options.signal,
             })
+            if (result === null) return null
             if (result.session !== null) risuSession = result.session
             if (result.kind === 'reauthentication-needed') {
                 await this.reauthenticate()
