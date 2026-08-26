@@ -1510,6 +1510,21 @@ mod tests {
             .unwrap();
         let compressed = gzip(&payload);
 
+        let mut truncated = compressed.clone();
+        truncated.truncate(truncated.len() - 3);
+        assert_failed_general_restore_preserves_active(
+            &legacy_wire(8, &truncated),
+            "truncated legacy MessagePack payload",
+        );
+
+        let mut bad_checksum = compressed.clone();
+        let last = bad_checksum.len() - 1;
+        bad_checksum[last] ^= 0xff;
+        assert_failed_general_restore_preserves_active(
+            &legacy_wire(8, &bad_checksum),
+            "invalid legacy MessagePack",
+        );
+
         let mut with_garbage = compressed.clone();
         with_garbage.extend_from_slice(b"garbage");
         assert_failed_general_restore_preserves_active(
