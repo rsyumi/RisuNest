@@ -1,7 +1,11 @@
 import { IDBFactory, IDBIndex, IDBKeyRange, IDBObjectStore } from 'fake-indexeddb'
 import { describe, expect, it, vi } from 'vitest'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
-import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
+import {
+    RevisionConflictError,
+    SnapshotReleasedError,
+    type AssetOwnerHead,
+} from '../persistentDataStore'
 import { fixtureDatabase } from './persistentDataFixtures'
 import { persistentDataStoreContract } from './persistentDataStoreContract'
 
@@ -370,6 +374,133 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
                 : original.call(this, query, count)
         })
     }
+
+    it('keeps ordinary owner invalidation bounded with a large head set', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `large-owner-head-save-${databaseSequence++}`
+        const database = structuredClone(fixtureDatabase)
+        const ownerCount = 4_096
+        database.modules = Array.from({ length: ownerCount }, (_, index) => ({
+            id: index % 2 === 0 ? '' : 'duplicate',
+            name: `Module ${index}`,
+            description: '',
+            assets: [],
+        }))
+        const character = database.characters.find(({ chaId }) => chaId === 'char-a')!
+        character.additionalAssets = []
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const imported = await store.replaceFromDatabase(database)
+        const root = (await store.readRoot()).value
+        const detail = (await store.readCharacter('char-a'))!.value
+        const characterHead: AssetOwnerHead = {
+            owner: { kind: 'character-additional-assets', characterId: 'char-a' },
+            present: true,
+            manifestHash: '88'.repeat(32),
+            entryCount: 0,
+        }
+        const rootHeads: AssetOwnerHead[] = database.modules.map((_, index) => ({
+            owner: { kind: 'root-module-assets', index },
+            present: true,
+            manifestHash: '99'.repeat(32),
+            entryCount: 0,
+        }))
+        const shadowed = await store.commit({
+            expectedRevision: imported.revision,
+            root,
+            character: detail,
+            assetOwnerHeads: [...rootHeads, characterHead],
+        })
+
+        let headGetAllCalls = 0
+        const headCursorRanges: Array<{
+            lower: IDBValidKey | undefined
+            upper: IDBValidKey | undefined
+        }> = []
+        const headDeleteQueries: Array<
+            IDBValidKey | { lower: IDBValidKey | undefined; upper: IDBValidKey | undefined }
+        > = []
+        const originalGetAll = IDBIndex.prototype.getAll
+        const originalOpenCursor = IDBObjectStore.prototype.openCursor
+        const originalDelete = IDBObjectStore.prototype.delete
+        const getAllSpy = vi.spyOn(IDBIndex.prototype, 'getAll').mockImplementation(function (
+            this: IDBIndex,
+            ...args: Parameters<IDBIndex['getAll']>
+        ) {
+            if (this.objectStore.name === 'assetOwnerHeads') headGetAllCalls++
+            return originalGetAll.apply(this, args)
+        })
+        const cursorSpy = vi.spyOn(IDBObjectStore.prototype, 'openCursor').mockImplementation(
+            function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore['openCursor']>
+            ) {
+                if (this.name === 'assetOwnerHeads') {
+                    const range = args[0] instanceof IDBKeyRange ? args[0] : undefined
+                    headCursorRanges.push({ lower: range?.lower, upper: range?.upper })
+                }
+                return originalOpenCursor.apply(this, args)
+            },
+        )
+        const deleteSpy = vi.spyOn(IDBObjectStore.prototype, 'delete').mockImplementation(
+            function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore['delete']>
+            ) {
+                if (this.name === 'assetOwnerHeads') {
+                    const query = args[0]
+                    headDeleteQueries.push(query instanceof IDBKeyRange
+                        ? { lower: query.lower, upper: query.upper }
+                        : query)
+                }
+                return originalDelete.apply(this, args)
+            },
+        )
+
+        let characterSaveMs: number
+        let rootSaveMs: number
+        try {
+            const characterStart = performance.now()
+            const characterSaved = await store.commit({
+                expectedRevision: shadowed.revision,
+                character: { ...detail, name: 'Ordinary character save' },
+            })
+            characterSaveMs = performance.now() - characterStart
+            const rootStart = performance.now()
+            await store.commit({
+                expectedRevision: characterSaved.revision,
+                root: { ...root, username: 'Ordinary root save' },
+            })
+            rootSaveMs = performance.now() - rootStart
+        } finally {
+            getAllSpy.mockRestore()
+            cursorSpy.mockRestore()
+            deleteSpy.mockRestore()
+        }
+
+        expect(headGetAllCalls).toBe(0)
+        expect(headCursorRanges).toEqual([])
+        expect(headDeleteQueries).toEqual([
+            'revision-1:asset-owner-head:character-additional-assets:char-a',
+            {
+                lower: 'revision-1:asset-owner-head:root-module-assets:',
+                upper: 'revision-1:asset-owner-head:root-module-assets:\uffff',
+            },
+            {
+                lower: 'revision-1:asset-owner-head:persona-embedded-module-assets:',
+                upper: 'revision-1:asset-owner-head:persona-embedded-module-assets:\uffff',
+            },
+        ])
+        expect(await store.readAssetOwnerHead(characterHead.owner)).toBeNull()
+        expect(await store.readAssetOwnerHead(rootHeads.at(-1)!.owner)).toBeNull()
+        console.info('large-owner-head-save-measurement', JSON.stringify({
+            ownerHeads: ownerCount + 1,
+            headGetAllCalls,
+            rootOwnerRangeDeletes: headDeleteQueries.length - 1,
+            characterSaveMs,
+            rootSaveMs,
+        }))
+    }, 15_000)
 
     it('upgrades version 7 with empty asset alias and owner-head stores without scans', async () => {
         const indexedDB = new IDBFactory()

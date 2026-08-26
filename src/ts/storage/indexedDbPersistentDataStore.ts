@@ -996,31 +996,40 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     ): Promise<void> {
         const changedCharacters = new Set(commitCharacterParents(input).keys())
         if (input.deleteCharacterId) changedCharacters.add(input.deleteCharacterId)
-        if (input.root || changedCharacters.size > 0) {
-            const records = (await requestResult(
-                transaction.objectStore('assetOwnerHeads').index('byGeneration').getAll(generation),
-            )) as Array<StoredRecord<AssetOwnerHead>>
-            for (const record of records) {
-                const owner = record.value.owner
-                if (
-                    (input.root && owner.kind !== 'character-additional-assets')
-                    || (
-                        owner.kind === 'character-additional-assets'
-                        && changedCharacters.has(owner.characterId)
-                    )
-                ) {
-                    transaction.objectStore('assetOwnerHeads').delete(record.key)
-                }
-            }
+        const store = transaction.objectStore('assetOwnerHeads')
+        if (input.root) {
+            this.deleteAssetOwnerHeadKind(store, generation, 'root-module-assets')
+            this.deleteAssetOwnerHeadKind(
+                store,
+                generation,
+                'persona-embedded-module-assets',
+            )
+        }
+        for (const characterId of changedCharacters) {
+            store.delete(
+                this.assetOwnerHeadKey(
+                    generation,
+                    `character-additional-assets:${characterId}`,
+                ),
+            )
         }
         for (const head of input.assetOwnerHeads ?? []) {
             const ownerKey = assetOwnerLocatorKey(head.owner)
-            transaction.objectStore('assetOwnerHeads').put({
+            store.put({
                 key: this.assetOwnerHeadKey(generation, ownerKey),
                 generation,
                 value: structuredClone(head),
             } satisfies StoredRecord<AssetOwnerHead>)
         }
+    }
+
+    private deleteAssetOwnerHeadKind(
+        store: IDBObjectStore,
+        generation: string,
+        kind: 'root-module-assets' | 'persona-embedded-module-assets',
+    ): void {
+        const prefix = `${generation}:asset-owner-head:${kind}:`
+        store.delete(this.keyRangeFactory.bound(prefix, `${prefix}\uffff`))
     }
 
     private async queryPluginStorageFromTransaction(
