@@ -103,6 +103,23 @@ export function appendConversationMessage(
     }
 }
 
+export function appendCurrentConversationMessage(
+    character: ConversationCharacter,
+    conversation: Chat,
+    candidateSession: ActiveConversationSession | null,
+    message: Message,
+): void {
+    const target = captureConversationMutationTarget(
+        character,
+        conversation,
+        candidateSession,
+    )
+    if (candidateSession && target.session !== candidateSession) {
+        throw new ConversationMutationTargetStaleError()
+    }
+    appendConversationMessage(target, message)
+}
+
 export function appendConversationComment(
     target: ConversationMutationTarget,
     addition: string,

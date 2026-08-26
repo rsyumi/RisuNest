@@ -14,6 +14,8 @@
     import { HardDriveUploadIcon, PlusIcon, TrashIcon } from "@lucide/svelte";
     import { selectSingleFile } from "src/ts/util";
     import { doingChat, previewFormated, previewBody, sendChat } from "src/ts/process/index.svelte";
+    import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
+    import { getActiveConversationSession } from "src/ts/storage/persistentDataRuntime.svelte";
     import SelectInput from "../UI/GUI/SelectInput.svelte";
     import { applyChatTemplate, chatTemplates } from "src/ts/process/templates/chatTemplate";
     import OptionInput from "../UI/GUI/OptionInput.svelte";
@@ -218,10 +220,15 @@
             const db = (DBState.db)
             let currentChar = db.characters[$selectedCharID]
             let currentChat = currentChar.chats[currentChar.chatPage]
-            currentChat.message.push({
+            appendCurrentConversationMessage(
+                currentChar,
+                currentChat,
+                getActiveConversationSession(),
+                {
                 role: 'user',
                 data: autopilot[i]
-            })
+                },
+            )
             currentChar.chats[currentChar.chatPage] = currentChat
             db.characters[$selectedCharID] = currentChar
             if($doingChat){

@@ -5,6 +5,7 @@ import type { Chat, Database, Message } from './storage/database.svelte'
 import { encodeLegacyConversationProjection } from './conversationCompatibility.testUtils'
 import {
     appendConversationComment,
+    appendCurrentConversationMessage,
     appendConversationMessage,
     captureConversationMutationTarget,
     ConversationMutationTargetStaleError,
@@ -34,6 +35,55 @@ function createCharacter(conversation: Chat): Database['characters'][number] {
 }
 
 describe('conversation mutations', () => {
+    it('routes a current interactive append through the matching session', () => {
+        const conversation = createConversation([{ role: 'user', data: 'before' }])
+        const character = createCharacter(conversation)
+        const onMutation = vi.fn()
+        const session = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversation.id,
+            conversation,
+            storeRevision: 1,
+            onMutation,
+        })
+
+        appendCurrentConversationMessage(
+            character,
+            conversation,
+            session,
+            { role: 'char', data: 'interactive append' },
+        )
+
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'before',
+            'interactive append',
+        ])
+        expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
+            commands: ['append'],
+        }))
+    })
+
+    it('rejects an interactive append owned by another active session', () => {
+        const conversation = createConversation([{ role: 'user', data: 'before' }])
+        const character = createCharacter(conversation)
+        const otherConversation = createConversation()
+        otherConversation.id = 'conversation-b'
+        const otherSession = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: otherConversation.id,
+            conversation: otherConversation,
+            storeRevision: 1,
+        })
+
+        expect(() => appendCurrentConversationMessage(
+            character,
+            conversation,
+            otherSession,
+            { role: 'char', data: 'wrong owner' },
+        )).toThrow(ConversationMutationTargetStaleError)
+        expect(conversation.message.map((message) => message.data)).toEqual(['before'])
+    })
+
     it('routes append through a matching session and preserves the direct fallback', () => {
         const sessionConversation = createConversation([{ role: 'user', data: 'before' }])
         const sessionCharacter = createCharacter(sessionConversation)
