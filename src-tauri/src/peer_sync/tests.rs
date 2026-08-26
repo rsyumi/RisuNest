@@ -584,6 +584,60 @@ fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_re
     host.stop().unwrap();
 }
 
+#[test]
+fn lan_transport_reuses_the_p0_ledger_and_persisted_bearer_after_restart() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let client_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(
+        source_root.path(),
+        &[(CLONE_CHUNK_SIZE + 256 * 1024) as usize],
+    );
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let credential_path = client_root.path().join("lan-credential.json");
+    let claimed = LanCloneClient::claim_and_persist(
+        &credential_path,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+
+    let cancellation = TransferCancellation::new();
+    let cancel_after_verified_chunk = cancellation.clone();
+    let mut first =
+        LoopbackCloneClient::from_lan(client_root.path(), claimed, &pairing.manifest_id).unwrap();
+    assert!(matches!(
+        first.download_with_progress(&cancellation, move |bytes| {
+            if bytes > CLONE_CHUNK_SIZE {
+                cancel_after_verified_chunk.cancel();
+            }
+        }),
+        Err(PeerSyncError::Cancelled)
+    ));
+    let object = host.manifest().payloads[0].object.clone();
+    assert_eq!(first.verified_chunk_count(&object), 1);
+    drop(first);
+
+    let persisted = LanCloneClient::open_persisted(&credential_path).unwrap();
+    let mut restarted =
+        LoopbackCloneClient::from_lan(client_root.path(), persisted, &pairing.manifest_id).unwrap();
+    let report = restarted.download(&TransferCancellation::new()).unwrap();
+    assert!(report.transferred_bytes < CLONE_CHUNK_SIZE);
+    assert_eq!(report.maximum_buffer_bytes, 64 * 1024);
+    let expected_verified = host
+        .manifest()
+        .objects
+        .values()
+        .map(|object| object.size)
+        .sum::<u64>();
+    assert_eq!(host.devices()[0].verified_bytes, expected_verified);
+    host.stop().unwrap();
+}
+
 fn assert_lan_stop_is_bounded(mut host: LanCloneHost, stalled: TcpStream) {
     const STOP_DEADLINE: Duration = Duration::from_secs(1);
     let (result_tx, result_rx) = mpsc::channel();

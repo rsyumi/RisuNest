@@ -8,8 +8,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
+    fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -29,6 +31,8 @@ const CONNECTION_IO_TIMEOUT: Duration = Duration::from_millis(250);
 const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(2);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
+const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 
 pub struct LanPairing {
     pub session_id: String,
@@ -38,9 +42,12 @@ pub struct LanPairing {
 
 pub struct LanCloneClient {
     client: reqwest::blocking::Client,
+    endpoint: String,
+    session_id: String,
     session_url: String,
     pub device_id: String,
     bearer: String,
+    manifest_id: Option<String>,
 }
 
 impl LanCloneClient {
@@ -94,8 +101,9 @@ impl LanCloneClient {
         }
         let response: ClaimResponseOwned = serde_json::from_slice(&body)
             .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
-        if response.device_id.is_empty()
+        if !is_canonical_uuid(&response.device_id)
             || response.bearer.len() != 64
+            || !is_lower_hex_256(&response.bearer)
             || response.permission != "clone-read"
         {
             return Err(PeerSyncError::Protocol(
@@ -104,10 +112,68 @@ impl LanCloneClient {
         }
         Ok(Self {
             client,
+            endpoint,
+            session_id: session_id.to_owned(),
             session_url,
             device_id: response.device_id,
             bearer: response.bearer,
+            manifest_id: None,
         })
+    }
+
+    pub fn claim_and_persist(
+        credential_path: &Path,
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+    ) -> Result<Self, PeerSyncError> {
+        validate_object_hash(manifest_id)?;
+        let mut client = Self::claim(endpoint, session_id, claim)?;
+        client.manifest_id = Some(manifest_id.to_owned());
+        client.persist(credential_path)?;
+        Ok(client)
+    }
+
+    pub fn open_persisted(credential_path: &Path) -> Result<Self, PeerSyncError> {
+        let metadata = fs::symlink_metadata(credential_path)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_PERSISTED_CREDENTIAL_BYTES
+        {
+            return Err(PeerSyncError::Storage(
+                "invalid persisted LAN clone credential file".to_owned(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        File::open(credential_path)?
+            .take(MAX_PERSISTED_CREDENTIAL_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_PERSISTED_CREDENTIAL_BYTES {
+            return Err(PeerSyncError::Storage(
+                "persisted LAN clone credential is too large".to_owned(),
+            ));
+        }
+        let persisted: PersistedLanCredential = serde_json::from_slice(&bytes)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        persisted.validate()?;
+        Self::from_persisted(persisted)
+    }
+
+    pub(crate) fn into_resumable_parts(
+        self,
+    ) -> Result<
+        (
+            reqwest::blocking::Client,
+            reqwest::Url,
+            String,
+            Option<String>,
+        ),
+        PeerSyncError,
+    > {
+        let session_url = reqwest::Url::parse(&self.session_url)
+            .map_err(|_| PeerSyncError::Protocol("invalid persisted LAN session URL".to_owned()))?;
+        Ok((self.client, session_url, self.bearer, self.manifest_id))
     }
 
     pub fn session_url(&self) -> &str {
@@ -285,6 +351,106 @@ impl LanCloneClient {
         request: reqwest::blocking::RequestBuilder,
     ) -> reqwest::blocking::RequestBuilder {
         request.bearer_auth(&self.bearer)
+    }
+
+    fn persist(&self, credential_path: &Path) -> Result<(), PeerSyncError> {
+        let persisted = PersistedLanCredential {
+            schema: PERSISTED_CREDENTIAL_SCHEMA.to_owned(),
+            endpoint: self.endpoint.clone(),
+            session_id: self.session_id.clone(),
+            manifest_id: self.manifest_id.clone().ok_or_else(|| {
+                PeerSyncError::Protocol("LAN clone manifest identity is missing".to_owned())
+            })?,
+            device_id: self.device_id.clone(),
+            bearer: self.bearer.clone(),
+            permission: "clone-read".to_owned(),
+        };
+        persisted.validate()?;
+        let bytes = serde_json::to_vec(&persisted)
+            .map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        if bytes.len() as u64 > MAX_PERSISTED_CREDENTIAL_BYTES {
+            return Err(PeerSyncError::Storage(
+                "persisted LAN clone credential is too large".to_owned(),
+            ));
+        }
+        let parent = credential_path.parent().ok_or_else(|| {
+            PeerSyncError::Storage("LAN clone credential path has no parent".to_owned())
+        })?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".peer-credential-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, credential_path)?;
+            sync_parent_directory(parent)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn from_persisted(persisted: PersistedLanCredential) -> Result<Self, PeerSyncError> {
+        let endpoint = validate_lan_endpoint(&persisted.endpoint)?;
+        let session_url = format!("{endpoint}/v1/sessions/{}", persisted.session_id);
+        if session_url.len() > MAX_URL_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "LAN session URL is too long".to_owned(),
+            ));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(transport)?;
+        Ok(Self {
+            client,
+            endpoint,
+            session_id: persisted.session_id,
+            session_url,
+            device_id: persisted.device_id,
+            bearer: persisted.bearer,
+            manifest_id: Some(persisted.manifest_id),
+        })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedLanCredential {
+    schema: String,
+    endpoint: String,
+    session_id: String,
+    manifest_id: String,
+    device_id: String,
+    bearer: String,
+    permission: String,
+}
+
+impl PersistedLanCredential {
+    fn validate(&self) -> Result<(), PeerSyncError> {
+        if self.schema != PERSISTED_CREDENTIAL_SCHEMA
+            || !is_canonical_uuid(&self.session_id)
+            || !is_canonical_uuid(&self.device_id)
+            || !is_lower_hex_256(&self.manifest_id)
+            || !is_lower_hex_256(&self.bearer)
+            || self.permission != "clone-read"
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid persisted LAN clone credential".to_owned(),
+            ));
+        }
+        validate_lan_endpoint(&self.endpoint)?;
+        Ok(())
     }
 }
 
@@ -920,6 +1086,23 @@ fn is_lower_hex_256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .map(|parsed| parsed.to_string() == value)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<(), PeerSyncError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> Result<(), PeerSyncError> {
+    Ok(())
 }
 
 fn random_secret() -> Result<[u8; 32], PeerSyncError> {

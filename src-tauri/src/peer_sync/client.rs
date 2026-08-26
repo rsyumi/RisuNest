@@ -1,3 +1,4 @@
+use super::lan::LanCloneClient;
 use super::{
     protocol::{sha256_hex, CloneManifest, CloneObjectKind, MAX_MANIFEST_BYTES},
     PeerSyncError,
@@ -82,8 +83,8 @@ enum LedgerEvent {
 
 pub struct LoopbackCloneClient {
     root: PathBuf,
-    session_url: Url,
-    http: Client,
+    transport: HttpCloneTransport,
+    required_manifest_id: Option<String>,
     manifest: Option<CloneManifest>,
     manifest_id: Option<String>,
     ledger: LedgerState,
@@ -91,6 +92,35 @@ pub struct LoopbackCloneClient {
     fail_after_cas_promotion: bool,
     #[cfg(test)]
     pause_after_cas_promotion: Option<PathBuf>,
+}
+
+struct HttpCloneTransport {
+    session_url: Url,
+    http: Client,
+    bearer: Option<String>,
+}
+
+impl HttpCloneTransport {
+    fn request(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        match &self.bearer {
+            Some(bearer) => request.bearer_auth(bearer),
+            None => request,
+        }
+    }
+
+    fn endpoint(&self, suffix: &str) -> Result<Url, PeerSyncError> {
+        let mut url = self.session_url.clone();
+        let path = format!(
+            "{}/{}",
+            url.path().trim_end_matches('/'),
+            suffix.trim_matches('/')
+        );
+        url.set_path(&path);
+        Ok(url)
+    }
 }
 
 impl LoopbackCloneClient {
@@ -111,8 +141,49 @@ impl LoopbackCloneClient {
             .map_err(transport_error)?;
         Ok(Self {
             root,
-            session_url,
-            http,
+            transport: HttpCloneTransport {
+                session_url,
+                http,
+                bearer: None,
+            },
+            required_manifest_id: None,
+            manifest: None,
+            manifest_id: None,
+            ledger,
+            #[cfg(test)]
+            fail_after_cas_promotion: false,
+            #[cfg(test)]
+            pause_after_cas_promotion: None,
+        })
+    }
+
+    pub fn from_lan(
+        staging_root: impl AsRef<Path>,
+        lan: LanCloneClient,
+        expected_manifest_id: &str,
+    ) -> Result<Self, PeerSyncError> {
+        super::protocol::validate_hash(expected_manifest_id)?;
+        let (http, session_url, bearer, persisted_manifest_id) = lan.into_resumable_parts()?;
+        if persisted_manifest_id
+            .as_deref()
+            .is_some_and(|persisted| persisted != expected_manifest_id)
+        {
+            return Err(PeerSyncError::StaleManifest {
+                expected: expected_manifest_id.to_owned(),
+                received: persisted_manifest_id.unwrap(),
+            });
+        }
+        fs::create_dir_all(staging_root.as_ref())?;
+        let root = fs::canonicalize(staging_root.as_ref())?;
+        let ledger = load_ledger(&root.join("ledger.jsonl"))?;
+        Ok(Self {
+            root,
+            transport: HttpCloneTransport {
+                session_url,
+                http,
+                bearer: Some(bearer),
+            },
+            required_manifest_id: Some(expected_manifest_id.to_owned()),
             manifest: None,
             manifest_id: None,
             ledger,
@@ -153,6 +224,7 @@ impl LoopbackCloneClient {
                 &mut progress,
             )?;
         }
+        self.report_verified_progress(&manifest, None)?;
         report.verified_objects = manifest.objects.len();
         Ok(report)
     }
@@ -190,8 +262,12 @@ impl LoopbackCloneClient {
             return Ok(());
         }
         let response = self
-            .http
-            .get(self.endpoint("manifest")?)
+            .transport
+            .request(
+                self.transport
+                    .http
+                    .get(self.transport.endpoint("manifest")?),
+            )
             .send()
             .map_err(transport_error)?;
         if response.status() != StatusCode::OK {
@@ -225,6 +301,14 @@ impl LoopbackCloneClient {
             ));
         }
         let manifest_id = sha256_hex(&bytes);
+        if let Some(expected) = &self.required_manifest_id {
+            if expected != &manifest_id {
+                return Err(PeerSyncError::StaleManifest {
+                    expected: expected.clone(),
+                    received: manifest_id,
+                });
+            }
+        }
         if etag != quoted(&manifest_id) {
             return Err(PeerSyncError::Protocol(
                 "clone manifest ETag does not match its bytes".to_owned(),
@@ -270,6 +354,7 @@ impl LoopbackCloneClient {
                 self.record_object_progress(object_hash, descriptor.chunks.len(), true)?;
             }
             remove_file_if_exists(&part_path)?;
+            self.report_verified_progress(manifest, Some(object_hash))?;
             return Ok(());
         }
         if current.verified {
@@ -316,9 +401,13 @@ impl LoopbackCloneClient {
             file.seek(SeekFrom::Start(chunk.offset))?;
             let range_end = chunk.offset + chunk.size - 1;
             let mut response = self
-                .http
-                .get(self.endpoint(&format!("objects/{object_hash}"))?)
-                .header(RANGE, format!("bytes={}-{}", chunk.offset, range_end))
+                .transport
+                .request(
+                    self.transport
+                        .http
+                        .get(self.transport.endpoint(&format!("objects/{object_hash}"))?)
+                        .header(RANGE, format!("bytes={}-{}", chunk.offset, range_end)),
+                )
                 .send()
                 .map_err(transport_error)?;
             validate_range_response(
@@ -380,6 +469,7 @@ impl LoopbackCloneClient {
             file.flush()?;
             file.sync_all()?;
             self.record_object_progress(object_hash, index + 1, false)?;
+            self.report_verified_progress(manifest, Some(object_hash))?;
         }
 
         file.seek(SeekFrom::Start(0))?;
@@ -419,13 +509,18 @@ impl LoopbackCloneClient {
         }
         drop(file);
         remove_file_if_exists(&part_path)?;
-        self.record_object_progress(object_hash, descriptor.chunks.len(), true)
+        self.record_object_progress(object_hash, descriptor.chunks.len(), true)?;
+        self.report_verified_progress(manifest, Some(object_hash))
     }
 
     fn verify_remote_object(&self, object_hash: &str, size: u64) -> Result<(), PeerSyncError> {
         let response = self
-            .http
-            .head(self.endpoint(&format!("objects/{object_hash}"))?)
+            .transport
+            .request(
+                self.transport
+                    .http
+                    .head(self.transport.endpoint(&format!("objects/{object_hash}"))?),
+            )
             .send()
             .map_err(transport_error)?;
         if response.status() != StatusCode::OK {
@@ -445,6 +540,55 @@ impl LoopbackCloneClient {
             return Err(PeerSyncError::Protocol(
                 "object HEAD does not advertise the immutable range contract".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    fn report_verified_progress(
+        &self,
+        manifest: &CloneManifest,
+        current_object: Option<&str>,
+    ) -> Result<(), PeerSyncError> {
+        if self.transport.bearer.is_none() {
+            return Ok(());
+        }
+        let verified_bytes = manifest
+            .objects
+            .iter()
+            .try_fold(0_u64, |total, (hash, object)| {
+                let next_chunk = self
+                    .ledger
+                    .objects
+                    .get(hash)
+                    .map(|progress| progress.next_chunk)
+                    .unwrap_or(0)
+                    .min(object.chunks.len());
+                let object_bytes = object.chunks[..next_chunk]
+                    .iter()
+                    .try_fold(0_u64, |subtotal, chunk| subtotal.checked_add(chunk.size))?;
+                total.checked_add(object_bytes)
+            })
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("verified clone byte count overflow".to_owned())
+            })?;
+        let response = self
+            .transport
+            .request(
+                self.transport
+                    .http
+                    .post(self.transport.endpoint("progress")?)
+                    .json(&serde_json::json!({
+                        "verifiedBytes": verified_bytes,
+                        "currentObject": current_object,
+                    })),
+            )
+            .send()
+            .map_err(transport_error)?;
+        if response.status() != StatusCode::NO_CONTENT {
+            return Err(PeerSyncError::Transport(format!(
+                "progress request returned {}",
+                response.status()
+            )));
         }
         Ok(())
     }
@@ -511,17 +655,6 @@ impl LoopbackCloneClient {
         file.flush()?;
         file.sync_all()?;
         Ok(())
-    }
-
-    fn endpoint(&self, suffix: &str) -> Result<Url, PeerSyncError> {
-        let mut url = self.session_url.clone();
-        let path = format!(
-            "{}/{}",
-            url.path().trim_end_matches('/'),
-            suffix.trim_matches('/')
-        );
-        url.set_path(&path);
-        Ok(url)
     }
 }
 
