@@ -6,6 +6,7 @@ use rusqlite::{params, Connection};
 
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const EMPTY_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn open_schema() -> Connection {
     let connection = Connection::open_in_memory().expect("open in-memory database");
@@ -113,8 +114,8 @@ fn constrains_generation_and_record_head_state() {
         .execute(
             "INSERT INTO logical_record_heads (
                 library_id, generation_id, record_key, record_kind,
-                state, object_hash, deleted_generation_sequence
-             ) VALUES (?1, ?2, ?3, 'root', 'live', ?4, NULL)",
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES (?1, ?2, ?3, 'root', 'live', ?4, 1, NULL)",
             params!["library-a", "generation-a", "r1:root", HASH_B],
         )
         .expect("insert live root head");
@@ -122,9 +123,9 @@ fn constrains_generation_and_record_head_state() {
     let live_without_hash = connection.execute(
         "INSERT INTO logical_record_heads (
             library_id, generation_id, record_key, record_kind,
-            state, object_hash, deleted_generation_sequence
+            state, object_hash, object_size, deleted_generation_sequence
          ) VALUES ('library-a', 'generation-a', 'r1:plugin', 'plugin',
-                   'live', NULL, NULL)",
+                   'live', NULL, 0, NULL)",
         [],
     );
     assert!(live_without_hash.is_err());
@@ -132,9 +133,9 @@ fn constrains_generation_and_record_head_state() {
     let tombstone_with_hash = connection.execute(
         "INSERT INTO logical_record_heads (
             library_id, generation_id, record_key, record_kind,
-            state, object_hash, deleted_generation_sequence
+            state, object_hash, object_size, deleted_generation_sequence
          ) VALUES ('library-a', 'generation-a', 'r1:cold', 'cold',
-                   'tombstone', ?1, '12')",
+                   'tombstone', ?1, 1, '12')",
         [HASH_B],
     );
     assert!(tombstone_with_hash.is_err());
@@ -148,16 +149,16 @@ fn records_dependencies_and_message_page_sources_without_payload_bytes() {
         .execute(
             "INSERT INTO logical_record_heads (
                 library_id, generation_id, record_key, record_kind,
-                state, object_hash, deleted_generation_sequence
-             ) VALUES (?1, ?2, ?3, 'conversation', 'live', ?4, NULL)",
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES (?1, ?2, ?3, 'conversation', 'live', ?4, 10, NULL)",
             params!["library-a", "generation-a", "r1:conversation", HASH_A],
         )
         .expect("insert conversation head");
     connection
         .execute(
             "INSERT INTO logical_record_dependencies (
-                library_id, generation_id, record_key, object_hash
-             ) VALUES (?1, ?2, ?3, ?4)",
+                library_id, generation_id, record_key, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, ?4, 20)",
             params!["library-a", "generation-a", "r1:conversation", HASH_B],
         )
         .expect("insert dependency");
@@ -165,8 +166,8 @@ fn records_dependencies_and_message_page_sources_without_payload_bytes() {
         .execute(
             "INSERT INTO logical_message_page_sources (
                 library_id, generation_id, record_key, page_index,
-                first_message_index, message_count, object_hash
-             ) VALUES (?1, ?2, ?3, 0, 0, 128, ?4)",
+                first_message_index, message_count, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, 0, 0, 128, ?4, 20)",
             params!["library-a", "generation-a", "r1:conversation", HASH_B],
         )
         .expect("insert message page source");
@@ -174,9 +175,9 @@ fn records_dependencies_and_message_page_sources_without_payload_bytes() {
     let duplicate_page_start = connection.execute(
         "INSERT INTO logical_message_page_sources (
             library_id, generation_id, record_key, page_index,
-            first_message_index, message_count, object_hash
+            first_message_index, message_count, object_hash, object_size
          ) VALUES ('library-a', 'generation-a', 'r1:conversation', 1,
-                   0, 64, ?1)",
+                   0, 64, ?1, 10)",
         [HASH_A],
     );
     assert!(duplicate_page_start.is_err());
@@ -184,9 +185,9 @@ fn records_dependencies_and_message_page_sources_without_payload_bytes() {
     let non_conversation_page = connection.execute(
         "INSERT INTO logical_message_page_sources (
             library_id, generation_id, record_key, page_index,
-            first_message_index, message_count, object_hash
+            first_message_index, message_count, object_hash, object_size
          ) VALUES ('library-a', 'generation-a', 'r1:root', 0,
-                   0, 1, ?1)",
+                   0, 1, ?1, 10)",
         [HASH_A],
     );
     assert!(non_conversation_page.is_err());
@@ -200,8 +201,8 @@ fn validation_requires_message_pages_to_be_manifest_dependencies() {
         .execute(
             "INSERT INTO logical_record_heads (
                 library_id, generation_id, record_key, record_kind,
-                state, object_hash, deleted_generation_sequence
-             ) VALUES (?1, ?2, ?3, 'conversation', 'live', ?4, NULL)",
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES (?1, ?2, ?3, 'conversation', 'live', ?4, 10, NULL)",
             params!["library-a", "generation-a", "r1:conversation", HASH_A],
         )
         .expect("insert conversation head");
@@ -209,8 +210,8 @@ fn validation_requires_message_pages_to_be_manifest_dependencies() {
         .execute(
             "INSERT INTO logical_message_page_sources (
                 library_id, generation_id, record_key, page_index,
-                first_message_index, message_count, object_hash
-             ) VALUES (?1, ?2, ?3, 0, 0, 32, ?4)",
+                first_message_index, message_count, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, 0, 0, 32, ?4, 20)",
             params!["library-a", "generation-a", "r1:conversation", HASH_B],
         )
         .expect("insert message page source");
@@ -223,8 +224,8 @@ fn validation_requires_message_pages_to_be_manifest_dependencies() {
     connection
         .execute(
             "INSERT INTO logical_record_dependencies (
-                library_id, generation_id, record_key, object_hash
-             ) VALUES (?1, ?2, ?3, ?4)",
+                library_id, generation_id, record_key, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, ?4, 20)",
             params!["library-a", "generation-a", "r1:conversation", HASH_B],
         )
         .expect("insert page dependency");
@@ -295,4 +296,163 @@ fn validation_rejects_partial_or_wrong_schema() {
 
     let error = validate_logical_schema(&connection).expect_err("reject partial schema");
     assert!(error.to_string().contains("logical_sync_generations"));
+}
+
+#[test]
+fn compact_index_supplies_manifest_object_sizes_without_record_bodies() {
+    let connection = open_schema();
+    insert_complete_generation(&connection);
+    connection
+        .execute(
+            "INSERT INTO logical_record_heads (
+                library_id, generation_id, record_key, record_kind,
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES (?1, ?2, ?3, 'conversation', 'live', ?4, 321, NULL)",
+            params!["library-a", "generation-a", "r1:conversation", HASH_A],
+        )
+        .expect("insert sized conversation head");
+    connection
+        .execute(
+            "INSERT INTO logical_record_dependencies (
+                library_id, generation_id, record_key, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, ?4, 654)",
+            params!["library-a", "generation-a", "r1:conversation", HASH_B],
+        )
+        .expect("insert sized dependency");
+    connection
+        .execute(
+            "INSERT INTO logical_message_page_sources (
+                library_id, generation_id, record_key, page_index,
+                first_message_index, message_count, object_hash, object_size
+             ) VALUES (?1, ?2, ?3, 0, 0, 128, ?4, 654)",
+            params!["library-a", "generation-a", "r1:conversation", HASH_B],
+        )
+        .expect("insert sized message page source");
+
+    let objects: Vec<(String, i64)> = connection
+        .prepare(
+            "SELECT object_hash, object_size
+             FROM logical_record_heads
+             WHERE library_id = ?1 AND generation_id = ?2 AND state = 'live'
+             UNION
+             SELECT object_hash, object_size
+             FROM logical_record_dependencies
+             WHERE library_id = ?1 AND generation_id = ?2
+             ORDER BY object_hash",
+        )
+        .expect("prepare compact manifest object query")
+        .query_map(params!["library-a", "generation-a"], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("query compact manifest objects")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect compact manifest objects");
+    assert_eq!(
+        objects,
+        vec![(HASH_A.to_string(), 321), (HASH_B.to_string(), 654)]
+    );
+
+    let page_object: (String, i64) = connection
+        .query_row(
+            "SELECT object_hash, object_size
+             FROM logical_message_page_sources
+             WHERE library_id = ?1 AND generation_id = ?2 AND record_key = ?3",
+            params!["library-a", "generation-a", "r1:conversation"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read compact page source");
+    assert_eq!(page_object, (HASH_B.to_string(), 654));
+}
+
+#[test]
+fn rejects_invalid_object_sizes_and_empty_hash_size_mismatches() {
+    let connection = open_schema();
+    insert_complete_generation(&connection);
+
+    let negative_head = connection.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind,
+            state, object_hash, object_size, deleted_generation_sequence
+         ) VALUES ('library-a', 'generation-a', 'r1:negative', 'root',
+                   'live', ?1, -1, NULL)",
+        [HASH_A],
+    );
+    assert!(negative_head.is_err());
+
+    let malformed_hash = connection.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind,
+            state, object_hash, object_size, deleted_generation_sequence
+         ) VALUES ('library-a', 'generation-a', 'r1:bad-hash', 'root',
+                   'live', 'not-a-sha256', 1, NULL)",
+        [],
+    );
+    assert!(malformed_hash.is_err());
+
+    let zero_sized_non_empty_hash = connection.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind,
+            state, object_hash, object_size, deleted_generation_sequence
+         ) VALUES ('library-a', 'generation-a', 'r1:wrong-zero', 'root',
+                   'live', ?1, 0, NULL)",
+        [HASH_A],
+    );
+    assert!(zero_sized_non_empty_hash.is_err());
+
+    let positive_sized_empty_hash = connection.execute(
+        "INSERT INTO logical_record_heads (
+            library_id, generation_id, record_key, record_kind,
+            state, object_hash, object_size, deleted_generation_sequence
+         ) VALUES ('library-a', 'generation-a', 'r1:wrong-empty', 'root',
+                   'live', ?1, 1, NULL)",
+        [EMPTY_HASH],
+    );
+    assert!(positive_sized_empty_hash.is_err());
+
+    connection
+        .execute(
+            "INSERT INTO logical_record_heads (
+                library_id, generation_id, record_key, record_kind,
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES ('library-a', 'generation-a', 'r1:empty', 'root',
+                       'live', ?1, 0, NULL)",
+            [EMPTY_HASH],
+        )
+        .expect("accept canonical empty object");
+
+    let missing_dependency_size = connection.execute(
+        "INSERT INTO logical_record_dependencies (
+            library_id, generation_id, record_key, object_hash
+         ) VALUES ('library-a', 'generation-a', 'r1:empty', ?1)",
+        [EMPTY_HASH],
+    );
+    assert!(missing_dependency_size.is_err());
+
+    let zero_sized_dependency_with_non_empty_hash = connection.execute(
+        "INSERT INTO logical_record_dependencies (
+            library_id, generation_id, record_key, object_hash, object_size
+         ) VALUES ('library-a', 'generation-a', 'r1:empty', ?1, 0)",
+        [HASH_A],
+    );
+    assert!(zero_sized_dependency_with_non_empty_hash.is_err());
+
+    connection
+        .execute(
+            "INSERT INTO logical_record_heads (
+                library_id, generation_id, record_key, record_kind,
+                state, object_hash, object_size, deleted_generation_sequence
+             ) VALUES ('library-a', 'generation-a', 'r1:conversation',
+                       'conversation', 'live', ?1, 10, NULL)",
+            [HASH_A],
+        )
+        .expect("insert conversation for page constraint");
+    let positive_sized_page_with_empty_hash = connection.execute(
+        "INSERT INTO logical_message_page_sources (
+            library_id, generation_id, record_key, page_index,
+            first_message_index, message_count, object_hash, object_size
+         ) VALUES ('library-a', 'generation-a', 'r1:conversation',
+                   0, 0, 1, ?1, 1)",
+        [EMPTY_HASH],
+    );
+    assert!(positive_sized_page_with_empty_hash.is_err());
 }

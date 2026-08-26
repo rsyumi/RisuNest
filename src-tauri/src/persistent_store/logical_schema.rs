@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS logical_record_heads (
             AND object_hash NOT GLOB '*[^0-9a-f]*'
         )
     ),
+    object_size INTEGER NOT NULL CHECK (object_size >= 0),
     deleted_generation_sequence TEXT CHECK (
         deleted_generation_sequence IS NULL OR (
             length(deleted_generation_sequence) > 0
@@ -73,10 +74,25 @@ CREATE TABLE IF NOT EXISTS logical_record_heads (
         )
     ),
     CHECK (
-        (state = 'live' AND object_hash IS NOT NULL AND deleted_generation_sequence IS NULL)
+        (
+            state = 'live'
+            AND object_hash IS NOT NULL
+            AND deleted_generation_sequence IS NULL
+            AND (
+                (
+                    object_size = 0
+                    AND object_hash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+                )
+                OR (
+                    object_size > 0
+                    AND object_hash != 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+                )
+            )
+        )
         OR (
             state = 'tombstone'
             AND object_hash IS NULL
+            AND object_size = 0
             AND deleted_generation_sequence IS NOT NULL
         )
     ),
@@ -89,7 +105,7 @@ CREATE TABLE IF NOT EXISTS logical_record_heads (
 CREATE INDEX IF NOT EXISTS logical_record_heads_kind
     ON logical_record_heads (library_id, generation_id, record_kind, record_key);
 CREATE INDEX IF NOT EXISTS logical_record_heads_object
-    ON logical_record_heads (library_id, generation_id, object_hash)
+    ON logical_record_heads (library_id, generation_id, object_hash, object_size)
     WHERE object_hash IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS logical_record_dependencies (
@@ -100,13 +116,26 @@ CREATE TABLE IF NOT EXISTS logical_record_dependencies (
         length(object_hash) = 64
         AND object_hash NOT GLOB '*[^0-9a-f]*'
     ),
+    object_size INTEGER NOT NULL CHECK (
+        object_size >= 0
+        AND (
+            (
+                object_size = 0
+                AND object_hash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+            )
+            OR (
+                object_size > 0
+                AND object_hash != 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+            )
+        )
+    ),
     PRIMARY KEY (library_id, generation_id, record_key, object_hash),
     FOREIGN KEY (library_id, generation_id, record_key)
         REFERENCES logical_record_heads (library_id, generation_id, record_key)
         ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS logical_record_dependencies_object
-    ON logical_record_dependencies (library_id, generation_id, object_hash);
+    ON logical_record_dependencies (library_id, generation_id, object_hash, object_size);
 
 CREATE TABLE IF NOT EXISTS logical_message_page_sources (
     library_id TEXT NOT NULL,
@@ -120,6 +149,19 @@ CREATE TABLE IF NOT EXISTS logical_message_page_sources (
         length(object_hash) = 64
         AND object_hash NOT GLOB '*[^0-9a-f]*'
     ),
+    object_size INTEGER NOT NULL CHECK (
+        object_size >= 0
+        AND (
+            (
+                object_size = 0
+                AND object_hash = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+            )
+            OR (
+                object_size > 0
+                AND object_hash != 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+            )
+        )
+    ),
     PRIMARY KEY (library_id, generation_id, record_key, page_index),
     UNIQUE (library_id, generation_id, record_key, first_message_index),
     FOREIGN KEY (library_id, generation_id, record_key, record_kind)
@@ -132,7 +174,7 @@ CREATE TABLE IF NOT EXISTS logical_message_page_sources (
         ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS logical_message_page_sources_object
-    ON logical_message_page_sources (library_id, generation_id, object_hash);
+    ON logical_message_page_sources (library_id, generation_id, object_hash, object_size);
 
 CREATE TABLE IF NOT EXISTS logical_peer_common_bases (
     peer_id TEXT NOT NULL CHECK (length(peer_id) > 0),
@@ -179,12 +221,19 @@ const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "record_kind",
             "state",
             "object_hash",
+            "object_size",
             "deleted_generation_sequence",
         ],
     ),
     (
         "logical_record_dependencies",
-        &["library_id", "generation_id", "record_key", "object_hash"],
+        &[
+            "library_id",
+            "generation_id",
+            "record_key",
+            "object_hash",
+            "object_size",
+        ],
     ),
     (
         "logical_message_page_sources",
@@ -197,6 +246,7 @@ const REQUIRED_TABLE_COLUMNS: &[(&str, &[&str])] = &[
             "first_message_index",
             "message_count",
             "object_hash",
+            "object_size",
         ],
     ),
     (
