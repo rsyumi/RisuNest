@@ -6,6 +6,7 @@ mod local_backup;
 mod native_file_jobs;
 mod native_media;
 #[cfg(desktop)]
+#[allow(dead_code, unused_imports)]
 mod peer_sync;
 mod persistent_store;
 #[cfg(feature = "official-publication-upload-pilot")]

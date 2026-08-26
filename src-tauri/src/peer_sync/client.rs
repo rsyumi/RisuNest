@@ -1,0 +1,766 @@
+use super::{
+    protocol::{sha256_hex, CloneManifest, CloneObjectKind, MAX_MANIFEST_BYTES},
+    PeerSyncError,
+};
+use crate::asset_repository::PayloadCas;
+use reqwest::{
+    blocking::{Client, Response},
+    header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE},
+    StatusCode, Url,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+const TRANSFER_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DownloadReport {
+    pub verified_objects: usize,
+    pub transferred_bytes: u64,
+    pub maximum_buffer_bytes: usize,
+    pub maximum_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransferCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TransferCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObjectProgress {
+    next_chunk: usize,
+    verified: bool,
+}
+
+#[derive(Debug, Default)]
+struct LedgerState {
+    manifest_id: Option<String>,
+    objects: BTreeMap<String, ObjectProgress>,
+    activated: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum LedgerEvent {
+    Manifest {
+        manifest_id: String,
+    },
+    Object {
+        object: String,
+        next_chunk: usize,
+        verified: bool,
+    },
+    Activated {
+        manifest_id: String,
+    },
+}
+
+pub struct LoopbackCloneClient {
+    root: PathBuf,
+    session_url: Url,
+    http: Client,
+    manifest: Option<CloneManifest>,
+    manifest_id: Option<String>,
+    ledger: LedgerState,
+}
+
+impl LoopbackCloneClient {
+    pub fn new(
+        staging_root: impl AsRef<Path>,
+        session_url: impl AsRef<str>,
+    ) -> Result<Self, PeerSyncError> {
+        fs::create_dir_all(staging_root.as_ref())?;
+        let root = fs::canonicalize(staging_root.as_ref())?;
+        let session_url = validate_loopback_url(session_url.as_ref())?;
+        let ledger = load_ledger(&root.join("ledger.jsonl"))?;
+        let http = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(transport_error)?;
+        Ok(Self {
+            root,
+            session_url,
+            http,
+            manifest: None,
+            manifest_id: None,
+            ledger,
+        })
+    }
+
+    pub fn download(
+        &mut self,
+        cancellation: &TransferCancellation,
+    ) -> Result<DownloadReport, PeerSyncError> {
+        self.download_with_progress(cancellation, |_| {})
+    }
+
+    pub fn download_with_progress(
+        &mut self,
+        cancellation: &TransferCancellation,
+        mut progress: impl FnMut(u64),
+    ) -> Result<DownloadReport, PeerSyncError> {
+        if cancellation.is_cancelled() {
+            return Err(PeerSyncError::Cancelled);
+        }
+        self.fetch_manifest()?;
+        let manifest = self.manifest.as_ref().unwrap().clone();
+        let mut report = DownloadReport {
+            maximum_buffer_bytes: TRANSFER_BUFFER_BYTES,
+            ..DownloadReport::default()
+        };
+        for object_hash in transfer_order(&manifest) {
+            self.download_object(
+                &manifest,
+                &object_hash,
+                cancellation,
+                &mut report,
+                &mut progress,
+            )?;
+        }
+        report.verified_objects = manifest.objects.len();
+        Ok(report)
+    }
+
+    #[cfg(test)]
+    pub fn verified_chunk_count(&self, object: &str) -> usize {
+        self.ledger
+            .objects
+            .get(object)
+            .map(|progress| progress.next_chunk)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn verified_object_path(&self, object: &str) -> Option<PathBuf> {
+        self.ledger
+            .objects
+            .get(object)
+            .filter(|progress| progress.verified)
+            .map(|_| self.object_path(object))
+    }
+
+    fn fetch_manifest(&mut self) -> Result<(), PeerSyncError> {
+        if self.manifest.is_some() {
+            return Ok(());
+        }
+        let response = self
+            .http
+            .get(self.endpoint("manifest")?)
+            .send()
+            .map_err(transport_error)?;
+        if response.status() != StatusCode::OK {
+            return Err(PeerSyncError::Transport(format!(
+                "manifest request returned {}",
+                response.status()
+            )));
+        }
+        if response.content_length().unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES as u64 {
+            return Err(PeerSyncError::Protocol(
+                "clone manifest exceeds the bounded v1 size".to_owned(),
+            ));
+        }
+        let etag = required_header(&response, ETAG)?.to_owned();
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(transport_error)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "clone manifest exceeds the bounded v1 size".to_owned(),
+            ));
+        }
+        let manifest: CloneManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+        manifest.validate()?;
+        if manifest.canonical_bytes()? != bytes {
+            return Err(PeerSyncError::Protocol(
+                "clone manifest bytes are not canonical".to_owned(),
+            ));
+        }
+        let manifest_id = sha256_hex(&bytes);
+        if etag != quoted(&manifest_id) {
+            return Err(PeerSyncError::Protocol(
+                "clone manifest ETag does not match its bytes".to_owned(),
+            ));
+        }
+        if let Some(expected) = &self.ledger.manifest_id {
+            if expected != &manifest_id {
+                return Err(PeerSyncError::StaleManifest {
+                    expected: expected.clone(),
+                    received: manifest_id,
+                });
+            }
+        } else {
+            self.append_event(&LedgerEvent::Manifest {
+                manifest_id: manifest_id.clone(),
+            })?;
+            self.ledger.manifest_id = Some(manifest_id.clone());
+        }
+        self.manifest = Some(manifest);
+        self.manifest_id = Some(manifest_id);
+        Ok(())
+    }
+
+    fn download_object(
+        &mut self,
+        manifest: &CloneManifest,
+        object_hash: &str,
+        cancellation: &TransferCancellation,
+        report: &mut DownloadReport,
+        progress_callback: &mut impl FnMut(u64),
+    ) -> Result<(), PeerSyncError> {
+        let descriptor = manifest.object(object_hash)?;
+        let current = self
+            .ledger
+            .objects
+            .get(object_hash)
+            .cloned()
+            .unwrap_or_default();
+        if current.verified {
+            if self.verify_local_object(object_hash, descriptor.size)? {
+                return Ok(());
+            }
+            self.record_object_progress(object_hash, 0, false)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(PeerSyncError::Cancelled);
+        }
+        self.verify_remote_object(object_hash, descriptor.size)?;
+        let download_directory = self.root.join("downloads");
+        fs::create_dir_all(&download_directory)?;
+        let part_path = download_directory.join(format!("{object_hash}.part"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&part_path)?;
+        let mut next_chunk = self
+            .ledger
+            .objects
+            .get(object_hash)
+            .map(|progress| progress.next_chunk)
+            .unwrap_or(0);
+        if next_chunk > descriptor.chunks.len() {
+            next_chunk = 0;
+            self.record_object_progress(object_hash, 0, false)?;
+        }
+        let expected_offset = descriptor
+            .chunks
+            .get(next_chunk)
+            .map(|chunk| chunk.offset)
+            .unwrap_or(descriptor.size);
+        if file.metadata()?.len() < expected_offset {
+            next_chunk = 0;
+            file.set_len(0)?;
+            file.sync_all()?;
+            self.record_object_progress(object_hash, 0, false)?;
+        } else {
+            file.set_len(expected_offset)?;
+        }
+
+        for (index, chunk) in descriptor.chunks.iter().enumerate().skip(next_chunk) {
+            if cancellation.is_cancelled() {
+                return Err(PeerSyncError::Cancelled);
+            }
+            file.seek(SeekFrom::Start(chunk.offset))?;
+            let range_end = chunk.offset + chunk.size - 1;
+            let mut response = self
+                .http
+                .get(self.endpoint(&format!("objects/{object_hash}"))?)
+                .header(RANGE, format!("bytes={}-{}", chunk.offset, range_end))
+                .send()
+                .map_err(transport_error)?;
+            validate_range_response(
+                &response,
+                object_hash,
+                chunk.offset,
+                range_end,
+                descriptor.size,
+            )?;
+            report.maximum_response_bytes = report.maximum_response_bytes.max(chunk.size);
+            let mut hasher = Sha256::new();
+            let mut received = 0_u64;
+            let mut buffer = [0_u8; TRANSFER_BUFFER_BYTES];
+            loop {
+                let read = match response.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        file.set_len(chunk.offset)?;
+                        file.sync_all()?;
+                        return Err(transport_error(error));
+                    }
+                };
+                if read == 0 {
+                    break;
+                }
+                if received + read as u64 > chunk.size {
+                    file.set_len(chunk.offset)?;
+                    file.sync_all()?;
+                    return Err(PeerSyncError::Protocol(
+                        "range response exceeded the requested clone chunk".to_owned(),
+                    ));
+                }
+                file.write_all(&buffer[..read])?;
+                hasher.update(&buffer[..read]);
+                received += read as u64;
+                report.transferred_bytes += read as u64;
+                progress_callback(report.transferred_bytes);
+                if cancellation.is_cancelled() {
+                    file.set_len(chunk.offset)?;
+                    file.sync_all()?;
+                    return Err(PeerSyncError::Cancelled);
+                }
+            }
+            if received != chunk.size {
+                file.set_len(chunk.offset)?;
+                file.sync_all()?;
+                return Err(PeerSyncError::Transport(
+                    "range response ended before the requested clone chunk".to_owned(),
+                ));
+            }
+            if hex::encode(hasher.finalize()) != chunk.sha256 {
+                file.set_len(chunk.offset)?;
+                file.sync_all()?;
+                return Err(PeerSyncError::ChunkHashMismatch {
+                    object: object_hash.to_owned(),
+                    offset: chunk.offset,
+                });
+            }
+            file.flush()?;
+            file.sync_all()?;
+            self.record_object_progress(object_hash, index + 1, false)?;
+        }
+
+        file.seek(SeekFrom::Start(0))?;
+        if hash_reader(&mut file)? != object_hash {
+            file.set_len(0)?;
+            file.sync_all()?;
+            self.record_object_progress(object_hash, 0, false)?;
+            return Err(PeerSyncError::WholeObjectHashMismatch {
+                object: object_hash.to_owned(),
+            });
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let cas = PayloadCas::new(&self.root)?;
+        let prepared = cas.prepare_reader(&mut file)?;
+        if prepared.content_hash != object_hash || prepared.byte_size != descriptor.size {
+            return Err(PeerSyncError::WholeObjectHashMismatch {
+                object: object_hash.to_owned(),
+            });
+        }
+        drop(file);
+        match fs::remove_file(&part_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.record_object_progress(object_hash, descriptor.chunks.len(), true)
+    }
+
+    fn verify_remote_object(&self, object_hash: &str, size: u64) -> Result<(), PeerSyncError> {
+        let response = self
+            .http
+            .head(self.endpoint(&format!("objects/{object_hash}"))?)
+            .send()
+            .map_err(transport_error)?;
+        if response.status() != StatusCode::OK {
+            return Err(PeerSyncError::Transport(format!(
+                "object HEAD returned {}",
+                response.status()
+            )));
+        }
+        if parse_u64_header(&response, CONTENT_LENGTH)? != size {
+            return Err(PeerSyncError::Protocol(
+                "object HEAD size does not match the manifest".to_owned(),
+            ));
+        }
+        if required_header(&response, ACCEPT_RANGES)? != "bytes"
+            || required_header(&response, ETAG)? != quoted(object_hash)
+        {
+            return Err(PeerSyncError::Protocol(
+                "object HEAD does not advertise the immutable range contract".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_local_object(&self, object_hash: &str, size: u64) -> Result<bool, PeerSyncError> {
+        let cas = PayloadCas::new(&self.root)?;
+        let Some(mut file) = cas.open_object(object_hash)? else {
+            return Ok(false);
+        };
+        if file.metadata()?.len() != size {
+            return Ok(false);
+        }
+        Ok(hash_reader(&mut file)? == object_hash)
+    }
+
+    fn object_path(&self, object_hash: &str) -> PathBuf {
+        self.root
+            .join("assets-v2")
+            .join("objects")
+            .join(&object_hash[..2])
+            .join(&object_hash[2..])
+    }
+
+    fn record_object_progress(
+        &mut self,
+        object: &str,
+        next_chunk: usize,
+        verified: bool,
+    ) -> Result<(), PeerSyncError> {
+        self.append_event(&LedgerEvent::Object {
+            object: object.to_owned(),
+            next_chunk,
+            verified,
+        })?;
+        self.ledger.objects.insert(
+            object.to_owned(),
+            ObjectProgress {
+                next_chunk,
+                verified,
+            },
+        );
+        Ok(())
+    }
+
+    fn record_activation(&mut self) -> Result<(), PeerSyncError> {
+        let manifest_id = self
+            .manifest_id
+            .clone()
+            .ok_or_else(|| PeerSyncError::Protocol("clone manifest is not loaded".to_owned()))?;
+        self.append_event(&LedgerEvent::Activated { manifest_id })?;
+        self.ledger.activated = true;
+        Ok(())
+    }
+
+    fn append_event(&self, event: &LedgerEvent) -> Result<(), PeerSyncError> {
+        let mut bytes =
+            serde_json::to_vec(event).map_err(|error| PeerSyncError::Storage(error.to_string()))?;
+        bytes.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("ledger.jsonl"))?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn endpoint(&self, suffix: &str) -> Result<Url, PeerSyncError> {
+        let mut url = self.session_url.clone();
+        let path = format!(
+            "{}/{}",
+            url.path().trim_end_matches('/'),
+            suffix.trim_matches('/')
+        );
+        url.set_path(&path);
+        Ok(url)
+    }
+}
+
+pub trait CloneTargetAdapter {
+    type Stage;
+
+    fn is_active(&self, manifest_id: &str) -> Result<bool, PeerSyncError>;
+    fn begin(&mut self, manifest_id: &str) -> Result<Self::Stage, PeerSyncError>;
+    fn stage_object(
+        &mut self,
+        stage: &mut Self::Stage,
+        kind: CloneObjectKind,
+        logical_key: &str,
+        reader: &mut dyn Read,
+    ) -> Result<(), PeerSyncError>;
+    fn abort(&mut self, stage: Self::Stage) -> Result<(), PeerSyncError>;
+    fn activate(&mut self, stage: &mut Self::Stage) -> Result<(), PeerSyncError>;
+}
+
+pub trait CloneValidator<S> {
+    fn validate(&mut self, manifest: &CloneManifest, stage: &S) -> Result<(), PeerSyncError>;
+}
+
+impl<S, F> CloneValidator<S> for F
+where
+    F: FnMut(&CloneManifest, &S) -> Result<(), PeerSyncError>,
+{
+    fn validate(&mut self, manifest: &CloneManifest, stage: &S) -> Result<(), PeerSyncError> {
+        self(manifest, stage)
+    }
+}
+
+pub fn activate_downloaded_clone<T, V>(
+    client: &mut LoopbackCloneClient,
+    target: &mut T,
+    validator: &mut V,
+) -> Result<(), PeerSyncError>
+where
+    T: CloneTargetAdapter,
+    V: CloneValidator<T::Stage>,
+{
+    client.fetch_manifest()?;
+    let manifest = client.manifest.as_ref().unwrap().clone();
+    let manifest_id = client.manifest_id.as_ref().unwrap().clone();
+    if target.is_active(&manifest_id)? {
+        if !client.ledger.activated {
+            client.record_activation()?;
+        }
+        return Err(PeerSyncError::AlreadyActivated);
+    }
+    if client.ledger.activated {
+        return Err(PeerSyncError::Validation(
+            "clone ledger says activated but target does not expose that manifest".to_owned(),
+        ));
+    }
+    for hash in manifest.objects.keys() {
+        let progress = client.ledger.objects.get(hash);
+        if !matches!(progress, Some(progress) if progress.verified)
+            || !client.verify_local_object(hash, manifest.objects[hash].size)?
+        {
+            return Err(PeerSyncError::Validation(
+                "clone activation requires every object to be locally verified".to_owned(),
+            ));
+        }
+    }
+
+    let mut stage = Some(target.begin(&manifest_id)?);
+    let operation = (|| {
+        for payload in &manifest.payloads {
+            let mut reader = client.open_verified_object(&payload.object)?;
+            target.stage_object(
+                stage.as_mut().unwrap(),
+                payload.kind,
+                &payload.logical_key,
+                &mut reader,
+            )?;
+        }
+        let mut database = client.open_verified_object(&manifest.database)?;
+        target.stage_object(
+            stage.as_mut().unwrap(),
+            CloneObjectKind::Database,
+            "database",
+            &mut database,
+        )?;
+        validator.validate(&manifest, stage.as_ref().unwrap())?;
+        target.activate(stage.as_mut().unwrap())?;
+        drop(stage.take());
+        client.record_activation()
+    })();
+    if let Err(error) = operation {
+        if let Some(stage) = stage {
+            let _ = target.abort(stage);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+impl LoopbackCloneClient {
+    fn open_verified_object(&self, hash: &str) -> Result<File, PeerSyncError> {
+        PayloadCas::new(&self.root)?
+            .open_object(hash)?
+            .ok_or_else(|| PeerSyncError::Storage("verified clone object is missing".to_owned()))
+    }
+}
+
+fn transfer_order(manifest: &CloneManifest) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut ordered = Vec::new();
+    for payload in &manifest.payloads {
+        if seen.insert(payload.object.clone()) {
+            ordered.push(payload.object.clone());
+        }
+    }
+    if seen.insert(manifest.database.clone()) {
+        ordered.push(manifest.database.clone());
+    }
+    ordered
+}
+
+fn load_ledger(path: &Path) -> Result<LedgerState, PeerSyncError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LedgerState::default())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut ledger = LedgerState::default();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut valid_bytes = 0_u64;
+    let mut truncated_tail = false;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            truncated_tail = true;
+            break;
+        }
+        valid_bytes += read as u64;
+        line.pop();
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let event: LedgerEvent = serde_json::from_slice(&line)
+            .map_err(|error| PeerSyncError::Storage(format!("invalid clone ledger: {error}")))?;
+        match event {
+            LedgerEvent::Manifest { manifest_id } => {
+                if let Some(existing) = &ledger.manifest_id {
+                    if existing != &manifest_id {
+                        return Err(PeerSyncError::Storage(
+                            "clone ledger contains multiple manifests".to_owned(),
+                        ));
+                    }
+                }
+                ledger.manifest_id = Some(manifest_id);
+            }
+            LedgerEvent::Object {
+                object,
+                next_chunk,
+                verified,
+            } => {
+                ledger.objects.insert(
+                    object,
+                    ObjectProgress {
+                        next_chunk,
+                        verified,
+                    },
+                );
+            }
+            LedgerEvent::Activated { manifest_id } => {
+                if ledger.manifest_id.as_deref() != Some(&manifest_id) {
+                    return Err(PeerSyncError::Storage(
+                        "clone activation ledger references another manifest".to_owned(),
+                    ));
+                }
+                ledger.activated = true;
+            }
+        }
+    }
+    drop(reader);
+    if truncated_tail {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(valid_bytes)?;
+        file.sync_all()?;
+    }
+    Ok(ledger)
+}
+
+fn validate_loopback_url(value: &str) -> Result<Url, PeerSyncError> {
+    let url = Url::parse(value).map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.port().is_none()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(PeerSyncError::Protocol(
+            "P0 clone client accepts only explicit 127.0.0.1 HTTP session URLs".to_owned(),
+        ));
+    }
+    Ok(url)
+}
+
+fn validate_range_response(
+    response: &Response,
+    object_hash: &str,
+    start: u64,
+    end: u64,
+    total: u64,
+) -> Result<(), PeerSyncError> {
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(PeerSyncError::Transport(format!(
+            "range request returned {}",
+            response.status()
+        )));
+    }
+    let expected_size = end - start + 1;
+    if parse_u64_header(response, CONTENT_LENGTH)? != expected_size
+        || required_header(response, ETAG)? != quoted(object_hash)
+        || required_header(response, CONTENT_RANGE)? != format!("bytes {start}-{end}/{total}")
+    {
+        return Err(PeerSyncError::Protocol(
+            "range response does not match the requested immutable chunk".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn required_header(
+    response: &Response,
+    name: reqwest::header::HeaderName,
+) -> Result<&str, PeerSyncError> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            PeerSyncError::Protocol("required HTTP response header is missing".to_owned())
+        })
+}
+
+fn parse_u64_header(
+    response: &Response,
+    name: reqwest::header::HeaderName,
+) -> Result<u64, PeerSyncError> {
+    required_header(response, name)?
+        .parse::<u64>()
+        .map_err(|_| {
+            PeerSyncError::Protocol("HTTP size header is not an unsigned integer".to_owned())
+        })
+}
+
+fn hash_reader(reader: &mut impl Read) -> Result<String, PeerSyncError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; TRANSFER_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn quoted(value: &str) -> String {
+    format!("\"{value}\"")
+}
+
+fn transport_error(error: impl std::fmt::Display) -> PeerSyncError {
+    PeerSyncError::Transport(error.to_string())
+}

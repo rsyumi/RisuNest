@@ -148,6 +148,13 @@ impl PayloadCas {
         Ok(Some(fs::read(path)?))
     }
 
+    pub fn open_object(&self, content_hash: &str) -> io::Result<Option<File>> {
+        let Some(path) = self.existing_object_path(content_hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(File::open(path)?))
+    }
+
     fn ensure_repository_root(&self) -> io::Result<()> {
         reject_link_components(&self.repository_root)?;
         let metadata = fs::symlink_metadata(&self.repository_root)?;
