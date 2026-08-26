@@ -224,6 +224,34 @@ describe('planBidirectionalSync', () => {
         expect(result).not.toHaveProperty('remoteApply')
     })
 
+    it('treats divergent tombstone generations as an explicit same-record conflict', async () => {
+        const base = manifest({
+            generation: 'base',
+            sequence: '1',
+            sourceRevision: 1,
+            records: [live(keys.preset, hashes.baseRoot)],
+        })
+        const local = manifest({
+            generation: 'local',
+            sequence: '2',
+            sourceRevision: 2,
+            records: [tombstone(keys.preset, '2')],
+        })
+        const remote = manifest({
+            generation: 'remote',
+            sequence: '3',
+            sourceRevision: 8,
+            records: [tombstone(keys.preset, '3')],
+        })
+
+        await expect(plan({ base, local, remote })).resolves.toMatchObject({
+            kind: 'conflict',
+            conflicts: [{ key: keys.preset, type: 'same-record' }],
+            replacementAllowed: false,
+            contentBytes: 0,
+        })
+    })
+
     it('accounts identical logical state as a zero-content no-op', async () => {
         const records = [
             live(keys.root, hashes.baseRoot, [hashes.sharedDependency]),

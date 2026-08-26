@@ -7,12 +7,18 @@ const textEncoder = new TextEncoder()
 
 export type LosslessBackupComponent = typeof REQUIRED_COMPONENTS[number]
 
-export interface VerifiedLosslessBackupProof {
-    packageId: string
-    libraryId: string
-    sourceManifestHash: string
-    verifiedComponents: readonly LosslessBackupComponent[]
+class VerifiedLosslessBackupProofValue {
+    readonly #j2Verified = true
+
+    private constructor(
+        readonly packageId: string,
+        readonly libraryId: string,
+        readonly sourceManifestHash: string,
+        readonly verifiedComponents: readonly LosslessBackupComponent[],
+    ) {}
 }
+
+export type VerifiedLosslessBackupProof = VerifiedLosslessBackupProofValue
 
 export interface ConflictReplacementRequest {
     plan: BidirectionalSyncConflictPlan
@@ -77,6 +83,9 @@ export function authorizeConflictReplacement(
             losingSide,
             requiredManifestHash,
         }
+    }
+    if (!(request.backup instanceof VerifiedLosslessBackupProofValue)) {
+        throw new TypeError('Lossless backup proof must be issued by the J2 lossless verifier')
     }
     const packageId = validatePackageId(request.backup.packageId)
     if (request.backup.libraryId !== request.plan.libraryId) {

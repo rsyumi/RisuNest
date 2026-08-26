@@ -37,33 +37,15 @@ describe('authorizeConflictReplacement', () => {
         })
     })
 
-    it('authorizes only a complete package for the exact losing manifest', () => {
-        expect(authorizeConflictReplacement(request('local', {
+    it('rejects a structurally forged proof until the J2 verifier issues an opaque proof', () => {
+        const forged = {
             packageId: 'lossless-package-1',
             libraryId: 'library-a',
             sourceManifestHash: plan.remoteManifestHash,
             verifiedComponents: ['database', 'assets', 'inlays', 'cold'],
-        }))).toEqual({
-            kind: 'authorized',
-            winner: 'local',
-            losingSide: 'remote',
-            packageId: 'lossless-package-1',
-            sourceManifestHash: plan.remoteManifestHash,
-        })
-    })
+        } as unknown as ConflictReplacementRequest['backup']
 
-    it('rejects an incomplete or wrong-side backup proof', () => {
-        expect(() => authorizeConflictReplacement(request('local', {
-            packageId: 'lossless-package-2',
-            libraryId: 'library-a',
-            sourceManifestHash: plan.remoteManifestHash,
-            verifiedComponents: ['database', 'assets', 'inlays'],
-        }))).toThrow('components')
-        expect(() => authorizeConflictReplacement(request('remote', {
-            packageId: 'lossless-package-3',
-            libraryId: 'library-a',
-            sourceManifestHash: plan.remoteManifestHash,
-            verifiedComponents: ['database', 'assets', 'inlays', 'cold'],
-        }))).toThrow('losing manifest')
+        expect(() => authorizeConflictReplacement(request('local', forged)))
+            .toThrow('J2 lossless verifier')
     })
 })

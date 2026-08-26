@@ -80,7 +80,9 @@ function recordsEqual(
 ): boolean {
     if (left === undefined || right === undefined) return left === right
     if (left.state === 'tombstone' || right.state === 'tombstone') {
-        return left.state === 'tombstone' && right.state === 'tombstone'
+        return left.state === 'tombstone'
+            && right.state === 'tombstone'
+            && left.deletedGenerationSequence === right.deletedGenerationSequence
     }
     return left.objectHash === right.objectHash
         && left.dependencies.length === right.dependencies.length
@@ -170,6 +172,9 @@ function conflictTypeFor(
     local: LogicalManifestRecord | undefined,
     remote: LogicalManifestRecord | undefined,
 ): BidirectionalSyncConflictType {
+    if (local?.state === 'tombstone' && remote?.state === 'tombstone') {
+        return 'same-record'
+    }
     const p4ConflictType: LogicalDeltaConflictType = local?.state === 'live'
         && remote?.state === 'live'
         ? 'live-live'
