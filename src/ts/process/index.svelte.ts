@@ -1907,6 +1907,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         fallbackChat.message[fallbackIndex] = update(fallbackMessage)
         return true
     }
+    const releaseOutputTarget = () => {
+        outputTarget?.release()
+        outputTarget = null
+    }
 
     let needsAutoContinue = false
     const resultTokens = await tokenize(result) + (arg.usedContinueTokens || 0)
@@ -1921,6 +1925,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
     if(needsAutoContinue){
         doingChat.set(false)
+        releaseOutputTarget()
         return await sendChat(chatProcessIndex, {
             chatAdditonalTokens: arg.chatAdditonalTokens,
             continue: true,
@@ -1973,6 +1978,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         
         doingChat.set(false)
+        releaseOutputTarget()
         return await sendChat(chatProcessIndex, {
             signal: abortSignal
         })
