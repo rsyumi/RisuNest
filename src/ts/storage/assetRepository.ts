@@ -7,6 +7,7 @@ import {
 } from './blobStore'
 import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
 import {
+    RevisionConflictError,
     validateAssetAlias,
     validateAssetAliasIdentity,
 } from './persistentDataStore'
@@ -14,6 +15,8 @@ import type {
     AssetAlias,
     AssetAliasIdentity,
     AssetAliasKind,
+    AssetAliasListQuery,
+    AssetAliasPage,
     DataRevision,
     PersistentDataStore,
     Versioned,
@@ -43,18 +46,6 @@ export interface AssetRepositoryOptions {
     cas: ImmutablePayloadCas
     legacy: BlobStore
     legacyFallback: boolean
-}
-
-export interface AssetAliasListQuery {
-    kind?: AssetAliasKind
-    limit: number
-    cursor?: string
-}
-
-export interface AssetAliasPage {
-    revision: DataRevision
-    items: AssetAlias[]
-    nextCursor?: string
 }
 
 export interface AssetAliasCatalog {
@@ -426,10 +417,20 @@ export function createCompleteTypedAssetRepository(
         } as AssetAlias
         validateAssetAlias(pendingAlias)
         const prepared = await options.cas.prepare(ownedData)
+        if (prepared.byteSize !== ownedData.byteLength) {
+            throw new Error(`Prepared payload size mismatch for ${identity.key}`)
+        }
         const alias = { ...pendingAlias, objectHash: prepared.contentHash } as AssetAlias
         validateAssetAlias(alias)
-        const { revision } = await options.store.readRoot()
-        await options.store.commitAssetAlias(alias, revision)
+        for (;;) {
+            const { revision } = await options.store.readRoot()
+            try {
+                await options.store.commitAssetAlias(alias, revision)
+                break
+            } catch (error) {
+                if (!(error instanceof RevisionConflictError)) throw error
+            }
+        }
         return aliasBlobMetadata(alias)
     }
 
@@ -493,9 +494,16 @@ export function createCompleteTypedAssetRepository(
         },
         async remove(identity) {
             validateAssetAliasIdentity(identity)
-            const versioned = await readValidatedAlias(options.store, identity)
-            if (!versioned) return
-            await options.store.deleteAssetAlias(identity, versioned.revision)
+            for (;;) {
+                const versioned = await readValidatedAlias(options.store, identity)
+                if (!versioned) return
+                try {
+                    await options.store.deleteAssetAlias(identity, versioned.revision)
+                    return
+                } catch (error) {
+                    if (!(error instanceof RevisionConflictError)) throw error
+                }
+            }
         },
         async resolveUrl(identity) {
             validateAssetAliasIdentity(identity)

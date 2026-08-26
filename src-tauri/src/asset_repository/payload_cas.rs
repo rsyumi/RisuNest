@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
-    io::{self, ErrorKind, Read, Write},
+    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -10,7 +10,8 @@ use std::os::windows::fs::MetadataExt;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreparedPayload {
     pub content_hash: String,
     pub byte_size: u64,
@@ -146,6 +147,33 @@ impl PayloadCas {
             return Ok(None);
         };
         Ok(Some(fs::read(path)?))
+    }
+
+    pub fn read_object_range(
+        &self,
+        content_hash: &str,
+        start: u64,
+        end_exclusive: u64,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if end_exclusive < start {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "payload range bounds must be in ascending order",
+            ));
+        }
+        let Some(path) = self.existing_object_path(content_hash)? else {
+            return Ok(None);
+        };
+        let mut file = File::open(path)?;
+        let size = file.metadata()?.len();
+        let bounded_start = start.min(size);
+        let bounded_end = end_exclusive.min(size);
+        let length = usize::try_from(bounded_end - bounded_start)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "payload range is too large"))?;
+        file.seek(SeekFrom::Start(bounded_start))?;
+        let mut data = vec![0; length];
+        file.read_exact(&mut data)?;
+        Ok(Some(data))
     }
 
     pub fn open_object(&self, content_hash: &str) -> io::Result<Option<File>> {

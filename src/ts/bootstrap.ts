@@ -82,7 +82,10 @@ import {
 import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
 import { formatNameList, summarizePinnedSyncConflict } from "./storage/sync/syncConflictSummary";
 import { withPersistentRevisionLease } from "./storage/persistentRecordIterator";
-import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
+import {
+    activateNativeAssetRepository,
+    initializePersistentStorage,
+} from "./storage/persistentStorageRuntime";
 import {
     acknowledgeRecoveredNativeRestores,
     reconcileNativeRestoresBeforeBootstrap,
@@ -156,6 +159,8 @@ export async function loadData() {
             ),
         })
         const local = await resolvePersistentWorkingSet()
+        const assetRepositoryRevision = await activateNativeAssetRepository()
+        if (assetRepositoryRevision !== null) local.revision = assetRepositoryRevision
         const nativeAppKv = isTauri ? createNativeAppKv() : null
         if (nativeAppKv) localStorage.removeItem('fallbackRisuToken')
         const nativeCredential = nativeAppKv

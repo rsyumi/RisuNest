@@ -1,6 +1,7 @@
 use super::{
-    active_generation, compare_plugin_storage_keys, current_revision, AssetAlias, AssetOwnerHead,
-    AssetOwnerLocator, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
+    active_generation, compare_plugin_storage_keys, current_revision, AssetAlias,
+    AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
+    AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CharacterSummary, ColdAlias,
     ConversationPage, ConversationQuery, ConversationSummary, ConversationWindow,
     ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary, PresetCatalog,
     PresetSummary, QueryOrder, ReadTarget, StoreError, StoreResult, Versioned,
@@ -149,6 +150,110 @@ pub(super) fn read_asset_alias(
             })
         })
         .transpose()
+}
+
+pub(super) fn list_asset_alias_page(
+    connection: &Connection,
+    query: &AssetAliasListQuery,
+    target: &ReadTarget,
+) -> StoreResult<AssetAliasPage> {
+    if !(1..=512).contains(&query.limit) {
+        return Err(StoreError::Validation {
+            message: "Asset alias page limit must be between 1 and 512".to_owned(),
+        });
+    }
+    if let Some(kind) = &query.kind {
+        validate_asset_kind(kind)?;
+    }
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            serde_json::from_str::<(String, String)>(cursor).map_err(|_| StoreError::Validation {
+                message: "Asset alias cursor is invalid".to_owned(),
+            })
+        })
+        .transpose()?;
+    if let Some((kind, _)) = &cursor {
+        validate_asset_kind(kind)?;
+        if query
+            .kind
+            .as_ref()
+            .is_some_and(|query_kind| query_kind != kind)
+        {
+            return Err(StoreError::Validation {
+                message: "Asset alias cursor kind does not match the query".to_owned(),
+            });
+        }
+    }
+    let (cursor_kind, cursor_key, has_cursor) =
+        cursor.as_ref().map_or(("asset", "", 0_i64), |(kind, key)| {
+            (kind.as_str(), key.as_str(), 1)
+        });
+    let mut statement = connection.prepare(
+        "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata
+         FROM asset_aliases
+         WHERE generation = ?1
+           AND (?2 IS NULL OR kind = ?2)
+           AND (?5 = 0 OR kind > ?3 OR (kind = ?3 AND logical_key > ?4))
+         ORDER BY kind ASC, logical_key ASC
+         LIMIT ?6",
+    )?;
+    let mut items = statement
+        .query_map(
+            params![
+                target.generation,
+                query.kind,
+                cursor_kind,
+                cursor_key,
+                has_cursor,
+                query.limit + 1,
+            ],
+            asset_alias_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    for item in &items {
+        item.validate()?;
+    }
+    let next_cursor = if items.len() > query.limit as usize {
+        items.truncate(query.limit as usize);
+        let last = items.last().expect("positive page limit");
+        Some(serde_json::to_string(&(
+            last.kind.as_str(),
+            last.key.as_str(),
+        ))?)
+    } else {
+        None
+    };
+    Ok(AssetAliasPage {
+        revision: target.revision,
+        items,
+        next_cursor,
+    })
+}
+
+pub(super) fn read_asset_repository_authority(
+    connection: &Connection,
+    target: &ReadTarget,
+) -> StoreResult<Versioned<AssetRepositoryAuthorityState>> {
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM asset_repository_authority WHERE generation = ?1",
+            [&target.generation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let value = match stored {
+        Some(stored) => serde_json::from_str(&stored).map_err(|_| StoreError::Validation {
+            message: "Asset repository authority state is invalid".to_owned(),
+        })?,
+        None => AssetRepositoryAuthorityState::Legacy,
+    };
+    value.validate()?;
+    Ok(Versioned {
+        revision: target.revision,
+        value,
+    })
 }
 
 pub(super) fn read_asset_owner_head(
@@ -371,7 +476,7 @@ fn asset_alias_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetAlias>
     })
 }
 
-fn validate_asset_kind(kind: &str) -> StoreResult<()> {
+pub(super) fn validate_asset_kind(kind: &str) -> StoreResult<()> {
     if matches!(kind, "asset" | "inlay") {
         Ok(())
     } else {

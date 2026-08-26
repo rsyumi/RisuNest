@@ -327,8 +327,15 @@ function openProductionStore(): Promise<BlobStore> {
 
 let gatedProductionStore: BlobStore | null = null
 
-export function configureActiveBlobStore(gate: StorageMutationGate): void {
-    gatedProductionStore = createGatedBlobStore(deferredStore, gate)
+export function configureActiveBlobStore(
+    gate: StorageMutationGate,
+    authoritative: BlobStore = deferredStore,
+): void {
+    gatedProductionStore = createGatedBlobStore(authoritative, gate)
+}
+
+export function getLegacyBlobStore(): BlobStore {
+    return deferredStore
 }
 
 export function getBlobStore(): BlobStore {

@@ -57,6 +57,7 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
         "asset_owner_heads",
         "owner_kind, owner_locator, present, manifest_hash, entry_count",
     ),
+    ("asset_repository_authority", "value"),
     ("cold_aliases", "key, object_hash, size, metadata"),
 ];
 
@@ -199,6 +200,82 @@ pub(crate) struct PluginStorageSummary {
 pub(crate) struct PluginStorageCatalog {
     pub(crate) revision: i64,
     pub(crate) items: Vec<PluginStorageSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetAliasListQuery {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    pub(crate) limit: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AssetAliasPage {
+    pub(crate) revision: i64,
+    pub(crate) items: Vec<AssetAlias>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "format",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum AssetRepositoryAuthorityState {
+    Legacy,
+    Preparing {
+        migration_id: String,
+        source_revision: i64,
+    },
+    #[serde(rename = "v2")]
+    V2 {
+        migration_id: String,
+        compatibility_hash: String,
+    },
+}
+
+impl AssetRepositoryAuthorityState {
+    fn validate(&self) -> StoreResult<()> {
+        let migration_id = match self {
+            Self::Legacy => return Ok(()),
+            Self::Preparing {
+                migration_id,
+                source_revision,
+            } => {
+                if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(source_revision) {
+                    return Err(StoreError::Validation {
+                        message: "Asset repository sourceRevision is invalid".to_owned(),
+                    });
+                }
+                migration_id
+            }
+            Self::V2 {
+                migration_id,
+                compatibility_hash,
+            } => {
+                validate_hash(compatibility_hash, "Asset repository compatibilityHash")?;
+                migration_id
+            }
+        };
+        if migration_id.is_empty()
+            || migration_id.len() > 64
+            || !migration_id
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-'))
+        {
+            return Err(StoreError::Validation {
+                message: "Asset repository migrationId is invalid".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -439,6 +516,19 @@ fn validate_object_hash(hash: &Option<String>, subject: &str) -> StoreResult<()>
             message: format!(
                 "{subject} objectHash must be null or 64 lowercase hexadecimal characters"
             ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_hash(hash: &str, subject: &str) -> StoreResult<()> {
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(StoreError::Validation {
+            message: format!("{subject} must be 64 lowercase hexadecimal characters"),
         });
     }
     Ok(())
@@ -746,6 +836,10 @@ impl PersistentStore {
             "INSERT OR IGNORE INTO root (generation, value) VALUES (?1, ?2)",
             params!["revision-0", "{}"],
         )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO asset_repository_authority (generation, value) VALUES (?1, ?2)",
+            params!["revision-0", r#"{"format":"legacy"}"#],
+        )?;
         transaction.commit()?;
         export::sweep_abandoned(&snapshots_dir)?;
         #[cfg(feature = "native-kei-upload-pilot")]
@@ -859,6 +953,23 @@ impl PersistentStore {
         query::read_asset_alias(connection, kind, key, &target)
     }
 
+    pub(crate) fn list_asset_alias_page(
+        &self,
+        query_input: &AssetAliasListQuery,
+        lease: Option<&str>,
+    ) -> StoreResult<AssetAliasPage> {
+        let (connection, target) = self.read_view(lease)?;
+        query::list_asset_alias_page(connection, query_input, &target)
+    }
+
+    pub(crate) fn read_asset_repository_authority(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<Versioned<AssetRepositoryAuthorityState>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::read_asset_repository_authority(connection, &target)
+    }
+
     pub(crate) fn read_asset_owner_head(
         &self,
         owner: &AssetOwnerLocator,
@@ -934,6 +1045,15 @@ impl PersistentStore {
         commit::commit_asset_alias(&mut self.connection, alias, expected_revision)
     }
 
+    pub(crate) fn delete_asset_alias(
+        &mut self,
+        kind: &str,
+        key: &str,
+        expected_revision: i64,
+    ) -> StoreResult<RevisionResult> {
+        commit::delete_asset_alias(&mut self.connection, kind, key, expected_revision)
+    }
+
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {
         commit::replace_begin(&mut self.connection)
     }
@@ -964,6 +1084,14 @@ impl PersistentStore {
         heads: &[AssetOwnerHead],
     ) -> StoreResult<()> {
         commit::replace_put_asset_owner_heads(&mut self.connection, staging_id, heads)
+    }
+
+    pub(crate) fn replace_put_asset_repository_authority(
+        &mut self,
+        staging_id: &str,
+        authority: &AssetRepositoryAuthorityState,
+    ) -> StoreResult<()> {
+        commit::replace_put_asset_repository_authority(&mut self.connection, staging_id, authority)
     }
 
     pub(crate) fn replace_put_cold_aliases(

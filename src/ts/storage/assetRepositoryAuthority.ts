@@ -1,17 +1,7 @@
 import type { BlobStore } from './blobStore'
+import type { AssetRepositoryAuthorityState } from './persistentDataStore'
 
-export type AssetRepositoryAuthorityState =
-    | { format: 'legacy' }
-    | {
-        format: 'preparing'
-        migrationId: string
-        sourceRevision: number
-    }
-    | {
-        format: 'v2'
-        migrationId: string
-        compatibilityHash: string
-    }
+export type { AssetRepositoryAuthorityState } from './persistentDataStore'
 
 export type CompleteAssetRepositoryBlobStore = BlobStore & Required<Pick<BlobStore, 'putNewInlayImage'>>
 

@@ -30,10 +30,14 @@ describe('createMutationGatedPersistentDataStore', () => {
         const calls: string[] = []
         const gate = {
             runWrite: vi.fn(async <T>(operation: () => Promise<T>) => {
-                calls.push('gate')
+                calls.push('write-gate')
                 return operation()
             }),
             runKeyedWrite: vi.fn(async <T>(_key: string, operation: () => Promise<T>) => operation()),
+            runTransition: vi.fn(async <T>(operation: () => Promise<T>) => {
+                calls.push('transition-gate')
+                return operation()
+            }),
         } as StorageMutationGate
         const commit = {
             expectedRevision: 3,
@@ -59,8 +63,9 @@ describe('createMutationGatedPersistentDataStore', () => {
         await expect(gated.commit(commit)).resolves.toBe(commitResult)
         await expect(gated.replaceFromDatabase(database, 4)).resolves.toBe(replacementResult)
 
-        expect(calls).toEqual(['gate', 'commit', 'gate', 'replace'])
-        expect(gate.runWrite).toHaveBeenCalledTimes(2)
+        expect(calls).toEqual(['write-gate', 'commit', 'transition-gate', 'replace'])
+        expect(gate.runWrite).toHaveBeenCalledOnce()
+        expect(gate.runTransition).toHaveBeenCalledOnce()
     })
 
     it('reads and exports without acquiring the write gate', async () => {
@@ -89,6 +94,7 @@ describe('createMutationGatedPersistentDataStore', () => {
         const gate = {
             runWrite: <T>(operation: () => Promise<T>) => operation(),
             runKeyedWrite: <T>(_key: string, operation: () => Promise<T>) => operation(),
+            runTransition: <T>(operation: () => Promise<T>) => operation(),
         }
         const gated = createMutationGatedPersistentDataStore(store, gate)
 

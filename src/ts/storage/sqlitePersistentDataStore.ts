@@ -11,6 +11,8 @@ import {
     validateConversationWindowQuery,
     type AssetAlias,
     type AssetAliasIdentity,
+    type AssetAliasListQuery,
+    type AssetAliasPage,
     type AssetOwnerHead,
     type AssetOwnerLocator,
     type CharacterDetail,
@@ -21,6 +23,8 @@ import {
     type ConversationWindow,
     type ConversationWindowQuery,
     type DataRevision,
+    type AssetRepositoryAuthorityState,
+    type AssetRepositoryMigrationInput,
     type PersistentDataStore,
     type PersistentRevisionLease,
     type PersistentRoot,
@@ -32,6 +36,7 @@ import {
 
 const MAX_STAGED_CHARACTER_COUNT = 16
 const MAX_STAGED_CHARACTER_BYTES = 4 * 1024 * 1024
+const MAX_STAGED_ASSET_RECORDS = 512
 const textEncoder = new TextEncoder()
 
 interface NativeStoreError {
@@ -100,6 +105,14 @@ function characterBatches(
     return batches
 }
 
+function batches<T>(values: T[], limit: number): T[][] {
+    const output: T[][] = []
+    for (let index = 0; index < values.length; index += limit) {
+        output.push(values.slice(index, index + limit))
+    }
+    return output
+}
+
 export class SqlitePersistentDataStore implements PersistentDataStore {
     async open(): Promise<void> {
         await invokeStore<{ revision: DataRevision }>('pds_open')
@@ -155,6 +168,14 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_read_asset_alias', { ...identity })
     }
 
+    listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage> {
+        return invokeStore('pds_list_asset_aliases', { query })
+    }
+
+    readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>> {
+        return invokeStore('pds_read_asset_repository_authority', {})
+    }
+
     readAssetOwnerHead(
         owner: AssetOwnerLocator,
     ): Promise<Versioned<AssetOwnerHead> | null> {
@@ -166,6 +187,70 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         expectedRevision: DataRevision,
     ): Promise<{ revision: DataRevision }> {
         return invokeStore('pds_commit_asset_alias', { alias, expectedRevision })
+    }
+
+    deleteAssetAlias(
+        identity: AssetAliasIdentity,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        return invokeStore('pds_delete_asset_alias', { ...identity, expectedRevision })
+    }
+
+    async activateAssetRepositoryMigration(
+        input: AssetRepositoryMigrationInput,
+    ): Promise<{ revision: DataRevision }> {
+        const { stagingId } = await invokeStore<{ stagingId: string }>('pds_replace_begin')
+        try {
+            await invokeStore<void>('pds_replace_put_asset_repository_authority', {
+                stagingId,
+                authority: {
+                    format: 'preparing',
+                    migrationId: input.migrationId,
+                    sourceRevision: input.sourceRevision,
+                },
+            })
+            const { characters, botPresets, ...root } = input.database
+            await invokeStore<void>('pds_replace_put_root', { stagingId, root })
+            await invokeStore<void>('pds_replace_put_presets', {
+                stagingId,
+                presets: botPresets ?? [],
+            })
+            for (const batch of characterBatches(characters)) {
+                await invokeStore<void>('pds_replace_add_characters', {
+                    stagingId,
+                    characters: batch,
+                })
+            }
+            for (const aliases of batches(input.assetAliases, MAX_STAGED_ASSET_RECORDS)) {
+                await invokeStore<void>('pds_replace_put_asset_aliases', {
+                    stagingId,
+                    aliases,
+                })
+            }
+            for (const heads of batches(input.assetOwnerHeads, MAX_STAGED_ASSET_RECORDS)) {
+                await invokeStore<void>('pds_replace_put_asset_owner_heads', {
+                    stagingId,
+                    heads,
+                })
+            }
+            await invokeStore<void>('pds_replace_put_asset_repository_authority', {
+                stagingId,
+                authority: {
+                    format: 'v2',
+                    migrationId: input.migrationId,
+                    compatibilityHash: input.compatibilityHash,
+                },
+            })
+            return await invokeStore('pds_replace_commit', {
+                stagingId,
+                expectedRevision: input.sourceRevision,
+            })
+        } catch (error) {
+            try {
+                await invokeStore<void>('pds_replace_abort', { stagingId })
+            } catch {}
+            throw error
+        }
     }
 
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }> {
@@ -192,10 +277,10 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
                     characters: batch,
                 })
             }
-            if (assetAliases.length > 0) {
+            for (const aliases of batches(assetAliases, MAX_STAGED_ASSET_RECORDS)) {
                 await invokeStore<void>('pds_replace_put_asset_aliases', {
                     stagingId,
-                    aliases: assetAliases,
+                    aliases,
                 })
             }
             return await invokeStore('pds_replace_commit', {
@@ -277,6 +362,14 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             readAssetAlias: async (identity) => {
                 assertActive()
                 return invokeStore('pds_read_asset_alias', { ...identity, lease })
+            },
+            listAssetAliases: async (query) => {
+                assertActive()
+                return invokeStore('pds_list_asset_aliases', { query, lease })
+            },
+            readAssetRepositoryAuthority: async () => {
+                assertActive()
+                return invokeStore('pds_read_asset_repository_authority', { lease })
             },
             readAssetOwnerHead: async (owner) => {
                 assertActive()

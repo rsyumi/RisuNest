@@ -1,7 +1,7 @@
 use super::{
-    active_generation, current_revision, AssetAlias, AssetOwnerHead, AssetOwnerLocator, ColdAlias,
-    ConversationMutation, PluginStorageMutation, RevisionResult, StagingResult, StoreError,
-    StoreResult, WorkingSetCommit, GENERATION_TABLES,
+    active_generation, current_revision, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
+    AssetRepositoryAuthorityState, ColdAlias, ConversationMutation, PluginStorageMutation,
+    RevisionResult, StagingResult, StoreError, StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
 use std::collections::HashSet;
 
@@ -23,6 +23,32 @@ pub(super) fn commit_asset_alias(
     let revision = actual_revision + 1;
     let generation = writable_generation(&transaction, &active, revision)?;
     put_asset_alias(&transaction, &generation, alias)?;
+    set_active(&transaction, revision, &generation)?;
+    transaction.commit()?;
+    Ok(RevisionResult { revision })
+}
+
+pub(super) fn delete_asset_alias(
+    connection: &mut Connection,
+    kind: &str,
+    key: &str,
+    expected_revision: i64,
+) -> StoreResult<RevisionResult> {
+    super::query::validate_asset_kind(kind)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actual_revision = current_revision(&transaction)?;
+    if actual_revision != expected_revision {
+        return Err(StoreError::RevisionConflict {
+            expected: expected_revision,
+            actual: actual_revision,
+        });
+    }
+    let revision = actual_revision + 1;
+    let generation = active_generation(&transaction)?;
+    transaction.execute(
+        "DELETE FROM asset_aliases WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
+        params![generation, kind, key],
+    )?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })
@@ -262,6 +288,11 @@ pub(super) fn replace_begin(connection: &mut Connection) -> StoreResult<StagingR
     let staging_id = format!("staging-{}", uuid::Uuid::new_v4());
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     put_root(&transaction, &staging_id, &Value::Object(Map::new()))?;
+    put_asset_repository_authority(
+        &transaction,
+        &staging_id,
+        &AssetRepositoryAuthorityState::Legacy,
+    )?;
     transaction.commit()?;
     Ok(StagingResult { staging_id })
 }
@@ -349,14 +380,36 @@ pub(super) fn replace_put_asset_owner_heads(
     validate_staged_owner_heads(&database, heads)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
-    transaction.execute(
-        "DELETE FROM asset_owner_heads WHERE generation = ?1",
-        [staging_id],
-    )?;
     for head in heads {
         put_asset_owner_head(&transaction, staging_id, head)?;
     }
     transaction.commit()?;
+    Ok(())
+}
+
+pub(super) fn replace_put_asset_repository_authority(
+    connection: &mut Connection,
+    staging_id: &str,
+    authority: &AssetRepositoryAuthorityState,
+) -> StoreResult<()> {
+    authority.validate()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    put_asset_repository_authority(&transaction, staging_id, authority)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn put_asset_repository_authority(
+    transaction: &Transaction<'_>,
+    generation: &str,
+    authority: &AssetRepositoryAuthorityState,
+) -> StoreResult<()> {
+    transaction.execute(
+        "INSERT INTO asset_repository_authority (generation, value) VALUES (?1, ?2)
+         ON CONFLICT(generation) DO UPDATE SET value = excluded.value",
+        params![generation, serde_json::to_string(authority)?],
+    )?;
     Ok(())
 }
 
@@ -519,6 +572,7 @@ pub(super) fn replace_commit_with_app_kv(
         .transpose()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_staging(&transaction, staging_id)?;
+    require_activatable_authority(&transaction, staging_id)?;
     let actual_revision = current_revision(&transaction)?;
     if let Some(expected) = expected_revision {
         if expected != actual_revision {
@@ -552,6 +606,7 @@ pub(super) fn validate_replace_commit(
     expected_revision: Option<i64>,
 ) -> StoreResult<i64> {
     require_staging(connection, staging_id)?;
+    require_activatable_authority(connection, staging_id)?;
     let actual_revision = current_revision(connection)?;
     if let Some(expected) = expected_revision {
         if expected != actual_revision {
@@ -562,6 +617,28 @@ pub(super) fn validate_replace_commit(
         }
     }
     Ok(actual_revision)
+}
+
+fn require_activatable_authority(connection: &Connection, staging_id: &str) -> StoreResult<()> {
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM asset_repository_authority WHERE generation = ?1",
+            [staging_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let authority = match stored {
+        Some(stored) => serde_json::from_str(&stored)
+            .map_err(|_| validation("Asset repository authority state is invalid"))?,
+        None => AssetRepositoryAuthorityState::Legacy,
+    };
+    authority.validate()?;
+    if matches!(authority, AssetRepositoryAuthorityState::Preparing { .. }) {
+        return Err(validation(
+            "Asset repository preparing generation cannot be activated",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn replace_abort(connection: &mut Connection, staging_id: &str) -> StoreResult<()> {

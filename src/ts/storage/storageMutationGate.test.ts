@@ -76,6 +76,46 @@ describe('storage mutation gate', () => {
         await Promise.all([firstWrite, secondWrite])
     })
 
+    test('does not interleave authority transitions with BlobStore writes', async () => {
+        const locks = createInRealmStorageLockManager()
+        const writer = createStorageMutationGate({ locks })
+        const transitioner = createStorageMutationGate({ locks })
+        const writeRelease = deferred()
+        const transitionRelease = deferred()
+        const events: string[] = []
+
+        const write = writer.runKeyedWrite('assets/a', async () => {
+            events.push('write-start')
+            await writeRelease.promise
+            events.push('write-end')
+        })
+        const transition = transitioner.runTransition(async () => {
+            events.push('transition-start')
+            await transitionRelease.promise
+            events.push('transition-end')
+        })
+        const laterWrite = writer.runKeyedWrite('assets/b', async () => {
+            events.push('later-write')
+        })
+
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(events).toEqual(['write-start'])
+        writeRelease.resolve()
+        await write
+        await Promise.resolve()
+        expect(events).toEqual(['write-start', 'write-end', 'transition-start'])
+        transitionRelease.resolve()
+        await Promise.all([transition, laterWrite])
+        expect(events).toEqual([
+            'write-start',
+            'write-end',
+            'transition-start',
+            'transition-end',
+            'later-write',
+        ])
+    })
+
     test('releases the lock when a write throws synchronously', async () => {
         const gate = createStorageMutationGate({ locks: createInRealmStorageLockManager() })
         const error = new Error('synchronous failure')

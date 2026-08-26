@@ -120,6 +120,7 @@ describe('platform BlobStore', () => {
                 events.push('lock')
                 return operation()
             },
+            async runTransition<T>(operation: () => Promise<T>) { return operation() },
         }
         const store = createGatedBlobStore(createBackedBlobStore(backend), gate)
         const metadata = { kind: 'asset' as const, mime: 'application/octet-stream', name: 'a', ext: '' }
@@ -147,6 +148,7 @@ describe('platform BlobStore', () => {
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
             async runKeyedWrite<T>(_key: string, operation: () => Promise<T>) { await blocked; return operation() },
+            async runTransition<T>(operation: () => Promise<T>) { return operation() },
         }
         const backing = createBackedBlobStore(backend)
         const store = createGatedBlobStore(backing, gate)
@@ -175,6 +177,7 @@ describe('platform BlobStore', () => {
         const gated = createGatedBlobStore(store, {
             async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
             async runKeyedWrite<T>(_key: string, operation: () => Promise<T>) { await blocked; return operation() },
+            async runTransition<T>(operation: () => Promise<T>) { return operation() },
         })
         const source = Uint8Array.of(4, 5)
         const input = { name: 'original.png' }

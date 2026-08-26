@@ -44,6 +44,13 @@ pub(crate) struct InlayImageMetadata {
     height: u32,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EncodedInlayImage {
+    data: Vec<u8>,
+    metadata: InlayImageMetadata,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InlayWriteTransaction {
@@ -800,54 +807,10 @@ fn write_inlay_image_with_suffix(
     name: &str,
     suffix: String,
 ) -> Result<InlayImageMetadata, String> {
-    if id.is_empty() || id.starts_with("assets/") {
-        return Err("invalid Inlay image id".to_owned());
-    }
-    let format = image::guess_format(data)
-        .map_err(|error| format!("unsupported Inlay image format: {error}"))?;
-    if !matches!(
-        format,
-        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
-    ) {
-        return Err(format!("unsupported new Inlay image format: {format:?}"));
-    }
-    if format == ImageFormat::WebP
-        && webp::BitstreamFeatures::new(data).is_some_and(|features| features.has_animation())
-    {
-        return Err("animated WebP Inlay images are unsupported".to_owned());
-    }
-    if format == ImageFormat::Png
-        && PngDecoder::new(Cursor::new(data))
-            .map_err(|error| format!("failed to inspect PNG Inlay image: {error}"))?
-            .is_apng()
-            .map_err(|error| format!("failed to inspect PNG animation: {error}"))?
-    {
-        return Err("APNG Inlay images are unsupported".to_owned());
-    }
-
-    let reader = ImageReader::new(Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|error| format!("failed to inspect Inlay image: {error}"))?;
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut decoded = DynamicImage::from_decoder(decoder)
-        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
-    decoded.apply_orientation(orientation);
-    let rgba = decoded.to_rgba8();
-    let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height()).encode(85.0);
-    let metadata = InlayImageMetadata {
-        key: id.to_owned(),
-        kind: "inlay".to_owned(),
-        size: encoded.len() as u64,
-        mime: "image/webp".to_owned(),
-        name: name.to_owned(),
-        ext: "webp".to_owned(),
-        inlay_type: "image".to_owned(),
-        width: rgba.width(),
-        height: rgba.height(),
-    };
+    let EncodedInlayImage {
+        data: encoded,
+        metadata,
+    } = encode_inlay_image(id, data, name)?;
     let metadata_bytes = serde_json::to_vec(&metadata)
         .map_err(|error| format!("failed to encode Inlay metadata: {error}"))?;
     let encoded_id = hex::encode(id.as_bytes());
@@ -936,6 +899,74 @@ fn write_inlay_image_with_suffix(
     recover_inlay_transaction(root, &transaction_path)
         .map_err(|error| format!("failed to durably commit Inlay transaction: {error}"))?;
     Ok(metadata)
+}
+
+fn encode_inlay_image(id: &str, data: &[u8], name: &str) -> Result<EncodedInlayImage, String> {
+    if id.is_empty() || id.starts_with("assets/") {
+        return Err("invalid Inlay image id".to_owned());
+    }
+    let format = image::guess_format(data)
+        .map_err(|error| format!("unsupported Inlay image format: {error}"))?;
+    if !matches!(
+        format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
+    ) {
+        return Err(format!("unsupported new Inlay image format: {format:?}"));
+    }
+    if format == ImageFormat::WebP
+        && webp::BitstreamFeatures::new(data).is_some_and(|features| features.has_animation())
+    {
+        return Err("animated WebP Inlay images are unsupported".to_owned());
+    }
+    if format == ImageFormat::Png
+        && PngDecoder::new(Cursor::new(data))
+            .map_err(|error| format!("failed to inspect PNG Inlay image: {error}"))?
+            .is_apng()
+            .map_err(|error| format!("failed to inspect PNG animation: {error}"))?
+    {
+        return Err("APNG Inlay images are unsupported".to_owned());
+    }
+
+    let reader = ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| format!("failed to inspect Inlay image: {error}"))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut decoded = DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("failed to decode Inlay image: {error}"))?;
+    decoded.apply_orientation(orientation);
+    let rgba = decoded.to_rgba8();
+    let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+        .encode(85.0)
+        .to_vec();
+    let metadata = InlayImageMetadata {
+        key: id.to_owned(),
+        kind: "inlay".to_owned(),
+        size: encoded.len() as u64,
+        mime: "image/webp".to_owned(),
+        name: name.to_owned(),
+        ext: "webp".to_owned(),
+        inlay_type: "image".to_owned(),
+        width: rgba.width(),
+        height: rgba.height(),
+    };
+    Ok(EncodedInlayImage {
+        data: encoded,
+        metadata,
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) async fn native_media_encode_inlay_image(
+    id: String,
+    data: Vec<u8>,
+    name: String,
+) -> Result<EncodedInlayImage, String> {
+    tauri::async_runtime::spawn_blocking(move || encode_inlay_image(&id, &data, &name))
+        .await
+        .map_err(|error| format!("failed to join native Inlay image encoder: {error}"))?
 }
 
 #[tauri::command(async)]

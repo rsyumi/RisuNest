@@ -1,6 +1,7 @@
 export interface StorageMutationGate {
     runWrite<T>(operation: () => Promise<T>): Promise<T>
     runKeyedWrite<T>(key: string, operation: () => Promise<T>): Promise<T>
+    runTransition<T>(operation: () => Promise<T>): Promise<T>
 }
 
 export interface StorageLockManager {
@@ -79,5 +80,7 @@ export function createStorageMutationGate(options: {
         runKeyedWrite: (key, operation) =>
             locks.request('risuai-persistent-storage', { mode: 'shared' }, () =>
                 locks.request(`risuai-blob:${key}`, { mode: 'exclusive' }, operation)),
+        runTransition: (operation) =>
+            locks.request('risuai-persistent-storage', { mode: 'exclusive' }, operation),
     }
 }

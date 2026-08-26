@@ -2,6 +2,8 @@ import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
     AssetAlias,
     AssetAliasIdentity,
+    AssetAliasListQuery,
+    AssetAliasPage,
     AssetOwnerHead,
     AssetOwnerLocator,
     CharacterDetail,
@@ -15,6 +17,8 @@ import type {
     ConversationWindow,
     ConversationWindowQuery,
     DataRevision,
+    AssetRepositoryAuthorityState,
+    AssetRepositoryMigrationInput,
     PersistentDataStore,
     PersistentRevisionLease,
     PersistentRoot,
@@ -34,8 +38,9 @@ import {
     validateConversationWindowQuery,
     validateAssetOwnerHead,
 } from './persistentDataStore'
+import { parseAssetRepositoryAuthorityState } from './assetRepositoryAuthority'
 
-const DATABASE_VERSION = 10
+const DATABASE_VERSION = 11
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
@@ -50,6 +55,7 @@ const INDEXED_GENERATION_STORE_NAMES = [
     'pluginStorageMetadata',
     'assetAliases',
     'assetOwnerHeads',
+    'assetRepositoryAuthority',
 ] as const
 const DATA_STORE_NAMES = ['root', ...INDEXED_GENERATION_STORE_NAMES] as const
 const STORE_NAMES = ['meta', ...DATA_STORE_NAMES] as const
@@ -351,7 +357,17 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             )
             this.createIndex(transaction.objectStore('assetAliases'), 'byGeneration', 'generation')
             this.createIndex(
+                transaction.objectStore('assetAliases'),
+                'byGenerationKindKey',
+                ['generation', 'value.kind', 'value.key'],
+            )
+            this.createIndex(
                 transaction.objectStore('assetOwnerHeads'),
+                'byGeneration',
+                'generation',
+            )
+            this.createIndex(
+                transaction.objectStore('assetRepositoryAuthority'),
                 'byGeneration',
                 'generation',
             )
@@ -367,6 +383,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (event.oldVersion >= 8 && event.oldVersion < 10) {
                 this.migrateAssetAliasKeys(transaction)
             }
+            if (event.oldVersion > 0 && event.oldVersion < 11) {
+                this.backfillAssetRepositoryAuthority(transaction)
+            }
         }
         this.database = await requestResult(request)
         this.database.onversionchange = () => {
@@ -374,7 +393,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             this.database = undefined
         }
 
-        const transaction = this.database.transaction(['meta', 'root'], 'readwrite')
+        const transaction = this.database.transaction(
+            ['meta', 'root', 'assetRepositoryAuthority'],
+            'readwrite',
+        )
         const meta = transaction.objectStore('meta')
         const currentRevision = await requestResult(meta.get('currentRevision'))
         meta.put({ key: 'schemaVersion', value: DATABASE_VERSION })
@@ -383,6 +405,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             meta.put({ key: 'activeGeneration', value: generation })
             meta.put({ key: 'currentRevision', value: 0 })
             transaction.objectStore('root').put({ key: generation, generation, value: {} })
+            this.putAssetRepositoryAuthority(transaction, generation, { format: 'legacy' })
         }
         await transactionDone(transaction)
         await this.sweepTemporaryGenerations()
@@ -477,6 +500,25 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.readAssetAliasFromTransaction(transaction, revision, generation, identity)
     }
 
+    async listAssetAliases(input: AssetAliasListQuery): Promise<AssetAliasPage> {
+        const transaction = this.requireDatabase().transaction(['meta', 'assetAliases'], 'readonly')
+        const { revision, generation } = await this.readActive(transaction)
+        return this.listAssetAliasesFromTransaction(transaction, revision, generation, input)
+    }
+
+    async readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>> {
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'assetRepositoryAuthority'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readAssetRepositoryAuthorityFromTransaction(
+            transaction,
+            revision,
+            generation,
+        )
+    }
+
     async readAssetOwnerHead(
         owner: AssetOwnerLocator,
     ): Promise<Versioned<AssetOwnerHead> | null> {
@@ -510,6 +552,88 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 generation,
                 value: structuredClone(alias),
             } satisfies StoredRecord<AssetAlias>)
+            this.setActive(transaction, revision, generation)
+            await transactionDone(transaction)
+            return { revision }
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async deleteAssetAlias(
+        identity: AssetAliasIdentity,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        validateAssetAliasIdentity(identity)
+        const transaction = this.requireDatabase().transaction([...STORE_NAMES], 'readwrite')
+        try {
+            const active = await this.readActive(transaction)
+            if (active.revision !== expectedRevision) {
+                throw new RevisionConflictError(expectedRevision, active.revision)
+            }
+            const revision = active.revision + 1
+            const generation = await this.ensureWritableGeneration(
+                transaction,
+                active.generation,
+                revision,
+            )
+            transaction.objectStore('assetAliases').delete(
+                this.assetAliasKey(generation, identity.kind, identity.key),
+            )
+            this.setActive(transaction, revision, generation)
+            await transactionDone(transaction)
+            return { revision }
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async activateAssetRepositoryMigration(
+        input: AssetRepositoryMigrationInput,
+    ): Promise<{ revision: DataRevision }> {
+        const authority = parseAssetRepositoryAuthorityState({
+            format: 'v2',
+            migrationId: input.migrationId,
+            compatibilityHash: input.compatibilityHash,
+        })
+        for (const alias of input.assetAliases) validateAssetAlias(alias)
+        const { characters, botPresets: _botPresets, pluginCustomStorage: _pluginStorage, ...root } =
+            input.database
+        const characterDetails = characters.map(({ chats: _chats, ...detail }) => detail)
+        validateOwnerHeadsForCommit({
+            expectedRevision: input.sourceRevision,
+            root,
+            characterDetails,
+            assetOwnerHeads: input.assetOwnerHeads,
+        })
+
+        const transaction = this.requireDatabase().transaction([...STORE_NAMES], 'readwrite')
+        try {
+            const active = await this.readActive(transaction)
+            if (active.revision !== input.sourceRevision) {
+                throw new RevisionConflictError(input.sourceRevision, active.revision)
+            }
+            const revision = active.revision + 1
+            const generation = this.generationFor(revision)
+            await this.stageDatabase(transaction, input.database, generation, input.assetAliases)
+            this.putAssetRepositoryAuthority(transaction, generation, {
+                format: 'preparing',
+                migrationId: input.migrationId,
+                sourceRevision: input.sourceRevision,
+            })
+            for (const head of input.assetOwnerHeads) {
+                this.putAssetOwnerHead(transaction, generation, head)
+            }
+            this.putAssetRepositoryAuthority(transaction, generation, authority)
+            if (!(await this.generationIsLeased(transaction, active.generation))) {
+                await this.deleteGenerationFromTransaction(transaction, active.generation)
+            }
             this.setActive(transaction, revision, generation)
             await transactionDone(transaction)
             return { revision }
@@ -909,6 +1033,33 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     identity,
                 )
             },
+            listAssetAliases: async (input) => {
+                assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'assetAliases'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                return this.listAssetAliasesFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                    input,
+                )
+            },
+            readAssetRepositoryAuthority: async () => {
+                assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'assetRepositoryAuthority'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                return this.readAssetRepositoryAuthorityFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                )
+            },
             readAssetOwnerHead: async (owner) => {
                 assertActive()
                 const transaction = this.requireDatabase().transaction(
@@ -993,6 +1144,99 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return { revision, value: structuredClone(record.value) }
     }
 
+    private async listAssetAliasesFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+        input: AssetAliasListQuery,
+    ): Promise<AssetAliasPage> {
+        if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 512) {
+            throw new TypeError('Asset alias page limit must be between 1 and 512')
+        }
+        if (input.kind !== undefined && input.kind !== 'asset' && input.kind !== 'inlay') {
+            throw new TypeError('Asset alias kind is invalid')
+        }
+        let cursorIdentity: AssetAliasIdentity | undefined
+        if (input.cursor !== undefined) {
+            try {
+                const decoded = JSON.parse(input.cursor) as unknown
+                if (!Array.isArray(decoded) || decoded.length !== 2) throw new TypeError()
+                cursorIdentity = { kind: decoded[0], key: decoded[1] } as AssetAliasIdentity
+                validateAssetAliasIdentity(cursorIdentity)
+            } catch {
+                throw new TypeError('Asset alias cursor is invalid')
+            }
+            if (input.kind !== undefined && cursorIdentity.kind !== input.kind) {
+                throw new TypeError('Asset alias cursor kind does not match the query')
+            }
+        }
+        const startKind = cursorIdentity?.kind ?? input.kind ?? 'asset'
+        const startKey = cursorIdentity?.key ?? ''
+        const range = this.keyRangeFactory.lowerBound(
+            [generation, startKind, startKey],
+            cursorIdentity !== undefined,
+        )
+        const items = await new Promise<AssetAlias[]>((resolve, reject) => {
+            const collected: AssetAlias[] = []
+            const request = transaction
+                .objectStore('assetAliases')
+                .index('byGenerationKindKey')
+                .openCursor(range)
+            request.onerror = () => reject(request.error)
+            request.onsuccess = () => {
+                const cursor = request.result
+                if (!cursor) {
+                    resolve(collected)
+                    return
+                }
+                const [recordGeneration, recordKind] = cursor.key as [string, string, string]
+                if (
+                    recordGeneration !== generation
+                    || (input.kind !== undefined && recordKind !== input.kind)
+                ) {
+                    resolve(collected)
+                    return
+                }
+                const alias = (cursor.value as StoredRecord<AssetAlias>).value
+                validateAssetAlias(alias)
+                collected.push(structuredClone(alias))
+                if (collected.length > input.limit) {
+                    resolve(collected)
+                    return
+                }
+                cursor.continue()
+            }
+        })
+        await transactionDone(transaction)
+        if (items.length <= input.limit) return { revision, items }
+        const pageItems = items.slice(0, input.limit)
+        const last = pageItems[pageItems.length - 1]
+        return {
+            revision,
+            items: pageItems,
+            nextCursor: JSON.stringify([last.kind, last.key]),
+        }
+    }
+
+    private async readAssetRepositoryAuthorityFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+    ): Promise<Versioned<AssetRepositoryAuthorityState>> {
+        const record = (await requestResult(
+            transaction.objectStore('assetRepositoryAuthority').get(generation),
+        )) as StoredRecord<AssetRepositoryAuthorityState> | undefined
+        await transactionDone(transaction)
+        if (!record) return { revision, value: { format: 'legacy' } }
+        if (record.generation !== generation) {
+            throw new Error('Persistent asset repository authority marker generation is invalid')
+        }
+        return {
+            revision,
+            value: parseAssetRepositoryAuthorityState(record.value),
+        }
+    }
+
     private async readAssetOwnerHeadFromTransaction(
         transaction: IDBTransaction,
         revision: DataRevision,
@@ -1042,13 +1286,33 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             )
         }
         for (const head of input.assetOwnerHeads ?? []) {
-            const ownerKey = assetOwnerLocatorKey(head.owner)
-            store.put({
-                key: this.assetOwnerHeadKey(generation, ownerKey),
-                generation,
-                value: structuredClone(head),
-            } satisfies StoredRecord<AssetOwnerHead>)
+            this.putAssetOwnerHead(transaction, generation, head)
         }
+    }
+
+    private putAssetOwnerHead(
+        transaction: IDBTransaction,
+        generation: string,
+        head: AssetOwnerHead,
+    ): void {
+        const ownerKey = assetOwnerLocatorKey(head.owner)
+        transaction.objectStore('assetOwnerHeads').put({
+            key: this.assetOwnerHeadKey(generation, ownerKey),
+            generation,
+            value: structuredClone(head),
+        } satisfies StoredRecord<AssetOwnerHead>)
+    }
+
+    private putAssetRepositoryAuthority(
+        transaction: IDBTransaction,
+        generation: string,
+        authority: AssetRepositoryAuthorityState,
+    ): void {
+        transaction.objectStore('assetRepositoryAuthority').put({
+            key: generation,
+            generation,
+            value: structuredClone(authority),
+        } satisfies StoredRecord<AssetRepositoryAuthorityState>)
     }
 
     private deleteAssetOwnerHeadKind(
@@ -1363,6 +1627,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const conversationIds = new Set<string>()
         const { characters, botPresets, pluginCustomStorage, ...root } = databaseValue
         this.putRoot(transaction, generation, root)
+        this.putAssetRepositoryAuthority(transaction, generation, { format: 'legacy' })
         this.writePresetRows(transaction, generation, botPresets ?? [])
         this.writePluginStorageRows(transaction, generation, pluginCustomStorage ?? {})
         for (const alias of assetAliases) {
@@ -2317,6 +2582,40 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             validateAssetAlias(record.value)
             records.push(record)
             cursor.delete()
+            cursor.continue()
+        }
+    }
+
+    private backfillAssetRepositoryAuthority(transaction: IDBTransaction): void {
+        const authority = transaction.objectStore('assetRepositoryAuthority')
+        const generations = new Set<string>()
+        const request = transaction.objectStore('meta').openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) {
+                for (const generation of generations) {
+                    authority.put({
+                        key: generation,
+                        generation,
+                        value: { format: 'legacy' },
+                    } satisfies StoredRecord<AssetRepositoryAuthorityState>)
+                }
+                return
+            }
+            const record = cursor.value as { key: string; value: unknown }
+            if (record.key === 'activeGeneration' && typeof record.value === 'string') {
+                generations.add(record.value)
+            } else if (record.key.startsWith('snapshotLease:')) {
+                if (typeof record.value === 'string') {
+                    generations.add(record.value)
+                } else if (
+                    record.value !== null
+                    && typeof record.value === 'object'
+                    && typeof (record.value as { generation?: unknown }).generation === 'string'
+                ) {
+                    generations.add((record.value as { generation: string }).generation)
+                }
+            }
             cursor.continue()
         }
     }

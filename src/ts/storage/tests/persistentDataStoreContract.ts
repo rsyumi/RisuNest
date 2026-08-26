@@ -494,6 +494,182 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             await lease.release()
         })
 
+        it('pages and deletes typed aliases without changing the pinned generation', async () => {
+            const { store } = await createHarness()
+            const sharedKey = 'shared/catalog-key'
+            const asset: AssetAlias = {
+                key: sharedKey,
+                objectHash: '12'.repeat(32),
+                kind: 'asset',
+                size: 1,
+                mime: 'application/octet-stream',
+                name: 'Asset',
+                ext: 'bin',
+            }
+            const inlay: AssetAlias = {
+                key: sharedKey,
+                objectHash: '34'.repeat(32),
+                kind: 'inlay',
+                size: 1,
+                mime: 'audio/ogg',
+                name: 'Inlay',
+                ext: 'ogg',
+                inlayType: 'audio',
+            }
+            const imported = await store.replaceFromDatabase(
+                structuredClone(fixtureDatabase),
+                undefined,
+                [inlay, asset],
+            )
+            const lease = await store.acquireRevision(imported.revision)
+
+            const first = await store.listAssetAliases({ limit: 1 })
+            expect(first).toEqual({
+                revision: imported.revision,
+                items: [asset],
+                nextCursor: expect.any(String),
+            })
+            expect(await store.listAssetAliases({
+                limit: 1,
+                cursor: first.nextCursor,
+            })).toEqual({ revision: imported.revision, items: [inlay] })
+            expect(await lease.listAssetAliases({ kind: 'asset', limit: 4 })).toEqual({
+                revision: imported.revision,
+                items: [asset],
+            })
+
+            const deleted = await store.deleteAssetAlias(
+                { kind: 'asset', key: sharedKey },
+                imported.revision,
+            )
+            expect(await store.readAssetAlias({ kind: 'asset', key: sharedKey })).toBeNull()
+            expect(await store.readAssetAlias({ kind: 'inlay', key: sharedKey })).toEqual({
+                revision: deleted.revision,
+                value: inlay,
+            })
+            expect(await lease.readAssetAlias({ kind: 'asset', key: sharedKey })).toEqual({
+                revision: imported.revision,
+                value: asset,
+            })
+            await lease.release()
+        })
+
+        it('activates DB, aliases, owner heads, and v2 authority in one revision', async () => {
+            const { store, reopen } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            database.modules = [{
+                id: 'migration-module',
+                name: 'Migration module',
+                description: '',
+                assets: [['asset', 'assets/migrated.bin', 'BIN']],
+            }]
+            const initial = await store.replaceFromDatabase(database)
+            const lease = await store.acquireRevision(initial.revision)
+            const alias: AssetAlias = {
+                key: 'assets/migrated.bin',
+                objectHash: '56'.repeat(32),
+                kind: 'asset',
+                size: 3,
+                mime: 'application/octet-stream',
+                name: 'Migrated',
+                ext: 'BIN',
+            }
+            const head: AssetOwnerHead = {
+                owner: { kind: 'root-module-assets', index: 0 },
+                present: true,
+                manifestHash: '78'.repeat(32),
+                entryCount: 1,
+            }
+
+            expect(await store.readAssetRepositoryAuthority()).toEqual({
+                revision: initial.revision,
+                value: { format: 'legacy' },
+            })
+            const activated = await store.activateAssetRepositoryMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'migration-atomic',
+                compatibilityHash: '9a'.repeat(32),
+                database,
+                assetAliases: [alias],
+                assetOwnerHeads: [head],
+            })
+
+            expect(await store.readAssetRepositoryAuthority()).toEqual({
+                revision: activated.revision,
+                value: {
+                    format: 'v2',
+                    migrationId: 'migration-atomic',
+                    compatibilityHash: '9a'.repeat(32),
+                },
+            })
+            expect(await store.readAssetAlias({ kind: 'asset', key: alias.key })).toEqual({
+                revision: activated.revision,
+                value: alias,
+            })
+            expect(await store.readAssetOwnerHead(head.owner)).toEqual({
+                revision: activated.revision,
+                value: head,
+            })
+            expect(await lease.readAssetRepositoryAuthority()).toEqual({
+                revision: initial.revision,
+                value: { format: 'legacy' },
+            })
+            expect(await lease.readAssetAlias({ kind: 'asset', key: alias.key })).toBeNull()
+            await lease.release()
+
+            const reopened = await reopen()
+            expect(await reopened.readAssetRepositoryAuthority()).toEqual({
+                revision: activated.revision,
+                value: {
+                    format: 'v2',
+                    migrationId: 'migration-atomic',
+                    compatibilityHash: '9a'.repeat(32),
+                },
+            })
+        })
+
+        it('rolls back a rejected or stale migration without exposing preparing authority', async () => {
+            const { store } = await createHarness()
+            const database = structuredClone(fixtureDatabase)
+            const initial = await store.replaceFromDatabase(database)
+            const invalidHead = {
+                owner: { kind: 'root-module-assets', index: 0 },
+                present: true,
+                manifestHash: 'invalid',
+                entryCount: 0,
+            } as unknown as AssetOwnerHead
+
+            await expect(store.activateAssetRepositoryMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'migration-invalid',
+                compatibilityHash: 'ab'.repeat(32),
+                database,
+                assetAliases: [],
+                assetOwnerHeads: [invalidHead],
+            })).rejects.toThrow('manifestHash')
+            expect(await store.readAssetRepositoryAuthority()).toEqual({
+                revision: initial.revision,
+                value: { format: 'legacy' },
+            })
+
+            const changed = await store.commit({
+                expectedRevision: initial.revision,
+                root: { ...(await store.readRoot()).value, username: 'changed' },
+            })
+            await expect(store.activateAssetRepositoryMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'migration-stale',
+                compatibilityHash: 'cd'.repeat(32),
+                database,
+                assetAliases: [],
+                assetOwnerHeads: [],
+            })).rejects.toBeInstanceOf(RevisionConflictError)
+            expect(await store.readAssetRepositoryAuthority()).toEqual({
+                revision: changed.revision,
+                value: { format: 'legacy' },
+            })
+        })
+
         it('activates staged zero-byte and missing-payload aliases across reopen', async () => {
             const { store, reopen } = await createHarness()
             const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

@@ -2,10 +2,11 @@ use super::export::ExportedRisuSave;
 #[cfg(feature = "native-kei-upload-pilot")]
 use super::kei::KeiUploadResult;
 use super::{
-    AssetAlias, AssetOwnerHead, AssetOwnerLocator, CharacterPage, CharacterQuery, CheckpointMode,
-    ConversationPage, ConversationQuery, ConversationWindow, ConversationWindowQuery, LeaseResult,
-    PersistentStore, PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated,
-    SnapshotInfo, StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
+    AssetAlias, AssetAliasListQuery, AssetAliasPage, AssetOwnerHead, AssetOwnerLocator,
+    AssetRepositoryAuthorityState, CharacterPage, CharacterQuery, CheckpointMode, ConversationPage,
+    ConversationQuery, ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore,
+    PluginStorageCatalog, PresetCatalog, RevisionResult, SnapshotCreated, SnapshotInfo,
+    StagingResult, StoreError, StoreResult, Versioned, WorkingSetCommit,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -220,6 +221,27 @@ pub(crate) fn pds_read_asset_alias(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_list_asset_aliases(
+    state: State<'_, PersistentStoreState>,
+    query: AssetAliasListQuery,
+    lease: Option<String>,
+) -> Result<AssetAliasPage, StoreError> {
+    with_store(state, |store| {
+        store.list_asset_alias_page(&query, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_read_asset_repository_authority(
+    state: State<'_, PersistentStoreState>,
+    lease: Option<String>,
+) -> Result<Versioned<AssetRepositoryAuthorityState>, StoreError> {
+    with_store(state, |store| {
+        store.read_asset_repository_authority(lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_read_asset_owner_head(
     state: State<'_, PersistentStoreState>,
     owner: AssetOwnerLocator,
@@ -238,6 +260,18 @@ pub(crate) fn pds_commit_asset_alias(
 ) -> Result<RevisionResult, StoreError> {
     with_store_mut(state, |store| {
         store.commit_asset_alias(&alias, expected_revision)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_delete_asset_alias(
+    state: State<'_, PersistentStoreState>,
+    kind: String,
+    key: String,
+    expected_revision: i64,
+) -> Result<RevisionResult, StoreError> {
+    with_store_mut(state, |store| {
+        store.delete_asset_alias(&kind, &key, expected_revision)
     })
 }
 
@@ -298,6 +332,28 @@ pub(crate) fn pds_replace_put_asset_aliases(
 ) -> Result<(), StoreError> {
     with_store_mut(state, |store| {
         store.replace_put_asset_aliases(&staging_id, &aliases)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_replace_put_asset_owner_heads(
+    state: State<'_, PersistentStoreState>,
+    staging_id: String,
+    heads: Vec<AssetOwnerHead>,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store.replace_put_asset_owner_heads(&staging_id, &heads)
+    })
+}
+
+#[tauri::command(async)]
+pub(crate) fn pds_replace_put_asset_repository_authority(
+    state: State<'_, PersistentStoreState>,
+    staging_id: String,
+    authority: AssetRepositoryAuthorityState,
+) -> Result<(), StoreError> {
+    with_store_mut(state, |store| {
+        store.replace_put_asset_repository_authority(&staging_id, &authority)
     })
 }
 

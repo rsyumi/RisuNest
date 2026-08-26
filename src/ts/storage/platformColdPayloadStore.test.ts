@@ -76,6 +76,7 @@ describe('platform cold payload storage', () => {
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) { events.push('lock'); return operation() },
             async runKeyedWrite<T>(_key: string, operation: () => Promise<T>) { return operation() },
+            async runTransition<T>(operation: () => Promise<T>) { return operation() },
         }
         const store = createGatedColdPayloadStore(legacy, gate)
 
@@ -101,6 +102,7 @@ describe('platform cold payload storage', () => {
         const gate = {
             async runWrite<T>(operation: () => Promise<T>) { await blocked; return operation() },
             async runKeyedWrite<T>(_key: string, operation: () => Promise<T>) { return operation() },
+            async runTransition<T>(operation: () => Promise<T>) { return operation() },
         }
         const store = createGatedColdPayloadStore(legacy, gate)
         const source = new Uint8Array([1])

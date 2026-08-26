@@ -1,7 +1,8 @@
 use super::{
-    AssetAlias, AssetOwnerHead, AssetOwnerLocator, CharacterQuery, CheckpointMode, ColdAlias,
-    ConversationMutation, ConversationPage, ConversationQuery, ConversationWindowQuery,
-    PersistentStore, PluginStorageMutation, QueryOrder, StoreError, WorkingSetCommit,
+    AssetAlias, AssetAliasListQuery, AssetOwnerHead, AssetOwnerLocator,
+    AssetRepositoryAuthorityState, CharacterQuery, CheckpointMode, ColdAlias, ConversationMutation,
+    ConversationPage, ConversationQuery, ConversationWindowQuery, PersistentStore,
+    PluginStorageMutation, QueryOrder, StoreError, WorkingSetCommit,
 };
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::{json, Value};
@@ -661,6 +662,156 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
             .expect("cold alias exists")
             .value,
         cold
+    );
+}
+
+#[test]
+fn alias_catalog_pages_and_deletes_only_the_typed_alias() {
+    let directory = tempfile::tempdir().expect("create alias catalog directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin staged replacement");
+    let key = "shared/catalog-key";
+    let asset = AssetAlias {
+        key: key.to_owned(),
+        object_hash: Some("31".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 1,
+        mime: "application/octet-stream".to_owned(),
+        name: "Asset".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let inlay = AssetAlias {
+        key: key.to_owned(),
+        object_hash: Some("32".repeat(32)),
+        kind: "inlay".to_owned(),
+        size: 2,
+        mime: "image/webp".to_owned(),
+        name: "Inlay".to_owned(),
+        ext: "webp".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: Some(1),
+        height: Some(1),
+        metadata: json!({}),
+    };
+    store
+        .replace_put_asset_aliases(&staging.staging_id, &[inlay.clone(), asset.clone()])
+        .expect("stage aliases");
+    let imported = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate aliases");
+    let lease = store
+        .acquire_revision(imported.revision)
+        .expect("pin aliases");
+
+    let first = store
+        .list_asset_alias_page(
+            &AssetAliasListQuery {
+                kind: None,
+                limit: 1,
+                cursor: None,
+            },
+            None,
+        )
+        .expect("list first alias page");
+    assert_eq!(first.items, vec![asset.clone()]);
+    let second = store
+        .list_asset_alias_page(
+            &AssetAliasListQuery {
+                kind: None,
+                limit: 1,
+                cursor: first.next_cursor,
+            },
+            None,
+        )
+        .expect("list second alias page");
+    assert_eq!(second.items, vec![inlay.clone()]);
+
+    let deleted = store
+        .delete_asset_alias("asset", key, imported.revision)
+        .expect("delete ordinary asset alias");
+    assert_eq!(
+        store
+            .read_asset_alias("asset", key, None)
+            .expect("read deleted alias"),
+        None
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("inlay", key, None)
+            .expect("read sibling Inlay")
+            .expect("sibling Inlay exists")
+            .revision,
+        deleted.revision
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("asset", key, Some(&lease.lease))
+            .expect("read pinned asset")
+            .expect("pinned asset exists")
+            .value,
+        asset
+    );
+}
+
+#[test]
+fn authority_marker_rejects_preparing_and_activates_v2_with_the_generation() {
+    let directory = tempfile::tempdir().expect("create authority directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    assert_eq!(
+        store
+            .read_asset_repository_authority(None)
+            .expect("read initial authority")
+            .value,
+        AssetRepositoryAuthorityState::Legacy
+    );
+
+    let staging = store.replace_begin().expect("begin preparing replacement");
+    store
+        .replace_put_asset_repository_authority(
+            &staging.staging_id,
+            &AssetRepositoryAuthorityState::Preparing {
+                migration_id: "migration-atomic".to_owned(),
+                source_revision: 0,
+            },
+        )
+        .expect("stage preparing authority");
+    assert!(store.replace_commit(&staging.staging_id, Some(0)).is_err());
+    assert_eq!(store.revision().expect("read unchanged revision"), 0);
+    assert_eq!(
+        store
+            .read_asset_repository_authority(None)
+            .expect("read unchanged authority")
+            .value,
+        AssetRepositoryAuthorityState::Legacy
+    );
+
+    store
+        .replace_put_asset_repository_authority(
+            &staging.staging_id,
+            &AssetRepositoryAuthorityState::V2 {
+                migration_id: "migration-atomic".to_owned(),
+                compatibility_hash: "9a".repeat(32),
+            },
+        )
+        .expect("stage v2 authority");
+    let activated = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate v2 authority");
+    assert_eq!(
+        store
+            .read_asset_repository_authority(None)
+            .expect("read v2 authority"),
+        super::Versioned {
+            revision: activated.revision,
+            value: AssetRepositoryAuthorityState::V2 {
+                migration_id: "migration-atomic".to_owned(),
+                compatibility_hash: "9a".repeat(32),
+            },
+        }
     );
 }
 
@@ -4696,6 +4847,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
             "DROP TABLE asset_aliases;
              DROP TABLE asset_owner_heads;
              DROP TABLE cold_aliases;
+             DROP TABLE asset_repository_authority;
              PRAGMA user_version = 5;",
         )
         .expect("downgrade fixture schema marker");
@@ -4717,12 +4869,40 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
         store.read_root(None).expect("read migrated root").revision,
         0
+    );
+}
+
+#[test]
+fn schema_v9_adds_generation_scoped_asset_repository_authority_to_v8() {
+    let directory = tempfile::tempdir().expect("create v8 authority migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            "DROP TABLE asset_repository_authority;
+             PRAGMA user_version = 8;",
+        )
+        .expect("downgrade authority schema fixture");
+    drop(store);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate v8 authority store");
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read migrated schema version");
+    assert_eq!(version, 9);
+    assert_eq!(
+        store
+            .read_asset_repository_authority(None)
+            .expect("read migrated legacy authority")
+            .value,
+        AssetRepositoryAuthorityState::Legacy
     );
 }
 
@@ -4820,6 +5000,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
             DROP TABLE asset_owner_heads;
             DROP TABLE cold_aliases;
+            DROP TABLE asset_repository_authority;
             PRAGMA user_version = 6;
             ",
         )
@@ -4831,7 +5012,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -4901,6 +5082,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
                 '8383838383838383838383838383838383838383838383838383838383838383', 1
             );
             DROP TABLE cold_aliases;
+            DROP TABLE asset_repository_authority;
             PRAGMA user_version = 7;
             "#,
         )
@@ -4923,7 +5105,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -5013,7 +5195,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     let snapshot_rows: i64 = store
         .connection
@@ -5223,7 +5405,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -5248,7 +5430,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -5386,7 +5568,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -5528,7 +5710,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -5674,7 +5856,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 8);
+    assert_eq!(integer_pragma("user_version"), 9);
 }
 
 #[test]
@@ -6474,7 +6656,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 9;")
+                .execute_batch("PRAGMA user_version = 10;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");

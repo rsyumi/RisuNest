@@ -586,8 +586,11 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(10)
-        const transaction = database.transaction(['assetAliases', 'assetOwnerHeads'], 'readonly')
+        expect(database.version).toBe(11)
+        const transaction = database.transaction(
+            ['assetAliases', 'assetOwnerHeads', 'assetRepositoryAuthority'],
+            'readonly',
+        )
         const aliases = transaction.objectStore('assetAliases')
         expect(aliases.indexNames.contains('byGeneration')).toBe(true)
         await expect(new Promise<number>((resolve, reject) => {
@@ -595,6 +598,9 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
             request.onsuccess = () => resolve(request.result)
             request.onerror = () => reject(request.error)
         })).resolves.toBe(0)
+        expect(
+            transaction.objectStore('assetRepositoryAuthority').indexNames.contains('byGeneration'),
+        ).toBe(true)
         const heads = transaction.objectStore('assetOwnerHeads')
         expect(heads.indexNames.contains('byGeneration')).toBe(true)
         await expect(new Promise<number>((resolve, reject) => {
@@ -630,7 +636,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(10)
+        expect(database.version).toBe(11)
         const transaction = database.transaction('assetOwnerHeads', 'readonly')
         const heads = transaction.objectStore('assetOwnerHeads')
         expect(heads.indexNames.contains('byGeneration')).toBe(true)

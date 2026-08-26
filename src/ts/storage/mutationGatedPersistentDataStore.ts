@@ -2,6 +2,8 @@ import type { Database } from './database.svelte'
 import type {
     AssetAlias,
     AssetAliasIdentity,
+    AssetAliasListQuery,
+    AssetRepositoryMigrationInput,
     AssetOwnerLocator,
     CharacterPage,
     CharacterQuery,
@@ -41,15 +43,21 @@ export function createMutationGatedPersistentDataStore(
         queryPluginStorage: () => store.queryPluginStorage(),
         readPluginStorage: (key: string) => store.readPluginStorage(key),
         readAssetAlias: (identity: AssetAliasIdentity) => store.readAssetAlias(identity),
+        listAssetAliases: (input: AssetAliasListQuery) => store.listAssetAliases(input),
+        readAssetRepositoryAuthority: () => store.readAssetRepositoryAuthority(),
         readAssetOwnerHead: (owner: AssetOwnerLocator) => store.readAssetOwnerHead(owner),
         commitAssetAlias: (alias: AssetAlias, expectedRevision: DataRevision) =>
             gate.runWrite(() => store.commitAssetAlias(alias, expectedRevision)),
+        deleteAssetAlias: (identity: AssetAliasIdentity, expectedRevision: DataRevision) =>
+            gate.runWrite(() => store.deleteAssetAlias(identity, expectedRevision)),
+        activateAssetRepositoryMigration: (input: AssetRepositoryMigrationInput) =>
+            gate.runTransition(() => store.activateAssetRepositoryMigration(input)),
         commit: (input: WorkingSetCommit) => gate.runWrite(() => store.commit(input)),
         replaceFromDatabase: (
             database: Database,
             expectedRevision?: DataRevision,
             assetAliases?: AssetAlias[],
-        ) => gate.runWrite(() =>
+        ) => gate.runTransition(() =>
             store.replaceFromDatabase(database, expectedRevision, assetAliases)),
         materializeDatabase: (revision?: DataRevision) => store.materializeDatabase(revision),
         acquireRevision: (revision: DataRevision): Promise<PersistentRevisionLease> =>
