@@ -63,7 +63,7 @@ import * as persistentDataRuntime from "./storage/persistentDataRuntime.svelte";
 import {
     captureChatMessageTarget,
     captureChatMessageTargetById,
-    resolveChatMessageTarget,
+    resolveRetainedChatMessageTarget,
     type CapturedChatMessageTarget,
 } from "./chatMessageUi";
 import {
@@ -2008,7 +2008,7 @@ $effect.root(() => {
             chatFoldedStateMessageIndex.index = -1
             return
         }
-        const target = resolveChatMessageTarget(chatFoldedState.data, foldTargetContext)
+        const target = resolveRetainedChatMessageTarget(chatFoldedState, foldTargetContext)
         if(!target){
             console.warn('Target message for folding is stale')
             chatFoldedStateMessageIndex.index = -1

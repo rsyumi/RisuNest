@@ -31,7 +31,7 @@
     import { removeChatMessage } from "../../ts/chatRemoval"
     import {
         captureChatMessageTarget,
-        editCapturedChatMessage,
+        saveCapturedChatMessage,
         toggleCapturedBookmark,
         toggleCapturedMessageDisabled,
         toggleCapturedMessageRole,
@@ -160,19 +160,26 @@
         })
     }
 
-    async function edit(){
+    function edit(){
         const target = editTarget ?? captureCurrentMessage()
-        editTarget = null
-        if (target) editCapturedChatMessage(target, chatMessageContext, message)
+        if (!target) return false
+        const result = saveCapturedChatMessage(target, chatMessageContext, message)
+        if (result.saved) editTarget = null
+        return result.saved
     }
 
     function handlePartialEditSave(e: CustomEvent<{ newData: string }>) {
         if (idx >= 0) {
-            message = e.detail.newData
             const target = partialEditTarget
             partialEditTarget = null
-            if (target) editCapturedChatMessage(target, chatMessageContext, e.detail.newData)
-            displaya(e.detail.newData)
+            if (!target) return
+            const result = saveCapturedChatMessage(
+                target,
+                chatMessageContext,
+                e.detail.newData,
+            )
+            message = result.displayData
+            displaya(result.displayData)
         }
     }
 
@@ -799,8 +806,7 @@
                 beginEdit()
             }
             else{
-                editMode = false
-                edit()
+                if(edit()) editMode = false
             }
         }}>
             <PencilIcon size={20}/>

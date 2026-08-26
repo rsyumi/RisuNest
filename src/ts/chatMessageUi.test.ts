@@ -6,8 +6,11 @@ import {
     captureChatMessageTarget,
     captureChatMessageTargetById,
     editCapturedChatMessage,
+    LatestChatScrollRequestGuard,
     renameCapturedBookmark,
+    resolveRetainedChatMessageTarget,
     resolveChatMessageTarget,
+    saveCapturedChatMessage,
     toggleCapturedBookmark,
     toggleCapturedMessageDisabled,
     toggleCapturedMessageRole,
@@ -109,6 +112,32 @@ describe('chat message UI targets', () => {
         ])
     })
 
+    it('returns canonical display data when a full or partial draft cannot save', () => {
+        const target = fixture([
+            { role: 'user', data: 'zero' },
+            { role: 'char', data: 'one' },
+            { role: 'user', data: 'two' },
+        ])
+        const fullEdit = capture(target, 0)
+        const partialEdit = capture(target, 2)
+        target.conversation.message.splice(1, 0, { role: 'char', data: 'inserted' })
+
+        expect(saveCapturedChatMessage(fullEdit, target, 'full draft')).toEqual({
+            saved: true,
+            displayData: 'full draft',
+        })
+        expect(saveCapturedChatMessage(partialEdit, target, 'partial draft')).toEqual({
+            saved: false,
+            displayData: 'two',
+        })
+        expect(target.conversation.message.map((message) => message.data)).toEqual([
+            'full draft',
+            'inserted',
+            'one',
+            'two',
+        ])
+    })
+
     it('preserves missing and duplicate IDs when bookmarks use the current last-match policy', async () => {
         const target = fixture([
             { role: 'user', data: 'first duplicate', chatId: 'duplicate' },
@@ -186,6 +215,28 @@ describe('chat message UI targets', () => {
         expect(replacement.conversation.bookmarkNames).toEqual({ 'replacement-id': 'Before' })
     })
 
+    it('aborts a fallback bookmark rename when the message ID changes during the prompt', async () => {
+        const target = fixture([{
+            role: 'char',
+            data: 'message',
+            chatId: 'before-id',
+        }], false)
+        target.conversation.bookmarks = ['before-id']
+        target.conversation.bookmarkNames = { 'before-id': 'Before' }
+        const prompt = deferred<string>()
+        const renaming = renameCapturedBookmark(
+            capture(target, 0),
+            target,
+            () => prompt.promise,
+        )
+        target.conversation.message[0].chatId = 'after-id'
+        target.conversation.bookmarks = ['after-id']
+        prompt.resolve('Must not apply')
+
+        await expect(renaming).resolves.toBe(false)
+        expect(target.conversation.bookmarkNames).toEqual({ 'before-id': 'Before' })
+    })
+
     it('rejects stale scroll, fold, and bookmark targets without changing canonical output', () => {
         const target = fixture([
             { role: 'user', data: 'zero', chatId: 'duplicate' },
@@ -207,5 +258,42 @@ describe('chat message UI targets', () => {
                 { role: 'user', data: 'two', chatId: 'duplicate' },
             ],
         }))
+    })
+
+    it('clears a retained fold target when its locator becomes stale', () => {
+        const target = fixture([{ role: 'user', data: 'fold me' }])
+        const retained = { data: capture(target, 0) }
+        target.session.edit(target.session.locate(0), { role: 'user', data: 'changed' })
+
+        expect(resolveRetainedChatMessageTarget(retained, target)).toBeNull()
+        expect(retained.data).toBeNull()
+    })
+
+    it('lets only the latest scroll request apply after overlapping waits', async () => {
+        const guard = new LatestChatScrollRequestGuard()
+        const firstWait = deferred<void>()
+        const secondWait = deferred<void>()
+        const applied: string[] = []
+        const applyAfter = async (
+            wait: Promise<void>,
+            request: number,
+            value: string,
+        ) => {
+            await wait
+            if (guard.isCurrent(request)) applied.push(value)
+        }
+        const first = guard.begin()
+        const firstCompletion = applyAfter(firstWait.promise, first, 'first')
+        const second = guard.begin()
+        const secondCompletion = applyAfter(secondWait.promise, second, 'second')
+
+        secondWait.resolve()
+        await secondCompletion
+        firstWait.resolve()
+        await firstCompletion
+
+        expect(guard.isCurrent(first)).toBe(false)
+        expect(guard.isCurrent(second)).toBe(true)
+        expect(applied).toEqual(['second'])
     })
 })

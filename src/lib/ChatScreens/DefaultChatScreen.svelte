@@ -33,7 +33,11 @@
     import PluginDefinedIcon from '../Others/PluginDefinedIcon.svelte';
     import { getAdditionalChatLoadPages, getInitialChatLoadPages } from 'src/ts/chatLoadPages';
     import { getActiveConversationSession } from '../../ts/storage/persistentDataRuntime.svelte';
-    import { resolveChatMessageTarget, type CapturedChatMessageTarget } from '../../ts/chatMessageUi';
+    import {
+        LatestChatScrollRequestGuard,
+        resolveChatMessageTarget,
+        type CapturedChatMessageTarget,
+    } from '../../ts/chatMessageUi';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -60,6 +64,7 @@
     let { openModuleList = $bindable(false), openChatList = $bindable(false), customStyle = '' }: Props = $props();
     let currentCharacter = $derived(DBState.db.characters[$selectedCharID])
     let currentChat = $derived(currentCharacter?.chats[currentCharacter.chatPage]?.message ?? [])
+    const scrollRequestGuard = new LatestChatScrollRequestGuard()
 
     function scrollToBottom() {
         chatsInstance?.scrollToLatestMessage();
@@ -76,14 +81,18 @@
         if($ScrollToMessageStore){
             const target = $ScrollToMessageStore
             ScrollToMessageStore.set(null)
-            scrollToMessage(target)
+            scrollToMessage(target, scrollRequestGuard.begin())
         }
     })
 
-    async function scrollToMessage(target: CapturedChatMessageTarget){
+    async function scrollToMessage(
+        target: CapturedChatMessageTarget,
+        requestGeneration: number,
+    ){
         // Forces the loading of past messages not rendered on the screen
         isScrollingToMessage = true
         try {
+            if (!scrollRequestGuard.isCurrent(requestGeneration)) return
             const resolved = resolveChatMessageTarget(target, scrollTargetContext)
             if (!resolved) return
             const index = resolved.absoluteIndex
@@ -93,7 +102,10 @@
             if(loadPages < neededLoadPages){
                 loadPages = neededLoadPages
                 await tick()
-                if (!resolveChatMessageTarget(target, scrollTargetContext)) return
+                if (
+                    !scrollRequestGuard.isCurrent(requestGeneration) ||
+                    !resolveChatMessageTarget(target, scrollTargetContext)
+                ) return
             }
 
             let element: Element | null = null;
@@ -102,7 +114,10 @@
                 element = document.querySelector(`[data-chat-index="${index}"]`)
                 if(element) break;
                 await sleep(100)
-                if (!resolveChatMessageTarget(target, scrollTargetContext)) return
+                if (
+                    !scrollRequestGuard.isCurrent(requestGeneration) ||
+                    !resolveChatMessageTarget(target, scrollTargetContext)
+                ) return
             }
 
             const preIndex = Math.max(0, index - 3)
@@ -113,7 +128,10 @@
                 element?.scrollIntoView({behavior: "instant", block: "start"})
             }
             await sleep(50)
-            if (!resolveChatMessageTarget(target, scrollTargetContext)) return
+            if (
+                !scrollRequestGuard.isCurrent(requestGeneration) ||
+                !resolveChatMessageTarget(target, scrollTargetContext)
+            ) return
 
             if(element){
                 // Wait for images to load to prevent layout shift
@@ -132,14 +150,20 @@
                         Promise.all(promises),
                         sleep(4000)
                     ]);
-                    if (!resolveChatMessageTarget(target, scrollTargetContext)) return
+                    if (
+                        !scrollRequestGuard.isCurrent(requestGeneration) ||
+                        !resolveChatMessageTarget(target, scrollTargetContext)
+                    ) return
                 }
 
                 element.scrollIntoView({behavior: "instant", block: "start"})
                 
                 // Small delay and scroll again to ensure position is correct after any final layout adjustments
                 await sleep(50)
-                if (!resolveChatMessageTarget(target, scrollTargetContext)) return
+                if (
+                    !scrollRequestGuard.isCurrent(requestGeneration) ||
+                    !resolveChatMessageTarget(target, scrollTargetContext)
+                ) return
                 element.scrollIntoView({behavior: "instant", block: "start"})
 
                 element.classList.add('ring-2', 'ring-blue-500')
@@ -148,7 +172,9 @@
                 }, 2000)
             }
         } finally {
-            isScrollingToMessage = false
+            if (scrollRequestGuard.isCurrent(requestGeneration)) {
+                isScrollingToMessage = false
+            }
         }
     }
 

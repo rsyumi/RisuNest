@@ -35,6 +35,24 @@ export interface ToggleBookmarkOptions {
     defaultName(message: Message): string
 }
 
+export interface CapturedChatMessageSaveResult {
+    saved: boolean
+    displayData: string
+}
+
+export class LatestChatScrollRequestGuard {
+    private generation = 0
+
+    begin(): number {
+        this.generation += 1
+        return this.generation
+    }
+
+    isCurrent(generation: number): boolean {
+        return generation === this.generation
+    }
+}
+
 export function captureChatMessageTarget(
     options: CaptureChatMessageTargetOptions,
 ): CapturedChatMessageTarget | null {
@@ -95,12 +113,34 @@ export function resolveChatMessageTarget(
     return target
 }
 
+export function resolveRetainedChatMessageTarget(
+    retained: { data: CapturedChatMessageTarget | null },
+    context: ChatMessageUiContext,
+): CapturedChatMessageTarget | null {
+    if (!retained.data) return null
+    const resolved = resolveChatMessageTarget(retained.data, context)
+    if (!resolved) retained.data = null
+    return resolved
+}
+
 export function editCapturedChatMessage(
     target: CapturedChatMessageTarget,
     context: ChatMessageUiContext,
     data: string,
 ): boolean {
     return editCapturedMessage(target, context, (message) => ({ ...message, data }))
+}
+
+export function saveCapturedChatMessage(
+    target: CapturedChatMessageTarget,
+    context: ChatMessageUiContext,
+    data: string,
+): CapturedChatMessageSaveResult {
+    const saved = editCapturedChatMessage(target, context, data)
+    return {
+        saved,
+        displayData: saved ? data : target.message.data,
+    }
 }
 
 export function toggleCapturedMessageRole(
@@ -160,6 +200,10 @@ export async function renameCapturedBookmark(
     if (!newName?.trim()) return false
     const current = resolveChatMessageTarget(initial, context)
     if (!current) return false
+    if (
+        current.message.chatId !== messageId ||
+        !current.conversation.bookmarks?.includes(messageId)
+    ) return false
     if (current.session && current.locator) {
         current.session.renameBookmark(current.locator, newName)
     } else {
