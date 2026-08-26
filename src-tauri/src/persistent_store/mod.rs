@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 
 pub(super) type StoreResult<T> = Result<T, StoreError>;
 
+pub(super) const CONVERSATION_RANGE_MAX_LIMIT: i64 = 4_096;
+pub(super) const JAVASCRIPT_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
 // Add every generation-scoped record family here so lease COW and cleanup cannot omit it.
 pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ("root", "value"),
@@ -253,6 +256,8 @@ pub(crate) struct ConversationPage {
 pub(crate) struct ConversationWindowQuery {
     pub(crate) character_id: String,
     pub(crate) conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) start_index: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) limit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

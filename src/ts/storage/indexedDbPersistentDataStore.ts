@@ -21,7 +21,11 @@ import type {
     Versioned,
     WorkingSetCommit,
 } from './persistentDataStore'
-import { RevisionConflictError, SnapshotReleasedError } from './persistentDataStore'
+import {
+    RevisionConflictError,
+    SnapshotReleasedError,
+    validateConversationWindowQuery,
+} from './persistentDataStore'
 
 const DATABASE_VERSION = 7
 const MESSAGE_PAGE_SIZE = 128
@@ -360,6 +364,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
     async readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null> {
+        validateConversationWindowQuery(input)
         const transaction = this.requireDatabase().transaction(
             ['meta', 'conversations', 'messagePages'],
             'readonly',
@@ -697,6 +702,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             },
             readConversationWindow: async (input) => {
                 assertActive()
+                validateConversationWindowQuery(input)
                 const transaction = this.requireDatabase().transaction(
                     ['meta', 'conversations', 'messagePages'],
                     'readonly',
@@ -959,7 +965,10 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         let startIndex: number
         let endIndex: number
         let anchorPage: StoredMessagePage | undefined
-        if (input.anchorMessageId !== undefined) {
+        if (input.startIndex !== undefined) {
+            startIndex = Math.min(totalMessages, input.startIndex)
+            endIndex = Math.min(totalMessages, startIndex + input.limit!)
+        } else if (input.anchorMessageId !== undefined) {
             const anchor = await this.findMessage(
                 transaction,
                 generation,

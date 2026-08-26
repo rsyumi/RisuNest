@@ -103,10 +103,35 @@ export interface ConversationPage {
 export interface ConversationWindowQuery {
     characterId: string
     conversationId: string
+    startIndex?: number
     limit?: number
     anchorMessageId?: string
     before?: number
     after?: number
+}
+
+export const CONVERSATION_RANGE_MAX_LIMIT = 4_096
+
+export function validateConversationWindowQuery(input: ConversationWindowQuery): void {
+    if (input.startIndex === undefined) return
+    if (!Number.isSafeInteger(input.startIndex) || input.startIndex < 0) {
+        throw new RangeError('Conversation range startIndex must be a nonnegative safe integer')
+    }
+    if (!Number.isSafeInteger(input.limit) || input.limit === undefined || input.limit <= 0) {
+        throw new RangeError('Conversation range limit must be a positive safe integer')
+    }
+    if (input.limit > CONVERSATION_RANGE_MAX_LIMIT) {
+        throw new RangeError(
+            `Conversation range limit cannot exceed ${CONVERSATION_RANGE_MAX_LIMIT}`,
+        )
+    }
+    if (
+        input.anchorMessageId !== undefined ||
+        input.before !== undefined ||
+        input.after !== undefined
+    ) {
+        throw new RangeError('Conversation absolute range cannot include anchor options')
+    }
 }
 
 export type ConversationMutation =

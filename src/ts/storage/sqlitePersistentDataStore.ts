@@ -8,6 +8,7 @@ import {
 import {
     RevisionConflictError,
     SnapshotReleasedError,
+    validateConversationWindowQuery,
     type CharacterDetail,
     type CharacterPage,
     type CharacterQuery,
@@ -131,10 +132,11 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
         return invokeStore('pds_read_conversation', { characterId, conversationId })
     }
 
-    readConversationWindow(
+    async readConversationWindow(
         input: ConversationWindowQuery,
     ): Promise<Versioned<ConversationWindow> | null> {
-        return invokeStore('pds_read_conversation_window', { query: input })
+        validateConversationWindowQuery(input)
+        return await invokeStore('pds_read_conversation_window', { query: input })
     }
 
     queryPluginStorage(): Promise<PluginStorageCatalog> {
@@ -232,6 +234,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             },
             readConversationWindow: async (input) => {
                 assertActive()
+                validateConversationWindowQuery(input)
                 return invokeStore('pds_read_conversation_window', { query: input, lease })
             },
             queryPluginStorage: async () => {

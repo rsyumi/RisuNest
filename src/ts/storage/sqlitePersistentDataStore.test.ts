@@ -112,6 +112,37 @@ describe('SqlitePersistentDataStore', () => {
         await expect(store.readRoot()).rejects.toEqual(new Error('disk I/O error'))
     })
 
+    it('forwards valid absolute ranges and rejects invalid ranges before native IPC', async () => {
+        mocks.invoke.mockResolvedValue({ revision: 9, value: null })
+        const store = new SqlitePersistentDataStore()
+        const validRange = {
+            characterId: 'char-a',
+            conversationId: 'conv-long',
+            startIndex: 127,
+            limit: 2,
+        }
+
+        await store.readConversationWindow(validRange)
+        expect(mocks.invoke).toHaveBeenCalledWith('pds_read_conversation_window', {
+            query: validRange,
+        })
+
+        mocks.invoke.mockClear()
+        await expect(store.readConversationWindow({
+            ...validRange,
+            startIndex: -1,
+        })).rejects.toBeInstanceOf(RangeError)
+        await expect(store.readConversationWindow({
+            ...validRange,
+            limit: 4_097,
+        })).rejects.toBeInstanceOf(RangeError)
+        await expect(store.readConversationWindow({
+            ...validRange,
+            anchorMessageId: 'msg-127',
+        })).rejects.toBeInstanceOf(RangeError)
+        expect(mocks.invoke).not.toHaveBeenCalled()
+    })
+
     it('replaces a database in staged 16-character batches before committing', async () => {
         mocks.invoke
             .mockResolvedValueOnce({ stagingId: 'staging-1' })

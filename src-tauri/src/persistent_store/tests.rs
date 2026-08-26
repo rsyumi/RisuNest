@@ -669,6 +669,7 @@ fn conversation_windows_cover_latest_and_anchor_boundaries() {
     let window = |anchor: Option<&str>, before, after| ConversationWindowQuery {
         character_id: "char-a".to_owned(),
         conversation_id: "conv-long".to_owned(),
+        start_index: None,
         limit: Some(4),
         anchor_message_id: anchor.map(str::to_owned),
         before,
@@ -697,6 +698,63 @@ fn conversation_windows_cover_latest_and_anchor_boundaries() {
     assert_eq!(anchored.value.messages[2]["chatId"], "msg-127");
     assert!(anchored.value.has_more_before);
     assert!(anchored.value.has_more_after);
+}
+
+#[test]
+fn conversation_windows_support_strict_absolute_ranges() {
+    let (_directory, store, _) = open_fixture();
+    let range = |start_index, limit| ConversationWindowQuery {
+        character_id: "char-a".to_owned(),
+        conversation_id: "conv-long".to_owned(),
+        start_index,
+        limit,
+        anchor_message_id: None,
+        before: None,
+        after: None,
+    };
+
+    for (start_index, limit, expected_start, expected_end, expected_ids) in [
+        (0, 3, 0, 3, vec!["msg-000", "msg-001", "msg-002"]),
+        (126, 3, 126, 129, vec!["msg-126", "msg-127", "msg-128"]),
+        (127, 1, 127, 128, vec!["msg-127"]),
+        (128, 10, 128, 130, vec!["msg-128", "msg-129"]),
+        (130, 4, 130, 130, vec![]),
+        (200, 4, 130, 130, vec![]),
+    ] {
+        let result = store
+            .read_conversation_window(&range(Some(start_index), Some(limit)), None)
+            .expect("read absolute range")
+            .expect("conversation exists");
+        assert_eq!(
+            (result.value.start_index, result.value.end_index),
+            (expected_start, expected_end)
+        );
+        assert_eq!(
+            result
+                .value
+                .messages
+                .iter()
+                .map(|message| message["chatId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+    }
+
+    for invalid in [
+        range(Some(-1), Some(1)),
+        range(Some(0), None),
+        range(Some(0), Some(0)),
+        range(Some(0), Some(4_097)),
+        ConversationWindowQuery {
+            anchor_message_id: Some("msg-000".to_owned()),
+            ..range(Some(0), Some(1))
+        },
+    ] {
+        assert!(matches!(
+            store.read_conversation_window(&invalid, None),
+            Err(StoreError::Validation { .. })
+        ));
+    }
 }
 
 #[test]
@@ -1836,6 +1894,7 @@ fn replace_range_clamps_out_of_bounds_indices() {
             &ConversationWindowQuery {
                 character_id: "char-a".to_owned(),
                 conversation_id: "conv-short".to_owned(),
+                start_index: None,
                 limit: None,
                 anchor_message_id: None,
                 before: None,
@@ -1872,7 +1931,8 @@ fn revision_leases_isolate_conversation_reads() {
                 &ConversationWindowQuery {
                     character_id: "char-a".to_owned(),
                     conversation_id: "conv-short".to_owned(),
-                    limit: None,
+                    start_index: Some(1),
+                    limit: Some(2),
                     anchor_message_id: None,
                     before: None,
                     after: None,
@@ -1884,6 +1944,8 @@ fn revision_leases_isolate_conversation_reads() {
     };
     assert_eq!(window(&store, Some(&lease.lease)).value.total_messages, 2);
     assert_eq!(window(&store, None).value.total_messages, 3);
+    assert_eq!(window(&store, Some(&lease.lease)).value.messages.len(), 1);
+    assert_eq!(window(&store, None).value.messages.len(), 2);
     assert_eq!(
         store
             .query_conversations(
@@ -1910,6 +1972,7 @@ fn revision_leases_isolate_conversation_reads() {
             &ConversationWindowQuery {
                 character_id: "char-a".to_owned(),
                 conversation_id: "conv-short".to_owned(),
+                start_index: None,
                 limit: None,
                 anchor_message_id: None,
                 before: None,

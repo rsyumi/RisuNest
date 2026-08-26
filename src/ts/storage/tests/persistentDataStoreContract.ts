@@ -275,6 +275,34 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect((await store.readRoot()).value.username).toBe('Committed after lease')
             expect(await store.readCharacter('char-b')).toBeNull()
             expect((await store.readConversation('char-a', 'conv-short'))?.value.message).toHaveLength(3)
+            expect(await lease.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-short',
+                startIndex: 1,
+                limit: 2,
+            })).toMatchObject({
+                revision: imported.revision,
+                value: {
+                    startIndex: 1,
+                    endIndex: 2,
+                    totalMessages: 2,
+                    messages: [{ chatId: 'msg-001' }],
+                },
+            })
+            expect(await store.readConversationWindow({
+                characterId: 'char-a',
+                conversationId: 'conv-short',
+                startIndex: 1,
+                limit: 2,
+            })).toMatchObject({
+                revision: committed.revision,
+                value: {
+                    startIndex: 1,
+                    endIndex: 3,
+                    totalMessages: 3,
+                    messages: [{ chatId: 'msg-001' }, { chatId: 'active-append' }],
+                },
+            })
 
             const replacement = structuredClone(fixtureDatabase)
             replacement.username = 'Staged after lease'
@@ -391,6 +419,129 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
                 hasMoreBefore: true,
                 hasMoreAfter: true,
             })
+        })
+
+        it('reads absolute conversation ranges with zero-based exclusive-end semantics', async () => {
+            const { store } = await createHarness()
+            await store.replaceFromDatabase(fixtureDatabase)
+
+            const cases = [
+                {
+                    startIndex: 0,
+                    limit: 3,
+                    ids: ['msg-000', 'msg-001', 'msg-002'],
+                    resultStart: 0,
+                    resultEnd: 3,
+                    hasMoreBefore: false,
+                    hasMoreAfter: true,
+                },
+                {
+                    startIndex: 126,
+                    limit: 3,
+                    ids: ['msg-126', 'msg-127', 'msg-128'],
+                    resultStart: 126,
+                    resultEnd: 129,
+                    hasMoreBefore: true,
+                    hasMoreAfter: true,
+                },
+                {
+                    startIndex: 127,
+                    limit: 1,
+                    ids: ['msg-127'],
+                    resultStart: 127,
+                    resultEnd: 128,
+                    hasMoreBefore: true,
+                    hasMoreAfter: true,
+                },
+                {
+                    startIndex: 128,
+                    limit: 10,
+                    ids: ['msg-128', 'msg-129'],
+                    resultStart: 128,
+                    resultEnd: 130,
+                    hasMoreBefore: true,
+                    hasMoreAfter: false,
+                },
+                {
+                    startIndex: 130,
+                    limit: 4,
+                    ids: [],
+                    resultStart: 130,
+                    resultEnd: 130,
+                    hasMoreBefore: true,
+                    hasMoreAfter: false,
+                },
+                {
+                    startIndex: 200,
+                    limit: 4,
+                    ids: [],
+                    resultStart: 130,
+                    resultEnd: 130,
+                    hasMoreBefore: true,
+                    hasMoreAfter: false,
+                },
+            ]
+
+            for (const range of cases) {
+                const result = await store.readConversationWindow({
+                    characterId: 'char-a',
+                    conversationId: 'conv-long',
+                    startIndex: range.startIndex,
+                    limit: range.limit,
+                })
+                expect(result?.value.messages.map((message) => message.chatId)).toEqual(range.ids)
+                expect(result?.value).toMatchObject({
+                    startIndex: range.resultStart,
+                    endIndex: range.resultEnd,
+                    totalMessages: 130,
+                    hasMoreBefore: range.hasMoreBefore,
+                    hasMoreAfter: range.hasMoreAfter,
+                })
+            }
+
+            expect(
+                await store.readConversationWindow({
+                    characterId: 'missing',
+                    conversationId: 'missing',
+                    startIndex: 0,
+                    limit: 1,
+                }),
+            ).toBeNull()
+        })
+
+        it('strictly validates only the absolute conversation range mode', async () => {
+            const { store } = await createHarness()
+            await store.replaceFromDatabase(fixtureDatabase)
+            const base = {
+                characterId: 'char-a',
+                conversationId: 'conv-long',
+            }
+
+            for (const query of [
+                { ...base, startIndex: -1, limit: 1 },
+                { ...base, startIndex: 1.5, limit: 1 },
+                { ...base, startIndex: Number.POSITIVE_INFINITY, limit: 1 },
+                { ...base, startIndex: Number.MAX_SAFE_INTEGER + 1, limit: 1 },
+                { ...base, startIndex: 0 },
+                { ...base, startIndex: 0, limit: 0 },
+                { ...base, startIndex: 0, limit: -1 },
+                { ...base, startIndex: 0, limit: 1.5 },
+                { ...base, startIndex: 0, limit: Number.NaN },
+                { ...base, startIndex: 0, limit: 4_097 },
+                { ...base, startIndex: 0, limit: 1, anchorMessageId: 'msg-000' },
+            ]) {
+                await expect(store.readConversationWindow(query)).rejects.toBeInstanceOf(RangeError)
+            }
+
+            await expect(store.readConversationWindow({ ...base, limit: -1 })).resolves.not.toThrow()
+            await expect(
+                store.readConversationWindow({
+                    ...base,
+                    anchorMessageId: 'msg-000',
+                    before: -1,
+                    after: -1,
+                }),
+            ).resolves.not.toThrow()
         })
 
         it('returns the active revision with every conversation page, including an empty page', async () => {

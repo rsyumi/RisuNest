@@ -3,6 +3,7 @@ use super::{
     CharacterQuery, CharacterSummary, ConversationPage, ConversationQuery, ConversationSummary,
     ConversationWindow, ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary,
     PresetCatalog, PresetSummary, QueryOrder, StoreError, StoreResult, Versioned,
+    CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
@@ -296,6 +297,36 @@ pub(super) fn read_conversation_window(
     query: &ConversationWindowQuery,
     lease: Option<&str>,
 ) -> StoreResult<Option<Versioned<ConversationWindow>>> {
+    let absolute_range = match query.start_index {
+        None => None,
+        Some(start_index) => {
+            if !(0..=JAVASCRIPT_MAX_SAFE_INTEGER).contains(&start_index) {
+                return Err(StoreError::Validation {
+                    message: "conversation range startIndex must be a nonnegative safe integer"
+                        .to_owned(),
+                });
+            }
+            let Some(limit) = query.limit else {
+                return Err(StoreError::Validation {
+                    message: "conversation range limit must be a positive safe integer".to_owned(),
+                });
+            };
+            if !(1..=CONVERSATION_RANGE_MAX_LIMIT).contains(&limit) {
+                return Err(StoreError::Validation {
+                    message: format!(
+                        "conversation range limit must be between 1 and {CONVERSATION_RANGE_MAX_LIMIT}"
+                    ),
+                });
+            }
+            if query.anchor_message_id.is_some() || query.before.is_some() || query.after.is_some()
+            {
+                return Err(StoreError::Validation {
+                    message: "conversation absolute range cannot include anchor options".to_owned(),
+                });
+            }
+            Some((start_index, limit))
+        }
+    };
     let target = read_target(connection, lease)?;
     let total: Option<i64> = connection
         .query_row(
@@ -308,29 +339,35 @@ pub(super) fn read_conversation_window(
         return Ok(None);
     };
 
-    let (start_index, end_index) = match query.anchor_message_id.as_deref() {
-        Some(anchor_id) => {
-            let anchor: Option<i64> = connection.query_row(
+    let (start_index, end_index) = match absolute_range {
+        Some((start_index, limit)) => {
+            let start_index = start_index.min(total_messages);
+            (start_index, (start_index + limit).min(total_messages))
+        }
+        None => match query.anchor_message_id.as_deref() {
+            Some(anchor_id) => {
+                let anchor: Option<i64> = connection.query_row(
                 "SELECT message_index FROM messages
                  WHERE generation = ?1 AND character_id = ?2 AND conversation_id = ?3 AND message_id = ?4
                  ORDER BY message_index ASC LIMIT 1",
                 params![target.generation, query.character_id, query.conversation_id, anchor_id],
                 |row| row.get(0),
             ).optional()?;
-            let Some(anchor) = anchor else {
-                return Ok(None);
-            };
-            let before = query.before.unwrap_or(0).max(0);
-            let after = query.after.unwrap_or(0).max(0);
-            (
-                (anchor - before).max(0),
-                (anchor + after + 1).min(total_messages),
-            )
-        }
-        None => {
-            let limit = query.limit.unwrap_or(128).max(0);
-            ((total_messages - limit).max(0), total_messages)
-        }
+                let Some(anchor) = anchor else {
+                    return Ok(None);
+                };
+                let before = query.before.unwrap_or(0).max(0);
+                let after = query.after.unwrap_or(0).max(0);
+                (
+                    (anchor - before).max(0),
+                    (anchor + after + 1).min(total_messages),
+                )
+            }
+            None => {
+                let limit = query.limit.unwrap_or(128).max(0);
+                ((total_messages - limit).max(0), total_messages)
+            }
+        },
     };
     let messages = read_messages(
         connection,
