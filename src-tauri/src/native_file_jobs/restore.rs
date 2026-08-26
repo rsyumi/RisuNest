@@ -139,7 +139,7 @@ fn restore_risu_save_reader<R: Read>(
                 parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
             RisuSaveFormat::LegacyStream => {
-                return Err(invalid("gzip-stream legacy RisuSave codec is not enabled"))
+                parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
         };
         if job.is_cancel_requested() {
@@ -1088,6 +1088,9 @@ mod tests {
     const W0_COMPRESSED_FIXTURE: &str = include_str!(
         "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-compressed-v4.input.base64"
     );
+    const W0_STREAM_FIXTURE: &str = include_str!(
+        "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-stream-v4.input.base64"
+    );
     const W0_LEGACY_EXPECTED: &str = include_str!(
         "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-raw-v4.expected.json"
     );
@@ -1464,6 +1467,43 @@ mod tests {
         assert_eq!(error.code, "invalid-input");
         assert!(error.message.contains("decoded block limit"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn strict_gzip_stream_msgpackr_restore_accepts_w0_fixture_and_block_round_trip() {
+        use base64::Engine;
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(W0_STREAM_FIXTURE.trim())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("stream-w0.risudat");
+        fs::write(&source, bytes).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        let first = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        let expected = persistent_projection(serde_json::from_str(W0_LEGACY_EXPECTED).unwrap());
+        assert_eq!(first, expected);
+        let exported_path = {
+            let mut store = sink.store.lock().unwrap();
+            let lease = store.acquire_revision(2).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            store.release_revision(&lease).unwrap();
+            PathBuf::from(exported.path)
+        };
+        let second_job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
+        assert_eq!(
+            sink.store.lock().unwrap().materialize(Some(3)).unwrap(),
+            first
+        );
     }
 
     #[test]
