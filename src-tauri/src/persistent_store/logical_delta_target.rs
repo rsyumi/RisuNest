@@ -455,6 +455,26 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         base: &LogicalManifest,
         local: &LogicalManifest,
     ) -> Result<(), PeerSyncError> {
+        let local_manifest_hash = hash_logical_manifest(local)
+            .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+        validate_same_generation_identity(
+            &base.generation,
+            &plan.expected_base_manifest_hash,
+            &local.generation,
+            &local_manifest_hash,
+        )?;
+        validate_same_generation_identity(
+            &base.generation,
+            &plan.expected_base_manifest_hash,
+            &self.remote_manifest.generation,
+            &self.remote_manifest_hash,
+        )?;
+        validate_same_generation_identity(
+            &local.generation,
+            &local_manifest_hash,
+            &self.remote_manifest.generation,
+            &self.remote_manifest_hash,
+        )?;
         if compare_generation_sequences(
             &self.remote_manifest.generation_sequence,
             &base.generation_sequence,
@@ -1472,6 +1492,18 @@ fn compare_generation_sequences(left: &str, right: &str) -> std::cmp::Ordering {
     left.len().cmp(&right.len()).then_with(|| left.cmp(right))
 }
 
+fn validate_same_generation_identity(
+    left_generation: &str,
+    left_hash: &str,
+    right_generation: &str,
+    right_hash: &str,
+) -> Result<(), PeerSyncError> {
+    if left_generation == right_generation && left_hash != right_hash {
+        return validation("logical generation ID is bound to different manifest hashes");
+    }
+    Ok(())
+}
+
 fn increment_generation_sequence(sequence: &str) -> Result<String, PeerSyncError> {
     let mut bytes = sequence.as_bytes().to_vec();
     let mut carry = true;
@@ -1576,11 +1608,9 @@ fn derive_exact_three_way_plan(
             }
         }
         let [base_record, local_record, remote_record] = triple;
-        if matches!(base_record, Some(LogicalManifestRecord::Live(_)))
-            && (local_record.is_none() || remote_record.is_none())
-        {
+        if base_record.is_some() && (local_record.is_none() || remote_record.is_none()) {
             return validation(format!(
-                "logical delta descendant must tombstone deleted base record {key}"
+                "logical delta descendant must retain or tombstone base record {key}"
             ));
         }
         let local_changed = local_record != base_record;
@@ -3002,9 +3032,10 @@ mod tests {
             logical_delta::{
                 build_logical_manifest, encode_asset_alias_metadata, encode_logical_manifest,
                 encode_logical_record_key, encode_message_page, LogicalAssetAliasMetadata,
-                LogicalManifest, LogicalManifestBuilderInput, LogicalManifestObject,
-                LogicalManifestRecord, LogicalOwnerHead, LogicalOwnerLocator,
-                LogicalRecordEnvelope, LogicalRecordLocator, ProjectedLogicalRecord,
+                LogicalManifest, LogicalManifestBuilderInput, LogicalManifestLiveRecord,
+                LogicalManifestObject, LogicalManifestRecord, LogicalManifestTombstoneRecord,
+                LogicalOwnerHead, LogicalOwnerLocator, LogicalRecordEnvelope, LogicalRecordLocator,
+                ProjectedLogicalRecord, LOGICAL_MANIFEST_SCHEMA,
             },
             LogicalDeltaActivation, LogicalDeltaApplyOperation, LogicalDeltaObject,
             LogicalDeltaObjectSource, ReadyLogicalDeltaPlan,
@@ -3235,6 +3266,102 @@ mod tests {
             merged_generation_sequence(&"9".repeat(64), "1"),
             Err(PeerSyncError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn exact_plan_rejects_omission_of_a_base_tombstone() {
+        let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            storage_key: "deleted-plugin".to_owned(),
+        })
+        .unwrap();
+        let base = LogicalManifest {
+            schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+            library_id: "library".to_owned(),
+            generation: "base".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records: vec![LogicalManifestRecord::Tombstone(
+                LogicalManifestTombstoneRecord {
+                    key,
+                    state: "tombstone".to_owned(),
+                    deleted_generation_sequence: "1".to_owned(),
+                },
+            )],
+            objects: vec![],
+        };
+        let local = base.clone();
+        let mut remote = base.clone();
+        remote.generation = "remote".to_owned();
+        remote.generation_sequence = "2".to_owned();
+        remote.records.clear();
+
+        assert!(matches!(
+            derive_exact_three_way_plan(&base, &local, &remote),
+            Err(PeerSyncError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn exact_plan_treats_an_absent_zero_byte_object_as_a_put() {
+        let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            storage_key: "empty-plugin".to_owned(),
+        })
+        .unwrap();
+        let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let empty_manifest = |generation: &str, sequence: &str| LogicalManifest {
+            schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+            library_id: "library".to_owned(),
+            generation: generation.to_owned(),
+            generation_sequence: sequence.to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records: vec![],
+            objects: vec![],
+        };
+        let base = empty_manifest("base", "1");
+        let local = empty_manifest("local", "2");
+        let mut remote = empty_manifest("remote", "2");
+        remote
+            .records
+            .push(LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key: key.clone(),
+                state: "live".to_owned(),
+                object_hash: empty_hash.to_owned(),
+                dependencies: vec![],
+            }));
+        remote.objects.push(LogicalManifestObject {
+            hash: empty_hash.to_owned(),
+            size: 0,
+        });
+
+        let (apply, preserve, candidates) =
+            derive_exact_three_way_plan(&base, &local, &remote).unwrap();
+        assert_eq!(
+            apply,
+            vec![LogicalDeltaApplyOperation::Put {
+                key,
+                object_hash: empty_hash.to_owned(),
+                dependencies: vec![],
+            }]
+        );
+        assert!(preserve.is_empty());
+        assert_eq!(candidates, vec![empty_hash]);
+    }
+
+    #[test]
+    fn generation_identity_rejects_the_same_id_with_a_different_hash() {
+        assert!(matches!(
+            validate_same_generation_identity("shared", &"a".repeat(64), "shared", &"b".repeat(64)),
+            Err(PeerSyncError::Validation(_))
+        ));
+        assert!(validate_same_generation_identity(
+            "left",
+            &"a".repeat(64),
+            "right",
+            &"b".repeat(64),
+        )
+        .is_ok());
     }
 
     #[test]

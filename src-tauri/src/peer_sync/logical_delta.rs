@@ -701,6 +701,10 @@ fn validate_generation_sequence(value: &str, description: &str) -> Result<(), Lo
     Ok(())
 }
 
+fn compare_generation_sequences(left: &str, right: &str) -> std::cmp::Ordering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
 fn validate_sorted_hashes(hashes: &[String], description: &str) -> Result<(), LogicalDeltaError> {
     let mut previous: Option<&str> = None;
     for hash in hashes {
@@ -763,6 +767,16 @@ pub fn validate_logical_manifest(manifest: &LogicalManifest) -> Result<(), Logic
                     &record.deleted_generation_sequence,
                     "tombstone deletedGenerationSequence",
                 )?;
+                if compare_generation_sequences(
+                    &record.deleted_generation_sequence,
+                    &manifest.generation_sequence,
+                )
+                .is_gt()
+                {
+                    return Err(invalid(
+                        "tombstone deletedGenerationSequence cannot exceed generationSequence",
+                    ));
+                }
             }
         }
     }
@@ -1488,6 +1502,25 @@ mod tests {
         let bytes = encode_logical_manifest(&manifest).unwrap();
         assert_eq!(String::from_utf8(bytes.clone()).unwrap(), expected);
         assert_eq!(decode_logical_manifest(&bytes).unwrap(), manifest);
+    }
+
+    #[test]
+    fn logical_manifest_rejects_tombstones_from_a_future_generation() {
+        let result = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library-1".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::tombstone(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "deleted-plugin".to_owned(),
+                },
+                "2".to_owned(),
+            )],
+        });
+
+        assert!(result.is_err());
     }
 
     #[test]
