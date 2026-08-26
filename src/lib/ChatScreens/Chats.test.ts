@@ -650,6 +650,46 @@ describe('Chats imperative mount lifecycle', () => {
         }))
     })
 
+    test('forgets deleted row heights before the same message ID is reused', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        await (mounted as HarnessInstance).jumpTo(0)
+
+        const oldMessage = probeElements(target).find(
+            (element) => element.dataset.message === 'message-0',
+        )!
+        const oldRow = oldMessage.closest<HTMLElement>('[data-chat-render-key]')!
+        TestResizeObserver.instances[0].emit(oldRow, 1_000)
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+        await (mounted as HarnessInstance).jumpToLatestMessage()
+        expect([...target.querySelectorAll<HTMLElement>('[data-chat-gap]')].map((gap) => (
+            (gap as HTMLElement).style.height
+        ))).toEqual([`${137 * 256 + 744}px`])
+
+        const withoutOldMessage = messages.slice(1)
+        ;(mounted as HarnessInstance).setMessages(withoutOldMessage)
+        await tick()
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-0'),
+        ).toBe(false))
+
+        const replacement = makeMessage(0, { data: 'replacement-message-0' })
+        const withReusedId = [replacement, ...withoutOldMessage]
+        ;(mounted as HarnessInstance).setMessages(withReusedId)
+        await tick()
+        await (mounted as HarnessInstance).jumpToLatestMessage()
+
+        expect([...target.querySelectorAll<HTMLElement>('[data-chat-gap]')].map((gap) => ({
+            start: gap.dataset.chatGapStart,
+            end: gap.dataset.chatGapEnd,
+            height: gap.style.height,
+        }))).toEqual([{ start: '0', end: '137', height: `${137 * 256}px` }])
+    })
+
     test('disconnects the shared observer and releases mounted rows on teardown', async () => {
         const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
         mounted = mount(ChatsHarness, {

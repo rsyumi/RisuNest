@@ -209,6 +209,12 @@
         if (needsStructuralRegistration || messages.length !== registeredLength || messageRenderKeys.length === 0) {
             messageRenderKeys = identitySequence.toArray()
         }
+        if (needsStructuralRegistration) {
+            const retainedKeys = new Set(viewportKeys(scope))
+            for (const key of measuredHeights.keys()) {
+                if (!retainedKeys.has(key)) measuredHeights.delete(key)
+            }
+        }
         registeredScope = scope
         registeredMessages = messages
         registeredLength = messages.length
