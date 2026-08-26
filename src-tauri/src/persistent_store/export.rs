@@ -611,12 +611,12 @@ fn write_object_with_array(
 }
 
 fn into_object(value: Value, message: &str) -> StoreResult<Map<String, Value>> {
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| StoreError::Validation {
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(StoreError::Validation {
             message: message.to_owned(),
-        })
+        }),
+    }
 }
 
 fn take_root_block_value(root: &mut Map<String, Value>, key: &str) -> Option<Value> {
@@ -778,28 +778,46 @@ mod tests {
     }
 
     #[test]
-    fn moves_large_root_block_value_without_cloning_its_payload() {
-        let payload = "x".repeat(2 * 1024 * 1024);
-        let mut root = json!({
-            "before": 1,
-            "modules": [{ "payload": payload }],
+    fn moves_large_owned_root_and_block_values_without_recursive_clones() {
+        let parsed = json!({
+            "before": { "payload": "r".repeat(2 * 1024 * 1024) },
+            "modules": [{ "payload": "m".repeat(2 * 1024 * 1024) }],
+            "loadouts": [{ "payload": "l".repeat(2 * 1024 * 1024) }],
+            "plugins": [{ "payload": "p".repeat(2 * 1024 * 1024) }],
             "after": 2,
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        let original_payload = root["modules"][0]["payload"].as_str().unwrap().as_ptr();
+        });
+        let root_payload = parsed["before"]["payload"].as_str().unwrap().as_ptr();
+        let module_payload = parsed["modules"][0]["payload"].as_str().unwrap().as_ptr();
+        let loadout_payload = parsed["loadouts"][0]["payload"].as_str().unwrap().as_ptr();
+        let plugin_payload = parsed["plugins"][0]["payload"].as_str().unwrap().as_ptr();
 
+        let mut root = into_object(parsed, "root").unwrap();
         let modules = take_root_block_value(&mut root, "modules").unwrap();
+        let loadouts = take_root_block_value(&mut root, "loadouts").unwrap();
+        let plugins = take_root_block_value(&mut root, "plugins").unwrap();
 
-        assert!(root["modules"].is_null());
+        assert_eq!(
+            root["before"]["payload"].as_str().unwrap().as_ptr(),
+            root_payload
+        );
+        assert!(
+            root["modules"].is_null() && root["loadouts"].is_null() && root["plugins"].is_null()
+        );
         assert_eq!(
             root.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["before", "modules", "after"]
+            ["before", "modules", "loadouts", "plugins", "after"]
         );
         assert_eq!(
             modules[0]["payload"].as_str().unwrap().as_ptr(),
-            original_payload
+            module_payload
+        );
+        assert_eq!(
+            loadouts[0]["payload"].as_str().unwrap().as_ptr(),
+            loadout_payload
+        );
+        assert_eq!(
+            plugins[0]["payload"].as_str().unwrap().as_ptr(),
+            plugin_payload
         );
     }
 
