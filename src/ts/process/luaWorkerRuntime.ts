@@ -269,6 +269,13 @@ export function createWasmoonLuaWorkerRuntime(
         'Lua Worker editDisplay mode permits only variable mutations',
       )
     }
+    if (current.mutations.length >= current.limits.mutationCount) {
+      throw new WorkerRuntimeError('lua_worker_mutation_limit', 'Lua Worker mutation count exceeds its limit')
+    }
+    const candidate = [...current.mutations, mutation]
+    if (canonicalByteLength(candidate) > current.limits.mutationBytes) {
+      throw new WorkerRuntimeError('lua_worker_mutation_limit', 'Lua Worker mutation bytes exceed their limit')
+    }
     try {
       applyLuaWorkerMutationToContext(current.workingContext, mutation)
     }
@@ -277,13 +284,6 @@ export function createWasmoonLuaWorkerRuntime(
         'lua_worker_context_window',
         error instanceof Error ? error.message : String(error),
       )
-    }
-    if (current.mutations.length >= current.limits.mutationCount) {
-      throw new WorkerRuntimeError('lua_worker_mutation_limit', 'Lua Worker mutation count exceeds its limit')
-    }
-    const candidate = [...current.mutations, mutation]
-    if (canonicalByteLength(candidate) > current.limits.mutationBytes) {
-      throw new WorkerRuntimeError('lua_worker_mutation_limit', 'Lua Worker mutation bytes exceed their limit')
     }
     current.mutations.push(mutation)
   }

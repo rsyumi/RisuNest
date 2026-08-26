@@ -28,6 +28,8 @@ test('requires parity, termination, busy-time, latency, and RSS gates', () => {
       { name: 'chat-reads' },
       { name: 'ordered-mutations' },
       { name: 'mutation-reads' },
+      { name: 'variables' },
+      { name: 'stop-chat' },
     ],
     parityMismatchCount: 0,
     globalIsolation: { passed: true },
@@ -50,8 +52,20 @@ test('requires parity, termination, busy-time, latency, and RSS gates', () => {
   }
   const gates = summarizePilotGates(
     pilot,
-    { processMemory: { workingSetBytes: 500 * 1024 * 1024 } },
-    { processMemory: { workingSetBytes: 530 * 1024 * 1024 } },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [1, 2],
+        workingSetBytes: 500 * 1024 * 1024,
+      },
+    },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [1, 2],
+        workingSetBytes: 530 * 1024 * 1024,
+      },
+    },
   )
 
   assert.equal(gates.semanticParity.passed, true)
@@ -61,6 +75,63 @@ test('requires parity, termination, busy-time, latency, and RSS gates', () => {
   assert.equal(gates.idleRss.passed, true)
   assert.equal(gates.windowsPilotPassed, true)
   assert.equal(gates.productionAdoptionEnabled, false)
+  assert.deepEqual(gates.productionBlockers, [])
+})
+
+test('fails closed when boundary or process RSS evidence is missing', () => {
+  const pilot = {
+    parity: [
+      { name: 'chat-reads' },
+      { name: 'ordered-mutations' },
+      { name: 'mutation-reads' },
+      { name: 'variables' },
+      { name: 'stop-chat' },
+    ],
+    parityMismatchCount: 0,
+    globalIsolation: { passed: true },
+    syntheticPromise: { passed: true },
+    boundaries: {},
+    atomicFailureComparison: {
+      zeroPartialWorkerMutation: true,
+      productionSemanticMatch: true,
+    },
+    termination: { passed: true, p95Ms: 10 },
+    performance: {
+      uiBusyMeasurement: 'warm-total-timer-lag-v1',
+      main: { p95Ms: 100, busyTimeMs: 80 },
+      worker: { p95Ms: 105, busyTimeMs: 4 },
+    },
+  }
+  const gates = summarizePilotGates(
+    pilot,
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [],
+        workingSetBytes: 0,
+      },
+    },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [],
+        workingSetBytes: 0,
+      },
+    },
+  )
+
+  assert.deepEqual(gates.supportedBoundaries.missingCases, [
+    'unsupported',
+    'contextWindow',
+    'memory',
+  ])
+  assert.equal(gates.supportedBoundaries.passed, false)
+  assert.equal(gates.idleRss.passed, false)
+  assert.equal(gates.windowsPilotPassed, false)
+  assert.deepEqual(gates.productionBlockers, [
+    'Supported boundary evidence is incomplete or failed.',
+    'Idle Worker RSS gate failed or has incomplete process samples.',
+  ])
 })
 
 test('fails semantic parity when atomic error handling differs from production', () => {
@@ -87,8 +158,20 @@ test('fails semantic parity when atomic error handling differs from production',
   }
   const gates = summarizePilotGates(
     pilot,
-    { processMemory: { workingSetBytes: 500 * 1024 * 1024 } },
-    { processMemory: { workingSetBytes: 530 * 1024 * 1024 } },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [1, 2],
+        workingSetBytes: 500 * 1024 * 1024,
+      },
+    },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [1, 2],
+        workingSetBytes: 530 * 1024 * 1024,
+      },
+    },
   )
 
   assert.equal(gates.semanticParity.passed, false)
@@ -119,8 +202,20 @@ test('fails UI busy gate without the warm total-lag measurement', () => {
   }
   const gates = summarizePilotGates(
     pilot,
-    { processMemory: { workingSetBytes: 500 * 1024 * 1024 } },
-    { processMemory: { workingSetBytes: 530 * 1024 * 1024 } },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [1, 2],
+        workingSetBytes: 500 * 1024 * 1024,
+      },
+    },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [1, 2],
+        workingSetBytes: 530 * 1024 * 1024,
+      },
+    },
   )
 
   assert.equal(gates.uiBusyTime.passed, false)
@@ -132,6 +227,8 @@ test('fails semantic parity when the mutation-read case is missing', () => {
     parity: [
       { name: 'chat-reads' },
       { name: 'ordered-mutations' },
+      { name: 'variables' },
+      { name: 'stop-chat' },
     ],
     parityMismatchCount: 0,
     globalIsolation: { passed: true },
@@ -156,4 +253,53 @@ test('fails semantic parity when the mutation-read case is missing', () => {
 
   assert.deepEqual(gates.semanticParity.missingCases, ['mutation-reads'])
   assert.equal(gates.semanticParity.passed, false)
+})
+
+test('requires variable and explicit stop parity cases', () => {
+  const pilot = {
+    parity: [
+      { name: 'chat-reads' },
+      { name: 'ordered-mutations' },
+      { name: 'mutation-reads' },
+    ],
+    parityMismatchCount: 0,
+    globalIsolation: { passed: true },
+    syntheticPromise: { passed: true },
+    boundaries: {
+      unsupported: { passed: true },
+      contextWindow: { passed: true },
+      memory: { passed: true },
+    },
+    atomicFailureComparison: {
+      zeroPartialWorkerMutation: true,
+      productionSemanticMatch: true,
+    },
+    termination: { passed: true, p95Ms: 10 },
+    performance: {
+      uiBusyMeasurement: 'warm-total-timer-lag-v1',
+      main: { p95Ms: 100, busyTimeMs: 80 },
+      worker: { p95Ms: 105, busyTimeMs: 4 },
+    },
+  }
+  const gates = summarizePilotGates(
+    pilot,
+    {
+      processMemory: {
+        requestedProcessIds: [1],
+        sampledProcessIds: [1],
+        workingSetBytes: 500 * 1024 * 1024,
+      },
+    },
+    {
+      processMemory: {
+        requestedProcessIds: [1],
+        sampledProcessIds: [1],
+        workingSetBytes: 530 * 1024 * 1024,
+      },
+    },
+  )
+
+  assert.deepEqual(gates.semanticParity.missingCases, ['variables', 'stop-chat'])
+  assert.equal(gates.semanticParity.passed, false)
+  assert.equal(gates.windowsPilotPassed, false)
 })

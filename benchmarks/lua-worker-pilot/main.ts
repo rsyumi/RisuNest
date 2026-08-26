@@ -12,6 +12,7 @@ import type {
   LuaWorkerPolicy,
 } from '../../src/ts/process/luaWorkerProtocol'
 import { runScripted } from '../../src/ts/process/scriptings'
+import { DBState } from '../../src/ts/stores.svelte'
 
 interface PilotChatMessage {
   role: 'user' | 'char'
@@ -191,6 +192,7 @@ async function parityCase(
   source: string,
   data: LuaWorkerJsonValue,
   context: LuaWorkerBoundedContext,
+  expectedCommittedStop = false,
 ): Promise<ParityCase> {
   const owner = `pilot-${name}`
   const main = await invokeMain(owner, mode, source, data, context)
@@ -209,8 +211,12 @@ async function parityCase(
       stopSending: workerResult.stopSending,
       chat: state.chat,
       variables: state.variables,
+      ...(expectedCommittedStop ? { committedStop: state.stopped } : {}),
     }
-    return { name, passed: sameValue(main, worker), main, worker }
+    const expectedMain = expectedCommittedStop
+      ? { ...main, committedStop: true }
+      : main
+    return { name, passed: sameValue(expectedMain, worker), main: expectedMain, worker }
   }
   finally {
     client.dispose()
@@ -314,6 +320,55 @@ async function runParityCorpus(): Promise<ParityCase[]> {
     `,
     null,
     chatContext,
+  ))
+  const previousGlobalVariables = DBState.db.globalChatVariables
+  DBState.db.globalChatVariables = {
+    ...(previousGlobalVariables ?? {}),
+    __risunest_worker_pilot_global: 'global-value',
+  }
+  try {
+    cases.push(await parityCase(
+      'variables',
+      'editInput',
+      `
+        listenEdit('editInput', function(id, value)
+          local previous = getState(id, 'profile')
+          local changed = setStateChanged(id, 'profile', { level = 2 })
+          setState(id, 'enabled', true)
+          return {
+            previous = previous,
+            changed = changed,
+            current = getState(id, 'profile'),
+            enabled = getState(id, 'enabled'),
+            global = getGlobalVar(id, '__risunest_worker_pilot_global')
+          }
+        end)
+      `,
+      null,
+      {
+        messages: [],
+        startIndex: 0,
+        totalMessages: 0,
+        chatVars: { __profile: JSON.stringify({ level: 1 }) },
+        globalVars: { __risunest_worker_pilot_global: 'global-value' },
+      },
+    ))
+  }
+  finally {
+    DBState.db.globalChatVariables = previousGlobalVariables
+  }
+  cases.push(await parityCase(
+    'stop-chat',
+    'editInput',
+    `
+      listenEdit('editInput', function(id, value)
+        stopChat(id)
+        return 'stopped'
+      end)
+    `,
+    null,
+    emptyContext,
+    true,
   ))
   return cases
 }

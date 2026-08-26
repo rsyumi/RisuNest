@@ -208,6 +208,44 @@ describe('real Wasmoon Lua Worker runtime', () => {
     })
   })
 
+  it('does not expose a caught mutation that exceeds the mutation limit', async () => {
+    const messages: LuaWorkerHostMessage[] = []
+    const runtime = createWasmoonLuaWorkerRuntime({
+      loadJsonLua: async () => jsonLua,
+      postMessage: (message) => messages.push(message),
+    })
+    runtime.handleMessage(register(`
+      listenEdit('editInput', function(id, value, meta)
+        local succeeded = pcall(function()
+          setChat(id, 0, 'rejected')
+        end)
+        return {
+          succeeded = succeeded,
+          current = getChatData(id, 0)
+        }
+      end)
+    `, {
+      limits: { ...LUA_WORKER_PROTOCOL_LIMITS, mutationCount: 0 },
+    }))
+    runtime.handleMessage(invoke(14, {
+      boundedContext: {
+        messages: [{ role: 'user', data: 'original' }],
+        startIndex: 0,
+        totalMessages: 1,
+      },
+    }))
+
+    const result = await waitForMessage(
+      messages,
+      (message) => message.type === 'result' && message.id === 14,
+    )
+    expect(result).toMatchObject({
+      type: 'result',
+      res: { succeeded: false, current: 'original' },
+      orderedMutations: [],
+    })
+  })
+
   it('provides the production log helper', async () => {
     const messages: LuaWorkerHostMessage[] = []
     const runtime = createWasmoonLuaWorkerRuntime({

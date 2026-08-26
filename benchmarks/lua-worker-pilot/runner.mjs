@@ -52,18 +52,46 @@ export function buildTauriProfileConfig(original, port, runId) {
 }
 
 export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
-  const requiredParityCases = ['chat-reads', 'ordered-mutations', 'mutation-reads']
+  const requiredParityCases = [
+    'chat-reads',
+    'ordered-mutations',
+    'mutation-reads',
+    'variables',
+    'stop-chat',
+  ]
+  const requiredBoundaryCases = ['unsupported', 'contextWindow', 'memory']
   const parityNames = new Set((pilot.parity ?? []).map((entry) => entry.name))
   const missingParityCases = requiredParityCases.filter((name) => !parityNames.has(name))
+  const boundaries = pilot.boundaries ?? {}
+  const missingBoundaryCases = requiredBoundaryCases.filter((name) => !(name in boundaries))
   const mainP95 = pilot.performance.main.p95Ms
   const workerP95 = pilot.performance.worker.p95Ms
   const mainBusy = pilot.performance.main.busyTimeMs
   const workerBusy = pilot.performance.worker.busyTimeMs
-  const rssBaseline = baselineMemory.processMemory.workingSetBytes
-  const rssDelta = Math.max(0, idleMemory.processMemory.workingSetBytes - rssBaseline)
+  const rssBaseline = Number.isFinite(baselineMemory.processMemory.workingSetBytes)
+    ? baselineMemory.processMemory.workingSetBytes
+    : 0
+  const rssIdle = Number.isFinite(idleMemory.processMemory.workingSetBytes)
+    ? idleMemory.processMemory.workingSetBytes
+    : 0
+  const rssDelta = Math.max(0, rssIdle - rssBaseline)
   const rssBudget = Math.min(64 * 1024 * 1024, rssBaseline * 0.10)
-  const supportedBoundariesPassed = Object.values(pilot.boundaries)
-    .every((boundary) => boundary.passed)
+  const supportedBoundariesPassed = missingBoundaryCases.length === 0
+    && requiredBoundaryCases.every((name) => boundaries[name]?.passed === true)
+  const hasCompleteProcessSample = (snapshot) => {
+    const memory = snapshot?.processMemory ?? {}
+    const requested = memory.requestedProcessIds
+    const sampled = memory.sampledProcessIds
+    return Array.isArray(requested)
+      && requested.length > 0
+      && Array.isArray(sampled)
+      && sampled.length === requested.length
+      && requested.every((pid) => Number.isSafeInteger(pid) && sampled.includes(pid))
+      && Number.isFinite(memory.workingSetBytes)
+      && memory.workingSetBytes > 0
+  }
+  const completeRssEvidence = hasCompleteProcessSample(baselineMemory)
+    && hasCompleteProcessSample(idleMemory)
   const semanticParity = {
     passed: pilot.parityMismatchCount === 0
       && pilot.globalIsolation.passed
@@ -86,17 +114,20 @@ export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
     reduction: mainBusy > 0 ? 1 - workerBusy / mainBusy : 0,
   }
   const integratedP95 = {
-    passed: workerP95 <= mainP95 * 1.10,
+    passed: Number.isFinite(mainP95) && mainP95 > 0
+      && Number.isFinite(workerP95) && workerP95 > 0
+      && workerP95 <= mainP95 * 1.10,
     mainMs: mainP95,
     workerMs: workerP95,
     ratio: mainP95 > 0 ? workerP95 / mainP95 : Number.POSITIVE_INFINITY,
   }
   const idleRss = {
-    passed: rssDelta <= rssBudget,
+    passed: completeRssEvidence && rssDelta <= rssBudget,
     baselineBytes: rssBaseline,
-    idleFourWorkersBytes: idleMemory.processMemory.workingSetBytes,
+    idleFourWorkersBytes: rssIdle,
     deltaBytes: rssDelta,
     budgetBytes: rssBudget,
+    completeProcessSamples: completeRssEvidence,
   }
   const partialMutations = {
     passed: pilot.atomicFailureComparison.zeroPartialWorkerMutation,
@@ -109,9 +140,23 @@ export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
     && idleRss.passed
     && partialMutations.passed
 
+  const supportedBoundaries = {
+    passed: supportedBoundariesPassed,
+    missingCases: missingBoundaryCases,
+  }
+  const productionBlockers = [
+    !semanticParity.passed && 'Semantic parity gate failed.',
+    !supportedBoundaries.passed && 'Supported boundary evidence is incomplete or failed.',
+    !termination.passed && 'Worker termination gate failed.',
+    !uiBusyTime.passed && 'UI busy-time gate failed.',
+    !integratedP95.passed && 'Integrated P95 latency gate failed.',
+    !idleRss.passed && 'Idle Worker RSS gate failed or has incomplete process samples.',
+    !partialMutations.passed && 'Partial-mutation gate failed.',
+  ].filter(Boolean)
+
   return {
     semanticParity,
-    supportedBoundaries: { passed: supportedBoundariesPassed },
+    supportedBoundaries,
     partialMutations,
     termination,
     uiBusyTime,
@@ -119,10 +164,7 @@ export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
     idleRss,
     windowsPilotPassed,
     productionAdoptionEnabled: false,
-    productionBlockers: [
-      'Physical Android WebView evidence is unavailable.',
-      'Current main-thread handler errors retain eager mutations while the pilot discards the atomic batch.',
-    ],
+    productionBlockers,
   }
 }
 
@@ -308,10 +350,14 @@ async function queryWindowsProcessMemory(processIds) {
 }
 
 function aggregateProcessMemory(processIds, rows) {
-  const processes = [...new Set(processIds)]
+  const requestedProcessIds = [...new Set(processIds)]
+  const processes = requestedProcessIds
     .map((pid) => rows.find((row) => row.pid === pid))
     .filter(Boolean)
   return {
+    requestedProcessIds,
+    sampledProcessIds: processes.map((row) => row.pid),
+    requestedProcessCount: requestedProcessIds.length,
     processCount: processes.length,
     workingSetBytes: processes.reduce((sum, row) => sum + row.workingSetBytes, 0),
     privateBytes: processes.reduce((sum, row) => sum + row.privateBytes, 0),
@@ -377,23 +423,29 @@ async function startBrowser(repositoryRoot, temporaryRoot, port, timeoutMs) {
   })
   preview.stdout.on('data', (chunk) => process.stderr.write(chunk))
   preview.stderr.on('data', (chunk) => process.stderr.write(chunk))
-  const url = `http://${CDP_HOST}:${previewPort}`
-  await waitForHttp(url, timeoutMs)
-  const executable = await findBrowserExecutable()
-  const browser = spawn(executable, [
-    '--headless=new',
-    `--remote-debugging-port=${port}`,
-    '--remote-allow-origins=*',
-    `--user-data-dir=${path.join(temporaryRoot, 'browser-profile')}`,
-    '--no-first-run',
-    '--disable-background-networking',
-    url,
-  ], {
-    cwd: repositoryRoot,
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  return { appProcess: browser, helperProcess: preview }
+  try {
+    const url = `http://${CDP_HOST}:${previewPort}`
+    await waitForHttp(url, timeoutMs)
+    const executable = await findBrowserExecutable()
+    const browser = spawn(executable, [
+      '--headless=new',
+      `--remote-debugging-port=${port}`,
+      '--remote-allow-origins=*',
+      `--user-data-dir=${path.join(temporaryRoot, 'browser-profile')}`,
+      '--no-first-run',
+      '--disable-background-networking',
+      url,
+    ], {
+      cwd: repositoryRoot,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return { appProcess: browser, helperProcess: preview }
+  }
+  catch (error) {
+    await stopProcess(preview)
+    throw error
+  }
 }
 
 async function startTauri(repositoryRoot, temporaryRoot, port) {
