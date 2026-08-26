@@ -134,6 +134,57 @@ test('fails closed when boundary or process RSS evidence is missing', () => {
   ])
 })
 
+test('fails RSS when baseline and idle process populations differ', () => {
+  const pilot = {
+    parity: [
+      { name: 'chat-reads' },
+      { name: 'ordered-mutations' },
+      { name: 'mutation-reads' },
+      { name: 'variables' },
+      { name: 'stop-chat' },
+    ],
+    parityMismatchCount: 0,
+    globalIsolation: { passed: true },
+    syntheticPromise: { passed: true },
+    boundaries: {
+      unsupported: { passed: true },
+      contextWindow: { passed: true },
+      memory: { passed: true },
+    },
+    atomicFailureComparison: {
+      zeroPartialWorkerMutation: true,
+      productionSemanticMatch: true,
+    },
+    termination: { passed: true, p95Ms: 10 },
+    performance: {
+      uiBusyMeasurement: 'warm-total-timer-lag-v1',
+      main: { p95Ms: 100, busyTimeMs: 80 },
+      worker: { p95Ms: 105, busyTimeMs: 4 },
+    },
+  }
+  const gates = summarizePilotGates(
+    pilot,
+    {
+      processMemory: {
+        requestedProcessIds: [1, 2],
+        sampledProcessIds: [1, 2],
+        workingSetBytes: 500 * 1024 * 1024,
+      },
+    },
+    {
+      processMemory: {
+        requestedProcessIds: [1, 3],
+        sampledProcessIds: [1, 3],
+        workingSetBytes: 530 * 1024 * 1024,
+      },
+    },
+  )
+
+  assert.equal(gates.idleRss.completeProcessSamples, false)
+  assert.equal(gates.idleRss.passed, false)
+  assert.equal(gates.windowsPilotPassed, false)
+})
+
 test('fails semantic parity when atomic error handling differs from production', () => {
   const pilot = {
     parity: [

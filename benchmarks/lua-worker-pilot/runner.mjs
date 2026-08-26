@@ -92,6 +92,11 @@ export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
   }
   const completeRssEvidence = hasCompleteProcessSample(baselineMemory)
     && hasCompleteProcessSample(idleMemory)
+    && baselineMemory.processMemory.requestedProcessIds.length
+      === idleMemory.processMemory.requestedProcessIds.length
+    && baselineMemory.processMemory.requestedProcessIds.every((pid) => (
+      idleMemory.processMemory.requestedProcessIds.includes(pid)
+    ))
   const semanticParity = {
     passed: pilot.parityMismatchCount === 0
       && pilot.globalIsolation.passed
