@@ -1390,6 +1390,7 @@ mod tests {
         decode_asset_alias_metadata, decode_logical_record, decode_message_page,
         LogicalManifestRecord,
     };
+    use crate::persistent_store::snapshot;
     use rusqlite::params;
     use serde_json::json;
 
@@ -1601,6 +1602,20 @@ mod tests {
             cas.read_object(&built.manifest_hash).unwrap().unwrap(),
             built.manifest_bytes,
         );
+        let base_manifest = cas.prepare_bytes(b"remote logical manifest").unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_peer_common_bases (
+                    peer_id, library_id, generation_id, manifest_hash,
+                    generation_sequence, updated_at
+                 ) VALUES ('peer', 'library', 'remote-generation', ?1, '1', 0)",
+                [&base_manifest.content_hash],
+            )
+            .unwrap();
+        let roots = snapshot::collect_asset_roots(&store.connection).unwrap();
+        assert!(roots.object_hashes.contains(&built.manifest_hash));
+        assert!(roots.object_hashes.contains(&base_manifest.content_hash));
 
         let conversation = built
             .manifest

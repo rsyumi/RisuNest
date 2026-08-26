@@ -514,6 +514,20 @@ pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetR
         "SELECT object_hash FROM cold_aliases WHERE object_hash IS NOT NULL",
         &mut roots.object_hashes,
     )?;
+    if table_exists(connection, "logical_sync_generations")? {
+        scan_optional_hash_column(
+            connection,
+            "SELECT manifest_hash FROM logical_sync_generations WHERE state = 'complete'",
+            &mut roots.object_hashes,
+        )?;
+    }
+    if table_exists(connection, "logical_peer_common_bases")? {
+        scan_optional_hash_column(
+            connection,
+            "SELECT manifest_hash FROM logical_peer_common_bases",
+            &mut roots.object_hashes,
+        )?;
+    }
 
     for query in [
         "SELECT value FROM root",
@@ -539,6 +553,18 @@ pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetR
         roots.blockers.insert("cold-payload-unscanned".to_owned());
     }
     Ok(roots)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(StoreError::from)
 }
 
 fn scan_optional_hash_column(
