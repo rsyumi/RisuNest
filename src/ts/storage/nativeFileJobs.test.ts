@@ -12,6 +12,7 @@ import {
     resumeNativeOfficialPublication,
     type NativeFileJobStatus,
     type NativeOfficialPublicationAttemptResult,
+    type NativeOfficialPublicationRetryRequest,
 } from './nativeFileJobs'
 
 function status(
@@ -1833,6 +1834,216 @@ describe('native file jobs', () => {
         ])
     })
 
+    it('uses one job for consecutive 403 retries and sends only fresh retry input', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const retry = {
+            accountId: 'account-1',
+            session: 'session-42',
+            saveDate: '1001',
+            credential: { kind: 'risu-auth' as const, token: 'new-token' },
+            baseUrl: 'https://stale.example',
+        }
+        const waiting = {
+            jobId: 'publication-1',
+            kind: 'official-publication-upload' as const,
+            state: 'waitingForInput' as const,
+            phase: 'awaiting-publication-retry' as const,
+            progress: { completedBytes: 512, completedItems: 1 },
+            publicationAttempt: {
+                kind: 'reauthentication-needed' as const,
+                accountId: 'account-1',
+                session: 'session-43',
+                saveDate: '1001',
+                status: 403,
+            },
+        }
+        const terminal = {
+            jobId: 'publication-1',
+            kind: 'official-publication-upload' as const,
+            state: 'succeeded' as const,
+            phase: 'complete' as const,
+            progress: { completedBytes: 1024, completedItems: 2 },
+            result: {
+                revision: 17,
+                sourceBytes: 512,
+                sourceSha256: 'f'.repeat(64),
+                characterCount: 2,
+                presetCount: 1,
+                warningCodes: [],
+                publication: {
+                    kind: 'written' as const,
+                    accountId: 'account-1',
+                    session: 'session-43',
+                    saveDate: '1002',
+                    status: 200,
+                    replacementKey: 'database/database.bin',
+                    warning: null,
+                    reloadSession: false,
+                },
+            },
+        }
+        let statusPoll = 0
+        const dependencies = {
+            isTauri: () => true,
+            invoke: async (command: string, args?: Record<string, unknown>) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_official_publication_retry') return 'accepted'
+                if (command === 'native_file_job_status') {
+                    return statusPoll++ === 0 ? waiting : terminal
+                }
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        }
+        const firstOutcome = await continueNativeOfficialPublication(
+            'publication-1',
+            retry,
+            { revision: 17, accountId: 'account-1' },
+            {},
+            dependencies,
+        )
+
+        expect(firstOutcome).toEqual({
+            kind: 'waiting-for-reauthentication',
+            jobId: 'publication-1',
+            accountId: 'account-1',
+            session: 'session-43',
+        })
+        const secondOutcome = await continueNativeOfficialPublication(
+            'publication-1',
+            {
+                accountId: 'account-1',
+                session: 'session-43',
+                saveDate: '1002',
+                credential: { kind: 'risu-auth', token: 'newer-token' },
+                expectedRevision: 0,
+            } as NativeOfficialPublicationRetryRequest & { expectedRevision: number },
+            { revision: 17, accountId: 'account-1' },
+            {},
+            dependencies,
+        )
+
+        expect(secondOutcome.kind).toBe('completed')
+        expect(calls).toEqual([
+            ['native_file_job_official_publication_retry', {
+                request: {
+                    jobId: 'publication-1',
+                    accountId: 'account-1',
+                    session: 'session-42',
+                    saveDate: '1001',
+                    credential: { kind: 'risu-auth', token: 'new-token' },
+                },
+            }],
+            ['native_file_job_status', { jobId: 'publication-1' }],
+            ['native_file_job_official_publication_retry', {
+                request: {
+                    jobId: 'publication-1',
+                    accountId: 'account-1',
+                    session: 'session-43',
+                    saveDate: '1002',
+                    credential: { kind: 'risu-auth', token: 'newer-token' },
+                },
+            }],
+            ['native_file_job_status', { jobId: 'publication-1' }],
+        ])
+    })
+
+    it('drains an already-aborted continuation through cancellation without sending retry input', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        controller.abort()
+
+        await expect(continueNativeOfficialPublication(
+            'publication-1',
+            {
+                accountId: 'account-1',
+                session: 'session-42',
+                saveDate: '1001',
+                credential: { kind: 'risu-auth', token: 'new-token' },
+            },
+            { revision: 17, accountId: 'account-1' },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_cancel') return 'requested'
+                    if (command === 'native_file_job_status') return {
+                        jobId: 'publication-1',
+                        kind: 'official-publication-upload',
+                        state: 'cancelled',
+                        phase: 'complete',
+                        progress: { completedBytes: 512, completedItems: 1 },
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(commands).toEqual([
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+    })
+
+    it('preserves a successful continuation that completes too late to cancel', async () => {
+        const controller = new AbortController()
+        const commands: string[] = []
+        controller.abort()
+        const terminal = {
+            jobId: 'publication-1',
+            kind: 'official-publication-upload' as const,
+            state: 'succeeded' as const,
+            phase: 'complete' as const,
+            progress: { completedBytes: 512, completedItems: 1 },
+            result: {
+                revision: 17,
+                sourceBytes: 512,
+                sourceSha256: 'f'.repeat(64),
+                characterCount: 2,
+                presetCount: 1,
+                warningCodes: [],
+                publication: {
+                    kind: 'written' as const,
+                    accountId: 'account-1',
+                    session: 'session-42',
+                    saveDate: '1001',
+                    status: 200,
+                    replacementKey: 'database/database.bin',
+                    warning: null,
+                    reloadSession: false,
+                },
+            },
+        }
+
+        await expect(continueNativeOfficialPublication(
+            'publication-1',
+            {
+                accountId: 'account-1',
+                session: 'session-42',
+                saveDate: '1001',
+                credential: { kind: 'risu-auth', token: 'new-token' },
+            },
+            { revision: 17, accountId: 'account-1' },
+            { signal: controller.signal },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_cancel') return 'too-late'
+                    if (command === 'native_file_job_status') return terminal
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(commands).toEqual(['native_file_job_cancel', 'native_file_job_status'])
+    })
+
     it('resumes an active publication as an unacknowledged terminal receipt', async () => {
         const commands: string[] = []
         let poll = 0
@@ -1932,6 +2143,66 @@ describe('native file jobs', () => {
             'native_file_job_cancel',
             'native_file_job_status',
             'native_file_job_forget',
+        ])
+    })
+
+    it('retains a recovered waiting job that succeeds too late to cancel', async () => {
+        const commands: string[] = []
+        let poll = 0
+        const terminal = {
+            jobId: 'publication-waiting',
+            kind: 'official-publication-upload' as const,
+            state: 'succeeded' as const,
+            phase: 'complete' as const,
+            progress: { completedBytes: 128, completedItems: 1 },
+            result: {
+                revision: 17,
+                sourceBytes: 128,
+                sourceSha256: 'c'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+                publication: {
+                    kind: 'not-modified' as const,
+                    accountId: 'account-1',
+                    session: 'session-1',
+                    saveDate: '1000',
+                    status: 304,
+                    replacementKey: 'database/database.bin',
+                },
+            },
+        }
+        const receipt = await resumeNativeOfficialPublication('publication-waiting', {}, {
+            isTauri: () => true,
+            invoke: async (command) => {
+                commands.push(command)
+                if (command === 'native_file_job_status') {
+                    if (poll++ === 0) return {
+                        ...terminal,
+                        state: 'waitingForInput' as const,
+                        phase: 'awaiting-publication-retry' as const,
+                        result: undefined,
+                        publicationAttempt: {
+                            kind: 'reauthentication-needed' as const,
+                            accountId: 'account-1',
+                            session: 'session-1',
+                            saveDate: '1000',
+                            status: 403,
+                        },
+                    }
+                    return terminal
+                }
+                if (command === 'native_file_job_cancel') return 'too-late'
+                throw new Error(`Unexpected command: ${command}`)
+            },
+            wait: async () => undefined,
+        })
+
+        expect(receipt?.result).toEqual(terminal.result)
+        expect(commands).toEqual([
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
         ])
     })
 

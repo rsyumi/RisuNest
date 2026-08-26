@@ -478,6 +478,12 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
     }
 }
 
+function cancelledNativeOfficialPublicationAbortError(): Error {
+    return Object.assign(abortError(), {
+        nativeOfficialPublicationCancellationDrained: true,
+    })
+}
+
 async function invokeNative(
     dependencies: NativeFileJobDependencies,
     command: string,
@@ -1430,11 +1436,17 @@ export async function continueNativeOfficialPublication(
     }
     if (options.signal?.aborted) {
         await cancelNativeOfficialPublication(jobId, {}, dependencies)
-        throw abortError()
+        throw cancelledNativeOfficialPublicationAbortError()
     }
 
     await invokeNative(dependencies, 'native_file_job_official_publication_retry', {
-        request: { jobId, ...request },
+        request: {
+            jobId,
+            accountId: request.accountId,
+            session: request.session,
+            saveDate: request.saveDate,
+            credential: request.credential,
+        },
     })
     const outcome = await pollNativeOfficialPublication(jobId, {
         jobId,

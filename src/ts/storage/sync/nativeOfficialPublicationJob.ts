@@ -41,6 +41,13 @@ export interface NativeOfficialPublicationJobDependencies {
     }): Promise<OfficialRecoveredPublication | null>
 }
 
+function hasDrainedNativeOfficialPublicationCancellation(error: unknown): boolean {
+    return typeof error === 'object'
+        && error !== null
+        && 'nativeOfficialPublicationCancellationDrained' in error
+        && error.nativeOfficialPublicationCancellationDrained === true
+}
+
 export function createNativeOfficialPublicationJobPublisher(
     dependencies: NativeOfficialPublicationJobDependencies,
 ): OfficialNativeDatabasePublisher {
@@ -129,7 +136,10 @@ export function createNativeOfficialPublicationJobPublisher(
             )
         }
         catch (error) {
-            if (pendingJobId !== null) {
+            if (
+                pendingJobId !== null
+                && !hasDrainedNativeOfficialPublicationCancellation(error)
+            ) {
                 try {
                     await cancelAttempt(pendingJobId)
                 }
@@ -137,7 +147,14 @@ export function createNativeOfficialPublicationJobPublisher(
             }
             throw error
         }
-        if (result === null) return null
+        if (result === null) {
+            if (pendingJobId === null) return null
+            try {
+                await cancelAttempt(pendingJobId)
+            }
+            catch {}
+            throw new Error('Native official publication ended before reauthentication retry')
+        }
         if (result.kind === 'auth-warning') {
             throw new Error('Official account authorization warning while writing database/database.bin')
         }

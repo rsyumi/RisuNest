@@ -259,6 +259,128 @@ describe('native official publication job publisher', () => {
         expect(result?.databaseFingerprint).toBe('a'.repeat(64))
     })
 
+    it('cancels a pending native publication when reauthentication stops without retrying', async () => {
+        const account: Pick<AccountStorage, 'writeOfficialDatabaseFromNative'> = {
+            async writeOfficialDatabaseFromNative<T>(
+                attempt: AccountNativeOfficialWriteAttempt<T>,
+                options?: { signal?: AbortSignal },
+            ): Promise<AccountNativeOfficialWriteResult<T> | null> {
+                const attempted = await attempt({
+                    credential: { kind: 'risu-auth', token: 'legacy-token' },
+                    session: 'session-1',
+                    saveDate: '1700000000000',
+                    signal: options?.signal,
+                })
+                expect(attempted).toMatchObject({ kind: 'reauthentication-needed' })
+                return null
+            },
+        }
+        const cancelAttempt = vi.fn(async () => null)
+        const publish = createNativeOfficialPublicationJobPublisher({
+            account,
+            baseUrl: 'https://hub.invalid',
+            runAttempt: vi.fn(async () => ({
+                kind: 'waiting-for-reauthentication' as const,
+                jobId: 'publication-1',
+                accountId: 'account-1',
+                session: 'session-42',
+            })),
+            cancelAttempt,
+        })
+
+        await expect(publish({
+            revision: 7,
+            accountId: 'account-1',
+            lease: pinnedLease(),
+            resourceReplacements: {},
+        })).rejects.toThrow('ended before reauthentication retry')
+
+        expect(cancelAttempt).toHaveBeenCalledOnce()
+        expect(cancelAttempt).toHaveBeenCalledWith('publication-1')
+    })
+
+    it('does not recancel a continuation that already drained an abort', async () => {
+        const drainedAbort = Object.assign(
+            new DOMException('Native file job was cancelled', 'AbortError'),
+            { nativeOfficialPublicationCancellationDrained: true },
+        )
+        const continueAttempt = vi.fn(async () => { throw drainedAbort })
+        const cancelAttempt = vi.fn(async () => null)
+        const publish = createNativeOfficialPublicationJobPublisher({
+            ...accountHarness(),
+            baseUrl: 'https://hub.invalid',
+            runAttempt: vi.fn(async () => ({
+                kind: 'waiting-for-reauthentication' as const,
+                jobId: 'publication-1',
+                accountId: 'account-1',
+                session: 'session-42',
+            })),
+            continueAttempt,
+            cancelAttempt,
+        })
+
+        await expect(publish({
+            revision: 7,
+            accountId: 'account-1',
+            lease: pinnedLease(),
+            resourceReplacements: {},
+            signal: new AbortController().signal,
+        })).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(continueAttempt).toHaveBeenCalledOnce()
+        expect(cancelAttempt).not.toHaveBeenCalled()
+    })
+
+    it('preserves a too-late successful job when login fails after it is pending', async () => {
+        const loginFailure = new DOMException('Login cancelled', 'AbortError')
+        const account: Pick<AccountStorage, 'writeOfficialDatabaseFromNative'> = {
+            async writeOfficialDatabaseFromNative<T>(
+                attempt: AccountNativeOfficialWriteAttempt<T>,
+                options?: { signal?: AbortSignal },
+            ): Promise<AccountNativeOfficialWriteResult<T> | null> {
+                await attempt({
+                    credential: { kind: 'risu-auth', token: 'legacy-token' },
+                    session: 'session-1',
+                    saveDate: '1700000000000',
+                    signal: options?.signal,
+                })
+                throw loginFailure
+            },
+        }
+        const acknowledge = vi.fn(async () => undefined)
+        const cancelAttempt = vi.fn(async () => receipt({
+            kind: 'written',
+            accountId: 'account-1',
+            session: 'session-42',
+            saveDate: '1700000000000',
+            status: 200,
+            replacementKey: 'database/database.bin',
+            warning: null,
+            reloadSession: false,
+        }, acknowledge))
+        const publish = createNativeOfficialPublicationJobPublisher({
+            account,
+            baseUrl: 'https://hub.invalid',
+            runAttempt: vi.fn(async () => ({
+                kind: 'waiting-for-reauthentication' as const,
+                jobId: 'publication-1',
+                accountId: 'account-1',
+                session: 'session-42',
+            })),
+            cancelAttempt,
+        })
+
+        await expect(publish({
+            revision: 7,
+            accountId: 'account-1',
+            lease: pinnedLease(),
+            resourceReplacements: {},
+        })).rejects.toBe(loginFailure)
+
+        expect(cancelAttempt).toHaveBeenCalledWith('publication-1')
+        expect(acknowledge).not.toHaveBeenCalled()
+    })
+
     it('falls back before account session work when the pinned lease is not native', async () => {
         const lease = pinnedLease()
         Reflect.deleteProperty(lease, nativePersistentRevisionLease)
