@@ -1,5 +1,6 @@
 import { bench, expect, vi } from 'vitest'
 import type { character, customscript } from '../storage/database.svelte'
+import { createStreamingDisplayController } from './streamingDisplayScheduler'
 import { fnv1a, makeRegexFixture } from './tests/phase1Fixtures'
 
 const mocks = vi.hoisted(() => {
@@ -7,6 +8,8 @@ const mocks = vi.hoisted(() => {
         currentSnapshotIndex: -1,
         effectOrder: [] as number[],
         emotions: {} as Record<string, [string, string, number][]>,
+        luaActionCount: 0,
+        pluginActionCount: 0,
     }
     const charEmotionStore = {
         set(value: Record<string, [string, string, number][]>) {
@@ -18,6 +21,10 @@ const mocks = vi.hoisted(() => {
         state,
         charEmotionStore,
         selectedCharStore: {},
+        pluginAction: async (data: string) => {
+            state.pluginActionCount += 1
+            return data
+        },
         database: {
             dynamicAssets: false,
             presetRegex: [] as customscript[],
@@ -52,10 +59,13 @@ vi.mock('src/ts/process/modules', () => ({
 }))
 vi.mock('src/ts/process/memory/hypamemory', () => ({ HypaProcesser: class {} }))
 vi.mock('src/ts/process/scriptings', () => ({
-    runLuaEditTrigger: async (_char: unknown, _mode: unknown, data: string) => data,
+    runLuaEditTrigger: async (_char: unknown, _mode: unknown, data: string) => {
+        mocks.state.luaActionCount += 1
+        return data
+    },
 }))
 vi.mock('src/ts/plugins/plugins.svelte', () => ({
-    pluginV2: { editinput: new Set(), editoutput: new Set(), editprocess: new Set(), editdisplay: new Set() },
+    pluginV2: { editinput: new Set(), editoutput: new Set([mocks.pluginAction]), editprocess: new Set(), editdisplay: new Set() },
 }))
 vi.mock('src/ts/process/triggers', () => ({ runTrigger: vi.fn() }))
 
@@ -64,17 +74,18 @@ const { processScriptFull, resetScriptCache } = await import('./scripts')
 type StreamingMode = 'off' | 'balanced' | 'strong'
 type FixtureName = 'ordinary' | 'stateful-emotion'
 
-interface ScheduledSnapshot {
-    index: number
-    displayAtMs: number
-}
-
 interface ReplayRun {
     finalHash: string
     sideEffectOrder: number[]
+    luaActionCount: number
+    pluginActionCount: number
     firstDisplayMs: number
+    firstWorkStartMs: number
     totalProcessingMs: number
     displayUpdateCount: number
+    activeMaximum: number
+    pendingMaximum: number
+    finalFlushCount: number
     longTaskCount: number
     longTaskTotalMs: number
     maxTaskMs: number
@@ -91,10 +102,16 @@ interface ReplayMeasurement {
     mode: StreamingMode
     finalHash: string
     sideEffectCount: number
+    luaActionCount: number
+    pluginActionCount: number
     sideEffectOrderHash: string
     sideEffectOrder: string
     displayUpdateCount: number
     firstDisplayMs: TimingSummary
+    firstWorkStartMs: TimingSummary
+    activeMaximum: number
+    pendingMaximum: number
+    finalFlushCount: number
     totalProcessingMs: TimingSummary
     longTaskCount: number
     longTaskTotalMs: TimingSummary
@@ -102,7 +119,6 @@ interface ReplayMeasurement {
 }
 
 const STREAMING_DISPLAY_FLUSH_DELAY_MS = 125
-const FRAME_INTERVAL_MS = 16
 const CHUNK_INTERVAL_MS = 10
 const LONG_TASK_THRESHOLD_MS = 50
 const MEASUREMENT_RUNS = 11
@@ -123,42 +139,40 @@ function makeSnapshots(chunkCount: number): string[] {
     return snapshots
 }
 
-function nextFrameAt(timeMs: number): number {
-    return Math.ceil(timeMs / FRAME_INTERVAL_MS) * FRAME_INTERVAL_MS
+class ReplayClock {
+    nowMs = 0
+    nextTimerId = 1
+    timers = new Map<number, { at: number; callback: () => void }>()
+
+    readonly clock = {
+        now: () => this.nowMs,
+        setTimeout: (callback: () => void, delay: number) => {
+            const id = this.nextTimerId++
+            this.timers.set(id, { at: this.nowMs + delay, callback })
+            return id as unknown as ReturnType<typeof setTimeout>
+        },
+        clearTimeout: (timer: ReturnType<typeof setTimeout>) => {
+            this.timers.delete(timer as unknown as number)
+        },
+    }
+
+    async advanceTo(targetMs: number) {
+        while(true){
+            const due = [...this.timers.entries()]
+                .filter(([, timer]) => timer.at <= targetMs)
+                .sort((left, right) => left[1].at - right[1].at)[0]
+            if(!due) break
+            this.nowMs = due[1].at
+            this.timers.delete(due[0])
+            due[1].callback()
+            await settleScheduler()
+        }
+        this.nowMs = targetMs
+    }
 }
 
-function selectDisplaySnapshots(chunkCount: number, mode: StreamingMode): ScheduledSnapshot[] {
-    if(mode === 'off'){
-        return Array.from({ length: chunkCount }, (_, index) => ({
-            index,
-            displayAtMs: index * CHUNK_INTERVAL_MS,
-        }))
-    }
-
-    const selected: ScheduledSnapshot[] = []
-    let pendingIndex: number | null = null
-    let scheduledAtMs: number | null = null
-
-    for(let index = 0; index < chunkCount; index++){
-        const arrivedAtMs = index * CHUNK_INTERVAL_MS
-        if(scheduledAtMs !== null && scheduledAtMs < arrivedAtMs){
-            if(pendingIndex !== null){
-                selected.push({ index: pendingIndex, displayAtMs: scheduledAtMs })
-                pendingIndex = null
-            }
-            scheduledAtMs = null
-        }
-        pendingIndex = index
-        scheduledAtMs ??= nextFrameAt(arrivedAtMs + STREAMING_DISPLAY_FLUSH_DELAY_MS)
-    }
-
-    if(pendingIndex !== null){
-        selected.push({
-            index: pendingIndex,
-            displayAtMs: (chunkCount - 1) * CHUNK_INTERVAL_MS,
-        })
-    }
-    return selected
+async function settleScheduler() {
+    for(let index = 0; index < 8; index++) await Promise.resolve()
 }
 
 function makeCharacter(fixture: FixtureName): character {
@@ -182,45 +196,96 @@ function makeCharacter(fixture: FixtureName): character {
 
 async function runReplay(chunkCount: number, fixture: FixtureName, mode: StreamingMode): Promise<ReplayRun> {
     const snapshots = makeSnapshots(chunkCount)
-    const scheduledSnapshots = selectDisplaySnapshots(chunkCount, mode)
-    const processedSnapshots = mode === 'strong'
-        ? [{ index: chunkCount - 1, displayAtMs: (chunkCount - 1) * CHUNK_INTERVAL_MS }]
-        : scheduledSnapshots
     const character = makeCharacter(fixture)
     const taskDurations: number[] = []
+    const clock = new ReplayClock()
+    let firstWorkStartMs = Number.POSITIVE_INFINITY
+    let firstDisplayMs = Number.POSITIVE_INFINITY
+    let displayUpdateCount = 0
+    let scheduledStartCount = 0
+    let activeCount = 0
+    let activeMaximum = 0
+    let pendingMaximum = 0
     let finalData = ''
 
     resetScriptCache()
     mocks.state.currentSnapshotIndex = -1
     mocks.state.effectOrder = []
     mocks.state.emotions = {}
+    mocks.state.luaActionCount = 0
+    mocks.state.pluginActionCount = 0
 
-    for(const snapshot of processedSnapshots){
-        mocks.state.currentSnapshotIndex = snapshot.index
+    const processSemantic = async ({ sequence, value }: { sequence: number; value: string }) => {
+        activeCount += 1
+        activeMaximum = Math.max(activeMaximum, activeCount)
+        const snapshotIndex = sequence - 1
+        scheduledStartCount += mode === 'strong' ? 0 : 1
+        firstWorkStartMs = Math.min(firstWorkStartMs, clock.nowMs)
+        mocks.state.currentSnapshotIndex = snapshotIndex
         const startedAt = performance.now()
-        const result = await processScriptFull(
-            character,
-            snapshots[snapshot.index],
-            'editoutput',
-            -1,
-            {},
-            { cache: 'bypass', regexWorker: false },
-        )
-        taskDurations.push(performance.now() - startedAt)
-        finalData = result.data
+        try {
+            const result = await processScriptFull(
+                character,
+                value,
+                'editoutput',
+                -1,
+                {},
+                { cache: 'bypass', regexWorker: false },
+            )
+            taskDurations.push(performance.now() - startedAt)
+            finalData = result.data
+            displayUpdateCount += 1
+            firstDisplayMs = Math.min(firstDisplayMs, clock.nowMs)
+        }
+        finally {
+            activeCount -= 1
+        }
     }
+    const controller = createStreamingDisplayController({
+        mode,
+        clock: clock.clock,
+        intervalMs: STREAMING_DISPLAY_FLUSH_DELAY_MS,
+        processSemantic,
+        processPreview: async ({ sequence, value }) => {
+            activeCount += 1
+            activeMaximum = Math.max(activeMaximum, activeCount)
+            scheduledStartCount += 1
+            firstWorkStartMs = Math.min(firstWorkStartMs, clock.nowMs)
+            mocks.state.currentSnapshotIndex = sequence - 1
+            finalData = value
+            displayUpdateCount += 1
+            firstDisplayMs = Math.min(firstDisplayMs, clock.nowMs)
+            activeCount -= 1
+        },
+    })
 
-    const firstDisplayMs = mode === 'strong'
-        ? scheduledSnapshots[0].displayAtMs
-        : scheduledSnapshots[0].displayAtMs + taskDurations[0]
+    for(let index = 0; index < snapshots.length; index++){
+        await clock.advanceTo(index * CHUNK_INTERVAL_MS)
+        await controller.submit(snapshots[index])
+        await settleScheduler()
+        const state = controller.inspect()
+        activeMaximum = Math.max(activeMaximum, state.activeCount)
+        pendingMaximum = Math.max(pendingMaximum, state.pendingCount)
+    }
+    const startsBeforeFinish = scheduledStartCount
+    await controller.finish()
+    await settleScheduler()
+    const finalFlushCount = scheduledStartCount - startsBeforeFinish
+
     const longTasks = taskDurations.filter((duration) => duration >= LONG_TASK_THRESHOLD_MS)
 
     return {
         finalHash: fnv1a(finalData),
         sideEffectOrder: [...mocks.state.effectOrder],
+        luaActionCount: mocks.state.luaActionCount,
+        pluginActionCount: mocks.state.pluginActionCount,
         firstDisplayMs,
+        firstWorkStartMs,
         totalProcessingMs: taskDurations.reduce((total, duration) => total + duration, 0),
-        displayUpdateCount: scheduledSnapshots.length + (mode === 'strong' ? 1 : 0),
+        displayUpdateCount,
+        activeMaximum,
+        pendingMaximum,
+        finalFlushCount,
         longTaskCount: longTasks.length,
         longTaskTotalMs: longTasks.reduce((total, duration) => total + duration, 0),
         maxTaskMs: Math.max(...taskDurations),
@@ -269,10 +334,16 @@ async function measureReplay(chunkCount: number, fixture: FixtureName, mode: Str
         mode,
         finalHash: reference.finalHash,
         sideEffectCount: reference.sideEffectOrder.length,
+        luaActionCount: reference.luaActionCount,
+        pluginActionCount: reference.pluginActionCount,
         sideEffectOrderHash: fnv1a(reference.sideEffectOrder.join(',')),
         sideEffectOrder: formatSideEffectOrder(reference.sideEffectOrder, chunkCount, mode),
         displayUpdateCount: reference.displayUpdateCount,
         firstDisplayMs: summarize(measuredRuns.map((run) => run.firstDisplayMs)),
+        firstWorkStartMs: summarize(measuredRuns.map((run) => run.firstWorkStartMs)),
+        activeMaximum: Math.max(...measuredRuns.map((run) => run.activeMaximum)),
+        pendingMaximum: Math.max(...measuredRuns.map((run) => run.pendingMaximum)),
+        finalFlushCount: Math.max(...measuredRuns.map((run) => run.finalFlushCount)),
         totalProcessingMs: summarize(measuredRuns.map((run) => run.totalProcessingMs)),
         longTaskCount: Math.max(...measuredRuns.map((run) => run.longTaskCount)),
         longTaskTotalMs: summarize(measuredRuns.map((run) => run.longTaskTotalMs)),
@@ -297,6 +368,12 @@ for(const chunkCount of [20, 100, 500]){
     expect(new Set(stateful.map((measurement) => measurement.finalHash))).toEqual(new Set([regexFixture.expectedHash]))
     expect(stateful.find((measurement) => measurement.mode === 'balanced')?.sideEffectCount)
         .not.toBe(stateful.find((measurement) => measurement.mode === 'off')?.sideEffectCount)
+    for(const measurement of stateful){
+        expect(measurement.luaActionCount).toBe(measurement.sideEffectCount)
+        expect(measurement.pluginActionCount).toBe(measurement.sideEffectCount)
+        expect(measurement.activeMaximum).toBeLessThanOrEqual(1)
+        expect(measurement.pendingMaximum).toBeLessThanOrEqual(1)
+    }
 }
 
 console.log(`STREAMING_DISPLAY_MEASUREMENTS ${JSON.stringify({
@@ -305,7 +382,7 @@ console.log(`STREAMING_DISPLAY_MEASUREMENTS ${JSON.stringify({
         regexRuleCount: regexFixture.scripts.length,
         chunkIntervalMs: CHUNK_INTERVAL_MS,
         flushDelayMs: STREAMING_DISPLAY_FLUSH_DELAY_MS,
-        frameIntervalMs: FRAME_INTERVAL_MS,
+        scheduler: 'production-leading-edge',
         warmRuns: MEASUREMENT_RUNS,
         discardedRuns: 1,
         longTaskThresholdMs: LONG_TASK_THRESHOLD_MS,

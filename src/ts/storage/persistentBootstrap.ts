@@ -17,6 +17,9 @@ import { removeCharacterIdFromOrder } from './characterOrderMutation'
 
 const BOOTSTRAP_CATALOG_PAGE_SIZE = 200
 const TRASH_EXPIRY_MS = 3 * 24 * 60 * 60 * 1000
+const NEW_DATABASE_SEED: Partial<Database> = {
+    streamingDisplayOptimizationMode: 'off',
+}
 
 export interface PersistentBootstrapDependencies {
     store: PersistentDataStore
@@ -53,7 +56,7 @@ export async function bootstrapPersistentDatabase(
     const active = await dependencies.store.readRoot()
 
     if (active.revision === 0) {
-        const database = await dependencies.prepareDatabase({} as Database)
+        const database = await dependencies.prepareDatabase({ ...NEW_DATABASE_SEED } as Database)
         const { revision } = await dependencies.store.replaceFromDatabase(database, 0)
         const profile = selectPluginCompatibilityProfile(database.plugins ?? [])
         if (profile === 'scalable-v3' && dependencies.projectScalableWorkingSet) {

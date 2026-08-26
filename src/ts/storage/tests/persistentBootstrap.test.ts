@@ -60,7 +60,9 @@ describe('bootstrapPersistentDatabase', () => {
         const result = await bootstrapPersistentDatabase({ store, prepareDatabase })
 
         expect(prepareDatabase).toHaveBeenCalledTimes(1)
-        expect(prepareDatabase).toHaveBeenCalledWith({})
+        expect(prepareDatabase).toHaveBeenCalledWith({
+            streamingDisplayOptimizationMode: 'off',
+        })
         expect(store.materializeDatabase).not.toHaveBeenCalled()
         expect(store.replaceFromDatabase).toHaveBeenCalledWith(prepared, 0)
         expect(result).toEqual({ database: prepared, revision: 1, profile: 'scalable-v3' })

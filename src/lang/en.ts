@@ -131,10 +131,10 @@ export const languageEnglish = {
         showUnrecommended: "If enabled, it will show unrecommended, deprecated settings. It is NOT RECOMMENDED to use these settings.",
         streamingDisplayOptimizationMode:
             "Reduces display lag when long responses are streamed with heavy post-processing, such as regex-based scripts. This can help on mobile or low-end devices.\n\n" +
-            "Off keeps the normal behavior, but post-processing runs on every token and can add significant overhead.\n\n" +
-            "Balanced lowers the load by trying post-processing only at short intervals, about every 0.125 seconds.\n\n" +
-            "Strong is similar to Balanced, but skips post-processing while streaming and runs it only once after the stream finishes.\n\n" +
-            "This is an experimental feature, and some features may behave unexpectedly because of it.",
+            "Exact compatibility processes every provider update. It has the highest compatibility and the highest CPU cost.\n\n" +
+            "Balanced shows the first update immediately, then processes only the latest update at most about every 0.125 seconds. Stateful scripts can run fewer times.\n\n" +
+            "Strong shows batched raw previews and performs semantic post-processing once after normal completion. It changes intermediate behavior the most.\n\n" +
+            "The selected mode is pinned until the current generation ends. Balanced and Strong can change how many times stateful regex, Lua, or plugin actions run.",
         imageCompression: "If enabled, it will compress images when exporting character. if animated images doesn't works, try disabling this option.",
         useExperimental: "If enabled, it will show some experimental features.",
         forceProxyAsOpenAI: "If enabled, it will force to use OpenAI format when using reverse proxy.",
@@ -887,8 +887,8 @@ export const languageEnglish = {
     chatNotes: "Chat Notes",
     showUnrecommended: "Show Unrecommended Settings",
     streamingDisplayOptimizationMode: "Streaming Display Optimization",
-    streamingDisplayOptimizationOff: "Off",
-    streamingDisplayOptimizationBalanced: "Balanced",
+    streamingDisplayOptimizationOff: "Exact compatibility",
+    streamingDisplayOptimizationBalanced: "Balanced (Recommended)",
     streamingDisplayOptimizationStrong: "Strong",
     altGreet: "Alternative First Messages",
     scripts: "Scripts",
