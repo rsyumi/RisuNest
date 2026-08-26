@@ -421,8 +421,9 @@ fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobErr
 fn messagepack_map_to_json(
     entries: Vec<(MessagePackValue, MessagePackValue)>,
 ) -> Result<JsonSlot, NativeJobError> {
-    let mut indexed = BTreeMap::<u32, (String, Value)>::new();
+    let mut indexed = BTreeMap::<u32, (String, Option<Value>)>::new();
     let mut ordinary = serde_json::Map::new();
+    let mut undefined = HashSet::new();
     for (key, value) in entries {
         let key = key
             .as_str()
@@ -433,18 +434,39 @@ fn messagepack_map_to_json(
         } else {
             key
         };
-        let JsonSlot::Value(value) = messagepack_to_json(value)? else {
-            continue;
-        };
+        let value = messagepack_to_json(value)?;
         if let Some(index) = javascript_array_index(&key) {
-            indexed.insert(index, (key, value));
+            indexed.insert(
+                index,
+                (
+                    key,
+                    match value {
+                        JsonSlot::Value(value) => Some(value),
+                        JsonSlot::Undefined => None,
+                    },
+                ),
+            );
         } else {
-            ordinary.insert(key, value);
+            match value {
+                JsonSlot::Value(value) => {
+                    undefined.remove(&key);
+                    ordinary.insert(key, value);
+                }
+                JsonSlot::Undefined => {
+                    ordinary.insert(key.clone(), Value::Null);
+                    undefined.insert(key);
+                }
+            }
         }
+    }
+    for key in undefined {
+        ordinary.shift_remove(&key);
     }
     let mut output = serde_json::Map::new();
     for (_, (key, value)) in indexed {
-        output.insert(key, value);
+        if let Some(value) = value {
+            output.insert(key, value);
+        }
     }
     output.extend(ordinary);
     Ok(JsonSlot::Value(Value::Object(output)))
@@ -495,16 +517,18 @@ fn timestamp_to_iso(bytes: &[u8]) -> Result<String, NativeJobError> {
     if nanoseconds >= 1_000_000_000 {
         return Err(corrupt("invalid MessagePack timestamp nanoseconds"));
     }
-    const JS_DATE_LIMIT_SECONDS: i64 = 8_640_000_000_000;
-    if !(-JS_DATE_LIMIT_SECONDS..=JS_DATE_LIMIT_SECONDS).contains(&seconds)
-        || (seconds == JS_DATE_LIMIT_SECONDS && nanoseconds != 0)
-    {
+    const JS_DATE_LIMIT_MILLISECONDS: f64 = 8_640_000_000_000_000.0;
+    let milliseconds = seconds as f64 * 1000.0 + nanoseconds as f64 / 1_000_000.0;
+    if !milliseconds.is_finite() || milliseconds.abs() > JS_DATE_LIMIT_MILLISECONDS {
         return Err(compatibility_fallback(
             "MessagePack timestamp is outside the JavaScript Date range",
         ));
     }
-    let datetime = time::OffsetDateTime::from_unix_timestamp(seconds)
-        .and_then(|value| value.replace_nanosecond(nanoseconds))
+    let milliseconds = milliseconds.trunc() as i64;
+    let clipped_seconds = milliseconds.div_euclid(1000);
+    let clipped_nanoseconds = milliseconds.rem_euclid(1000) as u32 * 1_000_000;
+    let datetime = time::OffsetDateTime::from_unix_timestamp(clipped_seconds)
+        .and_then(|value| value.replace_nanosecond(clipped_nanoseconds))
         .map_err(|_| {
             compatibility_fallback("MessagePack timestamp cannot be represented natively")
         })?;
@@ -1479,6 +1503,87 @@ mod tests {
 
         let error = assert_failed_general_restore_preserves_active(&bytes, "extension 42");
         assert_eq!(error.code, "compatibility-fallback");
+    }
+
+    #[test]
+    fn strict_raw_msgpackr_restore_preserves_undefined_collision_state() {
+        use base64::Engine;
+
+        let parity = msgpackr_parity_fixture();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(parity["edgePayloadBase64"].as_str().unwrap())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("raw-undefined-collision.risudat");
+        fs::write(&source, legacy_wire(7, &payload)).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        restore_risu_save(&source, 1, &job, &sink).unwrap();
+
+        let restored = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        let unknown = &restored["roadmap14Unknown"];
+        assert_eq!(
+            unknown["undefinedSanitizedFirst"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["before", "__proto_", "between", "after"]
+        );
+        assert_eq!(
+            unknown["undefinedSanitizedFirst"]["__proto_"],
+            "literal-last"
+        );
+        assert_eq!(
+            unknown["undefinedSanitizedLast"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["before", "between", "after"]
+        );
+        assert!(unknown["undefinedSanitizedLast"].get("__proto_").is_none());
+    }
+
+    #[test]
+    fn strict_raw_msgpackr_edge_fixture_preserves_timeclip_and_block_round_trip() {
+        use base64::Engine;
+
+        let parity = msgpackr_parity_fixture();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(parity["edgePayloadBase64"].as_str().unwrap())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("raw-edge-parity.risudat");
+        fs::write(&source, legacy_wire(7, &payload)).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        restore_risu_save(&source, 1, &job, &sink).unwrap();
+
+        let first = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        let expected = persistent_projection(parity["edgeExpectedProjection"].clone());
+        assert_eq!(first, expected);
+
+        let exported_path = {
+            let mut store = sink.store.lock().unwrap();
+            let lease = store.acquire_revision(2).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            store.release_revision(&lease).unwrap();
+            PathBuf::from(exported.path)
+        };
+        let second_job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
+        let second = sink.store.lock().unwrap().materialize(Some(3)).unwrap();
+        assert_eq!(canonical_hash(&second), canonical_hash(&first));
+        assert_eq!(second, first);
     }
 
     #[test]

@@ -28,7 +28,15 @@ interface ParityFixture {
         invalid: string
         year10000: string
         maximum: string
+        negativeSubMillisecond: string
     }
+    edgePayloadBase64: string
+    edgeExpectedCanonicalSha256: string
+    edgeExpectedDecodedKeys: {
+        undefinedSanitizedFirst: string[]
+        undefinedSanitizedLast: string[]
+    }
+    edgeExpectedProjection: Record<string, unknown>
     unknownExtensionBase64: string
 }
 
@@ -80,6 +88,31 @@ describe('Roadmap 14 msgpackr cross-language fixture', () => {
         const projection = persistedProjection(decoded)
         expect(projection).toEqual(fixture.expectedProjection)
         expect(canonicalSha256(projection)).toBe(fixture.expectedCanonicalSha256)
+    })
+
+    it('freezes undefined collision state and negative sub-millisecond TimeClip semantics', () => {
+        const fixture = readFixture()
+        const decoder = new Unpackr({ int64AsType: 'number', useRecords: false })
+        const payload = Buffer.from(fixture.edgePayloadBase64, 'base64')
+        const decoded = decoder.decode(payload) as Record<string, any>
+        const unknown = decoded.roadmap14Unknown
+
+        expect(Object.keys(unknown.undefinedSanitizedFirst))
+            .toEqual(fixture.edgeExpectedDecodedKeys.undefinedSanitizedFirst)
+        expect(unknown.undefinedSanitizedFirst.__proto_).toBe('literal-last')
+        expect(Object.keys(unknown.undefinedSanitizedLast))
+            .toEqual(fixture.edgeExpectedDecodedKeys.undefinedSanitizedLast)
+        expect(Object.hasOwn(unknown.undefinedSanitizedLast, '__proto_')).toBe(true)
+        expect(unknown.undefinedSanitizedLast.__proto_).toBeUndefined()
+        expect(unknown.negativeSubMillisecond).toBeInstanceOf(Date)
+        expect(unknown.negativeSubMillisecond.getTime()).toBe(-999)
+        expect(unknown.negativeSubMillisecond.toISOString())
+            .toBe('1969-12-31T23:59:59.001Z')
+        expect(payload.toString('hex')).toContain(fixture.dateEncodings.negativeSubMillisecond)
+
+        const projection = persistedProjection(decoded)
+        expect(projection).toEqual(fixture.edgeExpectedProjection)
+        expect(canonicalSha256(projection)).toBe(fixture.edgeExpectedCanonicalSha256)
     })
 
     it('freezes msgpackr rejection of unknown extension values', () => {

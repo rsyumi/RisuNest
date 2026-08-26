@@ -146,7 +146,49 @@
   "dateEncodings": {
     "invalid": "d4ffff",
     "year10000": "c70cff000000000000003afff44180",
-    "maximum": "c70cff00000000000007dba8218000"
+    "maximum": "c70cff00000000000007dba8218000",
+    "negativeSubMillisecond": "c70cff0007a120ffffffffffffffff"
+  },
+  "edgePayloadBase64": "3gAKqHVzZXJuYW1lt01lc3NhZ2VQYWNrIGVkZ2UgcGFyaXR5rWZvcm1hdHZlcnNpb24EsHJvYWRtYXAxNFVua25vd27eAAO3dW5kZWZpbmVkU2FuaXRpemVkRmlyc3TeAAWmYmVmb3JlAalfX3Byb3RvX1/UAACnYmV0d2VlbgKoX19wcm90b1+sbGl0ZXJhbC1sYXN0pWFmdGVyA7Z1bmRlZmluZWRTYW5pdGl6ZWRMYXN03gAFpmJlZm9yZQGoX19wcm90b1+tbGl0ZXJhbC1maXJzdKdiZXR3ZWVuAqlfX3Byb3RvX1/UAAClYWZ0ZXIDtm5lZ2F0aXZlU3ViTWlsbGlzZWNvbmTHDP8AB6Eg//////////+qYm90UHJlc2V0c5CsYm90UHJlc2V0c0lkAKdtb2R1bGVzkKhsb2Fkb3V0c5CncGx1Z2luc5CzcGx1Z2luQ3VzdG9tU3RvcmFnZd4AAKpjaGFyYWN0ZXJzkA==",
+  "edgeExpectedCanonicalSha256": "f9168aa5e94935fee3807e780efec8e1e071bcfb0bb03ea7392adf45730040c1",
+  "edgeExpectedDecodedKeys": {
+    "undefinedSanitizedFirst": [
+      "before",
+      "__proto_",
+      "between",
+      "after"
+    ],
+    "undefinedSanitizedLast": [
+      "before",
+      "__proto_",
+      "between",
+      "after"
+    ]
+  },
+  "edgeExpectedProjection": {
+    "username": "MessagePack edge parity",
+    "formatversion": 4,
+    "roadmap14Unknown": {
+      "undefinedSanitizedFirst": {
+        "before": 1,
+        "__proto_": "literal-last",
+        "between": 2,
+        "after": 3
+      },
+      "undefinedSanitizedLast": {
+        "before": 1,
+        "between": 2,
+        "after": 3
+      },
+      "negativeSubMillisecond": "1969-12-31T23:59:59.001Z"
+    },
+    "botPresets": [],
+    "botPresetsId": 0,
+    "modules": [],
+    "loadouts": [],
+    "plugins": [],
+    "pluginCustomStorage": {},
+    "characters": []
   },
   "unknownExtensionBase64": "1CoA"
 }
