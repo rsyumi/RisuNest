@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-import { Unpackr } from 'msgpackr/index-no-eval'
+import { Packr, Unpackr } from 'msgpackr/index-no-eval'
 import { describe, expect, it, vi } from 'vitest'
 
 import { decodeRisuSave } from '../../../risuSave'
@@ -22,6 +22,12 @@ interface ParityFixture {
         unknown: string[]
         ordered: string[]
         pluginStorage: string[]
+        prototypeCollision: string[]
+    }
+    dateEncodings: {
+        invalid: string
+        year10000: string
+        maximum: string
     }
     unknownExtensionBase64: string
 }
@@ -48,7 +54,28 @@ describe('Roadmap 14 msgpackr cross-language fixture', () => {
         expect(Object.keys(decoded.roadmap14Unknown.ordered)).toEqual(fixture.expectedObjectKeys.ordered)
         expect(Object.keys(decoded.pluginCustomStorage)).toEqual(fixture.expectedObjectKeys.pluginStorage)
         expect(decoded.roadmap14Unknown.persistedDate).toBeInstanceOf(Date)
+        expect(decoded.roadmap14Unknown.invalidDate).toBeInstanceOf(Date)
+        expect(Number.isNaN(decoded.roadmap14Unknown.invalidDate.getTime())).toBe(true)
+        expect(decoded.roadmap14Unknown.year10000.toISOString())
+            .toBe('+010000-01-01T00:00:00.000Z')
+        expect(decoded.roadmap14Unknown.maximumDate.toISOString())
+            .toBe('+275760-09-13T00:00:00.000Z')
+        expect(Object.keys(decoded.roadmap14Unknown.prototypeCollision))
+            .toEqual(fixture.expectedObjectKeys.prototypeCollision)
+        expect(decoded.roadmap14Unknown.prototypeCollision.__proto_).toBe('literal-last')
+        expect(Object.hasOwn(decoded.roadmap14Unknown.prototypeCollision, '__proto__')).toBe(false)
         expect(decoded.roadmap14Unknown.omitted).toBeUndefined()
+
+        const encoder = new Packr({ useRecords: false })
+        const year10000 = new Date(0)
+        year10000.setUTCFullYear(10000, 0, 1)
+        year10000.setUTCHours(0, 0, 0, 0)
+        expect(Buffer.from(encoder.encode(new Date(Number.NaN))).toString('hex'))
+            .toBe(fixture.dateEncodings.invalid)
+        expect(Buffer.from(encoder.encode(year10000)).toString('hex'))
+            .toBe(fixture.dateEncodings.year10000)
+        expect(Buffer.from(encoder.encode(new Date(8.64e15))).toString('hex'))
+            .toBe(fixture.dateEncodings.maximum)
 
         const projection = persistedProjection(decoded)
         expect(projection).toEqual(fixture.expectedProjection)

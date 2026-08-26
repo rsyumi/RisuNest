@@ -408,10 +408,11 @@ fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobErr
         }
         MessagePackValue::Map(entries) => messagepack_map_to_json(entries),
         MessagePackValue::Ext(kind, bytes) if kind == 0 && bytes == [0] => Ok(JsonSlot::Undefined),
+        MessagePackValue::Ext(-1, bytes) if bytes == [0xff] => Ok(JsonSlot::Value(Value::Null)),
         MessagePackValue::Ext(-1, bytes) => {
             Ok(JsonSlot::Value(Value::String(timestamp_to_iso(&bytes)?)))
         }
-        MessagePackValue::Ext(kind, _) => Err(invalid(format!(
+        MessagePackValue::Ext(kind, _) => Err(compatibility_fallback(format!(
             "unsupported legacy MessagePack extension {kind}"
         ))),
     }
@@ -427,6 +428,11 @@ fn messagepack_map_to_json(
             .as_str()
             .map(str::to_owned)
             .ok_or_else(|| invalid("legacy MessagePack object keys must be strings"))?;
+        let key = if key == "__proto__" {
+            "__proto_".to_owned()
+        } else {
+            key
+        };
         let JsonSlot::Value(value) = messagepack_to_json(value)? else {
             continue;
         };
@@ -489,9 +495,19 @@ fn timestamp_to_iso(bytes: &[u8]) -> Result<String, NativeJobError> {
     if nanoseconds >= 1_000_000_000 {
         return Err(corrupt("invalid MessagePack timestamp nanoseconds"));
     }
+    const JS_DATE_LIMIT_SECONDS: i64 = 8_640_000_000_000;
+    if !(-JS_DATE_LIMIT_SECONDS..=JS_DATE_LIMIT_SECONDS).contains(&seconds)
+        || (seconds == JS_DATE_LIMIT_SECONDS && nanoseconds != 0)
+    {
+        return Err(compatibility_fallback(
+            "MessagePack timestamp is outside the JavaScript Date range",
+        ));
+    }
     let datetime = time::OffsetDateTime::from_unix_timestamp(seconds)
         .and_then(|value| value.replace_nanosecond(nanoseconds))
-        .map_err(|_| invalid("MessagePack timestamp is outside the supported Date range"))?;
+        .map_err(|_| {
+            compatibility_fallback("MessagePack timestamp cannot be represented natively")
+        })?;
     let year = datetime.year();
     let year = if (0..=9999).contains(&year) {
         format!("{year:04}")
@@ -1023,6 +1039,10 @@ fn invalid(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("invalid-input", message)
 }
 
+fn compatibility_fallback(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("compatibility-fallback", message)
+}
+
 fn truncated(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("truncated-input", message)
 }
@@ -1270,7 +1290,10 @@ mod tests {
         assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
     }
 
-    fn assert_failed_general_restore_preserves_active(bytes: &[u8], expected: &str) {
+    fn assert_failed_general_restore_preserves_active(
+        bytes: &[u8],
+        expected: &str,
+    ) -> NativeJobError {
         let (directory, sink) = fixture();
         let source = directory.path().join("invalid-general.risudat");
         fs::write(&source, bytes).unwrap();
@@ -1286,6 +1309,7 @@ mod tests {
         let store = sink.store.lock().unwrap();
         assert_eq!(store.revision().unwrap(), 1);
         assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
+        error
     }
 
     fn persistent_projection(value: Value) -> Value {
@@ -1390,6 +1414,31 @@ mod tests {
             first["roadmap14Unknown"]["persistedDate"],
             "2020-01-02T03:04:05.678Z"
         );
+        assert_eq!(first["roadmap14Unknown"]["invalidDate"], Value::Null);
+        assert_eq!(
+            first["roadmap14Unknown"]["year10000"],
+            "+010000-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            first["roadmap14Unknown"]["maximumDate"],
+            "+275760-09-13T00:00:00.000Z"
+        );
+        assert_eq!(
+            first["roadmap14Unknown"]["prototypeCollision"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["before", "__proto_", "after"]
+        );
+        assert_eq!(
+            first["roadmap14Unknown"]["prototypeCollision"]["__proto_"],
+            "literal-last"
+        );
+        assert!(first["roadmap14Unknown"]["prototypeCollision"]
+            .get("__proto__")
+            .is_none());
         assert!(first["roadmap14Unknown"].get("omitted").is_none());
         assert_eq!(
             first["roadmap14Unknown"]["ordered"]
@@ -1428,7 +1477,8 @@ mod tests {
             .unwrap();
         let bytes = legacy_wire(7, &payload);
 
-        assert_failed_general_restore_preserves_active(&bytes, "extension 42");
+        let error = assert_failed_general_restore_preserves_active(&bytes, "extension 42");
+        assert_eq!(error.code, "compatibility-fallback");
     }
 
     #[test]
