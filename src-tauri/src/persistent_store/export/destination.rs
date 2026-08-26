@@ -1,5 +1,4 @@
 use super::{managed_file, ManagedFileKind};
-use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -268,14 +267,7 @@ fn validated_destination(
 }
 
 fn unique_temporary_path(destination: &Path) -> PathBuf {
-    let mut name = OsString::from(".");
-    name.push(
-        destination
-            .file_name()
-            .expect("validated destination file name"),
-    );
-    name.push(format!(".{}.tmp", Uuid::new_v4()));
-    destination.with_file_name(name)
+    destination.with_file_name(format!("{}.tmp", Uuid::new_v4()))
 }
 
 fn io_error(operation: &'static str, source: io::Error) -> DestinationWriteError {
@@ -641,6 +633,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(&destination).unwrap(), b"complete new export");
+        assert!(sibling_temporary_files(&destination_root).is_empty());
+    }
+
+    #[test]
+    fn writes_a_long_valid_destination_name_without_expanding_the_temp_component() {
+        let directory = TempDir::new().unwrap();
+        let source_root = directory.path().join("exports");
+        let destination_root = directory.path().join("chosen");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        let source = source_path(&source_root);
+        let destination = destination_root.join(format!("{}.risudat", "a".repeat(240)));
+        fs::write(&source, b"long destination export").unwrap();
+
+        write_desktop_destination(
+            &source_root,
+            &source,
+            &destination_root,
+            &destination,
+            || false,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"long destination export");
         assert!(sibling_temporary_files(&destination_root).is_empty());
     }
 
