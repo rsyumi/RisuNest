@@ -453,8 +453,7 @@ pub fn run() {
             native_media::recover_inlay_writes(&app_data_dir).map_err(std::io::Error::other)?;
             let state = native_file_jobs::NativeFileJobState::initialize(
                 app_data_dir.join("native-file-jobs"),
-            )
-            .map_err(std::io::Error::other)?;
+            );
             app.manage(state);
             Ok(())
         })

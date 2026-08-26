@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
@@ -14,6 +14,32 @@ const MAX_WARNING_CODES: usize = 16;
 const MAX_CODE_BYTES: usize = 64;
 const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_MANIFEST_BYTES: u64 = 4096;
+const MAX_CONCURRENT_JOBS: usize = 2;
+const MAX_CLEANUP_ERRORS: usize = 4;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeJobError {
+    pub(crate) code: String,
+    pub(crate) message: String,
+}
+
+impl NativeJobError {
+    fn new(code: &str, message: impl AsRef<str>) -> Self {
+        Self {
+            code: code.to_owned(),
+            message: bounded_message(message.as_ref()),
+        }
+    }
+}
+
+impl std::fmt::Display for NativeJobError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for NativeJobError {}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -56,20 +82,32 @@ pub(crate) struct NativeFileJobStartRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct NativeFileJobStarted {
     pub(crate) job_id: String,
+    pub(crate) warning_codes: Vec<String>,
 }
 
-fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, String> {
+fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, NativeJobError> {
     match source {
         JobSource::DesktopPath { path } => {
-            let path = Path::new(path)
-                .canonicalize()
-                .map_err(|error| format!("desktop source is unavailable: {error}"))?;
+            let path = Path::new(path).canonicalize().map_err(|error| {
+                NativeJobError::new(
+                    "invalid-source",
+                    format!("desktop source is unavailable: {error}"),
+                )
+            })?;
             if !path
                 .metadata()
-                .map_err(|error| format!("desktop source metadata is unavailable: {error}"))?
+                .map_err(|error| {
+                    NativeJobError::new(
+                        "invalid-source",
+                        format!("desktop source metadata is unavailable: {error}"),
+                    )
+                })?
                 .is_file()
             {
-                return Err("desktop source must be a regular file".to_owned());
+                return Err(NativeJobError::new(
+                    "invalid-source",
+                    "desktop source must be a regular file",
+                ));
             }
             Ok(path)
         }
@@ -77,44 +115,69 @@ fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, String
     }
 }
 
-fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, String> {
-    let parsed = Uuid::parse_str(token).map_err(|_| "invalid Android spool token".to_owned())?;
+fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJobError> {
+    let parsed =
+        Uuid::parse_str(token).map_err(|_| invalid_source_error("invalid Android spool token"))?;
     if parsed.hyphenated().to_string() != token {
-        return Err("invalid Android spool token".to_owned());
+        return Err(invalid_source_error("invalid Android spool token"));
     }
-    let spool = job_root.join("sources").join(token);
-    let manifest_path = spool.join("source.json");
-    let manifest_metadata = manifest_path
-        .metadata()
-        .map_err(|error| format!("Android spool manifest is unavailable: {error}"))?;
+    let sources_root = job_root.join("sources").canonicalize().map_err(|error| {
+        invalid_source_error(format!("Android source root is unavailable: {error}"))
+    })?;
+    let spool = sources_root.join(token);
+    let canonical_spool = spool.canonicalize().map_err(|error| {
+        invalid_source_error(format!("Android spool directory is unavailable: {error}"))
+    })?;
+    if canonical_spool.parent() != Some(sources_root.as_path())
+        || canonical_spool.file_name().and_then(|name| name.to_str()) != Some(token)
+    {
+        return Err(invalid_source_error(
+            "Android spool owned directory escapes its canonical source root",
+        ));
+    }
+    let manifest_path = canonical_spool.join("source.json");
+    let manifest_metadata = manifest_path.metadata().map_err(|error| {
+        invalid_source_error(format!("Android spool manifest is unavailable: {error}"))
+    })?;
     if !manifest_metadata.is_file() || manifest_metadata.len() > MAX_MANIFEST_BYTES {
-        return Err("Android spool manifest is invalid".to_owned());
+        return Err(invalid_source_error("Android spool manifest is invalid"));
     }
-    let manifest: SpoolManifest = serde_json::from_slice(
-        &fs::read(&manifest_path)
-            .map_err(|error| format!("Android spool manifest cannot be read: {error}"))?,
-    )
-    .map_err(|error| format!("Android spool manifest is invalid: {error}"))?;
+    let manifest: SpoolManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| {
+            invalid_source_error(format!("Android spool manifest cannot be read: {error}"))
+        })?)
+        .map_err(|error| {
+            invalid_source_error(format!("Android spool manifest is invalid: {error}"))
+        })?;
     if manifest.token != token || manifest.state != SpoolState::Ready {
-        return Err("Android spool source is not ready".to_owned());
+        return Err(invalid_source_error("Android spool source is not ready"));
     }
-    let canonical_spool = spool
-        .canonicalize()
-        .map_err(|error| format!("Android spool directory is unavailable: {error}"))?;
-    let source = spool
+    let source = canonical_spool
         .join("source.risudat")
         .canonicalize()
-        .map_err(|error| format!("Android spool source is unavailable: {error}"))?;
+        .map_err(|error| {
+            invalid_source_error(format!("Android spool source is unavailable: {error}"))
+        })?;
     if source.parent() != Some(canonical_spool.as_path()) {
-        return Err("Android spool source escapes its owned directory".to_owned());
+        return Err(invalid_source_error(
+            "Android spool source escapes its owned directory",
+        ));
     }
-    let metadata = source
-        .metadata()
-        .map_err(|error| format!("Android spool source metadata is unavailable: {error}"))?;
+    let metadata = source.metadata().map_err(|error| {
+        invalid_source_error(format!(
+            "Android spool source metadata is unavailable: {error}"
+        ))
+    })?;
     if !metadata.is_file() || manifest.bytes.is_some_and(|bytes| bytes != metadata.len()) {
-        return Err("Android spool source does not match its ready manifest".to_owned());
+        return Err(invalid_source_error(
+            "Android spool source does not match its ready manifest",
+        ));
     }
     Ok(source)
+}
+
+fn invalid_source_error(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("invalid-source", message)
 }
 
 fn cleanup_owned_directories(jobs_root: &Path) -> Result<(), String> {
@@ -124,15 +187,31 @@ fn cleanup_owned_directories(jobs_root: &Path) -> Result<(), String> {
     let canonical_root = jobs_root
         .canonicalize()
         .map_err(|error| format!("native job root cannot be resolved: {error}"))?;
+    let mut errors = Vec::new();
     for entry in fs::read_dir(&canonical_root)
         .map_err(|error| format!("native job root cannot be read: {error}"))?
     {
-        let entry = entry.map_err(|error| format!("native job entry cannot be read: {error}"))?;
-        if !entry
-            .file_type()
-            .map_err(|error| format!("native job entry type is unavailable: {error}"))?
-            .is_dir()
-        {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native job entry cannot be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let is_directory = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native job entry type is unavailable: {error}"),
+                );
+                continue;
+            }
+        };
+        if !is_directory {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -160,17 +239,27 @@ fn cleanup_owned_directories(jobs_root: &Path) -> Result<(), String> {
         if ownership.job_id != name {
             continue;
         }
-        let owned = entry
-            .path()
-            .canonicalize()
-            .map_err(|error| format!("native job directory cannot be resolved: {error}"))?;
+        let owned = match entry.path().canonicalize() {
+            Ok(owned) => owned,
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native job directory cannot be resolved: {error}"),
+                );
+                continue;
+            }
+        };
         if owned.parent() != Some(canonical_root.as_path()) {
             continue;
         }
-        fs::remove_dir_all(&owned)
-            .map_err(|error| format!("native job directory cannot be removed: {error}"))?;
+        if let Err(error) = fs::remove_dir_all(&owned) {
+            record_cleanup_error(
+                &mut errors,
+                format!("native job directory cannot be removed: {error}"),
+            );
+        }
     }
-    Ok(())
+    cleanup_errors_result(errors)
 }
 
 fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
@@ -180,16 +269,31 @@ fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
     let canonical_root = sources_root
         .canonicalize()
         .map_err(|error| format!("native source root cannot be resolved: {error}"))?;
+    let mut errors = Vec::new();
     for entry in fs::read_dir(&canonical_root)
         .map_err(|error| format!("native source root cannot be read: {error}"))?
     {
-        let entry =
-            entry.map_err(|error| format!("native source entry cannot be read: {error}"))?;
-        if !entry
-            .file_type()
-            .map_err(|error| format!("native source entry type is unavailable: {error}"))?
-            .is_dir()
-        {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native source entry cannot be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let is_directory = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native source entry type is unavailable: {error}"),
+                );
+                continue;
+            }
+        };
+        if !is_directory {
             continue;
         }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -201,7 +305,20 @@ fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
         if id.hyphenated().to_string() != name {
             continue;
         }
-        let manifest_path = entry.path().join("source.json");
+        let owned = match entry.path().canonicalize() {
+            Ok(owned) => owned,
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native source directory cannot be resolved: {error}"),
+                );
+                continue;
+            }
+        };
+        if owned.parent() != Some(canonical_root.as_path()) {
+            continue;
+        }
+        let manifest_path = owned.join("source.json");
         let Ok(metadata) = manifest_path.metadata() else {
             continue;
         };
@@ -217,59 +334,109 @@ fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
         if manifest.token != name {
             continue;
         }
-        let owned = entry
-            .path()
-            .canonicalize()
-            .map_err(|error| format!("native source directory cannot be resolved: {error}"))?;
-        if owned.parent() != Some(canonical_root.as_path()) {
-            continue;
+        if let Err(error) = fs::remove_dir_all(&owned) {
+            record_cleanup_error(
+                &mut errors,
+                format!("native source directory cannot be removed: {error}"),
+            );
         }
-        fs::remove_dir_all(&owned)
-            .map_err(|error| format!("native source directory cannot be removed: {error}"))?;
     }
-    Ok(())
+    cleanup_errors_result(errors)
+}
+
+fn record_cleanup_error(errors: &mut Vec<String>, error: String) {
+    if errors.len() < MAX_CLEANUP_ERRORS {
+        errors.push(error);
+    }
+}
+
+fn cleanup_errors_result(errors: Vec<String>) -> Result<(), String> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub(crate) struct NativeFileJobState {
     root: PathBuf,
-    registry: JobRegistry,
+    registry: Arc<JobRegistry>,
+    active_workers: Arc<AtomicUsize>,
+    max_concurrent_jobs: usize,
+    startup_warnings: Vec<NativeJobError>,
+    capability_error: Option<NativeJobError>,
 }
 
 impl NativeFileJobState {
-    pub(crate) fn initialize(root: PathBuf) -> Result<Self, String> {
+    pub(crate) fn initialize(root: PathBuf) -> Self {
+        Self::initialize_with_max_workers(root, MAX_CONCURRENT_JOBS)
+    }
+
+    fn initialize_with_max_workers(root: PathBuf, max_concurrent_jobs: usize) -> Self {
         let jobs_root = root.join("jobs");
         let sources_root = root.join("sources");
-        fs::create_dir_all(&jobs_root)
-            .map_err(|error| format!("native job root cannot be created: {error}"))?;
-        fs::create_dir_all(&sources_root)
-            .map_err(|error| format!("native source root cannot be created: {error}"))?;
-        cleanup_owned_directories(&jobs_root)?;
-        cleanup_spool_directories(&sources_root)?;
-        Ok(Self {
+        let mut startup_warnings = Vec::new();
+        let mut capability_error = None;
+        for (path, label) in [(&jobs_root, "native job"), (&sources_root, "native source")] {
+            if let Err(error) = fs::create_dir_all(path) {
+                let error = NativeJobError::new(
+                    "capability-unavailable",
+                    format!("{label} root cannot be created: {error}"),
+                );
+                startup_warnings.push(error.clone());
+                capability_error.get_or_insert(error);
+            }
+        }
+        if jobs_root.is_dir() {
+            if let Err(error) = cleanup_owned_directories(&jobs_root) {
+                startup_warnings.push(NativeJobError::new("cleanup-failed", error));
+            }
+        }
+        if sources_root.is_dir() {
+            if let Err(error) = cleanup_spool_directories(&sources_root) {
+                startup_warnings.push(NativeJobError::new("cleanup-failed", error));
+            }
+        }
+        startup_warnings.truncate(MAX_WARNING_CODES);
+        Self {
             root,
-            registry: JobRegistry::default(),
-        })
+            registry: Arc::new(JobRegistry::default()),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            max_concurrent_jobs,
+            startup_warnings,
+            capability_error,
+        }
     }
 
     pub(crate) fn start(
         &self,
         request: NativeFileJobStartRequest,
         sink: Arc<dyn restore::ReplacementSink>,
-    ) -> Result<NativeFileJobStarted, String> {
+    ) -> Result<NativeFileJobStarted, NativeJobError> {
+        if let Some(error) = &self.capability_error {
+            return Err(error.clone());
+        }
         let source_path = resolve_source(&self.root, &request.source)?;
-        let job = self.registry.create(request.kind)?;
+        let worker_permit =
+            WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
+        let job = self
+            .registry
+            .create(request.kind)
+            .map_err(|error| NativeJobError::new("store-error", error))?;
         let job_id = job.id();
         let owned_directory = match create_owned_directory(&self.root.join("jobs"), &job_id) {
             Ok(path) => path,
             Err(error) => {
-                let _ = job.finish_failure("job-setup-failed", &error);
+                let _ = job.finish_failure("capability-unavailable", &error);
                 let _ = self.registry.forget(&job_id);
-                return Err(error);
+                return Err(NativeJobError::new("capability-unavailable", error));
             }
         };
         let root = self.root.clone();
         let source = request.source.clone();
+        let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
+            let _worker_permit = worker_permit;
             let outcome = match request.kind {
                 JobKind::RestoreBlockRisuSave => restore::restore_block_risu_save(
                     &source_path,
@@ -278,35 +445,96 @@ impl NativeFileJobState {
                     sink.as_ref(),
                 ),
             };
-            let _ = cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id());
-            if let JobSource::AndroidSpool { token } = source {
-                let _ = cleanup_one_spool_directory(&root.join("sources"), &token);
+            let mut cleanup_errors = Vec::new();
+            if let Err(error) =
+                cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id())
+            {
+                cleanup_errors.push(error);
             }
-            match outcome {
-                Ok(result) => {
+            if let JobSource::AndroidSpool { token } = source {
+                if let Err(error) = cleanup_one_spool_directory(&root.join("sources"), &token) {
+                    cleanup_errors.push(error);
+                }
+            }
+            match (outcome, cleanup_errors.is_empty()) {
+                (Ok(result), true) => {
                     let _ = job.finish_success(result);
                 }
-                Err(_error) if job.is_cancel_requested() => {
+                (Ok(mut result), false) => {
+                    result.warning_codes.push("cleanup-failed".to_owned());
+                    let _ = job.finish_success(result);
+                }
+                (Err(error), false) => {
+                    let cleanup = cleanup_errors.join("; ");
+                    let _ = job.finish_failure(
+                        "cleanup-failed",
+                        &format!("{}; cleanup failed: {cleanup}", error.message),
+                    );
+                }
+                (Err(error), true) if error.code == "cancelled" => {
                     let _ = job.finish_cancelled();
                 }
-                Err(error) => {
-                    let _ = job.finish_failure("restore-failed", &error);
+                (Err(error), true) => {
+                    let _ = job.finish_failure(&error.code, &error.message);
                 }
             }
+            let _ = registry.prune();
         });
-        Ok(NativeFileJobStarted { job_id })
+        Ok(NativeFileJobStarted {
+            job_id,
+            warning_codes: self
+                .startup_warnings
+                .iter()
+                .map(|warning| warning.code.clone())
+                .collect(),
+        })
     }
 
-    pub(crate) fn status(&self, job_id: &str) -> Result<JobStatus, String> {
-        self.registry.status(job_id)
+    pub(crate) fn status(&self, job_id: &str) -> Result<JobStatus, NativeJobError> {
+        self.registry
+            .status(job_id)
+            .map_err(|error| NativeJobError::new("store-error", error))
     }
 
-    pub(crate) fn cancel(&self, job_id: &str) -> Result<CancelOutcome, String> {
-        self.registry.cancel(job_id)
+    pub(crate) fn cancel(&self, job_id: &str) -> Result<CancelOutcome, NativeJobError> {
+        self.registry
+            .cancel(job_id)
+            .map_err(|error| NativeJobError::new("store-error", error))
     }
 
-    pub(crate) fn forget(&self, job_id: &str) -> Result<bool, String> {
-        self.registry.forget(job_id)
+    pub(crate) fn forget(&self, job_id: &str) -> Result<bool, NativeJobError> {
+        self.registry
+            .forget(job_id)
+            .map_err(|error| NativeJobError::new("store-error", error))
+    }
+}
+
+#[derive(Debug)]
+struct WorkerPermit {
+    active_workers: Arc<AtomicUsize>,
+}
+
+impl WorkerPermit {
+    fn acquire(
+        active_workers: Arc<AtomicUsize>,
+        max_concurrent_jobs: usize,
+    ) -> Result<Self, NativeJobError> {
+        let reserved = active_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < max_concurrent_jobs).then_some(active + 1)
+        });
+        if reserved.is_err() {
+            return Err(NativeJobError::new(
+                "capability-unavailable",
+                "native file job concurrency limit reached",
+            ));
+        }
+        Ok(Self { active_workers })
+    }
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        self.active_workers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -314,23 +542,34 @@ fn create_owned_directory(jobs_root: &Path, job_id: &str) -> Result<PathBuf, Str
     let path = jobs_root.join(job_id);
     fs::create_dir(&path)
         .map_err(|error| format!("native job directory cannot be created: {error}"))?;
-    let manifest_path = path.join("ownership.json");
-    let mut manifest = File::create(&manifest_path)
-        .map_err(|error| format!("native job ownership cannot be created: {error}"))?;
-    serde_json::to_writer(
-        &mut manifest,
-        &JobOwnership {
-            job_id: job_id.to_owned(),
+    let result = (|| {
+        let manifest_path = path.join("ownership.json");
+        let mut manifest = File::create(&manifest_path)
+            .map_err(|error| format!("native job ownership cannot be created: {error}"))?;
+        serde_json::to_writer(
+            &mut manifest,
+            &JobOwnership {
+                job_id: job_id.to_owned(),
+            },
+        )
+        .map_err(|error| format!("native job ownership cannot be written: {error}"))?;
+        manifest
+            .flush()
+            .map_err(|error| format!("native job ownership cannot be flushed: {error}"))?;
+        manifest
+            .sync_all()
+            .map_err(|error| format!("native job ownership cannot be synced: {error}"))?;
+        Ok(path.clone())
+    })();
+    match result {
+        Ok(path) => Ok(path),
+        Err(error) => match fs::remove_dir_all(&path) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!(
+                "{error}; partial native job directory cleanup failed: {cleanup}"
+            )),
         },
-    )
-    .map_err(|error| format!("native job ownership cannot be written: {error}"))?;
-    manifest
-        .flush()
-        .map_err(|error| format!("native job ownership cannot be flushed: {error}"))?;
-    manifest
-        .sync_all()
-        .map_err(|error| format!("native job ownership cannot be synced: {error}"))?;
-    Ok(path)
+    }
 }
 
 fn cleanup_one_owned_directory(
@@ -438,9 +677,11 @@ impl restore::ReplacementSink for PersistentReplacementSink {
         staging_id: &str,
         expected_revision: i64,
     ) -> crate::persistent_store::StoreResult<crate::persistent_store::RevisionResult> {
-        crate::persistent_store::commands::with_store_mut(self.app.state(), |store| {
-            store.replace_commit(staging_id, Some(expected_revision))
-        })
+        crate::persistent_store::commands::replace_commit_with_snapshot(
+            &self.app,
+            staging_id,
+            Some(expected_revision),
+        )
     }
 
     fn abort(&self, staging_id: &str) -> crate::persistent_store::StoreResult<()> {
@@ -455,7 +696,7 @@ pub(crate) fn native_file_job_start(
     app: AppHandle,
     state: State<'_, NativeFileJobState>,
     request: NativeFileJobStartRequest,
-) -> Result<NativeFileJobStarted, String> {
+) -> Result<NativeFileJobStarted, NativeJobError> {
     state.start(
         request,
         Arc::new(PersistentReplacementSink { app }) as Arc<dyn restore::ReplacementSink>,
@@ -466,7 +707,7 @@ pub(crate) fn native_file_job_start(
 pub(crate) fn native_file_job_status(
     state: State<'_, NativeFileJobState>,
     job_id: String,
-) -> Result<JobStatus, String> {
+) -> Result<JobStatus, NativeJobError> {
     state.status(&job_id)
 }
 
@@ -474,7 +715,7 @@ pub(crate) fn native_file_job_status(
 pub(crate) fn native_file_job_cancel(
     state: State<'_, NativeFileJobState>,
     job_id: String,
-) -> Result<CancelOutcome, String> {
+) -> Result<CancelOutcome, NativeJobError> {
     state.cancel(&job_id)
 }
 
@@ -482,7 +723,7 @@ pub(crate) fn native_file_job_cancel(
 pub(crate) fn native_file_job_forget(
     state: State<'_, NativeFileJobState>,
     job_id: String,
-) -> Result<bool, String> {
+) -> Result<bool, NativeJobError> {
     state.forget(&job_id)
 }
 
@@ -611,6 +852,7 @@ impl JobRegistry {
     }
 
     pub(crate) fn status(&self, id: &str) -> Result<JobStatus, String> {
+        self.prune()?;
         let job = self
             .lookup(id)?
             .ok_or_else(|| "native job not found".to_owned())?;
@@ -618,6 +860,7 @@ impl JobRegistry {
     }
 
     pub(crate) fn cancel(&self, id: &str) -> Result<CancelOutcome, String> {
+        self.prune()?;
         let Some(job) = self.lookup(id)? else {
             return Ok(CancelOutcome::Missing);
         };
@@ -625,6 +868,7 @@ impl JobRegistry {
     }
 
     pub(crate) fn forget(&self, id: &str) -> Result<bool, String> {
+        self.prune()?;
         let mut jobs = self
             .jobs
             .lock()
@@ -1029,7 +1273,6 @@ mod tests {
             job.start(JobPhase::ReadingSource).unwrap();
             job.finish_success(result(revision)).unwrap();
         }
-        registry.prune().unwrap();
 
         assert!(registry.status(&ids[0]).is_err());
         assert!(registry.status(&ids[1]).is_ok());
@@ -1040,7 +1283,6 @@ mod tests {
         let id = job.id();
         job.start(JobPhase::ReadingSource).unwrap();
         job.finish_success(result(1)).unwrap();
-        expiring.prune().unwrap();
         assert!(expiring.status(&id).is_err());
     }
 
@@ -1103,6 +1345,61 @@ mod tests {
             resolve_source(directory.path(), &JobSource::AndroidSpool { token },).unwrap(),
             spool.join("source.risudat").canonicalize().unwrap(),
         );
+    }
+
+    #[test]
+    fn android_spool_rejects_an_owned_directory_escape_before_manifest_access() {
+        let directory = TempDir::new().unwrap();
+        let sources_root = directory.path().join("sources");
+        fs::create_dir_all(&sources_root).unwrap();
+        let outside = TempDir::new().unwrap();
+        let token = Uuid::new_v4().to_string();
+        let spool = sources_root.join(&token);
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &spool).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &spool).unwrap();
+
+        let error =
+            resolve_source(directory.path(), &JobSource::AndroidSpool { token }).unwrap_err();
+
+        assert!(
+            error.message.contains("owned directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn initialization_records_capability_failure_without_failing_launch() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("native-file-jobs");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("jobs"), b"blocks directory creation").unwrap();
+
+        let state = NativeFileJobState::initialize(root);
+
+        assert_eq!(
+            state.capability_error.as_ref().unwrap().code,
+            "capability-unavailable"
+        );
+        assert!(state
+            .startup_warnings
+            .iter()
+            .any(|warning| warning.code == "capability-unavailable"));
+        assert!(state.startup_warnings.len() <= MAX_WARNING_CODES);
+    }
+
+    #[test]
+    fn worker_permits_bound_native_job_threads() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let first = WorkerPermit::acquire(Arc::clone(&active), 1).unwrap();
+
+        let error = WorkerPermit::acquire(Arc::clone(&active), 1).unwrap_err();
+
+        assert_eq!(error.code, "capability-unavailable");
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        drop(first);
+        assert!(WorkerPermit::acquire(Arc::clone(&active), 1).is_ok());
     }
 
     #[test]

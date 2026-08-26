@@ -1,11 +1,11 @@
-use super::{JobControl, JobPhase, JobProgress, JobResultSummary};
+use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
@@ -16,14 +16,14 @@ const CHARACTER_BATCH_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(crate) struct RestoreLimits {
     pub(crate) max_encoded_block_bytes: u64,
-    pub(crate) max_decoded_block_bytes: usize,
+    pub(crate) max_decoded_block_bytes: u64,
 }
 
 impl Default for RestoreLimits {
     fn default() -> Self {
         Self {
-            max_encoded_block_bytes: 64 * 1024 * 1024,
-            max_decoded_block_bytes: 64 * 1024 * 1024,
+            max_encoded_block_bytes: u32::MAX as u64,
+            max_decoded_block_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -42,7 +42,7 @@ pub(crate) fn restore_block_risu_save(
     expected_revision: i64,
     job: &JobControl,
     sink: &dyn ReplacementSink,
-) -> Result<JobResultSummary, String> {
+) -> Result<JobResultSummary, NativeJobError> {
     restore_block_risu_save_with_limits(
         source,
         expected_revision,
@@ -58,15 +58,16 @@ pub(crate) fn restore_block_risu_save_with_limits(
     job: &JobControl,
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
-) -> Result<JobResultSummary, String> {
+) -> Result<JobResultSummary, NativeJobError> {
     let total_bytes = source
         .metadata()
-        .map_err(|error| format!("source metadata is unavailable: {error}"))?
+        .map_err(|error| invalid_source(format!("source metadata is unavailable: {error}")))?
         .len();
     if total_bytes < RISU_SAVE_HEADER.len() as u64 {
-        return Err("truncated block RisuSave header".to_owned());
+        return Err(truncated("truncated block RisuSave header"));
     }
-    let file = File::open(source).map_err(|error| format!("source cannot be opened: {error}"))?;
+    let file = File::open(source)
+        .map_err(|error| invalid_source(format!("source cannot be opened: {error}")))?;
     restore_block_risu_save_reader(file, total_bytes, expected_revision, job, sink, limits)
 }
 
@@ -77,51 +78,53 @@ fn restore_block_risu_save_reader<R: Read>(
     job: &JobControl,
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
-) -> Result<JobResultSummary, String> {
+) -> Result<JobResultSummary, NativeJobError> {
     if job.is_cancel_requested() {
-        return Err("restore cancelled before staging".to_owned());
+        return Err(cancelled("restore cancelled before staging"));
     }
     if total_bytes < RISU_SAVE_HEADER.len() as u64 {
-        return Err("truncated block RisuSave header".to_owned());
+        return Err(truncated("truncated block RisuSave header"));
     }
-    job.start(JobPhase::ReadingSource)?;
+    job.start(JobPhase::ReadingSource)
+        .map_err(|error| job_error(job, error))?;
     let mut reader = TrackedReader::new(source, total_bytes, job);
     let mut header = [0u8; RISU_SAVE_HEADER.len()];
     reader.read_exact_checked(&mut header)?;
     if header != RISU_SAVE_HEADER {
-        return Err("invalid block RisuSave header".to_owned());
+        return Err(invalid("invalid block RisuSave header"));
     }
 
     let staging_id = sink.begin().map_err(store_error)?.staging_id;
-    let parsed = parse_and_stage(&mut reader, &staging_id, job, sink, limits);
-    let parsed = match parsed {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            let _ = sink.abort(&staging_id);
-            return Err(error);
+    let outcome = (|| {
+        let parsed = parse_and_stage(&mut reader, &staging_id, job, sink, limits)?;
+        if job.is_cancel_requested() {
+            return Err(cancelled("restore cancelled before activation"));
         }
-    };
-
-    if job.is_cancel_requested() {
-        let _ = sink.abort(&staging_id);
-        return Err("restore cancelled before activation".to_owned());
+        job.set_phase(JobPhase::ActivatingDatabase)
+            .map_err(|error| job_error(job, error))?;
+        let revision = sink
+            .commit(&staging_id, expected_revision)
+            .map_err(store_error)?
+            .revision;
+        Ok(JobResultSummary {
+            revision,
+            source_bytes: reader.completed,
+            source_sha256: hex::encode(reader.hasher.finalize()),
+            character_count: parsed.character_count,
+            preset_count: parsed.preset_count,
+            warning_codes: Vec::new(),
+        })
+    })();
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(error) => match sink.abort(&staging_id) {
+            Ok(()) => Err(error),
+            Err(abort_error) => Err(cleanup_failed(format!(
+                "{}; staging abort failed: {}",
+                error.message, abort_error
+            ))),
+        },
     }
-    job.set_phase(JobPhase::ActivatingDatabase)?;
-    let revision = match sink.commit(&staging_id, expected_revision) {
-        Ok(result) => result.revision,
-        Err(error) => {
-            let _ = sink.abort(&staging_id);
-            return Err(store_error(error));
-        }
-    };
-    Ok(JobResultSummary {
-        revision,
-        source_bytes: reader.completed,
-        source_sha256: hex::encode(reader.hasher.finalize()),
-        character_count: parsed.character_count,
-        preset_count: parsed.preset_count,
-        warning_codes: Vec::new(),
-    })
 }
 
 struct ParsedCounts {
@@ -135,7 +138,7 @@ fn parse_and_stage<R: Read>(
     job: &JobControl,
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
-) -> Result<ParsedCounts, String> {
+) -> Result<ParsedCounts, NativeJobError> {
     let mut loaded = HashSet::new();
     let mut directory = None;
     let mut root = None;
@@ -150,48 +153,45 @@ fn parse_and_stage<R: Read>(
 
     while reader.completed < reader.total {
         if job.is_cancel_requested() {
-            return Err("restore cancelled while reading source".to_owned());
+            return Err(cancelled("restore cancelled while reading source"));
         }
         let mut prefix = [0u8; 3];
         reader.read_exact_checked(&mut prefix)?;
         let block_type = prefix[0];
         let compression = prefix[1];
         if compression > 1 {
-            return Err(format!("invalid compression flag {compression}"));
+            return Err(invalid(format!("invalid compression flag {compression}")));
         }
         let mut name_bytes = vec![0u8; prefix[2] as usize];
         reader.read_exact_checked(&mut name_bytes)?;
         let name =
-            String::from_utf8(name_bytes).map_err(|_| "invalid UTF-8 block name".to_owned())?;
+            String::from_utf8(name_bytes).map_err(|_| invalid("invalid UTF-8 block name"))?;
         if name.is_empty() || !loaded.insert(name.clone()) {
-            return Err(format!("duplicate block {name}"));
+            return Err(invalid(format!("duplicate block {name}")));
         }
         let mut length_bytes = [0u8; 4];
         reader.read_exact_checked(&mut length_bytes)?;
         let encoded_length = u32::from_le_bytes(length_bytes) as u64;
         if encoded_length > limits.max_encoded_block_bytes {
-            return Err(format!("encoded block limit exceeded for {name}"));
+            return Err(invalid(format!("encoded block limit exceeded for {name}")));
         }
         if encoded_length > reader.total.saturating_sub(reader.completed) {
-            return Err(format!("truncated block body for {name}"));
+            return Err(truncated(format!("truncated block body for {name}")));
         }
-        let mut encoded = vec![0u8; encoded_length as usize];
-        reader.read_exact_checked(&mut encoded)?;
-        let decoded = decode_block(&name, compression, encoded, limits, job)?;
-        let value: Value = serde_json::from_slice(&decoded)
-            .map_err(|error| format!("invalid JSON in block {name}: {error}"))?;
+        let (value, decoded_bytes) =
+            read_block_value(reader, &name, compression, encoded_length, limits, job)?;
 
         match block_type {
             0 if name == "config" => {
                 if !value.is_object() {
-                    return Err("config block must be a JSON object".to_owned());
+                    return Err(invalid("config block must be a JSON object"));
                 }
             }
             1 if name == "root" => {
                 let mut object = value
                     .as_object()
                     .cloned()
-                    .ok_or_else(|| "root block must be a JSON object".to_owned())?;
+                    .ok_or_else(|| invalid("root block must be a JSON object"))?;
                 directory = Some(parse_directory(object.remove("__directory"))?);
                 root = Some(object);
             }
@@ -199,13 +199,15 @@ fn parse_and_stage<R: Read>(
                 let character_id = value
                     .get("chaId")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| format!("character block {name} requires chaId"))?;
+                    .ok_or_else(|| invalid(format!("character block {name} requires chaId")))?;
                 if character_id != name {
-                    return Err(format!("character block name does not match chaId {name}"));
+                    return Err(invalid(format!(
+                        "character block name does not match chaId {name}"
+                    )));
                 }
                 if !character_batch.is_empty()
                     && (character_batch.len() >= CHARACTER_BATCH_COUNT
-                        || character_batch_bytes.saturating_add(decoded.len())
+                        || character_batch_bytes.saturating_add(decoded_bytes)
                             > CHARACTER_BATCH_BYTES)
                 {
                     sink.add_characters(staging_id, &character_batch)
@@ -213,7 +215,7 @@ fn parse_and_stage<R: Read>(
                     character_batch.clear();
                     character_batch_bytes = 0;
                 }
-                character_batch_bytes = character_batch_bytes.saturating_add(decoded.len());
+                character_batch_bytes = character_batch_bytes.saturating_add(decoded_bytes);
                 character_batch.push(value);
                 character_count += 1;
                 if character_batch.len() >= CHARACTER_BATCH_COUNT
@@ -230,34 +232,38 @@ fn parse_and_stage<R: Read>(
                     value
                         .as_array()
                         .cloned()
-                        .ok_or_else(|| "preset block must be a JSON array".to_owned())?,
+                        .ok_or_else(|| invalid("preset block must be a JSON array"))?,
                 );
             }
             5 if name == "modules" => {
                 if !value.is_array() {
-                    return Err("modules block must be a JSON array".to_owned());
+                    return Err(invalid("modules block must be a JSON array"));
                 }
                 modules = Some(value);
             }
             9 if name == "plugins" => {
                 if !value.is_array() {
-                    return Err("plugins block must be a JSON array".to_owned());
+                    return Err(invalid("plugins block must be a JSON array"));
                 }
                 plugins = Some(value);
             }
             10 if name == "loadouts" => {
                 if !value.is_array() {
-                    return Err("loadouts block must be a JSON array".to_owned());
+                    return Err(invalid("loadouts block must be a JSON array"));
                 }
                 loadouts = Some(value);
             }
             11 if name == "pluginStorage" => {
                 if !value.is_object() {
-                    return Err("pluginStorage block must be a JSON object".to_owned());
+                    return Err(invalid("pluginStorage block must be a JSON object"));
                 }
                 plugin_storage = Some(value);
             }
-            _ => return Err(format!("unsupported block type {block_type} for {name}")),
+            _ => {
+                return Err(invalid(format!(
+                    "unsupported block type {block_type} for {name}"
+                )))
+            }
         }
         reader.complete_item()?;
     }
@@ -274,43 +280,46 @@ fn parse_and_stage<R: Read>(
         "pluginStorage",
         "config",
     ];
-    let directory = directory.ok_or_else(|| "missing required block root".to_owned())?;
+    let directory = directory.ok_or_else(|| invalid("missing required block root"))?;
     for name in required {
         if !directory.contains(name) || !loaded.contains(name) {
-            return Err(format!("missing required block {name}"));
+            return Err(invalid(format!("missing required block {name}")));
         }
     }
     for name in &directory {
         if !loaded.contains(name) {
-            return Err(format!("missing required block {name}"));
+            return Err(invalid(format!("missing required block {name}")));
         }
     }
     if loaded
         .iter()
         .any(|name| name != "root" && !directory.contains(name))
     {
-        return Err("file contains a block not listed by root directory".to_owned());
+        return Err(invalid(
+            "file contains a block not listed by root directory",
+        ));
     }
 
-    job.set_phase(JobPhase::StagingDatabase)?;
-    let mut root = root.ok_or_else(|| "missing required block root".to_owned())?;
+    job.set_phase(JobPhase::StagingDatabase)
+        .map_err(|error| job_error(job, error))?;
+    let mut root = root.ok_or_else(|| invalid("missing required block root"))?;
     root.insert(
         "modules".to_owned(),
-        modules.ok_or_else(|| "missing required block modules".to_owned())?,
+        modules.ok_or_else(|| invalid("missing required block modules"))?,
     );
     root.insert(
         "loadouts".to_owned(),
-        loadouts.ok_or_else(|| "missing required block loadouts".to_owned())?,
+        loadouts.ok_or_else(|| invalid("missing required block loadouts"))?,
     );
     root.insert(
         "plugins".to_owned(),
-        plugins.ok_or_else(|| "missing required block plugins".to_owned())?,
+        plugins.ok_or_else(|| invalid("missing required block plugins"))?,
     );
     root.insert(
         "pluginCustomStorage".to_owned(),
-        plugin_storage.ok_or_else(|| "missing required block pluginStorage".to_owned())?,
+        plugin_storage.ok_or_else(|| invalid("missing required block pluginStorage"))?,
     );
-    let presets = presets.ok_or_else(|| "missing required block preset".to_owned())?;
+    let presets = presets.ok_or_else(|| invalid("missing required block preset"))?;
     sink.put_root(staging_id, &Value::Object(root))
         .map_err(store_error)?;
     sink.put_presets(staging_id, &presets)
@@ -321,57 +330,138 @@ fn parse_and_stage<R: Read>(
     })
 }
 
-fn parse_directory(value: Option<Value>) -> Result<HashSet<String>, String> {
+fn parse_directory(value: Option<Value>) -> Result<HashSet<String>, NativeJobError> {
     let values = value
         .and_then(|value| value.as_array().cloned())
-        .ok_or_else(|| "root block requires __directory string array".to_owned())?;
+        .ok_or_else(|| invalid("root block requires __directory string array"))?;
     let mut directory = HashSet::new();
     for value in values {
         let name = value
             .as_str()
             .filter(|name| !name.is_empty())
-            .ok_or_else(|| "root __directory contains an invalid name".to_owned())?;
+            .ok_or_else(|| invalid("root __directory contains an invalid name"))?;
         if name == "root" || !directory.insert(name.to_owned()) {
-            return Err(format!("duplicate block {name} in root directory"));
+            return Err(invalid(format!("duplicate block {name} in root directory")));
         }
     }
     Ok(directory)
 }
 
-fn decode_block(
+fn read_block_value<R: Read>(
+    reader: &mut TrackedReader<'_, R>,
     name: &str,
     compression: u8,
-    encoded: Vec<u8>,
+    encoded_length: u64,
     limits: RestoreLimits,
     job: &JobControl,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Value, usize), NativeJobError> {
+    let block = EncodedBlockReader {
+        reader,
+        remaining: encoded_length,
+    };
     if compression == 0 {
-        if encoded.len() > limits.max_decoded_block_bytes {
-            return Err(format!("decoded block limit exceeded for {name}"));
+        if encoded_length > limits.max_decoded_block_bytes {
+            return Err(invalid(format!("decoded block limit exceeded for {name}")));
         }
-        return Ok(encoded);
+        let decoded = DecodedLimitReader::new(block, limits.max_decoded_block_bytes, job, name);
+        let mut buffered = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
+        let value = serde_json::from_reader(&mut buffered)
+            .map_err(|error| json_error(name, compression, error, job))?;
+        if !buffered.buffer().is_empty() || buffered.get_ref().inner.remaining != 0 {
+            return Err(corrupt(format!("trailing data in block {name}")));
+        }
+        return Ok((value, buffered.get_ref().completed as usize));
     }
-    let mut decoder = GzDecoder::new(encoded.as_slice());
-    let mut decoded = Vec::new();
+
+    let buffered = BufReader::with_capacity(READ_CHUNK_BYTES, block);
+    let decoder = GzDecoder::new(buffered);
+    let decoded = DecodedLimitReader::new(decoder, limits.max_decoded_block_bytes, job, name);
+    let mut json_reader = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
+    let value = serde_json::from_reader(&mut json_reader)
+        .map_err(|error| json_error(name, compression, error, job))?;
+    let decoded_bytes = json_reader.get_ref().completed as usize;
+    let mut decoded = json_reader.into_inner();
     let mut buffer = [0u8; READ_CHUNK_BYTES];
     loop {
-        if job.is_cancel_requested() {
-            return Err(format!(
-                "restore cancelled while decompressing block {name}"
-            ));
-        }
-        let read = decoder
+        let read = decoded
             .read(&mut buffer)
-            .map_err(|error| format!("invalid gzip in block {name}: {error}"))?;
+            .map_err(|error| gzip_io_error(name, error, job))?;
         if read == 0 {
             break;
         }
-        if decoded.len().saturating_add(read) > limits.max_decoded_block_bytes {
-            return Err(format!("decoded block limit exceeded for {name}"));
-        }
-        decoded.extend_from_slice(&buffer[..read]);
     }
-    Ok(decoded)
+    let decoder = decoded.into_inner();
+    let buffered = decoder.into_inner();
+    if !buffered.buffer().is_empty() || buffered.get_ref().remaining != 0 {
+        return Err(corrupt(format!("trailing data in gzip block {name}")));
+    }
+    Ok((value, decoded_bytes))
+}
+
+struct EncodedBlockReader<'a, 'b, R: Read> {
+    reader: &'a mut TrackedReader<'b, R>,
+    remaining: u64,
+}
+
+impl<R: Read> Read for EncodedBlockReader<'_, '_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let allowed = buffer
+            .len()
+            .min(self.remaining.min(READ_CHUNK_BYTES as u64) as usize);
+        let read = self
+            .reader
+            .read_chunk(&mut buffer[..allowed])
+            .map_err(native_error_to_io)?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
+}
+
+struct DecodedLimitReader<'a, R: Read> {
+    inner: R,
+    completed: u64,
+    max_bytes: u64,
+    job: &'a JobControl,
+    name: &'a str,
+}
+
+impl<'a, R: Read> DecodedLimitReader<'a, R> {
+    fn new(inner: R, max_bytes: u64, job: &'a JobControl, name: &'a str) -> Self {
+        Self {
+            inner,
+            completed: 0,
+            max_bytes,
+            job,
+            name,
+        }
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: Read> Read for DecodedLimitReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.job.is_cancel_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "restore cancelled while decoding block",
+            ));
+        }
+        let read = self.inner.read(buffer)?;
+        self.completed = self.completed.saturating_add(read as u64);
+        if self.completed > self.max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("decoded block limit exceeded for {}", self.name),
+            ));
+        }
+        Ok(read)
+    }
 }
 
 struct TrackedReader<'a, R: Read> {
@@ -395,51 +485,142 @@ impl<'a, R: Read> TrackedReader<'a, R> {
         }
     }
 
-    fn read_exact_checked(&mut self, buffer: &mut [u8]) -> Result<(), String> {
+    fn read_exact_checked(&mut self, buffer: &mut [u8]) -> Result<(), NativeJobError> {
         let mut offset = 0;
         while offset < buffer.len() {
-            if self.job.is_cancel_requested() {
-                return Err("restore cancelled while reading source".to_owned());
-            }
             let end = (offset + READ_CHUNK_BYTES).min(buffer.len());
-            let read = self
-                .source
-                .read(&mut buffer[offset..end])
-                .map_err(|error| format!("source read failed: {error}"))?;
-            if read == 0 {
-                return Err("truncated block RisuSave source".to_owned());
-            }
-            self.hasher.update(&buffer[offset..offset + read]);
-            self.completed += read as u64;
-            self.job.set_progress(JobProgress {
-                completed_bytes: self.completed,
-                total_bytes: Some(self.total),
-                completed_items: self.completed_items,
-                total_items: None,
-            })?;
+            let read = self.read_chunk(&mut buffer[offset..end])?;
             offset += read;
         }
         Ok(())
     }
 
-    fn complete_item(&mut self) -> Result<(), String> {
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, NativeJobError> {
+        if self.job.is_cancel_requested() {
+            return Err(cancelled("restore cancelled while reading source"));
+        }
+        let read = self
+            .source
+            .read(buffer)
+            .map_err(|error| invalid_source(format!("source read failed: {error}")))?;
+        if read == 0 {
+            return Err(truncated("truncated block RisuSave source"));
+        }
+        self.hasher.update(&buffer[..read]);
+        self.completed += read as u64;
+        self.job
+            .set_progress(JobProgress {
+                completed_bytes: self.completed,
+                total_bytes: Some(self.total),
+                completed_items: self.completed_items,
+                total_items: None,
+            })
+            .map_err(|error| job_error(self.job, error))?;
+        Ok(read)
+    }
+
+    fn complete_item(&mut self) -> Result<(), NativeJobError> {
         self.completed_items += 1;
-        self.job.set_progress(JobProgress {
-            completed_bytes: self.completed,
-            total_bytes: Some(self.total),
-            completed_items: self.completed_items,
-            total_items: None,
-        })
+        self.job
+            .set_progress(JobProgress {
+                completed_bytes: self.completed,
+                total_bytes: Some(self.total),
+                completed_items: self.completed_items,
+                total_items: None,
+            })
+            .map_err(|error| job_error(self.job, error))
     }
 }
 
-fn store_error(error: StoreError) -> String {
+fn native_error_to_io(error: NativeJobError) -> io::Error {
+    let kind = match error.code.as_str() {
+        "cancelled" => io::ErrorKind::Interrupted,
+        "truncated-input" => io::ErrorKind::UnexpectedEof,
+        "corrupt-input" | "invalid-input" => io::ErrorKind::InvalidData,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error)
+}
+
+fn json_error(
+    name: &str,
+    compression: u8,
+    error: serde_json::Error,
+    job: &JobControl,
+) -> NativeJobError {
+    if job.is_cancel_requested() {
+        return cancelled(format!("restore cancelled while decoding block {name}"));
+    }
+    let message = error.to_string();
+    if message.contains("decoded block limit exceeded") {
+        return invalid(message);
+    }
+    if message.contains("source read failed") {
+        return invalid_source(message);
+    }
+    if message.contains("truncated block RisuSave source") {
+        return truncated(message);
+    }
+    if compression == 1 && error.is_io() {
+        return corrupt(format!("invalid gzip in block {name}: {error}"));
+    }
+    corrupt(format!("invalid JSON in block {name}: {error}"))
+}
+
+fn gzip_io_error(name: &str, error: io::Error, job: &JobControl) -> NativeJobError {
+    if job.is_cancel_requested() || error.kind() == io::ErrorKind::Interrupted {
+        return cancelled(format!("restore cancelled while decoding block {name}"));
+    }
+    if error.to_string().contains("decoded block limit exceeded") {
+        return invalid(error.to_string());
+    }
+    corrupt(format!("invalid gzip in block {name}: {error}"))
+}
+
+fn invalid(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("invalid-input", message)
+}
+
+fn truncated(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("truncated-input", message)
+}
+
+fn corrupt(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("corrupt-input", message)
+}
+
+fn cancelled(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("cancelled", message)
+}
+
+fn invalid_source(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("invalid-source", message)
+}
+
+fn cleanup_failed(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("cleanup-failed", message)
+}
+
+fn job_error(job: &JobControl, message: String) -> NativeJobError {
+    if job.is_cancel_requested() {
+        cancelled(message)
+    } else {
+        NativeJobError::new("store-error", message)
+    }
+}
+
+fn store_error(error: StoreError) -> NativeJobError {
     match error {
-        StoreError::RevisionConflict { expected, actual } => {
-            format!("revision conflict: expected {expected}, actual {actual}")
+        StoreError::RevisionConflict { expected, actual } => NativeJobError::new(
+            "revision-conflict",
+            format!("revision conflict: expected {expected}, actual {actual}"),
+        ),
+        StoreError::SnapshotReleased => {
+            NativeJobError::new("store-error", "persistent snapshot was released")
         }
-        StoreError::SnapshotReleased => "persistent snapshot was released".to_owned(),
-        StoreError::Validation { message } | StoreError::Store { message } => message,
+        StoreError::Validation { message } | StoreError::Store { message } => {
+            NativeJobError::new("store-error", message)
+        }
     }
 }
 
@@ -453,7 +634,8 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::io::{self, Read};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -462,6 +644,7 @@ mod tests {
     struct StoreSink {
         store: Mutex<PersistentStore>,
         fail_character_batches: bool,
+        abort_calls: AtomicUsize,
     }
 
     impl ReplacementSink for StoreSink {
@@ -503,6 +686,7 @@ mod tests {
         }
 
         fn abort(&self, staging_id: &str) -> StoreResult<()> {
+            self.abort_calls.fetch_add(1, Ordering::AcqRel);
             self.store.lock().unwrap().replace_abort(staging_id)
         }
     }
@@ -522,6 +706,7 @@ mod tests {
             StoreSink {
                 store: Mutex::new(store),
                 fail_character_batches: false,
+                abort_calls: AtomicUsize::new(0),
             },
         )
     }
@@ -608,7 +793,10 @@ mod tests {
 
         let error = restore_block_risu_save(&source, 1, &job, &sink).unwrap_err();
 
-        assert!(error.contains(expected), "unexpected error: {error}");
+        assert!(
+            error.message.contains(expected),
+            "unexpected error: {error}"
+        );
         let store = sink.store.lock().unwrap();
         assert_eq!(store.revision().unwrap(), 1);
         assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
@@ -638,6 +826,58 @@ mod tests {
     }
 
     #[test]
+    fn current_exporter_round_trip_supports_a_character_larger_than_64_mib() {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let staging = store.replace_begin().unwrap().staging_id;
+        store
+            .replace_put_root(
+                &staging,
+                &json!({
+                    "username": "Large export",
+                    "modules": [],
+                    "loadouts": [],
+                    "plugins": [],
+                    "pluginCustomStorage": {},
+                }),
+            )
+            .unwrap();
+        store.replace_put_presets(&staging, &[]).unwrap();
+        store
+            .replace_add_characters(
+                &staging,
+                &[json!({
+                    "type": "character",
+                    "chaId": "large-character",
+                    "name": "Large character",
+                    "description": "x".repeat(64 * 1024 * 1024 + 1),
+                    "chats": [],
+                })],
+            )
+            .unwrap();
+        store.replace_commit(&staging, Some(0)).unwrap();
+        let lease = store.acquire_revision(1).unwrap().lease;
+        let exported = store.export_risu_save(&lease, false).unwrap();
+        let exported_path = PathBuf::from(&exported.path);
+        let sink = StoreSink {
+            store: Mutex::new(store),
+            fail_character_batches: false,
+            abort_calls: AtomicUsize::new(0),
+        };
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_block_risu_save(&exported_path, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        assert_eq!(result.character_count, 1);
+        let mut store = sink.store.lock().unwrap();
+        store.release_revision(&lease).unwrap();
+        store.cleanup_risu_save_export(&exported_path).unwrap();
+    }
+
+    #[test]
     fn strict_restore_rejects_missing_and_duplicate_required_blocks() {
         let mut missing = valid_blocks();
         missing.pop();
@@ -662,6 +902,24 @@ mod tests {
         let mut invalid_gzip = valid_blocks();
         invalid_gzip[2] = raw_block(5, 1, "modules", b"not-gzip");
         assert_failed_restore_preserves_active(&save_bytes(invalid_gzip), "invalid gzip");
+
+        let mut trailing_garbage = gzip(br#"[{"name":"Module"}]"#);
+        trailing_garbage.extend_from_slice(b"garbage");
+        let mut invalid_gzip = valid_blocks();
+        invalid_gzip[2] = raw_block(5, 1, "modules", &trailing_garbage);
+        assert_failed_restore_preserves_active(
+            &save_bytes(invalid_gzip),
+            "trailing data in gzip block",
+        );
+
+        let mut multiple_members = gzip(br#"[{"name":"Module"}]"#);
+        multiple_members.extend_from_slice(&gzip(br#"[]"#));
+        let mut invalid_gzip = valid_blocks();
+        invalid_gzip[2] = raw_block(5, 1, "modules", &multiple_members);
+        assert_failed_restore_preserves_active(
+            &save_bytes(invalid_gzip),
+            "trailing data in gzip block",
+        );
 
         let mut unknown_flag = valid_blocks();
         unknown_flag[2] = raw_block(5, 2, "modules", b"{}");
@@ -694,7 +952,8 @@ mod tests {
         let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
         registry.cancel(&job.id()).unwrap();
         let error = restore_block_risu_save(&source, 1, &job, &sink).unwrap_err();
-        assert!(error.contains("cancelled"));
+        assert_eq!(error.code, "cancelled");
+        assert!(error.message.contains("cancelled"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
 
         let (directory, sink) = fixture();
@@ -704,7 +963,61 @@ mod tests {
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
         let error = restore_block_risu_save(&source, 0, &job, &sink).unwrap_err();
-        assert!(error.contains("revision conflict"));
+        assert_eq!(error.code, "revision-conflict");
+        assert!(error.message.contains("revision conflict"));
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+    }
+
+    struct CancelAfterBeginSink<'a> {
+        inner: &'a StoreSink,
+        job: &'a JobControl,
+    }
+
+    impl ReplacementSink for CancelAfterBeginSink<'_> {
+        fn begin(&self) -> StoreResult<StagingResult> {
+            let staging = self.inner.begin()?;
+            self.job.cancel_requested.store(true, Ordering::Release);
+            Ok(staging)
+        }
+
+        fn put_root(&self, staging_id: &str, root: &Value) -> StoreResult<()> {
+            self.inner.put_root(staging_id, root)
+        }
+
+        fn put_presets(&self, staging_id: &str, presets: &[Value]) -> StoreResult<()> {
+            self.inner.put_presets(staging_id, presets)
+        }
+
+        fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()> {
+            self.inner.add_characters(staging_id, characters)
+        }
+
+        fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
+            self.inner.commit(staging_id, expected_revision)
+        }
+
+        fn abort(&self, staging_id: &str) -> StoreResult<()> {
+            self.inner.abort(staging_id)
+        }
+    }
+
+    #[test]
+    fn cancellation_after_replace_begin_always_aborts_staging() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("cancel-after-begin.risudat");
+        valid_save(&source);
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        let cancelling = CancelAfterBeginSink {
+            inner: &sink,
+            job: &job,
+        };
+
+        let error = restore_block_risu_save(&source, 1, &job, &cancelling).unwrap_err();
+
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
     }
 
@@ -730,7 +1043,8 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("decoded block limit"));
+        assert_eq!(error.code, "invalid-input");
+        assert!(error.message.contains("decoded block limit"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
 
         let staging_id = sink
@@ -758,7 +1072,8 @@ mod tests {
 
         let error = restore_block_risu_save(&source, 1, &job, &sink).unwrap_err();
 
-        assert!(error.contains("simulated disk full"));
+        assert_eq!(error.code, "store-error");
+        assert!(error.message.contains("simulated disk full"));
         let mut store = sink.store.lock().unwrap();
         assert_eq!(store.revision().unwrap(), 1);
         let staged = store.replace_begin().unwrap().staging_id;
@@ -771,7 +1086,7 @@ mod tests {
         let source = directory.path().join("job.risudat");
         valid_save(&source);
         let jobs_root = directory.path().join("native-file-jobs");
-        let state = NativeFileJobState::initialize(jobs_root.clone()).unwrap();
+        let state = NativeFileJobState::initialize(jobs_root.clone());
         let sink = Arc::new(sink);
 
         let started = state
@@ -802,6 +1117,105 @@ mod tests {
         );
         assert!(!jobs_root.join("jobs").join(&started.job_id).exists());
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 2);
+    }
+
+    struct BlockingBeginSink {
+        inner: Arc<StoreSink>,
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        released: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl ReplacementSink for BlockingBeginSink {
+        fn begin(&self) -> StoreResult<StagingResult> {
+            let (entered, entered_signal) = &*self.entered;
+            *entered.lock().unwrap() = true;
+            entered_signal.notify_all();
+            let (released, released_signal) = &*self.released;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = released_signal.wait(released).unwrap();
+            }
+            self.inner.begin()
+        }
+
+        fn put_root(&self, staging_id: &str, root: &Value) -> StoreResult<()> {
+            self.inner.put_root(staging_id, root)
+        }
+
+        fn put_presets(&self, staging_id: &str, presets: &[Value]) -> StoreResult<()> {
+            self.inner.put_presets(staging_id, presets)
+        }
+
+        fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()> {
+            self.inner.add_characters(staging_id, characters)
+        }
+
+        fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult> {
+            self.inner.commit(staging_id, expected_revision)
+        }
+
+        fn abort(&self, staging_id: &str) -> StoreResult<()> {
+            self.inner.abort(staging_id)
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_failure_is_reported_as_a_bounded_warning() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("cleanup-warning.risudat");
+        valid_save(&source);
+        let jobs_root = directory.path().join("native-file-jobs");
+        let state = NativeFileJobState::initialize(jobs_root.clone());
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let sink = Arc::new(BlockingBeginSink {
+            inner: Arc::new(sink),
+            entered: Arc::clone(&entered),
+            released: Arc::clone(&released),
+        });
+        let started = state
+            .start(
+                NativeFileJobStartRequest {
+                    kind: JobKind::RestoreBlockRisuSave,
+                    source: JobSource::DesktopPath {
+                        path: source.to_string_lossy().into_owned(),
+                    },
+                    expected_revision: 1,
+                },
+                sink,
+            )
+            .unwrap();
+        let (entered_lock, entered_signal) = &*entered;
+        let mut has_entered = entered_lock.lock().unwrap();
+        while !*has_entered {
+            has_entered = entered_signal.wait(has_entered).unwrap();
+        }
+        drop(has_entered);
+        fs::write(
+            jobs_root
+                .join("jobs")
+                .join(&started.job_id)
+                .join("ownership.json"),
+            br#"{"jobId":"different-job"}"#,
+        )
+        .unwrap();
+        let (released_lock, released_signal) = &*released;
+        *released_lock.lock().unwrap() = true;
+        released_signal.notify_all();
+
+        let status = loop {
+            let status = state.status(&started.job_id).unwrap();
+            if status.state.is_terminal() {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+
+        assert_eq!(status.state, JobState::Succeeded);
+        assert_eq!(status.result.unwrap().warning_codes, vec!["cleanup-failed"]);
+        assert!(jobs_root.join("jobs").join(&started.job_id).exists());
+        let relaunched = NativeFileJobState::initialize(jobs_root);
+        assert!(relaunched.capability_error.is_none());
     }
 
     struct BlockingReader {
