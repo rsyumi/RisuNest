@@ -61,7 +61,11 @@
     }
 
     $effect(() => {
-        if (!running) cancellationRequested = false
+        if (!running) {
+            cancellationRequested = false
+            return
+        }
+        return cancelCapture
     })
 
 </script>

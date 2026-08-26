@@ -24,6 +24,7 @@ vi.mock('src/lang', () => ({
 }))
 
 import ChatScreenshotDialog from './ChatScreenshotDialog.svelte'
+import ChatScreenshotDialogHarness from './ChatScreenshotDialogHarness.test.svelte'
 
 describe('ChatScreenshotDialog', () => {
     let target: HTMLDivElement
@@ -120,5 +121,17 @@ describe('ChatScreenshotDialog', () => {
 
         expect(onCancel).toHaveBeenCalledOnce()
         expect(onClose).toHaveBeenCalledOnce()
+    })
+
+    test('cancels a running job when its parent destroys the dialog', async () => {
+        const onCancel = vi.fn()
+        mounted = mount(ChatScreenshotDialogHarness, { target, props: { onCancel } })
+        await tick()
+
+        ;(mounted as { destroyDialog(): void }).destroyDialog()
+        await tick()
+
+        expect(target.querySelector('[role="dialog"]')).toBeNull()
+        expect(onCancel).toHaveBeenCalledOnce()
     })
 })
