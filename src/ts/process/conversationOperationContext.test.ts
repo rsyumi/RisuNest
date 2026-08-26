@@ -2,6 +2,7 @@ import { expect, test, vi } from 'vitest'
 import {
     ActiveConversationSession,
     ConversationSessionStaleError,
+    MessageLocatorMismatchError,
 } from '../storage/activeConversationSession'
 import type { Chat, Message } from '../storage/database.svelte'
 import {
@@ -233,6 +234,90 @@ test('a batch refuses an unversioned direct mutation of its pinned baseline', ()
         message('one', 'message-1'),
     ])
     expect(session.pinCount('transaction')).toBe(0)
+})
+
+test.each(['array', 'message'] as const)(
+    'a batch refuses a deep-equal live %s identity replacement',
+    (replacement) => {
+        const conversation = chat([
+            message('zero', 'message-0'),
+            message('one', 'message-1'),
+        ])
+        const session = createSession(conversation)
+        const operation = createConversationOperationContext(session, conversation)
+        operation.chat.message[0].data = 'operation edit'
+
+        if (replacement === 'array') {
+            conversation.message = conversation.message.slice()
+        } else {
+            conversation.message[1] = { ...conversation.message[1] }
+        }
+
+        expect(() => operation.commit(session)).toThrow(MessageLocatorMismatchError)
+        expect(conversation.message.map((entry) => entry.data)).toEqual(['zero', 'one'])
+        expect(session.version).toBe(0)
+        expect(session.activePinReasons).toEqual([])
+    },
+)
+
+test('adopts only the generated ID of a future prompt message into its pinned baseline', () => {
+    const conversation = chat([
+        message('zero', 'message-0'),
+        message('one', ''),
+    ])
+    const session = createSession(conversation)
+    const operation = createConversationOperationContext(session, conversation)
+    const locator = session.locate(1)
+
+    session.ensureMessageId(locator, () => 'generated-message-1')
+    operation.adoptMessageId(locator, 'generated-message-1')
+    operation.chat.message[0].data = 'operation edit'
+    operation.commit(session)
+
+    expect(conversation.message).toEqual([
+        message('operation edit', 'message-0'),
+        message('one', 'generated-message-1'),
+    ])
+    expect(session.version).toBe(1)
+    expect(session.activePinReasons).toEqual([])
+})
+
+test('refuses ID adoption when another unversioned message field changed', () => {
+    const conversation = chat([
+        message('zero', 'message-0'),
+        message('one', ''),
+    ])
+    const session = createSession(conversation)
+    const operation = createConversationOperationContext(session, conversation)
+    const locator = session.locate(1)
+
+    session.ensureMessageId(locator, () => 'generated-message-1')
+    conversation.message[1].data = 'unversioned edit'
+
+    expect(() => operation.adoptMessageId(locator, 'generated-message-1')).toThrow(
+        MessageLocatorMismatchError,
+    )
+    operation.release()
+    expect(session.activePinReasons).toEqual([])
+})
+
+test('refuses ID adoption after the operation structurally changes the projection', () => {
+    const conversation = chat([
+        message('zero', 'message-0'),
+        message('one', ''),
+    ])
+    const session = createSession(conversation)
+    const operation = createConversationOperationContext(session, conversation)
+    const locator = session.locate(1)
+
+    operation.chat.message.reverse()
+    session.ensureMessageId(locator, () => 'generated-message-1')
+
+    expect(() => operation.adoptMessageId(locator, 'generated-message-1')).toThrow(
+        MessageLocatorMismatchError,
+    )
+    operation.release()
+    expect(session.activePinReasons).toEqual([])
 })
 
 test('a batch refuses a different active session even when IDs and contents match', () => {

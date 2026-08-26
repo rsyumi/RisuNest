@@ -9,6 +9,7 @@ import {
     type ActiveConversationPin,
     type ConversationMetadata,
     type ConversationPosition,
+    type MessageLocator,
 } from '../storage/activeConversationSession'
 import type { Chat, Database, Message } from '../storage/database.svelte'
 import { CONVERSATION_RANGE_MAX_LIMIT } from '../storage/persistentDataStore'
@@ -87,6 +88,8 @@ export class ConversationOperationContext {
 
     private readonly originalMetadata: ConversationMetadata
     private readonly originalMessages: Message[]
+    private readonly sourceMessages: Message[]
+    private readonly sourceMessageIdentities: readonly Message[]
     private readonly pin: ActiveConversationPin
     private released = false
 
@@ -107,6 +110,8 @@ export class ConversationOperationContext {
         }
 
         this.baseVersion = session.version
+        this.sourceMessages = sourceChat.message
+        this.sourceMessageIdentities = [...sourceChat.message]
         const totalMessages = session.totalMessages
         const pinReason = totalMessages <= CONVERSATION_RANGE_MAX_LIMIT &&
             !exceedsCloneBudget(
@@ -182,6 +187,59 @@ export class ConversationOperationContext {
         )
     }
 
+    adoptMessageId(locator: MessageLocator, messageId: string): void {
+        this.assertOpen()
+        if (!messageId) throw new Error('Cannot adopt an empty message ID')
+        if (this.session.version !== this.baseVersion) {
+            throw new ConversationSessionStaleError(
+                this.baseVersion,
+                this.session.version,
+            )
+        }
+        const absoluteIndex = this.session.resolveLocator(locator)
+        const liveMessage = this.session.resolveMessage(locator)
+        if (liveMessage.chatId !== messageId) {
+            throw new MessageLocatorMismatchError(
+                'Prompt message ID no longer matches its locator',
+            )
+        }
+        const originalMessage = this.originalMessages[absoluteIndex]
+        const projectedMessage = this.chat.message[absoluteIndex]
+        if (!originalMessage) {
+            throw new MessageLocatorMismatchError(
+                'Prompt message ID is outside the operation baseline',
+            )
+        }
+        if (originalMessage.chatId === messageId) return
+        if (
+            this.chat.message.length !== this.originalMessages.length ||
+            !projectedMessage ||
+            !valuesEqual(originalMessage, projectedMessage)
+        ) {
+            throw new MessageLocatorMismatchError(
+                'Prompt message ID cannot be projected after a structural mutation',
+            )
+        }
+        if (originalMessage.chatId || (
+            projectedMessage.chatId && projectedMessage.chatId !== messageId
+        )) {
+            throw new MessageLocatorMismatchError(
+                'Prompt message ID changed from a non-empty baseline',
+            )
+        }
+        const expectedLiveMessage = {
+            ...safeStructuredClone(originalMessage),
+            chatId: messageId,
+        }
+        if (!valuesEqual(expectedLiveMessage, liveMessage)) {
+            throw new MessageLocatorMismatchError(
+                'Prompt message changed while adopting its generated ID',
+            )
+        }
+        originalMessage.chatId = messageId
+        projectedMessage.chatId = messageId
+    }
+
     collectMutationBatch(): ConversationMutationBatch {
         this.assertOpen()
         if (this.session.version !== this.baseVersion) {
@@ -190,10 +248,15 @@ export class ConversationOperationContext {
                 this.session.version,
             )
         }
-        if (!valuesEqual(
-            this.originalMessages,
-            this.session.materializeCompatibilityArray(),
-        )) {
+        const liveMessages = this.session.materializeCompatibilityArray()
+        if (
+            liveMessages !== this.sourceMessages ||
+            liveMessages.length !== this.sourceMessageIdentities.length ||
+            liveMessages.some(
+                (message, index) => message !== this.sourceMessageIdentities[index],
+            ) ||
+            !valuesEqual(this.originalMessages, liveMessages)
+        ) {
             throw new MessageLocatorMismatchError(
                 'Conversation operation baseline changed without a session command',
             )

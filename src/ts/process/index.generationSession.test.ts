@@ -73,6 +73,14 @@ vi.mock('./request/request', () => ({
 }))
 vi.mock('./stableDiff', () => ({ stableDiff: vi.fn() }))
 vi.mock('./scripts', () => ({
+    createPromptScriptOperationScope: () => ({
+        assertOwnerCurrent: vi.fn(),
+        adoptMessageId: vi.fn(),
+        parse: (_char: unknown, text: string) => text,
+        finish: vi.fn(),
+        finishAfterError: vi.fn(),
+        release: vi.fn(),
+    }),
     processScript: vi.fn(async (_char: unknown, data: string) => data),
     processScriptFull: vi.fn(async (
         _char: unknown,

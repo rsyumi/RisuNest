@@ -134,6 +134,14 @@ vi.mock('../util', () => ({
 vi.mock('./request/request', () => ({ requestChatData: harness.requestChatData }))
 vi.mock('./stableDiff', () => ({ stableDiff: harness.stableDiff }))
 vi.mock('./scripts', () => ({
+    createPromptScriptOperationScope: () => ({
+        assertOwnerCurrent: vi.fn(),
+        adoptMessageId: vi.fn(),
+        parse: (_char: unknown, text: string) => text,
+        finish: vi.fn(),
+        finishAfterError: vi.fn(),
+        release: vi.fn(),
+    }),
     processScript: vi.fn(async (_char, text: string) => text),
     processScriptFull: harness.processScriptFull,
     risuChatParser: vi.fn((text: string) => text),

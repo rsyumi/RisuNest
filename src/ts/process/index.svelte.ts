@@ -10,7 +10,7 @@ import { loadLoreBookV3Prompt } from "./lorebook.svelte";
 import { findCharacterbyId, getAuthorNoteDefaultText, getPersonaPrompt, getUserName, isLastCharPunctuation, trimUntilPunctuation, parseToggleSyntax, prebuiltAssetCommand } from "../util";
 import { requestChatData } from "./request/request";
 import { stableDiff } from "./stableDiff";
-import { processScript, processScriptFull, risuChatParser } from "./scripts";
+import { createPromptScriptOperationScope, processScript, processScriptFull, risuChatParser, type PromptScriptOperationScope } from "./scripts";
 import { exampleMessage } from "./exampleMessages";
 import { sayTTS } from "./tts";
 import { supaMemory } from "./memory/supaMemory";
@@ -970,7 +970,11 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     const requiresLivePromptCompatibility = (pluginV2.editprocess?.size ?? 0) > 0
     const promptHistory = beginPromptHistoryOperation(nowChatroom, currentChat)
     let promptHistoryCompatibilitySnapshot: PromptHistoryCompatibilitySnapshot | null = null
+    let promptScriptOperationScope: PromptScriptOperationScope | null = null
     try {
+    promptScriptOperationScope = createPromptScriptOperationScope(nowChatroom, {
+        pluginCompatibility: requiresLivePromptCompatibility,
+    })
     const promptHistorySelection = selectPromptHistory(promptHistory)
     const promptHistoryEntries = requiresLivePromptCompatibility
         ? (promptHistoryCompatibilitySnapshot = createLivePromptHistoryCompatibilitySnapshot(
@@ -979,6 +983,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         )).entries
         : iteratePromptHistory(promptHistory, promptHistorySelection)
     for(const entry of promptHistoryEntries){
+        promptScriptOperationScope.assertOwnerCurrent()
         const { relativeIndex: index } = entry
         let msg: Message
         if (requiresLivePromptCompatibility) {
@@ -987,8 +992,17 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         } else {
             msg = ensurePromptHistoryEntryId(promptHistory, entry, v4)
         }
-        let formatedChat = (await processScriptFull(nowChatroom,risuChatParser(msg.data, {chara: currentChar, role: msg.role}), 'editprocess', index, {
+        promptScriptOperationScope?.adoptMessageId(entry.locator, msg.chatId)
+        const parsedMessage = promptScriptOperationScope
+            ? promptScriptOperationScope.parse(nowChatroom, msg.data, {
+                chara: currentChar,
+                role: msg.role,
+            })
+            : risuChatParser(msg.data, {chara: currentChar, role: msg.role})
+        let formatedChat = (await processScriptFull(nowChatroom, parsedMessage, 'editprocess', index, {
             chatRole: msg.role,
+        }, {
+            promptOperationScope: promptScriptOperationScope ?? undefined,
         })).data
         let name = ''
         if(msg.role === 'char'){
@@ -1071,7 +1085,12 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             (usingPromptTemplate && DBState.db.promptSettings.sendName)
         ){
             const form = DBState.db.groupTemplate || `<{{char}}\'s Message>\n{{slot}}\n</{{char}}\'s Message>`
-            formatedChat = risuChatParser(form, {chara: findCharacterbyIdwithCache(msg.saying).name}).replace('{{slot}}', formatedChat)
+            const groupTemplate = promptScriptOperationScope
+                ? promptScriptOperationScope.parse(nowChatroom, form, {
+                    chara: findCharacterbyIdwithCache(msg.saying).name,
+                })
+                : risuChatParser(form, {chara: findCharacterbyIdwithCache(msg.saying).name})
+            formatedChat = groupTemplate.replace('{{slot}}', formatedChat)
             switch(DBState.db.groupOtherBotRole){
                 case 'user':
                 case 'assistant':
@@ -1135,7 +1154,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         chats.push(chat)
         currentTokens += await tokenizer.tokenizeChat(chat)
     }
+    promptScriptOperationScope?.finish()
+    promptScriptOperationScope = null
+    } catch (error) {
+        promptScriptOperationScope?.finishAfterError()
+        promptScriptOperationScope = null
+        throw error
     } finally {
+        promptScriptOperationScope?.release()
         promptHistoryCompatibilitySnapshot?.dispose()
         promptHistory.dispose()
     }

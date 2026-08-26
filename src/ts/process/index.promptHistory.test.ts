@@ -32,9 +32,9 @@ vi.mock('../parser/parser.svelte', () => ({
             const result = callback(source, {
                 ...args,
                 chatID: args.chatID ?? -1,
-                db: args.db ?? {},
                 chara: args.chara ?? '',
                 rmVar: false,
+                runVar: args.runVar ?? false,
                 cbsConditions: args.cbsConditions ?? {},
             }, parts.slice(1), {})
             if (typeof result === 'string') return result
@@ -314,6 +314,223 @@ describe('sendChat prompt history characterization', () => {
         expect(get(doingChat)).toBe(false)
     })
 
+    it('shares one mutating prompt operation and exposes earlier injections to later outer CBS parsing', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const liveChat = selectedCharacter.chats[0]
+        liveChat.message = [
+            { role: 'user', data: 'WRITE:first', chatId: 'first' },
+            { role: 'char', data: 'seen={{previouschatlog::0}}', chatId: 'second' },
+            { role: 'user', data: 'seen={{previouschatlog::1}}', chatId: 'third' },
+        ]
+        liveChat.fmIndex = -1
+        selectedCharacter.customscript = [{
+            comment: 'Prepare stored content',
+            in: 'WRITE:',
+            out: 'STORED:',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }, {
+            comment: 'Persist processed content',
+            in: 'STORED:',
+            out: '@@inject',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }]
+        const session = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: liveChat.id!,
+            conversation: liveChat,
+            storeRevision: 46,
+        })
+        const readRange = vi.spyOn(session, 'readRange')
+        testState.activeSession = session
+        mockTriggerClone()
+
+        await expect(sendChat(-1, { preview: true })).resolves.toBe(true)
+
+        expect(previewFormated.slice(-3).map((message) => message.content)).toEqual([
+            'first',
+            'seen=first',
+            'seen=seen=first',
+        ])
+        expect(liveChat.message.map((message) => message.data)).toEqual([
+            'STORED:first',
+            'seen=STORED:first',
+            'seen=seen=STORED:first',
+        ])
+        expect(readRange.mock.calls.map(([start, limit]) => [start, limit])).toEqual([
+            [0, 3],
+            [0, 3],
+            [0, 3],
+        ])
+        expect(session.version).toBe(2)
+        expect(session.activePinReasons).toEqual([])
+    })
+
+    it('adopts a later prompt message ID without treating it as an unversioned baseline edit', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const liveChat = selectedCharacter.chats[0]
+        liveChat.message = [
+            { role: 'user', data: 'WRITE:first', chatId: 'first' },
+            { role: 'char', data: 'plain second', chatId: '' },
+        ]
+        liveChat.fmIndex = -1
+        selectedCharacter.customscript = [{
+            comment: 'Prepare stored content',
+            in: 'WRITE:',
+            out: 'STORED:',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }, {
+            comment: 'Persist processed content',
+            in: 'STORED:',
+            out: '@@inject',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }]
+        const session = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: liveChat.id!,
+            conversation: liveChat,
+            storeRevision: 47,
+        })
+        testState.activeSession = session
+        mockTriggerClone()
+
+        await expect(sendChat(-1, { preview: true })).resolves.toBe(true)
+
+        const promptMessages = previewFormated.slice(-2)
+        expect(promptMessages.map((message) => message.content)).toEqual([
+            'first',
+            'plain second',
+        ])
+        expect(promptMessages[1].memo).toBeTruthy()
+        expect(liveChat.message[1].chatId).toBe(promptMessages[1].memo)
+        expect(liveChat.message.map((message) => message.data)).toEqual([
+            'STORED:first',
+            'plain second',
+        ])
+        expect(session.version).toBe(2)
+        expect(session.activePinReasons).toEqual([])
+    })
+
+    it('discards a pending prompt operation when a same-owner session edit advances the version', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const liveChat = selectedCharacter.chats[0]
+        liveChat.message = [
+            { role: 'user', data: 'WRITE:first', chatId: 'first' },
+            { role: 'char', data: 'second', chatId: 'second' },
+            { role: 'user', data: 'third', chatId: 'third' },
+        ]
+        liveChat.fmIndex = -1
+        selectedCharacter.customscript = [{
+            comment: 'Prepare stored content',
+            in: 'WRITE:',
+            out: 'STORED:',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }, {
+            comment: 'Persist processed content',
+            in: 'STORED:',
+            out: '@@inject',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }]
+        const session = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: liveChat.id!,
+            conversation: liveChat,
+            storeRevision: 51,
+        })
+        testState.activeSession = session
+        mockTriggerClone()
+
+        let tokenizeCalls = 0
+        let edited = false
+        testState.onTokenizeChat = () => {
+            tokenizeCalls += 1
+            if (edited || tokenizeCalls < 2) return
+            edited = true
+            session.edit(session.locate(1), {
+                ...liveChat.message[1],
+                data: 'concurrent UI edit',
+            })
+        }
+
+        await expect(sendChat(-1, { preview: true })).rejects.toMatchObject({
+            name: 'ConversationSessionStaleError',
+        })
+
+        expect(edited).toBe(true)
+        expect(liveChat.message.map((message) => message.data)).toEqual([
+            'WRITE:first',
+            'concurrent UI edit',
+            'third',
+        ])
+        expect(session.version).toBe(2)
+        expect(session.activePinReasons).toEqual([])
+    })
+
+    it('rejects an active session for a different chat that aliases the same message array', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const sharedMessages: Message[] = [
+            { role: 'user', data: 'reset', chatId: 'reset', disabled: 'allBefore' },
+            { role: 'user', data: 'WRITE:first', chatId: 'first' },
+        ]
+        const sessionChat: Chat = {
+            id: 'session-chat',
+            name: 'Session chat',
+            note: '',
+            localLore: [],
+            message: sharedMessages,
+        }
+        const selectedChat: Chat = {
+            id: 'selected-chat',
+            name: 'Selected chat',
+            note: '',
+            localLore: [],
+            message: sharedMessages,
+        }
+        selectedCharacter.chats = [sessionChat, selectedChat]
+        selectedCharacter.chatPage = 1
+        selectedCharacter.customscript = [{
+            comment: 'Must not route to the aliased session',
+            in: 'WRITE:',
+            out: '{{setvar::wrong_owner::value}}',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }]
+        const session = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: sessionChat.id!,
+            conversation: sessionChat,
+            storeRevision: 52,
+        })
+        testState.activeSession = session
+        testState.runTrigger.mockResolvedValue(null)
+
+        await expect(sendChat(-1, { preview: true })).rejects.toMatchObject({
+            name: 'ConversationSessionInactiveError',
+        })
+
+        expect(sessionChat.scriptstate).toBeUndefined()
+        expect(selectedChat.scriptstate).toBeUndefined()
+        expect(sharedMessages[1].data).toBe('WRITE:first')
+        expect(session.version).toBe(0)
+        expect(session.activePinReasons).toEqual([])
+    })
+
     it('uses an explicit compatibility snapshot for stateful Plugin v2 prompt listeners', async () => {
         setDatabaseLite(makeDatabase())
         const selectedCharacter = DBState.db.characters[0] as character
@@ -325,8 +542,13 @@ describe('sendChat prompt history characterization', () => {
             storeRevision: 42,
         })
         const readRange = vi.spyOn(session, 'readRange')
+        const acquirePin = vi.spyOn(session, 'acquirePin')
         testState.activeSession = session
         let pluginCalls = 0
+        const tokenizePinReasons: string[][] = []
+        testState.onTokenizeChat = () => {
+            tokenizePinReasons.push([...session.activePinReasons])
+        }
         testState.pluginV2.editprocess.add((content) => {
             pluginCalls += 1
             if (pluginCalls === 1) {
@@ -353,6 +575,103 @@ describe('sendChat prompt history characterization', () => {
         expect(previewFormated[1].content).toBe('plugin-mutated CBS_REGEX|PLUGIN')
         expect(previewFormated[ACTIVE_MESSAGE_COUNT - 1].content).toBe('CBS_REGEX|PLUGIN')
         expect(previewFormated.some((message) => message.memo === 'replacement')).toBe(false)
+        expect(tokenizePinReasons).toHaveLength(ACTIVE_MESSAGE_COUNT * 2)
+        expect(tokenizePinReasons.slice(0, ACTIVE_MESSAGE_COUNT).every(
+            (reasons) => reasons.includes('compatibility'),
+        )).toBe(true)
+        expect(acquirePin.mock.calls.filter(([reason]) => reason === 'compatibility')).toHaveLength(1)
+        expect(acquirePin.mock.calls.filter(([reason]) => reason === 'transaction')).toHaveLength(0)
+    })
+
+    it('keeps mutating Plugin v2 prompt scripts on the pinned live-reference path', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const liveChat = selectedCharacter.chats[0]
+        liveChat.message = [
+            { role: 'user', data: 'WRITE:first', chatId: 'first' },
+            { role: 'char', data: 'plain second', chatId: 'second' },
+        ]
+        liveChat.fmIndex = -1
+        selectedCharacter.customscript = [{
+            comment: 'Persist Plugin-processed content',
+            in: 'STORE:',
+            out: '@@inject',
+            type: 'editprocess',
+            flag: 'g',
+            ableFlag: true,
+        }]
+        const session = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: liveChat.id!,
+            conversation: liveChat,
+            storeRevision: 48,
+        })
+        testState.activeSession = session
+        testState.pluginV2.editprocess.add((content) => content.replace('WRITE:', 'STORE:'))
+        mockTriggerClone()
+
+        await expect(sendChat(-1, { preview: true })).resolves.toBe(true)
+
+        expect(liveChat.message[0].data).toBe('STORE:first')
+        expect(session.activePinReasons).toEqual([])
+    })
+
+    it('fails before the next outer CBS parse when Plugin v2 loses its prompt owner', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const liveChat = selectedCharacter.chats[0]
+        liveChat.message = [
+            { role: 'user', data: 'reset', chatId: 'reset', disabled: 'allBefore' },
+            { role: 'user', data: 'first {{lastmessage}}', chatId: 'first' },
+            { role: 'char', data: 'second {{lastmessage}}', chatId: '' },
+        ]
+        selectedCharacter.customscript = []
+        const originalSession = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: liveChat.id!,
+            conversation: liveChat,
+            storeRevision: 49,
+        })
+        testState.activeSession = originalSession
+        mockTriggerClone()
+
+        let pluginCalls = 0
+        testState.pluginV2.editprocess.add((content) => {
+            pluginCalls += 1
+            return content
+        })
+        let replacementChat: Chat | undefined
+        testState.onTokenizeChat = () => {
+            if (replacementChat) return
+            const replacementDatabase = makeDatabase()
+            const replacementCharacter = replacementDatabase.characters[0] as character
+            replacementCharacter.chaId = 'replacement-character'
+            replacementChat = replacementCharacter.chats[0]
+            replacementChat.id = 'replacement-conversation'
+            replacementChat.message = [{
+                role: 'user',
+                data: 'replacement must remain untouched',
+                chatId: 'replacement-message',
+            }]
+            setDatabaseLite(replacementDatabase)
+            testState.activeSession = new ActiveConversationSession({
+                characterId: replacementCharacter.chaId,
+                conversationId: replacementChat.id,
+                conversation: replacementChat,
+                storeRevision: 50,
+            })
+        }
+
+        await expect(sendChat(-1, { preview: true })).rejects.toMatchObject({
+            name: 'ConversationSessionInactiveError',
+        })
+
+        expect(pluginCalls).toBe(1)
+        expect(replacementChat?.message.map((message) => message.data)).toEqual([
+            'replacement must remain untouched',
+        ])
+        expect(liveChat.message[2].chatId).toBe('')
+        expect(originalSession.activePinReasons).toEqual([])
     })
 
     it('persists a compatibility-snapshot ID across prompt builds without an active session', async () => {

@@ -109,7 +109,11 @@ vi.mock('./regexWorkerClient', async (importOriginal) => {
     }
 })
 
-const { processScriptFull, resetScriptCache } = await import('./scripts')
+const {
+    createPromptScriptOperationScope,
+    processScriptFull,
+    resetScriptCache,
+} = await import('./scripts')
 const { RegexExecutionTimeoutError } = await import('./regexWorkerClient')
 const { getCurrentCharacter, getCurrentChat } = await import('../storage/database.svelte')
 
@@ -606,6 +610,85 @@ describe('history-sensitive regex conversation operations', () => {
         expect(session.activePinReasons).toEqual([])
         expect(chat.message[0].data).toBe('input-plugin')
         expect(session.version).toBe(1)
+    })
+
+    it('keeps a mutating Plugin v2 prompt scope off the transaction path', async () => {
+        const chat = {
+            id: 'prompt-plugin-chat',
+            message: [{ role: 'user', data: 'before', chatId: 'message-0' }],
+        } as Chat
+        const char = makeCharacter([makeScript('input-plugin', '@@inject')])
+        char.chaId = 'prompt-plugin-character'
+        char.chats = [chat]
+        char.chatPage = 0
+        const session = new ActiveConversationSession({
+            characterId: char.chaId,
+            conversationId: chat.id!,
+            conversation: chat,
+            storeRevision: 30,
+        })
+        const acquirePin = vi.spyOn(session, 'acquirePin')
+        mocks.database.characters = [char] as never
+        mocks.state.currentChat = chat
+        mocks.state.session = session
+        mocks.pluginV2.editoutput.add(async (data) => `${data}-plugin`)
+        const scope = createPromptScriptOperationScope(char, {
+            pluginCompatibility: true,
+        })
+
+        try {
+            const result = await processScriptFull(char, 'input', 'editoutput', 0, {}, {
+                cache: 'bypass',
+                regexWorker: false,
+                promptOperationScope: scope,
+            })
+            scope.finish()
+
+            expect(result.data).toBe('')
+            expect(chat.message[0].data).toBe('input-plugin')
+            expect(session.version).toBe(0)
+            expect(acquirePin.mock.calls.filter(([reason]) => reason === 'compatibility'))
+                .toHaveLength(1)
+            expect(acquirePin.mock.calls.filter(([reason]) => reason === 'transaction'))
+                .toHaveLength(0)
+            expect(session.activePinReasons).toEqual([])
+        } finally {
+            scope.release()
+        }
+    })
+
+    it('refuses to capture a prompt scope for a character that is no longer selected', () => {
+        const originalChat = {
+            id: 'prompt-original-chat',
+            message: [{ role: 'user', data: 'original', chatId: 'original-message' }],
+        } as Chat
+        const replacementChat = {
+            id: 'prompt-replacement-chat',
+            message: [{ role: 'user', data: 'replacement', chatId: 'replacement-message' }],
+        } as Chat
+        const originalCharacter = makeCharacter([])
+        originalCharacter.chaId = 'prompt-original-character'
+        originalCharacter.chats = [originalChat]
+        originalCharacter.chatPage = 0
+        const replacementCharacter = makeCharacter([])
+        replacementCharacter.chaId = 'prompt-replacement-character'
+        replacementCharacter.chats = [replacementChat]
+        replacementCharacter.chatPage = 0
+        const replacementSession = new ActiveConversationSession({
+            characterId: replacementCharacter.chaId,
+            conversationId: replacementChat.id!,
+            conversation: replacementChat,
+            storeRevision: 31,
+        })
+        mocks.database.characters = [originalCharacter, replacementCharacter] as never
+        mocks.state.selectedCharIndex = 1
+        mocks.state.currentChat = replacementChat
+        mocks.state.session = replacementSession
+
+        expect(() => createPromptScriptOperationScope(originalCharacter)).toThrow(
+            /inactive|ownership/i,
+        )
+        expect(replacementSession.activePinReasons).toEqual([])
     })
 
     it('does not retarget a post-plugin history action after navigation', async () => {

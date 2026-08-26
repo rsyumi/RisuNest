@@ -23,6 +23,7 @@ import {
     requireCurrentConversationSession,
     type ActiveConversationPin,
     type ActiveConversationSession,
+    type MessageLocator,
 } from "../storage/activeConversationSession";
 import {
     getChatVarFromConversation,
@@ -38,6 +39,7 @@ export interface ProcessScriptOptions {
     regexWorker?: boolean
     captureContext?: ProcessScriptCaptureContext
     projectedChatID?: number
+    promptOperationScope?: PromptScriptOperationScope
 }
 
 export interface ProcessScriptCaptureContext {
@@ -167,7 +169,7 @@ const HISTORY_SENSITIVE_CBS_NAMES = new Set([
     'main_prompt', 'jb', 'jailbreak', 'globalnote', 'systemnote', 'ujb',
 ])
 
-interface ScriptConversationOwner {
+export interface ScriptConversationOwner {
     database: Database
     character: character | groupChat | null
     session: ActiveConversationSession | null
@@ -178,9 +180,13 @@ interface ScriptConversationOwner {
 
 function captureScriptConversationOwner(
     char: character | groupChat | simpleCharacterArgument,
+    requirePromptOwnerMatch = false,
 ): ScriptConversationOwner {
     const db = getDatabase()
     const selectedCharacter = db.characters[get(selectedCharID)] ?? null
+    if (requirePromptOwnerMatch && selectedCharacter !== char) {
+        throw new ConversationSessionInactiveError()
+    }
     const selectedCharacterId = selectedCharacter?.chaId ?? char.chaId
     const session = peekActiveConversationSession()
     let chat: Chat | null = null
@@ -192,7 +198,7 @@ function captureScriptConversationOwner(
     if (
         session?.isActive &&
         chat &&
-        session.materializeCompatibilityArray() === chat.message
+        session.matchesConversation(selectedCharacterId, chat)
     ) {
         return {
             database: db,
@@ -202,6 +208,9 @@ function captureScriptConversationOwner(
             version: session.version,
             selectedCharacterId: session.characterId,
         }
+    }
+    if (requirePromptOwnerMatch && session) {
+        throw new ConversationSessionInactiveError()
     }
     return {
         database: db,
@@ -282,9 +291,157 @@ function classifyConversationAccess(
     return access
 }
 
+export class PromptScriptOperationScope {
+    private operation: ConversationOperationContext | null = null
+    private compatibilityPin: ActiveConversationPin | null
+    private closed = false
+
+    constructor(
+        private readonly owner: ScriptConversationOwner,
+        readonly usesPluginCompatibility: boolean,
+    ) {
+        this.compatibilityPin = usesPluginCompatibility && owner.session
+            ? owner.session.acquirePin('compatibility')
+            : null
+    }
+
+    get database(): Database {
+        return this.owner.database
+    }
+
+    getOwner(): ScriptConversationOwner {
+        this.assertOpen()
+        return this.owner
+    }
+
+    parse(
+        char: character | groupChat | simpleCharacterArgument,
+        data: string,
+        parserArgument: Parameters<typeof risuChatParserOrg>[1] = {},
+    ): string {
+        this.assertOwnerCurrent()
+        const scripts = [
+            ...(this.owner.database.presetRegex ?? []),
+            ...char.customscript,
+            ...getModuleRegexScripts(),
+        ]
+        const access = classifyConversationAccess(
+            getRegexExecutionPlan(scripts, 'editprocess'),
+            data,
+        )
+        if (access === 'mutating' && !this.usesPluginCompatibility) {
+            this.ensureOperation()
+        }
+        const database = this.operation?.createDatabaseView(this.owner.database) ??
+            this.owner.database
+        const chat = this.operation?.chat ?? this.owner.chat
+        return risuChatParserOrg(data, {
+            ...parserArgument,
+            db: database,
+            selectedCharacterId: this.owner.selectedCharacterId,
+            getChatVar: chat
+                ? (key: string) => getChatVarFromConversation(
+                    database,
+                    this.owner.selectedCharacterId,
+                    chat,
+                    key,
+                )
+                : undefined,
+            setChatVar: access === 'mutating' && chat
+                ? (key: string, value: string) => {
+                    setChatVarOnConversation(chat, key, value)
+                }
+                : undefined,
+        })
+    }
+
+    operationFor(access: ConversationAccess): ConversationOperationContext | null {
+        this.assertOwnerCurrent()
+        if (access === 'mutating' && !this.usesPluginCompatibility) {
+            this.ensureOperation()
+        }
+        return this.operation
+    }
+
+    adoptMessageId(locator: MessageLocator | undefined, messageId: string | undefined): void {
+        if (!locator || !messageId || !this.operation) return
+        this.operation.adoptMessageId(locator, messageId)
+    }
+
+    assertOwnerCurrent(): void {
+        this.assertOpen()
+        requireScriptConversationOwner(this.owner)
+    }
+
+    finish(): void {
+        this.assertOwnerCurrent()
+        const operation = this.operation
+        this.operation = null
+        this.closed = true
+        try {
+            if (operation) operation.commit(peekActiveConversationSession())
+        } finally {
+            this.releaseCompatibilityPin()
+        }
+    }
+
+    finishAfterError(): void {
+        if (this.closed) return
+        const operation = this.operation
+        this.operation = null
+        this.closed = true
+        try {
+            if (!operation) return
+            if (operation.hasPendingMutations()) {
+                operation.commit(peekActiveConversationSession())
+            } else {
+                operation.release()
+            }
+        } finally {
+            this.releaseCompatibilityPin()
+        }
+    }
+
+    release(): void {
+        if (this.closed) return
+        this.closed = true
+        this.operation?.release()
+        this.operation = null
+        this.releaseCompatibilityPin()
+    }
+
+    private ensureOperation(): void {
+        if (this.operation || !this.owner.session || !this.owner.chat) return
+        this.operation = createConversationOperationContext(
+            this.owner.session,
+            this.owner.chat,
+        )
+    }
+
+    private assertOpen(): void {
+        if (this.closed) throw new Error('Prompt script operation scope is closed')
+    }
+
+    private releaseCompatibilityPin(): void {
+        this.compatibilityPin?.release()
+        this.compatibilityPin = null
+    }
+}
+
+export function createPromptScriptOperationScope(
+    char: character | groupChat | simpleCharacterArgument,
+    options: { pluginCompatibility?: boolean } = {},
+): PromptScriptOperationScope {
+    return new PromptScriptOperationScope(
+        captureScriptConversationOwner(char, true),
+        options.pluginCompatibility === true,
+    )
+}
+
 export async function processScriptFull(char:character|groupChat|simpleCharacterArgument, data:string, mode:ScriptMode, chatID = -1, cbsConditions:CbsConditions = {}, options:ProcessScriptOptions = {}){
     const captureContext = options.captureContext
-    let db = captureContext?.parserContext.database ?? getDatabase()
+    const promptOperationScope = captureContext ? undefined : options.promptOperationScope
+    let db = captureContext?.parserContext.database ?? promptOperationScope?.database ?? getDatabase()
     let emoChanged = false
     if (!captureContext) {
         data = await runLuaEditTrigger(char, mode, data, { index:chatID })
@@ -310,10 +467,13 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
     }
 
-    const conversationOwner = captureContext ? null : captureScriptConversationOwner(char)
+    const conversationOwner = captureContext
+        ? null
+        : promptOperationScope?.getOwner() ?? captureScriptConversationOwner(char)
     const usesPluginCompatibility = !captureContext &&
         conversationOwner !== null && pluginV2[mode].size > 0
-    const compatibilityPin = usesPluginCompatibility && conversationOwner.session
+    const compatibilityPin = usesPluginCompatibility &&
+        !promptOperationScope?.usesPluginCompatibility && conversationOwner.session
         ? conversationOwner.session.acquirePin('compatibility')
         : null
     if(usesPluginCompatibility){
@@ -346,14 +506,19 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
             ? 'none'
             : classifyConversationAccess(plan, data)
         const needsConversationOperation = conversationAccess === 'mutating'
-        readPin = conversationAccess === 'read-only' &&
-            !compatibilityPin && conversationOwner?.session
-            ? conversationOwner.session.acquirePin('transaction')
-            : null
         if (conversationAccess !== 'none' && conversationOwner) {
             requireScriptConversationOwner(conversationOwner)
         }
-        if (needsConversationOperation && conversationOwner?.session && conversationOwner.chat) {
+        conversationOperation = promptOperationScope?.operationFor(conversationAccess) ?? null
+        readPin = conversationAccess === 'read-only' && !conversationOperation &&
+            !compatibilityPin && !promptOperationScope?.usesPluginCompatibility &&
+            conversationOwner?.session
+            ? conversationOwner.session.acquirePin('transaction')
+            : null
+        if (
+            !promptOperationScope && !conversationOperation && needsConversationOperation &&
+            conversationOwner?.session && conversationOwner.chat
+        ) {
             conversationOperation = createConversationOperationContext(
                 conversationOwner.session,
                 conversationOwner.chat,
@@ -366,6 +531,8 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         throw error
     }
     const needsConversationOperation = conversationAccess === 'mutating'
+    const ownsConversationOperation = conversationOperation !== null &&
+        promptOperationScope === undefined
     const operationDatabase = conversationOperation?.createDatabaseView(db) ?? db
     const operationChat = conversationOperation?.chat ?? conversationOwner?.chat ?? null
     const parseCbs = (value: string) => captureContext
@@ -409,7 +576,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         })
     let conversationOperationCommitted = false
     const finish = <T>(result: T): T => {
-        if (conversationOperation) {
+        if (conversationOperation && ownsConversationOperation) {
             conversationOperation.commit(peekActiveConversationSession())
             conversationOperationCommitted = true
         }
@@ -683,7 +850,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
 
     return finish({data, emoChanged})
     } catch (error) {
-        if (conversationOperation?.hasPendingMutations()) {
+        if (ownsConversationOperation && conversationOperation?.hasPendingMutations()) {
             conversationOperation.commit(peekActiveConversationSession())
             conversationOperationCommitted = true
         }
@@ -692,7 +859,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         }
         throw error
     } finally {
-        if (conversationOperation && !conversationOperationCommitted) {
+        if (ownsConversationOperation && conversationOperation && !conversationOperationCommitted) {
             conversationOperation.release()
         }
         readPin?.release()
