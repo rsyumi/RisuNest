@@ -7,12 +7,23 @@ import { DBState, selectedCharID } from "../stores.svelte";
 import {
     activateCharacter,
     flushPendingData,
+    getActiveConversationSession,
     getPersistentNavigationGeneration,
     markPersistentDataDirty,
     reconcilePersistentActiveCharacterIds,
 } from "../storage/persistentDataRuntime.svelte";
 import { restoreColdPersistentCharacter } from './coldCharacterRestore'
 import { doingChat } from './generationState'
+import { appendCurrentConversationMessage } from '../conversationMutations'
+import type { ActiveConversationPin } from '../storage/activeConversationSession'
+
+interface GroupGreetingMutation {
+    chatId: string
+    index: number
+    data: string
+    saying: string
+    pin: ActiveConversationPin | null
+}
 
 function markGroupDirty(group: unknown) {
     markPersistentDataDirty(new TextEncoder().encode(JSON.stringify(group)).byteLength)
@@ -51,6 +62,28 @@ async function settleGroupRollback(groupId: string): Promise<void> {
     reconcilePersistentActiveCharacterIds(DBState.db, groupId)
 }
 
+function rollbackGroupGreeting(
+    groupId: string,
+    group: Extract<(typeof DBState.db.characters)[number], { type: 'group' }>,
+    greeting: GroupGreetingMutation,
+): void {
+    const chat = group.chats.find((candidate) => candidate.id === greeting.chatId)
+        ?? group.chats[group.chatPage]
+    const message = chat?.message[greeting.index]
+    if (
+        !chat ||
+        message?.saying !== greeting.saying ||
+        message.data !== greeting.data
+    ) return
+
+    const session = getActiveConversationSession()
+    if (session?.matchesConversation(groupId, chat)) {
+        session.delete(session.locate(greeting.index))
+    } else if (!session) {
+        chat.message.splice(greeting.index, 1)
+    }
+}
+
 export async function addGroupChar(): Promise<boolean> {
     let selectedId = get(selectedCharID)
     let group = DBState.db.characters[selectedId]
@@ -78,46 +111,61 @@ export async function addGroupChar(): Promise<boolean> {
                 group = DBState.db.characters[selectedId]
                 if (group?.type !== 'group' || group.chaId !== groupId) return false
                 if (group.characters.includes(res)) return false
+                const selectedChat = group.chats[group.chatPage]
+                const activeSession = getActiveConversationSession()
+                if (
+                    activeSession &&
+                    !activeSession.matchesConversation(groupId, selectedChat)
+                ) return false
                 group.characters.push(res)
                 group.characterTalks.push(1 / 6 * 4)
                 group.characterActive.push(true)
-                let addedMessageIndex = -1
-                let addedMessageChatId: string | undefined
+                let greeting: GroupGreetingMutation | null = null
                 if(loadFirstMessage){
                     const message = {
                         role:'char',
                         data: member?.firstMessage ?? '',
                         saying: res,
                     } as const
-                    const chat = group.chats[group.chatPage]
-                    addedMessageIndex = chat.message.length
-                    addedMessageChatId = chat.id
-                    chat.message.push(message)
+                    const index = selectedChat.message.length
+                    appendCurrentConversationMessage(
+                        group,
+                        selectedChat,
+                        activeSession,
+                        message,
+                    )
+                    greeting = {
+                        chatId: selectedChat.id,
+                        index,
+                        data: message.data,
+                        saying: res,
+                        pin: activeSession?.acquireRangePin(
+                            index,
+                            index + 1,
+                            'transaction',
+                        ) ?? null,
+                    }
                 }
-                markGroupDirty(group)
-                const activation = await activateSelectedGroup(groupId)
-                if (activation === 'activated') return true
-                if (activation === 'superseded') return false
-                group = DBState.db.characters.find((character) => character.chaId === groupId)
-                if (!group || group.type !== 'group') return false
-                const memberIndex = group.characters.indexOf(res)
-                if (memberIndex >= 0) {
-                    group.characters.splice(memberIndex, 1)
-                    group.characterTalks.splice(memberIndex, 1)
-                    group.characterActive.splice(memberIndex, 1)
+                try {
+                    markGroupDirty(group)
+                    const activation = await activateSelectedGroup(groupId)
+                    if (activation === 'activated') return true
+                    if (activation === 'superseded') return false
+                    group = DBState.db.characters.find((character) => character.chaId === groupId)
+                    if (!group || group.type !== 'group') return false
+                    const memberIndex = group.characters.indexOf(res)
+                    if (memberIndex >= 0) {
+                        group.characters.splice(memberIndex, 1)
+                        group.characterTalks.splice(memberIndex, 1)
+                        group.characterActive.splice(memberIndex, 1)
+                    }
+                    if (greeting) rollbackGroupGreeting(groupId, group, greeting)
+                    markGroupDirty(group)
+                    await settleGroupRollback(groupId)
+                    return false
+                } finally {
+                    greeting?.pin?.release()
                 }
-                if (loadFirstMessage) {
-                    const chat = group.chats.find((candidate) => candidate.id === addedMessageChatId)
-                        ?? group.chats[group.chatPage]
-                    const message = chat?.message[addedMessageIndex]
-                    if (
-                        message?.saying === res &&
-                        message.data === (member.firstMessage ?? '')
-                    ) chat.message.splice(addedMessageIndex, 1)
-                }
-                markGroupDirty(group)
-                await settleGroupRollback(groupId)
-                return false
             }
         }
     }

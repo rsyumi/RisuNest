@@ -4,6 +4,7 @@ const mocks = vi.hoisted(() => ({
     database: { characters: [] as any[] },
     selectedId: 0,
     selectedCharacterId: null as string | null,
+    activeSession: null as import('../storage/activeConversationSession').ActiveConversationSession | null,
     doingChat: false,
     navigationGeneration: 0,
     alertConfirm: vi.fn(async () => true),
@@ -48,6 +49,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     activateCharacter: mocks.activateCharacter,
     flushPendingData: mocks.flushPendingData,
     getPersistentNavigationGeneration: () => mocks.navigationGeneration,
+    getActiveConversationSession: () => mocks.activeSession,
     markPersistentDataDirty: mocks.markPersistentDataDirty,
     reconcilePersistentActiveCharacterIds: mocks.reconcilePersistentActiveCharacterIds,
 }))
@@ -56,6 +58,7 @@ vi.mock('./coldCharacterRestore', () => ({
 }))
 
 import { addGroupChar, groupOrder, rmCharFromGroup } from './group'
+import { ActiveConversationSession } from '../storage/activeConversationSession'
 
 function makeGroup() {
     return {
@@ -75,6 +78,7 @@ describe('group working-set residency', () => {
         mocks.navigationGeneration = 0
         mocks.selectedId = 0
         mocks.selectedCharacterId = null
+        mocks.activeSession = null
         mocks.doingChat = false
         const group = makeGroup()
         mocks.database.characters = [
@@ -108,6 +112,50 @@ describe('group working-set residency', () => {
             { role: 'char', data: 'Hydrated B', saying: 'member-b' },
         ])
         expect(mocks.markPersistentDataDirty).toHaveBeenCalled()
+    })
+
+    it('routes a first-message greeting through the active conversation session', async () => {
+        const group = mocks.database.characters[0]
+        const onMutation = vi.fn()
+        mocks.activeSession = new ActiveConversationSession({
+            characterId: group.chaId,
+            conversationId: group.chats[0].id,
+            conversation: group.chats[0],
+            storeRevision: 1,
+            onMutation,
+        })
+
+        await expect(addGroupChar()).resolves.toBe(true)
+
+        expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
+            commands: ['append'],
+        }))
+    })
+
+    it('rolls a failed first-message greeting back through the current session', async () => {
+        const group = mocks.database.characters[0]
+        const onMutation = vi.fn()
+        mocks.activeSession = new ActiveConversationSession({
+            characterId: group.chaId,
+            conversationId: group.chats[0].id,
+            conversation: group.chats[0],
+            storeRevision: 1,
+            onMutation,
+        })
+        mocks.activateCharacter.mockImplementation(async () => {
+            mocks.navigationGeneration++
+            return false
+        })
+
+        await expect(addGroupChar()).resolves.toBe(false)
+
+        expect(group.chats[0].message).toEqual([])
+        expect(onMutation).toHaveBeenNthCalledWith(1, expect.objectContaining({
+            commands: ['append'],
+        }))
+        expect(onMutation).toHaveBeenNthCalledWith(2, expect.objectContaining({
+            commands: ['delete'],
+        }))
     })
 
     it('orders group generation from detail-only members without conversation histories', () => {
