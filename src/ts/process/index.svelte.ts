@@ -45,6 +45,7 @@ import {
 } from '../storage/persistentDataRuntime.svelte'
 import {
     captureGenerationConversationOperation,
+    captureGenerationTailFallbackOperation,
     recaptureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
@@ -1743,36 +1744,30 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     const isGenerationOwnerCurrent = () => get(selectedCharID) === selectedChar
         && DBState.db.characters[selectedChar] === generationCharacter
         && generationCharacter.chatPage === selectedChat
-    const legacyFallbackChat = getGenerationChat()
-    const legacyFallbackIndex = (legacyFallbackChat?.message.length ?? 0) - 1
-    let legacyFallbackMessage = legacyFallbackChat?.message[legacyFallbackIndex]
-    const isLegacyFallbackOwned = () => !generationHadOperation
-        && isGenerationOwnerCurrent()
-        && getGenerationChat() === legacyFallbackChat
-        && legacyFallbackChat?.message[legacyFallbackIndex] === legacyFallbackMessage
-    const readGeneratedOutput = (): Message | null | undefined => {
-        if(outputTarget){
-            return outputTarget.snapshot()
-        }
-        return isLegacyFallbackOwned() ? legacyFallbackMessage : null
-    }
+    const generationChat = getGenerationChat()
+    const legacyFallbackTarget = req.type === 'multiline'
+        && req.result.length === 0
+        && generationChat
+        ? captureGenerationTailFallbackOperation({
+            session: getActiveConversationSession(),
+            getCurrentSession: getActiveConversationSession,
+            chat: generationChat,
+            getCurrentChat: getGenerationChat,
+            isOwnerCurrent: isGenerationOwnerCurrent,
+        })
+        : null
+    const getGeneratedOutputTarget = () => outputTarget ?? legacyFallbackTarget
+    const readGeneratedOutput = (): Message | null => getGeneratedOutputTarget()?.snapshot() ?? null
     const updateGeneratedOutput = (update: (message: Message) => Message): boolean => {
-        if(outputTarget){
-            const message = outputTarget.snapshot()
-            return message !== null && outputTarget.commitMessage(update(message))
-        }
-        if(!isLegacyFallbackOwned() || !legacyFallbackChat || !legacyFallbackMessage){
-            return false
-        }
-        legacyFallbackChat.message[legacyFallbackIndex] = update(legacyFallbackMessage)
-        legacyFallbackMessage = legacyFallbackChat.message[legacyFallbackIndex]
-        return true
+        const target = getGeneratedOutputTarget()
+        if (!target) return false
+        const message = target.snapshot()
+        return message !== null && target.commitMessage(update(message))
     }
-    const hasGeneratedOutputOwnership = () => outputTarget
-        ? outputTarget.isOwned()
-        : isLegacyFallbackOwned()
+    const hasGeneratedOutputOwnership = () => getGeneratedOutputTarget()?.isOwned() ?? false
     const releaseOutputTarget = () => {
         outputTarget?.release()
+        legacyFallbackTarget?.release()
         outputTarget = null
     }
     try {
@@ -2159,11 +2154,11 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         }
         targetCharacter.chats[selectedChat] = runCurrentChatFunction(outputChat)
         currentChat = targetCharacter.chats[selectedChat]
-        if(outputTarget && !outputTarget.refresh()){
+        if(!getGeneratedOutputTarget()?.refresh()){
             return false
         }
         const triggerResult = await runTrigger(currentChar, 'output', {chat:currentChat})
-        if(outputTarget ? !outputTarget.isOwned() : !isLegacyFallbackOwned()){
+        if(!hasGeneratedOutputOwnership()){
             return false
         }
         if(triggerResult && triggerResult.sendAIprompt){
@@ -2543,7 +2538,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
     return await completeGeneration()
     }
     finally {
-        outputTarget?.release()
+        releaseOutputTarget()
     }
 }
 

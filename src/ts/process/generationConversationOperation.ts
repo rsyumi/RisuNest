@@ -35,6 +35,14 @@ function hasExactlyOneTarget(options: GenerationConversationOperationOptions): b
         + Number(options.messageId !== undefined) === 1
 }
 
+function canUseActiveSession(options: GenerationConversationOperationOptions): boolean {
+    const session = options.session
+    return session !== null
+        && session.isActive
+        && options.getCurrentSession() === session
+        && session.materializeCompatibilityArray() === options.chat.message
+}
+
 export function captureGenerationConversationOperation(
     options: GenerationConversationOperationOptions,
 ): GenerationConversationOperation {
@@ -46,14 +54,25 @@ export function captureGenerationConversationOperation(
     }
 
     const session = options.session
-    const usesSession = session !== null
-        && session.isActive
-        && options.getCurrentSession() === session
-        && session.materializeCompatibilityArray() === options.chat.message
+    const usesSession = canUseActiveSession(options)
 
     return usesSession
-        ? captureSessionOperation(session, options)
+        ? captureSessionOperation(session!, options)
         : captureFullArrayFallback(options)
+}
+
+export function captureGenerationTailFallbackOperation(
+    options: Omit<
+        GenerationConversationOperationOptions,
+        'append' | 'continueLast' | 'messageId'
+    >,
+): GenerationConversationOperation {
+    try {
+        return captureGenerationConversationOperation({ ...options, continueLast: true })
+    } catch (error) {
+        if (!(error instanceof RangeError)) throw error
+        return captureEmptyTailFallbackOperation(options)
+    }
 }
 
 export function recaptureGenerationConversationOperation(
@@ -215,4 +234,44 @@ function captureFullArrayFallback(
         },
     }
     return operation
+}
+
+function captureEmptyTailFallbackOperation(
+    options: Omit<
+        GenerationConversationOperationOptions,
+        'append' | 'continueLast' | 'messageId'
+    >,
+): GenerationConversationOperation {
+    const usesSession = canUseActiveSession(options)
+    const session = usesSession ? options.session! : null
+    const pin = session?.acquirePin('transaction')
+    let released = false
+    const ownerIsCurrent = () => {
+        if (
+            released
+            || options.isOwnerCurrent?.() === false
+            || options.getCurrentChat() !== options.chat
+        ) return false
+        return session === null || (
+            session.isActive
+            && options.getCurrentSession() === session
+            && session.materializeCompatibilityArray() === options.chat.message
+        )
+    }
+
+    return {
+        absoluteIndex: -1,
+        messageId: undefined,
+        usesFullArrayFallback: !usesSession,
+        isOwned: ownerIsCurrent,
+        snapshot: () => null,
+        commitData: () => false,
+        commitMessage: () => false,
+        refresh: ownerIsCurrent,
+        release() {
+            if (released) return
+            released = true
+            pin?.release()
+        },
+    }
 }

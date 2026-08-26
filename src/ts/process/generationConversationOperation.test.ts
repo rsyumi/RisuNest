@@ -3,6 +3,7 @@ import type { Chat, Message } from '../storage/database.svelte'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import {
     captureGenerationConversationOperation,
+    captureGenerationTailFallbackOperation,
     recaptureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
@@ -120,6 +121,66 @@ describe('generation conversation operation', () => {
             data: 'existing response continued',
             chatId: 'response-1',
         })
+        operation.release()
+    })
+
+    it('captures the legacy generation tail through the active session locator', () => {
+        const harness = createHarness([
+            message('user prompt', 'user-1'),
+            message('existing response', 'response-1'),
+        ])
+
+        const operation = captureGenerationTailFallbackOperation({
+            session: harness.session,
+            getCurrentSession: () => harness.session,
+            chat: harness.chat,
+            getCurrentChat: () => harness.chat,
+        })
+
+        expect(operation.usesFullArrayFallback).toBe(false)
+        expect(operation.snapshot()).toMatchObject({
+            data: 'existing response',
+            chatId: 'response-1',
+        })
+        expect(harness.session?.pinCount('transaction')).toBe(1)
+
+        operation.release()
+        expect(harness.session?.pinCount('transaction')).toBe(0)
+    })
+
+    it('retains owner-only fallback semantics for an empty conversation', () => {
+        const harness = createHarness([])
+
+        const operation = captureGenerationTailFallbackOperation({
+            session: harness.session,
+            getCurrentSession: () => harness.session,
+            chat: harness.chat,
+            getCurrentChat: () => harness.chat,
+        })
+
+        expect(operation.usesFullArrayFallback).toBe(false)
+        expect(operation.isOwned()).toBe(true)
+        expect(operation.absoluteIndex).toBe(-1)
+        expect(operation.snapshot()).toBeNull()
+        expect(operation.commitData('must not append')).toBe(false)
+        expect(harness.session?.pinCount('transaction')).toBe(1)
+
+        operation.release()
+        expect(harness.session?.pinCount('transaction')).toBe(0)
+    })
+
+    it('keeps a named full-array fallback without an active session', () => {
+        const currentChat = chat([message('existing response', 'response-1')])
+
+        const operation = captureGenerationTailFallbackOperation({
+            session: null,
+            getCurrentSession: () => null,
+            chat: currentChat,
+            getCurrentChat: () => currentChat,
+        })
+
+        expect(operation.usesFullArrayFallback).toBe(true)
+        expect(operation.snapshot()?.chatId).toBe('response-1')
         operation.release()
     })
 

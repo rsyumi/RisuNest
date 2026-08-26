@@ -646,6 +646,20 @@ describe('sendChat generation session integration', () => {
         expect(currentCharacter.chats[0].message[0].data).toBe('replacement')
     })
 
+    it('keeps an empty multiline response bound to the existing session tail', async () => {
+        const { chat, session } = installDatabase()
+        mocks.modelResponse = { type: 'multiline', result: [] }
+        mocks.outputTrigger = () => ({ chat })
+
+        await expect(sendChat()).resolves.toBe(true)
+
+        expect(chat.message).toEqual([expect.objectContaining({
+            data: 'hello',
+            chatId: 'user-message',
+        })])
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
     it('continues the captured message without appending and disposes its operation pin', async () => {
         const chat = makeChat([{
             role: 'char',
