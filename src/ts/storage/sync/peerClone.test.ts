@@ -137,6 +137,28 @@ describe('PeerClone facade', () => {
         ])
     })
 
+    it('treats the large fixture result as release evidence instead of a runtime gate', async () => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => (command === 'peer_clone_capabilities'
+            ? {
+                desktop: true,
+                sourceReady: true,
+                atomicActivationReady: true,
+                losslessBackupReady: true,
+                httpTransportReady: true,
+                largeFixturePassed: false,
+                productionEnabled: true,
+            }
+            : command === 'peer_clone_prepare'
+                ? { phase: 'prepared', sessionId: 'source-session', devices: [] }
+                : undefined) as T)
+        const facade = createPeerCloneFacade({ platform: 'desktop', invoke: invoke as unknown as PeerCloneInvoke })
+
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+        await expect(facade.prepare()).resolves.toEqual({ phase: 'prepared', sessionId: 'source-session', devices: [] })
+        await expect(facade.download()).resolves.toBeUndefined()
+    })
+
     it('reports web and Android as explicitly unsupported without invoking native commands', async () => {
         const invoke = vi.fn()
         expect(createPeerCloneFacade({ platform: 'web', invoke }).status()).toEqual({ kind: 'unsupported', platform: 'web' })

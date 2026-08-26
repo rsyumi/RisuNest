@@ -266,7 +266,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             || !current.sourceReady
             || !current.losslessBackupReady
             || !current.httpTransportReady
-            || !current.largeFixturePassed
         ) {
             throw new Error('Peer clone source is not enabled by native production gates')
         }
@@ -278,7 +277,6 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             || !current.atomicActivationReady
             || !current.losslessBackupReady
             || !current.httpTransportReady
-            || !current.largeFixturePassed
         ) {
             throw new Error('Peer clone target is not enabled by native production gates')
         }

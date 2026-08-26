@@ -46,8 +46,7 @@ impl PeerCloneCapabilities {
                 && gates.source_ready
                 && gates.atomic_activation_ready
                 && gates.lossless_backup_ready
-                && gates.http_transport_ready
-                && gates.large_fixture_passed,
+                && gates.http_transport_ready,
         }
     }
 }
@@ -103,5 +102,20 @@ mod tests {
             })
             .production_enabled
         );
+    }
+
+    #[test]
+    fn large_fixture_is_release_evidence_not_a_runtime_gate() {
+        let capabilities = PeerCloneCapabilities::from_gates(PeerCloneGateState {
+            desktop: true,
+            source_ready: true,
+            atomic_activation_ready: true,
+            lossless_backup_ready: true,
+            http_transport_ready: true,
+            large_fixture_passed: false,
+        });
+
+        assert!(capabilities.production_enabled);
+        assert!(!capabilities.large_fixture_passed);
     }
 }
