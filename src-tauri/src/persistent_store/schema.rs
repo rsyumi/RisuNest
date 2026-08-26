@@ -2,7 +2,7 @@ use super::{StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-const SCHEMA_VERSION: u32 = 9;
+pub(super) const SCHEMA_VERSION: u32 = 9;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(

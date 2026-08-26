@@ -4508,7 +4508,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        8
+        9
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),
@@ -5336,7 +5336,7 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        8
+        9
     );
     assert_eq!(
         store
@@ -5364,7 +5364,7 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        8
+        9
     );
     assert_eq!(
         store
