@@ -4,10 +4,8 @@ pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
 pub(crate) mod kei;
 #[allow(dead_code)]
-#[cfg(desktop)]
 mod logical_index;
 #[allow(dead_code)]
-#[cfg(desktop)]
 mod logical_schema;
 mod query;
 mod schema;
