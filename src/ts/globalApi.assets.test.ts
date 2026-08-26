@@ -114,7 +114,8 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
 vi.mock('@tauri-apps/api/webviewWindow', () => ({ getCurrentWebviewWindow: vi.fn(() => ({})) }))
 vi.mock('@tauri-apps/plugin-http', () => ({ fetch: vi.fn() }))
 
-import { createThrottledSizeEstimator, forageStorage, getFileSrc, LocalWriter, saveAsset } from './globalApi.svelte'
+import { createThrottledSizeEstimator, forageStorage, getFileSrc, LocalWriter, saveAsset, TauriWriter } from './globalApi.svelte'
+import { remove, writeFile } from '@tauri-apps/plugin-fs'
 
 function createFakeBlobStore(entries: { [key: string]: { data: Uint8Array, mime: string } }) {
     return {
@@ -285,6 +286,41 @@ describe('createThrottledSizeEstimator', () => {
 })
 
 describe('LocalWriter streamed backup entries', () => {
+    test('forwards abort to a browser destination', async () => {
+        const localWriter = new LocalWriter()
+        const abort = vi.fn(async () => undefined)
+        localWriter.writer = {
+            write: vi.fn(async () => undefined),
+            close: vi.fn(async () => undefined),
+            abort,
+        } as any
+
+        await localWriter.abort()
+
+        expect(abort).toHaveBeenCalledOnce()
+    })
+
+    test('discards buffered bytes and removes a partially flushed Tauri destination', async () => {
+        const writer = new TauriWriter('partial.zip')
+
+        await writer.write(new Uint8Array(4 * 1024 * 1024))
+        await writer.write(Uint8Array.of(1, 2, 3))
+        await writer.abort()
+
+        expect(writeFile).toHaveBeenCalledOnce()
+        expect(remove).toHaveBeenCalledWith('partial.zip')
+    })
+
+    test('removes a Tauri destination after the first flush rejects', async () => {
+        vi.mocked(writeFile).mockRejectedValueOnce(new Error('write failed'))
+        const writer = new TauriWriter('failed.zip')
+
+        await expect(writer.write(new Uint8Array(4 * 1024 * 1024))).rejects.toThrow('write failed')
+        await writer.abort()
+
+        expect(remove).toHaveBeenCalledWith('failed.zip')
+    })
+
     test('writes the legacy length-prefixed entry without joining payload chunks', async () => {
         const writes: Uint8Array[] = []
         const localWriter = new LocalWriter()

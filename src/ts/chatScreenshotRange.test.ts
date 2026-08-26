@@ -54,4 +54,23 @@ describe('chat screenshot ranges', () => {
         expect(Object.isFrozen(job)).toBe(true)
         expect(Object.isFrozen(job.messages[0].generationInfo)).toBe(true)
     })
+
+    it('snapshots live proxy-backed messages', () => {
+        const message = new Proxy(
+            { role: 'user' as const, data: 'proxied', generationInfo: { model: 'model' } },
+            {},
+        )
+
+        const job = createChatScreenshotJob({
+            characterId: 'character',
+            chatId: 'chat',
+            messages: [message],
+            start: 1,
+            end: 1,
+        })
+
+        expect(job.messages).toEqual([
+            { role: 'user', data: 'proxied', generationInfo: { model: 'model' } },
+        ])
+    })
 })

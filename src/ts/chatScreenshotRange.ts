@@ -1,4 +1,7 @@
 import type { Message } from './storage/database.svelte'
+import rfdc from 'rfdc'
+
+const cloneScreenshotData = rfdc()
 
 export type ScreenshotRange = Readonly<{ start: number; end: number }>
 
@@ -66,9 +69,9 @@ export function createChatScreenshotJob(input: {
     end: number
 }): ChatScreenshotJob {
     const validation = validateScreenshotRange(input.messages.length, input.start, input.end)
-    if (!validation.ok) throw new Error(`Invalid screenshot range: ${validation.reason}`)
+    if (validation.ok === false) throw new Error(`Invalid screenshot range: ${validation.reason}`)
 
-    const selectedMessages = structuredClone(
+    const selectedMessages = cloneScreenshotData(
         input.messages.slice(validation.start - 1, validation.end),
     )
     return deepFreeze({

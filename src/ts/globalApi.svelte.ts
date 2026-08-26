@@ -1018,6 +1018,8 @@ export class TauriWriter {
     firstWrite: boolean = true
     private pending: Uint8Array[] = []
     private pendingBytes = 0
+    private aborted = false
+    private destinationTouched = false
 
     /**
      * Creates an instance of TauriWriter.
@@ -1033,6 +1035,7 @@ export class TauriWriter {
      * and an Android content URI makes that round trip expensive.
      */
     async write(data: Uint8Array) {
+        if (this.aborted) throw new Error('Cannot write to an aborted Tauri writer')
         this.pending.push(data.slice())
         this.pendingBytes += data.byteLength
         if (this.pendingBytes >= TAURI_WRITER_FLUSH_BYTES) await this.flush()
@@ -1042,7 +1045,16 @@ export class TauriWriter {
      * Flushes any buffered data.
      */
     async close() {
+        if (this.aborted) throw new Error('Cannot close an aborted Tauri writer')
         await this.flush()
+    }
+
+    async abort() {
+        if (this.aborted) return
+        this.aborted = true
+        this.pending = []
+        this.pendingBytes = 0
+        if (this.destinationTouched) await remove(this.path)
     }
 
     private async flush() {
@@ -1055,6 +1067,7 @@ export class TauriWriter {
         }
         this.pending = []
         this.pendingBytes = 0
+        this.destinationTouched = true
         await writeFile(this.path, block, { append: !this.firstWrite })
         this.firstWrite = false
     }
@@ -1155,6 +1168,14 @@ export class LocalWriter {
      */
     async close(): Promise<void> {
         await this.writer.close()
+    }
+
+    async abort(): Promise<void> {
+        const abortable = this.writer as typeof this.writer & {
+            abort?: () => void | Promise<void>
+        }
+        if (!abortable.abort) throw new Error('Local writer does not support abort')
+        await abortable.abort()
     }
 }
 
