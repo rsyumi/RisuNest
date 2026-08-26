@@ -114,6 +114,89 @@ describe('pinned conversation branch jobs', () => {
         expect(release).toHaveBeenCalledOnce()
     })
 
+    it('commits source folder metadata and the new branch atomically after final validation', async () => {
+        const source = [message('zero', 'zero')]
+        const release = vi.fn(async () => undefined)
+        const beforeCommit = vi.fn(async () => undefined)
+        const lease = {
+            revision: 3,
+            readConversationWindow: vi.fn(async () => ({
+                revision: 3,
+                value: {
+                    characterId: 'char-a',
+                    conversationId: 'source-chat',
+                    messages: source,
+                    startIndex: 0,
+                    endIndex: 1,
+                    totalMessages: 1,
+                    hasMoreBefore: false,
+                    hasMoreAfter: false,
+                },
+            })),
+            release,
+        } as unknown as PersistentRevisionLease
+        const commit = vi.fn(async () => ({ revision: 4 }))
+        const store = {
+            acquireRevision: vi.fn(async () => lease),
+            commit,
+        } as unknown as PersistentDataStore
+        const character = {
+            type: 'character',
+            chaId: 'char-a',
+            name: 'Character',
+            chatFolders: [{ id: 'folder-id', name: 'Branches of Source', folded: false }],
+        } as any
+        const sourceConversation = {
+            id: 'source-chat',
+            name: 'Source',
+            note: '',
+            localLore: [],
+            folderId: 'folder-id',
+        }
+        const branch = {
+            ...sourceConversation,
+            id: 'branch-chat',
+            name: 'Source (Branch)',
+        }
+
+        await copyPinnedConversationBranch(store, {
+            characterId: 'char-a',
+            sourceConversationId: 'source-chat',
+            sourceRevision: 3,
+            inclusiveEndIndex: 0,
+            branch,
+            branchMarker: message('marker', 'marker'),
+            character,
+            sourceConversation,
+            beforeCommit,
+        })
+
+        expect(beforeCommit).toHaveBeenCalledOnce()
+        expect(commit).toHaveBeenCalledWith({
+            expectedRevision: 3,
+            character,
+            conversations: [{
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'source-chat',
+                start: 0,
+                deleteCount: 0,
+                messages: [],
+                conversation: sourceConversation,
+            }, {
+                type: 'replace-range',
+                characterId: 'char-a',
+                conversationId: 'branch-chat',
+                start: 0,
+                deleteCount: 0,
+                messages: [...source, message('marker', 'marker')],
+                conversation: branch,
+                configuredIndex: 0,
+            }],
+        })
+        expect(release).toHaveBeenCalledOnce()
+    })
+
     it('matches the canonical legacy branch for a 10,000-turn source', async () => {
         const messages = Array.from({ length: 10_000 }, (_, index) => message(
             `turn-${index.toString().padStart(5, '0')}`,

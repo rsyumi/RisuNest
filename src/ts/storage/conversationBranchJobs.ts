@@ -1,8 +1,10 @@
 import type { Chat, Message } from './database.svelte'
 import {
     CONVERSATION_RANGE_MAX_LIMIT,
+    type CharacterDetail,
     type DataRevision,
     type PersistentDataStore,
+    type WorkingSetCommit,
 } from './persistentDataStore'
 import {
     assertPinnedRevision,
@@ -18,6 +20,9 @@ export interface CopyPinnedConversationBranchInput {
     inclusiveEndIndex: number
     branch: Omit<Chat, 'message'>
     branchMarker: Message
+    character?: CharacterDetail
+    sourceConversation?: Omit<Chat, 'message'>
+    beforeCommit?: () => void | Promise<void>
     pageSize?: number
     signal?: AbortSignal
 }
@@ -48,6 +53,15 @@ function validateCopyInput(input: CopyPinnedConversationBranchInput): number {
         )
     }
     if (!input.branch.id) throw new Error('Branch conversation requires a nonempty ID')
+    if (input.character?.chaId !== undefined && input.character.chaId !== input.characterId) {
+        throw new Error('Branch character detail returned a mismatched character ID')
+    }
+    if (
+        input.sourceConversation?.id !== undefined
+        && input.sourceConversation.id !== input.sourceConversationId
+    ) {
+        throw new Error('Branch source detail returned a mismatched conversation ID')
+    }
     return pageSize
 }
 
@@ -97,19 +111,36 @@ export async function copyPinnedConversationBranch(
         }
 
         input.signal?.throwIfAborted()
-        const committed = await store.commit({
-            expectedRevision: input.sourceRevision,
-            conversations: [{
+        await input.beforeCommit?.()
+        input.signal?.throwIfAborted()
+        const conversations: NonNullable<WorkingSetCommit['conversations']> = []
+        if (input.sourceConversation) {
+            conversations.push({
                 type: 'replace-range',
                 characterId: input.characterId,
-                conversationId: input.branch.id,
+                conversationId: input.sourceConversationId,
                 start: 0,
                 deleteCount: 0,
-                messages: [...messages, structuredClone(input.branchMarker)],
-                conversation: structuredClone(input.branch),
-                configuredIndex: 0,
-            }],
+                messages: [],
+                conversation: structuredClone(input.sourceConversation),
+            })
+        }
+        conversations.push({
+            type: 'replace-range',
+            characterId: input.characterId,
+            conversationId: input.branch.id,
+            start: 0,
+            deleteCount: 0,
+            messages: [...messages, structuredClone(input.branchMarker)],
+            conversation: structuredClone(input.branch),
+            configuredIndex: 0,
         })
+        const commit: WorkingSetCommit = {
+            expectedRevision: input.sourceRevision,
+            conversations,
+        }
+        if (input.character) commit.character = structuredClone(input.character)
+        const committed = await store.commit(commit)
         return {
             sourceCharacterId: input.characterId,
             sourceConversationId: input.sourceConversationId,
