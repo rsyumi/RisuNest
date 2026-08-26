@@ -1,8 +1,8 @@
-#[allow(dead_code)]
-pub(crate) mod png_card;
 pub(crate) mod classifier;
 mod error;
 mod json_card;
+#[allow(dead_code)]
+pub(crate) mod png_card;
 mod risum;
 mod staging;
 
