@@ -46,6 +46,71 @@ const sameSignature = (
 ) => areChatRenderSignaturesEqual(left, right)
 
 describe('ChatRenderIdentityRegistry', () => {
+    it('registers a 10,000-message identity sequence once and resolves viewport rows without rescanning messages', () => {
+        const registry = new ChatRenderIdentityRegistry()
+        const source = Array.from({ length: 10_000 }, (_, index) => message(`message-${index}`))
+        let indexedReads = 0
+        const messages = new Proxy(source, {
+            get(target, property, receiver) {
+                if (typeof property === 'string' && /^\d+$/.test(property)) indexedReads++
+                return Reflect.get(target, property, receiver)
+            },
+        })
+
+        const sequence = registry.register('conversation-a', messages)
+        expect(indexedReads).toBeGreaterThanOrEqual(10_000)
+
+        indexedReads = 0
+        expect(sequence.keysAt([100, 5000, 9999])).toEqual([
+            registry.resolve('conversation-a', [source[100]])[0],
+            registry.resolve('conversation-a', [source[5000]])[0],
+            registry.resolve('conversation-a', [source[9999]])[0],
+        ])
+        expect(indexedReads).toBe(0)
+    })
+
+    it('registers only an appended suffix when the earlier message objects are unchanged', () => {
+        const registry = new ChatRenderIdentityRegistry()
+        const reads = [0, 0, 0, 0]
+        const countedMessage = (index: number): Message => {
+            const value = { role: 'char' as const, data: `message ${index}` } as Message
+            Object.defineProperty(value, 'chatId', {
+                get() {
+                    reads[index]++
+                    return `message-${index}`
+                },
+            })
+            return value
+        }
+        const messages = [countedMessage(0), countedMessage(1), countedMessage(2)]
+        const before = registry.register('conversation-a', messages).toArray()
+        reads.fill(0)
+
+        messages.push(countedMessage(3))
+        const after = registry.register('conversation-a', messages).toArray()
+
+        expect(reads.slice(0, 3)).toEqual([0, 0, 0])
+        expect(reads[3]).toBeGreaterThan(0)
+        expect(after.slice(0, 3)).toEqual(before)
+        expect(new Set(after).size).toBe(4)
+    })
+
+    it('rebuilds safely when an append turns a unique chat ID into a duplicate', () => {
+        const registry = new ChatRenderIdentityRegistry()
+        const original = message('duplicate', 'first')
+        const messages = [original]
+        const uniqueKey = registry.register('conversation-a', messages).keyAt(0)
+
+        messages.push(message('duplicate', 'second'))
+        const duplicateKeys = registry.register('conversation-a', messages).toArray()
+
+        expect(new Set(duplicateKeys).size).toBe(2)
+        expect(duplicateKeys[0]).not.toBe(uniqueKey)
+
+        messages.pop()
+        expect(registry.register('conversation-a', messages).keyAt(0)).toBe(uniqueKey)
+    })
+
     it('uses a unique chatId as stable identity across edits, rerolls, and index moves', () => {
         const registry = new ChatRenderIdentityRegistry()
         const original = message('message-1')

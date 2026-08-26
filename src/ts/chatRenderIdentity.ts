@@ -4,34 +4,128 @@ function scopedKey(scope: string, kind: 'chat' | 'legacy', value: string): strin
     return `${scope.length}:${scope}|${kind}:${value.length}:${value}`
 }
 
+export class ChatRenderIdentitySequence {
+    constructor(private readonly keys: readonly string[]) {}
+
+    keyAt(index: number): string | undefined {
+        return this.keys[index]
+    }
+
+    keysAt(indices: readonly number[]): string[] {
+        return indices.map((index) => {
+            const key = this.keyAt(index)
+            if (key === undefined) throw new RangeError(`Message index ${index} is out of range`)
+            return key
+        })
+    }
+
+    toArray(): string[] {
+        return [...this.keys]
+    }
+}
+
 export class ChatRenderIdentityRegistry {
     private legacyKeys = new WeakMap<Message, string[]>()
     private nextLegacyKey = 0
+    private registeredScope: string | null = null
+    private registeredMessages: Message[] = []
+    private registeredKeys: string[] = []
+    private registeredIdCounts = new Map<string, number>()
+    private registeredObjectOccurrences = new Map<Message, number>()
 
-    resolve(scope: string, messages: readonly Message[]): string[] {
-        const idCounts = new Map<string, number>()
-        for (const message of messages) {
-            if (message.chatId) {
-                idCounts.set(message.chatId, (idCounts.get(message.chatId) ?? 0) + 1)
+    register(scope: string, messages: readonly Message[]): ChatRenderIdentitySequence {
+        const sameScope = scope === this.registeredScope
+        const previousLength = this.registeredMessages.length
+        const unchangedPrefix = sameScope
+            && messages.length >= previousLength
+            && this.registeredMessages.every((message, index) => messages[index] === message)
+
+        if (unchangedPrefix && messages.length === previousLength) {
+            return new ChatRenderIdentitySequence(this.registeredKeys)
+        }
+
+        if (unchangedPrefix && messages.length > previousLength) {
+            const suffixIds: Array<string | undefined> = []
+            const suffixIdCounts = new Map<string, number>()
+            for (let index = previousLength; index < messages.length; index++) {
+                const chatId = messages[index].chatId
+                suffixIds.push(chatId)
+                if (chatId) suffixIdCounts.set(chatId, (suffixIdCounts.get(chatId) ?? 0) + 1)
+            }
+            const changesExistingIdentity = [...suffixIdCounts].some(([chatId, count]) => (
+                count > 1 || this.registeredIdCounts.has(chatId)
+            ))
+            if (!changesExistingIdentity) {
+                const nextKeys = [...this.registeredKeys]
+                const objectOccurrences = new Map(this.registeredObjectOccurrences)
+                for (let offset = 0; offset < suffixIds.length; offset++) {
+                    const message = messages[previousLength + offset]
+                    const chatId = suffixIds[offset]
+                    if (chatId) {
+                        nextKeys.push(scopedKey(scope, 'chat', chatId))
+                        this.registeredIdCounts.set(chatId, 1)
+                        continue
+                    }
+
+                    const occurrence = objectOccurrences.get(message) ?? 0
+                    objectOccurrences.set(message, occurrence + 1)
+                    nextKeys.push(this.legacyKey(scope, message, occurrence))
+                }
+                this.setRegistration(scope, messages, nextKeys, objectOccurrences)
+                return new ChatRenderIdentitySequence(nextKeys)
             }
         }
 
+        return this.rebuild(scope, messages)
+    }
+
+    private rebuild(scope: string, messages: readonly Message[]): ChatRenderIdentitySequence {
+        const messageIds = messages.map((message) => message.chatId)
+        const idCounts = new Map<string, number>()
+        for (const chatId of messageIds) {
+            if (chatId) idCounts.set(chatId, (idCounts.get(chatId) ?? 0) + 1)
+        }
+
         const objectOccurrences = new Map<Message, number>()
-        return messages.map((message) => {
-            if (message.chatId && idCounts.get(message.chatId) === 1) {
-                return scopedKey(scope, 'chat', message.chatId)
+        const keys = messages.map((message, index) => {
+            const chatId = messageIds[index]
+            if (chatId && idCounts.get(chatId) === 1) {
+                return scopedKey(scope, 'chat', chatId)
             }
 
             const occurrence = objectOccurrences.get(message) ?? 0
             objectOccurrences.set(message, occurrence + 1)
-            let keys = this.legacyKeys.get(message)
-            if (!keys) {
-                keys = []
-                this.legacyKeys.set(message, keys)
-            }
-            keys[occurrence] ??= String(this.nextLegacyKey++)
-            return scopedKey(scope, 'legacy', keys[occurrence])
+            return this.legacyKey(scope, message, occurrence)
         })
+        this.registeredIdCounts = idCounts
+        this.setRegistration(scope, messages, keys, objectOccurrences)
+        return new ChatRenderIdentitySequence(keys)
+    }
+
+    private legacyKey(scope: string, message: Message, occurrence: number): string {
+        let keys = this.legacyKeys.get(message)
+        if (!keys) {
+            keys = []
+            this.legacyKeys.set(message, keys)
+        }
+        keys[occurrence] ??= String(this.nextLegacyKey++)
+        return scopedKey(scope, 'legacy', keys[occurrence])
+    }
+
+    private setRegistration(
+        scope: string,
+        messages: readonly Message[],
+        keys: string[],
+        objectOccurrences: Map<Message, number>,
+    ): void {
+        this.registeredScope = scope
+        this.registeredMessages = [...messages]
+        this.registeredKeys = keys
+        this.registeredObjectOccurrences = objectOccurrences
+    }
+
+    resolve(scope: string, messages: readonly Message[]): string[] {
+        return this.register(scope, messages).toArray()
     }
 }
 
