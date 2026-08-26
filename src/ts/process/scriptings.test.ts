@@ -381,3 +381,203 @@ test('revokes the character image URL once when the inlay write fails', async ()
     vi.restoreAllMocks()
   }
 })
+
+test('records the bounded Worker pilot pure CPU and recursive golden result', async () => {
+  const result = await runScripted(`
+    function k3_fibonacci(value)
+      if value < 2 then
+        return value
+      end
+      return k3_fibonacci(value - 1) + k3_fibonacci(value - 2)
+    end
+
+    function k3_pure_cpu(id)
+      return k3_fibonacci(10)
+    end
+  `, {
+    char: { chaId: 'k3-pure-cpu' } as never,
+    chat: { message: [] } as never,
+    mode: 'k3_pure_cpu',
+  })
+
+  expect(result).toEqual({
+    chat: { message: [] },
+    res: 55,
+    stopSending: false,
+  })
+})
+
+test('records Lua global persistence with owner and mode isolation', async () => {
+  const code = `
+    counter = 0
+
+    function k3_global_a(id)
+      counter = counter + 1
+      return counter
+    end
+
+    function k3_global_b(id)
+      counter = counter + 1
+      return counter
+    end
+  `
+  const invoke = (owner: string, mode: string) => runScripted(code, {
+    char: { chaId: owner } as never,
+    chat: { message: [] } as never,
+    mode,
+  })
+
+  await expect(invoke('k3-owner-a', 'k3_global_a')).resolves.toMatchObject({ res: 1 })
+  await expect(invoke('k3-owner-a', 'k3_global_a')).resolves.toMatchObject({ res: 2 })
+  await expect(invoke('k3-owner-a', 'k3_global_b')).resolves.toMatchObject({ res: 1 })
+  await expect(invoke('k3-owner-b', 'k3_global_a')).resolves.toMatchObject({ res: 1 })
+})
+
+test('records nil, null, false, arrays, and JSON round trips', async () => {
+  const data = {
+    dense: [1, false, 'value'],
+    object: { empty: '', falseValue: false, zero: 0 },
+  }
+  const code = `
+    function k3_nil(id)
+      return nil
+    end
+
+    listenEdit('editInput', function(id, value, meta)
+      return value
+    end)
+  `
+
+  await expect(runScripted(code, {
+    char: { chaId: 'k3-values' } as never,
+    chat: { message: [] } as never,
+    mode: 'k3_nil',
+  })).resolves.toMatchObject({ res: null, stopSending: false })
+
+  await expect(runScripted(code, {
+    char: { chaId: 'k3-values' } as never,
+    chat: { message: [] } as never,
+    data: data as never,
+    mode: 'editInput',
+  })).resolves.toMatchObject({ res: data, stopSending: false })
+
+  await expect(runScripted(code, {
+    char: { chaId: 'k3-values-null' } as never,
+    chat: { message: [] } as never,
+    data: { nullValue: null } as never,
+    mode: 'editInput',
+  })).resolves.toMatchObject({ res: {}, stopSending: false })
+})
+
+test('records sparse arrays as a current-runtime handler error', async () => {
+  const sparse: unknown[] = []
+  sparse[2] = 'tail'
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+  try {
+    const result = await runScripted(`
+      listenEdit('editInput', function(id, value, meta)
+        return value
+      end)
+    `, {
+      char: { chaId: 'k3-sparse-array' } as never,
+      chat: { message: [] } as never,
+      data: { sparse } as never,
+      mode: 'editInput',
+    })
+
+    expect(result).toMatchObject({ res: undefined, stopSending: false })
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining('invalid table: mixed or invalid key types'),
+    )
+  }
+  finally {
+    consoleError.mockRestore()
+  }
+})
+
+test.each(['editRequest', 'editInput', 'editOutput', 'editDisplay'] as const)(
+  'records %s listener ordering',
+  async (mode) => {
+    const result = await runScripted(`
+      listenEdit('${mode}', function(id, value, meta)
+        table.insert(value.order, 'first')
+        return value
+      end)
+
+      listenEdit('${mode}', function(id, value, meta)
+        table.insert(value.order, 'second')
+        return value
+      end)
+    `, {
+      char: { chaId: `k3-listener-${mode}` } as never,
+      chat: { message: [] } as never,
+      data: { order: [] } as never,
+      mode,
+    })
+
+    expect(result).toMatchObject({
+      res: { order: ['first', 'second'] },
+      stopSending: false,
+    })
+  },
+)
+
+test('records handler errors as an empty result without partial chat mutation', async () => {
+  const chat = { message: [{ role: 'user', data: 'unchanged' }] }
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+  try {
+    const result = await runScripted(`
+      function k3_handler_error(id)
+        error('synthetic handler failure')
+      end
+    `, {
+      char: { chaId: 'k3-handler-error' } as never,
+      chat: chat as never,
+      mode: 'k3_handler_error',
+    })
+
+    expect(result).toEqual({ chat, res: undefined, stopSending: false })
+    expect(consoleError).toHaveBeenCalled()
+  }
+  finally {
+    consoleError.mockRestore()
+  }
+})
+
+test('records explicit false stop and ordered chat mutations', async () => {
+  const result = await runScripted(`
+    function k3_ordered_mutations(id)
+      setChat(id, 0, 'edited')
+      insertChat(id, 1, 'char', 'inserted')
+      setChatRole(id, 0, 'char')
+      removeChat(id, 2)
+      addChat(id, 'user', 'tail')
+      cutChat(id, 1, 4)
+      return false
+    end
+  `, {
+    char: { chaId: 'k3-ordered-mutations' } as never,
+    chat: {
+      message: [
+        { role: 'user', data: 'original' },
+        { role: 'char', data: 'remove-me' },
+        { role: 'user', data: 'keep-me' },
+      ],
+    } as never,
+    mode: 'k3_ordered_mutations',
+  })
+
+  expect(result).toEqual({
+    chat: {
+      message: [
+        { role: 'char', data: 'inserted' },
+        { role: 'user', data: 'keep-me' },
+        { role: 'user', data: 'tail' },
+      ],
+    },
+    res: false,
+    stopSending: true,
+  })
+})
