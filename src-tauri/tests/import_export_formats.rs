@@ -135,6 +135,28 @@ fn promote_classic_zip_to_zip64(mut archive: Vec<u8>) -> Vec<u8> {
     archive
 }
 
+fn set_classic_zip_comment(mut archive: Vec<u8>, comment: &[u8]) -> Vec<u8> {
+    let eocd = archive.len() - 22;
+    assert_eq!(&archive[eocd..eocd + 4], b"PK\x05\x06");
+    let comment_length = u16::try_from(comment.len()).unwrap();
+    archive[eocd + 20..eocd + 22].copy_from_slice(&comment_length.to_le_bytes());
+    archive.extend_from_slice(comment);
+    archive
+}
+
+fn classic_eocd(entry_count: u16, directory_size: u32, directory_offset: u32) -> Vec<u8> {
+    let mut footer = Vec::with_capacity(22);
+    footer.extend_from_slice(b"PK\x05\x06");
+    footer.extend_from_slice(&0_u16.to_le_bytes());
+    footer.extend_from_slice(&0_u16.to_le_bytes());
+    footer.extend_from_slice(&entry_count.to_le_bytes());
+    footer.extend_from_slice(&entry_count.to_le_bytes());
+    footer.extend_from_slice(&directory_size.to_le_bytes());
+    footer.extend_from_slice(&directory_offset.to_le_bytes());
+    footer.extend_from_slice(&0_u16.to_le_bytes());
+    footer
+}
+
 struct OneByteReader {
     bytes: Cursor<Vec<u8>>,
     reads: Rc<Cell<usize>>,
@@ -805,6 +827,104 @@ fn appended_charx_probe_accepts_checked_zip64_count_and_offset() {
         .unwrap(),
         ContentKind::JpegAsset
     );
+}
+
+#[test]
+fn charx_preflight_uses_the_same_last_eocd_signature_as_zip_0_6_6() {
+    let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
+    let card = br#"{"spec":"chara_card_v3","data":{"name":"fixture"}}"#;
+    let mut comment = classic_eocd(2_000, 0, 0);
+    comment.extend_from_slice(b"ignored trailing comment bytes");
+    let zip = set_classic_zip_comment(charx(&[("card.json", card)]), &comment);
+    let mut appended = jpeg.to_vec();
+    appended.extend_from_slice(&zip);
+    let expected_preflight_bytes = appended.len() + 20;
+    let mut reader = ChunkedSeekReader::new(appended, usize::MAX);
+    let bytes_read = Rc::clone(&reader.bytes_read);
+
+    assert_eq!(
+        classify_content("card.jpeg", &mut reader, &limits(), &|| false).unwrap(),
+        ContentKind::JpegAsset
+    );
+    assert!(
+        bytes_read.get() <= expected_preflight_bytes,
+        "read {} bytes after the oversized last EOCD should have been rejected",
+        bytes_read.get()
+    );
+}
+
+#[test]
+fn charx_preflight_uses_zip64_count_even_when_classic_count_is_not_a_sentinel() {
+    let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
+    let card = br#"{"spec":"chara_card_v3","data":{"name":"fixture"}}"#;
+    let mut zip = promote_classic_zip_to_zip64(charx(&[("card.json", card)]));
+    let eocd = zip.len() - 22;
+    let record = eocd - 20 - 56;
+    let directory_size = u64::from_le_bytes(zip[record + 40..record + 48].try_into().unwrap());
+    let directory_offset = u64::from_le_bytes(zip[record + 48..record + 56].try_into().unwrap());
+    let classic_directory_size = u32::try_from(directory_size + 56 + 20).unwrap();
+    zip[eocd + 8..eocd + 10].copy_from_slice(&1_u16.to_le_bytes());
+    zip[eocd + 10..eocd + 12].copy_from_slice(&1_u16.to_le_bytes());
+    zip[eocd + 12..eocd + 16].copy_from_slice(&classic_directory_size.to_le_bytes());
+    zip[eocd + 16..eocd + 20]
+        .copy_from_slice(&u32::try_from(directory_offset).unwrap().to_le_bytes());
+    zip[record + 24..record + 32].copy_from_slice(&2_000_u64.to_le_bytes());
+    zip[record + 32..record + 40].copy_from_slice(&2_000_u64.to_le_bytes());
+    let mut appended = jpeg.to_vec();
+    appended.extend_from_slice(&zip);
+    let expected_preflight_bytes = appended.len() + 20;
+    let mut reader = ChunkedSeekReader::new(appended, usize::MAX);
+    let bytes_read = Rc::clone(&reader.bytes_read);
+
+    assert_eq!(
+        classify_content("card.jpeg", &mut reader, &limits(), &|| false).unwrap(),
+        ContentKind::JpegAsset
+    );
+    assert!(
+        bytes_read.get() <= expected_preflight_bytes,
+        "read {} bytes after the oversized ZIP64 count should have been rejected",
+        bytes_read.get()
+    );
+}
+
+#[test]
+fn appended_zip64_uses_the_preflight_archive_start_instead_of_a_jpeg_pk0606() {
+    let card = br#"{"spec":"chara_card_v3","data":{"name":"fixture"}}"#;
+    let zip = promote_classic_zip_to_zip64(charx(&[("card.json", card)]));
+    let eocd = zip.len() - 22;
+    let locator = eocd - 20;
+    let record = eocd - 20 - 56;
+    let nominal_record = usize::try_from(u64::from_le_bytes(
+        zip[locator + 8..locator + 16].try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut jpeg = vec![0xaa; 128 * 1024];
+    jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+    jpeg[nominal_record..nominal_record + 56].copy_from_slice(&zip[record..record + 56]);
+    jpeg.extend_from_slice(&zip);
+
+    assert_eq!(
+        classify_content("card.jpeg", &mut Cursor::new(jpeg), &limits(), &|| false).unwrap(),
+        ContentKind::AppendedCharxJpeg
+    );
+}
+
+#[test]
+fn appended_zip64_does_not_scan_the_large_jpeg_prefix_past_cancellation() {
+    let card = br#"{"spec":"chara_card_v3","data":{"name":"fixture"}}"#;
+    let zip = promote_classic_zip_to_zip64(charx(&[("card.json", card)]));
+    let mut jpeg = vec![0xaa; 256 * 1024];
+    jpeg[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
+    jpeg.extend_from_slice(&zip);
+    let mut reader = ChunkedSeekReader::new(jpeg, usize::MAX);
+    let bytes_read = Rc::clone(&reader.bytes_read);
+    let cancelled = || bytes_read.get() >= 70 * 1024;
+
+    assert_eq!(
+        classify_content("card.jpeg", &mut reader, &limits(), &cancelled).unwrap(),
+        ContentKind::AppendedCharxJpeg
+    );
+    assert!(bytes_read.get() < 70 * 1024);
 }
 
 #[test]

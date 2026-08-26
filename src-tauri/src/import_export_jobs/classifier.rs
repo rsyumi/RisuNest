@@ -1,6 +1,6 @@
 use super::{FormatError, ImportLimits};
 use serde_json::Value;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 
 const SNIFF_PREFIX_BYTES: usize = 16;
 const ZIP_PREFLIGHT_READ_BYTES: usize = 64 * 1024;
@@ -96,17 +96,15 @@ fn probe_charx(
     if cancelled() {
         return Err(FormatError::cancelled());
     }
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| FormatError::io("seek CharX probe source", error))?;
-    let mut archive = match zip::ZipArchive::new(reader) {
+    let view = ArchiveView::new(reader, preflight.archive_start, preflight.archive_end)?;
+    let mut archive = match zip::ZipArchive::new(view) {
         Ok(archive) => archive,
         Err(_) => return Ok(false),
     };
     if cancelled() {
         return Err(FormatError::cancelled());
     }
-    if archive.len() != preflight.entry_count {
+    if archive.offset() != 0 || archive.len() != preflight.entry_count {
         return Ok(false);
     }
     let mut card_index = None;
@@ -178,6 +176,8 @@ fn probe_charx(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ZipPreflight {
     entry_count: usize,
+    archive_start: u64,
+    archive_end: u64,
 }
 
 fn preflight_zip(
@@ -217,20 +217,30 @@ fn preflight_zip(
     let total_entries = le_u16(&tail, eocd_index + 10)?;
     let directory_size = le_u32(&tail, eocd_index + 12)?;
     let directory_offset = le_u32(&tail, eocd_index + 16)?;
+    let comment_length = le_u16(&tail, eocd_index + 20)? as u64;
+    let Some(archive_end) = eocd_absolute
+        .checked_add(ZIP_EOCD_BYTES as u64)
+        .and_then(|end| end.checked_add(comment_length))
+    else {
+        return Ok(None);
+    };
+    if archive_end > file_length {
+        return Ok(None);
+    }
 
-    let zip64 = disk_entries == u16::MAX
-        || total_entries == u16::MAX
-        || directory_size == u32::MAX
-        || directory_offset == u32::MAX;
     if disk_number != 0 || central_disk != 0 {
         return Ok(None);
     }
-    if zip64 {
+    let locator_index = eocd_index.checked_sub(ZIP64_LOCATOR_BYTES);
+    if locator_index
+        .is_some_and(|index| tail.get(index..index + 4) == Some(ZIP64_LOCATOR_SIGNATURE))
+    {
         return preflight_zip64(
             reader,
             &tail,
             tail_start,
             eocd_index,
+            archive_end,
             max_entries,
             max_directory_bytes,
             cancelled,
@@ -243,17 +253,22 @@ fn preflight_zip(
     if entry_count > max_entries || directory_size as u64 > max_directory_bytes {
         return Ok(None);
     }
-    if !validate_directory_bounds(
+    let Some(archive_start) = validate_directory_bounds(
         reader,
         eocd_absolute,
         directory_size as u64,
         directory_offset as u64,
         entry_count,
         cancelled,
-    )? {
+    )?
+    else {
         return Ok(None);
-    }
-    Ok(Some(ZipPreflight { entry_count }))
+    };
+    Ok(Some(ZipPreflight {
+        entry_count,
+        archive_start,
+        archive_end,
+    }))
 }
 
 fn preflight_zip64(
@@ -261,6 +276,7 @@ fn preflight_zip64(
     tail: &[u8],
     tail_start: u64,
     eocd_index: usize,
+    archive_end: u64,
     max_entries: usize,
     max_directory_bytes: u64,
     cancelled: &impl Fn() -> bool,
@@ -321,11 +337,11 @@ fn preflight_zip64(
     let Some(directory_start) = record_absolute.checked_sub(directory_size) else {
         return Ok(None);
     };
-    let Some(archive_offset) = directory_start.checked_sub(directory_offset) else {
+    let Some(archive_start) = directory_start.checked_sub(directory_offset) else {
         return Ok(None);
     };
     if locator_record_offset
-        .checked_add(archive_offset)
+        .checked_add(archive_start)
         .is_none_or(|offset| offset != record_absolute)
     {
         return Ok(None);
@@ -333,7 +349,11 @@ fn preflight_zip64(
     if !validate_directory_signature(reader, directory_start, entry_count, cancelled)? {
         return Ok(None);
     }
-    Ok(Some(ZipPreflight { entry_count }))
+    Ok(Some(ZipPreflight {
+        entry_count,
+        archive_start,
+        archive_end,
+    }))
 }
 
 fn validate_directory_bounds(
@@ -343,14 +363,76 @@ fn validate_directory_bounds(
     directory_offset: u64,
     entry_count: usize,
     cancelled: &impl Fn() -> bool,
-) -> Result<bool, FormatError> {
+) -> Result<Option<u64>, FormatError> {
     let Some(directory_start) = directory_end.checked_sub(directory_size) else {
-        return Ok(false);
+        return Ok(None);
     };
-    if directory_start.checked_sub(directory_offset).is_none() {
-        return Ok(false);
+    let Some(archive_start) = directory_start.checked_sub(directory_offset) else {
+        return Ok(None);
+    };
+    Ok(
+        validate_directory_signature(reader, directory_start, entry_count, cancelled)?
+            .then_some(archive_start),
+    )
+}
+
+struct ArchiveView<'a, R> {
+    reader: &'a mut R,
+    start: u64,
+    length: u64,
+    position: u64,
+}
+
+impl<'a, R: Read + Seek> ArchiveView<'a, R> {
+    fn new(reader: &'a mut R, start: u64, end: u64) -> Result<Self, FormatError> {
+        let length = end
+            .checked_sub(start)
+            .ok_or_else(|| FormatError::invalid("ZIP archive bounds are reversed"))?;
+        reader
+            .seek(SeekFrom::Start(start))
+            .map_err(|error| FormatError::io("seek bounded ZIP archive", error))?;
+        Ok(Self {
+            reader,
+            start,
+            length,
+            position: 0,
+        })
     }
-    validate_directory_signature(reader, directory_start, entry_count, cancelled)
+}
+
+impl<R: Read> Read for ArchiveView<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.length.saturating_sub(self.position);
+        if remaining == 0 || output.is_empty() {
+            return Ok(0);
+        }
+        let allowed = usize::try_from(remaining.min(output.len() as u64)).unwrap_or(output.len());
+        let read = self.reader.read(&mut output[..allowed])?;
+        self.position = self
+            .position
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ZIP read overflow"))?;
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for ArchiveView<'_, R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => offset as i128,
+            SeekFrom::End(offset) => self.length as i128 + offset as i128,
+            SeekFrom::Current(offset) => self.position as i128 + offset as i128,
+        };
+        let target = u64::try_from(target)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid ZIP seek"))?;
+        let absolute = self
+            .start
+            .checked_add(target)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ZIP seek overflow"))?;
+        self.reader.seek(SeekFrom::Start(absolute))?;
+        self.position = target;
+        Ok(target)
+    }
 }
 
 fn validate_directory_signature(
@@ -431,18 +513,12 @@ fn find_eocd(tail: &[u8]) -> Option<usize> {
     if tail.len() < ZIP_EOCD_BYTES {
         return None;
     }
-    (0..=tail.len() - ZIP_EOCD_BYTES).rev().find(|index| {
-        if tail.get(*index..*index + 4) != Some(ZIP_EOCD_SIGNATURE) {
-            return false;
-        }
-        let Some(comment_length) = optional_le_u16(tail, *index + 20) else {
-            return false;
-        };
-        index
-            .checked_add(ZIP_EOCD_BYTES)
-            .and_then(|value| value.checked_add(comment_length as usize))
-            == Some(tail.len())
-    })
+    let search_start = tail
+        .len()
+        .saturating_sub(ZIP_EOCD_BYTES + ZIP_COMMENT_MAX_BYTES);
+    (search_start..=tail.len() - ZIP_EOCD_BYTES)
+        .rev()
+        .find(|index| tail.get(*index..*index + 4) == Some(ZIP_EOCD_SIGNATURE))
 }
 
 fn le_u16(bytes: &[u8], offset: usize) -> Result<u16, FormatError> {
