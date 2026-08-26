@@ -134,6 +134,11 @@ function beginPromptHistoryOperation(
     })
 }
 
+interface GenerationCompletionLifecycle {
+    responseApplied: boolean
+    acknowledgementAttempted: boolean
+}
+
 export async function sendChat(chatProcessIndex = -1,arg:{
     chatAdditonalTokens?:number,
     signal?:AbortSignal,
@@ -142,6 +147,30 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     preview?:boolean
     previewPrompt?:boolean
 } = {}):Promise<boolean> {
+    const lifecycle: GenerationCompletionLifecycle = {
+        responseApplied: false,
+        acknowledgementAttempted: false,
+    }
+    try {
+        return await sendChatInternal(chatProcessIndex, arg, lifecycle)
+    }
+    catch(error) {
+        if(lifecycle.responseApplied && !lifecycle.acknowledgementAttempted){
+            lifecycle.acknowledgementAttempted = true
+            await acknowledgeGenerationCompletion()
+        }
+        throw error
+    }
+}
+
+async function sendChatInternal(chatProcessIndex: number,arg:{
+    chatAdditonalTokens?:number,
+    signal?:AbortSignal,
+    continue?:boolean,
+    usedContinueTokens?:number,
+    preview?:boolean
+    previewPrompt?:boolean
+}, lifecycle: GenerationCompletionLifecycle):Promise<boolean> {
 
     chatProcessStage.set(0)
     const abortSignal = arg.signal ?? (new AbortController()).signal
@@ -1704,7 +1733,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let resendChat = false
 
     async function completeGeneration(): Promise<true> {
-        await acknowledgeGenerationCompletion()
+        await acknowledgeCompletedGeneration()
         if(DBState.db.notification){
             try {
                 const permission = await Notification.requestPermission()
@@ -1720,6 +1749,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }
         void peerSync()
         return true
+    }
+
+    async function acknowledgeCompletedGeneration(): Promise<void> {
+        lifecycle.acknowledgementAttempted = true
+        await acknowledgeGenerationCompletion()
     }
     
     if(abortSignal.aborted === true){
@@ -1799,12 +1833,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     const result2 = await processStreamingSnapshot(value, cache, context.signal)
                     if(result2 === null || !context.canCommit()) return
                     if(!outputTarget?.commitData(result2.data)) return
+                    lifecycle.responseApplied = true
                     emoChanged = result2.emoChanged
                     targetCharacter.reloadKeys += 1
                 },
                 processPreview: async ({ value }, context) => {
                     if(!context.canCommit()) return
                     if(!outputTarget?.commitData(reformatContent(prefix + value))) return
+                    lifecycle.responseApplied = true
                     targetCharacter.reloadKeys += 1
                 },
             })
@@ -1954,6 +1990,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                 })){
                     return false
                 }
+                lifecycle.responseApplied = true
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
                     if(!outputTarget.commitData(p)){
@@ -1983,6 +2020,10 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     },
                 })
                 generationHadOperation = true
+                if(!outputTarget.isOwned()){
+                    return false
+                }
+                lifecycle.responseApplied = true
                 if(inlayResult.promise){
                     const p = await inlayResult.promise
                     if(!outputTarget.commitData(p)){
@@ -2085,7 +2126,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     if(needsAutoContinue){
-        await acknowledgeGenerationCompletion()
+        await acknowledgeCompletedGeneration()
         doingChat.set(false)
         releaseOutputTarget()
         return await sendChat(chatProcessIndex, {
@@ -2142,7 +2183,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
             return false
         }
 
-        await acknowledgeGenerationCompletion()
+        await acknowledgeCompletedGeneration()
         doingChat.set(false)
         releaseOutputTarget()
         return await sendChat(chatProcessIndex, {

@@ -504,7 +504,7 @@ export function createPersistentDataRuntime(
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
         acknowledgeGenerationCompletion: () =>
-            coordinator.flushPendingData('generation-completion'),
+            coordinator.flushPendingDataLocally('generation-completion'),
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
         activateCharacter,

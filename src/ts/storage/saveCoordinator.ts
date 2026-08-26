@@ -639,10 +639,16 @@ export class SaveCoordinator {
     private debounceHandle: unknown
     private operationTail: Promise<void> = Promise.resolve()
     private flushPromise: Promise<void> | null = null
+    private localFlushPromise: Promise<void> | null = null
+    private localFlushDuringPublicationPromise: Promise<void> | null = null
+    private queuedOperationCount = 0
+    private publicationInProgress = false
+    private readonly operationStateWaiters = new Set<() => void>()
     private additionPromise: Promise<void> | null = null
     private lastReportedFlushPromise: Promise<void> | null = null
     private pendingPublication: PinnedPublication | null = null
     private pendingPublicationRevision: DataRevision | null = null
+    private deferredPublicationRevision: DataRevision | null = null
     private readonly pendingPublicationCleanup = new Set<PinnedPublication>()
     private lastOfficialPublishAttemptAt: number | null = null
     private officialPublishRetryHandle: unknown
@@ -681,6 +687,7 @@ export class SaveCoordinator {
         this.pendingByteCount = 0
         this.pendingPublication = null
         this.pendingPublicationRevision = null
+        this.deferredPublicationRevision = null
         this.lastOfficialPublishAttemptAt = null
         this.pendingCharacterAddition = null
         this.reservedCharacterAddition = null
@@ -757,6 +764,49 @@ export class SaveCoordinator {
             },
         )
         return promise
+    }
+
+    flushPendingDataLocally(reason: string): Promise<void> {
+        this.assertInitialized()
+        this.cancelDebounce()
+        if (this.localFlushPromise) return this.localFlushPromise
+        const promise = this.runLocalFlush(reason)
+        this.localFlushPromise = promise
+        this.reportActivePromise()
+        void promise.then(
+            () => {
+                if (this.localFlushPromise === promise) {
+                    this.localFlushPromise = null
+                    this.reportActivePromise()
+                }
+            },
+            () => {
+                if (this.localFlushPromise === promise) {
+                    this.localFlushPromise = null
+                    this.reportActivePromise()
+                }
+            },
+        )
+        return promise
+    }
+
+    private async runLocalFlush(reason: string): Promise<void> {
+        while (this.queuedOperationCount > 0 && !this.publicationInProgress) {
+            await this.waitForOperationStateChange()
+        }
+        if (this.publicationInProgress) {
+            const promise = this.flushIterations(reason, false)
+            this.localFlushDuringPublicationPromise = promise
+            try {
+                await promise
+                return
+            } finally {
+                if (this.localFlushDuringPublicationPromise === promise) {
+                    this.localFlushDuringPublicationPromise = null
+                }
+            }
+        }
+        await this.enqueue(() => this.flushIterations(reason, false))
     }
 
     replacePersistentDatabase(
@@ -1492,13 +1542,14 @@ export class SaveCoordinator {
         this.assertInitialized()
         if (!this.dependencies.officialPublisher) return Promise.resolve()
         return this.enqueue(async () => {
+            await this.applyDeferredPublication()
             this.pendingPublicationRevision ??= this.revision
             await this.publishPendingRevision()
         })
     }
 
     get hasPendingOfficialPublication(): boolean {
-        return this.pendingPublicationRevision !== null
+        return this.pendingPublicationRevision !== null || this.deferredPublicationRevision !== null
     }
 
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void> {
@@ -1553,7 +1604,17 @@ export class SaveCoordinator {
     }
 
     private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-        const result = this.operationTail.then(operation, operation)
+        this.queuedOperationCount += 1
+        this.notifyOperationStateChange()
+        const run = async (): Promise<T> => {
+            try {
+                return await operation()
+            } finally {
+                this.queuedOperationCount -= 1
+                this.notifyOperationStateChange()
+            }
+        }
+        const result = this.operationTail.then(run, run)
         this.operationTail = result.then(
             () => undefined,
             () => undefined,
@@ -1561,8 +1622,23 @@ export class SaveCoordinator {
         return result
     }
 
+    private waitForOperationStateChange(): Promise<void> {
+        return new Promise((resolve) => this.operationStateWaiters.add(resolve))
+    }
+
+    private notifyOperationStateChange(): void {
+        const waiters = [...this.operationStateWaiters]
+        this.operationStateWaiters.clear()
+        for (const resolve of waiters) resolve()
+    }
+
     private async flushIterations(_reason: string, publishOfficial: boolean): Promise<void> {
-        if (this.pendingPublicationCleanup.size > 0) await this.retryPublicationCleanup()
+        if (publishOfficial && this.deferredPublicationRevision !== null) {
+            await this.applyDeferredPublication()
+        }
+        if (publishOfficial && this.pendingPublicationCleanup.size > 0) {
+            await this.retryPublicationCleanup()
+        }
         if (this.pendingResidentCompensations.length > 0) {
             await this.retryPendingResidentCompensations(publishOfficial)
         }
@@ -1665,8 +1741,9 @@ export class SaveCoordinator {
                     addition.pending.baseline = addition.canonical
                 }
                 this.dependencies.onLocalRevision?.(committed.revision)
-                if (publishOfficial && this.dependencies.officialPublisher) {
-                    await this.stagePublication(committed.revision)
+                if (this.dependencies.officialPublisher) {
+                    if (publishOfficial) await this.stagePublication(committed.revision)
+                    else this.deferPublication(committed.revision)
                 }
             }
 
@@ -1697,6 +1774,9 @@ export class SaveCoordinator {
                     this.pendingByteCount = 0
                     return
                 }
+                if (!publishOfficial && this.hasPendingOfficialPublication && !this.publicationInProgress) {
+                    this.armOfficialPublishRetry(this.officialPublishDelayMs())
+                }
                 this.pendingCharacterAddition = null
                 this.pendingByteCount = 0
                 this.lastBackgroundErrorMessage = null
@@ -1713,6 +1793,22 @@ export class SaveCoordinator {
             await this.disposeOrQueuePublication(stale)
         }
         this.pendingPublicationRevision = revision
+    }
+
+    private deferPublication(revision: DataRevision): void {
+        if (!this.publicationInProgress && !this.pendingPublication) {
+            this.pendingPublicationRevision = revision
+            this.deferredPublicationRevision = null
+            return
+        }
+        this.deferredPublicationRevision = revision
+    }
+
+    private async applyDeferredPublication(): Promise<void> {
+        const revision = this.deferredPublicationRevision
+        if (revision === null || this.publicationInProgress) return
+        this.deferredPublicationRevision = null
+        await this.stagePublication(revision)
     }
 
     private async runReplacement(
@@ -2368,16 +2464,23 @@ export class SaveCoordinator {
     }
 
     private reportActivePromise(): void {
-        const active = this.additionPromise ?? this.flushPromise
+        const active = this.additionPromise ?? this.flushPromise ?? this.localFlushPromise
         if (active === this.lastReportedFlushPromise) return
         this.lastReportedFlushPromise = active
         this.dependencies.onFlushPromise?.(active)
     }
 
     private async publishPendingRevision(): Promise<void> {
+        this.publicationInProgress = true
+        this.notifyOperationStateChange()
         const revision = this.pendingPublicationRevision
-        if (revision === null || !this.dependencies.officialPublisher) return
+        if (revision === null || !this.dependencies.officialPublisher) {
+            this.publicationInProgress = false
+            this.notifyOperationStateChange()
+            return
+        }
         let publication = this.pendingPublication
+        let failure: unknown = null
         try {
             if (!publication) {
                 publication = await this.dependencies.officialPublisher.pin(revision)
@@ -2387,13 +2490,30 @@ export class SaveCoordinator {
         } catch (error) {
             if (publication) this.lastOfficialPublishAttemptAt = this.currentTime()
             this.armOfficialPublishRetry(OFFICIAL_PUBLISH_MIN_INTERVAL_MS)
-            throw error
+            failure = error
+        } finally {
+            this.publicationInProgress = false
+            this.notifyOperationStateChange()
+        }
+        if (this.localFlushDuringPublicationPromise) {
+            await this.localFlushDuringPublicationPromise.catch(() => undefined)
+        }
+        if (failure !== null) {
+            await this.applyDeferredPublication()
+            if (this.pendingPublicationRevision !== null) {
+                this.armOfficialPublishRetry(OFFICIAL_PUBLISH_MIN_INTERVAL_MS)
+            }
+            throw failure
         }
         this.lastOfficialPublishAttemptAt = this.currentTime()
         this.cancelOfficialPublishRetry()
         this.pendingPublication = null
         this.pendingPublicationRevision = null
         await this.disposeOrQueuePublication(publication)
+        await this.applyDeferredPublication()
+        if (this.pendingPublicationRevision !== null) {
+            this.armOfficialPublishRetry(this.officialPublishDelayMs())
+        }
         this.armPublicationCleanupRetryIfNeeded()
     }
 

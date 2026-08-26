@@ -259,10 +259,12 @@ describe('persistent production runtime', () => {
         await store.open()
         await store.replaceFromDatabase(database)
         const adapter = makeAdapter(database)
+        const pin = vi.fn(() => new Promise<never>(() => undefined))
         const runtime = createPersistentDataRuntime({
             store,
             state: adapter,
             clock: rendererOwnedDebounceClock,
+            officialPublisher: { pin },
             prepareDatabase: async (candidate) => structuredClone(candidate),
         })
         await runtime.initializeActiveWorkingSet(database)
@@ -279,6 +281,9 @@ describe('persistent production runtime', () => {
         adapter.current().characters[0].chats[0].message.push(completedGeneration)
         runtime.markPersistentDataDirty(64)
         await runtime.acknowledgeGenerationCompletion()
+
+        expect(pin).not.toHaveBeenCalled()
+        expect(runtime.hasPendingOfficialPublication()).toBe(true)
 
         const reopened = makeStore(databaseName)
         await reopened.open()

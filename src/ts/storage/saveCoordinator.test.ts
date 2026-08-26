@@ -3767,6 +3767,214 @@ describe('SaveCoordinator', () => {
         expect(pin).toHaveBeenCalledWith(2)
     })
 
+    it('acknowledges a local generation commit without waiting for an unbounded official publisher', async () => {
+        const database = makeDatabase()
+        const scheduled: Array<() => void> = []
+        const cleared = new Set<symbol>()
+        const clock = {
+            setTimeout: (callback: () => void) => {
+                const handle = Symbol('timer')
+                scheduled.push(() => {
+                    if (!cleared.has(handle)) callback()
+                })
+                return handle
+            },
+            clearTimeout: (handle: unknown) => {
+                if (typeof handle === 'symbol') cleared.add(handle)
+            },
+        }
+        const pin = vi.fn(() => new Promise<never>(() => undefined))
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: { pin },
+            clock,
+        })
+        coordinator.initialize(1)
+        database.username = 'Durable local generation'
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingDataLocally('generation-completion')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(coordinator.revision).toBe(2)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        expect(pin).not.toHaveBeenCalled()
+        expect(scheduled.length).toBeGreaterThan(1)
+    })
+
+    it('does not let an in-flight unbounded publication block a newer local generation commit', async () => {
+        const database = makeDatabase()
+        const publish = vi.fn(() => new Promise<never>(() => undefined))
+        const pin = vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) }))
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(1)
+        database.username = 'First local revision'
+        coordinator.markPersistentDataDirty(1)
+
+        void coordinator.flushPendingData('ordinary-save')
+        await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce())
+        database.username = 'Completed generation revision'
+        coordinator.markPersistentDataDirty(1)
+
+        const result = await Promise.race([
+            coordinator.flushPendingDataLocally('generation-completion').then(() => 'committed'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 25)),
+        ])
+
+        expect(result).toBe('committed')
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(coordinator.revision).toBe(3)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+        expect(pin).toHaveBeenCalledWith(2)
+    })
+
+    it('does not queue local acknowledgement behind a publication operation that has not started yet', async () => {
+        const database = makeDatabase()
+        const publish = vi.fn(() => new Promise<never>(() => undefined))
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: {
+                pin: vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) })),
+            },
+        })
+        coordinator.initialize(1)
+        database.username = 'Completed generation'
+        coordinator.markPersistentDataDirty(1)
+
+        void coordinator.flushPendingData('ordinary-save')
+        const result = await Promise.race([
+            coordinator.flushPendingDataLocally('generation-completion').then(() => 'committed'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 25)),
+        ])
+
+        expect(result).toBe('committed')
+        expect(commit).toHaveBeenCalledOnce()
+        expect(coordinator.revision).toBe(2)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+    })
+
+    it('does not retry stalled official publication cleanup during local acknowledgement', async () => {
+        const database = makeDatabase()
+        const cleanupFailure = new Error('cleanup offline')
+        const dispose = vi.fn()
+            .mockRejectedValueOnce(cleanupFailure)
+            .mockImplementationOnce(() => new Promise<never>(() => undefined))
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: {
+                pin: vi.fn(async () => ({
+                    publish: vi.fn(async () => undefined),
+                    dispose,
+                })),
+            },
+            clock: {
+                setTimeout: () => Symbol('timer'),
+                clearTimeout: () => undefined,
+            },
+        })
+        coordinator.initialize(1)
+        database.username = 'Published revision'
+        coordinator.markPersistentDataDirty(1)
+        await coordinator.flushPendingData('ordinary-save')
+
+        database.username = 'Completed generation'
+        coordinator.markPersistentDataDirty(1)
+        const result = await Promise.race([
+            coordinator.flushPendingDataLocally('generation-completion').then(() => 'committed'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('blocked'), 25)),
+        ])
+
+        expect(result).toBe('committed')
+        expect(commit).toHaveBeenCalledTimes(2)
+        expect(dispose).toHaveBeenCalledOnce()
+    })
+
+    it('serializes publication completion with an in-flight local generation commit', async () => {
+        const database = makeDatabase()
+        const publication = deferred<void>()
+        const generationCommit = deferred<{ revision: number }>()
+        const publish = vi.fn(() => publication.promise)
+        const commit = vi.fn()
+            .mockResolvedValueOnce({ revision: 2 })
+            .mockImplementationOnce(() => generationCommit.promise)
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: {
+                pin: vi.fn(async () => ({ publish, dispose: vi.fn(async () => undefined) })),
+            },
+        })
+        coordinator.initialize(1)
+        database.username = 'First revision'
+        coordinator.markPersistentDataDirty(1)
+        const ordinaryFlush = coordinator.flushPendingData('ordinary-save')
+        await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce())
+
+        database.username = 'Completed generation'
+        coordinator.markPersistentDataDirty(1)
+        const localFlush = coordinator.flushPendingDataLocally('generation-completion')
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledTimes(2))
+        publication.resolve()
+        const ordinaryState = await Promise.race([
+            ordinaryFlush.then(() => 'settled', () => 'rejected'),
+            new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 25)),
+        ])
+
+        expect(ordinaryState).toBe('pending')
+        expect(commit).toHaveBeenCalledTimes(2)
+        generationCommit.resolve({ revision: 3 })
+        await localFlush
+        await ordinaryFlush
+
+        expect(coordinator.revision).toBe(3)
+        expect(coordinator.hasPendingOfficialPublication).toBe(true)
+    })
+
+    it('rejects local generation acknowledgement when the PDS commit fails', async () => {
+        const database = makeDatabase()
+        const error = new Error('local PDS failed')
+        const commit = vi.fn().mockRejectedValue(error)
+        const pin = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            officialPublisher: { pin },
+        })
+        coordinator.initialize(1)
+        database.username = 'Uncommitted generation'
+        coordinator.markPersistentDataDirty(25)
+        await expect(
+            coordinator.flushPendingDataLocally('generation-completion'),
+        ).rejects.toBe(error)
+
+        expect(coordinator.revision).toBe(1)
+        expect(coordinator.pendingBytes).toBe(25)
+        expect(coordinator.hasPendingOfficialPublication).toBe(false)
+        expect(pin).not.toHaveBeenCalled()
+    })
+
     it('autonomously retries a failed official publication while preserving its lease', async () => {
         vi.useFakeTimers()
         try {
