@@ -64,6 +64,8 @@ struct SpoolManifest {
     state: SpoolState,
     display_name: String,
     bytes: Option<u64>,
+    #[serde(default)]
+    total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -198,7 +200,10 @@ fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJ
         .map_err(|error| {
             invalid_source_error(format!("Android spool manifest is invalid: {error}"))
         })?;
-    if manifest.token != token || manifest.state != SpoolState::Ready {
+    if manifest.token != token
+        || manifest.state != SpoolState::Ready
+        || !is_safe_spool_display_name(&manifest.display_name)
+    {
         return Err(invalid_source_error("Android spool source is not ready"));
     }
     let source = canonical_spool
@@ -223,6 +228,14 @@ fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJ
         ));
     }
     Ok(source)
+}
+
+fn is_safe_spool_display_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 180
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn invalid_source_error(message: impl AsRef<str>) -> NativeJobError {
@@ -1862,6 +1875,7 @@ mod tests {
                 state: SpoolState::Copying,
                 display_name: "external.risudat".to_owned(),
                 bytes: Some(9),
+                total_bytes: Some(9),
             })
             .unwrap(),
         )
@@ -1881,6 +1895,27 @@ mod tests {
                 state: SpoolState::Ready,
                 display_name: "../../external.risudat".to_owned(),
                 bytes: Some(9),
+                total_bytes: Some(9),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(resolve_source(
+            directory.path(),
+            &JobSource::AndroidSpool {
+                token: token.clone(),
+            },
+        )
+        .is_err());
+
+        fs::write(
+            spool.join("source.json"),
+            serde_json::to_vec(&SpoolManifest {
+                token: token.clone(),
+                state: SpoolState::Ready,
+                display_name: "external.risudat".to_owned(),
+                bytes: Some(9),
+                total_bytes: Some(12),
             })
             .unwrap(),
         )
@@ -2027,6 +2062,7 @@ mod tests {
                 state: SpoolState::Copying,
                 display_name: "chosen.risudat".to_owned(),
                 bytes: None,
+                total_bytes: None,
             })
             .unwrap(),
         )

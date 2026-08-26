@@ -17,6 +17,7 @@ import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.IntentCompat
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
@@ -25,11 +26,24 @@ import androidx.core.view.updateLayoutParams
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val EXIT_CONFIRMATION_WINDOW_MILLIS = 2_000L
 private const val EXIT_FLUSH_TIMEOUT_MILLIS = 1_500L
 private const val NATIVE_LIFECYCLE_EVENT = "risu-native-lifecycle"
 private const val LIFECYCLE_BRIDGE_NAME = "RisuLifecycleBridge"
+private const val SAF_BRIDGE_NAME = "RisuSafBridge"
 private const val STOP_REASON = "stop"
 private const val TRIM_MEMORY_REASON = "trim-memory"
 private const val EXIT_REASON = "exit"
@@ -181,28 +195,13 @@ internal class BackNavigationPolicy(
   }
 }
 
-internal fun sanitizeOpenedFileName(name: String): String {
-  val leaf = name.substringAfterLast('/').substringAfterLast('\\')
-  val safe = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
-  return safe.ifBlank { "opened-file" }
-}
+internal fun sanitizeOpenedFileName(name: String): String = safeSafDisplayName(name)
 
-internal fun escapeJsStringLiteral(value: String): String = buildString {
-  for (character in value) {
-    when {
-      character == '\\' -> append("\\\\")
-      character == '"' -> append("\\\"")
-      character == '\u2028' || character == '\u2029' || character < ' ' ->
-        append("\\u%04x".format(character.code))
-      else -> append(character)
-    }
-  }
-}
-
-internal fun openedFilesScript(paths: List<String>): String {
-  val values = paths.joinToString(",") { "\"${escapeJsStringLiteral(it)}\"" }
-  return "window.tauriOpenedFiles=[$values];"
-}
+private data class PendingSafDestination(
+  val requestId: String,
+  val source: File,
+  val cancellation: AtomicBoolean,
+)
 
 internal class LifecycleFlushDispatcher(
   private val dispatch: (String) -> Unit,
@@ -267,6 +266,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val exitFlushGate = ExitFlushGate()
   private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val safScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val safDestinationCancellations = ConcurrentHashMap<String, AtomicBoolean>()
+  private var pendingSafDestination: PendingSafDestination? = null
+  private val safDestinationPicker = registerForActivityResult(
+    ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ::onSafDestinationSelected,
+  )
   private val rendererRecoveryMarker by lazy {
     val preferences = getSharedPreferences(NATIVE_RESILIENCE_PREFERENCES, MODE_PRIVATE)
     OneShotRecoveryMarker(
@@ -306,7 +312,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     Log.e(TAG, "Android WebView renderer exited, didCrash=$didCrash")
     return rendererRecoveryCoordinator.recover(
       removeFromParent = { (webView.parent as? ViewGroup)?.removeView(webView) },
-      removeJavascriptBridge = { webView.removeJavascriptInterface(LIFECYCLE_BRIDGE_NAME) },
+      removeJavascriptBridge = {
+        webView.removeJavascriptInterface(LIFECYCLE_BRIDGE_NAME)
+        webView.removeJavascriptInterface(SAF_BRIDGE_NAME)
+      },
       destroyView = webView::destroy,
       clearReference = {
         if (lifecycleWebView === webView) {
@@ -322,6 +331,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     super.onWebViewCreate(webView)
     lifecycleWebView = webView
     webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
+    webView.addJavascriptInterface(SafBridge(), SAF_BRIDGE_NAME)
     injectOpenedFiles(webView)
 
     val contentRoot = findViewById<ViewGroup>(android.R.id.content)
@@ -373,6 +383,21 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   override fun onStop() {
     lifecycleFlushDispatcher.onStop()
     super.onStop()
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    lifecycleWebView?.let { injectOpenedFiles(it, intent) }
+  }
+
+  override fun onDestroy() {
+    safDestinationCancellations.values.forEach { it.set(true) }
+    pendingSafDestination = null
+    safScope.cancel()
+    safDestinationCancellations.clear()
+    lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
+    super.onDestroy()
   }
 
   override fun onTrimMemory(level: Int) {
@@ -433,16 +458,156 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private fun injectOpenedFiles(webView: WebView) {
-    val openedFiles = copyOpenedFiles(launchOpenedFileUris(intent))
-    if (openedFiles.isEmpty()) {
+  private inner class SafBridge {
+    @JavascriptInterface
+    fun copyExport(
+      requestId: String,
+      sourcePath: String,
+      suggestedName: String,
+    ) {
+      if (requestId.isBlank() || requestId.length > 128) return
+      val cancellation = AtomicBoolean(false)
+      if (safDestinationCancellations.putIfAbsent(requestId, cancellation) != null) return
+      safScope.launch {
+        val script = try {
+          val source = withContext(Dispatchers.IO) {
+            resolveManagedExportSource(dataDir, sourcePath)
+          } ?: throw SafDestinationException(
+            "invalid-source",
+            emptyList(),
+            "Android SAF export source is not an owned native export",
+          )
+          if (cancellation.get()) {
+            throw SafDestinationException(
+              "cancelled",
+              emptyList(),
+              "Android SAF destination copy was cancelled",
+            )
+          }
+          if (pendingSafDestination != null) throw SafDestinationException(
+            "destination-busy",
+            emptyList(),
+            "Another Android SAF destination picker is already open",
+          )
+          pendingSafDestination = PendingSafDestination(requestId, source, cancellation)
+          safDestinationPicker.launch(safeSafDestinationName(suggestedName))
+          null
+        } catch (error: SafDestinationException) {
+          androidSafDestinationScript(
+            requestId = requestId,
+            state = if (error.code == "cancelled") "cancelled" else "failed",
+            code = error.code,
+            message = error.message,
+            warningCodes = error.warningCodes,
+          )
+        } catch (error: Exception) {
+          androidSafDestinationScript(
+            requestId = requestId,
+            state = "failed",
+            code = "destination-write-failed",
+            message = "Android SAF destination copy failed",
+            warningCodes = emptyList(),
+          )
+        }
+        if (script != null) {
+          safDestinationCancellations.remove(requestId, cancellation)
+          lifecycleWebView?.evaluateJavascript(script, null)
+        }
+      }
+    }
+
+    @JavascriptInterface
+    fun cancelExport(requestId: String) {
+      safDestinationCancellations[requestId]?.set(true)
+    }
+  }
+
+  private fun onSafDestinationSelected(uri: Uri?) {
+    val pending = pendingSafDestination ?: return
+    pendingSafDestination = null
+    if (uri == null) {
+      safDestinationCancellations.remove(pending.requestId, pending.cancellation)
+      lifecycleWebView?.evaluateJavascript(
+        androidSafDestinationScript(
+          requestId = pending.requestId,
+          state = "cancelled",
+          code = "cancelled",
+          message = "Android SAF destination selection was cancelled",
+          warningCodes = emptyList(),
+        ),
+        null,
+      )
       return
     }
-    val script = openedFilesScript(openedFiles)
-    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-      WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("*"))
-    } else {
-      webView.evaluateJavascript(script, null)
+    safScope.launch {
+      val copyContext = currentCoroutineContext()
+      val script = try {
+        if (uri.scheme != ContentResolver.SCHEME_CONTENT) {
+          throw SafDestinationException(
+            "invalid-destination",
+            emptyList(),
+            "Android SAF destination must be a content URI",
+          )
+        }
+        val result = copySafDestinationOnIo(
+          source = pending.source,
+          openDestination = {
+            contentResolver.openOutputStream(uri, "wt")
+              ?: throw IOException("Android SAF provider did not open the destination")
+          },
+          deletePartial = { contentResolver.delete(uri, null, null) > 0 },
+          createdDocument = true,
+          isCancelled = { pending.cancellation.get() || !copyContext.isActive },
+        )
+        androidSafDestinationScript(
+          requestId = pending.requestId,
+          state = "succeeded",
+          bytes = result.bytes,
+          warningCodes = result.warningCodes,
+        )
+      } catch (error: SafDestinationException) {
+        androidSafDestinationScript(
+          requestId = pending.requestId,
+          state = if (error.code == "cancelled") "cancelled" else "failed",
+          code = error.code,
+          message = error.message,
+          warningCodes = error.warningCodes,
+        )
+      } catch (error: Exception) {
+        androidSafDestinationScript(
+          requestId = pending.requestId,
+          state = "failed",
+          code = "destination-write-failed",
+          message = "Android SAF destination copy failed",
+          warningCodes = listOf(
+            "android-saf-provider-not-atomic",
+            "partial-destination-may-remain",
+          ),
+        )
+      } finally {
+        safDestinationCancellations.remove(pending.requestId, pending.cancellation)
+      }
+      lifecycleWebView?.evaluateJavascript(script, null)
+    }
+  }
+
+  private fun injectOpenedFiles(webView: WebView, openedIntent: Intent? = intent) {
+    val uris = launchOpenedFileUris(openedIntent)
+    if (uris.isEmpty()) return
+    safScope.launch {
+      val store = SafSpoolStore(File(dataDir, "native-file-jobs/sources"))
+      val sources = withContext(Dispatchers.IO) {
+        store.cleanupStale()
+        uris.map(::contentResolverSource)
+      }
+      val copyContext = currentCoroutineContext()
+      val batch = spoolOpenedFilesOnIo(
+        store,
+        sources,
+        isCancelled = { !copyContext.isActive },
+      )
+      if (!copyContext.isActive || lifecycleWebView !== webView) return@launch
+      webView.evaluateJavascript(androidSpoolBatchScript(batch), null)
     }
   }
 
@@ -496,38 +661,43 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private fun copyOpenedFiles(uris: List<Uri>): List<String> {
-    if (uris.isEmpty()) {
-      return emptyList()
+  private fun contentResolverSource(uri: Uri): SafInputSource {
+    val (displayName, totalBytes) = try {
+      resolveSourceMetadata(uri)
+    } catch (error: Exception) {
+      sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") to null
     }
-    val directory = File(cacheDir, "opened_files")
-    directory.mkdirs()
-    val stamp = System.currentTimeMillis()
-    return uris.mapIndexedNotNull { index, uri ->
-      try {
-        val target = File(directory, "$stamp-$index-${resolveDisplayName(uri)}")
-        contentResolver.openInputStream(uri)?.use { input ->
-          target.outputStream().use { output -> input.copyTo(output) }
-        } ?: return@mapIndexedNotNull null
-        target.absolutePath
-      } catch (error: Exception) {
-        null
-      }
+    return object : SafInputSource {
+      override val displayName = displayName
+      override val totalBytes = totalBytes
+
+      override fun open(): InputStream = contentResolver.openInputStream(uri)
+        ?: throw IOException("Android SAF provider did not open the source")
     }
   }
 
-  private fun resolveDisplayName(uri: Uri): String {
+  private fun resolveSourceMetadata(uri: Uri): Pair<String, Long?> {
     if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
-      contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-        val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-        if (column >= 0 && cursor.moveToFirst()) {
-          val name = cursor.getString(column)
-          if (!name.isNullOrBlank()) {
-            return sanitizeOpenedFileName(name)
+      contentResolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+        null,
+        null,
+        null,
+      )?.use { cursor ->
+        if (cursor.moveToFirst()) {
+          val nameColumn = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+          val sizeColumn = cursor.getColumnIndex(OpenableColumns.SIZE)
+          val name = if (nameColumn >= 0) cursor.getString(nameColumn) else null
+          val size = if (sizeColumn >= 0 && !cursor.isNull(sizeColumn)) {
+            cursor.getLong(sizeColumn).takeIf { it >= 0 }
+          } else {
+            null
           }
+          if (!name.isNullOrBlank()) return sanitizeOpenedFileName(name) to size
         }
       }
     }
-    return sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file")
+    return sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") to null
   }
 }

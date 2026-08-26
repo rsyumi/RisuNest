@@ -274,13 +274,25 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `opened files script escapes JS string hazards`() {
-    val script = openedFilesScript(listOf("/data/opened/a\"b\\c\nd.charx"))
-
-    assertEquals(
-      "window.tauriOpenedFiles=[\"/data/opened/a\\\"b\\\\c\\u000ad.charx\"];",
-      script,
+  fun `opened file spool script escapes metadata and exposes tokens instead of paths`() {
+    val script = androidSpoolBatchScript(
+      SafSpoolBatch(
+        ready = listOf(
+          SafSpoolReady(
+            token = "11111111-1111-4111-8111-111111111111",
+            displayName = "a\"b\\c\nd.risudat",
+            bytes = 9,
+            totalBytes = null,
+          ),
+        ),
+        failures = emptyList(),
+      ),
     )
+
+    assertEquals(true, script.contains("window.tauriOpenedFileSpools="))
+    assertEquals(true, script.contains("11111111-1111-4111-8111-111111111111"))
+    assertEquals(true, script.contains("a\\\"b\\\\c\\nd.risudat"))
+    assertEquals(false, script.contains("/data/opened"))
   }
 
   @Test
