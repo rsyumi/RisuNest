@@ -3984,6 +3984,7 @@ name = "risuai"
 version = "0.0.0"
 dependencies = [
  "base64 0.21.7",
+ "crc32fast",
  "darling 0.20.11",
  "eventsource-client",
  "flate2",
