@@ -93,6 +93,7 @@ export type ActiveConversationCommandName =
     | 'edit'
     | 'delete'
     | 'truncate'
+    | 'replace-range'
     | 'replace-tail'
     | 'reroll'
     | 'bookmark'
@@ -732,6 +733,33 @@ export class ActiveConversationTransaction {
         this.record('truncate')
     }
 
+    replaceRange(
+        position: ConversationPosition,
+        deleteCount: number,
+        messages: readonly Message[],
+    ): void {
+        this.assertOpen()
+        validatePosition(
+            this.conversationId,
+            this.currentMessages,
+            this.currentVersion,
+            position,
+            this.locatorRegistry,
+            this.sourceMessages,
+            this.sourceLocatorRegistry,
+        )
+        validateIndex(deleteCount, 'Conversation replace-range deleteCount')
+        if (deleteCount > this.currentMessages.length - position.absoluteIndex) {
+            throw new RangeError('Conversation replace-range exceeds the current message count')
+        }
+        this.currentMessages = [
+            ...this.currentMessages.slice(0, position.absoluteIndex),
+            ...safeStructuredClone(messages),
+            ...this.currentMessages.slice(position.absoluteIndex + deleteCount),
+        ]
+        this.record('replace-range')
+    }
+
     replaceTail(position: ConversationPosition, messages: readonly Message[]): void {
         this.assertOpen()
         this.replaceTailAs('replace-tail', position, messages)
@@ -1116,6 +1144,17 @@ export class ActiveConversationSession {
     truncate(locator: MessageLocator): void {
         this.assertActive()
         this.transaction((transaction) => transaction.truncate(locator))
+    }
+
+    replaceRange(
+        position: ConversationPosition,
+        deleteCount: number,
+        messages: readonly Message[],
+    ): void {
+        this.assertActive()
+        this.transaction((transaction) =>
+            transaction.replaceRange(position, deleteCount, messages),
+        )
     }
 
     replaceTail(position: ConversationPosition, messages: readonly Message[]): void {
