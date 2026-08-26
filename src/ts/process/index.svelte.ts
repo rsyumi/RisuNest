@@ -45,6 +45,7 @@ import {
 } from '../storage/persistentDataRuntime.svelte'
 import {
     captureGenerationConversationOperation,
+    recaptureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
 import { requireCurrentConversationSession } from '../storage/activeConversationSession'
@@ -1913,10 +1914,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             return false
         }
         currentChat = publishedChat
-        const replacementOutputIndex = currentChat.message.findIndex(
-            (message) => message.chatId === outputMessageId,
-        )
-        outputTarget = replacementOutputIndex === -1 ? null : captureGenerationConversationOperation({
+        outputTarget = recaptureGenerationConversationOperation({
             session: getActiveConversationSession(),
             getCurrentSession: getActiveConversationSession,
             chat: currentChat,
@@ -2159,17 +2157,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             if(!outputMessageId){
                 return false
             }
-            const replacementOutputIndex = currentChat.message.findIndex(
-                (message) => message.chatId === outputMessageId,
-            )
-            outputTarget = replacementOutputIndex === -1 ? null : captureGenerationConversationOperation({
-                    session: getActiveConversationSession(),
-                    getCurrentSession: getActiveConversationSession,
-                    chat: currentChat,
-                    getCurrentChat: getTargetChat,
-                    isOwnerCurrent: isGenerationOwnerCurrent,
-                    messageId: outputMessageId,
-                })
+            outputTarget = recaptureGenerationConversationOperation({
+                session: getActiveConversationSession(),
+                getCurrentSession: getActiveConversationSession,
+                chat: currentChat,
+                getCurrentChat: getTargetChat,
+                isOwnerCurrent: isGenerationOwnerCurrent,
+                messageId: outputMessageId,
+            })
             if(!outputTarget || !outputTarget.isOwned()){
                 return false
             }

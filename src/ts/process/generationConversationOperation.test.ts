@@ -3,6 +3,7 @@ import type { Chat, Message } from '../storage/database.svelte'
 import { ActiveConversationSession } from '../storage/activeConversationSession'
 import {
     captureGenerationConversationOperation,
+    recaptureGenerationConversationOperation,
     type GenerationConversationOperation,
 } from './generationConversationOperation'
 import { consumeStreamingDisplayStream } from './streamingDisplayStream'
@@ -59,6 +60,23 @@ function createHarness(messages: Message[]) {
 }
 
 describe('generation conversation operation', () => {
+    it('recaptures a message by ID through the conversation operation boundary', () => {
+        const harness = createHarness([message('target', 'generation-1')])
+        const capture = (messageId: string) => recaptureGenerationConversationOperation({
+            session: harness.session,
+            getCurrentSession: () => harness.session,
+            chat: harness.chat,
+            getCurrentChat: () => harness.chat,
+            messageId,
+        })
+
+        const operation = capture('generation-1')
+
+        expect(operation?.snapshot()?.data).toBe('target')
+        expect(capture('missing')).toBeNull()
+        operation?.release()
+    })
+
     it('preserves append, streaming, final, and async postprocessing order through locators', async () => {
         const harness = createHarness([message('user prompt', 'user-1')])
         const operation = harness.capture({ append: message('', 'generation-1') })

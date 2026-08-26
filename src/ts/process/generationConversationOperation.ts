@@ -56,6 +56,20 @@ export function captureGenerationConversationOperation(
         : captureFullArrayFallback(options)
 }
 
+export function recaptureGenerationConversationOperation(
+    options: Omit<
+        GenerationConversationOperationOptions,
+        'append' | 'continueLast' | 'messageId'
+    > & { messageId: string },
+): GenerationConversationOperation | null {
+    try {
+        return captureGenerationConversationOperation(options)
+    } catch (error) {
+        if (error instanceof RangeError) return null
+        throw error
+    }
+}
+
 function captureSessionOperation(
     session: ActiveConversationSession,
     options: GenerationConversationOperationOptions,
