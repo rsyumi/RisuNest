@@ -308,6 +308,58 @@ pub struct LogicalManifestBuilderInput {
     pub records: Vec<ProjectedLogicalRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum IndexedLogicalRecordState {
+    Live {
+        object: LogicalManifestObject,
+        dependencies: Vec<LogicalManifestObject>,
+    },
+    Tombstone {
+        deleted_generation_sequence: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexedLogicalRecord {
+    key: String,
+    state: IndexedLogicalRecordState,
+}
+
+impl IndexedLogicalRecord {
+    pub fn live(
+        key: String,
+        object: LogicalManifestObject,
+        dependencies: Vec<LogicalManifestObject>,
+    ) -> Self {
+        Self {
+            key,
+            state: IndexedLogicalRecordState::Live {
+                object,
+                dependencies,
+            },
+        }
+    }
+
+    pub fn tombstone(key: String, deleted_generation_sequence: String) -> Self {
+        Self {
+            key,
+            state: IndexedLogicalRecordState::Tombstone {
+                deleted_generation_sequence,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexedLogicalManifestBuilderInput {
+    pub library_id: String,
+    pub generation: String,
+    pub generation_sequence: String,
+    pub parent_generation: Option<String>,
+    pub source_revision: u64,
+    pub records: Vec<IndexedLogicalRecord>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuiltLogicalRecordObject {
     pub key: String,
@@ -320,6 +372,13 @@ pub struct BuiltLogicalManifest {
     pub manifest_bytes: Vec<u8>,
     pub manifest_hash: String,
     pub record_objects: Vec<BuiltLogicalRecordObject>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BuiltIndexedLogicalManifest {
+    pub manifest: LogicalManifest,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_hash: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -677,6 +736,128 @@ fn insert_manifest_object(
     Ok(())
 }
 
+fn insert_dependency_objects(
+    objects: &mut BTreeMap<String, u64>,
+    dependencies: Vec<LogicalManifestObject>,
+    duplicate_message: &str,
+) -> Result<Vec<String>, LogicalDeltaError> {
+    let mut hashes = Vec::with_capacity(dependencies.len());
+    let mut unique = BTreeSet::new();
+    for dependency in dependencies {
+        if !unique.insert(dependency.hash.clone()) {
+            return Err(invalid(duplicate_message));
+        }
+        insert_manifest_object(objects, &dependency)?;
+        hashes.push(dependency.hash);
+    }
+    hashes.sort();
+    Ok(hashes)
+}
+
+struct CanonicalLogicalManifest {
+    manifest: LogicalManifest,
+    bytes: Vec<u8>,
+    hash: String,
+}
+
+fn finish_logical_manifest(
+    library_id: String,
+    generation: String,
+    generation_sequence: String,
+    parent_generation: Option<String>,
+    source_revision: u64,
+    mut records: Vec<LogicalManifestRecord>,
+    objects: BTreeMap<String, u64>,
+) -> Result<CanonicalLogicalManifest, LogicalDeltaError> {
+    records.sort_by(|left, right| left.key().cmp(right.key()));
+    if records
+        .windows(2)
+        .any(|pair| pair[0].key() == pair[1].key())
+    {
+        return Err(invalid("logical manifest records contain duplicate keys"));
+    }
+    let manifest = LogicalManifest {
+        schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+        library_id,
+        generation,
+        generation_sequence,
+        parent_generation,
+        source_revision,
+        records,
+        objects: objects
+            .into_iter()
+            .map(|(hash, size)| LogicalManifestObject { hash, size })
+            .collect(),
+    };
+    let bytes = encode_logical_manifest(&manifest)?;
+    let hash = hex::encode(Sha256::digest(&bytes));
+    Ok(CanonicalLogicalManifest {
+        manifest,
+        bytes,
+        hash,
+    })
+}
+
+pub fn build_indexed_logical_manifest(
+    input: IndexedLogicalManifestBuilderInput,
+) -> Result<BuiltIndexedLogicalManifest, LogicalDeltaError> {
+    let mut records = Vec::with_capacity(input.records.len());
+    let mut objects = BTreeMap::new();
+
+    for indexed in input.records {
+        decode_logical_record_key(&indexed.key)?;
+        match indexed.state {
+            IndexedLogicalRecordState::Live {
+                object,
+                dependencies,
+            } => {
+                insert_manifest_object(&mut objects, &object)?;
+                let dependency_hashes = insert_dependency_objects(
+                    &mut objects,
+                    dependencies,
+                    "indexed logical record dependency descriptors are duplicated",
+                )?;
+                records.push(LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                    key: indexed.key,
+                    state: "live".to_owned(),
+                    object_hash: object.hash,
+                    dependencies: dependency_hashes,
+                }));
+            }
+            IndexedLogicalRecordState::Tombstone {
+                deleted_generation_sequence,
+            } => {
+                validate_generation_sequence(
+                    &deleted_generation_sequence,
+                    "tombstone deletedGenerationSequence",
+                )?;
+                records.push(LogicalManifestRecord::Tombstone(
+                    LogicalManifestTombstoneRecord {
+                        key: indexed.key,
+                        state: "tombstone".to_owned(),
+                        deleted_generation_sequence,
+                    },
+                ));
+            }
+        }
+    }
+
+    let canonical = finish_logical_manifest(
+        input.library_id,
+        input.generation,
+        input.generation_sequence,
+        input.parent_generation,
+        input.source_revision,
+        records,
+        objects,
+    )?;
+    Ok(BuiltIndexedLogicalManifest {
+        manifest: canonical.manifest,
+        manifest_bytes: canonical.bytes,
+        manifest_hash: canonical.hash,
+    })
+}
+
 pub fn build_logical_manifest(
     input: LogicalManifestBuilderInput,
 ) -> Result<BuiltLogicalManifest, LogicalDeltaError> {
@@ -692,18 +873,11 @@ pub fn build_logical_manifest(
                 dependencies,
             } => {
                 let expected_dependencies = record.dependency_hashes();
-                let mut provided_dependencies = Vec::with_capacity(dependencies.len());
-                let mut provided_hashes = BTreeSet::new();
-                for dependency in dependencies {
-                    if !provided_hashes.insert(dependency.hash.clone()) {
-                        return Err(invalid(
-                            "logical record dependency descriptors are duplicated",
-                        ));
-                    }
-                    insert_manifest_object(&mut objects, &dependency)?;
-                    provided_dependencies.push(dependency.hash);
-                }
-                provided_dependencies.sort();
+                let provided_dependencies = insert_dependency_objects(
+                    &mut objects,
+                    dependencies,
+                    "logical record dependency descriptors are duplicated",
+                )?;
                 if provided_dependencies != expected_dependencies {
                     return Err(invalid(
                         "logical record dependency descriptors do not match its envelope",
@@ -747,34 +921,20 @@ pub fn build_logical_manifest(
         }
     }
 
-    records.sort_by(|left, right| left.key().cmp(right.key()));
-    if records
-        .windows(2)
-        .any(|pair| pair[0].key() == pair[1].key())
-    {
-        return Err(invalid("logical manifest records contain duplicate keys"));
-    }
     record_objects.sort_by(|left, right| left.key.cmp(&right.key));
-
-    let manifest = LogicalManifest {
-        schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
-        library_id: input.library_id,
-        generation: input.generation,
-        generation_sequence: input.generation_sequence,
-        parent_generation: input.parent_generation,
-        source_revision: input.source_revision,
+    let canonical = finish_logical_manifest(
+        input.library_id,
+        input.generation,
+        input.generation_sequence,
+        input.parent_generation,
+        input.source_revision,
         records,
-        objects: objects
-            .into_iter()
-            .map(|(hash, size)| LogicalManifestObject { hash, size })
-            .collect(),
-    };
-    let manifest_bytes = encode_logical_manifest(&manifest)?;
-    let manifest_hash = hex::encode(Sha256::digest(&manifest_bytes));
+        objects,
+    )?;
     Ok(BuiltLogicalManifest {
-        manifest,
-        manifest_bytes,
-        manifest_hash,
+        manifest: canonical.manifest,
+        manifest_bytes: canonical.bytes,
+        manifest_hash: canonical.hash,
         record_objects,
     })
 }
@@ -917,13 +1077,14 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        build_logical_manifest, decode_logical_manifest, decode_logical_record,
-        decode_logical_record_key, decode_message_page, encode_logical_manifest,
-        encode_logical_record, encode_logical_record_key, encode_message_page, LogicalManifest,
-        LogicalManifestBuilderInput, LogicalManifestLiveRecord, LogicalManifestObject,
-        LogicalManifestRecord, LogicalManifestTombstoneRecord, LogicalOwnerHead,
-        LogicalOwnerLocator, LogicalRecordEnvelope, LogicalRecordLocator, ProjectedLogicalRecord,
-        LOGICAL_MANIFEST_SCHEMA, LOGICAL_MESSAGE_PAGE_SIZE,
+        build_indexed_logical_manifest, build_logical_manifest, decode_logical_manifest,
+        decode_logical_record, decode_logical_record_key, decode_message_page,
+        encode_logical_manifest, encode_logical_record, encode_logical_record_key,
+        encode_message_page, IndexedLogicalManifestBuilderInput, IndexedLogicalRecord,
+        LogicalManifest, LogicalManifestBuilderInput, LogicalManifestLiveRecord,
+        LogicalManifestObject, LogicalManifestRecord, LogicalManifestTombstoneRecord,
+        LogicalOwnerHead, LogicalOwnerLocator, LogicalRecordEnvelope, LogicalRecordLocator,
+        ProjectedLogicalRecord, LOGICAL_MANIFEST_SCHEMA, LOGICAL_MESSAGE_PAGE_SIZE,
     };
 
     #[test]
@@ -1278,5 +1439,180 @@ mod tests {
             ProjectedLogicalRecord::live(LogicalRecordLocator::Root, root, vec![]),
         ];
         assert!(build_logical_manifest(duplicate).is_err());
+    }
+
+    #[test]
+    fn indexed_manifest_builder_uses_only_compact_record_metadata() {
+        let record_hash = "1".repeat(64);
+        let dependency_hash = "2".repeat(64);
+        let built = build_indexed_logical_manifest(IndexedLogicalManifestBuilderInput {
+            library_id: "library-1".to_owned(),
+            generation: "device-a:8".to_owned(),
+            generation_sequence: "8".to_owned(),
+            parent_generation: Some("device-a:7".to_owned()),
+            source_revision: 8,
+            records: vec![IndexedLogicalRecord::live(
+                "r1:root".to_owned(),
+                LogicalManifestObject {
+                    hash: record_hash.clone(),
+                    size: 11,
+                },
+                vec![LogicalManifestObject {
+                    hash: dependency_hash.clone(),
+                    size: 17,
+                }],
+            )],
+        })
+        .unwrap();
+
+        assert_eq!(
+            built.manifest.records,
+            vec![LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key: "r1:root".to_owned(),
+                state: "live".to_owned(),
+                object_hash: record_hash.clone(),
+                dependencies: vec![dependency_hash.clone()],
+            })]
+        );
+        assert_eq!(
+            built.manifest.objects,
+            vec![
+                LogicalManifestObject {
+                    hash: record_hash,
+                    size: 11,
+                },
+                LogicalManifestObject {
+                    hash: dependency_hash,
+                    size: 17,
+                },
+            ]
+        );
+        assert_eq!(
+            decode_logical_manifest(&built.manifest_bytes).unwrap(),
+            built.manifest
+        );
+    }
+
+    #[test]
+    fn indexed_manifest_bytes_equal_the_equivalent_projected_build() {
+        let root = LogicalRecordEnvelope::Root {
+            value: json!({ "username": "Fixture" }),
+            owner_heads: vec![],
+        };
+        let encoded_root = encode_logical_record(&root).unwrap();
+        let projected = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library-1".to_owned(),
+            generation: "device-a:9".to_owned(),
+            generation_sequence: "9".to_owned(),
+            parent_generation: Some("device-a:8".to_owned()),
+            source_revision: 9,
+            records: vec![
+                ProjectedLogicalRecord::live(LogicalRecordLocator::Root, root, vec![]),
+                ProjectedLogicalRecord::tombstone(
+                    LogicalRecordLocator::Asset {
+                        logical_key: "deleted.bin".to_owned(),
+                    },
+                    "9".to_owned(),
+                ),
+            ],
+        })
+        .unwrap();
+        let indexed = build_indexed_logical_manifest(IndexedLogicalManifestBuilderInput {
+            library_id: "library-1".to_owned(),
+            generation: "device-a:9".to_owned(),
+            generation_sequence: "9".to_owned(),
+            parent_generation: Some("device-a:8".to_owned()),
+            source_revision: 9,
+            records: vec![
+                IndexedLogicalRecord::live(
+                    "r1:root".to_owned(),
+                    LogicalManifestObject {
+                        hash: encoded_root.hash,
+                        size: encoded_root.size,
+                    },
+                    vec![],
+                ),
+                IndexedLogicalRecord::tombstone(
+                    "r1:asset:WyJkZWxldGVkLmJpbiJd".to_owned(),
+                    "9".to_owned(),
+                ),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(indexed.manifest, projected.manifest);
+        assert_eq!(indexed.manifest_bytes, projected.manifest_bytes);
+        assert_eq!(indexed.manifest_hash, projected.manifest_hash);
+    }
+
+    #[test]
+    fn indexed_manifest_builder_rejects_duplicate_keys_and_conflicting_objects() {
+        let base = || IndexedLogicalManifestBuilderInput {
+            library_id: "library-1".to_owned(),
+            generation: "device-a:10".to_owned(),
+            generation_sequence: "10".to_owned(),
+            parent_generation: Some("device-a:9".to_owned()),
+            source_revision: 10,
+            records: vec![],
+        };
+
+        let mut duplicate_keys = base();
+        duplicate_keys.records = vec![
+            IndexedLogicalRecord::tombstone("r1:root".to_owned(), "10".to_owned()),
+            IndexedLogicalRecord::tombstone("r1:root".to_owned(), "10".to_owned()),
+        ];
+        assert!(build_indexed_logical_manifest(duplicate_keys).is_err());
+
+        let shared_hash = "5".repeat(64);
+        let mut conflicting_objects = base();
+        conflicting_objects.records = vec![
+            IndexedLogicalRecord::live(
+                "r1:root".to_owned(),
+                LogicalManifestObject {
+                    hash: shared_hash.clone(),
+                    size: 7,
+                },
+                vec![],
+            ),
+            IndexedLogicalRecord::live(
+                "r1:preset:WyIwIl0".to_owned(),
+                LogicalManifestObject {
+                    hash: shared_hash,
+                    size: 8,
+                },
+                vec![],
+            ),
+        ];
+        assert!(build_indexed_logical_manifest(conflicting_objects).is_err());
+
+        let duplicate_hash = "6".repeat(64);
+        let mut duplicate_dependencies = base();
+        duplicate_dependencies
+            .records
+            .push(IndexedLogicalRecord::live(
+                "r1:root".to_owned(),
+                LogicalManifestObject {
+                    hash: "7".repeat(64),
+                    size: 9,
+                },
+                vec![
+                    LogicalManifestObject {
+                        hash: duplicate_hash.clone(),
+                        size: 5,
+                    },
+                    LogicalManifestObject {
+                        hash: duplicate_hash,
+                        size: 5,
+                    },
+                ],
+            ));
+        assert!(build_indexed_logical_manifest(duplicate_dependencies).is_err());
+
+        let mut invalid_key = base();
+        invalid_key.records.push(IndexedLogicalRecord::tombstone(
+            "root".to_owned(),
+            "10".to_owned(),
+        ));
+        assert!(build_indexed_logical_manifest(invalid_key).is_err());
     }
 }
