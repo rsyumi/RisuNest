@@ -1,6 +1,9 @@
 use super::{logical_schema, read_target, PersistentStore, StoreError, StoreResult};
 use crate::{
-    asset_repository::PayloadCas,
+    asset_repository::{
+        owner_manifest_codec::{decode_owner_manifest, encode_owner_manifest},
+        PayloadCas,
+    },
     peer_sync::logical_delta::{
         build_indexed_logical_manifest, decode_logical_record_key, encode_asset_alias_metadata,
         encode_logical_record, encode_logical_record_key, encode_message_page,
@@ -42,6 +45,13 @@ struct PageSource {
     first_message_index: u64,
     message_count: u64,
     object: LogicalManifestObject,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedOwnerHead {
+    head: LogicalOwnerHead,
+    tuples: Option<Vec<Value>>,
+    dependencies: Vec<LogicalManifestObject>,
 }
 
 #[derive(Debug)]
@@ -341,8 +351,11 @@ fn project_root(
         [pds_generation],
         |row| row.get(0),
     )?;
-    let owner_heads = load_owner_heads(transaction, cas, pds_generation, None)?;
-    let dependencies = owner_dependencies(cas, &owner_heads)?;
+    let owner_heads =
+        validate_owner_heads(cas, load_owner_heads(transaction, pds_generation, None)?)?;
+    let mut value: Value = serde_json::from_str(&raw)?;
+    strip_root_owner_properties(&mut value, &owner_heads)?;
+    let dependencies = owner_dependencies(&owner_heads)?;
     insert_live_record(
         transaction,
         library_id,
@@ -350,8 +363,8 @@ fn project_root(
         encode_logical_record_key(&LogicalRecordLocator::Root).map_err(codec_error)?,
         RECORD_KIND_ROOT,
         LogicalRecordEnvelope::Root {
-            value: serde_json::from_str(&raw)?,
-            owner_heads,
+            value,
+            owner_heads: logical_owner_heads(&owner_heads),
         },
         dependencies,
         &[],
@@ -440,8 +453,13 @@ fn project_characters(
         let character_id: String = row.get(0)?;
         let configured_index = nonnegative_u64(row.get(1)?, "character configured index")?;
         let raw: String = row.get(2)?;
-        let owner_heads = load_owner_heads(transaction, cas, pds_generation, Some(&character_id))?;
-        let dependencies = owner_dependencies(cas, &owner_heads)?;
+        let owner_heads = validate_owner_heads(
+            cas,
+            load_owner_heads(transaction, pds_generation, Some(&character_id))?,
+        )?;
+        let mut detail: Value = serde_json::from_str(&raw)?;
+        strip_character_owner_property(&mut detail, &character_id, &owner_heads)?;
+        let dependencies = owner_dependencies(&owner_heads)?;
         insert_live_record(
             transaction,
             library_id,
@@ -451,8 +469,8 @@ fn project_characters(
             RECORD_KIND_CHARACTER,
             LogicalRecordEnvelope::Character {
                 configured_index,
-                detail: serde_json::from_str(&raw)?,
-                owner_heads,
+                detail,
+                owner_heads: logical_owner_heads(&owner_heads),
             },
             dependencies,
             &[],
@@ -691,7 +709,6 @@ fn project_cold_aliases(
 
 fn load_owner_heads(
     connection: &Connection,
-    cas: &PayloadCas,
     pds_generation: &str,
     character_id: Option<&str>,
 ) -> StoreResult<Vec<LogicalOwnerHead>> {
@@ -742,7 +759,6 @@ fn load_owner_heads(
             let hash = manifest_hash.ok_or_else(|| StoreError::Validation {
                 message: "present owner head has no manifest hash".to_owned(),
             })?;
-            require_cas_size(cas, &hash)?;
             LogicalOwnerHead::present(owner, hash, entry_count).map_err(codec_error)?
         } else {
             if manifest_hash.is_some() || entry_count != 0 {
@@ -755,20 +771,197 @@ fn load_owner_heads(
     Ok(heads)
 }
 
-fn owner_dependencies(
+fn validate_owner_heads(
     cas: &PayloadCas,
-    heads: &[LogicalOwnerHead],
-) -> StoreResult<Vec<LogicalManifestObject>> {
-    heads
-        .iter()
-        .filter_map(|head| head.manifest_hash.as_deref())
-        .map(|hash| {
-            Ok(LogicalManifestObject {
-                hash: hash.to_owned(),
-                size: require_cas_size(cas, hash)?,
-            })
-        })
-        .collect()
+    heads: Vec<LogicalOwnerHead>,
+) -> StoreResult<Vec<ValidatedOwnerHead>> {
+    let mut validated = Vec::with_capacity(heads.len());
+    for head in heads {
+        let Some(manifest_hash) = head.manifest_hash.as_deref() else {
+            validated.push(ValidatedOwnerHead {
+                head,
+                tuples: None,
+                dependencies: Vec::new(),
+            });
+            continue;
+        };
+        let bytes = cas
+            .read_object(manifest_hash)?
+            .ok_or_else(|| StoreError::Validation {
+                message: format!("referenced owner manifest {manifest_hash} is missing"),
+            })?;
+        verify_object_bytes(&bytes, manifest_hash, bytes.len() as u64)?;
+        let entries = decode_owner_manifest(&bytes).map_err(codec_error)?;
+        if encode_owner_manifest(&entries).map_err(codec_error)? != bytes {
+            return validation("owner manifest bytes are not canonical");
+        }
+        if entries.len() as u64 != head.entry_count {
+            return validation("owner manifest entry count does not match its head");
+        }
+        let mut dependencies = BTreeMap::from([(manifest_hash.to_owned(), bytes.len() as u64)]);
+        let mut tuples = Vec::with_capacity(entries.len());
+        for entry in entries {
+            tuples.push(Value::Array(
+                entry.tuple.into_iter().map(Value::String).collect(),
+            ));
+            if let Some(payload_hash) = entry.payload_hash {
+                let hash = hex::encode(payload_hash);
+                let size = require_cas_size(cas, &hash)?;
+                if dependencies
+                    .insert(hash, size)
+                    .is_some_and(|old| old != size)
+                {
+                    return validation("owner dependency hash has conflicting sizes");
+                }
+            }
+        }
+        validated.push(ValidatedOwnerHead {
+            head,
+            tuples: Some(tuples),
+            dependencies: dependencies
+                .into_iter()
+                .map(|(hash, size)| LogicalManifestObject { hash, size })
+                .collect(),
+        });
+    }
+    Ok(validated)
+}
+
+fn logical_owner_heads(heads: &[ValidatedOwnerHead]) -> Vec<LogicalOwnerHead> {
+    heads.iter().map(|head| head.head.clone()).collect()
+}
+
+fn owner_dependencies(heads: &[ValidatedOwnerHead]) -> StoreResult<Vec<LogicalManifestObject>> {
+    let mut dependencies = BTreeMap::new();
+    for dependency in heads.iter().flat_map(|head| &head.dependencies) {
+        if dependencies
+            .insert(dependency.hash.clone(), dependency.size)
+            .is_some_and(|old| old != dependency.size)
+        {
+            return validation("owner dependency hash has conflicting sizes");
+        }
+    }
+    Ok(dependencies
+        .into_iter()
+        .map(|(hash, size)| LogicalManifestObject { hash, size })
+        .collect())
+}
+
+fn strip_owner_property(
+    parent: &mut serde_json::Map<String, Value>,
+    property: &str,
+    head: &ValidatedOwnerHead,
+) -> StoreResult<()> {
+    let present = parent.contains_key(property);
+    if present != head.head.present {
+        return validation("owner head property presence does not match its parent record");
+    }
+    if let Some(expected) = &head.tuples {
+        if parent.get(property) != Some(&Value::Array(expected.clone())) {
+            return validation("owner manifest tuples do not match their parent record");
+        }
+        parent.remove(property);
+    }
+    Ok(())
+}
+
+fn strip_root_owner_properties(value: &mut Value, heads: &[ValidatedOwnerHead]) -> StoreResult<()> {
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Validation {
+            message: "logical root projection requires an object".to_owned(),
+        })?;
+    let mut by_identity = BTreeMap::new();
+    for head in heads {
+        let identity = match &head.head.owner {
+            LogicalOwnerLocator::RootModule { index } => format!("module:{index}"),
+            LogicalOwnerLocator::PersonaEmbeddedModule { index } => format!("persona:{index}"),
+            LogicalOwnerLocator::CharacterAdditional { .. } => {
+                return validation("root logical record contains a character owner head")
+            }
+        };
+        if by_identity.insert(identity, head).is_some() {
+            return validation("root logical record contains duplicate owner heads");
+        }
+    }
+    let mut expected = 0_usize;
+    if let Some(modules) = root.get_mut("modules") {
+        let modules = modules
+            .as_array_mut()
+            .ok_or_else(|| StoreError::Validation {
+                message: "root modules must be an array".to_owned(),
+            })?;
+        for (index, module) in modules.iter_mut().enumerate() {
+            let module = module
+                .as_object_mut()
+                .ok_or_else(|| StoreError::Validation {
+                    message: "root module must be an object".to_owned(),
+                })?;
+            let head = by_identity.get(&format!("module:{index}")).ok_or_else(|| {
+                StoreError::Validation {
+                    message: "root module owner head coverage is incomplete".to_owned(),
+                }
+            })?;
+            strip_owner_property(module, "assets", head)?;
+            expected += 1;
+        }
+    }
+    if let Some(personas) = root.get_mut("personas") {
+        let personas = personas
+            .as_array_mut()
+            .ok_or_else(|| StoreError::Validation {
+                message: "root personas must be an array".to_owned(),
+            })?;
+        for (index, persona) in personas.iter_mut().enumerate() {
+            let persona = persona
+                .as_object_mut()
+                .ok_or_else(|| StoreError::Validation {
+                    message: "root persona must be an object".to_owned(),
+                })?;
+            let Some(embedded) = persona.get_mut("embeddedModule") else {
+                continue;
+            };
+            let embedded = embedded
+                .as_object_mut()
+                .ok_or_else(|| StoreError::Validation {
+                    message: "persona embeddedModule must be an object".to_owned(),
+                })?;
+            let head = by_identity
+                .get(&format!("persona:{index}"))
+                .ok_or_else(|| StoreError::Validation {
+                    message: "persona embedded module owner head coverage is incomplete".to_owned(),
+                })?;
+            strip_owner_property(embedded, "assets", head)?;
+            expected += 1;
+        }
+    }
+    if by_identity.len() != expected {
+        return validation("root logical record contains owner heads for missing occurrences");
+    }
+    Ok(())
+}
+
+fn strip_character_owner_property(
+    detail: &mut Value,
+    character_id: &str,
+    heads: &[ValidatedOwnerHead],
+) -> StoreResult<()> {
+    let [head] = heads else {
+        return validation("character owner head coverage must contain exactly one head");
+    };
+    if !matches!(
+        &head.head.owner,
+        LogicalOwnerLocator::CharacterAdditional { character_id: owner_id }
+            if owner_id == character_id
+    ) {
+        return validation("character logical record owner head does not match its key");
+    }
+    let detail = detail
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Validation {
+            message: "character logical projection requires an object".to_owned(),
+        })?;
+    strip_owner_property(detail, "additionalAssets", head)
 }
 
 fn payload_dependency(
@@ -1069,9 +1262,13 @@ fn reconstruct_record(
                 params![pds_generation],
                 "root record source is missing",
             )?;
+            let owner_heads =
+                validate_owner_heads(cas, load_owner_heads(connection, pds_generation, None)?)?;
+            let mut value: Value = serde_json::from_str(&raw)?;
+            strip_root_owner_properties(&mut value, &owner_heads)?;
             LogicalRecordEnvelope::Root {
-                value: serde_json::from_str(&raw)?,
-                owner_heads: load_owner_heads(connection, cas, pds_generation, None)?,
+                value,
+                owner_heads: logical_owner_heads(&owner_heads),
             }
         }
         LogicalRecordLocator::Preset { preset_id } => {
@@ -1114,15 +1311,16 @@ fn reconstruct_record(
                 )
                 .optional()?
                 .ok_or_else(|| missing_source("character"))?;
+            let owner_heads = validate_owner_heads(
+                cas,
+                load_owner_heads(connection, pds_generation, Some(&character_id))?,
+            )?;
+            let mut detail: Value = serde_json::from_str(&raw)?;
+            strip_character_owner_property(&mut detail, &character_id, &owner_heads)?;
             LogicalRecordEnvelope::Character {
                 configured_index: nonnegative_u64(configured_index, "character configured index")?,
-                detail: serde_json::from_str(&raw)?,
-                owner_heads: load_owner_heads(
-                    connection,
-                    cas,
-                    pds_generation,
-                    Some(&character_id),
-                )?,
+                detail,
+                owner_heads: logical_owner_heads(&owner_heads),
             }
         }
         LogicalRecordLocator::Conversation {
@@ -1386,6 +1584,9 @@ fn validation<T>(message: impl Into<String>) -> StoreResult<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asset_repository::owner_manifest_codec::{
+        encode_owner_manifest, OwnerManifestEntry,
+    };
     use crate::peer_sync::logical_delta::{
         decode_asset_alias_metadata, decode_logical_record, decode_message_page,
         LogicalManifestRecord,
@@ -1441,7 +1642,17 @@ mod tests {
             .expect("store inlay");
         let cold = cas.prepare_bytes(b"cold bytes").expect("store cold");
         let owner = cas
-            .prepare_bytes(b"owner manifest bytes")
+            .prepare_bytes(
+                &encode_owner_manifest(&[OwnerManifestEntry {
+                    tuple: [
+                        "owner".to_owned(),
+                        "assets/owner.bin".to_owned(),
+                        "bin".to_owned(),
+                    ],
+                    payload_hash: None,
+                }])
+                .unwrap(),
+            )
             .expect("store owner manifest");
         store
             .connection
@@ -1468,7 +1679,7 @@ mod tests {
                 generation, character_id, configured_index, recent_at, trashed, name, image,
                 conversation_count, type, creator_notes, trash_time, detail
              ) VALUES ('revision-0', 'char', 2, 10, 0, 'Char', NULL, 1, 'character', NULL, NULL, ?1)",
-            [r#"{"name":"Char"}"#],
+            [r#"{"chaId":"char","name":"Char","additionalAssets":[["owner","assets/owner.bin","bin"]]}"#],
         ).expect("seed character");
         store
             .connection

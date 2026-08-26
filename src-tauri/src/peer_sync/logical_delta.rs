@@ -936,7 +936,17 @@ pub fn build_logical_manifest(
                     dependencies,
                     "logical record dependency descriptors are duplicated",
                 )?;
-                if provided_dependencies != expected_dependencies {
+                let dependencies_match = if matches!(
+                    &record,
+                    LogicalRecordEnvelope::Root { .. } | LogicalRecordEnvelope::Character { .. }
+                ) {
+                    expected_dependencies
+                        .iter()
+                        .all(|hash| provided_dependencies.binary_search(hash).is_ok())
+                } else {
+                    provided_dependencies == expected_dependencies
+                };
+                if !dependencies_match {
                     return Err(invalid(
                         "logical record dependency descriptors do not match its envelope",
                     ));
@@ -954,7 +964,7 @@ pub fn build_logical_manifest(
                     key: key.clone(),
                     state: "live".to_owned(),
                     object_hash: encoded.hash.clone(),
-                    dependencies: expected_dependencies,
+                    dependencies: provided_dependencies,
                 }));
                 record_objects.push(BuiltLogicalRecordObject {
                     key,
