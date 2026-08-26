@@ -1069,7 +1069,14 @@ impl PersistentStore {
         key: &str,
         expected_revision: i64,
     ) -> StoreResult<RevisionResult> {
-        commit::delete_asset_alias(&mut self.connection, kind, key, expected_revision)
+        let maintain_logical_index = logical_index::logical_index_is_active(&self.connection)?;
+        commit::delete_asset_alias(
+            &mut self.connection,
+            maintain_logical_index,
+            kind,
+            key,
+            expected_revision,
+        )
     }
 
     pub(crate) fn replace_begin(&mut self) -> StoreResult<StagingResult> {

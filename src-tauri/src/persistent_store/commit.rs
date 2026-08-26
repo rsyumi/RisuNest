@@ -46,6 +46,7 @@ pub(super) fn commit_asset_alias(
 
 pub(super) fn delete_asset_alias(
     connection: &mut Connection,
+    maintain_logical_index: bool,
     kind: &str,
     key: &str,
     expected_revision: i64,
@@ -59,12 +60,27 @@ pub(super) fn delete_asset_alias(
             actual: actual_revision,
         });
     }
+    let active = active_generation(&transaction)?;
     let revision = actual_revision + 1;
-    let generation = active_generation(&transaction)?;
+    let generation = writable_generation(&transaction, &active, revision, maintain_logical_index)?;
+    let logical = super::logical_index::begin_incremental_logical_commit(
+        &transaction,
+        &active,
+        &generation,
+        revision,
+    )?;
     transaction.execute(
         "DELETE FROM asset_aliases WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
         params![generation, kind, key],
     )?;
+    if let Some(logical) = logical {
+        super::logical_index::maintain_incremental_asset_alias_deletion(
+            &transaction,
+            &logical,
+            kind,
+            key,
+        )?;
+    }
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
     Ok(RevisionResult { revision })

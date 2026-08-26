@@ -1114,6 +1114,29 @@ pub(super) fn maintain_incremental_asset_alias(
     Ok(())
 }
 
+pub(super) fn maintain_incremental_asset_alias_deletion(
+    transaction: &Transaction<'_>,
+    logical: &IncrementalLogicalCommit,
+    kind: &str,
+    logical_key: &str,
+) -> StoreResult<()> {
+    let locator = match kind {
+        RECORD_KIND_ASSET => LogicalRecordLocator::Asset {
+            logical_key: logical_key.to_owned(),
+        },
+        RECORD_KIND_INLAY => LogicalRecordLocator::Inlay {
+            logical_key: logical_key.to_owned(),
+        },
+        _ => return validation("asset alias kind is unsupported"),
+    };
+    delete_projection(
+        transaction,
+        logical,
+        encode_logical_record_key(&locator).map_err(codec_error)?,
+        kind,
+    )
+}
+
 fn replace_root_projection(
     transaction: &Transaction<'_>,
     cas: &PayloadCas,
@@ -4772,6 +4795,62 @@ mod tests {
                 .manifest_hash,
             sealed.manifest_hash,
         );
+    }
+
+    #[test]
+    fn deleting_an_asset_alias_clones_the_retained_generation_and_records_a_tombstone() {
+        let (_directory, mut store, cas) = open_j2_fixture();
+        seed_all_record_families(&store, &cas);
+        store
+            .rebuild_logical_index(&cas, logical_build_request())
+            .unwrap();
+
+        let deleted = store.delete_asset_alias("asset", "same", 0).unwrap();
+
+        assert_eq!(deleted.revision, 1);
+        assert_eq!(active_generation(&store.connection).unwrap(), "revision-1");
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM asset_aliases
+                     WHERE generation = 'revision-0' AND kind = 'asset' AND logical_key = 'same'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM asset_aliases
+                     WHERE generation = 'revision-1' AND kind = 'asset' AND logical_key = 'same'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let asset_key = encode_logical_record_key(&LogicalRecordLocator::Asset {
+            logical_key: "same".to_owned(),
+        })
+        .unwrap();
+        let tombstone: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT head.state, head.deleted_generation_sequence
+                 FROM logical_record_heads AS head
+                 JOIN logical_library_head AS library
+                   ON library.library_id = head.library_id
+                  AND library.generation_id = head.generation_id
+                 WHERE head.record_key = ?1",
+                [asset_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tombstone, ("tombstone".to_owned(), "1".to_owned()));
     }
 
     #[test]
