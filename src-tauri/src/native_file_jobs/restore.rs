@@ -6,6 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufReader, Read};
+use std::path::Path;
 
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 const LEGACY_RISU_SAVE_PREFIX: &[u8] = b"\0RISUSAVE\0";
@@ -36,6 +37,31 @@ pub(crate) trait ReplacementSink: Send + Sync {
     fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()>;
     fn commit(&self, staging_id: &str, expected_revision: i64) -> StoreResult<RevisionResult>;
     fn abort(&self, staging_id: &str) -> StoreResult<()>;
+}
+
+pub(crate) trait RestoreControl {
+    fn is_cancel_requested(&self) -> bool;
+    fn start(&self, phase: JobPhase) -> Result<(), String>;
+    fn set_phase(&self, phase: JobPhase) -> Result<(), String>;
+    fn set_progress(&self, progress: JobProgress) -> Result<(), String>;
+}
+
+impl RestoreControl for JobControl {
+    fn is_cancel_requested(&self) -> bool {
+        JobControl::is_cancel_requested(self)
+    }
+
+    fn start(&self, phase: JobPhase) -> Result<(), String> {
+        JobControl::start(self, phase)
+    }
+
+    fn set_phase(&self, phase: JobPhase) -> Result<(), String> {
+        JobControl::set_phase(self, phase)
+    }
+
+    fn set_progress(&self, progress: JobProgress) -> Result<(), String> {
+        JobControl::set_progress(self, progress)
+    }
 }
 
 pub(crate) fn restore_block_risu_save(
@@ -263,6 +289,51 @@ fn read_risu_save_format<R: Read>(
         9 => Ok(RisuSaveFormat::LegacyStream),
         value => Err(invalid(format!("unsupported legacy RisuSave kind {value}"))),
     }
+}
+
+pub(crate) fn stage_block_risu_save(
+    source: &Path,
+    staging_id: &str,
+    control: &dyn RestoreControl,
+    sink: &dyn ReplacementSink,
+) -> Result<(), NativeJobError> {
+    stage_block_risu_save_with_limits(source, staging_id, control, sink, RestoreLimits::default())
+}
+
+fn stage_block_risu_save_with_limits(
+    source: &Path,
+    staging_id: &str,
+    control: &dyn RestoreControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<(), NativeJobError> {
+    let source = super::open_regular_file_no_follow(source)?;
+    stage_block_risu_save_reader(source, staging_id, control, sink, limits)
+}
+
+fn stage_block_risu_save_reader(
+    source: OpenedJobSource,
+    staging_id: &str,
+    control: &dyn RestoreControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<(), NativeJobError> {
+    let OpenedJobSource { file, total_bytes } = source;
+    if total_bytes < RISU_SAVE_HEADER.len() as u64 {
+        return Err(truncated("truncated block RisuSave header"));
+    }
+    control
+        .start(JobPhase::ReadingSource)
+        .map_err(|error| job_error(control, error))?;
+    let mut reader = TrackedReader::new(file, total_bytes, control);
+    let mut header = [0u8; RISU_SAVE_HEADER.len()];
+    reader.read_exact_checked(&mut header)?;
+    if header != RISU_SAVE_HEADER {
+        return Err(invalid("invalid block RisuSave header"));
+    }
+    parse_and_stage(&mut reader, staging_id, control, sink, limits)?;
+    reader.require_eof()?;
+    Ok(())
 }
 
 struct ParsedCounts {
@@ -617,7 +688,7 @@ impl<R: Read> Read for RemainingSourceReader<'_, '_, R> {
 fn parse_and_stage<R: Read>(
     reader: &mut TrackedReader<'_, R>,
     staging_id: &str,
-    job: &JobControl,
+    job: &dyn RestoreControl,
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
 ) -> Result<ParsedCounts, NativeJobError> {
@@ -840,7 +911,7 @@ fn read_block_value<R: Read>(
     compression: u8,
     encoded_length: u64,
     limits: RestoreLimits,
-    job: &JobControl,
+    job: &dyn RestoreControl,
 ) -> Result<(Value, usize), NativeJobError> {
     let block = EncodedBlockReader {
         reader,
@@ -911,12 +982,12 @@ struct DecodedLimitReader<'a, R: Read> {
     inner: R,
     completed: u64,
     max_bytes: u64,
-    job: &'a JobControl,
+    job: &'a dyn RestoreControl,
     name: &'a str,
 }
 
 impl<'a, R: Read> DecodedLimitReader<'a, R> {
-    fn new(inner: R, max_bytes: u64, job: &'a JobControl, name: &'a str) -> Self {
+    fn new(inner: R, max_bytes: u64, job: &'a dyn RestoreControl, name: &'a str) -> Self {
         Self {
             inner,
             completed: 0,
@@ -957,11 +1028,11 @@ struct TrackedReader<'a, R: Read> {
     completed: u64,
     completed_items: u64,
     hasher: Sha256,
-    job: &'a JobControl,
+    job: &'a dyn RestoreControl,
 }
 
 impl<'a, R: Read> TrackedReader<'a, R> {
-    fn new(source: R, total: u64, job: &'a JobControl) -> Self {
+    fn new(source: R, total: u64, job: &'a dyn RestoreControl) -> Self {
         Self {
             source,
             total,
@@ -1093,7 +1164,7 @@ fn json_error(
     name: &str,
     compression: u8,
     error: serde_json::Error,
-    job: &JobControl,
+    job: &dyn RestoreControl,
 ) -> NativeJobError {
     if job.is_cancel_requested() {
         return cancelled(format!("restore cancelled while decoding block {name}"));
@@ -1114,7 +1185,7 @@ fn json_error(
     corrupt(format!("invalid JSON in block {name}: {error}"))
 }
 
-fn gzip_io_error(name: &str, error: io::Error, job: &JobControl) -> NativeJobError {
+fn gzip_io_error(name: &str, error: io::Error, job: &dyn RestoreControl) -> NativeJobError {
     if job.is_cancel_requested() || error.kind() == io::ErrorKind::Interrupted {
         return cancelled(format!("restore cancelled while decoding block {name}"));
     }
@@ -1156,7 +1227,7 @@ fn cleanup_failed(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("cleanup-failed", message)
 }
 
-fn job_error(job: &JobControl, message: String) -> NativeJobError {
+fn job_error(job: &dyn RestoreControl, message: String) -> NativeJobError {
     if job.is_cancel_requested() {
         cancelled(message)
     } else {

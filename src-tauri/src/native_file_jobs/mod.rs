@@ -1820,7 +1820,7 @@ impl JobPhase {
 }
 
 mod export;
-mod restore;
+pub(crate) mod restore;
 
 #[cfg(test)]
 mod tests {

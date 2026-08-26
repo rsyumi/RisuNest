@@ -270,13 +270,17 @@ const EXPECTED_ADAPTER_CAPABILITY_MATRIX = {
         },
         {
             id: 'lossless-package-v1',
-            oracleStatus: 'unsupported',
-            resultWarning: 'The future lossless package adapter is not implemented.',
+            oracleStatus: 'known-gap',
+            resultWarning: 'The private native foundation preserves all package data, but production routing remains disabled pending physical atomicity gates.',
             capabilities: [
+                { feature: 'database', category: 'preserved' },
+                { feature: 'ordinary-assets', category: 'preserved' },
+                { feature: 'inlays', category: 'preserved' },
+                { feature: 'cold-payloads', category: 'preserved' },
                 {
-                    feature: 'adapter',
-                    category: 'unsupported',
-                    warning: 'The future lossless package adapter is not implemented.',
+                    feature: 'production-route',
+                    category: 'partial',
+                    warning: 'The public route stays disabled until 10 GB, process-kill, disk-full, and Android evidence passes.',
                 },
             ],
         },

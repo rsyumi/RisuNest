@@ -2,7 +2,7 @@ use super::{StoreError, StoreResult};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -19,13 +19,14 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
 
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
-        0 => create_v7(connection),
+        0 => create_v8(connection),
         1 => migrate_v1(connection),
         2 => migrate_v2(connection),
         3 => migrate_v3(connection),
         4 => migrate_v4(connection),
         5 => migrate_v5(connection),
-        6 => migrate_v6(connection),
+        6 => migrate_v6_or_v7_to_v8(connection, true),
+        7 => migrate_v6_or_v7_to_v8(connection, false),
         SCHEMA_VERSION => Ok(()),
         _ => Err(StoreError::Store {
             message: format!("unsupported persistent schema version {version}"),
@@ -33,7 +34,7 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     }
 }
 
-fn create_v7(connection: &mut Connection) -> StoreResult<()> {
+fn create_v8(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
         "
         BEGIN IMMEDIATE;
@@ -127,11 +128,12 @@ fn create_v7(connection: &mut Connection) -> StoreResult<()> {
             ),
             width INTEGER CHECK (width IS NULL OR width >= 0),
             height INTEGER CHECK (height IS NULL OR height >= 0),
+            metadata TEXT NOT NULL DEFAULT '{}',
             CHECK (
                 (kind = 'asset' AND inlay_type IS NULL AND width IS NULL AND height IS NULL)
                 OR (kind = 'inlay' AND inlay_type IS NOT NULL)
             ),
-            PRIMARY KEY (generation, logical_key)
+            PRIMARY KEY (generation, kind, logical_key)
         );
         CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
         CREATE TABLE asset_owner_heads (
@@ -157,18 +159,24 @@ fn create_v7(connection: &mut Connection) -> StoreResult<()> {
             PRIMARY KEY (generation, owner_kind, owner_locator)
         );
         CREATE INDEX asset_owner_heads_generation ON asset_owner_heads (generation);
-        PRAGMA user_version = 7;
+        CREATE TABLE cold_aliases (
+            generation TEXT NOT NULL,
+            key TEXT NOT NULL,
+            object_hash TEXT CHECK (
+                object_hash IS NULL OR (
+                    length(object_hash) = 64
+                    AND object_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            size INTEGER NOT NULL CHECK (size >= 0),
+            metadata TEXT NOT NULL,
+            PRIMARY KEY (generation, key)
+        );
+        CREATE INDEX cold_aliases_generation ON cold_aliases (generation);
+        PRAGMA user_version = 8;
         COMMIT;
         ",
     )?;
-    Ok(())
-}
-
-fn migrate_v6(connection: &mut Connection) -> StoreResult<()> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    create_asset_owner_heads(&transaction)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    transaction.commit()?;
     Ok(())
 }
 
@@ -176,6 +184,7 @@ fn migrate_v5(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     create_asset_aliases(&transaction)?;
     create_asset_owner_heads(&transaction)?;
+    create_cold_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -203,11 +212,12 @@ fn create_asset_aliases(transaction: &Transaction<'_>) -> StoreResult<()> {
             ),
             width INTEGER CHECK (width IS NULL OR width >= 0),
             height INTEGER CHECK (height IS NULL OR height >= 0),
+            metadata TEXT NOT NULL DEFAULT '{}',
             CHECK (
                 (kind = 'asset' AND inlay_type IS NULL AND width IS NULL AND height IS NULL)
                 OR (kind = 'inlay' AND inlay_type IS NOT NULL)
             ),
-            PRIMARY KEY (generation, logical_key)
+            PRIMARY KEY (generation, kind, logical_key)
         );
         CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
         ",
@@ -246,6 +256,79 @@ fn create_asset_owner_heads(transaction: &Transaction<'_>) -> StoreResult<()> {
     Ok(())
 }
 
+fn create_cold_aliases(transaction: &Transaction<'_>) -> StoreResult<()> {
+    transaction.execute_batch(
+        "
+        CREATE TABLE cold_aliases (
+            generation TEXT NOT NULL,
+            key TEXT NOT NULL,
+            object_hash TEXT CHECK (
+                object_hash IS NULL OR (
+                    length(object_hash) = 64
+                    AND object_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            size INTEGER NOT NULL CHECK (size >= 0),
+            metadata TEXT NOT NULL,
+            PRIMARY KEY (generation, key)
+        );
+        CREATE INDEX cold_aliases_generation ON cold_aliases (generation);
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v6_or_v7_to_v8(
+    connection: &mut Connection,
+    create_owner_heads: bool,
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "
+        DROP INDEX asset_aliases_generation;
+        ALTER TABLE asset_aliases RENAME TO asset_aliases_v6;
+        ",
+    )?;
+    create_asset_aliases(&transaction)?;
+    transaction.execute_batch(
+        "
+        INSERT INTO asset_aliases (
+            generation, logical_key, object_hash, kind, size, mime, name, ext,
+            inlay_type, width, height, metadata
+        )
+        SELECT generation, logical_key, object_hash, kind, size, mime, name, ext,
+               inlay_type, width, height,
+               CASE kind
+                   WHEN 'asset' THEN json_object(
+                       'name', name, 'ext', ext, 'mime', mime
+                   )
+                   ELSE json_patch(
+                       json_object(
+                           'name', name, 'ext', ext, 'mime', mime,
+                           'inlayType', inlay_type
+                       ),
+                       CASE
+                           WHEN width IS NOT NULL AND height IS NOT NULL
+                               THEN json_object('width', width, 'height', height)
+                           WHEN width IS NOT NULL THEN json_object('width', width)
+                           WHEN height IS NOT NULL THEN json_object('height', height)
+                           ELSE '{}'
+                       END
+                   )
+               END
+        FROM asset_aliases_v6;
+        DROP TABLE asset_aliases_v6;
+        ",
+    )?;
+    if create_owner_heads {
+        create_asset_owner_heads(&transaction)?;
+    }
+    create_cold_aliases(&transaction)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -278,6 +361,7 @@ fn migrate_v1(connection: &mut Connection) -> StoreResult<()> {
     migrate_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
     create_asset_owner_heads(&transaction)?;
+    create_cold_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -301,6 +385,7 @@ fn migrate_v2(connection: &mut Connection) -> StoreResult<()> {
     migrate_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
     create_asset_owner_heads(&transaction)?;
+    create_cold_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -312,6 +397,7 @@ fn migrate_v3(connection: &mut Connection) -> StoreResult<()> {
     ensure_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
     create_asset_owner_heads(&transaction)?;
+    create_cold_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -323,6 +409,7 @@ fn migrate_v4(connection: &mut Connection) -> StoreResult<()> {
     ensure_snapshot_leases(&transaction)?;
     create_asset_aliases(&transaction)?;
     create_asset_owner_heads(&transaction)?;
+    create_cold_aliases(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())

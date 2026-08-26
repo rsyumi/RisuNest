@@ -1,7 +1,18 @@
 use crate::{
     asset_repository::{PayloadCas, PreparedPayload},
     local_backup::CancellationProbe,
-    persistent_store::{AssetAlias, PersistentStore, StoreError},
+    lossless_f0::{
+        rebuild_f0_v1, validate_f0_v1, F0Error, F0ErrorCode, F0ExpectedMissing,
+        F0PayloadDescriptor, F0PayloadKind, F0Reference, F0ReferenceStatus, F0Validation,
+    },
+    native_file_jobs::{
+        restore::{self as block_restore, ReplacementSink, RestoreControl},
+        JobPhase, JobProgress,
+    },
+    persistent_store::{
+        AssetAlias, ColdAlias, PersistentStore, RevisionResult, StagingResult, StoreError,
+        StoreResult,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,6 +22,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 const MAGIC: &[u8; 17] = b"RISUNESTLOSSLESS\0";
@@ -24,7 +36,7 @@ const MAX_PATH_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 512;
 const DATABASE_PATH: &str = "database.risudat";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PayloadKind {
     Database,
@@ -129,7 +141,7 @@ pub(crate) struct StagedLosslessEntry {
     pub(crate) byte_length: u64,
     pub(crate) sha256: String,
     pub(crate) metadata: Value,
-    pub(crate) staged_path: Option<PathBuf>,
+    pub(crate) staged_path: Option<JobOwnedFile>,
     pub(crate) immutable_object: Option<PreparedPayload>,
 }
 
@@ -154,36 +166,12 @@ pub(crate) struct LosslessRestoreReport {
     pub(crate) warnings: Vec<LosslessWarning>,
 }
 
-pub(crate) trait LosslessRestoreHooks {
-    fn stage_database(
-        &mut self,
-        store: &mut PersistentStore,
-        staging_id: &str,
-        database: &StagedLosslessEntry,
-    ) -> Result<(), LosslessError>;
-
-    fn validate_reference_graph(
-        &mut self,
-        manifest: &LosslessManifest,
-    ) -> Result<(), LosslessError>;
-
-    fn create_pre_replacement_backup(
-        &mut self,
-        cancellation: &dyn CancellationProbe,
-    ) -> Result<PathBuf, LosslessError>;
-
-    fn confirm_pre_replacement_backup(
-        &mut self,
-        backup: &VerifiedLosslessBackup,
-    ) -> Result<(), LosslessError>;
-}
-
 pub(crate) fn project_payload_aliases(
     entries: &[StagedLosslessEntry],
 ) -> Result<Vec<AssetAlias>, LosslessError> {
     entries
         .iter()
-        .filter(|entry| entry.kind != PayloadKind::Database)
+        .filter(|entry| matches!(entry.kind, PayloadKind::Asset | PayloadKind::Inlay))
         .map(|entry| {
             let metadata = entry.metadata.as_object().ok_or_else(|| {
                 invalid_manifest("lossless package payload metadata must be a JSON object")
@@ -248,9 +236,116 @@ pub(crate) fn project_payload_aliases(
                 inlay_type,
                 width,
                 height,
+                metadata: entry.metadata.clone(),
             })
         })
         .collect()
+}
+
+pub(crate) fn project_cold_aliases(
+    entries: &[StagedLosslessEntry],
+) -> Result<Vec<ColdAlias>, LosslessError> {
+    entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::Cold)
+        .map(|entry| {
+            if !entry.metadata.is_object() {
+                return Err(invalid_manifest(
+                    "lossless package cold metadata must be a JSON object",
+                ));
+            }
+            let size = i64::try_from(entry.byte_length).map_err(|_| {
+                invalid_manifest("lossless package cold payload exceeds the alias size range")
+            })?;
+            Ok(ColdAlias {
+                key: entry.logical_key.clone().ok_or_else(|| {
+                    invalid_manifest("lossless package cold entry is missing its logical key")
+                })?,
+                object_hash: entry
+                    .immutable_object
+                    .as_ref()
+                    .map(|payload| payload.content_hash.clone())
+                    .or_else(|| Some(entry.sha256.clone())),
+                size,
+                metadata: entry.metadata.clone(),
+            })
+        })
+        .collect()
+}
+
+struct LosslessRestoreControl<'a> {
+    cancellation: &'a dyn CancellationProbe,
+}
+
+impl RestoreControl for LosslessRestoreControl<'_> {
+    fn is_cancel_requested(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    fn start(&self, _phase: JobPhase) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_phase(&self, _phase: JobPhase) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_progress(&self, _progress: JobProgress) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct DirectStagingSink<'a> {
+    store: Mutex<&'a mut PersistentStore>,
+}
+
+impl DirectStagingSink<'_> {
+    fn unavailable<T>() -> StoreResult<T> {
+        Err(StoreError::Validation {
+            message: "lossless database decoder cannot own replacement activation".to_owned(),
+        })
+    }
+}
+
+impl ReplacementSink for DirectStagingSink<'_> {
+    fn begin(&self) -> StoreResult<StagingResult> {
+        Self::unavailable()
+    }
+
+    fn put_root(&self, staging_id: &str, root: &Value) -> StoreResult<()> {
+        self.store
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("lossless staging mutex poisoned: {error}"),
+            })?
+            .replace_put_root(staging_id, root)
+    }
+
+    fn put_presets(&self, staging_id: &str, presets: &[Value]) -> StoreResult<()> {
+        self.store
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("lossless staging mutex poisoned: {error}"),
+            })?
+            .replace_put_presets(staging_id, presets)
+    }
+
+    fn add_characters(&self, staging_id: &str, characters: &[Value]) -> StoreResult<()> {
+        self.store
+            .lock()
+            .map_err(|error| StoreError::Store {
+                message: format!("lossless staging mutex poisoned: {error}"),
+            })?
+            .replace_add_characters(staging_id, characters)
+    }
+
+    fn commit(&self, _staging_id: &str, _expected_revision: i64) -> StoreResult<RevisionResult> {
+        Self::unavailable()
+    }
+
+    fn abort(&self, _staging_id: &str) -> StoreResult<()> {
+        Self::unavailable()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,8 +359,10 @@ pub(crate) enum LosslessErrorCode {
     DuplicateLogicalKey,
     MissingDatabase,
     DuplicateDatabase,
+    InvalidDatabase,
     MissingReference,
     UnexpectedReference,
+    BackupIncomplete,
     HashMismatch,
     LengthMismatch,
     TruncatedInput,
@@ -493,17 +590,10 @@ pub(crate) fn read_lossless_package_v1(
     let mut source = CountingReader::new(reader);
     let manifest = read_manifest(&mut source, cancellation)?;
     let staging_directory = prepare_staging_directory(job_staging_root)?;
-    let mut owned_paths = OwnedPaths::default();
     let mut entries = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
         let staged = if entry.kind == PayloadKind::Database {
-            stage_database_entry(
-                &mut source,
-                entry,
-                &staging_directory,
-                cancellation,
-                &mut owned_paths,
-            )?
+            stage_database_entry(&mut source, entry, &staging_directory, cancellation)?
         } else {
             stage_payload_entry(&mut source, entry, cas, cancellation)?
         };
@@ -517,7 +607,6 @@ pub(crate) fn read_lossless_package_v1(
             "lossless package has trailing data",
         ));
     }
-    owned_paths.release();
     Ok(LosslessReadReport {
         manifest,
         entries,
@@ -557,72 +646,707 @@ pub(crate) fn restore_lossless_package_v1(
     cas: &PayloadCas,
     store: &mut PersistentStore,
     expected_revision: i64,
-    hooks: &mut dyn LosslessRestoreHooks,
+    pre_replacement_backup: &Path,
     cancellation: &dyn CancellationProbe,
 ) -> Result<LosslessRestoreReport, LosslessError> {
     let incoming = read_lossless_package_v1(reader, job_staging_root, cas, cancellation)?;
+    let lease = store
+        .acquire_revision(expected_revision)
+        .map_err(store_error)?
+        .lease;
     let database = incoming
         .entries
         .iter()
         .find(|entry| entry.kind == PayloadKind::Database)
         .expect("validated lossless manifest has one database entry");
-    let database_path = database.staged_path.clone();
     let staging_id = match store.replace_begin().map_err(store_error) {
         Ok(staging) => staging.staging_id,
         Err(error) => {
-            if let Some(path) = database_path {
-                let _ = fs::remove_file(path);
+            return match store.release_revision(&lease).map_err(store_error) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(cleanup_error(error, "revision lease release", cleanup)),
             }
-            return Err(error);
         }
     };
-    let outcome = (|| {
-        hooks.stage_database(store, &staging_id, database)?;
-        check_cancelled(cancellation)?;
-        hooks.validate_reference_graph(&incoming.manifest)?;
-        check_cancelled(cancellation)?;
-        let backup_path = hooks.create_pre_replacement_backup(cancellation)?;
-        check_cancelled(cancellation)?;
-        let mut backup_file = File::open(&backup_path).map_err(|error| {
-            LosslessError::new(
-                LosslessErrorCode::Io,
-                format!("pre-replacement lossless backup cannot be opened: {error}"),
-            )
-        })?;
-        let backup = verify_lossless_package_v1(&mut backup_file, cancellation)?;
-        hooks.confirm_pre_replacement_backup(&backup)?;
-        check_cancelled(cancellation)?;
+    let prepared = (|| {
+        stage_block_database(store, &staging_id, database, cancellation)?;
         let aliases = project_payload_aliases(&incoming.entries)?;
+        let cold_aliases = project_cold_aliases(&incoming.entries)?;
         store
             .replace_put_asset_aliases(&staging_id, &aliases)
             .map_err(store_error)?;
+        store
+            .replace_put_cold_aliases(&staging_id, &cold_aliases)
+            .map_err(store_error)?;
         check_cancelled(cancellation)?;
-        let revision = store
-            .replace_commit(&staging_id, Some(expected_revision))
-            .map_err(store_error)?
-            .revision;
-        Ok(LosslessRestoreReport {
-            revision,
-            source_bytes: incoming.archive_bytes,
-            backup_bytes: backup.archive_bytes,
-            warnings: incoming.manifest.warnings.clone(),
-        })
+        let staged_database = store
+            .materialize_staging(&staging_id)
+            .map_err(store_error)?;
+        validate_staged_f0(&incoming.manifest, &incoming.entries, &staged_database, cas)?;
+        check_cancelled(cancellation)?;
+        create_and_verify_pre_replacement_backup(
+            pre_replacement_backup,
+            job_staging_root,
+            cas,
+            store,
+            &lease,
+            expected_revision,
+            cancellation,
+        )
     })();
-    if let Some(path) = database_path {
-        let _ = fs::remove_file(path);
+    let released = store.release_revision(&lease).map_err(store_error);
+    let backup_bytes = match (prepared, released) {
+        (Ok(bytes), Ok(())) => bytes,
+        (Err(error), Ok(())) => return abort_restore(store, &staging_id, error),
+        (Ok(_), Err(cleanup)) => return abort_restore(store, &staging_id, cleanup),
+        (Err(error), Err(cleanup)) => {
+            return abort_restore(
+                store,
+                &staging_id,
+                cleanup_error(error, "revision lease release", cleanup),
+            )
+        }
+    };
+    check_cancelled(cancellation).or_else(|error| abort_restore(store, &staging_id, error))?;
+    let revision = match store
+        .replace_commit(&staging_id, Some(expected_revision))
+        .map_err(store_error)
+    {
+        Ok(revision) => revision.revision,
+        Err(error) => return abort_restore(store, &staging_id, error),
+    };
+    Ok(LosslessRestoreReport {
+        revision,
+        source_bytes: incoming.archive_bytes,
+        backup_bytes,
+        warnings: incoming.manifest.warnings,
+    })
+}
+
+fn stage_block_database(
+    store: &mut PersistentStore,
+    staging_id: &str,
+    database: &StagedLosslessEntry,
+    cancellation: &dyn CancellationProbe,
+) -> Result<(), LosslessError> {
+    let path = database.staged_path.as_deref().ok_or_else(|| {
+        LosslessError::new(
+            LosslessErrorCode::InvalidDatabase,
+            "lossless database entry has no owned staging file",
+        )
+    })?;
+    let control = LosslessRestoreControl { cancellation };
+    let sink = DirectStagingSink {
+        store: Mutex::new(store),
+    };
+    block_restore::stage_block_risu_save(path, staging_id, &control, &sink)
+        .map_err(block_database_error)
+}
+
+fn block_database_error(error: crate::native_file_jobs::NativeJobError) -> LosslessError {
+    let code = if error.code == "cancelled" {
+        LosslessErrorCode::Cancelled
+    } else {
+        LosslessErrorCode::InvalidDatabase
+    };
+    LosslessError::new(
+        code,
+        format!("invalid lossless database payload: {}", error.message),
+    )
+}
+
+fn validate_staged_f0(
+    manifest: &LosslessManifest,
+    entries: &[StagedLosslessEntry],
+    database: &Value,
+    cas: &PayloadCas,
+) -> Result<F0Validation, LosslessError> {
+    let payloads = staged_f0_payloads(entries, cas)?;
+    let expected_missing = manifest
+        .references
+        .iter()
+        .filter(|reference| reference.status == ReferenceStatus::ExpectedMissing)
+        .map(|reference| F0ExpectedMissing {
+            target_kind: reference.target_kind.clone(),
+            target_key: reference.target_key.clone(),
+        })
+        .collect::<Vec<_>>();
+    let validation = validate_f0_v1(database, &payloads, &expected_missing).map_err(f0_error)?;
+    if validation.canonical_database_sha256 != manifest.compatibility.canonical_database_sha256 {
+        return Err(LosslessError::new(
+            LosslessErrorCode::HashMismatch,
+            "lossless package canonical database hash differs from decoded database",
+        ));
     }
-    match outcome {
-        Ok(report) => Ok(report),
-        Err(error) => match store.replace_abort(&staging_id).map_err(store_error) {
-            Ok(()) => Err(error),
-            Err(abort_error) => Err(LosslessError::new(
-                abort_error.code,
-                format!(
-                    "{}; staging abort failed: {}",
-                    error.message, abort_error.message
-                ),
-            )),
+    if validation.reference_graph_sha256 != manifest.compatibility.reference_graph_sha256
+        || validation
+            .references
+            .iter()
+            .map(lossless_reference)
+            .collect::<Vec<_>>()
+            != manifest.references
+    {
+        return Err(LosslessError::new(
+            LosslessErrorCode::UnexpectedReference,
+            "lossless package ordered reference graph differs from decoded database and payload manifest",
+        ));
+    }
+    Ok(validation)
+}
+
+fn staged_f0_payloads(
+    entries: &[StagedLosslessEntry],
+    cas: &PayloadCas,
+) -> Result<Vec<F0PayloadDescriptor>, LosslessError> {
+    entries
+        .iter()
+        .filter(|entry| entry.kind != PayloadKind::Database)
+        .map(|entry| {
+            let prepared = entry.immutable_object.as_ref().ok_or_else(|| {
+                LosslessError::new(
+                    LosslessErrorCode::InvalidManifest,
+                    "lossless payload is not staged in immutable storage",
+                )
+            })?;
+            if prepared.content_hash != entry.sha256 || prepared.byte_size != entry.byte_length {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::HashMismatch,
+                    "lossless payload manifest differs from immutable staged object",
+                ));
+            }
+            let path = cas
+                .object_path(&entry.sha256)
+                .map_err(LosslessError::io)?
+                .ok_or_else(|| {
+                    LosslessError::new(
+                        LosslessErrorCode::MissingReference,
+                        "lossless payload object is missing after staging",
+                    )
+                })?;
+            let actual_length = fs::metadata(&path).map_err(LosslessError::io)?.len();
+            if actual_length != entry.byte_length {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::LengthMismatch,
+                    "lossless payload object length differs from its manifest",
+                ));
+            }
+            Ok(F0PayloadDescriptor {
+                kind: f0_payload_kind(entry.kind)?,
+                key: entry.logical_key.clone().ok_or_else(|| {
+                    invalid_manifest("lossless payload entry is missing its logical key")
+                })?,
+                sha256: entry.sha256.clone(),
+                byte_length: entry.byte_length,
+                metadata: entry.metadata.clone(),
+                cold_source: (entry.kind == PayloadKind::Cold).then_some(path),
+            })
+        })
+        .collect()
+}
+
+fn f0_payload_kind(kind: PayloadKind) -> Result<F0PayloadKind, LosslessError> {
+    match kind {
+        PayloadKind::Asset => Ok(F0PayloadKind::Asset),
+        PayloadKind::Inlay => Ok(F0PayloadKind::Inlay),
+        PayloadKind::Cold => Ok(F0PayloadKind::Cold),
+        PayloadKind::Database => Err(invalid_manifest(
+            "database entry cannot be used as an F0 payload",
+        )),
+    }
+}
+
+fn lossless_reference(reference: &F0Reference) -> LosslessReference {
+    LosslessReference {
+        owner_kind: reference.owner_kind.clone(),
+        owner_id: reference.owner_id.clone(),
+        source_path: reference.source_path.clone(),
+        occurrence: reference.occurrence,
+        target_kind: reference.target_kind.clone(),
+        target_key: reference.target_key.clone(),
+        status: match reference.status {
+            F0ReferenceStatus::Present => ReferenceStatus::Present,
+            F0ReferenceStatus::ExpectedMissing => ReferenceStatus::ExpectedMissing,
+            F0ReferenceStatus::UnexpectedMissing => ReferenceStatus::UnexpectedMissing,
+            F0ReferenceStatus::External => ReferenceStatus::External,
+            F0ReferenceStatus::Invalid => ReferenceStatus::Invalid,
         },
+        metadata: reference.metadata.clone(),
+    }
+}
+
+fn f0_error(error: F0Error) -> LosslessError {
+    let code = match error.code {
+        F0ErrorCode::UnexpectedMissing => LosslessErrorCode::UnexpectedReference,
+        F0ErrorCode::InvalidDatabase | F0ErrorCode::CanonicalValue => {
+            LosslessErrorCode::InvalidDatabase
+        }
+        F0ErrorCode::InvalidInventory | F0ErrorCode::ColdPayload => {
+            LosslessErrorCode::InvalidManifest
+        }
+    };
+    LosslessError::new(code, error.message)
+}
+
+fn abort_restore<T>(
+    store: &mut PersistentStore,
+    staging_id: &str,
+    error: LosslessError,
+) -> Result<T, LosslessError> {
+    match store.replace_abort(staging_id).map_err(store_error) {
+        Ok(()) => Err(error),
+        Err(abort) => Err(cleanup_error(error, "staging abort", abort)),
+    }
+}
+
+fn cleanup_error(primary: LosslessError, action: &str, cleanup: LosslessError) -> LosslessError {
+    LosslessError::new(
+        cleanup.code,
+        format!("{}; {action} failed: {}", primary.message, cleanup.message),
+    )
+}
+
+fn create_and_verify_pre_replacement_backup(
+    output_path: &Path,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    store: &mut PersistentStore,
+    lease: &str,
+    expected_revision: i64,
+    cancellation: &dyn CancellationProbe,
+) -> Result<u64, LosslessError> {
+    check_cancelled(cancellation)?;
+    let database = store.materialize_lease(lease).map_err(store_error)?;
+    let assets = store.list_asset_aliases(Some(lease)).map_err(store_error)?;
+    let cold = store.list_cold_aliases(Some(lease)).map_err(store_error)?;
+    if assets.revision != expected_revision || cold.revision != expected_revision {
+        return Err(LosslessError::new(
+            LosslessErrorCode::RevisionConflict,
+            "pre-replacement inventory is not pinned to the expected revision",
+        ));
+    }
+    let exported = store.export_risu_save(lease, false).map_err(store_error)?;
+    let export_path = PathBuf::from(&exported.path);
+    let outcome = (|| {
+        let (entries, payloads) =
+            pinned_backup_entries(&export_path, &assets.value, &cold.value, cas, cancellation)?;
+        let diagnostic = rebuild_f0_v1(&database, &payloads, &[]).map_err(f0_error)?;
+        let mut seen_missing = HashSet::new();
+        let expected_missing = diagnostic
+            .references
+            .iter()
+            .filter(|reference| reference.status == F0ReferenceStatus::UnexpectedMissing)
+            .filter_map(|reference| {
+                let target = (reference.target_kind.clone(), reference.target_key.clone());
+                seen_missing
+                    .insert(target.clone())
+                    .then_some(F0ExpectedMissing {
+                        target_kind: target.0,
+                        target_key: target.1,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let validation =
+            validate_f0_v1(&database, &payloads, &expected_missing).map_err(f0_error)?;
+        let warnings = if expected_missing.is_empty() {
+            Vec::new()
+        } else {
+            vec![LosslessWarning {
+                code: "expected-missing-reference".to_owned(),
+                message: "pre-replacement database contains legacy references whose payloads are already missing".to_owned(),
+                metadata: serde_json::json!({ "targetCount": expected_missing.len() }),
+            }]
+        };
+        let compatibility = LosslessCompatibility {
+            oracle_version: FORMAT_VERSION,
+            canonical_database_sha256: validation.canonical_database_sha256.clone(),
+            reference_graph_sha256: validation.reference_graph_sha256.clone(),
+        };
+        let references = validation
+            .references
+            .iter()
+            .map(lossless_reference)
+            .collect::<Vec<_>>();
+        let mut output_guard = IncompleteBackupFile::create(output_path)?;
+        let written = write_lossless_package_v1(
+            output_guard.file_mut(),
+            &entries,
+            compatibility,
+            references,
+            warnings,
+            serde_json::json!({ "sourceRevision": expected_revision }),
+            cancellation,
+        )?;
+        output_guard.sync()?;
+        validate_payload_manifest(&written.manifest, &payloads)?;
+        let verified_bytes = verify_pre_replacement_backup(
+            output_path,
+            &written.manifest,
+            &database,
+            job_staging_root,
+            cas,
+            store,
+            cancellation,
+        )?;
+        if verified_bytes != written.archive_bytes {
+            return Err(LosslessError::new(
+                LosslessErrorCode::BackupIncomplete,
+                "pre-replacement lossless backup byte count changed during verification",
+            ));
+        }
+        output_guard.keep();
+        Ok(verified_bytes)
+    })();
+    let cleanup = store
+        .cleanup_risu_save_export(&export_path)
+        .map_err(store_error);
+    match (outcome, cleanup) {
+        (Ok(bytes), Ok(())) => Ok(bytes),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(cleanup_error(
+            error,
+            "pinned database export cleanup",
+            cleanup,
+        )),
+    }
+}
+
+fn pinned_backup_entries(
+    database_path: &Path,
+    assets: &[AssetAlias],
+    cold: &[ColdAlias],
+    cas: &PayloadCas,
+    cancellation: &dyn CancellationProbe,
+) -> Result<(Vec<LosslessWriteEntry>, Vec<F0PayloadDescriptor>), LosslessError> {
+    let mut entries = Vec::with_capacity(1 + assets.len() + cold.len());
+    let mut payloads = Vec::with_capacity(assets.len() + cold.len());
+    entries.push(LosslessWriteEntry {
+        logical_path: DATABASE_PATH.to_owned(),
+        logical_key: None,
+        kind: PayloadKind::Database,
+        metadata: Value::Object(serde_json::Map::new()),
+        source: database_path.to_path_buf(),
+    });
+    for alias in assets {
+        check_cancelled(cancellation)?;
+        let kind = match alias.kind.as_str() {
+            "asset" => PayloadKind::Asset,
+            "inlay" => PayloadKind::Inlay,
+            _ => {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::BackupIncomplete,
+                    "pre-replacement asset inventory contains an unsupported kind",
+                ))
+            }
+        };
+        let hash = required_backup_object_hash(alias.object_hash.as_deref(), &alias.key)?;
+        let (source, byte_length) = pinned_object(cas, hash, alias.size, &alias.key)?;
+        let metadata = lossless_asset_metadata(alias)?;
+        entries.push(LosslessWriteEntry {
+            logical_path: backup_logical_path(kind, &alias.key),
+            logical_key: Some(alias.key.clone()),
+            kind,
+            metadata: metadata.clone(),
+            source: source.clone(),
+        });
+        payloads.push(F0PayloadDescriptor {
+            kind: f0_payload_kind(kind)?,
+            key: alias.key.clone(),
+            sha256: hash.to_owned(),
+            byte_length,
+            metadata,
+            cold_source: None,
+        });
+    }
+    for alias in cold {
+        check_cancelled(cancellation)?;
+        let hash = required_backup_object_hash(alias.object_hash.as_deref(), &alias.key)?;
+        let (source, byte_length) = pinned_object(cas, hash, alias.size, &alias.key)?;
+        entries.push(LosslessWriteEntry {
+            logical_path: backup_logical_path(PayloadKind::Cold, &alias.key),
+            logical_key: Some(alias.key.clone()),
+            kind: PayloadKind::Cold,
+            metadata: alias.metadata.clone(),
+            source: source.clone(),
+        });
+        payloads.push(F0PayloadDescriptor {
+            kind: F0PayloadKind::Cold,
+            key: alias.key.clone(),
+            sha256: hash.to_owned(),
+            byte_length,
+            metadata: alias.metadata.clone(),
+            cold_source: Some(source),
+        });
+    }
+    Ok((entries, payloads))
+}
+
+fn lossless_asset_metadata(alias: &AssetAlias) -> Result<Value, LosslessError> {
+    let mut metadata = alias.metadata.as_object().cloned().ok_or_else(|| {
+        LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            format!(
+                "pre-replacement payload metadata is not an object: {}",
+                alias.key
+            ),
+        )
+    })?;
+    metadata.insert("name".to_owned(), Value::String(alias.name.clone()));
+    metadata.insert("ext".to_owned(), Value::String(alias.ext.clone()));
+    metadata.insert("mime".to_owned(), Value::String(alias.mime.clone()));
+    if alias.kind == "inlay" {
+        let inlay_type = alias.inlay_type.as_ref().ok_or_else(|| {
+            LosslessError::new(
+                LosslessErrorCode::BackupIncomplete,
+                format!(
+                    "pre-replacement Inlay has no declared Inlay type: {}",
+                    alias.key
+                ),
+            )
+        })?;
+        metadata.insert("inlayType".to_owned(), Value::String(inlay_type.clone()));
+        if let Some(width) = alias.width {
+            metadata.insert("width".to_owned(), Value::from(width));
+        }
+        if let Some(height) = alias.height {
+            metadata.insert("height".to_owned(), Value::from(height));
+        }
+    }
+    Ok(Value::Object(metadata))
+}
+
+fn required_backup_object_hash<'a>(
+    hash: Option<&'a str>,
+    logical_key: &str,
+) -> Result<&'a str, LosslessError> {
+    hash.ok_or_else(|| {
+        LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            format!("pre-replacement payload has no immutable object: {logical_key}"),
+        )
+    })
+}
+
+fn pinned_object(
+    cas: &PayloadCas,
+    hash: &str,
+    declared_size: i64,
+    logical_key: &str,
+) -> Result<(PathBuf, u64), LosslessError> {
+    let declared_size = u64::try_from(declared_size).map_err(|_| {
+        LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            format!("pre-replacement payload has a negative size: {logical_key}"),
+        )
+    })?;
+    let path = cas
+        .object_path(hash)
+        .map_err(LosslessError::io)?
+        .ok_or_else(|| {
+            LosslessError::new(
+                LosslessErrorCode::BackupIncomplete,
+                format!("pre-replacement payload object is missing: {logical_key}"),
+            )
+        })?;
+    let actual_size = fs::metadata(&path).map_err(LosslessError::io)?.len();
+    if actual_size != declared_size {
+        return Err(LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            format!("pre-replacement payload size differs from its alias: {logical_key}"),
+        ));
+    }
+    Ok((path, actual_size))
+}
+
+fn backup_logical_path(kind: PayloadKind, logical_key: &str) -> String {
+    let namespace = match kind {
+        PayloadKind::Database => "database",
+        PayloadKind::Asset => "assets",
+        PayloadKind::Inlay => "inlays",
+        PayloadKind::Cold => "cold",
+    };
+    format!("{namespace}/{}", hex::encode(logical_key.as_bytes()))
+}
+
+fn validate_payload_manifest(
+    manifest: &LosslessManifest,
+    payloads: &[F0PayloadDescriptor],
+) -> Result<(), LosslessError> {
+    let package_payloads = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.kind != PayloadKind::Database)
+        .collect::<Vec<_>>();
+    if package_payloads.len() != payloads.len() {
+        return Err(LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            "pre-replacement payload inventory cardinality differs from its package",
+        ));
+    }
+    for payload in payloads {
+        let kind = match payload.kind {
+            F0PayloadKind::Asset => PayloadKind::Asset,
+            F0PayloadKind::Inlay => PayloadKind::Inlay,
+            F0PayloadKind::Cold => PayloadKind::Cold,
+        };
+        let entry = package_payloads
+            .iter()
+            .find(|entry| {
+                entry.kind == kind && entry.logical_key.as_deref() == Some(payload.key.as_str())
+            })
+            .ok_or_else(|| {
+                LosslessError::new(
+                    LosslessErrorCode::BackupIncomplete,
+                    format!(
+                        "pre-replacement package omitted payload inventory entry: {}",
+                        payload.key
+                    ),
+                )
+            })?;
+        if entry.sha256 != payload.sha256
+            || entry.byte_length != payload.byte_length
+            || entry.metadata != payload.metadata
+        {
+            return Err(LosslessError::new(
+                LosslessErrorCode::BackupIncomplete,
+                format!(
+                    "pre-replacement package payload differs from pinned inventory: {}",
+                    payload.key
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_pre_replacement_backup(
+    backup_path: &Path,
+    expected_manifest: &LosslessManifest,
+    expected_database: &Value,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    store: &mut PersistentStore,
+    cancellation: &dyn CancellationProbe,
+) -> Result<u64, LosslessError> {
+    let mut raw = File::open(backup_path).map_err(LosslessError::io)?;
+    let verified = verify_lossless_package_v1(&mut raw, cancellation)?;
+    if &verified.manifest != expected_manifest {
+        return Err(LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            "pre-replacement package manifest changed during verification",
+        ));
+    }
+    let verification_root = JobOwnedDirectory::create(job_staging_root)?;
+    let mut raw = File::open(backup_path).map_err(LosslessError::io)?;
+    let staged = read_lossless_package_v1(&mut raw, verification_root.as_ref(), cas, cancellation)?;
+    let database_entry = staged
+        .entries
+        .iter()
+        .find(|entry| entry.kind == PayloadKind::Database)
+        .expect("verified backup has one database entry");
+    let verification_staging = store.replace_begin().map_err(store_error)?.staging_id;
+    let validation = (|| {
+        stage_block_database(store, &verification_staging, database_entry, cancellation)?;
+        let decoded = store
+            .materialize_staging(&verification_staging)
+            .map_err(store_error)?;
+        if &decoded != expected_database {
+            return Err(LosslessError::new(
+                LosslessErrorCode::BackupIncomplete,
+                "pre-replacement database does not decode to the pinned expected revision",
+            ));
+        }
+        validate_staged_f0(&staged.manifest, &staged.entries, &decoded, cas)?;
+        Ok(())
+    })();
+    let aborted = store
+        .replace_abort(&verification_staging)
+        .map_err(store_error);
+    match (validation, aborted) {
+        (Ok(()), Ok(())) => Ok(verified.archive_bytes),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(cleanup_error(
+            error,
+            "pre-replacement verification staging abort",
+            cleanup,
+        )),
+    }
+}
+
+struct IncompleteBackupFile {
+    file: Option<File>,
+    path: PathBuf,
+    keep: bool,
+}
+
+impl IncompleteBackupFile {
+    fn create(path: &Path) -> Result<Self, LosslessError> {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(LosslessError::io)?;
+        Ok(Self {
+            file: Some(file),
+            path: path.to_path_buf(),
+            keep: false,
+        })
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("backup output remains open")
+    }
+
+    fn sync(&mut self) -> Result<(), LosslessError> {
+        self.file_mut().sync_all().map_err(LosslessError::io)?;
+        self.file.take();
+        Ok(())
+    }
+
+    fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for IncompleteBackupFile {
+    fn drop(&mut self) {
+        self.file.take();
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct JobOwnedDirectory {
+    path: PathBuf,
+}
+
+impl JobOwnedDirectory {
+    fn create(parent: &Path) -> Result<Self, LosslessError> {
+        let parent = fs::canonicalize(parent).map_err(LosslessError::io)?;
+        let path = parent.join(format!("lossless-verify-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).map_err(LosslessError::io)?;
+        let path = fs::canonicalize(path).map_err(LosslessError::io)?;
+        if path.parent() != Some(parent.as_path()) {
+            return Err(LosslessError::new(
+                LosslessErrorCode::InvalidPath,
+                "lossless verification root escapes its job-owned parent",
+            ));
+        }
+        Ok(Self { path })
+    }
+}
+
+impl AsRef<Path> for JobOwnedDirectory {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for JobOwnedDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -778,7 +1502,7 @@ fn validate_manifest(manifest: &LosslessManifest) -> Result<(), LosslessError> {
                     "lossless package payload logical key is invalid",
                 ));
             }
-            if !logical_keys.insert(logical_key.to_owned()) {
+            if !logical_keys.insert((entry.kind, logical_key.to_owned())) {
                 return Err(LosslessError::new(
                     LosslessErrorCode::DuplicateLogicalKey,
                     format!("duplicate lossless package logical key: {logical_key}"),
@@ -888,10 +1612,9 @@ fn stage_database_entry(
     entry: &LosslessManifestEntry,
     staging_directory: &Path,
     cancellation: &dyn CancellationProbe,
-    owned_paths: &mut OwnedPaths,
 ) -> Result<StagedLosslessEntry, LosslessError> {
     let path = staging_directory.join(format!("{}.database", uuid::Uuid::new_v4()));
-    let mut guard = IncompleteFile::new(path.clone());
+    let owned = JobOwnedFile::new(path.clone());
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -902,9 +1625,7 @@ fn stage_database_entry(
     output.sync_all().map_err(LosslessError::io)?;
     drop(output);
     require_entry_hash(entry, &actual_hash)?;
-    owned_paths.track(path.clone());
-    guard.keep();
-    Ok(staged_entry(entry, Some(path), None))
+    Ok(staged_entry(entry, Some(owned), None))
 }
 
 fn stage_payload_entry(
@@ -945,7 +1666,7 @@ fn stage_payload_entry(
 
 fn staged_entry(
     entry: &LosslessManifestEntry,
-    staged_path: Option<PathBuf>,
+    staged_path: Option<JobOwnedFile>,
     immutable_object: Option<PreparedPayload>,
 ) -> StagedLosslessEntry {
     StagedLosslessEntry {
@@ -1082,6 +1803,21 @@ fn prepare_staging_directory(root: &Path) -> Result<PathBuf, LosslessError> {
             "lossless package staging directory escapes its owned root",
         ));
     }
+    for candidate in fs::read_dir(&staging).map_err(LosslessError::io)? {
+        let candidate = candidate.map_err(LosslessError::io)?;
+        let file_name = candidate.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(id) = file_name.strip_suffix(".database") else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(id).is_ok()
+            && candidate.file_type().map_err(LosslessError::io)?.is_file()
+        {
+            fs::remove_file(candidate.path()).map_err(LosslessError::io)?;
+        }
+    }
     Ok(staging)
 }
 
@@ -1196,49 +1932,34 @@ fn write_all_checked(
     Ok(())
 }
 
-struct IncompleteFile {
+#[derive(Debug)]
+pub(crate) struct JobOwnedFile {
     path: PathBuf,
-    keep: bool,
 }
 
-impl IncompleteFile {
+impl JobOwnedFile {
     fn new(path: PathBuf) -> Self {
-        Self { path, keep: false }
-    }
-
-    fn keep(&mut self) {
-        self.keep = true;
+        Self { path }
     }
 }
 
-impl Drop for IncompleteFile {
+impl AsRef<Path> for JobOwnedFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for JobOwnedFile {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for JobOwnedFile {
     fn drop(&mut self) {
-        if !self.keep {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-#[derive(Default)]
-struct OwnedPaths {
-    paths: Vec<PathBuf>,
-}
-
-impl OwnedPaths {
-    fn track(&mut self, path: PathBuf) {
-        self.paths.push(path);
-    }
-
-    fn release(&mut self) {
-        self.paths.clear();
-    }
-}
-
-impl Drop for OwnedPaths {
-    fn drop(&mut self) {
-        for path in self.paths.iter().rev() {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -1250,10 +1971,7 @@ mod tests {
     use std::{
         fs,
         io::Cursor,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
+        sync::{atomic::AtomicBool, Arc},
     };
 
     #[test]
@@ -1371,215 +2089,47 @@ mod tests {
     }
 
     #[test]
-    fn restore_verifies_graph_and_complete_old_backup_before_one_activation() {
-        struct Hooks {
-            events: Vec<&'static str>,
-            backup_path: PathBuf,
-            backup_bytes: Vec<u8>,
-        }
-
-        impl LosslessRestoreHooks for Hooks {
-            fn stage_database(
-                &mut self,
-                store: &mut PersistentStore,
-                staging_id: &str,
-                database: &StagedLosslessEntry,
-            ) -> Result<(), LosslessError> {
-                assert_eq!(
-                    fs::read(database.staged_path.as_ref().unwrap()).unwrap(),
-                    b"new-db"
-                );
-                store
-                    .replace_put_root(staging_id, &json!({ "database": "new" }))
-                    .map_err(store_error)?;
-                store
-                    .replace_put_presets(staging_id, &[])
-                    .map_err(store_error)?;
-                store
-                    .replace_add_characters(staging_id, &[])
-                    .map_err(store_error)?;
-                self.events.push("stage-database");
-                Ok(())
-            }
-
-            fn validate_reference_graph(
-                &mut self,
-                manifest: &LosslessManifest,
-            ) -> Result<(), LosslessError> {
-                assert_eq!(manifest.references[0].occurrence, 0);
-                assert_eq!(manifest.compatibility, f0_compatibility());
-                self.events.push("validate-graph");
-                Ok(())
-            }
-
-            fn create_pre_replacement_backup(
-                &mut self,
-                _cancellation: &dyn CancellationProbe,
-            ) -> Result<PathBuf, LosslessError> {
-                self.events.push("create-backup");
-                fs::write(&self.backup_path, &self.backup_bytes).unwrap();
-                Ok(self.backup_path.clone())
-            }
-
-            fn confirm_pre_replacement_backup(
-                &mut self,
-                backup: &VerifiedLosslessBackup,
-            ) -> Result<(), LosslessError> {
-                assert_eq!(
-                    backup.manifest.entries[0].sha256,
-                    hex::encode(Sha256::digest(b"old-db"))
-                );
-                self.events.push("confirm-backup");
-                Ok(())
-            }
-        }
-
+    fn arbitrary_database_bytes_cannot_pass_with_manifest_constants() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("staging");
         let repository = directory.path().join("repository");
         fs::create_dir(&staging).unwrap();
         fs::create_dir(&repository).unwrap();
         let incoming = minimal_package(directory.path(), "new", b"new-db", b"new-asset");
-        let backup_bytes = minimal_package(directory.path(), "old", b"old-db", b"old-asset");
         let backup_path = directory.path().join("pre-replacement.lossless");
-        let mut hooks = Hooks {
-            events: Vec::new(),
-            backup_path,
-            backup_bytes,
-        };
         let cas = PayloadCas::new(repository).unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
 
-        let restored = restore_lossless_package_v1(
+        let error = restore_lossless_package_v1(
             &mut Cursor::new(incoming),
             &staging,
             &cas,
             &mut store,
             0,
-            &mut hooks,
+            &backup_path,
             &NeverCancelled,
         )
-        .expect("restore commits complete new state");
+        .unwrap_err();
 
-        assert_eq!(restored.revision, 1);
-        assert_eq!(store.revision().unwrap(), 1);
-        assert_eq!(store.materialize(None).unwrap()["database"], "new");
-        assert_eq!(
-            hooks.events,
-            [
-                "stage-database",
-                "validate-graph",
-                "create-backup",
-                "confirm-backup",
-            ]
-        );
+        assert_eq!(error.code, LosslessErrorCode::InvalidDatabase);
+        assert_eq!(store.revision().unwrap(), 0);
+        assert!(!backup_path.exists());
     }
 
     #[test]
-    fn sqlite_reopen_observes_complete_old_or_database_with_one_alias_generation() {
-        struct StoreHooks {
-            backup_path: PathBuf,
-            backup_bytes: Vec<u8>,
-        }
-
-        impl LosslessRestoreHooks for StoreHooks {
-            fn stage_database(
-                &mut self,
-                store: &mut PersistentStore,
-                staging_id: &str,
-                database: &StagedLosslessEntry,
-            ) -> Result<(), LosslessError> {
-                let value: Value = serde_json::from_slice(
-                    &fs::read(database.staged_path.as_ref().unwrap()).map_err(LosslessError::io)?,
-                )
-                .map_err(|error| invalid_manifest(error.to_string()))?;
-                store
-                    .replace_put_root(staging_id, &value)
-                    .map_err(store_error)?;
-                store
-                    .replace_put_presets(staging_id, &[])
-                    .map_err(store_error)?;
-                store
-                    .replace_add_characters(staging_id, &[])
-                    .map_err(store_error)?;
-                Ok(())
-            }
-
-            fn validate_reference_graph(
-                &mut self,
-                manifest: &LosslessManifest,
-            ) -> Result<(), LosslessError> {
-                assert_eq!(
-                    manifest
-                        .references
-                        .iter()
-                        .map(|reference| reference.occurrence)
-                        .collect::<Vec<_>>(),
-                    [0, 1, 2]
-                );
-                assert_eq!(manifest.compatibility, f0_compatibility());
-                Ok(())
-            }
-
-            fn create_pre_replacement_backup(
-                &mut self,
-                _cancellation: &dyn CancellationProbe,
-            ) -> Result<PathBuf, LosslessError> {
-                fs::write(&self.backup_path, &self.backup_bytes).map_err(LosslessError::io)?;
-                Ok(self.backup_path.clone())
-            }
-
-            fn confirm_pre_replacement_backup(
-                &mut self,
-                backup: &VerifiedLosslessBackup,
-            ) -> Result<(), LosslessError> {
-                let database = backup
-                    .manifest
-                    .entries
-                    .iter()
-                    .find(|entry| entry.kind == PayloadKind::Database)
-                    .unwrap();
-                if database.sha256 != hex::encode(Sha256::digest(br#"{"username":"Old"}"#)) {
-                    return Err(invalid_manifest(
-                        "pre-replacement backup is not the current database",
-                    ));
-                }
-                Ok(())
-            }
-        }
-
+    fn sqlite_reopen_observes_complete_old_or_database_and_typed_payload_generation() {
         for fail_before_commit in [true, false] {
             let directory = tempfile::tempdir().unwrap();
             let staging = directory.path().join("job-staging");
             let repository = directory.path().join("repository");
             fs::create_dir(&staging).unwrap();
             fs::create_dir(&repository).unwrap();
-            let incoming = atomic_package(directory.path());
-            let backup = minimal_package(
-                directory.path(),
-                if fail_before_commit {
-                    "old-fail"
-                } else {
-                    "old-success"
-                },
-                br#"{"username":"Old"}"#,
-                b"old-asset",
-            );
+            let incoming = production_package(directory.path(), "New", b"new");
             let backup_path = directory.path().join("pre-replacement.lossless");
             let mut store =
                 crate::persistent_store::PersistentStore::open(directory.path()).unwrap();
-            let old = store.replace_begin().unwrap().staging_id;
-            store
-                .replace_put_root(&old, &json!({ "username": "Old" }))
-                .unwrap();
-            store.replace_put_presets(&old, &[]).unwrap();
-            store.replace_add_characters(&old, &[]).unwrap();
-            store.replace_commit(&old, Some(0)).unwrap();
-            let mut hooks = StoreHooks {
-                backup_path,
-                backup_bytes: backup,
-            };
             let cas = PayloadCas::new(&repository).unwrap();
+            seed_active_store(&mut store, &cas, "Old", b"old");
 
             let result = restore_lossless_package_v1(
                 &mut Cursor::new(incoming),
@@ -1587,7 +2137,7 @@ mod tests {
                 &cas,
                 &mut store,
                 if fail_before_commit { 0 } else { 1 },
-                &mut hooks,
+                &backup_path,
                 &NeverCancelled,
             );
 
@@ -1601,33 +2151,50 @@ mod tests {
                 );
                 assert_eq!(reopened.revision().unwrap(), 1);
                 assert_eq!(reopened.materialize(None).unwrap()["username"], "Old");
-                assert_eq!(reopened.read_asset_alias("asset.bin", None).unwrap(), None);
+                assert!(!backup_path.exists());
             } else {
                 assert_eq!(result.unwrap().revision, 2);
                 assert_eq!(reopened.revision().unwrap(), 2);
                 assert_eq!(reopened.materialize(None).unwrap()["username"], "New");
-                for key in ["asset.bin", "audio", "character"] {
-                    let alias = reopened
-                        .read_asset_alias(key, None)
-                        .unwrap()
-                        .expect("payload alias activates with database");
-                    assert_eq!(alias.revision, 2);
-                    assert_eq!(
-                        cas.read_object(alias.value.object_hash.as_ref().unwrap())
-                            .unwrap()
-                            .is_some(),
-                        true
-                    );
-                }
+                let asset = reopened
+                    .read_asset_alias_by_kind("asset", "shared", None)
+                    .unwrap()
+                    .unwrap();
+                let inlay = reopened
+                    .read_asset_alias_by_kind("inlay", "shared", None)
+                    .unwrap()
+                    .unwrap();
+                let cold = reopened.read_cold_alias("shared", None).unwrap().unwrap();
+                assert_eq!((asset.revision, inlay.revision, cold.revision), (2, 2, 2));
+                assert_eq!(asset.value.metadata["nested"]["label"], "New-asset");
+                assert_eq!(inlay.value.metadata["nested"]["label"], "New-inlay");
+                assert_eq!(cold.value.metadata["nested"]["label"], "New-cold");
                 assert_eq!(
-                    reopened
-                        .read_asset_alias("character", None)
+                    cas.read_object(asset.value.object_hash.as_ref().unwrap())
                         .unwrap()
-                        .unwrap()
-                        .value
-                        .kind,
-                    "asset"
+                        .unwrap(),
+                    b"new-asset"
                 );
+                assert_eq!(
+                    cas.read_object(inlay.value.object_hash.as_ref().unwrap())
+                        .unwrap()
+                        .unwrap(),
+                    b"new-inlay"
+                );
+                assert!(backup_path.is_file());
+                let backup = verify_lossless_package_v1(
+                    &mut File::open(&backup_path).unwrap(),
+                    &NeverCancelled,
+                )
+                .unwrap();
+                assert_eq!(backup.manifest.extensions["sourceRevision"], 1);
+                assert_eq!(backup.manifest.entries.len(), 4);
+                assert!(backup
+                    .manifest
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == PayloadKind::Cold
+                        && entry.logical_key.as_deref() == Some("shared")));
             }
         }
     }
@@ -1664,6 +2231,12 @@ mod tests {
                 &project_payload_aliases(&incoming.entries).unwrap(),
             )
             .unwrap();
+        store
+            .replace_put_cold_aliases(
+                &abandoned,
+                &project_cold_aliases(&incoming.entries).unwrap(),
+            )
+            .unwrap();
 
         drop(store);
         let reopened = PersistentStore::open(directory.path()).unwrap();
@@ -1671,6 +2244,7 @@ mod tests {
         assert_eq!(reopened.revision().unwrap(), 1);
         assert_eq!(reopened.materialize(None).unwrap()["username"], "Old");
         assert_eq!(reopened.read_asset_alias("asset.bin", None).unwrap(), None);
+        assert_eq!(reopened.read_cold_alias("character", None).unwrap(), None);
     }
 
     #[test]
@@ -1911,6 +2485,118 @@ mod tests {
     }
 
     #[test]
+    fn payload_logical_keys_are_unique_within_each_namespace() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("database");
+        let asset = directory.path().join("asset");
+        let inlay = directory.path().join("inlay");
+        let cold = directory.path().join("cold");
+        fs::write(&database, b"database").unwrap();
+        fs::write(&asset, b"asset").unwrap();
+        fs::write(&inlay, b"inlay").unwrap();
+        fs::write(&cold, b"cold").unwrap();
+        let entries = vec![
+            LosslessWriteEntry {
+                logical_path: DATABASE_PATH.to_owned(),
+                logical_key: None,
+                kind: PayloadKind::Database,
+                metadata: json!({}),
+                source: database,
+            },
+            LosslessWriteEntry {
+                logical_path: "assets/shared".to_owned(),
+                logical_key: Some("shared".to_owned()),
+                kind: PayloadKind::Asset,
+                metadata: json!({ "name": "asset", "ext": "", "mime": "application/octet-stream" }),
+                source: asset,
+            },
+            LosslessWriteEntry {
+                logical_path: "inlays/shared".to_owned(),
+                logical_key: Some("shared".to_owned()),
+                kind: PayloadKind::Inlay,
+                metadata: json!({
+                    "name": "inlay", "ext": "", "mime": "application/octet-stream",
+                    "inlayType": "image"
+                }),
+                source: inlay,
+            },
+            LosslessWriteEntry {
+                logical_path: "cold/shared".to_owned(),
+                logical_key: Some("shared".to_owned()),
+                kind: PayloadKind::Cold,
+                metadata: json!({ "name": "cold", "ext": "", "mime": "application/octet-stream" }),
+                source: cold,
+            },
+        ];
+
+        let report = write_lossless_package_v1(
+            &mut Vec::new(),
+            &entries,
+            compatibility(),
+            vec![
+                reference("asset", "shared", ReferenceStatus::Present, 0),
+                reference("inlay", "shared", ReferenceStatus::Present, 1),
+                reference("cold", "shared", ReferenceStatus::Present, 2),
+            ],
+            vec![],
+            json!({}),
+            &NeverCancelled,
+        )
+        .expect("kind-scoped keys do not collide");
+
+        assert_eq!(report.manifest.entries.len(), 4);
+    }
+
+    #[test]
+    fn successful_read_owns_database_file_and_reopen_sweeps_a_forgotten_job_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let package = minimal_package(directory.path(), "owned", b"database", b"asset");
+        let cas = PayloadCas::new(repository).unwrap();
+
+        let first =
+            read_lossless_package_v1(&mut Cursor::new(&package), &staging, &cas, &NeverCancelled)
+                .unwrap();
+        let forgotten = first
+            .entries
+            .iter()
+            .find(|entry| entry.kind == PayloadKind::Database)
+            .unwrap()
+            .staged_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf();
+        assert!(forgotten.is_file());
+        std::mem::forget(first);
+
+        let second =
+            read_lossless_package_v1(&mut Cursor::new(&package), &staging, &cas, &NeverCancelled)
+                .unwrap();
+        assert!(
+            !forgotten.exists(),
+            "reopen must sweep the forgotten job file"
+        );
+        let active = second
+            .entries
+            .iter()
+            .find(|entry| entry.kind == PayloadKind::Database)
+            .unwrap()
+            .staged_path
+            .as_ref()
+            .unwrap()
+            .to_path_buf();
+        assert!(active.is_file());
+        drop(second);
+        assert!(
+            !active.exists(),
+            "the successful report retains cleanup ownership"
+        );
+    }
+
+    #[test]
     fn version_one_retains_the_u32_per_entry_limit_without_allocating_the_boundary() {
         let mut manifest = LosslessManifest {
             version: FORMAT_VERSION,
@@ -1949,164 +2635,205 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_graph_rejection_and_corrupt_backup_abort_without_activation() {
-        #[derive(Clone, Copy)]
-        enum Failure {
-            Graph,
-            CancelAfterGraph,
-            CorruptBackup,
-        }
-
-        struct Hooks {
-            failure: Failure,
-            events: Vec<&'static str>,
-            cancelled: Arc<AtomicBool>,
-            backup_path: PathBuf,
-            backup: Vec<u8>,
-        }
-
-        impl LosslessRestoreHooks for Hooks {
-            fn stage_database(
-                &mut self,
-                store: &mut PersistentStore,
-                staging_id: &str,
-                _database: &StagedLosslessEntry,
-            ) -> Result<(), LosslessError> {
-                store
-                    .replace_put_root(staging_id, &json!({ "database": "new" }))
-                    .map_err(store_error)?;
-                store
-                    .replace_put_presets(staging_id, &[])
-                    .map_err(store_error)?;
-                store
-                    .replace_add_characters(staging_id, &[])
-                    .map_err(store_error)?;
-                self.events.push("stage");
-                Ok(())
-            }
-
-            fn validate_reference_graph(
-                &mut self,
-                _manifest: &LosslessManifest,
-            ) -> Result<(), LosslessError> {
-                self.events.push("graph");
-                match self.failure {
-                    Failure::Graph => Err(LosslessError::new(
-                        LosslessErrorCode::UnexpectedReference,
-                        "F0 ordered reference graph differs",
-                    )),
-                    Failure::CancelAfterGraph => {
-                        self.cancelled.store(true, Ordering::SeqCst);
-                        Ok(())
-                    }
-                    Failure::CorruptBackup => Ok(()),
-                }
-            }
-
-            fn create_pre_replacement_backup(
-                &mut self,
-                _cancellation: &dyn CancellationProbe,
-            ) -> Result<PathBuf, LosslessError> {
-                self.events.push("backup");
-                let mut bytes = self.backup.clone();
-                *bytes.last_mut().unwrap() ^= 1;
-                fs::write(&self.backup_path, bytes).map_err(LosslessError::io)?;
-                Ok(self.backup_path.clone())
-            }
-
-            fn confirm_pre_replacement_backup(
-                &mut self,
-                _backup: &VerifiedLosslessBackup,
-            ) -> Result<(), LosslessError> {
-                self.events.push("confirm");
-                Ok(())
-            }
-        }
-
-        for (index, failure) in [
-            Failure::Graph,
-            Failure::CancelAfterGraph,
-            Failure::CorruptBackup,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let directory = tempfile::tempdir().unwrap();
-            let staging = directory.path().join("staging");
-            let repository = directory.path().join("repository");
-            fs::create_dir(&staging).unwrap();
-            fs::create_dir(&repository).unwrap();
-            let incoming = minimal_package(
-                directory.path(),
-                &format!("incoming-{index}"),
-                b"new-db",
-                b"new-asset",
-            );
-            let backup = minimal_package(
-                directory.path(),
-                &format!("backup-{index}"),
-                b"old-db",
-                b"old-asset",
-            );
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let cancellation = crate::local_backup::AtomicCancellation::new(Arc::clone(&cancelled));
-            let mut hooks = Hooks {
-                failure,
-                events: Vec::new(),
-                cancelled,
-                backup_path: directory.path().join("pre-replacement.lossless"),
-                backup,
-            };
-            let cas = PayloadCas::new(repository).unwrap();
-            let mut store = PersistentStore::open(directory.path()).unwrap();
-
-            let error = restore_lossless_package_v1(
-                &mut Cursor::new(incoming),
-                &staging,
-                &cas,
-                &mut store,
-                0,
-                &mut hooks,
-                &cancellation,
-            )
-            .unwrap_err();
-
-            assert_eq!(store.revision().unwrap(), 0);
-            assert_eq!(
-                store.read_asset_alias("incoming-0.bin", None).unwrap(),
-                None
-            );
-            match failure {
-                Failure::Graph => assert_eq!(error.code, LosslessErrorCode::UnexpectedReference),
-                Failure::CancelAfterGraph => {
-                    assert_eq!(error.code, LosslessErrorCode::Cancelled)
-                }
-                Failure::CorruptBackup => assert_eq!(error.code, LosslessErrorCode::HashMismatch),
-            }
-            assert!(!hooks.events.contains(&"confirm"));
-        }
-
+    fn cancellation_and_incomplete_pinned_inventory_abort_without_activation_or_backup() {
         let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("cancelled-database");
-        fs::write(&database, b"database").unwrap();
+        let staging = directory.path().join("staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let cas = PayloadCas::new(repository).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let backup_path = directory.path().join("cancelled.lossless");
         let cancelled = Arc::new(AtomicBool::new(true));
-        let error = write_lossless_package_v1(
-            &mut Vec::new(),
-            &[LosslessWriteEntry {
-                logical_path: DATABASE_PATH.to_owned(),
-                logical_key: None,
-                kind: PayloadKind::Database,
-                metadata: json!({}),
-                source: database,
-            }],
-            compatibility(),
-            vec![],
-            vec![],
-            json!({}),
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(incoming.clone()),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
             &crate::local_backup::AtomicCancellation::new(cancelled),
         )
         .unwrap_err();
         assert_eq!(error.code, LosslessErrorCode::Cancelled);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert!(!backup_path.exists());
+
+        let old_asset = store
+            .read_asset_alias_by_kind("asset", "shared", None)
+            .unwrap()
+            .unwrap();
+        let object = cas
+            .object_path(old_asset.value.object_hash.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        fs::remove_file(object).unwrap();
+        let backup_path = directory.path().join("incomplete.lossless");
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::BackupIncomplete);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert!(!backup_path.exists());
+    }
+
+    #[test]
+    fn pre_replacement_backup_marks_already_missing_legacy_payloads_expected() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let cas = PayloadCas::new(repository).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        stage_f0_database(&mut store, "OldMissing");
+        let backup_path = directory.path().join("legacy-missing.lossless");
+
+        restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        let backup =
+            verify_lossless_package_v1(&mut File::open(&backup_path).unwrap(), &NeverCancelled)
+                .unwrap();
+        assert!(backup
+            .manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "expected-missing-reference"));
+        assert!(backup.manifest.references.iter().any(|reference| {
+            reference.target_kind == "asset"
+                && reference.target_key == "shared"
+                && reference.status == ReferenceStatus::ExpectedMissing
+        }));
+        assert!(backup.manifest.references.iter().any(|reference| {
+            reference.target_kind == "inlay"
+                && reference.target_key == "shared"
+                && reference.status == ReferenceStatus::ExpectedMissing
+        }));
+        assert!(backup.manifest.references.iter().any(|reference| {
+            reference.target_kind == "cold"
+                && reference.target_key == "shared"
+                && reference.status == ReferenceStatus::ExpectedMissing
+        }));
+    }
+
+    #[test]
+    fn decoded_graph_mismatch_and_backup_output_failpoint_preserve_active_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+
+        let mut mismatched = production_package(directory.path(), "Mismatch", b"mismatch");
+        rewrite_manifest(&mut mismatched, |manifest| {
+            manifest.compatibility.reference_graph_sha256 = "00".repeat(32);
+        });
+        let graph_backup = directory.path().join("graph-mismatch.lossless");
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(mismatched),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &graph_backup,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, LosslessErrorCode::UnexpectedReference);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert!(!graph_backup.exists());
+
+        let incoming = production_package(directory.path(), "OutputFailure", b"output");
+        let backup_directory = directory.path().join("backup-output-failpoint");
+        fs::create_dir(&backup_directory).unwrap();
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_directory,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, LosslessErrorCode::Io);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert!(backup_directory.is_dir());
+    }
+
+    #[test]
+    fn asset_backup_metadata_fills_canonical_fields_without_discarding_unknowns() {
+        let asset = AssetAlias {
+            key: "shared".to_owned(),
+            object_hash: Some("11".repeat(32)),
+            kind: "asset".to_owned(),
+            size: 1,
+            mime: "application/octet-stream".to_owned(),
+            name: "shared.bin".to_owned(),
+            ext: "bin".to_owned(),
+            inlay_type: None,
+            width: None,
+            height: None,
+            metadata: json!({ "nested": { "preserved": true } }),
+        };
+        let inlay = AssetAlias {
+            key: "shared".to_owned(),
+            object_hash: Some("22".repeat(32)),
+            kind: "inlay".to_owned(),
+            size: 1,
+            mime: "image/png".to_owned(),
+            name: "original.png".to_owned(),
+            ext: "png".to_owned(),
+            inlay_type: Some("image".to_owned()),
+            width: Some(11),
+            height: Some(13),
+            metadata: json!({ "nested": { "preserved": true } }),
+        };
+
+        assert_eq!(
+            lossless_asset_metadata(&asset).unwrap(),
+            json!({
+                "nested": { "preserved": true },
+                "name": "shared.bin",
+                "ext": "bin",
+                "mime": "application/octet-stream"
+            })
+        );
+        assert_eq!(
+            lossless_asset_metadata(&inlay).unwrap(),
+            json!({
+                "nested": { "preserved": true },
+                "name": "original.png",
+                "ext": "png",
+                "mime": "image/png",
+                "inlayType": "image",
+                "width": 11,
+                "height": 13
+            })
+        );
     }
 
     #[test]
@@ -2159,6 +2886,255 @@ mod tests {
         assert_eq!(verified.manifest.references.len(), 50_000);
         assert_eq!(verified.manifest.references[0].occurrence, 0);
         assert_eq!(verified.manifest.references[49_999].occurrence, 49_999);
+    }
+
+    fn production_package(root: &Path, username: &str, payload_prefix: &[u8]) -> Vec<u8> {
+        let database_root = root.join(format!("package-database-{username}"));
+        fs::create_dir(&database_root).unwrap();
+        let mut source_store = PersistentStore::open(&database_root).unwrap();
+        stage_f0_database(&mut source_store, username);
+        let lease = source_store.acquire_revision(1).unwrap().lease;
+        let database = source_store.materialize_lease(&lease).unwrap();
+        let export = source_store.export_risu_save(&lease, false).unwrap();
+        let database_path = PathBuf::from(&export.path);
+
+        let asset_bytes = [payload_prefix, b"-asset"].concat();
+        let inlay_bytes = [payload_prefix, b"-inlay"].concat();
+        let cold_bytes = cold_payload(&json!({
+            "message": [{ "data": format!("{}-cold", username) }]
+        }));
+        let asset_path = root.join(format!("package-asset-{username}"));
+        let inlay_path = root.join(format!("package-inlay-{username}"));
+        let cold_path = root.join(format!("package-cold-{username}"));
+        fs::write(&asset_path, &asset_bytes).unwrap();
+        fs::write(&inlay_path, &inlay_bytes).unwrap();
+        fs::write(&cold_path, &cold_bytes).unwrap();
+        let metadata = payload_metadata(username);
+        let entries = vec![
+            LosslessWriteEntry {
+                logical_path: DATABASE_PATH.to_owned(),
+                logical_key: None,
+                kind: PayloadKind::Database,
+                metadata: json!({}),
+                source: database_path.clone(),
+            },
+            LosslessWriteEntry {
+                logical_path: "assets/shared".to_owned(),
+                logical_key: Some("shared".to_owned()),
+                kind: PayloadKind::Asset,
+                metadata: metadata.0.clone(),
+                source: asset_path,
+            },
+            LosslessWriteEntry {
+                logical_path: "inlays/shared".to_owned(),
+                logical_key: Some("shared".to_owned()),
+                kind: PayloadKind::Inlay,
+                metadata: metadata.1.clone(),
+                source: inlay_path,
+            },
+            LosslessWriteEntry {
+                logical_path: "cold/shared".to_owned(),
+                logical_key: Some("shared".to_owned()),
+                kind: PayloadKind::Cold,
+                metadata: metadata.2.clone(),
+                source: cold_path.clone(),
+            },
+        ];
+        let payloads = vec![
+            test_f0_payload(F0PayloadKind::Asset, &asset_bytes, metadata.0, None),
+            test_f0_payload(F0PayloadKind::Inlay, &inlay_bytes, metadata.1, None),
+            test_f0_payload(
+                F0PayloadKind::Cold,
+                &cold_bytes,
+                metadata.2,
+                Some(cold_path),
+            ),
+        ];
+        let validation = validate_f0_v1(&database, &payloads, &[]).unwrap();
+        let mut package = Vec::new();
+        write_lossless_package_v1(
+            &mut package,
+            &entries,
+            LosslessCompatibility {
+                oracle_version: 1,
+                canonical_database_sha256: validation.canonical_database_sha256,
+                reference_graph_sha256: validation.reference_graph_sha256,
+            },
+            validation
+                .references
+                .iter()
+                .map(lossless_reference)
+                .collect(),
+            vec![],
+            json!({ "fixtureUnknown": { "preserved": true } }),
+            &NeverCancelled,
+        )
+        .unwrap();
+        source_store
+            .cleanup_risu_save_export(&database_path)
+            .unwrap();
+        source_store.release_revision(&lease).unwrap();
+        package
+    }
+
+    fn seed_active_store(
+        store: &mut PersistentStore,
+        cas: &PayloadCas,
+        username: &str,
+        payload_prefix: &[u8],
+    ) {
+        let asset_bytes = [payload_prefix, b"-asset"].concat();
+        let inlay_bytes = [payload_prefix, b"-inlay"].concat();
+        let cold_bytes = cold_payload(&json!({
+            "message": [{ "data": format!("{}-cold", username) }]
+        }));
+        let asset = cas.prepare_bytes(&asset_bytes).unwrap();
+        let inlay = cas.prepare_bytes(&inlay_bytes).unwrap();
+        let cold = cas.prepare_bytes(&cold_bytes).unwrap();
+        let metadata = payload_metadata(username);
+        let staging = store.replace_begin().unwrap().staging_id;
+        put_f0_database(store, &staging, username);
+        store
+            .replace_put_asset_aliases(
+                &staging,
+                &[
+                    AssetAlias {
+                        key: "shared".to_owned(),
+                        object_hash: Some(asset.content_hash),
+                        kind: "asset".to_owned(),
+                        size: asset_bytes.len() as i64,
+                        mime: "application/octet-stream".to_owned(),
+                        name: "shared.bin".to_owned(),
+                        ext: "bin".to_owned(),
+                        inlay_type: None,
+                        width: None,
+                        height: None,
+                        metadata: metadata.0,
+                    },
+                    AssetAlias {
+                        key: "shared".to_owned(),
+                        object_hash: Some(inlay.content_hash),
+                        kind: "inlay".to_owned(),
+                        size: inlay_bytes.len() as i64,
+                        mime: "image/webp".to_owned(),
+                        name: "shared.webp".to_owned(),
+                        ext: "webp".to_owned(),
+                        inlay_type: Some("image".to_owned()),
+                        width: Some(7),
+                        height: Some(9),
+                        metadata: metadata.1,
+                    },
+                ],
+            )
+            .unwrap();
+        store
+            .replace_put_cold_aliases(
+                &staging,
+                &[ColdAlias {
+                    key: "shared".to_owned(),
+                    object_hash: Some(cold.content_hash),
+                    size: cold_bytes.len() as i64,
+                    metadata: metadata.2,
+                }],
+            )
+            .unwrap();
+        store.replace_commit(&staging, Some(0)).unwrap();
+    }
+
+    fn stage_f0_database(store: &mut PersistentStore, username: &str) {
+        let staging = store.replace_begin().unwrap().staging_id;
+        put_f0_database(store, &staging, username);
+        store.replace_commit(&staging, Some(0)).unwrap();
+    }
+
+    fn put_f0_database(store: &mut PersistentStore, staging: &str, username: &str) {
+        store
+            .replace_put_root(
+                staging,
+                &json!({
+                    "username": username,
+                    "botPresetsId": 0,
+                    "personas": [{ "id": "persona" }],
+                    "selectedPersona": 0,
+                    "enabledModules": [],
+                    "characterOrder": [],
+                    "userIcon": "shared",
+                    "modules": [],
+                    "loadouts": [],
+                    "plugins": [],
+                    "pluginCustomStorage": {
+                        "fixture": { "username": username }
+                    }
+                }),
+            )
+            .unwrap();
+        store
+            .replace_put_presets(staging, &[json!({ "name": "preset" })])
+            .unwrap();
+        store
+            .replace_add_characters(
+                staging,
+                &[json!({
+                    "chaId": "character",
+                    "type": "character",
+                    "name": username,
+                    "image": "",
+                    "desc": "{{inlay::shared}}",
+                    "coldstorage": "shared",
+                    "chats": [],
+                    "chatPage": 0
+                })],
+            )
+            .unwrap();
+    }
+
+    fn payload_metadata(username: &str) -> (Value, Value, Value) {
+        (
+            json!({
+                "name": "shared.bin",
+                "ext": "bin",
+                "mime": "application/octet-stream",
+                "nested": { "label": format!("{username}-asset") }
+            }),
+            json!({
+                "name": "shared.webp",
+                "ext": "webp",
+                "mime": "image/webp",
+                "inlayType": "image",
+                "width": 7,
+                "height": 9,
+                "nested": { "label": format!("{username}-inlay") }
+            }),
+            json!({
+                "name": "shared.json.zlib",
+                "ext": "zlib",
+                "mime": "application/octet-stream",
+                "nested": { "label": format!("{username}-cold") }
+            }),
+        )
+    }
+
+    fn test_f0_payload(
+        kind: F0PayloadKind,
+        bytes: &[u8],
+        metadata: Value,
+        cold_source: Option<PathBuf>,
+    ) -> F0PayloadDescriptor {
+        F0PayloadDescriptor {
+            kind,
+            key: "shared".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            byte_length: bytes.len() as u64,
+            metadata,
+            cold_source,
+        }
+    }
+
+    fn cold_payload(value: &Value) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        serde_json::to_writer(&mut encoder, value).unwrap();
+        encoder.finish().unwrap()
     }
 
     fn atomic_package(root: &Path) -> Vec<u8> {
@@ -2318,5 +3294,25 @@ mod tests {
                 .unwrap()
                 .to_owned(),
         }
+    }
+
+    fn rewrite_manifest(package: &mut [u8], mutate: impl FnOnce(&mut LosslessManifest)) {
+        let manifest_length_offset = MAGIC.len() + std::mem::size_of::<u32>();
+        let manifest_hash_offset = manifest_length_offset + std::mem::size_of::<u64>();
+        let manifest_offset = manifest_hash_offset + 32;
+        let manifest_length = u64::from_le_bytes(
+            package[manifest_length_offset..manifest_hash_offset]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let manifest_end = manifest_offset + manifest_length;
+        let mut manifest: LosslessManifest =
+            serde_json::from_slice(&package[manifest_offset..manifest_end]).unwrap();
+        mutate(&mut manifest);
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        assert_eq!(manifest_bytes.len(), manifest_length);
+        package[manifest_hash_offset..manifest_offset]
+            .copy_from_slice(&Sha256::digest(&manifest_bytes));
+        package[manifest_offset..manifest_end].copy_from_slice(&manifest_bytes);
     }
 }

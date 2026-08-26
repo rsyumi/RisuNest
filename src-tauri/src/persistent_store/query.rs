@@ -1,10 +1,10 @@
 use super::{
     active_generation, compare_plugin_storage_keys, current_revision, read_target, AssetAlias,
     AssetOwnerHead, AssetOwnerLocator, CharacterPage, CharacterQuery, CharacterSummary,
-    ConversationPage, ConversationQuery, ConversationSummary, ConversationWindow,
-    ConversationWindowQuery, PluginStorageCatalog, PluginStorageSummary, PresetCatalog,
-    PresetSummary, QueryOrder, StoreError, StoreResult, Versioned, CONVERSATION_RANGE_MAX_LIMIT,
-    JAVASCRIPT_MAX_SAFE_INTEGER,
+    ColdAlias, ConversationPage,
+    ConversationQuery, ConversationSummary, ConversationWindow, ConversationWindowQuery,
+    PluginStorageCatalog, PluginStorageSummary, PresetCatalog, PresetSummary, QueryOrder,
+    StoreError, StoreResult, Versioned, CONVERSATION_RANGE_MAX_LIMIT, JAVASCRIPT_MAX_SAFE_INTEGER,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
@@ -131,29 +131,19 @@ pub(super) fn read_plugin_storage(
 
 pub(super) fn read_asset_alias(
     connection: &Connection,
+    kind: &str,
     key: &str,
     lease: Option<&str>,
 ) -> StoreResult<Option<Versioned<AssetAlias>>> {
+    validate_asset_kind(kind)?;
     let target = read_target(connection, lease)?;
     let value = connection
         .query_row(
-            "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height
-             FROM asset_aliases WHERE generation = ?1 AND logical_key = ?2",
-            params![target.generation, key],
-            |row| {
-                Ok(AssetAlias {
-                    key: row.get(0)?,
-                    object_hash: row.get(1)?,
-                    kind: row.get(2)?,
-                    size: row.get(3)?,
-                    mime: row.get(4)?,
-                    name: row.get(5)?,
-                    ext: row.get(6)?,
-                    inlay_type: row.get(7)?,
-                    width: row.get(8)?,
-                    height: row.get(9)?,
-                })
-            },
+            "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata
+             FROM asset_aliases
+             WHERE generation = ?1 AND kind = ?2 AND logical_key = ?3",
+            params![target.generation, kind, key],
+            asset_alias_from_row,
         )
         .optional()?;
     value
@@ -200,6 +190,138 @@ pub(super) fn read_asset_owner_head(
             })
         })
         .transpose()
+}
+
+pub(super) fn read_cold_alias(
+    connection: &Connection,
+    key: &str,
+    lease: Option<&str>,
+) -> StoreResult<Option<Versioned<ColdAlias>>> {
+    let target = read_target(connection, lease)?;
+    let value = connection
+        .query_row(
+            "SELECT key, object_hash, size, metadata FROM cold_aliases
+             WHERE generation = ?1 AND key = ?2",
+            params![target.generation, key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    value
+        .map(|(key, object_hash, size, metadata)| {
+            let value = ColdAlias {
+                key,
+                object_hash,
+                size,
+                metadata: serde_json::from_str(&metadata)?,
+            };
+            value.validate()?;
+            Ok(Versioned {
+                revision: target.revision,
+                value,
+            })
+        })
+        .transpose()
+}
+
+pub(super) fn list_asset_aliases(
+    connection: &Connection,
+    lease: Option<&str>,
+) -> StoreResult<Versioned<Vec<AssetAlias>>> {
+    let target = read_target(connection, lease)?;
+    let mut statement = connection.prepare(
+        "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata
+         FROM asset_aliases WHERE generation = ?1 ORDER BY kind ASC, logical_key ASC",
+    )?;
+    let values = statement
+        .query_map([&target.generation], asset_alias_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for value in &values {
+        value.validate()?;
+    }
+    Ok(Versioned {
+        revision: target.revision,
+        value: values,
+    })
+}
+
+pub(super) fn list_cold_aliases(
+    connection: &Connection,
+    lease: Option<&str>,
+) -> StoreResult<Versioned<Vec<ColdAlias>>> {
+    let target = read_target(connection, lease)?;
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT key, object_hash, size, metadata FROM cold_aliases
+             WHERE generation = ?1 ORDER BY key ASC",
+        )?;
+        let rows = statement
+            .query_map([&target.generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let values = rows
+        .into_iter()
+        .map(|(key, object_hash, size, metadata)| {
+            let value = ColdAlias {
+                key,
+                object_hash,
+                size,
+                metadata: serde_json::from_str(&metadata)?,
+            };
+            value.validate()?;
+            Ok(value)
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(Versioned {
+        revision: target.revision,
+        value: values,
+    })
+}
+
+fn asset_alias_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetAlias> {
+    Ok(AssetAlias {
+        key: row.get(0)?,
+        object_hash: row.get(1)?,
+        kind: row.get(2)?,
+        size: row.get(3)?,
+        mime: row.get(4)?,
+        name: row.get(5)?,
+        ext: row.get(6)?,
+        inlay_type: row.get(7)?,
+        width: row.get(8)?,
+        height: row.get(9)?,
+        metadata: serde_json::from_str(&row.get::<_, String>(10)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+    })
+}
+
+fn validate_asset_kind(kind: &str) -> StoreResult<()> {
+    if matches!(kind, "asset" | "inlay") {
+        Ok(())
+    } else {
+        Err(StoreError::Validation {
+            message: "Asset alias kind must be asset or inlay".to_owned(),
+        })
+    }
 }
 
 pub(super) fn query_characters(
@@ -475,22 +597,53 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
         return Err(StoreError::RevisionConflict { expected, actual });
     }
     let generation = active_generation(&transaction)?;
-    let root: Option<String> = transaction
+    let value = materialize_generation(&transaction, &generation)?
+        .ok_or(StoreError::RevisionConflict { expected, actual })?;
+    transaction.commit()?;
+    Ok(value)
+}
+
+pub(super) fn materialize_lease(connection: &Connection, lease: &str) -> StoreResult<Value> {
+    let transaction = connection.unchecked_transaction()?;
+    let target = read_target(&transaction, Some(lease))?;
+    let value = materialize_generation(&transaction, &target.generation)?.ok_or_else(|| {
+        StoreError::Store {
+            message: "Persistent lease generation is missing its root".to_owned(),
+        }
+    })?;
+    transaction.commit()?;
+    Ok(value)
+}
+
+pub(super) fn materialize_staging(connection: &Connection, staging_id: &str) -> StoreResult<Value> {
+    let transaction = connection.unchecked_transaction()?;
+    super::commit::require_staging(&transaction, staging_id)?;
+    let value = materialize_generation(&transaction, staging_id)?.ok_or_else(|| {
+        StoreError::Validation {
+            message: "Staging generation does not exist".to_owned(),
+        }
+    })?;
+    transaction.commit()?;
+    Ok(value)
+}
+
+fn materialize_generation(connection: &Connection, generation: &str) -> StoreResult<Option<Value>> {
+    let root: Option<String> = connection
         .query_row(
             "SELECT value FROM root WHERE generation = ?1",
-            [&generation],
+            [generation],
             |row| row.get(0),
         )
         .optional()?;
     let Some(root) = root else {
-        return Err(StoreError::RevisionConflict { expected, actual });
+        return Ok(None);
     };
     let mut database = into_object(
         serde_json::from_str(&root)?,
         "Persistent root must be an object",
     )?;
     let character_records = {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             "SELECT character_id, detail FROM characters
              WHERE generation = ?1 ORDER BY configured_index ASC",
         )?;
@@ -506,7 +659,7 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
             "Character detail must be an object",
         )?;
         let conversation_records = {
-            let mut statement = transaction.prepare(
+            let mut statement = connection.prepare(
                 "SELECT conversation_id, detail FROM conversations
                  WHERE generation = ?1 AND character_id = ?2 ORDER BY configured_index ASC",
             )?;
@@ -518,8 +671,8 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
         let mut chats = Vec::new();
         for (conversation_id, detail) in conversation_records {
             chats.push(conversation_value(
-                &transaction,
-                &generation,
+                connection,
+                generation,
                 &character_id,
                 &conversation_id,
                 detail,
@@ -530,7 +683,7 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
     }
     database.insert("characters".to_owned(), Value::Array(characters));
     let presets = {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             "SELECT value FROM bot_presets WHERE generation = ?1 ORDER BY configured_index ASC",
         )?;
         let presets = statement
@@ -541,7 +694,7 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
     };
     database.insert("botPresets".to_owned(), Value::Array(presets));
     let plugin_storage = {
-        let mut statement = transaction.prepare(
+        let mut statement = connection.prepare(
             "SELECT storage_key, value, ordinal FROM plugin_storage
              WHERE generation = ?1",
         )?;
@@ -570,8 +723,7 @@ pub(super) fn materialize(connection: &Connection, revision: Option<i64>) -> Sto
         "pluginCustomStorage".to_owned(),
         Value::Object(plugin_storage),
     );
-    transaction.commit()?;
-    Ok(Value::Object(database))
+    Ok(Some(Value::Object(database)))
 }
 
 fn page_input(limit: i64, cursor: Option<&str>) -> StoreResult<(i64, i64)> {

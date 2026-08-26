@@ -16,7 +16,7 @@ export type AdapterId =
     | 'risu-sharing'
     | 'lossless-package-v1'
 
-export type CapabilityCategory = 'preserved' | 'unsupported' | 'external'
+export type CapabilityCategory = 'preserved' | 'partial' | 'unsupported' | 'external'
 export type AdapterOracleStatus = 'passing' | 'known-gap' | 'unsupported'
 
 export type AdapterCapability = {
@@ -231,13 +231,14 @@ export const ADAPTER_CAPABILITY_MATRIX = {
         },
         {
             id: 'lossless-package-v1',
-            oracleStatus: 'unsupported',
-            resultWarning: 'The future lossless package adapter is not implemented.',
+            oracleStatus: 'known-gap',
+            resultWarning: 'The private native foundation preserves all package data, but production routing remains disabled pending physical atomicity gates.',
             capabilities: [
+                ...COMPLETE_BACKUP_CAPABILITIES,
                 {
-                    feature: 'adapter',
-                    category: 'unsupported',
-                    warning: 'The future lossless package adapter is not implemented.',
+                    feature: 'production-route',
+                    category: 'partial',
+                    warning: 'The public route stays disabled until 10 GB, process-kill, disk-full, and Android evidence passes.',
                 },
             ],
         },

@@ -1,5 +1,5 @@
 use super::{
-    active_generation, current_revision, AssetAlias, AssetOwnerHead, AssetOwnerLocator,
+    active_generation, current_revision, AssetAlias, AssetOwnerHead, AssetOwnerLocator, ColdAlias,
     ConversationMutation, PluginStorageMutation, RevisionResult, StagingResult, StoreError,
     StoreResult, WorkingSetCommit, GENERATION_TABLES,
 };
@@ -22,6 +22,10 @@ pub(super) fn commit_asset_alias(
     let active = active_generation(&transaction)?;
     let revision = actual_revision + 1;
     let generation = writable_generation(&transaction, &active, revision)?;
+    transaction.execute(
+        "DELETE FROM asset_aliases WHERE generation = ?1 AND logical_key = ?2",
+        params![generation, alias.key],
+    )?;
     put_asset_alias(&transaction, &generation, alias)?;
     set_active(&transaction, revision, &generation)?;
     transaction.commit()?;
@@ -330,6 +334,37 @@ pub(super) fn replace_put_asset_aliases(
     Ok(())
 }
 
+pub(super) fn replace_put_cold_aliases(
+    connection: &mut Connection,
+    staging_id: &str,
+    aliases: &[ColdAlias],
+) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    for alias in aliases {
+        alias.validate()?;
+    }
+    for alias in aliases {
+        transaction.execute(
+            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(generation, key) DO UPDATE SET
+                object_hash = excluded.object_hash,
+                size = excluded.size,
+                metadata = excluded.metadata",
+            params![
+                staging_id,
+                alias.key,
+                alias.object_hash,
+                alias.size,
+                serde_json::to_string(&alias.metadata)?,
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn put_asset_alias(
     transaction: &Transaction<'_>,
     generation: &str,
@@ -338,9 +373,9 @@ fn put_asset_alias(
     transaction.execute(
         "INSERT INTO asset_aliases (
             generation, logical_key, object_hash, kind, size, mime, name, ext,
-            inlay_type, width, height
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-         ON CONFLICT(generation, logical_key) DO UPDATE SET
+            inlay_type, width, height, metadata
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(generation, kind, logical_key) DO UPDATE SET
             object_hash = excluded.object_hash,
             kind = excluded.kind,
             size = excluded.size,
@@ -349,7 +384,8 @@ fn put_asset_alias(
             ext = excluded.ext,
             inlay_type = excluded.inlay_type,
             width = excluded.width,
-            height = excluded.height",
+            height = excluded.height,
+            metadata = excluded.metadata",
         params![
             generation,
             alias.key,
@@ -362,6 +398,7 @@ fn put_asset_alias(
             alias.inlay_type,
             alias.width,
             alias.height,
+            serde_json::to_string(&alias.metadata)?,
         ],
     )?;
     Ok(())
@@ -541,7 +578,7 @@ fn replace_presets(
     Ok(())
 }
 
-fn require_staging(connection: &Connection, staging_id: &str) -> StoreResult<()> {
+pub(super) fn require_staging(connection: &Connection, staging_id: &str) -> StoreResult<()> {
     if !staging_id.starts_with("staging-") {
         return Err(validation("Invalid staging generation"));
     }

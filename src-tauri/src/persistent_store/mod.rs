@@ -45,12 +45,13 @@ pub(super) const GENERATION_TABLES: &[(&str, &str)] = &[
     ),
     (
         "asset_aliases",
-        "logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height",
+        "logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata",
     ),
     (
         "asset_owner_heads",
         "owner_kind, owner_locator, present, manifest_hash, entry_count",
     ),
+    ("cold_aliases", "key, object_hash, size, metadata"),
 ];
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -210,23 +211,13 @@ pub(crate) struct AssetAlias {
     pub(crate) width: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) height: Option<i64>,
+    #[serde(default = "empty_alias_metadata")]
+    pub(crate) metadata: Value,
 }
 
 impl AssetAlias {
     pub(super) fn validate(&self) -> StoreResult<()> {
-        if let Some(hash) = &self.object_hash {
-            if hash.len() != 64
-                || !hash
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err(StoreError::Validation {
-                    message:
-                        "Asset alias objectHash must be null or 64 lowercase hexadecimal characters"
-                            .to_owned(),
-                });
-            }
-        }
+        validate_object_hash(&self.object_hash, "Asset alias")?;
         if !matches!(self.kind.as_str(), "asset" | "inlay") {
             return Err(StoreError::Validation {
                 message: "Asset alias kind must be asset or inlay".to_owned(),
@@ -271,6 +262,11 @@ impl AssetAlias {
         if self.height.is_some_and(|value| value < 0) {
             return Err(StoreError::Validation {
                 message: "Asset alias height must be nonnegative".to_owned(),
+            });
+        }
+        if !self.metadata.is_object() {
+            return Err(StoreError::Validation {
+                message: "Asset alias metadata must be a JSON object".to_owned(),
             });
         }
         Ok(())
@@ -320,6 +316,10 @@ impl AssetOwnerLocator {
             }
         }
     }
+}
+
+fn empty_alias_metadata() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -389,6 +389,53 @@ impl AssetOwnerHead {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ColdAlias {
+    pub(crate) key: String,
+    pub(crate) object_hash: Option<String>,
+    pub(crate) size: i64,
+    pub(crate) metadata: Value,
+}
+
+impl ColdAlias {
+    pub(super) fn validate(&self) -> StoreResult<()> {
+        if self.key.is_empty() || self.key.contains('\0') {
+            return Err(StoreError::Validation {
+                message: "Cold alias key must be nonempty and contain no NUL characters".to_owned(),
+            });
+        }
+        validate_object_hash(&self.object_hash, "Cold alias")?;
+        if self.size < 0 {
+            return Err(StoreError::Validation {
+                message: "Cold alias size must be nonnegative".to_owned(),
+            });
+        }
+        if !self.metadata.is_object() {
+            return Err(StoreError::Validation {
+                message: "Cold alias metadata must be a JSON object".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_object_hash(hash: &Option<String>, subject: &str) -> StoreResult<()> {
+    if hash.as_ref().is_some_and(|hash| {
+        hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(StoreError::Validation {
+            message: format!(
+                "{subject} objectHash must be null or 64 lowercase hexadecimal characters"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn plugin_storage_array_index(key: &str) -> Option<u32> {
@@ -773,10 +820,11 @@ impl PersistentStore {
 
     pub(crate) fn read_asset_alias(
         &self,
+        kind: &str,
         key: &str,
         lease: Option<&str>,
     ) -> StoreResult<Option<Versioned<AssetAlias>>> {
-        query::read_asset_alias(&self.connection, key, lease)
+        query::read_asset_alias(&self.connection, kind, key, lease)
     }
 
     pub(crate) fn read_asset_owner_head(
@@ -787,8 +835,38 @@ impl PersistentStore {
         query::read_asset_owner_head(&self.connection, owner, lease)
     }
 
+    pub(crate) fn read_cold_alias(
+        &self,
+        key: &str,
+        lease: Option<&str>,
+    ) -> StoreResult<Option<Versioned<ColdAlias>>> {
+        query::read_cold_alias(&self.connection, key, lease)
+    }
+
+    pub(crate) fn list_asset_aliases(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<Versioned<Vec<AssetAlias>>> {
+        query::list_asset_aliases(&self.connection, lease)
+    }
+
+    pub(crate) fn list_cold_aliases(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<Versioned<Vec<ColdAlias>>> {
+        query::list_cold_aliases(&self.connection, lease)
+    }
+
     pub(crate) fn materialize(&self, revision: Option<i64>) -> StoreResult<Value> {
         query::materialize(&self.connection, revision)
+    }
+
+    pub(crate) fn materialize_lease(&self, lease: &str) -> StoreResult<Value> {
+        query::materialize_lease(&self.connection, lease)
+    }
+
+    pub(crate) fn materialize_staging(&self, staging_id: &str) -> StoreResult<Value> {
+        query::materialize_staging(&self.connection, staging_id)
     }
 
     pub(crate) fn commit(&mut self, commit: &WorkingSetCommit) -> StoreResult<RevisionResult> {
@@ -825,6 +903,14 @@ impl PersistentStore {
         aliases: &[AssetAlias],
     ) -> StoreResult<()> {
         commit::replace_put_asset_aliases(&mut self.connection, staging_id, aliases)
+    }
+
+    pub(crate) fn replace_put_cold_aliases(
+        &mut self,
+        staging_id: &str,
+        aliases: &[ColdAlias],
+    ) -> StoreResult<()> {
+        commit::replace_put_cold_aliases(&mut self.connection, staging_id, aliases)
     }
 
     pub(crate) fn replace_add_characters(

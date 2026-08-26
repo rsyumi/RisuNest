@@ -182,6 +182,30 @@ fn direct_stat_and_read_resolve_only_the_requested_hash_path() {
 }
 
 #[test]
+fn exact_object_path_can_be_reopened_for_bounded_backup_streaming() {
+    let directory = tempfile::tempdir().expect("temporary repository");
+    let cas = PayloadCas::new(directory.path()).expect("open repository");
+    let prepared = cas
+        .prepare_bytes(b"streamed backup payload")
+        .expect("prepare payload");
+
+    let path = cas
+        .object_path(&prepared.content_hash)
+        .expect("resolve object")
+        .expect("object exists");
+
+    assert_eq!(
+        std::fs::read(path).expect("reopen exact object"),
+        b"streamed backup payload"
+    );
+    assert_eq!(
+        cas.object_path(&"00".repeat(32))
+            .expect("resolve missing object"),
+        None
+    );
+}
+
+#[test]
 fn rejects_a_linked_object_target_without_reading_or_replacing_it() {
     let directory = tempfile::tempdir().expect("temporary repository");
     let external = tempfile::NamedTempFile::new().expect("external payload");

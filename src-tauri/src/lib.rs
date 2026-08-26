@@ -5,6 +5,8 @@ pub mod import_export_jobs;
 mod local_backup;
 #[allow(dead_code)]
 mod lossless_backup;
+#[allow(dead_code)]
+mod lossless_f0;
 pub mod native_file_jobs;
 mod native_media;
 mod native_tokenizer;

@@ -544,7 +544,7 @@ fn validate_restore_database(path: &Path) -> StoreResult<()> {
         return Err(validation("snapshot integrity check failed"));
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if !matches!(version, 1 | 2 | 3 | 4 | 5 | 6 | 7) {
+    if !matches!(version, 1..=8) {
         return Err(validation("snapshot schema version is not supported"));
     }
     Ok(())

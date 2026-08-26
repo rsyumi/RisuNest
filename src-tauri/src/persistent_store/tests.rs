@@ -1,7 +1,8 @@
 use super::{
     AssetAlias, AssetOwnerHead, AssetOwnerLocator, CharacterQuery, CheckpointMode,
-    ConversationMutation, ConversationPage, ConversationQuery, ConversationWindowQuery,
-    PersistentStore, PluginStorageMutation, QueryOrder, StoreError, WorkingSetCommit,
+    ColdAlias, ConversationMutation, ConversationPage,
+    ConversationQuery, ConversationWindowQuery, PersistentStore, PluginStorageMutation, QueryOrder,
+    StoreError, WorkingSetCommit,
 };
 use serde_json::{json, Value};
 use std::{
@@ -467,6 +468,441 @@ fn owner_head_validation_uses_the_final_character_parent_and_rejects_atomically(
 }
 
 #[test]
+fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
+    let directory = tempfile::tempdir().expect("create payload namespace directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin staged replacement");
+    let key = "shared/payload-key";
+    let asset = AssetAlias {
+        key: key.to_owned(),
+        object_hash: Some("11".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 1,
+        mime: "application/octet-stream".to_owned(),
+        name: "Asset".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({ "name": "Asset", "ext": "bin", "mime": "application/octet-stream" }),
+    };
+    let inlay = AssetAlias {
+        key: key.to_owned(),
+        object_hash: Some("22".repeat(32)),
+        kind: "inlay".to_owned(),
+        size: 2,
+        mime: "image/webp".to_owned(),
+        name: "Inlay".to_owned(),
+        ext: "webp".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: Some(10),
+        height: Some(20),
+        metadata: json!({
+            "name": "Inlay",
+            "ext": "webp",
+            "mime": "image/webp",
+            "inlayType": "image",
+            "width": 10,
+            "height": 20
+        }),
+    };
+    let cold = ColdAlias {
+        key: key.to_owned(),
+        object_hash: Some("33".repeat(32)),
+        size: 3,
+        metadata: json!({ "source": "cold-storage", "ordinal": 7 }),
+    };
+
+    store
+        .replace_put_asset_aliases(&staging.staging_id, &[inlay.clone(), asset.clone()])
+        .expect("stage asset and Inlay aliases");
+    store
+        .replace_put_cold_aliases(&staging.staging_id, std::slice::from_ref(&cold))
+        .expect("stage cold alias");
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("asset", key, None)
+            .expect("read pre-activation ordinary asset"),
+        None
+    );
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("inlay", key, None)
+            .expect("read pre-activation Inlay"),
+        None
+    );
+    assert_eq!(
+        store
+            .read_cold_alias(key, None)
+            .expect("read pre-activation cold alias"),
+        None
+    );
+    assert_eq!(store.revision().expect("read pre-activation revision"), 0);
+    assert_eq!(
+        store
+            .replace_commit(&staging.staging_id, Some(0))
+            .expect("activate all payload namespaces")
+            .revision,
+        1
+    );
+
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("asset", key, None)
+            .expect("read ordinary asset")
+            .expect("ordinary asset exists")
+            .value,
+        asset
+    );
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("inlay", key, None)
+            .expect("read Inlay")
+            .expect("Inlay exists")
+            .value,
+        inlay
+    );
+    assert_eq!(
+        store
+            .read_cold_alias(key, None)
+            .expect("read cold alias")
+            .expect("cold alias exists")
+            .value,
+        cold
+    );
+}
+
+#[test]
+fn asset_alias_unknown_metadata_survives_activation_lease_and_reopen() {
+    let directory = tempfile::tempdir().expect("create alias metadata directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let original = AssetAlias {
+        key: "asset/metadata".to_owned(),
+        object_hash: Some("12".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 12,
+        mime: "application/octet-stream".to_owned(),
+        name: "Metadata".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({
+            "name": "Metadata",
+            "ext": "bin",
+            "mime": "application/octet-stream",
+            "unknown": {
+                "nested": [0, false, null, { "unicode": "메타데이터" }]
+            }
+        }),
+    };
+    let original_inlay = AssetAlias {
+        key: original.key.clone(),
+        object_hash: Some("56".repeat(32)),
+        kind: "inlay".to_owned(),
+        size: 56,
+        mime: "image/webp".to_owned(),
+        name: "Metadata Inlay".to_owned(),
+        ext: "webp".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: Some(4),
+        height: Some(5),
+        metadata: json!({
+            "name": "Metadata Inlay",
+            "ext": "webp",
+            "mime": "image/webp",
+            "inlayType": "image",
+            "width": 4,
+            "height": 5,
+            "unknown": { "nested": [{ "retained": true }] }
+        }),
+    };
+    let staging = store.replace_begin().expect("begin alias metadata staging");
+    store
+        .replace_put_asset_aliases(
+            &staging.staging_id,
+            &[original.clone(), original_inlay.clone()],
+        )
+        .expect("stage alias metadata");
+    let first = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate alias metadata");
+    let lease = store
+        .acquire_revision(first.revision)
+        .expect("lease original alias metadata");
+    let replacement = AssetAlias {
+        object_hash: Some("34".repeat(32)),
+        metadata: json!({
+            "name": "Metadata",
+            "ext": "bin",
+            "mime": "application/octet-stream",
+            "unknown": { "nested": ["current"] }
+        }),
+        ..original.clone()
+    };
+    let second = store
+        .commit_asset_alias(&replacement, first.revision)
+        .expect("replace current alias metadata");
+    drop(store);
+
+    let store = PersistentStore::open(directory.path()).expect("reopen alias metadata store");
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("asset", &original.key, None)
+            .expect("read current alias metadata"),
+        Some(super::Versioned {
+            revision: second.revision,
+            value: replacement.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("asset", &original.key, Some(&lease.lease))
+            .expect("read leased alias metadata"),
+        Some(super::Versioned {
+            revision: first.revision,
+            value: original.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("inlay", &original.key, Some(&lease.lease))
+            .expect("read leased Inlay metadata"),
+        Some(super::Versioned {
+            revision: first.revision,
+            value: original_inlay.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .list_asset_aliases(None)
+            .expect("list current alias metadata")
+            .value,
+        vec![replacement]
+    );
+    assert_eq!(
+        store
+            .list_asset_aliases(Some(&lease.lease))
+            .expect("list leased alias metadata")
+            .value,
+        vec![original, original_inlay]
+    );
+}
+
+#[test]
+fn payload_inventories_and_typed_reads_are_deterministic_at_a_pinned_revision() {
+    let directory = tempfile::tempdir().expect("create pinned inventory directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let shared_asset = AssetAlias {
+        key: "shared".to_owned(),
+        object_hash: Some("11".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 1,
+        mime: "application/octet-stream".to_owned(),
+        name: "Shared asset".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let z_asset = AssetAlias {
+        key: "z-last".to_owned(),
+        name: "Last asset".to_owned(),
+        ..shared_asset.clone()
+    };
+    let shared_inlay = AssetAlias {
+        key: "shared".to_owned(),
+        object_hash: Some("22".repeat(32)),
+        kind: "inlay".to_owned(),
+        size: 2,
+        mime: "image/webp".to_owned(),
+        name: "Shared Inlay".to_owned(),
+        ext: "webp".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: Some(1),
+        height: Some(2),
+        metadata: json!({}),
+    };
+    let cold_a = ColdAlias {
+        key: "a-first".to_owned(),
+        object_hash: Some("33".repeat(32)),
+        size: 3,
+        metadata: json!({ "kind": "memory" }),
+    };
+    let cold_z = ColdAlias {
+        key: "z-last".to_owned(),
+        object_hash: None,
+        size: 0,
+        metadata: json!({ "kind": "embedding", "missing": true }),
+    };
+    let first_staging = store.replace_begin().expect("begin first inventory");
+    store
+        .replace_put_asset_aliases(
+            &first_staging.staging_id,
+            &[z_asset.clone(), shared_inlay.clone(), shared_asset.clone()],
+        )
+        .expect("stage first asset inventory");
+    store
+        .replace_put_cold_aliases(&first_staging.staging_id, &[cold_z.clone(), cold_a.clone()])
+        .expect("stage first cold inventory");
+    let first = store
+        .replace_commit(&first_staging.staging_id, Some(0))
+        .expect("activate first inventory");
+    let lease = store
+        .acquire_revision(first.revision)
+        .expect("pin first inventory");
+
+    let replacement_asset = AssetAlias {
+        object_hash: Some("44".repeat(32)),
+        name: "Current asset".to_owned(),
+        ..shared_asset.clone()
+    };
+    let replacement_cold = ColdAlias {
+        object_hash: Some("55".repeat(32)),
+        metadata: json!({ "kind": "current" }),
+        ..cold_a.clone()
+    };
+    let second_staging = store.replace_begin().expect("begin second inventory");
+    store
+        .replace_put_asset_aliases(
+            &second_staging.staging_id,
+            std::slice::from_ref(&replacement_asset),
+        )
+        .expect("stage replacement asset inventory");
+    store
+        .replace_put_cold_aliases(
+            &second_staging.staging_id,
+            std::slice::from_ref(&replacement_cold),
+        )
+        .expect("stage replacement cold inventory");
+    let second = store
+        .replace_commit(&second_staging.staging_id, Some(first.revision))
+        .expect("activate second inventory");
+
+    assert_eq!(
+        store
+            .list_asset_aliases(Some(&lease.lease))
+            .expect("list pinned assets"),
+        super::Versioned {
+            revision: first.revision,
+            value: vec![shared_asset.clone(), z_asset, shared_inlay.clone()],
+        }
+    );
+    assert_eq!(
+        store
+            .list_cold_aliases(Some(&lease.lease))
+            .expect("list pinned cold aliases"),
+        super::Versioned {
+            revision: first.revision,
+            value: vec![cold_a.clone(), cold_z],
+        }
+    );
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("inlay", "shared", Some(&lease.lease))
+            .expect("read pinned Inlay")
+            .expect("pinned Inlay exists")
+            .value,
+        shared_inlay
+    );
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("asset", "shared", None)
+            .expect("read current asset")
+            .expect("current asset exists"),
+        super::Versioned {
+            revision: second.revision,
+            value: replacement_asset.clone(),
+        }
+    );
+    assert_eq!(
+        store
+            .read_cold_alias("a-first", Some(&lease.lease))
+            .expect("read pinned cold alias")
+            .expect("pinned cold alias exists")
+            .value,
+        cold_a
+    );
+    assert_eq!(
+        store
+            .read_cold_alias("a-first", None)
+            .expect("read current cold alias")
+            .expect("current cold alias exists"),
+        super::Versioned {
+            revision: second.revision,
+            value: replacement_cold,
+        }
+    );
+}
+
+#[test]
+fn cold_aliases_follow_copy_on_write_without_leaking_between_revisions() {
+    let directory = tempfile::tempdir().expect("create cold COW directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let cold = ColdAlias {
+        key: "cold/cow".to_owned(),
+        object_hash: Some("66".repeat(32)),
+        size: 6,
+        metadata: json!({ "scope": "both revisions" }),
+    };
+    let staging = store.replace_begin().expect("begin cold COW fixture");
+    store
+        .replace_put_cold_aliases(&staging.staging_id, std::slice::from_ref(&cold))
+        .expect("stage cold COW fixture");
+    let first = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate cold COW fixture");
+    let lease = store
+        .acquire_revision(first.revision)
+        .expect("pin cold COW fixture");
+    let second = store
+        .commit(&WorkingSetCommit {
+            expected_revision: first.revision,
+            root: Some(json!({ "username": "copy-on-write" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+        })
+        .expect("commit copy-on-write revision");
+
+    assert_eq!(
+        store
+            .read_cold_alias(&cold.key, None)
+            .expect("read current copied cold alias"),
+        Some(super::Versioned {
+            revision: second.revision,
+            value: cold.clone(),
+        })
+    );
+    assert_eq!(
+        store
+            .read_cold_alias(&cold.key, Some(&lease.lease))
+            .expect("read pinned cold alias"),
+        Some(super::Versioned {
+            revision: first.revision,
+            value: cold.clone(),
+        })
+    );
+    store
+        .release_revision(&lease.lease)
+        .expect("release pinned cold revision");
+    assert_eq!(
+        store
+            .read_cold_alias(&cold.key, None)
+            .expect("read current cold alias after lease release")
+            .expect("current cold alias remains")
+            .value,
+        cold
+    );
+}
+
+#[test]
 fn asset_alias_overwrite_isolated_by_revision_lease() {
     let (_directory, mut store, _) = open_fixture();
     let original = AssetAlias {
@@ -480,6 +916,7 @@ fn asset_alias_overwrite_isolated_by_revision_lease() {
         inlay_type: None,
         width: None,
         height: None,
+        metadata: json!({}),
     };
     let first = store
         .commit_asset_alias(&original, 1)
@@ -498,6 +935,7 @@ fn asset_alias_overwrite_isolated_by_revision_lease() {
         inlay_type: Some("image".to_owned()),
         width: Some(320),
         height: Some(180),
+        metadata: json!({}),
     };
     let second = store
         .commit_asset_alias(&replacement, first.revision)
@@ -511,6 +949,12 @@ fn asset_alias_overwrite_isolated_by_revision_lease() {
             revision: second.revision,
             value: replacement,
         })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias_by_kind("asset", &original.key, None)
+            .expect("read replaced ordinary alias"),
+        None
     );
     assert_eq!(
         store
@@ -541,6 +985,7 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
         inlay_type: None,
         width: None,
         height: None,
+        metadata: json!({}),
     };
     let missing_payload = AssetAlias {
         key: "inlay/missing".to_owned(),
@@ -553,6 +998,7 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
         inlay_type: Some("image".to_owned()),
         width: Some(0),
         height: Some(0),
+        metadata: json!({}),
     };
     let duplicate_bytes_alias = AssetAlias {
         key: "assets/empty-copy.dat".to_owned(),
@@ -613,7 +1059,7 @@ fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
 }
 
 #[test]
-fn asset_alias_abort_and_reopen_sweep_remove_staged_rows() {
+fn payload_alias_abort_and_reopen_sweep_remove_all_staged_rows() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
     let alias = AssetAlias {
@@ -627,11 +1073,21 @@ fn asset_alias_abort_and_reopen_sweep_remove_staged_rows() {
         inlay_type: None,
         width: None,
         height: None,
+        metadata: json!({}),
+    };
+    let cold = ColdAlias {
+        key: alias.key.clone(),
+        object_hash: Some("77".repeat(32)),
+        size: 7,
+        metadata: json!({ "retained": true }),
     };
     let aborted = store.replace_begin().expect("begin aborted replacement");
     store
         .replace_put_asset_aliases(&aborted.staging_id, std::slice::from_ref(&alias))
         .expect("stage aborted alias");
+    store
+        .replace_put_cold_aliases(&aborted.staging_id, std::slice::from_ref(&cold))
+        .expect("stage aborted cold alias");
     store
         .replace_abort(&aborted.staging_id)
         .expect("abort staged aliases");
@@ -644,11 +1100,23 @@ fn asset_alias_abort_and_reopen_sweep_remove_staged_rows() {
         )
         .expect("count aborted alias rows");
     assert_eq!(aborted_rows, 0);
+    let aborted_cold_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
+            [&aborted.staging_id],
+            |row| row.get(0),
+        )
+        .expect("count aborted cold alias rows");
+    assert_eq!(aborted_cold_rows, 0);
 
     let abandoned = store.replace_begin().expect("begin abandoned replacement");
     store
         .replace_put_asset_aliases(&abandoned.staging_id, &[alias])
         .expect("stage abandoned alias");
+    store
+        .replace_put_cold_aliases(&abandoned.staging_id, &[cold])
+        .expect("stage abandoned cold alias");
     drop(store);
     let store = PersistentStore::open(directory.path()).expect("reopen persistent store");
     let abandoned_rows: i64 = store
@@ -660,6 +1128,15 @@ fn asset_alias_abort_and_reopen_sweep_remove_staged_rows() {
         )
         .expect("count swept alias rows");
     assert_eq!(abandoned_rows, 0);
+    let abandoned_cold_rows: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
+            [&abandoned.staging_id],
+            |row| row.get(0),
+        )
+        .expect("count swept cold alias rows");
+    assert_eq!(abandoned_cold_rows, 0);
 }
 
 #[test]
@@ -675,6 +1152,7 @@ fn invalid_asset_aliases_leave_revision_and_staging_rows_unchanged() {
         inlay_type: None,
         width: None,
         height: None,
+        metadata: json!({}),
     };
     let invalid_hash = AssetAlias {
         key: "assets/invalid.bin".to_owned(),
@@ -693,11 +1171,17 @@ fn invalid_asset_aliases_leave_revision_and_staging_rows_unchanged() {
         height: Some(1),
         ..valid.clone()
     };
+    let invalid_lossless_metadata = AssetAlias {
+        key: "assets/invalid-lossless-metadata.bin".to_owned(),
+        metadata: json!(["not", "an", "object"]),
+        ..valid.clone()
+    };
 
     for invalid in [
         &invalid_hash,
         &inlay_without_type,
         &asset_with_inlay_metadata,
+        &invalid_lossless_metadata,
     ] {
         let directory = tempfile::tempdir().expect("create temporary directory");
         let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
@@ -727,6 +1211,60 @@ fn invalid_asset_aliases_leave_revision_and_staging_rows_unchanged() {
         .expect("count rejected staged aliases");
     assert_eq!(staged_rows, 0);
     assert_eq!(store.revision().expect("read staged failure revision"), 0);
+}
+
+#[test]
+fn invalid_cold_alias_batch_leaves_staging_and_revision_unchanged() {
+    let directory = tempfile::tempdir().expect("create cold validation directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let valid = ColdAlias {
+        key: "cold/valid".to_owned(),
+        object_hash: Some("aa".repeat(32)),
+        size: 1,
+        metadata: json!({ "type": "memory" }),
+    };
+    let invalid_cases = [
+        ColdAlias {
+            key: String::new(),
+            ..valid.clone()
+        },
+        ColdAlias {
+            key: "cold\0invalid".to_owned(),
+            ..valid.clone()
+        },
+        ColdAlias {
+            object_hash: Some("AA".repeat(32)),
+            ..valid.clone()
+        },
+        ColdAlias {
+            size: -1,
+            ..valid.clone()
+        },
+        ColdAlias {
+            metadata: json!(["not", "an", "object"]),
+            ..valid.clone()
+        },
+    ];
+
+    for invalid in invalid_cases {
+        let staging = store.replace_begin().expect("begin invalid cold batch");
+        assert!(store
+            .replace_put_cold_aliases(&staging.staging_id, &[valid.clone(), invalid])
+            .is_err());
+        let rows: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM cold_aliases WHERE generation = ?1",
+                [&staging.staging_id],
+                |row| row.get(0),
+            )
+            .expect("count rejected cold batch");
+        assert_eq!(rows, 0);
+        assert_eq!(store.revision().expect("read unchanged revision"), 0);
+        store
+            .replace_abort(&staging.staging_id)
+            .expect("abort rejected cold staging");
+    }
 }
 
 #[test]
@@ -811,6 +1349,7 @@ fn native_export_lease_retains_its_asset_alias_generation() {
         inlay_type: None,
         width: None,
         height: None,
+        metadata: json!({}),
     };
     let first = store
         .commit_asset_alias(&original, 1)
@@ -1226,6 +1765,104 @@ fn staged_fixture_round_trips_through_materialize() {
         store.materialize(None).expect("materialize fixture"),
         database
     );
+}
+
+#[test]
+fn pinned_materialization_is_not_affected_by_active_changes() {
+    let (_directory, mut store, database) = open_fixture();
+    let lease = store
+        .acquire_revision(1)
+        .expect("acquire materialization lease");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Changed after lease" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            plugin_storage: None,
+        })
+        .expect("change active generation after lease");
+
+    assert_ne!(
+        store.materialize(None).expect("materialize active data"),
+        database
+    );
+    assert_eq!(
+        store
+            .materialize_lease(&lease.lease)
+            .expect("materialize pinned generation"),
+        database
+    );
+    store
+        .release_revision(&lease.lease)
+        .expect("release materialization lease");
+    assert!(matches!(
+        store.materialize_lease(&lease.lease),
+        Err(StoreError::SnapshotReleased)
+    ));
+}
+
+#[test]
+fn staged_materialization_is_exact_and_inaccessible_after_abort_or_reopen() {
+    let (directory, mut store, active_database) = open_fixture();
+    let aborted = store.replace_begin().expect("begin staged materialization");
+    store
+        .replace_put_root(
+            &aborted.staging_id,
+            &json!({
+                "username": "Staged database",
+                "pluginCustomStorage": { "staged": 0 }
+            }),
+        )
+        .expect("write staged materialization root");
+
+    assert_eq!(
+        store
+            .materialize_staging(&aborted.staging_id)
+            .expect("materialize exact staging generation"),
+        json!({
+            "username": "Staged database",
+            "characters": [],
+            "botPresets": [],
+            "pluginCustomStorage": { "staged": 0 }
+        })
+    );
+    assert_eq!(
+        store
+            .materialize(None)
+            .expect("materialize active generation"),
+        active_database
+    );
+
+    store
+        .replace_abort(&aborted.staging_id)
+        .expect("abort staged materialization");
+    assert!(matches!(
+        store.materialize_staging(&aborted.staging_id),
+        Err(StoreError::Validation { .. })
+    ));
+
+    let abandoned = store
+        .replace_begin()
+        .expect("begin abandoned staged materialization");
+    store
+        .replace_put_root(
+            &abandoned.staging_id,
+            &json!({ "username": "Abandoned database" }),
+        )
+        .expect("write abandoned staged root");
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen persistent store");
+    assert!(matches!(
+        reopened.materialize_staging(&abandoned.staging_id),
+        Err(StoreError::Validation { .. })
+    ));
 }
 
 #[test]
@@ -3176,7 +3813,7 @@ fn create_v2_database_with_lease(path: &Path) {
 }
 
 #[test]
-fn schema_v7_adds_only_empty_asset_tables_to_v5() {
+fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
     let directory = tempfile::tempdir().expect("create v5 migration directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
     drop(store);
@@ -3184,8 +3821,9 @@ fn schema_v7_adds_only_empty_asset_tables_to_v5() {
     let connection = rusqlite::Connection::open(&database_path).expect("open migration fixture");
     connection
         .execute_batch(
-            "DROP TABLE asset_owner_heads;
-             DROP TABLE asset_aliases;
+            "DROP TABLE asset_aliases;
+             DROP TABLE asset_owner_heads;
+             DROP TABLE cold_aliases;
              PRAGMA user_version = 5;",
         )
         .expect("downgrade fixture schema marker");
@@ -3207,7 +3845,7 @@ fn schema_v7_adds_only_empty_asset_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -3217,39 +3855,209 @@ fn schema_v7_adds_only_empty_asset_tables_to_v5() {
 }
 
 #[test]
-fn schema_v7_adds_only_an_empty_owner_head_table_to_v6() {
-    let directory = tempfile::tempdir().expect("create v6 migration directory");
+fn schema_v8_migrates_v6_alias_without_changing_its_value() {
+    let directory = tempfile::tempdir().expect("create v6 alias migration directory");
     let store = PersistentStore::open(directory.path()).expect("create current store");
+    let alias = AssetAlias {
+        key: "legacy/shared-key".to_owned(),
+        object_hash: Some("ab".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 17,
+        mime: "application/octet-stream".to_owned(),
+        name: "Legacy alias".to_owned(),
+        ext: "BIN".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({
+            "name": "Legacy alias",
+            "ext": "BIN",
+            "mime": "application/octet-stream"
+        }),
+    };
+    let inlay = AssetAlias {
+        key: "legacy/inlay-key".to_owned(),
+        object_hash: Some("cd".repeat(32)),
+        kind: "inlay".to_owned(),
+        size: 23,
+        mime: "image/webp".to_owned(),
+        name: "Legacy Inlay".to_owned(),
+        ext: "WebP".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: Some(640),
+        height: None,
+        metadata: json!({
+            "name": "Legacy Inlay",
+            "ext": "WebP",
+            "mime": "image/webp",
+            "inlayType": "image",
+            "width": 640
+        }),
+    };
+    for legacy in [&alias, &inlay] {
+        store
+            .connection
+            .execute(
+                "INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height
+             ) VALUES ('revision-0', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    legacy.key,
+                    legacy.object_hash,
+                    legacy.kind,
+                    legacy.size,
+                    legacy.mime,
+                    legacy.name,
+                    legacy.ext,
+                    legacy.inlay_type,
+                    legacy.width,
+                    legacy.height,
+                ],
+            )
+            .expect("insert legacy alias");
+    }
+    store
+        .connection
+        .execute_batch(
+            "
+            DROP INDEX asset_aliases_generation;
+            ALTER TABLE asset_aliases RENAME TO asset_aliases_v8;
+            CREATE TABLE asset_aliases (
+                generation TEXT NOT NULL,
+                logical_key TEXT NOT NULL,
+                object_hash TEXT,
+                kind TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mime TEXT NOT NULL,
+                name TEXT NOT NULL,
+                ext TEXT NOT NULL,
+                inlay_type TEXT,
+                width INTEGER,
+                height INTEGER,
+                PRIMARY KEY (generation, logical_key)
+            );
+            INSERT INTO asset_aliases (
+                generation, logical_key, object_hash, kind, size, mime, name, ext,
+                inlay_type, width, height
+            )
+            SELECT generation, logical_key, object_hash, kind, size, mime, name, ext,
+                   inlay_type, width, height
+            FROM asset_aliases_v8;
+            DROP TABLE asset_aliases_v8;
+            CREATE INDEX asset_aliases_generation ON asset_aliases (generation);
+            DROP TABLE asset_owner_heads;
+            DROP TABLE cold_aliases;
+            PRAGMA user_version = 6;
+            ",
+        )
+        .expect("downgrade alias schema fixture to v6");
     drop(store);
-    let database_path = directory.path().join("persistent/persistent.db");
-    let connection = rusqlite::Connection::open(&database_path).expect("open migration fixture");
-    connection
-        .execute_batch("DROP TABLE asset_owner_heads; PRAGMA user_version = 6;")
-        .expect("downgrade fixture schema marker");
-    drop(connection);
 
-    let store = PersistentStore::open(directory.path()).expect("migrate v6 store");
+    let store = PersistentStore::open(directory.path()).expect("migrate v6 alias store");
     let version: i64 = store
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    let head_count: i64 = store
-        .connection
-        .query_row("SELECT COUNT(*) FROM asset_owner_heads", [], |row| {
-            row.get(0)
-        })
-        .expect("count migrated owner heads");
-
-    assert_eq!(version, 7);
-    assert_eq!(head_count, 0);
+    assert_eq!(version, 8);
     assert_eq!(
-        store.read_root(None).expect("read migrated root").revision,
-        0
+        store
+            .read_asset_alias("asset", &alias.key, None)
+            .expect("read migrated alias"),
+        Some(super::Versioned {
+            revision: 0,
+            value: alias,
+        })
+    );
+    assert_eq!(
+        store
+            .read_asset_alias("inlay", &inlay.key, None)
+            .expect("read migrated Inlay alias"),
+        Some(super::Versioned {
+            revision: 0,
+            value: inlay,
+        })
+    );
+    assert_eq!(
+        store
+            .list_cold_aliases(None)
+            .expect("read empty migrated cold inventory")
+            .value,
+        Vec::<ColdAlias>::new()
+    );
+    let primary_key_columns = {
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT name FROM pragma_table_info('asset_aliases')
+                 WHERE pk > 0 ORDER BY pk",
+            )
+            .expect("prepare alias primary key query");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query alias primary key")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect alias primary key")
+    };
+    assert_eq!(
+        primary_key_columns,
+        vec!["generation", "kind", "logical_key"]
     );
 }
 
 #[test]
-fn schema_v7_migrates_v2_snapshot_lease_and_plugin_records() {
+fn schema_v8_preserves_reserved_v7_tables() {
+    let directory = tempfile::tempdir().expect("create v7 migration directory");
+    let store = PersistentStore::open(directory.path()).expect("create current store");
+    store
+        .connection
+        .execute_batch(
+            "
+            DROP TABLE cold_aliases;
+            CREATE TABLE reserved_v7_records (
+                generation TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                PRIMARY KEY (generation, owner)
+            );
+            INSERT INTO reserved_v7_records (generation, owner)
+            VALUES ('revision-0', 'preserved');
+            PRAGMA user_version = 7;
+            ",
+        )
+        .expect("create reserved v7 fixture");
+    drop(store);
+
+    let store = PersistentStore::open(directory.path()).expect("migrate reserved v7 store");
+    let version: i64 = store
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read migrated schema version");
+    let reserved: String = store
+        .connection
+        .query_row(
+            "SELECT owner FROM reserved_v7_records WHERE generation = 'revision-0'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read preserved reserved v7 row");
+    let cold_table_exists: bool = store
+        .connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'cold_aliases'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query migrated cold table");
+
+    assert_eq!(version, 8);
+    assert_eq!(reserved, "preserved");
+    assert!(cold_table_exists);
+}
+
+#[test]
+fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
     let directory = tempfile::tempdir().expect("create v2 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database_with_lease(&database_path);
@@ -3257,7 +4065,7 @@ fn schema_v7_migrates_v2_snapshot_lease_and_plugin_records() {
     let mut store = PersistentStore::open(directory.path()).expect("migrate v2 store");
     assert_eq!(
         store
-            .read_asset_alias("assets/not-backfilled.bin", None)
+            .read_asset_alias("asset", "assets/not-backfilled.bin", None)
             .expect("query empty migrated alias table"),
         None
     );
@@ -3280,7 +4088,7 @@ fn schema_v7_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 
     store
         .release_revision("snapshot-7-v2fixture")
@@ -3413,7 +4221,7 @@ fn create_task4_v4_database(path: &Path) {
 }
 
 #[test]
-fn schema_v7_migrates_snapshot_v3_without_plugin_table() {
+fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
     let directory = tempfile::tempdir().expect("create snapshot v3 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_snapshot_v3_database(&database_path);
@@ -3432,7 +4240,7 @@ fn schema_v7_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        7
+        8
     );
     store
         .release_revision("snapshot-v3fixture")
@@ -3448,7 +4256,7 @@ fn schema_v7_migrates_snapshot_v3_without_plugin_table() {
 }
 
 #[test]
-fn schema_v7_migrates_task4_v4_lease_with_plugin_ordinal() {
+fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
     let directory = tempfile::tempdir().expect("create Task 4 v4 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_task4_v4_database(&database_path);
@@ -3467,7 +4275,7 @@ fn schema_v7_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        7
+        8
     );
     store
         .release_revision("snapshot-7-task4v4")
@@ -3486,7 +4294,7 @@ fn schema_v7_migrates_task4_v4_lease_with_plugin_ordinal() {
 }
 
 #[test]
-fn schema_v7_migrates_existing_v2_plugin_storage() {
+fn schema_v8_migrates_existing_v2_plugin_storage() {
     let directory = tempfile::tempdir().expect("create v2 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database(&database_path);
@@ -3511,11 +4319,11 @@ fn schema_v7_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
-fn schema_v7_adds_durable_plugin_ordinals_to_task4_v3() {
+fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
     let directory = tempfile::tempdir().expect("create v3 migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v3_database(&database_path);
@@ -3536,11 +4344,11 @@ fn schema_v7_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
-fn schema_v7_migrates_large_retained_roots_one_generation_at_a_time() {
+fn schema_v8_migrates_large_retained_roots_one_generation_at_a_time() {
     let directory = tempfile::tempdir().expect("create retained root migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v2_database(&database_path);
@@ -3586,7 +4394,7 @@ fn schema_v7_migrates_large_retained_roots_one_generation_at_a_time() {
 }
 
 #[test]
-fn schema_v7_migrates_records_for_every_v1_generation() {
+fn schema_v8_migrates_records_for_every_v1_generation() {
     let directory = tempfile::tempdir().expect("create migration directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -3674,11 +4482,11 @@ fn schema_v7_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
-fn schema_v7_rolls_back_when_v1_bot_presets_is_not_an_array() {
+fn schema_v8_rolls_back_when_v1_bot_presets_is_not_an_array() {
     let directory = tempfile::tempdir().expect("create migration rollback directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -3740,7 +4548,7 @@ fn schema_v7_rolls_back_when_v1_bot_presets_is_not_an_array() {
 }
 
 #[test]
-fn schema_v7_rolls_back_when_v1_plugin_storage_is_not_an_object() {
+fn schema_v8_rolls_back_when_v1_plugin_storage_is_not_an_object() {
     let directory = tempfile::tempdir().expect("create plugin migration rollback directory");
     let database_path = directory.path().join("persistent/persistent.db");
     create_v1_database(&database_path);
@@ -3789,7 +4597,7 @@ fn schema_v7_rolls_back_when_v1_plugin_storage_is_not_an_object() {
 }
 
 #[test]
-fn pending_v1_snapshot_restores_then_migrates_to_v7() {
+fn pending_v1_snapshot_restores_then_migrates_to_v8() {
     let directory = tempfile::tempdir().expect("create restore directory");
     let store = PersistentStore::open(directory.path()).expect("open current v5 store");
     let candidate = directory
@@ -3816,7 +4624,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v7() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]
@@ -3962,7 +4770,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 7);
+    assert_eq!(integer_pragma("user_version"), 8);
 }
 
 #[test]
@@ -4424,7 +5232,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 8;")
+                .execute_batch("PRAGMA user_version = 9;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
