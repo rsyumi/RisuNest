@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
         return character.chaId
     }),
     readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
+    saveAsset: vi.fn(),
     compressImage: vi.fn(async (_data: Uint8Array) => new Uint8Array([99])),
     charxWrites: [] as Array<{ key: string; data: Uint8Array }>,
     pngWrites: [] as Array<{ key: string; data: Uint8Array }>,
@@ -63,7 +64,7 @@ vi.mock('./globalApi.svelte', () => ({
     LocalWriter: class {},
     openURL: vi.fn(),
     readImage: mocks.readImage,
-    saveAsset: vi.fn(),
+    saveAsset: mocks.saveAsset,
     VirtualWriter: class {},
 }))
 vi.mock('src/ts/platform', () => ({ isTauri: false, isNodeServer: false }))
@@ -125,6 +126,8 @@ import {
     exportCharacterCard,
     importCharacterCardSpec,
     importCharacterProcess,
+    mapPreparedNativeCharacterCard,
+    type CharacterCardV2Risu,
 } from './characterCards'
 
 describe('character card additions', () => {
@@ -218,6 +221,99 @@ describe('character card additions', () => {
             },
         })
         expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+    })
+
+    it('maps prepared native metadata without reading or committing payloads', async () => {
+        const card = JSON.parse(goldenCardJson)
+        card.data.assets[0].uri = 'ccdefault:'
+        const originalCard = structuredClone(card)
+        const trigger = [{ comment: 'native trigger' }]
+        const regex = [{ comment: 'native regex', in: 'a', out: 'b', type: 'editinput' }]
+        const lorebook = [{
+            key: 'native lore',
+            secondkey: '',
+            insertorder: 0,
+            comment: 'native lore',
+            content: 'native content',
+            mode: 'normal',
+            alwaysActive: false,
+            selective: false,
+        }]
+
+        const mapped = await mapPreparedNativeCharacterCard({
+            card,
+            assets: [{ token: 'assets/config.JSON', logicalId: 'asset://config' }],
+            portraitLogicalId: 'asset://portrait',
+            module: { trigger, regex, lorebook } as any,
+        })
+
+        expect(mapped).toMatchObject({
+            image: 'asset://portrait',
+            additionalAssets: [
+                ['config', 'asset://config', 'JSON'],
+                ['config duplicate', 'asset://config', 'JSON'],
+            ],
+            triggerscript: trigger,
+            customscript: regex,
+            globalLore: lorebook,
+        })
+        expect(card).toEqual(originalCard)
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+    })
+
+    it('rejects prepared native v3 data URIs before payload work', async () => {
+        const card = JSON.parse(goldenCardJson)
+        card.data.assets[0].uri = 'data:image/png;base64,AA=='
+
+        await expect(mapPreparedNativeCharacterCard({
+            card,
+            assets: [{ token: 'assets/config.JSON', logicalId: 'asset://config' }],
+        })).rejects.toThrow(/data URI/i)
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+    })
+
+    it('rejects prepared native v2 inline base64 before payload work', async () => {
+        const card:CharacterCardV2Risu = {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: {
+                name: 'Legacy native card',
+                description: '',
+                personality: '',
+                scenario: '',
+                first_mes: '',
+                mes_example: '',
+                creator_notes: '',
+                system_prompt: '',
+                post_history_instructions: '',
+                alternate_greetings: [],
+                tags: [],
+                creator: '',
+                character_version: '',
+                extensions: { risuai: { emotions: [['happy', 'AA==']] } },
+            },
+        }
+
+        await expect(mapPreparedNativeCharacterCard({
+            card,
+            assets: [],
+        })).rejects.toThrow(/logical asset reference/i)
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+    })
+
+    it('rejects duplicate prepared native asset tokens', async () => {
+        const card = JSON.parse(goldenCardJson)
+
+        await expect(mapPreparedNativeCharacterCard({
+            card,
+            assets: [
+                { token: 'assets/Portrait.JPEG', logicalId: 'asset://portrait' },
+                { token: 'assets/Portrait.JPEG', logicalId: 'asset://other' },
+                { token: 'assets/config.JSON', logicalId: 'asset://config' },
+            ],
+        })).rejects.toThrow(/duplicate/i)
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
     })
 
     it('keeps ordinary asset bytes exact in the JavaScript CharX export fallback', async () => {

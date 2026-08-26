@@ -702,7 +702,133 @@ export async function exportChar(charaID:number):Promise<string> {
 }
 
 
+export type PreparedNativeCharacterCardMetadata = CharacterCardV2Risu | CharacterCardV3
+
+export interface PreparedNativeCharacterCardAsset {
+    token: string
+    logicalId: string
+}
+
+export interface PreparedNativeCharacterCardModule {
+    trigger?: readonly triggerscript[]
+    regex?: readonly customscript[]
+    lorebook?: readonly loreBook[]
+}
+
+export interface PreparedNativeCharacterCardInput {
+    card: PreparedNativeCharacterCardMetadata
+    assets: readonly PreparedNativeCharacterCardAsset[]
+    portraitLogicalId?: string
+    module?: PreparedNativeCharacterCardModule
+}
+
+interface CardAssetImportPolicy {
+    initialImage?: string
+    rejectPayload(reference: string): never
+}
+
+export async function mapPreparedNativeCharacterCard(input: PreparedNativeCharacterCardInput): Promise<character | false> {
+    const assetDict = createPreparedNativeAssetDict(input.assets)
+    if(input.portraitLogicalId !== undefined && input.portraitLogicalId.trim().length === 0){
+        throw new Error('Prepared native portrait logical ID must not be empty')
+    }
+
+    preflightPreparedNativeCard(input.card, assetDict, input.portraitLogicalId)
+
+    const card = safeStructuredClone(input.card)
+    let overrideLorebook:loreBook[] = null
+    if(input.module){
+        const data = card.data as typeof card.data & {
+            extensions: Record<string, any>
+        }
+        data.extensions ??= {}
+        data.extensions.risuai ??= {}
+        data.extensions.risuai.triggerscript = [...safeStructuredClone(input.module.trigger ?? [])]
+        data.extensions.risuai.customScripts = [...safeStructuredClone(input.module.regex ?? [])]
+        if(input.module.lorebook !== undefined){
+            overrideLorebook = [...safeStructuredClone(input.module.lorebook)]
+        }
+    }
+
+    return importCharacterCardSpecWithPolicy(
+        card,
+        undefined,
+        'normal',
+        assetDict,
+        overrideLorebook,
+        true,
+        {
+            initialImage: input.portraitLogicalId,
+            rejectPayload(reference): never {
+                throw new Error(`Prepared native card cannot load payload reference: ${reference}`)
+            },
+        },
+    )
+}
+
+function createPreparedNativeAssetDict(assets: readonly PreparedNativeCharacterCardAsset[]): Record<string, string> {
+    const assetDict:Record<string, string> = Object.create(null)
+    for(const asset of assets){
+        if(asset.token.trim().length === 0 || asset.logicalId.trim().length === 0){
+            throw new Error('Prepared native asset token and logical ID must not be empty')
+        }
+        if(Object.hasOwn(assetDict, asset.token)){
+            throw new Error(`Duplicate prepared native asset token: ${asset.token}`)
+        }
+        assetDict[asset.token] = asset.logicalId
+    }
+    return assetDict
+}
+
+function preflightPreparedNativeCard(card: PreparedNativeCharacterCardMetadata, assetDict: Record<string, string>, portraitLogicalId?: string): void {
+    if(card.spec === 'chara_card_v3'){
+        for(const asset of card.data.assets ?? []){
+            if(asset.uri.startsWith('data:')){
+                throw new Error('Prepared native card data URI payloads are not allowed')
+            }
+            if(asset.uri.startsWith('__asset:')){
+                requirePreparedNativeAsset(asset.uri.slice('__asset:'.length), assetDict)
+            }
+            else if(asset.uri.startsWith('embeded://')){
+                requirePreparedNativeAsset(asset.uri.slice('embeded://'.length), assetDict)
+            }
+            else if(asset.uri === 'ccdefault:' && asset.type === 'icon' && asset.name === 'main' && !portraitLogicalId){
+                throw new Error('Prepared native main icon requires a portrait logical ID')
+            }
+        }
+        return
+    }
+
+    const risuai = card.data.extensions.risuai
+    for(const emotion of risuai?.emotions ?? []){
+        requirePreparedNativeV2Reference(emotion[1], assetDict)
+    }
+    for(const asset of risuai?.additionalAssets ?? []){
+        requirePreparedNativeV2Reference(asset[1], assetDict)
+    }
+    for(const reference of Object.values(risuai?.vits ?? {})){
+        requirePreparedNativeV2Reference(reference, assetDict)
+    }
+}
+
+function requirePreparedNativeV2Reference(reference: string, assetDict: Record<string, string>): void {
+    if(!reference.startsWith('__asset:')){
+        throw new Error('Prepared native v2 payload fields require a logical asset reference')
+    }
+    requirePreparedNativeAsset(reference.slice('__asset:'.length), assetDict)
+}
+
+function requirePreparedNativeAsset(token: string, assetDict: Record<string, string>): void {
+    if(token.length === 0 || !Object.hasOwn(assetDict, token)){
+        throw new Error(`Prepared native asset token is missing: ${token}`)
+    }
+}
+
 export async function importCharacterCardSpec<T extends boolean = false>(card:CharacterCardV2Risu|CharacterCardV3, img?:Uint8Array, mode:'hub'|'normal' = 'normal', assetDict:{[key:string]:string} = {}, overrideLorebook: loreBook[] = null, returnValue:T = false as T):Promise<T extends true ? character|false : string|false>{
+    return importCharacterCardSpecWithPolicy(card, img, mode, assetDict, overrideLorebook, returnValue)
+}
+
+async function importCharacterCardSpecWithPolicy<T extends boolean = false>(card:CharacterCardV2Risu|CharacterCardV3, img?:Uint8Array, mode:'hub'|'normal' = 'normal', assetDict:{[key:string]:string} = {}, overrideLorebook: loreBook[] = null, returnValue:T = false as T, assetPolicy?:CardAssetImportPolicy):Promise<T extends true ? character|false : string|false>{
     if(!card ||(card.spec !== 'chara_card_v2' && card.spec !== 'chara_card_v3' )){
         return false
     }
@@ -710,7 +836,7 @@ export async function importCharacterCardSpec<T extends boolean = false>(card:Ch
     console.log(`Importing ${card.spec}, mode is ${mode}`)
 
     const data = card.data
-    let im = img ? await saveAsset(img) : undefined
+    let im = assetPolicy ? assetPolicy.initialImage : (img ? await saveAsset(img) : undefined)
     let db = DBState.db
 
     const risuext = safeStructuredClone(data.extensions.risuai)
@@ -747,6 +873,7 @@ export async function importCharacterCardSpec<T extends boolean = false>(card:Ch
                     emotions.push([risuext.emotions[i][0],imgp])
                     continue
                 }
+                assetPolicy?.rejectPayload(risuext.emotions[i][1])
                 const imgp = await saveAsset(mode === 'hub' ? (await getHubResources(risuext.emotions[i][1])) : Buffer.from(risuext.emotions[i][1], 'base64'))
                 emotions.push([risuext.emotions[i][0],imgp])
             }
@@ -774,6 +901,7 @@ export async function importCharacterCardSpec<T extends boolean = false>(card:Ch
                     extAssets.push([risuext.additionalAssets[i][0],imgp,fileName])
                     continue
                 }
+                assetPolicy?.rejectPayload(risuext.additionalAssets[i][1])
                 const imgp = await saveAsset(mode === 'hub' ? (await getHubResources(risuext.additionalAssets[i][1])) :Buffer.from(risuext.additionalAssets[i][1], 'base64'), '', fileName)
                 extAssets.push([risuext.additionalAssets[i][0],imgp,fileName])
             }
@@ -797,6 +925,7 @@ export async function importCharacterCardSpec<T extends boolean = false>(card:Ch
                     risuext.vits[key] = imgp
                     continue
                 }
+                assetPolicy?.rejectPayload(risuext.vits[key])
                 const imgp = await saveAsset(mode === 'hub' ? (await getHubResources(risuext.vits[key])) : Buffer.from(risuext.vits[key], 'base64'))
                 risuext.vits[key] = imgp
             }
@@ -855,6 +984,7 @@ export async function importCharacterCardSpec<T extends boolean = false>(card:Ch
                     }
                 }
                 else if(data.assets[i].uri.startsWith('data:')){
+                    assetPolicy?.rejectPayload(data.assets[i].uri)
                     //data uri
                     const b64 = data.assets[i].uri.split(',')[1]
                     if(b64.length < 50 * 1024 * 1024){
@@ -1908,7 +2038,7 @@ export function isCharacterHasAssets(char:character|groupChat){
 }
 
 
-type CharacterCardV2Risu = {
+export type CharacterCardV2Risu = {
     spec: 'chara_card_v2'
     spec_version: '2.0' // May 8th addition
     data: {
