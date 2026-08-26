@@ -13,7 +13,6 @@ import {
     DeferredInlayMarkerRegistry,
     getInlayRenderSource,
     getInlayRenderSources,
-    getNativeInlayThumbnailSize,
     mountDeferredInlaySources,
     resolveDeferredInlaySources,
     renderDeferredInlaySourceMarkup,
@@ -40,17 +39,17 @@ describe('getInlayRenderSource', () => {
             ext: 'webm',
             inlayType: 'video',
         })
-        inlayMocks.getInlayAssetRenderUrl.mockResolvedValue('http://risuasset.localhost/video-id?thumb=256')
+        inlayMocks.getInlayAssetRenderUrl.mockResolvedValue('http://risuasset.localhost/video-id')
 
-        await expect(getInlayRenderSource('video-id', true, 256)).resolves.toEqual({
-            url: 'http://risuasset.localhost/video-id?thumb=256',
+        await expect(getInlayRenderSource('video-id', true)).resolves.toEqual({
+            url: 'http://risuasset.localhost/video-id',
             mime: 'video/webm',
             type: 'video',
             name: 'clip.webm',
             size: 42,
             objectUrl: false,
         })
-        expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledWith('video-id', 256)
+        expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledWith('video-id')
         expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
     })
 
@@ -92,17 +91,6 @@ describe('getInlayRenderSource', () => {
         expect(inlayMocks.getInlayAssetMetadata).toHaveBeenNthCalledWith(2, 'shown-b', { migrateLegacy: false })
         expect(inlayMocks.listInlayAssetMetadata).not.toHaveBeenCalled()
         expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
-    })
-
-    test.each([
-        ['image/gif', 256],
-        ['image/jpeg', 256],
-        ['image/png', 256],
-        ['image/webp', 256],
-        ['image/avif', undefined],
-        ['image/svg+xml', undefined],
-    ] as const)('selects the native thumbnail size for %s', (mime, expected) => {
-        expect(getNativeInlayThumbnailSize({ mime, inlayType: 'image' }, true)).toBe(expected)
     })
 
     test('uses the stored MIME in media markup', () => {

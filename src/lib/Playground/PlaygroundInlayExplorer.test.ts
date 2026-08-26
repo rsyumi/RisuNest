@@ -55,7 +55,7 @@ describe('PlaygroundInlayExplorer native previews', () => {
             width: 800,
             height: 600,
         }])
-        inlayMocks.getInlayAssetRenderUrl.mockResolvedValue('http://risuasset.localhost/photo-id?thumb=256')
+        inlayMocks.getInlayAssetRenderUrl.mockResolvedValue('http://risuasset.localhost/photo-id')
     })
 
     afterEach(async () => {
@@ -66,7 +66,7 @@ describe('PlaygroundInlayExplorer native previews', () => {
         vi.clearAllMocks()
     })
 
-    test('lists metadata and requests a 256 thumbnail without loading the payload', async () => {
+    test('lists metadata and requests the original native URL without loading the payload', async () => {
         const target = document.createElement('div')
         document.body.appendChild(target)
         mounted = mount(PlaygroundInlayExplorer, { target })
@@ -77,9 +77,9 @@ describe('PlaygroundInlayExplorer native previews', () => {
         expect(inlayMocks.listInlayAssetMetadata).toHaveBeenCalledOnce()
         expect(inlayMocks.listInlayAssetMetadata).toHaveBeenCalledWith({ migrateLegacy: false })
         expect(inlayMocks.listInlayAssets).not.toHaveBeenCalled()
-        expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledWith('photo-id', 256)
+        expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledWith('photo-id')
         expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
-        expect(target.querySelector('img')?.getAttribute('src')).toBe('http://risuasset.localhost/photo-id?thumb=256')
+        expect(target.querySelector('img')?.getAttribute('src')).toBe('http://risuasset.localhost/photo-id')
         expect(target.textContent).toContain('4.0 KB')
     })
 
@@ -100,7 +100,7 @@ describe('PlaygroundInlayExplorer native previews', () => {
 
         await vi.waitFor(() => expect(target.querySelector('img')).not.toBeNull())
 
-        expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledWith('photo-avif', undefined)
+        expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledWith('photo-avif')
         expect(target.querySelector('img')?.getAttribute('src')).toBe('http://risuasset.localhost/photo-avif')
     })
 
@@ -117,7 +117,7 @@ describe('PlaygroundInlayExplorer native previews', () => {
         await vi.waitFor(() => expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledOnce())
         await unmount(mounted)
         mounted = undefined
-        resolveUrl('http://risuasset.localhost/photo-id?thumb=256')
+        resolveUrl('http://risuasset.localhost/photo-id')
         await Promise.resolve()
         await Promise.resolve()
 

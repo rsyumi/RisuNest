@@ -482,7 +482,6 @@ pub fn run() {
             #[cfg(desktop)]
             install_py_dependencies,
             oauth_login,
-            native_media::native_media_remove_thumbnails,
             persistent_store::commands::pds_open,
             persistent_store::commands::pds_read_root,
             persistent_store::commands::pds_query_presets,

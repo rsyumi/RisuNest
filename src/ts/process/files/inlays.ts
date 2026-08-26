@@ -344,7 +344,6 @@ export async function listInlayAssetMetadata(
 
 export async function getInlayAssetRenderUrl(
     id: string,
-    thumbnailSize?: 128 | 256 | 512,
     store?: BlobStore,
 ): Promise<string | null> {
     const blobStore = store ?? await resolveBlobStore()
@@ -352,7 +351,7 @@ export async function getInlayAssetRenderUrl(
     if (metadata?.kind !== 'inlay') return null
     const url = await blobStore.resolveUrl(id)
     if (!url) return null
-    return thumbnailSize === undefined ? url : `${url}?thumb=${thumbnailSize}`
+    return url
 }
 
 export async function setInlayAsset(id: string, img: InlayAsset){

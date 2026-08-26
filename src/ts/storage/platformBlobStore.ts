@@ -2,7 +2,7 @@ import localforage from 'localforage'
 import {
     BaseDirectory, SeekMode, exists, mkdir, open, readDir, readFile, remove, stat, writeFile,
 } from '@tauri-apps/plugin-fs'
-import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { convertFileSrc } from '@tauri-apps/api/core'
 import { isTauri } from '../platform'
 import {
     createKeyValueBlobStore,
@@ -43,37 +43,10 @@ export function createBackedBlobStore(backend: BlobKeyValueBackend): BlobStore {
     return createKeyValueBlobStore(backend, blobKeyMapper)
 }
 
-type TauriCommandInvoker = (command: string, args?: Record<string, unknown>) => Promise<unknown>
-
 export function createTauriBlobStore(
     backend: BlobKeyValueBackend,
-    invokeCommand: TauriCommandInvoker = invoke,
 ): BlobStore {
-    const store = createBackedBlobStore(backend)
-    const cleanup = async (key: string) => {
-        try {
-            await invokeCommand('native_media_remove_thumbnails', {
-                physicalKey: physicalBlobKeys(key).payload,
-            })
-        } catch (error) {
-            console.warn('Failed to clean native media thumbnails', error)
-        }
-    }
-    return {
-        async put(key, data, metadata) {
-            const result = await store.put(key, data, metadata)
-            await cleanup(key)
-            return result
-        },
-        read: (key, range) => store.read(key, range),
-        stat: (key) => store.stat(key),
-        list: (query) => store.list(query),
-        async remove(key) {
-            await store.remove(key)
-            await cleanup(key)
-        },
-        resolveUrl: (key) => store.resolveUrl(key),
-    }
+    return createBackedBlobStore(backend)
 }
 
 export function createGatedBlobStore(store: BlobStore, gate: StorageMutationGate): BlobStore {

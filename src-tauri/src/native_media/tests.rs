@@ -1,20 +1,6 @@
-use super::{
-    decode_physical_key, remove_thumbnails, respond, with_thumbnail_cache_lock,
-    write_thumbnail_temp,
-};
-use base64::{engine::general_purpose, Engine as _};
+use super::{decode_physical_key, respond};
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    path::Path,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Barrier,
-    },
-    thread,
-    time::Duration,
-};
+use std::{fs, path::Path};
 use tauri::http::{header, Method, Request, StatusCode};
 use tempfile::TempDir;
 
@@ -263,12 +249,10 @@ fn returns_conditional_and_error_statuses() {
 }
 
 #[test]
-fn creates_bounded_webp_thumbnails_without_upscaling_and_invalidates_cache() {
+fn ignores_thumbnail_queries_and_serves_the_original_without_creating_a_cache() {
     let temp = TempDir::new().unwrap();
-    let png = general_purpose::STANDARD.decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-    ).unwrap();
-    write_blob(temp.path(), "assets/tiny.png", &png, "image/png");
+    let original = b"original-image-payload";
+    write_blob(temp.path(), "assets/tiny.png", original, "image/custom");
 
     let mut req = request(Method::GET, "assets/tiny.png");
     *req.uri_mut() = format!(
@@ -277,172 +261,9 @@ fn creates_bounded_webp_thumbnails_without_upscaling_and_invalidates_cache() {
     )
     .parse()
     .unwrap();
-    let first = respond(temp.path(), req);
-    assert_eq!(first.status(), StatusCode::OK);
-    assert_eq!(first.headers()[header::CONTENT_TYPE], "image/webp");
-    let decoded =
-        image::load_from_memory_with_format(first.body(), image::ImageFormat::WebP).unwrap();
-    assert_eq!((decoded.width(), decoded.height()), (1, 1));
-
-    let cache_dir = temp.path().join("blobstore/thumbnails");
-    assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 1);
-    let cached_path = fs::read_dir(&cache_dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let cached_modified = fs::metadata(&cached_path).unwrap().modified().unwrap();
-    let mut cached_req = request(Method::GET, "assets/tiny.png");
-    *cached_req.uri_mut() = format!(
-        "http://risuasset.localhost/{}?thumb=128",
-        hex("assets/tiny.png")
-    )
-    .parse()
-    .unwrap();
-    assert_eq!(respond(temp.path(), cached_req).body(), first.body());
-    assert_eq!(fs::read_dir(&cache_dir).unwrap().count(), 1);
-    assert_eq!(
-        fs::metadata(cached_path).unwrap().modified().unwrap(),
-        cached_modified
-    );
-    thread::sleep(Duration::from_millis(10));
-    write_blob(
-        temp.path(),
-        "assets/tiny.png",
-        &[png.as_slice(), &[0]].concat(),
-        "image/png",
-    );
-    let mut req = request(Method::GET, "assets/tiny.png");
-    *req.uri_mut() = format!(
-        "http://risuasset.localhost/{}?thumb=128",
-        hex("assets/tiny.png")
-    )
-    .parse()
-    .unwrap();
-    assert_eq!(respond(temp.path(), req).status(), StatusCode::OK);
-    assert_eq!(fs::read_dir(cache_dir).unwrap().count(), 2);
-
-    let mut unsupported = request(Method::GET, "assets/tiny.png");
-    *unsupported.uri_mut() = format!(
-        "http://risuasset.localhost/{}?thumb=64",
-        hex("assets/tiny.png")
-    )
-    .parse()
-    .unwrap();
-    assert_eq!(
-        respond(temp.path(), unsupported).status(),
-        StatusCode::NOT_FOUND
-    );
-}
-
-#[test]
-fn removes_overwritten_and_removed_key_thumbnails_without_touching_unrelated_files() {
-    let temp = TempDir::new().unwrap();
-    let png = general_purpose::STANDARD.decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-    ).unwrap();
-    for key in ["assets/target.png", "assets/unrelated.png"] {
-        write_blob(temp.path(), key, &png, "image/png");
-        let mut req = request(Method::GET, key);
-        *req.uri_mut() = format!("http://risuasset.localhost/{}?thumb=128", hex(key))
-            .parse()
-            .unwrap();
-        assert_eq!(respond(temp.path(), req).status(), StatusCode::OK);
-    }
-
-    thread::sleep(Duration::from_millis(10));
-    write_blob(
-        temp.path(),
-        "assets/target.png",
-        &[png.as_slice(), &[0]].concat(),
-        "image/png",
-    );
-    let mut overwritten = request(Method::GET, "assets/target.png");
-    *overwritten.uri_mut() = format!(
-        "http://risuasset.localhost/{}?thumb=128",
-        hex("assets/target.png")
-    )
-    .parse()
-    .unwrap();
-    assert_eq!(respond(temp.path(), overwritten).status(), StatusCode::OK);
-
-    let target_payload = temp.path().join("assets/target.png");
-    let target_metadata = temp
-        .path()
-        .join("blobstore/metadata")
-        .join(format!("{}.json", hex("assets/target.png")));
-    fs::remove_file(target_payload).unwrap();
-    fs::remove_file(target_metadata).unwrap();
-
-    let target_prefix = hex::encode(Sha256::digest(b"assets/target.png"));
-    let unrelated_prefix = hex::encode(Sha256::digest(b"assets/unrelated.png"));
-    let cache_dir = temp.path().join("blobstore/thumbnails");
-    fs::write(
-        cache_dir.join(format!(".{target_prefix}-128-stale.webp.crash.tmp")),
-        b"partial",
-    )
-    .unwrap();
-    fs::write(
-        cache_dir.join(format!(".{unrelated_prefix}-128-stale.webp.crash.tmp")),
-        b"partial",
-    )
-    .unwrap();
-
-    assert_eq!(
-        remove_thumbnails(temp.path(), "assets/target.png").unwrap(),
-        3
-    );
-    let remaining = fs::read_dir(temp.path().join("blobstore/thumbnails"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    assert_eq!(remaining.len(), 2);
-    assert!(remaining.iter().all(|name| !name.contains(&target_prefix)));
-    assert!(remaining
-        .iter()
-        .all(|name| name.contains(&unrelated_prefix)));
-    assert!(remove_thumbnails(temp.path(), "assets/../invalid").is_err());
-}
-
-#[test]
-fn removes_partial_thumbnail_temp_when_writing_fails() {
-    let temp = TempDir::new().unwrap();
-    let temp_path = temp.path().join("thumbnail.tmp");
-
-    let result: std::io::Result<()> = write_thumbnail_temp(&temp_path, || {
-        fs::write(&temp_path, b"partial")?;
-        Err(std::io::Error::other("simulated write failure"))
-    });
-
-    assert!(result.is_err());
-    assert!(!temp_path.exists());
-}
-
-#[test]
-fn serializes_thumbnail_cache_operations() {
-    let active = Arc::new(AtomicUsize::new(0));
-    let peak = Arc::new(AtomicUsize::new(0));
-    let barrier = Arc::new(Barrier::new(4));
-    let threads = (0..4)
-        .map(|_| {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                with_thumbnail_cache_lock(|| {
-                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(current, Ordering::SeqCst);
-                    thread::sleep(Duration::from_millis(5));
-                    active.fetch_sub(1, Ordering::SeqCst);
-                });
-            })
-        })
-        .collect::<Vec<_>>();
-    for thread in threads {
-        thread.join().unwrap();
-    }
-
-    assert_eq!(peak.load(Ordering::SeqCst), 1);
+    let response = respond(temp.path(), req);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/custom");
+    assert_eq!(response.body(), original);
+    assert!(!temp.path().join("blobstore/thumbnails").exists());
 }

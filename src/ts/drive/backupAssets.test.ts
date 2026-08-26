@@ -433,4 +433,23 @@ describe('account backup asset I/O', () => {
             ext: 'webp',
         })
     })
+
+    test('preserves an ordinary asset hash across restore and export', async () => {
+        const values = new Map<string, Uint8Array>()
+        const store = {
+            put: vi.fn(async (key: string, bytes: Uint8Array) => {
+                values.set(key, bytes.slice())
+            }),
+            read: vi.fn(async (key: string) => values.get(key)?.slice() ?? null),
+        } as unknown as BlobStore
+        const source = Uint8Array.of(0, 255, 1, 2, 3, 128)
+
+        await writeBackupAsset(store, 'assets/original.bin', source)
+        const exported = await readBackupAsset(store, 'assets/original.bin', false)
+        const digest = await crypto.subtle.digest('SHA-256', exported!.slice().buffer as ArrayBuffer)
+        const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+
+        expect(exported).toEqual(source)
+        expect(hash).toBe('e8e7f00d2b9a028c7a8ad275f02fe8206dd1f654446e88b305bf06f8adfc67f1')
+    })
 })

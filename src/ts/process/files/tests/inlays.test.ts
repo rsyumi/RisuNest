@@ -369,8 +369,8 @@ describe('native inlay rendering', () => {
             remove: async () => {},
             resolveUrl: async (key) => `asset://${key}`,
         })
-        await expect(getInlayAssetRenderUrl('id-a', 256, blobStore)).resolves.toBe(
-            'asset://blobstore/inlays/69642d61.bin?thumb=256',
+        await expect(getInlayAssetRenderUrl('id-a', blobStore)).resolves.toBe(
+            'asset://blobstore/inlays/69642d61.bin',
         )
         expect(payloadReads).toBe(0)
     })

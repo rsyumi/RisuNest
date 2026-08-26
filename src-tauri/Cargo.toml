@@ -37,7 +37,6 @@ oauth2 = "5.0.0"
 tokio = { version = "1.47.1", features = ["time"] }
 hex = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-sha2 = "0.10.9"
 webp = "0.3.1"
 flate2 = "1.1.2"
 [features]

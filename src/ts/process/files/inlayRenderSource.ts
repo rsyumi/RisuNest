@@ -168,22 +168,6 @@ export async function withResolvedDeferredInlaySources<T>(
     }
 }
 
-const nativeThumbnailMimes = new Set([
-    'image/gif',
-    'image/jpeg',
-    'image/png',
-    'image/webp',
-])
-
-export function getNativeInlayThumbnailSize(
-    metadata: Pick<InlayBlobMetadata, 'inlayType' | 'mime'>,
-    native: boolean,
-): 256 | undefined {
-    return native && metadata.inlayType === 'image' && nativeThumbnailMimes.has(metadata.mime.toLowerCase())
-        ? 256
-        : undefined
-}
-
 function escapeHtmlAttribute(value: string): string {
     return value
         .replaceAll('&', '&amp;')
@@ -224,14 +208,13 @@ function sourceFromMetadata(metadata: InlayBlobMetadata, url: string, objectUrl:
 export async function getInlayRenderSource(
     id: string,
     native: boolean,
-    thumbnailSize?: 128 | 256 | 512,
     knownMetadata?: InlayBlobMetadata,
 ): Promise<InlayRenderSource | null> {
     if (native) {
         const metadata = knownMetadata
             ?? await getInlayAssetMetadata(id, { migrateLegacy: false })
         if (!metadata) return null
-        const url = await getInlayAssetRenderUrl(id, thumbnailSize)
+        const url = await getInlayAssetRenderUrl(id)
         return url ? sourceFromMetadata(metadata, url, false) : null
     }
 

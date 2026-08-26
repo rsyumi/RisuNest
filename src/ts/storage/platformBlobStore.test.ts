@@ -36,7 +36,7 @@ describe('platform BlobStore', () => {
         expect(convert).toHaveBeenCalledWith('6173736574732f666f6c6465722f70686f746f2e6a7067', 'risuasset')
     })
 
-    test('Tauri BlobStore invokes thumbnail cleanup after successful puts and removals', async () => {
+    test('Tauri BlobStore mutates original payloads without native cleanup commands', async () => {
         const events: string[] = []
         const backend = {
             write: async (key: string) => { events.push(`write:${key}`) },
@@ -44,10 +44,7 @@ describe('platform BlobStore', () => {
             keys: async () => [],
             remove: async (key: string) => { events.push(`remove:${key}`) },
         }
-        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
-            events.push(`invoke:${command}:${args?.physicalKey}`)
-        })
-        const store = createTauriBlobStore(backend, invoke)
+        const store = createTauriBlobStore(backend)
 
         await store.put('assets/a.png', new Uint8Array([1]), {
             kind: 'asset', mime: 'image/png', name: 'a', ext: 'png',
@@ -55,45 +52,14 @@ describe('platform BlobStore', () => {
         expect(events).toEqual([
             'write:assets/a.png',
             'write:blobstore/metadata/6173736574732f612e706e67.json',
-            'invoke:native_media_remove_thumbnails:assets/a.png',
         ])
-        expect(invoke).toHaveBeenLastCalledWith('native_media_remove_thumbnails', {
-            physicalKey: 'assets/a.png',
-        })
 
         events.length = 0
         await store.remove('assets/a.png')
         expect(events).toEqual([
             'remove:assets/a.png',
             'remove:blobstore/metadata/6173736574732f612e706e67.json',
-            'invoke:native_media_remove_thumbnails:assets/a.png',
         ])
-    })
-
-    test('Tauri BlobStore keeps successful mutations when thumbnail cleanup fails', async () => {
-        const backend = {
-            write: vi.fn(async () => undefined),
-            read: async () => null,
-            keys: async () => [],
-            remove: vi.fn(async () => undefined),
-        }
-        const cleanupError = new Error('cleanup unavailable')
-        const invoke = vi.fn(async () => { throw cleanupError })
-        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
-        const store = createTauriBlobStore(backend, invoke)
-
-        try {
-            await expect(store.put('assets/a.png', new Uint8Array([1]), {
-                kind: 'asset', mime: 'image/png', name: 'a', ext: 'png',
-            })).resolves.toMatchObject({ key: 'assets/a.png' })
-            await expect(store.remove('assets/a.png')).resolves.toBeUndefined()
-
-            expect(invoke).toHaveBeenCalledTimes(2)
-            expect(warn).toHaveBeenCalledTimes(2)
-            expect(warn).toHaveBeenCalledWith('Failed to clean native media thumbnails', cleanupError)
-        } finally {
-            warn.mockRestore()
-        }
     })
 
     test('gates writes and removals while leaving reads ungated', async () => {

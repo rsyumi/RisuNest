@@ -1,22 +1,17 @@
-use image::imageops::FilterType;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::http::{
     header::{self, HeaderValue},
     Method, Request, Response, StatusCode,
 };
-use tauri::{AppHandle, Manager};
 
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 const EXPOSED_HEADERS: &str = "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag";
-static THUMBNAIL_CACHE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Deserialize)]
 struct BlobMetadata {
@@ -27,7 +22,6 @@ struct BlobMetadata {
 }
 
 struct ResolvedBlob {
-    physical_key: String,
     payload_path: PathBuf,
     mime: String,
     size: u64,
@@ -119,7 +113,6 @@ fn resolve_blob(root: &Path, physical_key: String) -> Option<ResolvedBlob> {
         return None;
     }
     Some(ResolvedBlob {
-        physical_key,
         payload_path,
         mime: blob_metadata.mime,
         size: file_metadata.len(),
@@ -135,154 +128,6 @@ fn etag(modified: SystemTime, size: u64) -> String {
         elapsed.subsec_nanos(),
         size
     )
-}
-
-fn requested_thumbnail(request: &Request<Vec<u8>>) -> Option<Option<u32>> {
-    let query = request.uri().query()?;
-    let mut thumb = None;
-    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        if name == "thumb" {
-            if thumb.is_some() {
-                return Some(None);
-            }
-            thumb = match value.as_ref() {
-                "128" => Some(128),
-                "256" => Some(256),
-                "512" => Some(512),
-                _ => return Some(None),
-            };
-        }
-    }
-    thumb.map(Some)
-}
-
-fn write_thumbnail_temp<T>(
-    temp_path: &Path,
-    operation: impl FnOnce() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    let result = operation();
-    if result.is_err() {
-        let _ = fs::remove_file(temp_path);
-    }
-    result
-}
-
-fn with_thumbnail_cache_lock<T>(operation: impl FnOnce() -> T) -> T {
-    let _guard = THUMBNAIL_CACHE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    operation()
-}
-
-fn thumbnail_path(root: &Path, blob: &ResolvedBlob, requested_size: u32) -> Option<PathBuf> {
-    let elapsed = blob.modified.duration_since(UNIX_EPOCH).ok()?;
-    let physical_key_hash = hex::encode(Sha256::digest(blob.physical_key.as_bytes()));
-    let mut version_hash = Sha256::new();
-    version_hash.update(elapsed.as_secs().to_le_bytes());
-    version_hash.update(elapsed.subsec_nanos().to_le_bytes());
-    version_hash.update(blob.size.to_le_bytes());
-    let cache_dir = root.join("blobstore").join("thumbnails");
-    let cache_path = cache_dir.join(format!(
-        "{physical_key_hash}-{requested_size}-{}.webp",
-        hex::encode(version_hash.finalize())
-    ));
-    with_thumbnail_cache_lock(|| {
-        if cache_path.is_file() {
-            return Some(cache_path);
-        }
-
-        let source = image::ImageReader::open(&blob.payload_path)
-            .ok()?
-            .with_guessed_format()
-            .ok()?
-            .decode()
-            .ok()?;
-        let rendered = if source.width() > requested_size || source.height() > requested_size {
-            source.resize(requested_size, requested_size, FilterType::Lanczos3)
-        } else {
-            source
-        };
-        let rgba = rendered.to_rgba8();
-        let encoded =
-            webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height()).encode(80.0);
-        fs::create_dir_all(&cache_dir).ok()?;
-        let temp_path = cache_dir.join(format!(
-            ".{}.{}.tmp",
-            cache_path.file_name()?.to_string_lossy(),
-            uuid::Uuid::new_v4()
-        ));
-        write_thumbnail_temp(&temp_path, || {
-            File::create(&temp_path)?.write_all(encoded.as_ref())
-        })
-        .ok()?;
-        match fs::rename(&temp_path, &cache_path) {
-            Ok(()) => Some(cache_path),
-            Err(_) if cache_path.is_file() => {
-                let _ = fs::remove_file(temp_path);
-                Some(cache_path)
-            }
-            Err(_) => {
-                let _ = fs::remove_file(temp_path);
-                None
-            }
-        }
-    })
-}
-
-pub(crate) fn remove_thumbnails(root: &Path, physical_key: &str) -> Result<usize, String> {
-    if !valid_physical_key(physical_key) {
-        return Err("invalid native media physical key".to_owned());
-    }
-    let prefix = format!("{}-", hex::encode(Sha256::digest(physical_key.as_bytes())));
-    let temp_prefix = format!(".{prefix}");
-    with_thumbnail_cache_lock(|| {
-        let cache_dir = root.join("blobstore").join("thumbnails");
-        let entries = match fs::read_dir(cache_dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => {
-                return Err(format!(
-                    "failed to read native media thumbnail cache: {error}"
-                ))
-            }
-        };
-        let mut removed = 0;
-        for entry in entries {
-            let entry =
-                entry.map_err(|error| format!("failed to read thumbnail entry: {error}"))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let is_cached_webp = name.starts_with(&prefix) && name.ends_with(".webp");
-            let is_crash_temp = name.starts_with(&temp_prefix) && name.ends_with(".tmp");
-            if !is_cached_webp && !is_crash_temp {
-                continue;
-            }
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("failed to inspect thumbnail entry: {error}"))?;
-            if !file_type.is_file() {
-                continue;
-            }
-            fs::remove_file(entry.path())
-                .map_err(|error| format!("failed to remove thumbnail: {error}"))?;
-            removed += 1;
-        }
-        Ok(removed)
-    })
-}
-
-#[tauri::command(async)]
-pub(crate) fn native_media_remove_thumbnails(
-    app: AppHandle,
-    physical_key: String,
-) -> Result<usize, String> {
-    let root = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("failed to resolve application data directory: {error}"))?;
-    remove_thumbnails(&root, &physical_key)
 }
 
 fn parse_range(value: Option<&HeaderValue>, size: u64) -> Option<RequestedRange> {
@@ -343,7 +188,7 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
     let Some(physical_key) = decode_physical_key(&request.uri().to_string()) else {
         return not_found();
     };
-    let Some(mut blob) = resolve_blob(root, physical_key) else {
+    let Some(blob) = resolve_blob(root, physical_key) else {
         return not_found();
     };
     let validator = etag(blob.modified, blob.size);
@@ -358,22 +203,6 @@ pub(crate) fn respond(root: &Path, request: Request<Vec<u8>>) -> Response<Vec<u8
             .header(header::CACHE_CONTROL, "no-cache")
             .body(Vec::new())
             .unwrap();
-    }
-
-    match requested_thumbnail(&request) {
-        Some(Some(size)) => {
-            let Some(path) = thumbnail_path(root, &blob, size) else {
-                return not_found();
-            };
-            let Ok(metadata) = fs::metadata(&path) else {
-                return not_found();
-            };
-            blob.payload_path = path;
-            blob.mime = "image/webp".to_owned();
-            blob.size = metadata.len();
-        }
-        Some(None) => return not_found(),
-        None => {}
     }
 
     let Some(range) = parse_range(request.headers().get(header::RANGE), blob.size) else {

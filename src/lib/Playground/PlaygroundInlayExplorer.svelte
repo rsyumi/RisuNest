@@ -5,7 +5,7 @@
   import { language } from 'src/lang'
   import { alertConfirm } from 'src/ts/alert'
   import { listInlayAssetMetadata, removeInlayAsset } from 'src/ts/process/files/inlays'
-  import { getInlayRenderSource, getNativeInlayThumbnailSize } from 'src/ts/process/files/inlayRenderSource'
+  import { getInlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
   import type { InlayRenderSource } from 'src/ts/process/files/inlayRenderSource'
   import { isTauri } from 'src/ts/platform'
   import type { InlayBlobMetadata } from 'src/ts/storage/blobStore'
@@ -37,7 +37,7 @@
     const generation = previewGenerations.get(id) ?? 0
     let pending: Promise<string | null>
     pending = (async () => {
-      const source = await getInlayRenderSource(id, isTauri, getNativeInlayThumbnailSize(asset, isTauri), asset)
+      const source = await getInlayRenderSource(id, isTauri, asset)
       if (!source) return null
       if (destroyed || (previewGenerations.get(id) ?? 0) !== generation) {
         if (source.objectUrl) URL.revokeObjectURL(source.url)
