@@ -24,6 +24,11 @@ test('builds an isolated Tauri profile around the pilot frontend', () => {
 
 test('requires parity, termination, busy-time, latency, and RSS gates', () => {
   const pilot = {
+    parity: [
+      { name: 'chat-reads' },
+      { name: 'ordered-mutations' },
+      { name: 'mutation-reads' },
+    ],
     parityMismatchCount: 0,
     globalIsolation: { passed: true },
     syntheticPromise: { passed: true },
@@ -32,9 +37,13 @@ test('requires parity, termination, busy-time, latency, and RSS gates', () => {
       contextWindow: { passed: true },
       memory: { passed: true },
     },
-    atomicFailureComparison: { zeroPartialWorkerMutation: true },
+    atomicFailureComparison: {
+      zeroPartialWorkerMutation: true,
+      productionSemanticMatch: true,
+    },
     termination: { passed: true, p95Ms: 10 },
     performance: {
+      uiBusyMeasurement: 'warm-total-timer-lag-v1',
       main: { p95Ms: 100, busyTimeMs: 80 },
       worker: { p95Ms: 105, busyTimeMs: 4 },
     },
@@ -52,4 +61,99 @@ test('requires parity, termination, busy-time, latency, and RSS gates', () => {
   assert.equal(gates.idleRss.passed, true)
   assert.equal(gates.windowsPilotPassed, true)
   assert.equal(gates.productionAdoptionEnabled, false)
+})
+
+test('fails semantic parity when atomic error handling differs from production', () => {
+  const pilot = {
+    parity: [
+      { name: 'chat-reads' },
+      { name: 'ordered-mutations' },
+      { name: 'mutation-reads' },
+    ],
+    parityMismatchCount: 0,
+    globalIsolation: { passed: true },
+    syntheticPromise: { passed: true },
+    boundaries: { unsupported: { passed: true } },
+    atomicFailureComparison: {
+      zeroPartialWorkerMutation: true,
+      productionSemanticMatch: false,
+    },
+    termination: { passed: true, p95Ms: 10 },
+    performance: {
+      uiBusyMeasurement: 'warm-total-timer-lag-v1',
+      main: { p95Ms: 100, busyTimeMs: 80 },
+      worker: { p95Ms: 105, busyTimeMs: 4 },
+    },
+  }
+  const gates = summarizePilotGates(
+    pilot,
+    { processMemory: { workingSetBytes: 500 * 1024 * 1024 } },
+    { processMemory: { workingSetBytes: 530 * 1024 * 1024 } },
+  )
+
+  assert.equal(gates.semanticParity.passed, false)
+  assert.equal(gates.windowsPilotPassed, false)
+})
+
+test('fails UI busy gate without the warm total-lag measurement', () => {
+  const pilot = {
+    parity: [
+      { name: 'chat-reads' },
+      { name: 'ordered-mutations' },
+      { name: 'mutation-reads' },
+    ],
+    parityMismatchCount: 0,
+    globalIsolation: { passed: true },
+    syntheticPromise: { passed: true },
+    boundaries: { unsupported: { passed: true } },
+    atomicFailureComparison: {
+      zeroPartialWorkerMutation: true,
+      productionSemanticMatch: true,
+    },
+    termination: { passed: true, p95Ms: 10 },
+    performance: {
+      uiBusyMeasurement: 'maximum-timer-lag',
+      main: { p95Ms: 100, busyTimeMs: 80 },
+      worker: { p95Ms: 105, busyTimeMs: 4 },
+    },
+  }
+  const gates = summarizePilotGates(
+    pilot,
+    { processMemory: { workingSetBytes: 500 * 1024 * 1024 } },
+    { processMemory: { workingSetBytes: 530 * 1024 * 1024 } },
+  )
+
+  assert.equal(gates.uiBusyTime.passed, false)
+  assert.equal(gates.windowsPilotPassed, false)
+})
+
+test('fails semantic parity when the mutation-read case is missing', () => {
+  const pilot = {
+    parity: [
+      { name: 'chat-reads' },
+      { name: 'ordered-mutations' },
+    ],
+    parityMismatchCount: 0,
+    globalIsolation: { passed: true },
+    syntheticPromise: { passed: true },
+    boundaries: { unsupported: { passed: true } },
+    atomicFailureComparison: {
+      zeroPartialWorkerMutation: true,
+      productionSemanticMatch: true,
+    },
+    termination: { passed: true, p95Ms: 10 },
+    performance: {
+      uiBusyMeasurement: 'warm-total-timer-lag-v1',
+      main: { p95Ms: 100, busyTimeMs: 80 },
+      worker: { p95Ms: 105, busyTimeMs: 4 },
+    },
+  }
+  const gates = summarizePilotGates(
+    pilot,
+    { processMemory: { workingSetBytes: 500 * 1024 * 1024 } },
+    { processMemory: { workingSetBytes: 530 * 1024 * 1024 } },
+  )
+
+  assert.deepEqual(gates.semanticParity.missingCases, ['mutation-reads'])
+  assert.equal(gates.semanticParity.passed, false)
 })

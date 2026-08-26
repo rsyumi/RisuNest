@@ -18,5 +18,6 @@ export function createLuaWorkerPilotClient(
   return new LuaWorkerHarnessClient({
     ...options,
     workerFactory: createModuleWorker,
+    waitForReady: true,
   })
 }

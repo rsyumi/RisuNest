@@ -52,6 +52,9 @@ export function buildTauriProfileConfig(original, port, runId) {
 }
 
 export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
+  const requiredParityCases = ['chat-reads', 'ordered-mutations', 'mutation-reads']
+  const parityNames = new Set((pilot.parity ?? []).map((entry) => entry.name))
+  const missingParityCases = requiredParityCases.filter((name) => !parityNames.has(name))
   const mainP95 = pilot.performance.main.p95Ms
   const workerP95 = pilot.performance.worker.p95Ms
   const mainBusy = pilot.performance.main.busyTimeMs
@@ -64,8 +67,11 @@ export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
   const semanticParity = {
     passed: pilot.parityMismatchCount === 0
       && pilot.globalIsolation.passed
-      && pilot.syntheticPromise.passed,
+      && pilot.syntheticPromise.passed
+      && pilot.atomicFailureComparison.productionSemanticMatch
+      && missingParityCases.length === 0,
     mismatchCount: pilot.parityMismatchCount,
+    missingCases: missingParityCases,
   }
   const termination = {
     passed: pilot.termination.passed && pilot.termination.p95Ms <= 100,
@@ -73,7 +79,8 @@ export function summarizePilotGates(pilot, baselineMemory, idleMemory) {
     budgetMs: 100,
   }
   const uiBusyTime = {
-    passed: mainBusy > 0 && workerBusy <= mainBusy * 0.10,
+    passed: pilot.performance.uiBusyMeasurement === 'warm-total-timer-lag-v1'
+      && mainBusy > 0 && workerBusy <= mainBusy * 0.10,
     mainMs: mainBusy,
     workerMs: workerBusy,
     reduction: mainBusy > 0 ? 1 - workerBusy / mainBusy : 0,

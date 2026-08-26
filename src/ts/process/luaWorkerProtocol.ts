@@ -91,6 +91,8 @@ export type LuaWorkerRequest = {
 }
 
 export type LuaWorkerHostMessage = {
+  type: 'registered'
+} | {
   type: 'hostCall'
   id: number
   callId: number
@@ -210,6 +212,63 @@ export function assertLuaWorkerMutationInContextWindow(
       if (end < start) {
         throw new LuaWorkerContextWindowError('Lua Worker cutChat end precedes its start')
       }
+      return
+    }
+    default:
+      return
+  }
+}
+
+export function applyLuaWorkerMutationToContext(
+  context: LuaWorkerBoundedContext,
+  mutation: LuaWorkerMutation,
+): void {
+  assertLuaWorkerMutationInContextWindow(context, mutation)
+  switch (mutation.type) {
+    case 'setChat': {
+      const offset = normalizeLuaWorkerContextIndex(context, mutation.index) - context.startIndex
+      context.messages[offset] = { ...context.messages[offset], data: mutation.value }
+      return
+    }
+    case 'setChatRole': {
+      const offset = normalizeLuaWorkerContextIndex(context, mutation.index) - context.startIndex
+      context.messages[offset] = { ...context.messages[offset], role: mutation.role }
+      return
+    }
+    case 'removeChat': {
+      const offset = normalizeLuaWorkerContextIndex(context, mutation.index) - context.startIndex
+      context.messages.splice(offset, 1)
+      context.totalMessages--
+      return
+    }
+    case 'insertChat': {
+      const absoluteIndex = assertLuaWorkerContextBoundary(context, mutation.index, 'insertChat')
+      context.messages.splice(absoluteIndex - context.startIndex, 0, {
+        role: mutation.role,
+        data: mutation.value,
+      })
+      context.totalMessages++
+      return
+    }
+    case 'addChat': {
+      if (context.startIndex + context.messages.length !== context.totalMessages) {
+        throw new LuaWorkerContextWindowError(
+          'Lua Worker cannot append outside the bounded context window',
+        )
+      }
+      context.messages.push({ role: mutation.role, data: mutation.value })
+      context.totalMessages++
+      return
+    }
+    case 'cutChat': {
+      const start = assertLuaWorkerContextBoundary(context, mutation.start, 'cutChat start')
+      const end = assertLuaWorkerContextBoundary(context, mutation.end, 'cutChat end')
+      context.messages = context.messages.slice(
+        start - context.startIndex,
+        end - context.startIndex,
+      )
+      context.startIndex = 0
+      context.totalMessages = context.messages.length
       return
     }
     default:

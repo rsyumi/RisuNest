@@ -298,6 +298,23 @@ async function runParityCorpus(): Promise<ParityCase[]> {
     null,
     chatContext,
   ))
+  cases.push(await parityCase(
+    'mutation-reads',
+    'editInput',
+    `
+      listenEdit('editInput', function(id, value)
+        setChat(id, 0, 'edited')
+        setChatRole(id, 0, 'char')
+        insertChat(id, 1, 'user', 'inserted')
+        removeChat(id, 2)
+        addChat(id, 'char', 'tail')
+        cutChat(id, 1, 4)
+        return getRecentChats(id, getChatLength(id))
+      end)
+    `,
+    null,
+    chatContext,
+  ))
   return cases
 }
 
@@ -487,9 +504,12 @@ async function measureTimerBusyTime(operation: () => Promise<unknown>) {
   const intervalMs = 10
   let previous = performance.now()
   let maximumLagMs = 0
+  let totalLagMs = 0
   const timer = setInterval(() => {
     const current = performance.now()
-    maximumLagMs = Math.max(maximumLagMs, current - previous - intervalMs)
+    const lag = Math.max(0, current - previous - intervalMs)
+    maximumLagMs = Math.max(maximumLagMs, lag)
+    totalLagMs += lag
     previous = current
   }, intervalMs)
   await new Promise((resolve) => setTimeout(resolve, 25))
@@ -498,7 +518,7 @@ async function measureTimerBusyTime(operation: () => Promise<unknown>) {
   const elapsedMs = performance.now() - startedAt
   await new Promise((resolve) => setTimeout(resolve, 25))
   clearInterval(timer)
-  return { elapsedMs, maximumLagMs }
+  return { elapsedMs, maximumLagMs, totalLagMs }
 }
 
 async function runPerformance() {
@@ -529,7 +549,7 @@ async function runPerformance() {
       workerSamples.push(performance.now() - workerStarted)
     }
     const mainBusy = await measureTimerBusyTime(() => invokeMain(
-      'pilot-performance-main-busy',
+      'pilot-performance-main',
       'editInput',
       source,
       null,
@@ -546,15 +566,16 @@ async function runPerformance() {
     const workerWarm = workerSamples.slice(1)
     return {
       samples: 10,
+      uiBusyMeasurement: 'warm-total-timer-lag-v1',
       main: {
         p50Ms: percentile(mainWarm, 0.5),
         p95Ms: percentile(mainWarm, 0.95),
-        busyTimeMs: mainBusy.maximumLagMs,
+        busyTimeMs: mainBusy.totalLagMs,
       },
       worker: {
         p50Ms: percentile(workerWarm, 0.5),
         p95Ms: percentile(workerWarm, 0.95),
-        busyTimeMs: workerBusy.maximumLagMs,
+        busyTimeMs: workerBusy.totalLagMs,
       },
     }
   }

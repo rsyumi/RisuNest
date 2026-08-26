@@ -951,6 +951,79 @@ describe('LuaWorkerHarnessClient', () => {
     expect(worker.terminated).toBe(false)
   })
 
+  it('validates an ordered mutation batch against its evolving context', async () => {
+    const worker = new FakeLuaWorker()
+    const commitMutations = vi.fn(() => true)
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'ordered-mutation-context-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke(invocation(), { commitMutations })
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [
+        { type: 'insertChat', index: 1, role: 'char', value: 'inserted' },
+        { type: 'setChat', index: 1, value: 'edited after insert' },
+      ],
+      res: 'complete',
+      stopSending: false,
+    })
+
+    await expect(pending).resolves.toMatchObject({ res: 'complete' })
+    expect(commitMutations).toHaveBeenCalledWith(4, [
+      { type: 'insertChat', index: 1, role: 'char', value: 'inserted' },
+      { type: 'setChat', index: 1, value: 'edited after insert' },
+    ])
+  })
+
+  it.each(['lua_worker_timeout', 'lua_worker_memory'])(
+    'terminates and replaces a Worker after fatal runtime error %s',
+    async (category) => {
+      const workers = [new FakeLuaWorker(), new FakeLuaWorker()]
+      let workerIndex = 0
+      const workerFactory = vi.fn(() => workers[workerIndex++])
+      const client = new LuaWorkerHarnessClient({
+        engineKey: `fatal-${category}`,
+        source: 'fixture source',
+        workerFactory,
+      })
+      const first = client.invoke(invocation(), { commitMutations: () => true })
+      const firstOutcome = first.catch((error) => error)
+      const firstRequest = workers[0].requests.find((message) => message.type === 'invoke')!
+
+      workers[0].respond({
+        type: 'error',
+        id: firstRequest.id,
+        category,
+        message: 'fatal runtime state',
+      })
+
+      await expect(firstOutcome).resolves.toEqual(expect.objectContaining({ category }))
+      expect(workers[0].terminated).toBe(true)
+
+      const second = client.invoke({ ...invocation(), data: 'fresh VM' }, {
+        commitMutations: () => true,
+      })
+      const secondRequest = workers[1].requests.find((message) => message.type === 'invoke')!
+      workers[1].respond({
+        type: 'result',
+        id: secondRequest.id,
+        metrics: {},
+        orderedMutations: [],
+        res: 'fresh VM',
+        stopSending: false,
+      })
+
+      await expect(second).resolves.toMatchObject({ res: 'fresh VM' })
+      expect(workerFactory).toHaveBeenCalledTimes(2)
+    },
+  )
+
   it('bounds invocation error messages and their complete envelope', async () => {
     const errors = [
       {

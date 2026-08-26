@@ -11,7 +11,7 @@ import type {
   LuaWorkerRequest,
 } from './luaWorkerProtocol'
 import {
-  assertLuaWorkerMutationInContextWindow,
+  applyLuaWorkerMutationToContext,
   canonicalizeLuaWorkerJson,
   createLuaWorkerEngineKey,
   isLuaWorkerMetrics,
@@ -45,6 +45,7 @@ export const DEFAULT_LUA_WORKER_POLICY: LuaWorkerPolicy = {
 }
 
 export const DEFAULT_LUA_WORKER_TIMEOUT_MS = 2_000
+export const DEFAULT_LUA_WORKER_REGISTRATION_TIMEOUT_MS = 10_000
 export const MAX_LUA_WORKER_PENDING_INVOCATIONS = 8
 export const MAX_LUA_WORKER_SOURCE_BYTES = 256 * 1024
 export const MAX_LUA_WORKER_CONTEXT_MESSAGES = 256
@@ -105,6 +106,8 @@ export interface LuaWorkerHarnessOptions {
   policy?: LuaWorkerPolicy
   syntheticLLMMain?: (args: LuaWorkerJsonValue) => LuaWorkerJsonValue | Promise<LuaWorkerJsonValue>
   workerFactory: () => LuaWorkerLike
+  waitForReady?: boolean
+  registrationTimeoutMs?: number
 }
 
 export interface LuaWorkerInvokeOptions {
@@ -128,7 +131,8 @@ interface ActiveInvocation {
   abortListener?: () => void
   hostCallIds: Set<number>
   hostResponseBytes: number
-  timeout: ReturnType<typeof setTimeout>
+  timeout?: ReturnType<typeof setTimeout>
+  timeoutMs: number
   resolve: (result: LuaWorkerInvocationResult) => void
   reject: (error: unknown) => void
 }
@@ -148,6 +152,8 @@ export class LuaWorkerHarnessClient {
   private readonly pending: PendingInvocation[] = []
   private nextInvocationId = 1
   private disposed = false
+  private workerReady = false
+  private registrationTimeout: ReturnType<typeof setTimeout> | undefined
   private workerListeners: {
     worker: LuaWorkerLike
     message: EventListener
@@ -354,12 +360,6 @@ export class LuaWorkerHarnessClient {
       policy.cpuDeadlineMs,
       DEFAULT_LUA_WORKER_TIMEOUT_MS,
     )
-    const timeout = setTimeout(() => {
-      this.failWorker(new LuaWorkerHarnessError(
-        'lua_worker_timeout',
-        `Lua Worker invocation ${id} timed out`,
-      ))
-    }, timeoutMs)
     const active: ActiveInvocation = {
       id,
       boundedContext: pending.invocation.boundedContext,
@@ -370,7 +370,7 @@ export class LuaWorkerHarnessClient {
       lowLevelAccess: hasLuaWorkerLlmAccess(pending.invocation),
       phase: 'running',
       options: pending.options,
-      timeout,
+      timeoutMs,
       resolve: pending.resolve,
       reject: pending.reject,
     }
@@ -384,6 +384,9 @@ export class LuaWorkerHarnessClient {
       pending.options.signal.addEventListener('abort', active.abortListener, { once: true })
     }
     this.active = active
+    if (this.options.waitForReady !== true || this.workerReady) {
+      this.armActiveTimeout(active)
+    }
     try {
       const { mode, data, meta, contextVersion, boundedContext } = pending.invocation
       worker.postMessage({
@@ -428,6 +431,15 @@ export class LuaWorkerHarnessClient {
     worker.addEventListener('error', errorListener)
     this.worker = worker
     this.workerListeners = { worker, message: messageListener, error: errorListener }
+    this.workerReady = this.options.waitForReady !== true
+    if (!this.workerReady) {
+      this.registrationTimeout = setTimeout(() => {
+        this.failWorker(new LuaWorkerHarnessError(
+          'lua_worker_registration',
+          'Lua Worker registration timed out',
+        ))
+      }, this.options.registrationTimeoutMs ?? DEFAULT_LUA_WORKER_REGISTRATION_TIMEOUT_MS)
+    }
     try {
       worker.postMessage({
         type: 'register',
@@ -453,14 +465,39 @@ export class LuaWorkerHarnessClient {
   }
 
   private async handleMessage(message: LuaWorkerHostMessage): Promise<void> {
-    const active = this.active
-    if (active === undefined) {
-      return
-    }
     if (message === null || Array.isArray(message) || typeof message !== 'object') {
       this.failWorker(new LuaWorkerHarnessError(
         'lua_worker_malformed_result',
         'Lua Worker posted a non-object message',
+      ))
+      return
+    }
+    if (message.type === 'registered') {
+      if (this.options.waitForReady !== true) {
+        return
+      }
+      if (this.workerReady) {
+        this.failWorker(new LuaWorkerHarnessError(
+          'lua_worker_malformed_result',
+          'Lua Worker registered more than once',
+        ))
+        return
+      }
+      this.workerReady = true
+      this.clearRegistrationTimeout()
+      if (this.active?.phase === 'running') {
+        this.armActiveTimeout(this.active)
+      }
+      return
+    }
+    const active = this.active
+    if (active === undefined) {
+      return
+    }
+    if (this.options.waitForReady === true && !this.workerReady && message.type !== 'error') {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_malformed_result',
+        'Lua Worker posted an invocation message before registration completed',
       ))
       return
     }
@@ -504,9 +541,15 @@ export class LuaWorkerHarnessClient {
         ))
         return
       }
+      const runtimeError = new LuaWorkerHarnessError(message.category, message.message)
+      if (!this.workerReady || message.category === 'lua_worker_timeout'
+        || message.category === 'lua_worker_memory') {
+        this.failWorker(runtimeError)
+        return
+      }
       this.active = undefined
       this.cleanupActive(active)
-      active.reject(new LuaWorkerHarnessError(message.category, message.message))
+      active.reject(runtimeError)
       this.startNextInvocation()
       return
     }
@@ -612,8 +655,9 @@ export class LuaWorkerHarnessClient {
       return
     }
     try {
+      const mutationContext = cloneBoundedContext(active.boundedContext)
       for (const mutation of message.orderedMutations) {
-        assertLuaWorkerMutationInContextWindow(active.boundedContext, mutation)
+        applyLuaWorkerMutationToContext(mutationContext, mutation)
       }
     }
     catch (error) {
@@ -824,6 +868,8 @@ export class LuaWorkerHarnessClient {
     const listeners = this.workerListeners
     this.worker = undefined
     this.workerListeners = undefined
+    this.workerReady = false
+    this.clearRegistrationTimeout()
     if (listeners !== undefined) {
       listeners.worker.removeEventListener('message', listeners.message)
       listeners.worker.removeEventListener('error', listeners.error)
@@ -852,7 +898,9 @@ export class LuaWorkerHarnessClient {
   }
 
   private cleanupActive(active: ActiveInvocation): void {
-    clearTimeout(active.timeout)
+    if (active.timeout !== undefined) {
+      clearTimeout(active.timeout)
+    }
     if (active.options.signal !== undefined && active.abortListener !== undefined) {
       active.options.signal.removeEventListener('abort', active.abortListener)
     }
@@ -862,6 +910,25 @@ export class LuaWorkerHarnessClient {
     if (pending.options.signal !== undefined && pending.abortListener !== undefined) {
       pending.options.signal.removeEventListener('abort', pending.abortListener)
       pending.abortListener = undefined
+    }
+  }
+
+  private armActiveTimeout(active: ActiveInvocation): void {
+    if (active.timeout !== undefined || active.phase !== 'running') {
+      return
+    }
+    active.timeout = setTimeout(() => {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_timeout',
+        `Lua Worker invocation ${active.id} timed out`,
+      ))
+    }, active.timeoutMs)
+  }
+
+  private clearRegistrationTimeout(): void {
+    if (this.registrationTimeout !== undefined) {
+      clearTimeout(this.registrationTimeout)
+      this.registrationTimeout = undefined
     }
   }
 }
@@ -886,4 +953,14 @@ function utf8ByteLength(value: string): number {
 
 function hasLuaWorkerLlmAccess(invocation: LuaWorkerInvocation): boolean {
   return invocation.lowLevelAccess === true && invocation.mode !== 'editDisplay'
+}
+
+function cloneBoundedContext(context: LuaWorkerBoundedContext): LuaWorkerBoundedContext {
+  return {
+    messages: context.messages.map((message) => ({ ...message })),
+    startIndex: context.startIndex,
+    totalMessages: context.totalMessages,
+    chatVars: context.chatVars === undefined ? undefined : { ...context.chatVars },
+    globalVars: context.globalVars === undefined ? undefined : { ...context.globalVars },
+  }
 }

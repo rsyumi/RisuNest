@@ -149,10 +149,10 @@ describe('real Wasmoon Lua Worker runtime', () => {
         first: { role: 'user', data: 'zero', time: 10 },
         last: { role: 'user', data: 'two', time: 30 },
         recent: [
-          { role: 'char', data: 'one', time: 0 },
+          { role: 'char', data: 'inserted', time: 0 },
           { role: 'user', data: 'two', time: 30 },
         ],
-        length: 3,
+        length: 2,
       },
       orderedMutations: [
         { type: 'setChat', index: 0, value: 'edited' },
@@ -162,6 +162,99 @@ describe('real Wasmoon Lua Worker runtime', () => {
         { type: 'addChat', role: 'user', value: 'tail' },
         { type: 'cutChat', start: 1, end: 3 },
       ],
+    })
+  })
+
+  it('reflects ordered invocation-local chat mutations in later reads', async () => {
+    const messages: LuaWorkerHostMessage[] = []
+    const runtime = createWasmoonLuaWorkerRuntime({
+      loadJsonLua: async () => jsonLua,
+      postMessage: (message) => messages.push(message),
+    })
+    runtime.handleMessage(register(`
+      listenEdit('editInput', function(id, value, meta)
+        setChat(id, 0, 'edited')
+        setChatRole(id, 0, 'char')
+        insertChat(id, 1, 'user', 'inserted')
+        removeChat(id, 2)
+        addChat(id, 'char', 'tail')
+        cutChat(id, 1, 4)
+        return getRecentChats(id, getChatLength(id))
+      end)
+    `))
+    runtime.handleMessage(invoke(11, {
+      boundedContext: {
+        messages: [
+          { role: 'user', data: 'zero' },
+          { role: 'char', data: 'one' },
+          { role: 'user', data: 'two' },
+        ],
+        startIndex: 0,
+        totalMessages: 3,
+      },
+    }))
+
+    const result = await waitForMessage(
+      messages,
+      (message) => message.type === 'result' && message.id === 11,
+    )
+    expect(result).toMatchObject({
+      type: 'result',
+      res: [
+        { role: 'user', data: 'inserted', time: 0 },
+        { role: 'user', data: 'two', time: 0 },
+        { role: 'char', data: 'tail', time: 0 },
+      ],
+    })
+  })
+
+  it('provides the production log helper', async () => {
+    const messages: LuaWorkerHostMessage[] = []
+    const runtime = createWasmoonLuaWorkerRuntime({
+      loadJsonLua: async () => jsonLua,
+      postMessage: (message) => messages.push(message),
+    })
+    runtime.handleMessage(register(`
+      listenEdit('editInput', function(id, value, meta)
+        log({ diagnostic = true })
+        return 'logged'
+      end)
+    `))
+    runtime.handleMessage(invoke(12))
+
+    const result = await waitForMessage(
+      messages,
+      (message) => message.type === 'result' && message.id === 12,
+    )
+    expect(result).toMatchObject({ type: 'result', res: 'logged' })
+  })
+
+  it.each([
+    ['getLoreBooks', "getLoreBooks(id, '')"],
+    ['loadLoreBooks', 'loadLoreBooks(id)'],
+    ['axLLM', 'axLLM(id, {})'],
+    ['getCharacterImage', 'getCharacterImage(id)'],
+    ['getPersonaImage', 'getPersonaImage(id)'],
+  ])('classifies unsupported production helper %s explicitly', async (_name, call) => {
+    const messages: LuaWorkerHostMessage[] = []
+    const runtime = createWasmoonLuaWorkerRuntime({
+      loadJsonLua: async () => jsonLua,
+      postMessage: (message) => messages.push(message),
+    })
+    runtime.handleMessage(register(`
+      listenEdit('editInput', function(id, value, meta)
+        return ${call}
+      end)
+    `))
+    runtime.handleMessage(invoke(13))
+
+    const error = await waitForMessage(
+      messages,
+      (message) => message.type === 'error' && message.id === 13,
+    )
+    expect(error).toMatchObject({
+      type: 'error',
+      category: 'lua_worker_unsupported_callback',
     })
   })
 

@@ -1,6 +1,7 @@
 import { LuaFactory } from 'wasmoon'
 import type { LuaEngine } from 'wasmoon'
 import type {
+  LuaWorkerBoundedContext,
   LuaWorkerHostMessage,
   LuaWorkerJsonValue,
   LuaWorkerMutation,
@@ -8,7 +9,7 @@ import type {
   LuaWorkerRequest,
 } from './luaWorkerProtocol'
 import {
-  assertLuaWorkerMutationInContextWindow,
+  applyLuaWorkerMutationToContext,
   canonicalizeLuaWorkerJson,
   getLuaWorkerContextLength,
   readLuaWorkerContextMessage,
@@ -45,6 +46,7 @@ interface ActiveExecution {
   request: Extract<LuaWorkerRequest, { type: 'invoke' }>
   stopSending: boolean
   variables: Record<string, string>
+  workingContext: LuaWorkerBoundedContext
 }
 
 interface PendingHostCall {
@@ -112,6 +114,18 @@ function setFullChat(id, value)
     setFullChatMain(id, json.encode(value))
 end
 
+function log(value)
+    logMain(json.encode(value))
+end
+
+function getLoreBooks(id, search)
+    return json.decode(getLoreBooksMain(id, search))
+end
+
+function loadLoreBooks(id)
+    return json.decode(loadLoreBooksMain(id):await())
+end
+
 function LLM(id, prompt, useMultimodal, options)
     useMultimodal = useMultimodal or false
     options = options or {}
@@ -121,6 +135,25 @@ function LLM(id, prompt, useMultimodal, options)
         useMultimodal,
         json.encode(options)
     ):await())
+end
+
+function axLLM(id, prompt, useMultimodal, options)
+    useMultimodal = useMultimodal or false
+    options = options or {}
+    return json.decode(axLLMMain(
+        id,
+        json.encode(prompt),
+        useMultimodal,
+        json.encode(options)
+    ):await())
+end
+
+function getCharacterImage(id)
+    return getCharacterImageMain(id):await()
+end
+
+function getPersonaImage(id)
+    return getPersonaImageMain(id):await()
 end
 
 function getState(id, name)
@@ -237,7 +270,7 @@ export function createWasmoonLuaWorkerRuntime(
       )
     }
     try {
-      assertLuaWorkerMutationInContextWindow(current.request.boundedContext, mutation)
+      applyLuaWorkerMutationToContext(current.workingContext, mutation)
     }
     catch (error) {
       throw new WorkerRuntimeError(
@@ -258,7 +291,7 @@ export function createWasmoonLuaWorkerRuntime(
   const readMessage = (accessId: unknown, index: number) => {
     const current = requireExecution(accessId)
     try {
-      return readLuaWorkerContextMessage(current.request.boundedContext, index)
+      return readLuaWorkerContextMessage(current.workingContext, index)
     }
     catch (error) {
       throw new WorkerRuntimeError(
@@ -322,7 +355,7 @@ export function createWasmoonLuaWorkerRuntime(
     engine.global.set('getRecentChatsMain', (accessId: unknown, count: number) => {
       const current = requireExecution(accessId)
       try {
-        return JSON.stringify(readLuaWorkerRecentMessages(current.request.boundedContext, count))
+        return JSON.stringify(readLuaWorkerRecentMessages(current.workingContext, count))
       }
       catch (error) {
         throw new WorkerRuntimeError(
@@ -333,7 +366,7 @@ export function createWasmoonLuaWorkerRuntime(
     })
     engine.global.set('getChatLength', (accessId: unknown) => {
       const current = requireExecution(accessId)
-      return getLuaWorkerContextLength(current.request.boundedContext)
+      return getLuaWorkerContextLength(current.workingContext)
     })
     engine.global.set('setChat', (accessId: unknown, index: number, value: string) => {
       recordMutation(accessId, { type: 'setChat', index, value: value ?? '' })
@@ -432,6 +465,7 @@ export function createWasmoonLuaWorkerRuntime(
       })
     }
     await engine.doString(`${LUA_WORKER_WRAPPER}\n${request.source}`)
+    options.postMessage({ type: 'registered' })
     return {
       engine,
       mode: descriptor[1],
@@ -523,6 +557,7 @@ export function createWasmoonLuaWorkerRuntime(
         request,
         stopSending: false,
         variables: { ...request.boundedContext.chatVars },
+        workingContext: cloneBoundedContext(request.boundedContext),
       }
       execution = currentExecution
       const rawResult = await func(
@@ -697,4 +732,14 @@ function utf8ByteLength(value: string): number {
 
 function canonicalByteLength(value: unknown): number {
   return utf8ByteLength(canonicalizeLuaWorkerJson(value))
+}
+
+function cloneBoundedContext(context: LuaWorkerBoundedContext): LuaWorkerBoundedContext {
+  return {
+    messages: context.messages.map((message) => ({ ...message })),
+    startIndex: context.startIndex,
+    totalMessages: context.totalMessages,
+    chatVars: context.chatVars === undefined ? undefined : { ...context.chatVars },
+    globalVars: context.globalVars === undefined ? undefined : { ...context.globalVars },
+  }
 }
