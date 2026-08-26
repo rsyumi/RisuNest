@@ -86,7 +86,9 @@ import { initializePersistentStorage } from "./storage/persistentStorageRuntime"
 import {
     acknowledgeRecoveredNativeRestores,
     reconcileNativeRestoresBeforeBootstrap,
+    shouldReconcileNativeFileJobs,
 } from "./storage/nativeFileJobRecovery";
+import { registerAndroidRisuSaveRoute } from "./storage/androidRisuSaveRouteProduction.svelte";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
     initializeOfficialAccountBootstrap,
@@ -134,7 +136,7 @@ export async function loadData() {
         }
 
         await initializePersistentStorage()
-        const recoveredNativeRestoreJobs = isTauriDesktop
+        const recoveredNativeRestoreJobs = shouldReconcileNativeFileJobs(isTauri)
             ? await reconcileNativeRestoresBeforeBootstrap()
             : []
         const runtime = getPersistentDataRuntime()
@@ -488,6 +490,7 @@ export async function loadData() {
         startObserveDom()
         registerModelDynamic()
         await saveDb()
+        registerAndroidRisuSaveRoute()
         if (isTauri) schedulePeriodicNativeSnapshot()
         moduleUpdate()
         if (fullDatabaseResident) cleanChunks()

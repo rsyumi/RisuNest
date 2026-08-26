@@ -5,10 +5,48 @@ import {
     consumeAndroidSpoolBatch,
     copyNativeExportToAndroidSaf,
     getActiveAndroidSafSourceRequestIds,
+    listenAndroidSpoolBatches,
     type AndroidSafDestinationEvent,
 } from './androidSafBridge'
 
 describe('Android SAF bridge', () => {
+    it('subscribes before consuming the replayed ready batch and removes the listener', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const batches: unknown[] = []
+        const initial = {
+            requestId: 'initial-request',
+            ready: [{
+                token: '11111111-1111-4111-8111-111111111111',
+                displayName: 'initial.risudat',
+                bytes: 10,
+                totalBytes: 10,
+            }],
+            failures: [],
+        }
+
+        const dispose = listenAndroidSpoolBatches(
+            (batch) => batches.push(batch),
+            {
+                initialBatch: () => initial,
+                addEventListener: (_name, listener) => listeners.add(listener),
+                removeEventListener: (_name, listener) => listeners.delete(listener),
+            },
+        )
+        const eventBatch = {
+            requestId: 'event-request',
+            ready: [],
+            failures: [{ displayName: 'broken.risudat', code: 'source-read-failed' }],
+        }
+        for (const listener of listeners) {
+            listener(new CustomEvent('risu-android-spool-ready', { detail: eventBatch }))
+        }
+        await Promise.resolve()
+
+        expect(batches).toEqual([eventBatch, initial])
+        dispose()
+        expect(listeners.size).toBe(0)
+    })
+
     it('passes ready spool tokens to native jobs without file reads or byte payloads', async () => {
         const restore = vi.fn(async () => undefined)
         const unsupported = vi.fn()

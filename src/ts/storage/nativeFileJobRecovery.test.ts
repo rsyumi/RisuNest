@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     acknowledgeRecoveredNativeRestores,
     reconcileNativeRestoresBeforeBootstrap,
+    shouldReconcileNativeFileJobs,
 } from './nativeFileJobRecovery'
 import type { NativeFileJobStatus } from './nativeFileJobs'
 
@@ -29,6 +30,11 @@ function restoreStatus(
 }
 
 describe('native restore bootstrap reconciliation', () => {
+    it('reconciles persisted jobs on every Tauri target, including Android', () => {
+        expect(shouldReconcileNativeFileJobs(true)).toBe(true)
+        expect(shouldReconcileNativeFileJobs(false)).toBe(false)
+    })
+
     it('waits for an active restore, finalizes staged data, and retains success for plugin reload', async () => {
         const calls: string[] = []
         const statuses = [

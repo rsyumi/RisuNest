@@ -1,5 +1,6 @@
 import type { NativeFileJobSource } from './nativeFileJobs'
 
+const SPOOL_EVENT = 'risu-android-spool-ready'
 const DESTINATION_EVENT = 'risu-android-saf-destination'
 const PROGRESS_EVENT = 'risu-android-saf-progress'
 
@@ -19,6 +20,34 @@ export interface AndroidSpoolBatch {
     requestId: string
     ready: AndroidSpoolReady[]
     failures: AndroidSpoolFailure[]
+}
+
+export interface AndroidSpoolListenerDependencies {
+    initialBatch(): AndroidSpoolBatch | null | undefined
+    addEventListener(name: string, listener: (event: Event) => void): void
+    removeEventListener(name: string, listener: (event: Event) => void): void
+}
+
+const productionSpoolListenerDependencies: AndroidSpoolListenerDependencies = {
+    initialBatch: () => (window as Window & {
+        tauriOpenedFileSpools?: AndroidSpoolBatch
+    }).tauriOpenedFileSpools,
+    addEventListener: (name, listener) => window.addEventListener(name, listener),
+    removeEventListener: (name, listener) => window.removeEventListener(name, listener),
+}
+
+export function listenAndroidSpoolBatches(
+    listener: (batch: AndroidSpoolBatch) => void,
+    dependencies: AndroidSpoolListenerDependencies = productionSpoolListenerDependencies,
+): () => void {
+    const onReady = (event: Event) => {
+        const batch = (event as CustomEvent<AndroidSpoolBatch>).detail
+        if (batch) listener(batch)
+    }
+    dependencies.addEventListener(SPOOL_EVENT, onReady)
+    const initial = dependencies.initialBatch()
+    if (initial) queueMicrotask(() => listener(initial))
+    return () => dependencies.removeEventListener(SPOOL_EVENT, onReady)
 }
 
 export interface AndroidSpoolConsumer {

@@ -12,6 +12,10 @@ const productionDependencies: NativeFileJobRecoveryDependencies = {
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 }
 
+export function shouldReconcileNativeFileJobs(isNativeRuntime: boolean): boolean {
+    return isNativeRuntime
+}
+
 function isTerminal(status: NativeFileJobStatus): boolean {
     return status.state === 'succeeded'
         || status.state === 'failed'
