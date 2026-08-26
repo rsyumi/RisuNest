@@ -4,6 +4,8 @@ import type { Database } from '../storage/database.svelte'
 let database: Partial<Database>
 let persistentDatabase: Partial<Database>
 const materializePersistentDatabaseSnapshot = vi.fn()
+const getPersistentDataRuntime = vi.fn()
+const tryNativeKeiBackup = vi.fn()
 
 vi.mock('../storage/database.svelte', () => ({
     getDatabase: () => database,
@@ -13,6 +15,10 @@ vi.mock('./kei', () => ({
 }))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     materializePersistentDatabaseSnapshot,
+    getPersistentDataRuntime,
+}))
+vi.mock('./nativeBackup', () => ({
+    tryNativeKeiBackup,
 }))
 
 const fetchMock = vi.fn(async () => new Response(''))
@@ -41,6 +47,8 @@ describe('saveDbKei', () => {
             }],
         } as Partial<Database>
         materializePersistentDatabaseSnapshot.mockReset().mockResolvedValue(persistentDatabase)
+        getPersistentDataRuntime.mockReset().mockReturnValue({ revision: 7 })
+        tryNativeKeiBackup.mockReset().mockResolvedValue(false)
     })
 
     afterEach(() => {
@@ -62,6 +70,38 @@ describe('saveDbKei', () => {
             token: 'secret-token',
             database: persistentDatabase,
         })
+    })
+
+    it('uses the native pinned upload without materializing a JavaScript database', async () => {
+        const saveDbKei = await loadSaveDbKei()
+        tryNativeKeiBackup.mockResolvedValueOnce(true)
+
+        await saveDbKei()
+
+        expect(tryNativeKeiBackup).toHaveBeenCalledWith({
+            runtime: { revision: 7 },
+            url: 'https://kei.example/autobackup/save',
+            accountId: 'acc',
+            token: 'secret-token',
+        })
+        expect(materializePersistentDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    it('does not retry a failed native upload through the full JavaScript body path', async () => {
+        const saveDbKei = await loadSaveDbKei()
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        tryNativeKeiBackup.mockRejectedValueOnce(new Error('native offline'))
+
+        await expect(saveDbKei()).resolves.toBeUndefined()
+
+        expect(materializePersistentDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(fetchMock).not.toHaveBeenCalled()
+        expect(consoleError).toHaveBeenCalledWith(
+            'Kei auto backup failed:',
+            expect.objectContaining({ message: 'native offline' }),
+        )
+        consoleError.mockRestore()
     })
 
     it('does nothing without an account or with the kei flag off', async () => {

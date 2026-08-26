@@ -1,4 +1,5 @@
 use super::export::ExportedRisuSave;
+use super::kei::KeiUploadResult;
 use super::{
     AssetAlias, CharacterPage, CharacterQuery, CheckpointMode, ConversationPage, ConversationQuery,
     ConversationWindow, ConversationWindowQuery, LeaseResult, PersistentStore,
@@ -357,6 +358,20 @@ pub(crate) async fn official_publication_upload_file(
         message: error.to_string(),
     })?;
     upload_open_file_attempt(request, source, bytes).await
+}
+
+#[tauri::command(async)]
+pub(crate) async fn pds_kei_backup_upload(
+    state: State<'_, PersistentStoreState>,
+    lease: String,
+    url: String,
+    expected_account_id: String,
+    token: String,
+) -> Result<KeiUploadResult, StoreError> {
+    let prepared = with_store(state, |store| {
+        store.prepare_kei_upload(&lease, &url, &expected_account_id, &token)
+    })?;
+    prepared.upload().await
 }
 
 #[tauri::command(async)]

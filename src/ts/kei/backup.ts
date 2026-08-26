@@ -1,6 +1,10 @@
-import { keiServerURL } from "./kei"
-import { getDatabase } from "../storage/database.svelte"
-import { materializePersistentDatabaseSnapshot } from "../storage/persistentDataRuntime.svelte"
+import { getDatabase } from '../storage/database.svelte'
+import {
+    getPersistentDataRuntime,
+    materializePersistentDatabaseSnapshot,
+} from '../storage/persistentDataRuntime.svelte'
+import { keiServerURL } from './kei'
+import { tryNativeKeiBackup } from './nativeBackup'
 
 let lastKeiSave = 0
 
@@ -16,6 +20,17 @@ export async function saveDbKei(): Promise<void> {
         lastKeiSave = Date.now()
         const liveAccountId = liveAccount.id
         const liveToken = liveAccount.token
+        const url = keiServerURL() + '/autobackup/save'
+        if (
+            await tryNativeKeiBackup({
+                runtime: getPersistentDataRuntime(),
+                url,
+                accountId: liveAccountId,
+                token: liveToken,
+            })
+        ) {
+            return
+        }
         const database = await materializePersistentDatabaseSnapshot('kei-auto-backup')
         const snapshotAccount = database.account
         if (
@@ -25,15 +40,15 @@ export async function saveDbKei(): Promise<void> {
         ) {
             throw new Error('Kei account changed during backup materialization')
         }
-        await fetch(keiServerURL() + '/autobackup/save', {
+        await fetch(url, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
             },
             body: JSON.stringify({
                 token: snapshotAccount.token,
                 database,
-            })
+            }),
         })
     } catch (error) {
         console.error('Kei auto backup failed:', error)

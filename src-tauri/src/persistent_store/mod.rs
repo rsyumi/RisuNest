@@ -1,6 +1,7 @@
 pub(crate) mod commands;
 mod commit;
 mod export;
+mod kei;
 mod query;
 mod schema;
 mod snapshot;
@@ -537,6 +538,7 @@ impl PersistentStore {
         )?;
         transaction.commit()?;
         export::sweep_abandoned(&mut connection, &snapshots_dir)?;
+        kei::sweep_abandoned(&snapshots_dir);
         snapshot::sweep_temporary_generations(&mut connection)?;
 
         Ok(Self {
@@ -745,6 +747,16 @@ impl PersistentStore {
         path: &Path,
     ) -> StoreResult<(std::fs::File, u64)> {
         export::open_for_upload(&self.connection, &self.snapshots_dir, path)
+    }
+
+    fn prepare_kei_upload(
+        &self,
+        lease: &str,
+        url: &str,
+        expected_account_id: &str,
+        token: &str,
+    ) -> StoreResult<kei::PreparedKeiUpload> {
+        kei::prepare_upload(self, lease, url, expected_account_id, token)
     }
 
     pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> StoreResult<()> {
