@@ -28,6 +28,8 @@ import androidx.webkit.WebViewFeature
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.security.MessageDigest
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
@@ -51,6 +53,9 @@ private const val EXIT_REASON = "exit"
 private const val MINIMUM_WEBVIEW_MAJOR = 111
 private const val NATIVE_RESILIENCE_PREFERENCES = "risu-native-resilience"
 private const val RENDERER_RECOVERY_MARKER = "renderer-recovery-warning"
+private const val SAF_PROGRESS_INTERVAL_MILLIS = 100L
+private const val OPENED_FILE_INTENT_CONSUMED = "co.aiclient.risu.OPENED_FILE_INTENT_CONSUMED"
+private const val OPENED_FILE_FINGERPRINT_STATE = "risu.opened-file-fingerprint"
 private const val TAG = "RisuNative"
 
 internal typealias RendererRecoveryFailureLogger = (step: String, error: Throwable) -> Unit
@@ -195,11 +200,55 @@ internal class BackNavigationPolicy(
   }
 }
 
-internal fun sanitizeOpenedFileName(name: String): String = safeSafDisplayName(name)
+internal fun sanitizeOpenedFileName(name: String): String {
+  val leaf = name.substringAfterLast('/').substringAfterLast('\\')
+  val safe = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
+  return safe.ifBlank { "opened-file" }
+}
+
+internal fun escapeJsStringLiteral(value: String): String = buildString {
+  for (character in value) {
+    when {
+      character == '\\' -> append("\\\\")
+      character == '"' -> append("\\\"")
+      character == '\u2028' || character == '\u2029' || character < ' ' ->
+        append("\\u%04x".format(character.code))
+      else -> append(character)
+    }
+  }
+}
+
+internal fun openedFilesScript(paths: List<String>): String {
+  val values = paths.joinToString(",") { "\"${escapeJsStringLiteral(it)}\"" }
+  return "window.tauriOpenedFiles=[$values];"
+}
+
+internal class RestoredIntentConsumptionMarker(
+  private val isConsumed: () -> Boolean,
+  private val markConsumed: () -> Unit,
+) {
+  fun claim(): Boolean {
+    if (isConsumed()) return false
+    markConsumed()
+    return true
+  }
+}
+
+internal fun openedFileIntentFingerprint(action: String?, uris: List<String>): String {
+  val digest = MessageDigest.getInstance("SHA-256")
+  for (value in listOf(action.orEmpty()) + uris) {
+    val bytes = value.toByteArray(Charsets.UTF_8)
+    digest.update(bytes.size.toString().toByteArray(Charsets.US_ASCII))
+    digest.update(':'.code.toByte())
+    digest.update(bytes)
+  }
+  return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+}
 
 private data class PendingSafDestination(
   val requestId: String,
-  val source: File,
+  val exportId: String,
+  val source: File?,
   val cancellation: AtomicBoolean,
 )
 
@@ -267,8 +316,20 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private val rendererRecoveryCoordinator = RendererRecoveryCoordinator(::logRendererRecoveryFailure)
   private val mainHandler = Handler(Looper.getMainLooper())
   private val safScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val safSourceCancellations = ConcurrentHashMap<String, AtomicBoolean>()
   private val safDestinationCancellations = ConcurrentHashMap<String, AtomicBoolean>()
+  private val safProgressDispatchMillis = ConcurrentHashMap<String, Long>()
+  private val deliveredSpoolTokens = ConcurrentHashMap.newKeySet<String>()
   private var pendingSafDestination: PendingSafDestination? = null
+  private val safDestinationSlot = SafDestinationSlot()
+  private val safDestinationStateLock = Any()
+  private var consumedOpenedFileFingerprint: String? = null
+  private val safDestinationStateStore by lazy {
+    SafDestinationStateStore(
+      File(dataDir, "native-file-jobs/android-saf-destination.json"),
+      AndroidSafAtomicPublisher,
+    )
+  }
   private val safDestinationPicker = registerForActivityResult(
     ActivityResultContracts.CreateDocument("application/octet-stream"),
     ::onSafDestinationSelected,
@@ -302,8 +363,12 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private var exitFlushSequence = 0L
 
   override fun onCreate(savedInstanceState: Bundle?) {
+    consumedOpenedFileFingerprint = savedInstanceState?.getString(OPENED_FILE_FINGERPRINT_STATE)
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      recoverSafDestination(savedInstanceState != null)
+    }
     showRendererRecoveryWarning()
     diagnoseWebViewProvider()
   }
@@ -332,8 +397,13 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     lifecycleWebView = webView
     webView.addJavascriptInterface(LifecycleFlushBridge(), LIFECYCLE_BRIDGE_NAME)
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      deliveredSpoolTokens.clear()
       webView.addJavascriptInterface(SafBridge(), SAF_BRIDGE_NAME)
+      replayReadySpools(webView)
+      replaySafDestinationResult(webView)
       injectOpenedFiles(webView)
+    } else {
+      injectLegacyOpenedFiles(webView)
     }
 
     val contentRoot = findViewById<ViewGroup>(android.R.id.content)
@@ -387,19 +457,30 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     super.onStop()
   }
 
+  override fun onSaveInstanceState(outState: Bundle) {
+    consumedOpenedFileFingerprint?.let {
+      outState.putString(OPENED_FILE_FINGERPRINT_STATE, it)
+    }
+    super.onSaveInstanceState(outState)
+  }
+
   override fun onNewIntent(intent: Intent) {
     super.onNewIntent(intent)
-    setIntent(intent)
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
+      setIntent(intent)
+      consumedOpenedFileFingerprint = null
       lifecycleWebView?.let { injectOpenedFiles(it, intent) }
     }
   }
 
   override fun onDestroy() {
+    safSourceCancellations.values.forEach { it.set(true) }
     safDestinationCancellations.values.forEach { it.set(true) }
     pendingSafDestination = null
     safScope.cancel()
+    safSourceCancellations.clear()
     safDestinationCancellations.clear()
+    safProgressDispatchMillis.clear()
     lifecycleWebView?.removeJavascriptInterface(SAF_BRIDGE_NAME)
     super.onDestroy()
   }
@@ -469,14 +550,35 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       sourcePath: String,
       suggestedName: String,
     ) {
-      if (requestId.isBlank() || requestId.length > 128) return
+      if (!isCanonicalUuidV4(requestId)) return
+      if (!safDestinationSlot.tryAcquire()) {
+        safScope.launch {
+          val busy = destinationTerminalRecord(
+            requestId = requestId,
+            exportId = requestId,
+            phase = SafDestinationPhase.FAILED,
+            code = "destination-busy",
+            warningCodes = emptyList(),
+          )
+          dispatchSafDestination(busy, "Another Android SAF destination picker is already open")
+        }
+        return
+      }
       val cancellation = AtomicBoolean(false)
-      if (safDestinationCancellations.putIfAbsent(requestId, cancellation) != null) return
+      safDestinationCancellations[requestId] = cancellation
       safScope.launch {
-        val script = try {
+        var terminalRecord: SafDestinationRecord? = null
+        var terminalMessage: String? = null
+        var ownsPersistedState = false
+        try {
           val source = withContext(Dispatchers.IO) {
             resolveManagedExportSource(dataDir, sourcePath)
           } ?: throw SafDestinationException(
+            "invalid-source",
+            emptyList(),
+            "Android SAF export source is not an owned native export",
+          )
+          val exportId = managedExportId(source) ?: throw SafDestinationException(
             "invalid-source",
             emptyList(),
             "Android SAF export source is not an owned native export",
@@ -488,131 +590,722 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
               "Android SAF destination copy was cancelled",
             )
           }
-          if (pendingSafDestination != null) throw SafDestinationException(
-            "destination-busy",
-            emptyList(),
-            "Another Android SAF destination picker is already open",
-          )
-          pendingSafDestination = PendingSafDestination(requestId, source, cancellation)
-          safDestinationPicker.launch(safeSafDestinationName(suggestedName))
-          null
-        } catch (error: SafDestinationException) {
-          androidSafDestinationScript(
+          val state = SafDestinationRecord(
             requestId = requestId,
-            state = if (error.code == "cancelled") "cancelled" else "failed",
+            exportId = exportId,
+            phase = SafDestinationPhase.PICKING,
+            destinationUri = null,
+            bytes = null,
+            code = null,
+            warningCodes = emptyList(),
+            updatedAtMillis = System.currentTimeMillis(),
+          )
+          withContext(Dispatchers.IO) { saveSafDestinationState(state) }
+          ownsPersistedState = true
+          if (cancellation.get()) {
+            throw SafDestinationException(
+              "cancelled",
+              emptyList(),
+              "Android SAF destination copy was cancelled",
+            )
+          }
+          pendingSafDestination = PendingSafDestination(
+            requestId,
+            exportId,
+            source,
+            cancellation,
+          )
+          safDestinationPicker.launch(safeSafDestinationName(suggestedName))
+        } catch (error: SafDestinationException) {
+          terminalRecord = destinationTerminalRecord(
+            requestId = requestId,
+            exportId = managedExportIdFromPath(sourcePath) ?: requestId,
+            phase = if (error.code == "cancelled") {
+              SafDestinationPhase.CANCELLED
+            } else {
+              SafDestinationPhase.FAILED
+            },
             code = error.code,
-            message = error.message,
             warningCodes = error.warningCodes,
           )
+          terminalMessage = error.message
         } catch (error: Exception) {
-          androidSafDestinationScript(
+          terminalRecord = destinationTerminalRecord(
             requestId = requestId,
-            state = "failed",
-            code = "destination-write-failed",
-            message = "Android SAF destination copy failed",
+            exportId = managedExportIdFromPath(sourcePath) ?: requestId,
+            phase = SafDestinationPhase.FAILED,
+            code = "destination-state-failed",
             warningCodes = emptyList(),
           )
+          terminalMessage = "Android SAF destination state could not be persisted"
         }
-        if (script != null) {
+        terminalRecord?.let { record ->
+          if (ownsPersistedState) persistTerminalIfPossible(record)
           safDestinationCancellations.remove(requestId, cancellation)
-          lifecycleWebView?.evaluateJavascript(script, null)
+          safDestinationSlot.release()
+          dispatchSafDestination(record, terminalMessage)
         }
       }
     }
 
     @JavascriptInterface
-    fun cancelExport(requestId: String) {
-      safDestinationCancellations[requestId]?.set(true)
+    fun cancelExport(requestId: String): Boolean {
+      val cancellation = safDestinationCancellations[requestId] ?: return false
+      cancellation.set(true)
+      return synchronized(safDestinationStateLock) {
+        val record = runCatching { safDestinationStateStore.load() }.getOrNull()
+          ?.takeIf { it.requestId == requestId && !it.isTerminal() }
+          ?: return@synchronized false
+        runCatching {
+          safDestinationStateStore.save(
+            record.copy(
+              phase = SafDestinationPhase.CANCELLING,
+              updatedAtMillis = System.currentTimeMillis(),
+            ),
+          )
+        }.isSuccess
+      }
+    }
+
+    @JavascriptInterface
+    fun cancelSource(requestId: String) {
+      safSourceCancellations[requestId]?.set(true)
+    }
+
+    @JavascriptInterface
+    fun getActiveSourceRequestIds(): String = safSourceCancellations.keys
+      .filter(::isCanonicalUuidV4)
+      .sorted()
+      .take(16)
+      .joinToString(prefix = "[", separator = ",", postfix = "]") { "\"$it\"" }
+
+    @JavascriptInterface
+    fun getExportStatus(): String? {
+      val record = loadSafDestinationState()
+        ?.takeIf(SafDestinationRecord::isTerminal)
+        ?: return null
+      return destinationJson(record, destinationMessage(record))
+    }
+
+    @JavascriptInterface
+    fun acknowledgeExport(requestId: String): Boolean {
+      if (!isCanonicalUuidV4(requestId)) return false
+      return clearSafDestinationState(requestId)
     }
   }
 
   private fun onSafDestinationSelected(uri: Uri?) {
-    val pending = pendingSafDestination ?: return
-    pendingSafDestination = null
-    if (uri == null) {
-      safDestinationCancellations.remove(pending.requestId, pending.cancellation)
-      lifecycleWebView?.evaluateJavascript(
-        androidSafDestinationScript(
-          requestId = pending.requestId,
-          state = "cancelled",
-          code = "cancelled",
-          message = "Android SAF destination selection was cancelled",
-          warningCodes = emptyList(),
-        ),
-        null,
-      )
+    val pending = pendingSafDestination ?: restorePendingSafDestination() ?: run {
+      cleanupUnclaimedSafDestination(uri)
       return
     }
+    pendingSafDestination = null
     safScope.launch {
       val copyContext = currentCoroutineContext()
-      val script = try {
-        if (uri.scheme != ContentResolver.SCHEME_CONTENT) {
-          throw SafDestinationException(
-            "invalid-destination",
-            emptyList(),
-            "Android SAF destination must be a content URI",
-          )
+      var terminalMessage: String? = null
+      val selectedState = try {
+        withContext(Dispatchers.IO) {
+          claimSafDestinationSelection(pending, uri)
         }
+      } catch (error: Exception) {
+        val warnings = cleanupUnclaimedSafDestinationOnIo(uri)
+        val failure = destinationTerminalRecord(
+          requestId = pending.requestId,
+          exportId = pending.exportId,
+          phase = SafDestinationPhase.FAILED,
+          code = "destination-state-failed",
+          warningCodes = warnings,
+        )
+        val persisted = withContext(Dispatchers.IO) {
+          persistPendingSafDestinationFailure(failure)
+        }
+        safDestinationCancellations.remove(pending.requestId, pending.cancellation)
+        safProgressDispatchMillis.remove(pending.requestId)
+        if (persisted) safDestinationSlot.release()
+        dispatchSafDestination(failure, "Android SAF destination state could not be persisted")
+        return@launch
+      }
+      if (selectedState == null) {
+        val warnings = cleanupUnclaimedSafDestinationOnIo(uri)
+        val terminal = withContext(Dispatchers.IO) {
+          addSafDestinationWarnings(pending.requestId, warnings)
+        }
+        safDestinationCancellations.remove(pending.requestId, pending.cancellation)
+        safProgressDispatchMillis.remove(pending.requestId)
+        terminal?.let { dispatchSafDestination(it, destinationMessage(it)) }
+        return@launch
+      }
+      if (selectedState.isTerminal()) {
+        safDestinationCancellations.remove(pending.requestId, pending.cancellation)
+        safProgressDispatchMillis.remove(pending.requestId)
+        safDestinationSlot.release()
+        dispatchSafDestination(selectedState, destinationMessage(selectedState))
+        return@launch
+      }
+      val destinationUri = Uri.parse(requireNotNull(selectedState.destinationUri))
+      val terminalRecord = try {
+        val source = pending.source ?: throw SafDestinationException(
+          "invalid-source",
+          interruptedSafDestinationWarnings {
+            contentResolver.delete(destinationUri, null, null) > 0
+          },
+          "Android SAF export source did not survive process recreation",
+        )
         val result = copySafDestinationOnIo(
-          source = pending.source,
+          source = source,
           openDestination = {
-            contentResolver.openOutputStream(uri, "wt")
+            contentResolver.openOutputStream(destinationUri, "wt")
               ?: throw IOException("Android SAF provider did not open the destination")
           },
-          deletePartial = { contentResolver.delete(uri, null, null) > 0 },
+          deletePartial = { contentResolver.delete(destinationUri, null, null) > 0 },
           createdDocument = true,
           isCancelled = { pending.cancellation.get() || !copyContext.isActive },
+          onProgress = { copiedBytes ->
+            dispatchSafProgress(
+              requestId = pending.requestId,
+              operation = "destination-copy",
+              copiedBytes = copiedBytes,
+              totalBytes = source.length(),
+              token = null,
+              dispatchKey = pending.requestId,
+              isActive = {
+                safDestinationCancellations[pending.requestId] === pending.cancellation
+              },
+            )
+          },
         )
-        androidSafDestinationScript(
+        destinationTerminalRecord(
           requestId = pending.requestId,
-          state = "succeeded",
+          exportId = pending.exportId,
+          phase = SafDestinationPhase.SUCCEEDED,
           bytes = result.bytes,
           warningCodes = result.warningCodes,
         )
       } catch (error: SafDestinationException) {
-        androidSafDestinationScript(
+        terminalMessage = error.message
+        destinationTerminalRecord(
           requestId = pending.requestId,
-          state = if (error.code == "cancelled") "cancelled" else "failed",
+          exportId = pending.exportId,
+          phase = if (error.code == "cancelled") {
+            SafDestinationPhase.CANCELLED
+          } else {
+            SafDestinationPhase.FAILED
+          },
           code = error.code,
-          message = error.message,
           warningCodes = error.warningCodes,
         )
       } catch (error: Exception) {
-        androidSafDestinationScript(
+        terminalMessage = "Android SAF destination copy failed"
+        val warnings = if (destinationUri.scheme == ContentResolver.SCHEME_CONTENT) {
+          withContext(Dispatchers.IO) {
+            interruptedSafDestinationWarnings {
+              contentResolver.delete(destinationUri, null, null) > 0
+            }
+          }
+        } else {
+          emptyList()
+        }
+        destinationTerminalRecord(
           requestId = pending.requestId,
-          state = "failed",
+          exportId = pending.exportId,
+          phase = SafDestinationPhase.FAILED,
           code = "destination-write-failed",
-          message = "Android SAF destination copy failed",
-          warningCodes = listOf(
-            "android-saf-provider-not-atomic",
-            "partial-destination-may-remain",
-          ),
+          warningCodes = warnings,
         )
       } finally {
         safDestinationCancellations.remove(pending.requestId, pending.cancellation)
+        safProgressDispatchMillis.remove(pending.requestId)
       }
-      lifecycleWebView?.evaluateJavascript(script, null)
+      val (publishedRecord, publishedMessage) = finalizeSafDestination(
+        terminalRecord,
+        terminalMessage,
+        destinationUri,
+      )
+      safDestinationSlot.release()
+      dispatchSafDestination(publishedRecord, publishedMessage)
     }
   }
 
-  private fun injectOpenedFiles(webView: WebView, openedIntent: Intent? = intent) {
-    val uris = launchOpenedFileUris(openedIntent)
-    if (uris.isEmpty()) return
+  private fun cleanupUnclaimedSafDestination(uri: Uri?) {
+    if (uri == null || uri.scheme != ContentResolver.SCHEME_CONTENT) return
+    val terminalRequestId = loadSafDestinationState()
+      ?.takeIf(SafDestinationRecord::isTerminal)
+      ?.requestId
     safScope.launch {
-      val store = SafSpoolStore(File(dataDir, "native-file-jobs/sources"))
-      val sources = withContext(Dispatchers.IO) {
-        store.cleanupStale()
-        uris.map(::contentResolverSource)
+      val warnings = cleanupUnclaimedSafDestinationOnIo(uri)
+      val terminal = terminalRequestId?.let { requestId ->
+        withContext(Dispatchers.IO) { addSafDestinationWarnings(requestId, warnings) }
       }
-      val copyContext = currentCoroutineContext()
-      val batch = spoolOpenedFilesOnIo(
-        store,
-        sources,
-        isCancelled = { !copyContext.isActive },
-      )
-      if (!copyContext.isActive || lifecycleWebView !== webView) return@launch
-      webView.evaluateJavascript(androidSpoolBatchScript(batch), null)
+      terminal?.let { dispatchSafDestination(it, destinationMessage(it)) }
     }
+  }
+
+  private suspend fun cleanupUnclaimedSafDestinationOnIo(uri: Uri?): List<String> =
+    withContext(Dispatchers.IO) {
+      if (uri == null || uri.scheme != ContentResolver.SCHEME_CONTENT) return@withContext emptyList()
+      interruptedSafDestinationWarnings {
+        contentResolver.delete(uri, null, null) > 0
+      }
+    }
+
+  private suspend fun finalizeSafDestination(
+    record: SafDestinationRecord,
+    message: String?,
+    destinationUri: Uri?,
+  ): Pair<SafDestinationRecord, String?> {
+    if (persistTerminalIfPossible(record)) return record to message
+    if (record.phase != SafDestinationPhase.SUCCEEDED) return record to message
+    if (clearSafDestinationState(record.requestId)) {
+      return record.copy(
+        warningCodes = (
+          record.warningCodes + "destination-state-not-persisted"
+          ).distinct(),
+      ) to message
+    }
+    val cleanupWarnings = withContext(Dispatchers.IO) {
+      interruptedSafDestinationWarnings {
+        destinationUri != null &&
+          destinationUri.scheme == ContentResolver.SCHEME_CONTENT &&
+          contentResolver.delete(destinationUri, null, null) > 0
+      }
+    }
+    val failed = destinationTerminalRecord(
+      requestId = record.requestId,
+      exportId = record.exportId,
+      phase = SafDestinationPhase.FAILED,
+      code = "destination-state-failed",
+      warningCodes = cleanupWarnings,
+    )
+    persistTerminalIfPossible(failed)
+    return failed to "Android SAF destination result could not be persisted"
+  }
+
+  private fun managedExportIdFromPath(sourcePath: String): String? =
+    runCatching { managedExportId(File(sourcePath)) }.getOrNull()
+
+  private fun destinationTerminalRecord(
+    requestId: String,
+    exportId: String,
+    phase: SafDestinationPhase,
+    bytes: Long? = null,
+    code: String? = null,
+    warningCodes: List<String>,
+  ) = SafDestinationRecord(
+    requestId = requestId,
+    exportId = exportId,
+    phase = phase,
+    destinationUri = null,
+    bytes = bytes,
+    code = code,
+    warningCodes = warningCodes,
+    updatedAtMillis = System.currentTimeMillis(),
+  )
+
+  private suspend fun persistTerminalIfPossible(record: SafDestinationRecord): Boolean =
+    withContext(Dispatchers.IO) {
+      runCatching { saveSafDestinationState(record) }.isSuccess
+    }
+
+  private fun loadSafDestinationState(): SafDestinationRecord? = synchronized(
+    safDestinationStateLock,
+  ) {
+    runCatching { safDestinationStateStore.load() }.getOrNull()
+  }
+
+  private fun saveSafDestinationState(record: SafDestinationRecord) = synchronized(
+    safDestinationStateLock,
+  ) {
+    safDestinationStateStore.save(record)
+  }
+
+  private fun claimSafDestinationSelection(
+    pending: PendingSafDestination,
+    uri: Uri?,
+  ): SafDestinationRecord? = synchronized(safDestinationStateLock) {
+    val current = safDestinationStateStore.load() ?: return@synchronized null
+    val selected = if (uri != null && uri.scheme != ContentResolver.SCHEME_CONTENT) {
+      if (!isPendingSafDestinationPicker(current) || current.requestId != pending.requestId) {
+        return@synchronized null
+      }
+      current.copy(
+        phase = SafDestinationPhase.FAILED,
+        destinationUri = null,
+        bytes = null,
+        code = "invalid-destination",
+        warningCodes = emptyList(),
+        updatedAtMillis = System.currentTimeMillis(),
+      )
+    } else {
+      selectedSafDestinationState(
+        current,
+        pending.requestId,
+        uri?.toString(),
+        pending.cancellation.get(),
+        System.currentTimeMillis(),
+      ) ?: return@synchronized null
+    }
+    safDestinationStateStore.save(selected)
+    selected
+  }
+
+  private fun persistPendingSafDestinationFailure(failure: SafDestinationRecord): Boolean =
+    synchronized(safDestinationStateLock) {
+      val ownsState = runCatching { safDestinationStateStore.load() }.getOrNull()
+        ?.let { it.requestId == failure.requestId && !it.isTerminal() }
+        ?: false
+      if (!ownsState) return@synchronized false
+      runCatching { safDestinationStateStore.save(failure) }.isSuccess
+    }
+
+  private fun addSafDestinationWarnings(
+    requestId: String,
+    warnings: List<String>,
+  ): SafDestinationRecord? = synchronized(safDestinationStateLock) {
+    val current = runCatching { safDestinationStateStore.load() }.getOrNull()
+      ?.takeIf { it.requestId == requestId && it.isTerminal() }
+      ?: return@synchronized null
+    val merged = (current.warningCodes + warnings).distinct()
+    if (merged == current.warningCodes) return@synchronized current
+    val updated = current.copy(
+      warningCodes = merged,
+      updatedAtMillis = System.currentTimeMillis(),
+    )
+    return@synchronized runCatching {
+      safDestinationStateStore.save(updated)
+      updated
+    }.getOrNull()
+  }
+
+  private fun expireSafDestinationPicker(
+    requestId: String,
+    nowMillis: Long,
+  ): SafDestinationRecord? = synchronized(safDestinationStateLock) {
+    val current = safDestinationStateStore.load() ?: return@synchronized null
+    val expired = expiredSafDestinationState(current, requestId, nowMillis)
+      ?: return@synchronized null
+    safDestinationStateStore.save(expired)
+    expired
+  }
+
+  private fun clearSafDestinationState(requestId: String): Boolean = synchronized(
+    safDestinationStateLock,
+  ) {
+    runCatching { safDestinationStateStore.clear(requestId) }.getOrDefault(false)
+  }
+
+  private fun restorePendingSafDestination(): PendingSafDestination? {
+    val record = loadSafDestinationState()
+      ?.takeIf(::isPendingSafDestinationPicker)
+      ?: return null
+    val cancellation = safDestinationCancellations.computeIfAbsent(record.requestId) {
+      AtomicBoolean(record.phase == SafDestinationPhase.CANCELLING)
+    }
+    return PendingSafDestination(
+      requestId = record.requestId,
+      exportId = record.exportId,
+      source = resolveManagedExportById(dataDir, record.exportId),
+      cancellation = cancellation,
+    )
+  }
+
+  private fun recoverSafDestination(hasRestoredActivityState: Boolean) {
+    val record = loadSafDestinationState() ?: return
+    when (decideSafDestinationRecovery(record, hasRestoredActivityState)) {
+      SafDestinationRecoveryAction.WAIT_FOR_PICKER -> {
+        safDestinationSlot.acquireRestored()
+        pendingSafDestination = restorePendingSafDestination()
+        schedulePendingDestinationExpiry(record)
+      }
+      SafDestinationRecoveryAction.CLEAN_PARTIAL -> {
+        safDestinationSlot.acquireRestored()
+        safScope.launch {
+          try {
+            val destinationUri = record.destinationUri?.let(Uri::parse)
+            val warnings = withContext(Dispatchers.IO) {
+              interruptedSafDestinationWarnings {
+                destinationUri != null &&
+                  destinationUri.scheme == ContentResolver.SCHEME_CONTENT &&
+                  contentResolver.delete(destinationUri, null, null) > 0
+              }
+            }
+            val wasCancelling = record.phase == SafDestinationPhase.CANCELLING
+            val terminal = destinationTerminalRecord(
+              requestId = record.requestId,
+              exportId = record.exportId,
+              phase = if (wasCancelling) {
+                SafDestinationPhase.CANCELLED
+              } else {
+                SafDestinationPhase.FAILED
+              },
+              code = if (wasCancelling) "cancelled" else "destination-interrupted",
+              warningCodes = warnings,
+            )
+            persistTerminalIfPossible(terminal)
+            dispatchSafDestination(terminal, destinationMessage(terminal))
+          } finally {
+            safDestinationSlot.release()
+          }
+        }
+      }
+      SafDestinationRecoveryAction.FAIL_INTERRUPTED -> {
+        safDestinationSlot.acquireRestored()
+        safScope.launch {
+          try {
+            val wasCancelling = record.phase == SafDestinationPhase.CANCELLING
+            val terminal = destinationTerminalRecord(
+              requestId = record.requestId,
+              exportId = record.exportId,
+              phase = if (wasCancelling) {
+                SafDestinationPhase.CANCELLED
+              } else {
+                SafDestinationPhase.FAILED
+              },
+              code = if (wasCancelling) "cancelled" else "destination-interrupted",
+              warningCodes = emptyList(),
+            )
+            persistTerminalIfPossible(terminal)
+            dispatchSafDestination(terminal, destinationMessage(terminal))
+          } finally {
+            safDestinationSlot.release()
+          }
+        }
+      }
+      SafDestinationRecoveryAction.REPLAY_TERMINAL -> Unit
+    }
+  }
+
+  private fun schedulePendingDestinationExpiry(record: SafDestinationRecord) {
+    val delayMillis = (
+      record.updatedAtMillis + DESTINATION_PICKER_STALE_MILLIS - System.currentTimeMillis()
+      ).coerceAtLeast(1L)
+    mainHandler.postDelayed({
+      safScope.launch {
+        val terminal = withContext(Dispatchers.IO) {
+          runCatching {
+            expireSafDestinationPicker(record.requestId, System.currentTimeMillis())
+          }.getOrNull()
+        }
+          ?: return@launch
+        safDestinationCancellations[terminal.requestId]?.set(true)
+        if (pendingSafDestination?.requestId == terminal.requestId) {
+          pendingSafDestination = null
+        }
+        safDestinationCancellations.remove(terminal.requestId)
+        safDestinationSlot.release()
+        dispatchSafDestination(terminal, destinationMessage(terminal))
+      }
+    }, delayMillis)
+  }
+
+  private fun replaySafDestinationResult(webView: WebView) {
+    val record = loadSafDestinationState()
+      ?.takeIf(SafDestinationRecord::isTerminal)
+      ?: return
+    webView.evaluateJavascript(
+      androidSafDestinationScriptForRecord(record, destinationMessage(record)),
+      null,
+    )
+  }
+
+  private fun dispatchSafDestination(record: SafDestinationRecord, message: String?) {
+    lifecycleWebView?.evaluateJavascript(
+      androidSafDestinationScriptForRecord(record, message),
+      null,
+    )
+  }
+
+  private fun androidSafDestinationScriptForRecord(
+    record: SafDestinationRecord,
+    message: String?,
+  ) = androidSafDestinationScript(
+    requestId = record.requestId,
+    state = record.phase.wireName,
+    bytes = record.bytes,
+    code = record.code,
+    message = message,
+    warningCodes = record.warningCodes,
+  )
+
+  private fun destinationJson(record: SafDestinationRecord, message: String?) =
+    androidSafDestinationJson(
+      requestId = record.requestId,
+      state = record.phase.wireName,
+      bytes = record.bytes,
+      code = record.code,
+      message = message,
+      warningCodes = record.warningCodes,
+    )
+
+  private fun destinationMessage(record: SafDestinationRecord): String? = when (record.code) {
+    "cancelled" -> "Android SAF destination copy was cancelled"
+    "destination-interrupted" -> "Android SAF destination copy was interrupted"
+    "destination-state-failed" -> "Android SAF destination state could not be persisted"
+    "invalid-source" -> "Android SAF export source is unavailable"
+    "invalid-destination" -> "Android SAF destination is invalid"
+    "destination-write-failed" -> "Android SAF destination copy failed"
+    else -> null
+  }
+
+  private fun injectOpenedFiles(webView: WebView, openedIntent: Intent? = intent) {
+    val uris = claimOpenedFileUris(openedIntent)
+    if (uris.isEmpty()) return
+    val requestId = UUID.randomUUID().toString()
+    val cancellation = AtomicBoolean(false)
+    safSourceCancellations[requestId] = cancellation
+    safScope.launch {
+      try {
+        val store = safSpoolStore()
+        val sources = withContext(Dispatchers.IO) {
+          store.cleanupStale()
+          uris.map(::contentResolverSource)
+        }
+        val copyContext = currentCoroutineContext()
+        val batch = spoolOpenedFilesOnIo(
+          store,
+          sources,
+          isCancelled = { cancellation.get() || !copyContext.isActive },
+          onProgress = { progress ->
+            dispatchSafProgress(
+              requestId = requestId,
+              operation = "source-copy",
+              copiedBytes = progress.copiedBytes,
+              totalBytes = progress.totalBytes,
+              token = progress.token,
+              dispatchKey = "$requestId:${progress.token}",
+              isActive = { safSourceCancellations[requestId] === cancellation },
+            )
+          },
+        )
+        if (!copyContext.isActive || lifecycleWebView !== webView) return@launch
+        val newlyReady = batch.ready.filter { deliveredSpoolTokens.add(it.token) }
+        webView.evaluateJavascript(
+          androidSpoolBatchScript(requestId, batch.copy(ready = newlyReady)),
+          null,
+        )
+      } finally {
+        safSourceCancellations.remove(requestId, cancellation)
+        safProgressDispatchMillis.keys.removeAll {
+          it == requestId || it.startsWith("$requestId:")
+        }
+      }
+    }
+  }
+
+  private fun replayReadySpools(webView: WebView) {
+    val requestId = UUID.randomUUID().toString()
+    safScope.launch {
+      val ready = withContext(Dispatchers.IO) {
+        val store = safSpoolStore()
+        store.cleanupStale()
+        store.listReady().filter { deliveredSpoolTokens.add(it.token) }
+      }
+      if (ready.isEmpty() || lifecycleWebView !== webView) return@launch
+      webView.evaluateJavascript(
+        androidSpoolBatchScript(requestId, SafSpoolBatch(ready, emptyList())),
+        null,
+      )
+    }
+  }
+
+  private fun safSpoolStore() = SafSpoolStore(
+    root = File(dataDir, "native-file-jobs/sources"),
+    atomicPublisher = AndroidSafAtomicPublisher,
+  )
+
+  private fun claimOpenedFileUris(openedIntent: Intent?): List<Uri> {
+    openedIntent ?: return emptyList()
+    val uris = launchOpenedFileUris(openedIntent)
+    if (uris.isEmpty()) return emptyList()
+    val fingerprint = openedFileIntentFingerprint(
+      openedIntent.action,
+      uris.map(Uri::toString),
+    )
+    val marker = RestoredIntentConsumptionMarker(
+      isConsumed = {
+        openedIntent.getBooleanExtra(OPENED_FILE_INTENT_CONSUMED, false) ||
+          consumedOpenedFileFingerprint == fingerprint
+      },
+      markConsumed = {
+        openedIntent.putExtra(OPENED_FILE_INTENT_CONSUMED, true)
+        consumedOpenedFileFingerprint = fingerprint
+      },
+    )
+    return if (marker.claim()) uris else emptyList()
+  }
+
+  private fun dispatchSafProgress(
+    requestId: String,
+    operation: String,
+    copiedBytes: Long,
+    totalBytes: Long?,
+    token: String?,
+    dispatchKey: String,
+    isActive: () -> Boolean,
+  ) {
+    val now = SystemClock.elapsedRealtime()
+    val previous = safProgressDispatchMillis.put(dispatchKey, now)
+    if (previous != null && now - previous < SAF_PROGRESS_INTERVAL_MILLIS) return
+    val target = lifecycleWebView ?: return
+    val script = androidSafProgressScript(
+      requestId,
+      operation,
+      copiedBytes,
+      totalBytes,
+      token,
+    )
+    mainHandler.post {
+      if (lifecycleWebView === target && isActive()) {
+        target.evaluateJavascript(script, null)
+      }
+    }
+  }
+
+  private fun injectLegacyOpenedFiles(webView: WebView) {
+    val openedFiles = copyLegacyOpenedFiles(launchOpenedFileUris(intent))
+    if (openedFiles.isEmpty()) return
+    val script = openedFilesScript(openedFiles)
+    if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+      WebViewCompat.addDocumentStartJavaScript(webView, script, setOf("*"))
+    } else {
+      webView.evaluateJavascript(script, null)
+    }
+  }
+
+  private fun copyLegacyOpenedFiles(uris: List<Uri>): List<String> {
+    if (uris.isEmpty()) return emptyList()
+    val directory = File(cacheDir, "opened_files")
+    directory.mkdirs()
+    val stamp = System.currentTimeMillis()
+    return uris.mapIndexedNotNull { index, uri ->
+      try {
+        val target = File(directory, "$stamp-$index-${resolveLegacyDisplayName(uri)}")
+        contentResolver.openInputStream(uri)?.use { input ->
+          target.outputStream().use { output -> input.copyTo(output) }
+        } ?: return@mapIndexedNotNull null
+        target.absolutePath
+      } catch (error: Exception) {
+        null
+      }
+    }
+  }
+
+  private fun resolveLegacyDisplayName(uri: Uri): String {
+    if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+      contentResolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME),
+        null,
+        null,
+        null,
+      )?.use { cursor ->
+        val column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        if (column >= 0 && cursor.moveToFirst()) {
+          val name = cursor.getString(column)
+          if (!name.isNullOrBlank()) return sanitizeOpenedFileName(name)
+        }
+      }
+    }
+    return sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file")
   }
 
   private fun showRendererRecoveryWarning() {
@@ -669,7 +1362,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     val (displayName, totalBytes) = try {
       resolveSourceMetadata(uri)
     } catch (error: Exception) {
-      sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") to null
+      safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null
     }
     return object : SafInputSource {
       override val displayName = displayName
@@ -698,10 +1391,10 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           } else {
             null
           }
-          if (!name.isNullOrBlank()) return sanitizeOpenedFileName(name) to size
+          if (!name.isNullOrBlank()) return safeSafDisplayName(name) to size
         }
       }
     }
-    return sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") to null
+    return safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null
   }
 }

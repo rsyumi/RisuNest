@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+    cancelAndroidSafSource,
     consumeAndroidSpoolBatch,
     copyNativeExportToAndroidSaf,
+    getActiveAndroidSafSourceRequestIds,
     type AndroidSafDestinationEvent,
 } from './androidSafBridge'
 
@@ -12,6 +14,7 @@ describe('Android SAF bridge', () => {
         const unsupported = vi.fn()
 
         await consumeAndroidSpoolBatch({
+            requestId: 'source-request-1',
             ready: [
                 {
                     token: '11111111-1111-4111-8111-111111111111',
@@ -44,6 +47,7 @@ describe('Android SAF bridge', () => {
 
     it('asks the native picker to publish an owned export while keeping bytes outside TypeScript', async () => {
         const listeners = new Set<(event: Event) => void>()
+        const acknowledgeExport = vi.fn(() => true)
         const copyExport = vi.fn((requestId: string) => {
             queueMicrotask(() => {
                 const detail: AndroidSafDestinationEvent = {
@@ -63,7 +67,7 @@ describe('Android SAF bridge', () => {
             suggestedName: 'backup.risudat',
         }, {
             createRequestId: () => 'request-1',
-            bridge: { copyExport },
+            bridge: { copyExport, acknowledgeExport },
             addEventListener: (_name, listener) => listeners.add(listener),
             removeEventListener: (_name, listener) => listeners.delete(listener),
         })
@@ -77,6 +81,7 @@ describe('Android SAF bridge', () => {
             bytes: 4_294_967_296,
             warningCodes: ['android-saf-provider-not-atomic'],
         })
+        expect(acknowledgeExport).toHaveBeenCalledExactlyOnceWith('request-1')
         expect(listeners.size).toBe(0)
     })
 
@@ -139,5 +144,87 @@ describe('Android SAF bridge', () => {
         await expect(promise).rejects.toMatchObject({ name: 'AbortError' })
         expect(cancelExport).toHaveBeenCalledExactlyOnceWith('request-3')
         expect(listeners.size).toBe(0)
+    })
+
+    it('forwards a source spool cancellation request without exposing source bytes', () => {
+        const cancelSource = vi.fn()
+
+        cancelAndroidSafSource('source-request-1', { copyExport: vi.fn(), cancelSource })
+
+        expect(cancelSource).toHaveBeenCalledExactlyOnceWith('source-request-1')
+    })
+
+    it('can discover and cancel a source request before its first progress event', () => {
+        const requestId = '11111111-1111-4111-8111-111111111111'
+        const cancelSource = vi.fn()
+        const bridge = {
+            copyExport: vi.fn(),
+            cancelSource,
+            getActiveSourceRequestIds: () => JSON.stringify([requestId]),
+        }
+
+        const active = getActiveAndroidSafSourceRequestIds(bridge)
+        cancelAndroidSafSource(active[0], bridge)
+
+        expect(active).toEqual([requestId])
+        expect(cancelSource).toHaveBeenCalledExactlyOnceWith(requestId)
+    })
+
+    it('reports matching destination progress and ignores other requests', async () => {
+        const listeners = new Map<string, Set<(event: Event) => void>>()
+        const onProgress = vi.fn()
+        const dispatch = (name: string, detail: unknown) => {
+            for (const listener of listeners.get(name) ?? []) {
+                listener(new CustomEvent(name, { detail }))
+            }
+        }
+        const copyExport = vi.fn((requestId: string) => {
+            queueMicrotask(() => {
+                dispatch('risu-android-saf-progress', {
+                    requestId: 'another-request',
+                    operation: 'destination-copy',
+                    copiedBytes: 1,
+                    totalBytes: 10,
+                    token: null,
+                })
+                dispatch('risu-android-saf-progress', {
+                    requestId,
+                    operation: 'destination-copy',
+                    copiedBytes: 4,
+                    totalBytes: 10,
+                    token: null,
+                })
+                dispatch('risu-android-saf-destination', {
+                    requestId,
+                    state: 'succeeded',
+                    bytes: 10,
+                    warningCodes: ['android-saf-provider-not-atomic'],
+                })
+            })
+        })
+
+        await copyNativeExportToAndroidSaf({
+            sourcePath: '/data/user/0/co.aiclient.risu/files/persistent/exports/source.risudat',
+            suggestedName: 'backup.risudat',
+            onProgress,
+        }, {
+            createRequestId: () => 'destination-request-1',
+            bridge: { copyExport },
+            addEventListener: (name, listener) => {
+                const registered = listeners.get(name) ?? new Set()
+                registered.add(listener)
+                listeners.set(name, registered)
+            },
+            removeEventListener: (name, listener) => listeners.get(name)?.delete(listener),
+        })
+
+        expect(onProgress).toHaveBeenCalledExactlyOnceWith({
+            requestId: 'destination-request-1',
+            operation: 'destination-copy',
+            copiedBytes: 4,
+            totalBytes: 10,
+            token: null,
+        })
+        expect([...listeners.values()].every((registered) => registered.size === 0)).toBe(true)
     })
 })

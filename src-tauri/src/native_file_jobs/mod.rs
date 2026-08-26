@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
@@ -18,6 +18,11 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 const MAX_MANIFEST_BYTES: u64 = 4096;
 const MAX_CONCURRENT_JOBS: usize = 2;
 const MAX_CLEANUP_ERRORS: usize = 4;
+const ANDROID_SPOOL_FORMAT: &str = "risunest-android-saf-spool";
+const ANDROID_SPOOL_VERSION: u8 = 1;
+const ANDROID_SPOOL_STALE_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const ANDROID_SPOOL_STAGING_PREFIX: &str = ".spooling-";
+const ANDROID_SPOOL_CLEANUP_PREFIX: &str = ".cleanup-";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +63,7 @@ enum SpoolState {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SpoolManifest {
     token: String,
     state: SpoolState,
@@ -66,6 +71,15 @@ struct SpoolManifest {
     bytes: Option<u64>,
     #[serde(default)]
     total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpoolOwnership {
+    format: String,
+    version: u8,
+    token: String,
+    created_at_millis: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -166,12 +180,54 @@ pub(crate) fn open_job_source(
     }
 }
 
-fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJobError> {
+#[cfg(test)]
+fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, NativeJobError> {
+    match source {
+        JobSource::DesktopPath { path } => resolve_desktop_source(path),
+        JobSource::AndroidSpool { token } => resolve_spool_source(job_root, token),
+    }
+}
+
+#[cfg(test)]
+fn resolve_desktop_source(path: &str) -> Result<PathBuf, NativeJobError> {
+    let path = Path::new(path).canonicalize().map_err(|error| {
+        NativeJobError::new(
+            "invalid-source",
+            format!("desktop source is unavailable: {error}"),
+        )
+    })?;
+    if !path
+        .metadata()
+        .map_err(|error| {
+            NativeJobError::new(
+                "invalid-source",
+                format!("desktop source metadata is unavailable: {error}"),
+            )
+        })?
+        .is_file()
+    {
+        return Err(NativeJobError::new(
+            "invalid-source",
+            "desktop source must be a regular file",
+        ));
+    }
+    Ok(path)
+}
+
+fn parse_android_spool_token(token: &str) -> Result<Uuid, NativeJobError> {
     let parsed =
         Uuid::parse_str(token).map_err(|_| invalid_source_error("invalid Android spool token"))?;
-    if parsed.hyphenated().to_string() != token {
+    if parsed.hyphenated().to_string() != token
+        || parsed.get_version() != Some(uuid::Version::Random)
+        || parsed.get_variant() != uuid::Variant::RFC4122
+    {
         return Err(invalid_source_error("invalid Android spool token"));
     }
+    Ok(parsed)
+}
+
+fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJobError> {
+    parse_android_spool_token(token)?;
     let sources_root = job_root.join("sources").canonicalize().map_err(|error| {
         invalid_source_error(format!("Android source root is unavailable: {error}"))
     })?;
@@ -184,6 +240,70 @@ fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJ
     {
         return Err(invalid_source_error(
             "Android spool owned directory escapes its canonical source root",
+        ));
+    }
+    validate_spool_source(&canonical_spool, token)
+}
+
+fn claim_spool_source(
+    job_root: &Path,
+    token: &str,
+    owned_directory: &Path,
+) -> Result<PathBuf, NativeJobError> {
+    parse_android_spool_token(token)?;
+    let sources_root = job_root.join("sources").canonicalize().map_err(|error| {
+        invalid_source_error(format!("Android source root is unavailable: {error}"))
+    })?;
+    let pending = sources_root.join(token);
+    let pending_type = fs::symlink_metadata(&pending).map_err(|error| {
+        invalid_source_error(format!("Android spool directory is unavailable: {error}"))
+    })?;
+    if !pending_type.is_dir() || pending_type.file_type().is_symlink() {
+        return Err(invalid_source_error(
+            "Android spool owned directory is invalid",
+        ));
+    }
+    let canonical_owned = owned_directory.canonicalize().map_err(|error| {
+        invalid_source_error(format!("native job directory is unavailable: {error}"))
+    })?;
+    let claimed = canonical_owned.join("android-source");
+    fs::rename(&pending, &claimed).map_err(|error| {
+        invalid_source_error(format!("Android spool token is already claimed: {error}"))
+    })?;
+    let canonical_claimed = claimed.canonicalize().map_err(|error| {
+        invalid_source_error(format!("claimed Android spool is unavailable: {error}"))
+    })?;
+    if canonical_claimed.parent() != Some(canonical_owned.as_path())
+        || canonical_claimed.file_name().and_then(|name| name.to_str()) != Some("android-source")
+    {
+        return Err(invalid_source_error(
+            "claimed Android spool escapes its native job directory",
+        ));
+    }
+    validate_spool_source(&canonical_claimed, token)
+}
+
+fn validate_spool_source(canonical_spool: &Path, token: &str) -> Result<PathBuf, NativeJobError> {
+    let ownership_path = canonical_spool.join("ownership.json");
+    let ownership_metadata = ownership_path.metadata().map_err(|error| {
+        invalid_source_error(format!("Android spool ownership is unavailable: {error}"))
+    })?;
+    if !ownership_metadata.is_file() || ownership_metadata.len() > MAX_MANIFEST_BYTES {
+        return Err(invalid_source_error("Android spool ownership is invalid"));
+    }
+    let ownership: SpoolOwnership =
+        serde_json::from_slice(&fs::read(&ownership_path).map_err(|error| {
+            invalid_source_error(format!("Android spool ownership cannot be read: {error}"))
+        })?)
+        .map_err(|error| {
+            invalid_source_error(format!("Android spool ownership is invalid: {error}"))
+        })?;
+    if ownership.format != ANDROID_SPOOL_FORMAT
+        || ownership.version != ANDROID_SPOOL_VERSION
+        || ownership.token != token
+    {
+        return Err(invalid_source_error(
+            "Android spool ownership does not match its token",
         ));
     }
     let manifest_path = canonical_spool.join("source.json");
@@ -212,7 +332,7 @@ fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJ
         .map_err(|error| {
             invalid_source_error(format!("Android spool source is unavailable: {error}"))
         })?;
-    if source.parent() != Some(canonical_spool.as_path()) {
+    if source.parent() != Some(canonical_spool) {
         return Err(invalid_source_error(
             "Android spool source escapes its owned directory",
         ));
@@ -222,7 +342,7 @@ fn resolve_spool_source(job_root: &Path, token: &str) -> Result<PathBuf, NativeJ
             "Android spool source metadata is unavailable: {error}"
         ))
     })?;
-    if !metadata.is_file() || manifest.bytes.is_some_and(|bytes| bytes != metadata.len()) {
+    if !metadata.is_file() || manifest.bytes != Some(metadata.len()) {
         return Err(invalid_source_error(
             "Android spool source does not match its ready manifest",
         ));
@@ -325,6 +445,19 @@ fn cleanup_owned_directories(jobs_root: &Path) -> Result<(), String> {
 }
 
 fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    cleanup_spool_directories_at(sources_root, now_millis, ANDROID_SPOOL_STALE_MILLIS)
+}
+
+fn cleanup_spool_directories_at(
+    sources_root: &Path,
+    now_millis: u64,
+    stale_after_millis: u64,
+) -> Result<(), String> {
     if !sources_root.is_dir() {
         return Ok(());
     }
@@ -347,6 +480,7 @@ fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
         };
         let is_directory = match entry.file_type() {
             Ok(file_type) => file_type.is_dir(),
+            Err(error) if is_spool_cleanup_race_loss(&error, &entry.path()) => continue,
             Err(error) => {
                 record_cleanup_error(
                     &mut errors,
@@ -361,14 +495,20 @@ fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Ok(id) = Uuid::parse_str(&name) else {
-            continue;
-        };
-        if id.hyphenated().to_string() != name {
+        let (token, is_staging, is_cleanup) =
+            if let Some(token) = name.strip_prefix(ANDROID_SPOOL_STAGING_PREFIX) {
+                (token, true, false)
+            } else if let Some(token) = name.strip_prefix(ANDROID_SPOOL_CLEANUP_PREFIX) {
+                (token, false, true)
+            } else {
+                (name.as_str(), false, false)
+            };
+        if parse_android_spool_token(token).is_err() {
             continue;
         }
         let owned = match entry.path().canonicalize() {
             Ok(owned) => owned,
+            Err(error) if is_spool_cleanup_race_loss(&error, &entry.path()) => continue,
             Err(error) => {
                 record_cleanup_error(
                     &mut errors,
@@ -380,30 +520,120 @@ fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
         if owned.parent() != Some(canonical_root.as_path()) {
             continue;
         }
-        let manifest_path = owned.join("source.json");
-        let Ok(metadata) = manifest_path.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        let ownership_path = owned.join("ownership.json");
+        let ownership = ownership_path
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file() && metadata.len() <= MAX_MANIFEST_BYTES)
+            .and_then(|_| fs::read(&ownership_path).ok())
+            .and_then(|bytes| serde_json::from_slice::<SpoolOwnership>(&bytes).ok())
+            .filter(|ownership| {
+                ownership.format == ANDROID_SPOOL_FORMAT
+                    && ownership.version == ANDROID_SPOOL_VERSION
+                    && ownership.token == token
+            });
+        if is_cleanup {
+            if ownership.is_some() {
+                match fs::remove_dir_all(&owned) {
+                    Ok(()) => {}
+                    Err(error) if is_spool_cleanup_race_loss(&error, &owned) => {}
+                    Err(error) => record_cleanup_error(
+                        &mut errors,
+                        format!("native source cleanup directory cannot be removed: {error}"),
+                    ),
+                }
+            }
             continue;
         }
-        let Ok(bytes) = fs::read(&manifest_path) else {
+        let created_at_millis = ownership
+            .as_ref()
+            .map(|ownership| ownership.created_at_millis)
+            .or_else(|| {
+                is_staging.then(|| {
+                    entry
+                        .metadata()
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+                        .unwrap_or(now_millis)
+                })
+            });
+        let Some(created_at_millis) = created_at_millis else {
             continue;
         };
-        let Ok(manifest) = serde_json::from_slice::<SpoolManifest>(&bytes) else {
-            continue;
-        };
-        if manifest.token != name {
+        if now_millis.saturating_sub(created_at_millis) < stale_after_millis {
             continue;
         }
-        if let Err(error) = fs::remove_dir_all(&owned) {
-            record_cleanup_error(
+        let cleanup = canonical_root.join(format!("{ANDROID_SPOOL_CLEANUP_PREFIX}{token}"));
+        if cleanup.is_dir() {
+            let cleanup_ownership_path = cleanup.join("ownership.json");
+            let cleanup_is_owned = cleanup_ownership_path
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_file() && metadata.len() <= MAX_MANIFEST_BYTES)
+                .and_then(|_| fs::read(&cleanup_ownership_path).ok())
+                .and_then(|bytes| serde_json::from_slice::<SpoolOwnership>(&bytes).ok())
+                .is_some_and(|ownership| {
+                    ownership.format == ANDROID_SPOOL_FORMAT
+                        && ownership.version == ANDROID_SPOOL_VERSION
+                        && ownership.token == token
+                });
+            if !cleanup_is_owned {
+                continue;
+            }
+            match fs::remove_dir_all(&cleanup) {
+                Ok(()) => {}
+                Err(error) if is_spool_cleanup_race_loss(&error, &cleanup) => {}
+                Err(error) => {
+                    record_cleanup_error(
+                        &mut errors,
+                        format!("native source cleanup directory cannot be removed: {error}"),
+                    );
+                    continue;
+                }
+            }
+        }
+        match fs::rename(&owned, &cleanup) {
+            Ok(()) => {}
+            Err(error) if is_spool_cleanup_race_loss(&error, &owned) => continue,
+            Err(error) => {
+                record_cleanup_error(
+                    &mut errors,
+                    format!("native source cleanup claim failed: {error}"),
+                );
+                continue;
+            }
+        }
+        match fs::remove_dir_all(&cleanup) {
+            Ok(()) => {}
+            Err(error) if is_spool_cleanup_race_loss(&error, &cleanup) => {}
+            Err(error) => record_cleanup_error(
                 &mut errors,
                 format!("native source directory cannot be removed: {error}"),
-            );
+            ),
         }
     }
     cleanup_errors_result(errors)
+}
+
+fn is_spool_cleanup_race_loss(error: &std::io::Error, path: &Path) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    if !cfg!(windows) || error.kind() != std::io::ErrorKind::PermissionDenied {
+        return false;
+    }
+    for _ in 0..16 {
+        match fs::symlink_metadata(path) {
+            Err(probe) if probe.kind() == std::io::ErrorKind::NotFound => return true,
+            _ => std::thread::yield_now(),
+        }
+    }
+    matches!(
+        fs::symlink_metadata(path),
+        Err(probe) if probe.kind() == std::io::ErrorKind::NotFound
+    )
 }
 
 fn record_cleanup_error(errors: &mut Vec<String>, error: String) {
@@ -483,7 +713,13 @@ impl NativeFileJobState {
                 source,
                 expected_revision,
             } => {
-                let opened_source = open_job_source(&self.root, &source)?;
+                let opened_source = match &source {
+                    JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
+                    JobSource::AndroidSpool { token } => {
+                        parse_android_spool_token(token)?;
+                        None
+                    }
+                };
                 NativeFileJobTask::Restore {
                     opened_source,
                     source,
@@ -536,7 +772,13 @@ impl NativeFileJobState {
                 "test replacement sink only supports restore jobs",
             ));
         };
-        let opened_source = open_job_source(&self.root, &source)?;
+        let opened_source = match &source {
+            JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
+            JobSource::AndroidSpool { token } => {
+                parse_android_spool_token(token)?;
+                None
+            }
+        };
         self.spawn(
             NativeFileJobTask::Restore {
                 opened_source,
@@ -550,7 +792,7 @@ impl NativeFileJobState {
 
     fn spawn(
         &self,
-        task: NativeFileJobTask,
+        mut task: NativeFileJobTask,
         require_restore_finalization: bool,
     ) -> Result<NativeFileJobStarted, NativeJobError> {
         let worker_permit =
@@ -579,31 +821,71 @@ impl NativeFileJobState {
                 return Err(NativeJobError::new("capability-unavailable", error));
             }
         };
+        let source_preparation = (|| -> Result<(), NativeJobError> {
+            let NativeFileJobTask::Restore {
+                opened_source,
+                source,
+                ..
+            } = &mut task
+            else {
+                return Ok(());
+            };
+            match source {
+                JobSource::DesktopPath { .. } if opened_source.is_some() => Ok(()),
+                JobSource::AndroidSpool { token } if opened_source.is_none() => {
+                    let path = claim_spool_source(&self.root, token, &owned_directory)?;
+                    *opened_source = Some(open_regular_file_no_follow(&path)?);
+                    Ok(())
+                }
+                _ => Err(NativeJobError::new(
+                    "store-error",
+                    "native job source resolution is inconsistent",
+                )),
+            }
+        })();
+        if let Err(error) = source_preparation {
+            let cleanup =
+                cleanup_one_owned_directory(&self.root.join("jobs"), &owned_directory, &job_id);
+            let _ = job.finish_failure(&error.code, &error.message);
+            let _ = self.registry.forget(&job_id);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(NativeJobError::new(
+                    "cleanup-failed",
+                    format!("{}; cleanup failed: {cleanup}", error.message),
+                )),
+            };
+        };
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
             let _worker_permit = worker_permit;
-            let cleanup_source = task.cleanup_source();
             let outcome = match task {
                 NativeFileJobTask::Restore {
                     opened_source,
                     expected_revision,
                     sink,
                     ..
-                } => match sink {
-                    RestoreJobSink::Persistent(app) => restore::restore_block_risu_save(
-                        opened_source,
-                        expected_revision,
-                        &job,
-                        &PersistentReplacementSink { app },
-                    ),
-                    #[cfg(test)]
-                    RestoreJobSink::Test(sink) => restore::restore_block_risu_save(
-                        opened_source,
-                        expected_revision,
-                        &job,
-                        sink.as_ref(),
-                    ),
+                } => match opened_source {
+                    Some(opened_source) => match sink {
+                        RestoreJobSink::Persistent(app) => restore::restore_block_risu_save(
+                            opened_source,
+                            expected_revision,
+                            &job,
+                            &PersistentReplacementSink { app },
+                        ),
+                        #[cfg(test)]
+                        RestoreJobSink::Test(sink) => restore::restore_block_risu_save(
+                            opened_source,
+                            expected_revision,
+                            &job,
+                            sink.as_ref(),
+                        ),
+                    },
+                    None => Err(NativeJobError::new(
+                        "store-error",
+                        "native job source was not prepared",
+                    )),
                 },
                 NativeFileJobTask::Export {
                     destination,
@@ -623,11 +905,6 @@ impl NativeFileJobState {
                 cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id())
             {
                 cleanup_errors.push(error);
-            }
-            if let Some(JobSource::AndroidSpool { token }) = cleanup_source {
-                if let Err(error) = cleanup_one_spool_directory(&root.join("sources"), &token) {
-                    cleanup_errors.push(error);
-                }
             }
             match (outcome, cleanup_errors.is_empty()) {
                 (Ok(result), true) => {
@@ -704,7 +981,7 @@ enum RestoreJobSink {
 
 enum NativeFileJobTask {
     Restore {
-        opened_source: OpenedJobSource,
+        opened_source: Option<OpenedJobSource>,
         source: JobSource,
         expected_revision: i64,
         sink: RestoreJobSink,
@@ -733,13 +1010,6 @@ impl NativeFileJobTask {
             | Self::Export {
                 expected_revision, ..
             } => *expected_revision,
-        }
-    }
-
-    fn cleanup_source(&self) -> Option<JobSource> {
-        match self {
-            Self::Restore { source, .. } => Some(source.clone()),
-            Self::Export { .. } => None,
         }
     }
 }
@@ -844,33 +1114,6 @@ fn cleanup_one_owned_directory(
     }
     fs::remove_dir_all(canonical_owned)
         .map_err(|error| format!("native job directory cannot be removed: {error}"))
-}
-
-fn cleanup_one_spool_directory(sources_root: &Path, token: &str) -> Result<(), String> {
-    let parsed = Uuid::parse_str(token).map_err(|_| "invalid Android spool token".to_owned())?;
-    if parsed.hyphenated().to_string() != token {
-        return Err("invalid Android spool token".to_owned());
-    }
-    let canonical_root = sources_root
-        .canonicalize()
-        .map_err(|error| format!("native source root cannot be resolved: {error}"))?;
-    let owned = sources_root
-        .join(token)
-        .canonicalize()
-        .map_err(|error| format!("native source directory cannot be resolved: {error}"))?;
-    if owned.parent() != Some(canonical_root.as_path()) {
-        return Err("native source cleanup target is outside its owned root".to_owned());
-    }
-    let manifest: SpoolManifest = serde_json::from_slice(
-        &fs::read(owned.join("source.json"))
-            .map_err(|error| format!("native source manifest cannot be read: {error}"))?,
-    )
-    .map_err(|error| format!("native source manifest is invalid: {error}"))?;
-    if manifest.token != token {
-        return Err("native source ownership does not match cleanup target".to_owned());
-    }
-    fs::remove_dir_all(owned)
-        .map_err(|error| format!("native source directory cannot be removed: {error}"))
 }
 
 struct PersistentReplacementSink {
@@ -1583,6 +1826,8 @@ mod restore;
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1595,6 +1840,256 @@ mod tests {
             preset_count: 0,
             warning_codes: Vec::new(),
         }
+    }
+
+    fn write_literal_spool(root: &Path, token: &str, manifest: &str, created_at_millis: u64) {
+        let spool = root.join("sources").join(token);
+        fs::create_dir_all(&spool).unwrap();
+        fs::write(spool.join("source.risudat"), b"RISUSAVE\0").unwrap();
+        fs::write(
+            spool.join("ownership.json"),
+            format!(
+                "{{\"format\":\"risunest-android-saf-spool\",\"version\":1,\"token\":\"{token}\",\"createdAtMillis\":{created_at_millis}}}"
+            ),
+        )
+        .unwrap();
+        fs::write(spool.join("source.json"), manifest).unwrap();
+    }
+
+    #[test]
+    fn kotlin_camel_case_ready_manifest_is_claimed_once() {
+        let directory = TempDir::new().unwrap();
+        let token = Uuid::new_v4().to_string();
+        write_literal_spool(
+            directory.path(),
+            &token,
+            &format!(
+                "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"database.risudat\",\"bytes\":9,\"totalBytes\":12}}"
+            ),
+            1,
+        );
+        let jobs_root = directory.path().join("jobs");
+        fs::create_dir_all(&jobs_root).unwrap();
+        let job_id = Uuid::new_v4().to_string();
+        let owned = create_owned_directory(&jobs_root, &job_id).unwrap();
+
+        let source = claim_spool_source(directory.path(), &token, &owned).unwrap();
+
+        assert_eq!(source.file_name().unwrap(), "source.risudat");
+        assert!(source.starts_with(owned.canonicalize().unwrap()));
+        assert!(!directory.path().join("sources").join(&token).exists());
+        assert!(claim_spool_source(directory.path(), &token, &owned).is_err());
+    }
+
+    #[test]
+    fn ready_manifest_requires_a_non_null_exact_length() {
+        for bytes in ["null", "8", "10"] {
+            let directory = TempDir::new().unwrap();
+            let token = Uuid::new_v4().to_string();
+            write_literal_spool(
+                directory.path(),
+                &token,
+                &format!(
+                    "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"database.risudat\",\"bytes\":{bytes},\"totalBytes\":null}}"
+                ),
+                1,
+            );
+            let jobs_root = directory.path().join("jobs");
+            fs::create_dir_all(&jobs_root).unwrap();
+            let job_id = Uuid::new_v4().to_string();
+            let owned = create_owned_directory(&jobs_root, &job_id).unwrap();
+
+            assert!(claim_spool_source(directory.path(), &token, &owned).is_err());
+        }
+    }
+
+    #[test]
+    fn android_spool_tokens_require_canonical_rfc4122_uuid_v4() {
+        assert!(parse_android_spool_token("99999999-9999-4999-8999-999999999999").is_ok());
+        assert!(parse_android_spool_token("99999999-9999-1999-8999-999999999999").is_err());
+        assert!(parse_android_spool_token("99999999-9999-4999-0999-999999999999").is_err());
+        assert!(parse_android_spool_token("99999999-9999-4999-8999-99999999999A").is_err());
+    }
+
+    #[test]
+    fn concurrent_claims_have_exactly_one_job_owned_winner() {
+        let directory = TempDir::new().unwrap();
+        let token = Uuid::new_v4().to_string();
+        write_literal_spool(
+            directory.path(),
+            &token,
+            &format!(
+                "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"database.risudat\",\"bytes\":9,\"totalBytes\":null}}"
+            ),
+            1,
+        );
+        let jobs_root = directory.path().join("jobs");
+        fs::create_dir_all(&jobs_root).unwrap();
+        let owned = [Uuid::new_v4(), Uuid::new_v4()]
+            .map(|id| create_owned_directory(&jobs_root, &id.to_string()).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = owned.map(|owned_directory| {
+            let root = directory.path().to_owned();
+            let token = token.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                claim_spool_source(&root, &token, &owned_directory)
+            })
+        });
+
+        let outcomes = handles.map(|handle| handle.join().unwrap());
+
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_cleanup_and_job_claim_compete_by_atomic_directory_rename() {
+        for _ in 0..32 {
+            let directory = TempDir::new().unwrap();
+            let token = Uuid::new_v4().to_string();
+            write_literal_spool(
+                directory.path(),
+                &token,
+                &format!(
+                    "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"database.risudat\",\"bytes\":9,\"totalBytes\":null}}"
+                ),
+                1,
+            );
+            let jobs_root = directory.path().join("jobs");
+            fs::create_dir_all(&jobs_root).unwrap();
+            let owned = create_owned_directory(&jobs_root, &Uuid::new_v4().to_string()).unwrap();
+            let barrier = Arc::new(Barrier::new(2));
+            let claim_root = directory.path().to_owned();
+            let claim_token = token.clone();
+            let claim_owned = owned.clone();
+            let claim_barrier = Arc::clone(&barrier);
+            let claim = thread::spawn(move || {
+                claim_barrier.wait();
+                claim_spool_source(&claim_root, &claim_token, &claim_owned)
+            });
+            let cleanup_root = directory.path().join("sources");
+            let cleanup_barrier = Arc::clone(&barrier);
+            let cleanup = thread::spawn(move || {
+                cleanup_barrier.wait();
+                cleanup_spool_directories_at(&cleanup_root, 2_000, 100)
+            });
+
+            let claimed = claim.join().unwrap();
+            cleanup.join().unwrap().unwrap();
+
+            match claimed {
+                Ok(source) => assert_eq!(fs::read(source).unwrap(), b"RISUSAVE\0"),
+                Err(_) => assert!(!owned.join("android-source").exists()),
+            }
+            assert!(!directory.path().join("sources").join(&token).exists());
+        }
+    }
+
+    #[test]
+    fn startup_cleanup_uses_stable_owner_and_preserves_fresh_spools() {
+        let directory = TempDir::new().unwrap();
+        let sources = directory.path().join("sources");
+        let stale = Uuid::new_v4().to_string();
+        let fresh = Uuid::new_v4().to_string();
+        write_literal_spool(directory.path(), &stale, "{\"token\":", 1);
+        write_literal_spool(directory.path(), &fresh, "{\"token\":", 1_950);
+
+        cleanup_spool_directories_at(&sources, 2_000, 100).unwrap();
+
+        assert!(!sources.join(stale).exists());
+        assert!(sources.join(fresh).exists());
+    }
+
+    #[test]
+    fn startup_cleanup_preserves_a_conflicting_tombstone_without_matching_stable_owner() {
+        let directory = TempDir::new().unwrap();
+        let sources = directory.path().join("sources");
+        let token = Uuid::new_v4().to_string();
+        let foreign_token = Uuid::new_v4().to_string();
+        write_literal_spool(directory.path(), &token, "{\"token\":", 1);
+        let tombstone = sources.join(format!("{ANDROID_SPOOL_CLEANUP_PREFIX}{token}"));
+        fs::create_dir_all(&tombstone).unwrap();
+        fs::write(
+            tombstone.join("ownership.json"),
+            serde_json::to_vec(&SpoolOwnership {
+                format: ANDROID_SPOOL_FORMAT.to_owned(),
+                version: ANDROID_SPOOL_VERSION,
+                token: foreign_token,
+                created_at_millis: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let sentinel = tombstone.join("source.risudat");
+        fs::write(&sentinel, b"preserve-me").unwrap();
+
+        cleanup_spool_directories_at(&sources, 2_000, 100).unwrap();
+
+        assert!(sources.join(&token).is_dir());
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve-me");
+    }
+
+    #[test]
+    fn concurrent_cleanup_sweepers_treat_a_removed_owned_tombstone_as_a_lost_race() {
+        let directory = TempDir::new().unwrap();
+        let sources = directory.path().join("sources");
+        fs::create_dir_all(&sources).unwrap();
+        let token = Uuid::new_v4().to_string();
+        let tombstone = sources.join(format!("{ANDROID_SPOOL_CLEANUP_PREFIX}{token}"));
+        fs::create_dir_all(&tombstone).unwrap();
+        fs::write(
+            tombstone.join("ownership.json"),
+            serde_json::to_vec(&SpoolOwnership {
+                format: ANDROID_SPOOL_FORMAT.to_owned(),
+                version: ANDROID_SPOOL_VERSION,
+                token,
+                created_at_millis: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(tombstone.join("source.risudat"), b"stale").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let sweepers = (0..2)
+            .map(|_| {
+                let sources = sources.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    cleanup_spool_directories_at(&sources, 2_000, 100)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for sweeper in sweepers {
+            sweeper.join().unwrap().unwrap();
+        }
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn permission_denied_is_a_race_loss_only_after_the_path_disappears() {
+        let directory = TempDir::new().unwrap();
+        let permission_denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_spool_cleanup_race_loss(
+            &permission_denied,
+            directory.path(),
+        ));
+
+        let missing = directory.path().join("already-moved");
+        assert_eq!(
+            is_spool_cleanup_race_loss(&permission_denied, &missing),
+            cfg!(windows),
+        );
+        assert!(is_spool_cleanup_race_loss(
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+            directory.path(),
+        ));
     }
 
     #[test]
@@ -1869,6 +2364,17 @@ mod tests {
         fs::create_dir_all(&spool).unwrap();
         fs::write(spool.join("source.risudat"), b"RISUSAVE\0").unwrap();
         fs::write(
+            spool.join("ownership.json"),
+            serde_json::to_vec(&SpoolOwnership {
+                format: ANDROID_SPOOL_FORMAT.to_owned(),
+                version: ANDROID_SPOOL_VERSION,
+                token: token.clone(),
+                created_at_millis: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
             spool.join("source.json"),
             serde_json::to_vec(&SpoolManifest {
                 token: token.clone(),
@@ -2055,6 +2561,17 @@ mod tests {
         let owned = sources_root.join(&token);
         fs::create_dir_all(&owned).unwrap();
         fs::write(owned.join("source.risudat"), b"partial").unwrap();
+        fs::write(
+            owned.join("ownership.json"),
+            serde_json::to_vec(&SpoolOwnership {
+                format: ANDROID_SPOOL_FORMAT.to_owned(),
+                version: ANDROID_SPOOL_VERSION,
+                token: token.clone(),
+                created_at_millis: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         fs::write(
             owned.join("source.json"),
             serde_json::to_vec(&SpoolManifest {

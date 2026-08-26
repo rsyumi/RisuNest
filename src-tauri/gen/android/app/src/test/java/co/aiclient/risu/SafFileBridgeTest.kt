@@ -5,7 +5,9 @@ import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -21,6 +23,8 @@ class SafFileBridgeTest {
     val root = temporaryDirectory()
     val store = SafSpoolStore(
       root = root,
+      atomicPublisher = testAtomicPublisher,
+      nowMillis = { 1_000 },
       tokenFactory = sequenceOf(
         UUID.fromString("11111111-1111-4111-8111-111111111111"),
         UUID.fromString("22222222-2222-4222-8222-222222222222"),
@@ -71,9 +75,15 @@ class SafFileBridgeTest {
     assertTrue(openedThreads.all { it != Thread.currentThread().name })
     val manifest = root.resolve("11111111-1111-4111-8111-111111111111/source.json").readText()
     assertTrue(manifest.contains("\"state\":\"ready\""))
-    assertTrue(manifest.contains("\"display_name\":\"first.risudat\""))
-    assertTrue(manifest.contains("\"total_bytes\":3"))
-    assertFalse(manifest.contains("\"displayName\""))
+    assertTrue(manifest.contains("\"displayName\":\"first.risudat\""))
+    assertTrue(manifest.contains("\"totalBytes\":3"))
+    assertFalse(manifest.contains("\"display_name\""))
+    assertEquals(
+      "{\"format\":\"risunest-android-saf-spool\",\"version\":1," +
+        "\"token\":\"11111111-1111-4111-8111-111111111111\",\"createdAtMillis\":1000}",
+      root.resolve("11111111-1111-4111-8111-111111111111/ownership.json").readText(),
+    )
+    assertFalse(root.resolve("11111111-1111-4111-8111-111111111111/source.json.tmp").exists())
   }
 
   @Test
@@ -83,6 +93,7 @@ class SafFileBridgeTest {
     val store = SafSpoolStore(
       root = root,
       bufferBytes = 4,
+      atomicPublisher = testAtomicPublisher,
       tokenFactory = { UUID.fromString(token) },
     )
     var copied = 0L
@@ -99,13 +110,18 @@ class SafFileBridgeTest {
     assertEquals(emptyList<SafSpoolReady>(), batch.ready)
     assertEquals("cancelled", batch.failures.single().code)
     assertFalse(root.resolve(token).exists())
+    assertFalse(root.resolve(".spooling-$token").exists())
   }
 
   @Test
   fun `source failure is reported and its partial bytes are removed`() = runBlocking {
     val root = temporaryDirectory()
     val token = "44444444-4444-4444-8444-444444444444"
-    val store = SafSpoolStore(root, bufferBytes = 4) { UUID.fromString(token) }
+    val store = SafSpoolStore(
+      root = root,
+      bufferBytes = 4,
+      atomicPublisher = testAtomicPublisher,
+    ) { UUID.fromString(token) }
     val source = TestSafSource("broken.risudat", null) {
       object : InputStream() {
         private var reads = 0
@@ -144,7 +160,7 @@ class SafFileBridgeTest {
     ownedSpool(root, mismatchedToken, UUID.randomUUID().toString(), modifiedAt = 1L)
     root.resolve("unrelated").mkdirs()
 
-    val removed = SafSpoolStore(root).cleanupStale(
+    val removed = SafSpoolStore(root, atomicPublisher = testAtomicPublisher).cleanupStale(
       nowMillis = now,
       staleAfterMillis = 100L,
       activeTokens = setOf(activeToken),
@@ -156,6 +172,345 @@ class SafFileBridgeTest {
     assertTrue(root.resolve(freshToken).exists())
     assertTrue(root.resolve(mismatchedToken).exists())
     assertTrue(root.resolve("unrelated").exists())
+  }
+
+  @Test
+  fun `stale cleanup uses stable ownership when readiness manifest is truncated`() {
+    val root = temporaryDirectory()
+    val token = "99999999-9999-4999-8999-999999999999"
+    val directory = root.resolve(token)
+    directory.mkdirs()
+    directory.resolve("ownership.json").writeText(
+      "{\"format\":\"risunest-android-saf-spool\",\"version\":1," +
+        "\"token\":\"$token\",\"createdAtMillis\":1}",
+    )
+    directory.resolve("source.json").writeText("{\"token\":")
+    directory.resolve("source.risudat").writeBytes(byteArrayOf(1))
+
+    val removed = SafSpoolStore(root, atomicPublisher = testAtomicPublisher).cleanupStale(
+      nowMillis = 2_000,
+      staleAfterMillis = 100,
+    )
+
+    assertEquals(listOf(token), removed)
+    assertFalse(directory.exists())
+  }
+
+  @Test
+  fun `stale cleanup preserves a conflicting tombstone without matching stable ownership`() {
+    val root = temporaryDirectory()
+    val token = "99999999-9999-4999-8999-999999999999"
+    val foreignToken = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    ownedSpool(root, token, token, modifiedAt = 1L)
+    val tombstone = root.resolve(".cleanup-$token")
+    tombstone.mkdirs()
+    tombstone.resolve("ownership.json").writeText(
+      "{\"format\":\"risunest-android-saf-spool\",\"version\":1," +
+        "\"token\":\"$foreignToken\",\"createdAtMillis\":1}",
+    )
+    val sentinel = tombstone.resolve("source.risudat")
+    sentinel.writeText("preserve-me")
+
+    val removed = SafSpoolStore(root, atomicPublisher = testAtomicPublisher).cleanupStale(
+      nowMillis = 2_000,
+      staleAfterMillis = 100,
+    )
+
+    assertEquals(emptyList<String>(), removed)
+    assertTrue(root.resolve(token).isDirectory)
+    assertEquals("preserve-me", sentinel.readText())
+  }
+
+  @Test
+  fun `stale cleanup reclaims an unpublished staging directory without exposing a token`() {
+    val root = temporaryDirectory()
+    val token = "99999999-9999-4999-8999-999999999999"
+    val staging = root.resolve(".spooling-$token")
+    staging.mkdirs()
+    staging.resolve("source.json").writeText("{\"token\":")
+    staging.resolve("source.risudat").writeBytes(byteArrayOf(1))
+    staging.setLastModified(1)
+
+    val removed = SafSpoolStore(root, atomicPublisher = testAtomicPublisher).cleanupStale(
+      nowMillis = 2_000,
+      staleAfterMillis = 100,
+    )
+
+    assertEquals(listOf(token), removed)
+    assertFalse(staging.exists())
+    assertFalse(root.resolve(token).exists())
+  }
+
+  @Test
+  fun `invalid token factory UUID never creates a spool directory`() {
+    val root = temporaryDirectory()
+    val store = SafSpoolStore(
+      root = root,
+      atomicPublisher = testAtomicPublisher,
+      tokenFactory = { UUID.fromString("99999999-9999-1999-8999-999999999999") },
+    )
+
+    val batch = store.spool(listOf(TestSafSource("invalid.risudat", 1) {
+      ByteArrayInputStream(byteArrayOf(1))
+    }))
+
+    assertEquals(emptyList<SafSpoolReady>(), batch.ready)
+    assertEquals("invalid-token", batch.failures.single().code)
+    assertEquals(emptyList<File>(), root.listFiles().orEmpty().toList())
+  }
+
+  @Test
+  fun `manifest publication always uses a synced sibling temporary`() {
+    val root = temporaryDirectory()
+    val publications = mutableListOf<Pair<String, String>>()
+    val publisher = SafAtomicPublisher { temporary, target ->
+      if (temporary.isDirectory) {
+        assertTrue(temporary.name.startsWith(".spooling-"))
+        assertTrue(temporary.resolve("ownership.json").isFile)
+        assertTrue(temporary.resolve("source.risudat").isFile)
+        assertTrue(temporary.resolve("source.json").readText().contains("\"state\":\"ready\""))
+      } else {
+        assertTrue(temporary.name.endsWith(".tmp"))
+      }
+      publications.add(temporary.name to target.name)
+      testAtomicPublisher.publish(temporary, target)
+    }
+    val store = SafSpoolStore(
+      root = root,
+      atomicPublisher = publisher,
+      tokenFactory = { UUID.fromString("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") },
+    )
+
+    val batch = store.spool(listOf(TestSafSource("atomic.risudat", 1) {
+      ByteArrayInputStream(byteArrayOf(1))
+    }))
+
+    assertEquals(1, batch.ready.size)
+    assertEquals(
+      listOf(
+        "ownership.json.tmp" to "ownership.json",
+        "source.json.tmp" to "source.json",
+        "source.json.tmp" to "source.json",
+        ".spooling-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" to
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      ),
+      publications,
+    )
+  }
+
+  @Test
+  fun `ready spools can be replayed without reopening the provider`() {
+    val root = temporaryDirectory()
+    var opens = 0
+    val store = SafSpoolStore(
+      root = root,
+      atomicPublisher = testAtomicPublisher,
+      tokenFactory = { UUID.fromString("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb") },
+    )
+    val batch = store.spool(listOf(TestSafSource("replay.risudat", 2) {
+      opens += 1
+      ByteArrayInputStream(byteArrayOf(1, 2))
+    }))
+
+    val firstReplay = store.listReady()
+    val secondReplay = store.listReady()
+
+    assertEquals(1, opens)
+    assertEquals(batch.ready, firstReplay)
+    assertEquals(firstReplay, secondReplay)
+  }
+
+  @Test
+  fun `destination state survives store reconstruction with bounded identifiers only`() {
+    val root = temporaryDirectory()
+    val stateFile = root.resolve("android-saf-destination.json")
+    val first = SafDestinationStateStore(stateFile, testAtomicPublisher)
+    val record = SafDestinationRecord(
+      requestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      exportId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      phase = SafDestinationPhase.COPYING,
+      destinationUri = "content://provider/document/42",
+      bytes = null,
+      code = null,
+      warningCodes = listOf("android-saf-provider-not-atomic"),
+      updatedAtMillis = 1_000,
+    )
+
+    first.save(record)
+    val restored = SafDestinationStateStore(stateFile, testAtomicPublisher).load()
+
+    assertEquals(record, restored)
+    assertFalse(stateFile.readText().contains("/persistent/exports/"))
+
+    val cancelledPicker = record.copy(
+      phase = SafDestinationPhase.CANCELLING,
+      destinationUri = null,
+      updatedAtMillis = 1_001,
+    )
+    first.save(cancelledPicker)
+    assertEquals(cancelledPicker, first.load())
+    assertFalse(first.clear(cancelledPicker.requestId))
+
+    val terminal = cancelledPicker.copy(
+      phase = SafDestinationPhase.CANCELLED,
+      code = "cancelled",
+      updatedAtMillis = 1_002,
+    )
+    first.save(terminal)
+    assertTrue(first.clear(terminal.requestId))
+    assertNull(first.load())
+  }
+
+  @Test
+  fun `destination state rejects malformed and oversized persistence`() {
+    val root = temporaryDirectory()
+    val stateFile = root.resolve("android-saf-destination.json")
+    val store = SafDestinationStateStore(stateFile, testAtomicPublisher)
+    stateFile.writeText("{\"requestId\":")
+    assertNull(store.load())
+
+    stateFile.writeText("x".repeat(8_193))
+    assertNull(store.load())
+  }
+
+  @Test
+  fun `interrupted destination cleanup preserves provider limited warnings`() {
+    assertEquals(
+      listOf("android-saf-provider-not-atomic"),
+      interruptedSafDestinationWarnings { true },
+    )
+    assertEquals(
+      listOf("android-saf-provider-not-atomic", "partial-destination-may-remain"),
+      interruptedSafDestinationWarnings { false },
+    )
+    assertEquals(
+      listOf("android-saf-provider-not-atomic", "partial-destination-may-remain"),
+      interruptedSafDestinationWarnings { error("provider lost permission") },
+    )
+  }
+
+  @Test
+  fun `destination recovery distinguishes picker restoration partial cleanup and terminal replay`() {
+    fun record(phase: SafDestinationPhase) = SafDestinationRecord(
+      requestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      exportId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      phase = phase,
+      destinationUri = if (phase == SafDestinationPhase.PICKING) {
+        null
+      } else {
+        "content://provider/document/42"
+      },
+      bytes = null,
+      code = null,
+      warningCodes = emptyList(),
+      updatedAtMillis = 1_000,
+    )
+
+    assertEquals(
+      SafDestinationRecoveryAction.WAIT_FOR_PICKER,
+      decideSafDestinationRecovery(record(SafDestinationPhase.PICKING), true, nowMillis = 1_000),
+    )
+    assertEquals(
+      SafDestinationRecoveryAction.FAIL_INTERRUPTED,
+      decideSafDestinationRecovery(record(SafDestinationPhase.PICKING), false, nowMillis = 1_000),
+    )
+    assertEquals(
+      SafDestinationRecoveryAction.CLEAN_PARTIAL,
+      decideSafDestinationRecovery(record(SafDestinationPhase.COPYING), true, nowMillis = 1_000),
+    )
+    assertEquals(
+      SafDestinationRecoveryAction.REPLAY_TERMINAL,
+      decideSafDestinationRecovery(record(SafDestinationPhase.SUCCEEDED), false, nowMillis = 1_000),
+    )
+    assertEquals(
+      SafDestinationRecoveryAction.FAIL_INTERRUPTED,
+      decideSafDestinationRecovery(
+        record(SafDestinationPhase.PICKING),
+        true,
+        nowMillis = 1_000 + DESTINATION_PICKER_STALE_MILLIS,
+      ),
+    )
+    assertEquals(
+      SafDestinationRecoveryAction.WAIT_FOR_PICKER,
+      decideSafDestinationRecovery(
+        record(SafDestinationPhase.CANCELLING).copy(destinationUri = null),
+        true,
+        nowMillis = 1_000,
+      ),
+    )
+    assertTrue(
+      isPendingSafDestinationPicker(
+        record(SafDestinationPhase.CANCELLING).copy(destinationUri = null),
+      ),
+    )
+    assertEquals(
+      SafDestinationRecoveryAction.FAIL_INTERRUPTED,
+      decideSafDestinationRecovery(
+        record(SafDestinationPhase.CANCELLING).copy(destinationUri = null),
+        true,
+        nowMillis = 1_000 + DESTINATION_PICKER_STALE_MILLIS,
+      ),
+    )
+
+    val cancelling = record(SafDestinationPhase.CANCELLING).copy(destinationUri = null)
+    val selectedAfterCancellation = selectedSafDestinationState(
+      cancelling,
+      cancelling.requestId,
+      "content://provider/document/43",
+      cancellationRequested = false,
+      nowMillis = 1_001,
+    )
+    assertEquals(SafDestinationPhase.CANCELLING, selectedAfterCancellation?.phase)
+
+    val expired = expiredSafDestinationState(
+      record(SafDestinationPhase.PICKING),
+      cancelling.requestId,
+      nowMillis = 1_000 + DESTINATION_PICKER_STALE_MILLIS,
+    )
+    assertEquals(SafDestinationPhase.FAILED, expired?.phase)
+    assertNull(
+      selectedSafDestinationState(
+        expired!!,
+        expired.requestId,
+        "content://provider/document/44",
+        cancellationRequested = false,
+        nowMillis = expired.updatedAtMillis + 1,
+      ),
+    )
+
+    val selected = selectedSafDestinationState(
+      record(SafDestinationPhase.PICKING),
+      cancelling.requestId,
+      "content://provider/document/45",
+      cancellationRequested = false,
+      nowMillis = 1_001,
+    )
+    assertEquals(SafDestinationPhase.COPYING, selected?.phase)
+    assertNull(
+      expiredSafDestinationState(
+        selected!!,
+        selected.requestId,
+        nowMillis = 1_000 + DESTINATION_PICKER_STALE_MILLIS,
+      ),
+    )
+  }
+
+  @Test
+  fun `destination slot admits exactly one concurrent picker start`() {
+    val slot = SafDestinationSlot()
+    val winners = AtomicInteger(0)
+    val starts = (0 until 16).map {
+      Thread {
+        if (slot.tryAcquire()) winners.incrementAndGet()
+      }
+    }
+
+    starts.forEach(Thread::start)
+    starts.forEach(Thread::join)
+
+    assertEquals(1, winners.get())
+    slot.release()
+    assertTrue(slot.tryAcquire())
   }
 
   @Test
@@ -216,7 +571,9 @@ class SafFileBridgeTest {
     outside.writeBytes(byteArrayOf(2))
 
     assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
+    assertEquals(source.canonicalFile, resolveManagedExportById(appData, id))
     assertNull(resolveManagedExportSource(appData, outside.path))
+    assertNull(resolveManagedExportById(appData, "99999999-9999-1999-8999-999999999999"))
     assertNull(resolveManagedExportSource(appData, exports.resolve("manual.risudat").path))
 
     exports.resolve("risusave-$id.lease").delete()
@@ -230,15 +587,47 @@ class SafFileBridgeTest {
     assertEquals("opened-file.risudat", safeSafDestinationName("///"))
   }
 
+  @Test
+  fun `destination terminal script keeps a replayable bounded result`() {
+    val script = androidSafDestinationScript(
+      requestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      state = "failed",
+      code = "destination-interrupted",
+      message = "copy interrupted",
+      warningCodes = listOf(
+        "android-saf-provider-not-atomic",
+        "partial-destination-may-remain",
+      ),
+    )
+
+    assertTrue(script.startsWith("window.tauriAndroidSafDestinationResult="))
+    assertTrue(script.contains("risu-android-saf-destination"))
+    assertFalse(script.contains("content://"))
+    assertFalse(script.contains("persistent/exports"))
+  }
+
   private fun ownedSpool(root: File, directoryToken: String, manifestToken: String, modifiedAt: Long) {
     val directory = root.resolve(directoryToken)
     directory.mkdirs()
     directory.resolve("source.risudat").writeBytes(byteArrayOf(1))
     directory.resolve("source.json").writeText(
-      "{\"token\":\"$manifestToken\",\"state\":\"copying\",\"display_name\":\"x\",\"bytes\":null,\"total_bytes\":null}",
+      "{\"token\":\"$manifestToken\",\"state\":\"copying\",\"displayName\":\"x\",\"bytes\":null,\"totalBytes\":null}",
+    )
+    directory.resolve("ownership.json").writeText(
+      "{\"format\":\"risunest-android-saf-spool\",\"version\":1," +
+        "\"token\":\"$manifestToken\",\"createdAtMillis\":$modifiedAt}",
     )
     directory.setLastModified(modifiedAt)
     directory.resolve("source.json").setLastModified(modifiedAt)
+  }
+
+  private val testAtomicPublisher = SafAtomicPublisher { temporary, target ->
+    Files.move(
+      temporary.toPath(),
+      target.toPath(),
+      StandardCopyOption.ATOMIC_MOVE,
+      StandardCopyOption.REPLACE_EXISTING,
+    )
   }
 
   private fun collectingOutput(destination: MutableList<Byte>) = object : java.io.OutputStream() {

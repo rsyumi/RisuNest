@@ -1,6 +1,7 @@
 import type { NativeFileJobSource } from './nativeFileJobs'
 
 const DESTINATION_EVENT = 'risu-android-saf-destination'
+const PROGRESS_EVENT = 'risu-android-saf-progress'
 
 export interface AndroidSpoolReady {
     token: string
@@ -15,6 +16,7 @@ export interface AndroidSpoolFailure {
 }
 
 export interface AndroidSpoolBatch {
+    requestId: string
     ready: AndroidSpoolReady[]
     failures: AndroidSpoolFailure[]
 }
@@ -46,6 +48,15 @@ export interface AndroidSafDestinationRequest {
     sourcePath: string
     suggestedName: string
     signal?: AbortSignal
+    onProgress?(progress: AndroidSafProgress): void
+}
+
+export interface AndroidSafProgress {
+    requestId: string
+    operation: 'source-copy' | 'destination-copy'
+    copiedBytes: number
+    totalBytes: number | null
+    token: string | null
 }
 
 export interface AndroidSafDestinationResult {
@@ -68,7 +79,11 @@ export interface AndroidSafJavascriptBridge {
         sourcePath: string,
         suggestedName: string,
     ): void
-    cancelExport?(requestId: string): void
+    cancelExport?(requestId: string): boolean | void
+    cancelSource?(requestId: string): void
+    getActiveSourceRequestIds?(): string
+    getExportStatus?(): string | null
+    acknowledgeExport?(requestId: string): boolean
 }
 
 export interface AndroidSafDestinationDependencies {
@@ -106,6 +121,43 @@ export class AndroidSafDestinationError extends Error {
     }
 }
 
+export function cancelAndroidSafSource(
+    requestId: string,
+    bridge: AndroidSafJavascriptBridge = productionBridge(),
+): void {
+    bridge.cancelSource?.(requestId)
+}
+
+export function getActiveAndroidSafSourceRequestIds(
+    bridge: AndroidSafJavascriptBridge = productionBridge(),
+): string[] {
+    const encoded = bridge.getActiveSourceRequestIds?.()
+    if (!encoded) return []
+    try {
+        const requestIds: unknown = JSON.parse(encoded)
+        if (!Array.isArray(requestIds)) return []
+        return requestIds.filter((value): value is string =>
+            typeof value === 'string'
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value))
+            .slice(0, 16)
+    }
+    catch {
+        return []
+    }
+}
+
+export function listenAndroidSafProgress(
+    listener: (progress: AndroidSafProgress) => void,
+    dependencies: Pick<AndroidSafDestinationDependencies, 'addEventListener' | 'removeEventListener'> = productionDependencies,
+): () => void {
+    const onProgress = (event: Event) => {
+        const detail = (event as CustomEvent<AndroidSafProgress>).detail
+        if (detail) listener(detail)
+    }
+    dependencies.addEventListener(PROGRESS_EVENT, onProgress)
+    return () => dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
+}
+
 export function copyNativeExportToAndroidSaf(
     request: AndroidSafDestinationRequest,
     dependencies: AndroidSafDestinationDependencies = productionDependencies,
@@ -119,6 +171,9 @@ export function copyNativeExportToAndroidSaf(
         const cleanup = () => {
             request.signal?.removeEventListener('abort', onAbort)
             dependencies.removeEventListener(DESTINATION_EVENT, onEvent)
+            if (request.onProgress) {
+                dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
+            }
         }
         const finish = (callback: () => void) => {
             if (settled) return
@@ -133,6 +188,7 @@ export function copyNativeExportToAndroidSaf(
         const onEvent = (event: Event) => {
             const detail = (event as CustomEvent<AndroidSafDestinationEvent>).detail
             if (!detail || detail.requestId !== requestId) return
+            dependencies.bridge.acknowledgeExport?.(requestId)
             if (detail.state === 'succeeded' && typeof detail.bytes === 'number') {
                 finish(() => resolve({
                     bytes: detail.bytes as number,
@@ -150,7 +206,19 @@ export function copyNativeExportToAndroidSaf(
                 detail.message ?? 'Android SAF destination copy failed',
             )))
         }
+        const onProgress = (event: Event) => {
+            const detail = (event as CustomEvent<AndroidSafProgress>).detail
+            if (
+                detail?.requestId === requestId &&
+                detail.operation === 'destination-copy'
+            ) {
+                request.onProgress?.(detail)
+            }
+        }
         dependencies.addEventListener(DESTINATION_EVENT, onEvent)
+        if (request.onProgress) {
+            dependencies.addEventListener(PROGRESS_EVENT, onProgress)
+        }
         request.signal?.addEventListener('abort', onAbort, { once: true })
         try {
             dependencies.bridge.copyExport(

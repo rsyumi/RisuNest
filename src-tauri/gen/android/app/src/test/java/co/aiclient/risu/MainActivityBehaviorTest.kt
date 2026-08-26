@@ -12,6 +12,49 @@ class MainActivityBehaviorTest {
   }
 
   @Test
+  fun `disabled SAF jobs retain the legacy tauri opened files contract`() {
+    assertEquals(
+      "window.tauriOpenedFiles=[\"C:\\\\opened\\u000afile.risudat\"];",
+      openedFilesScript(listOf("C:\\opened\nfile.risudat")),
+    )
+  }
+
+  @Test
+  fun `restored intent payload is consumed only once before asynchronous work`() {
+    var consumed = false
+    val marker = RestoredIntentConsumptionMarker(
+      isConsumed = { consumed },
+      markConsumed = { consumed = true },
+    )
+
+    assertEquals(true, marker.claim())
+    assertEquals(false, marker.claim())
+  }
+
+  @Test
+  fun `restored launch fingerprint identifies the same URI payload without mutable Intent extras`() {
+    val original = openedFileIntentFingerprint(
+      "android.intent.action.SEND_MULTIPLE",
+      listOf("content://provider/a", "content://provider/b"),
+    )
+
+    assertEquals(
+      original,
+      openedFileIntentFingerprint(
+        "android.intent.action.SEND_MULTIPLE",
+        listOf("content://provider/a", "content://provider/b"),
+      ),
+    )
+    assertEquals(
+      false,
+      original == openedFileIntentFingerprint(
+        "android.intent.action.SEND_MULTIPLE",
+        listOf("content://provider/b", "content://provider/a"),
+      ),
+    )
+  }
+
+  @Test
   fun `web view provider must meet the Vite 8 Chrome 111 baseline`() {
     assertEquals(
       WebViewProviderStatus.SUPPORTED,
@@ -279,9 +322,10 @@ class MainActivityBehaviorTest {
   }
 
   @Test
-  fun `opened file spool script escapes metadata and exposes tokens instead of paths`() {
+  fun `opened file spool script exposes the cancellable request and tokens instead of paths`() {
     val script = androidSpoolBatchScript(
-      SafSpoolBatch(
+      requestId = "request-1",
+      batch = SafSpoolBatch(
         ready = listOf(
           SafSpoolReady(
             token = "11111111-1111-4111-8111-111111111111",
@@ -295,9 +339,36 @@ class MainActivityBehaviorTest {
     )
 
     assertEquals(true, script.contains("window.tauriOpenedFileSpools="))
+    assertEquals(true, script.contains("\"requestId\":\"request-1\""))
     assertEquals(true, script.contains("11111111-1111-4111-8111-111111111111"))
     assertEquals(true, script.contains("a\\\"b\\\\c\\nd.risudat"))
     assertEquals(false, script.contains("/data/opened"))
+  }
+
+  @Test
+  fun `SAF progress script uses one bounded event shape for source and destination`() {
+    val source = androidSafProgressScript(
+      requestId = "source-1",
+      operation = "source-copy",
+      copiedBytes = 64,
+      totalBytes = null,
+      token = "11111111-1111-4111-8111-111111111111",
+    )
+    val destination = androidSafProgressScript(
+      requestId = "destination-1",
+      operation = "destination-copy",
+      copiedBytes = 128,
+      totalBytes = 256,
+      token = null,
+    )
+
+    assertEquals(true, source.contains("risu-android-saf-progress"))
+    assertEquals(true, source.contains("\"requestId\":\"source-1\""))
+    assertEquals(true, source.contains("\"operation\":\"source-copy\""))
+    assertEquals(true, source.contains("\"totalBytes\":null"))
+    assertEquals(true, destination.contains("\"operation\":\"destination-copy\""))
+    assertEquals(true, destination.contains("\"totalBytes\":256"))
+    assertEquals(true, destination.contains("\"token\":null"))
   }
 
   @Test
