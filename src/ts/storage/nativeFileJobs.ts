@@ -731,7 +731,7 @@ export async function prepareNativeContentImport(
         }
         catch {}
     }
-    const cancelAndDrain = async (): Promise<void> => {
+    const cancelAndDrain = async (reportStatus = true): Promise<void> => {
         if (!cancellationRequested) {
             cancellationRequested = true
             await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
@@ -740,67 +740,83 @@ export async function prepareNativeContentImport(
             const status = await invokeNative(dependencies, 'native_file_job_status', {
                 jobId: started.jobId,
             }) as NativeFileJobStatus
-            options.onStatus?.(status)
+            if (reportStatus) options.onStatus?.(status)
             if (isTerminalJob(status)) break
             await dependencies.wait(options.pollIntervalMs ?? 100)
         }
         await forgetBestEffort()
     }
 
-    while (true) {
-        if (options.signal?.aborted) {
-            await cancelAndDrain()
-            throw abortError()
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (options.signal?.aborted) {
-            if (isTerminalJob(status)) await forgetBestEffort()
-            else await cancelAndDrain()
-            throw abortError()
-        }
-        if (!isTerminalJob(status)) {
-            await dependencies.wait(options.pollIntervalMs ?? 100)
-            continue
-        }
-        if (status.state === 'cancelled') {
-            await forgetBestEffort()
-            throw abortError()
-        }
-        if (status.state === 'failed') {
-            const error = new NativeFileJobError(
-                status.error?.code ?? 'content-prepare-failed',
-                status.error?.message ?? 'Native content preparation failed',
-            )
-            await forgetBestEffort()
-            throw error
-        }
+    let lastStatus: NativeFileJobStatus | undefined
+    let cleanupAttempted = false
+    try {
+        while (true) {
+            if (options.signal?.aborted) {
+                await cancelAndDrain()
+                cleanupAttempted = true
+                throw abortError()
+            }
+            const status = await invokeNative(dependencies, 'native_file_job_status', {
+                jobId: started.jobId,
+            }) as NativeFileJobStatus
+            lastStatus = status
+            options.onStatus?.(status)
+            if (options.signal?.aborted) {
+                if (isTerminalJob(status)) await forgetBestEffort()
+                else await cancelAndDrain()
+                cleanupAttempted = true
+                throw abortError()
+            }
+            if (!isTerminalJob(status)) {
+                await dependencies.wait(options.pollIntervalMs ?? 100)
+                continue
+            }
+            if (status.state === 'cancelled') {
+                await forgetBestEffort()
+                cleanupAttempted = true
+                throw abortError()
+            }
+            if (status.state === 'failed') {
+                const error = new NativeFileJobError(
+                    status.error?.code ?? 'content-prepare-failed',
+                    status.error?.message ?? 'Native content preparation failed',
+                )
+                await forgetBestEffort()
+                cleanupAttempted = true
+                throw error
+            }
 
-        let content: PreparedNativeContent
-        try {
-            content = validatePreparedContent(status.preparedContent)
+            const content = validatePreparedContent(status.preparedContent)
+            let forgotten = false
+            const acknowledge = async (): Promise<void> => {
+                if (forgotten) return
+                await forget()
+                forgotten = true
+            }
+            return {
+                jobId: started.jobId,
+                content,
+                warningCodes: [...new Set([
+                    ...(started.warningCodes ?? []),
+                    ...(status.warningCodes ?? []),
+                ])].slice(0, 16),
+                confirmActivated: acknowledge,
+                cancel: acknowledge,
+            }
         }
-        catch (error) {
-            await forgetBestEffort()
-            throw error
+    }
+    catch (error) {
+        if (!cleanupAttempted) {
+            if (lastStatus && isTerminalJob(lastStatus)) {
+                await forgetBestEffort()
+            }
+            else {
+                try {
+                    await cancelAndDrain(false)
+                }
+                catch {}
+            }
         }
-        let forgotten = false
-        const acknowledge = async (): Promise<void> => {
-            if (forgotten) return
-            await forget()
-            forgotten = true
-        }
-        return {
-            jobId: started.jobId,
-            content,
-            warningCodes: [...new Set([
-                ...(started.warningCodes ?? []),
-                ...(status.warningCodes ?? []),
-            ])].slice(0, 16),
-            confirmActivated: acknowledge,
-            cancel: acknowledge,
-        }
+        throw error
     }
 }

@@ -131,6 +131,33 @@ describe('native prepared content import', () => {
         ])
     })
 
+    it('forgets a retained success when status reporting throws before returning the receipt', async () => {
+        const calls: string[] = []
+
+        await expect(prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
+            'card.json',
+            {
+                onStatus: () => { throw new Error('status callback failed') },
+            },
+            nativeDependencies(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', preparedContent)
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )).rejects.toThrow('status callback failed')
+
+        expect(calls).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+    })
+
     it('cancels, drains, and forgets when aborted before content is prepared', async () => {
         const controller = new AbortController()
         const calls: string[] = []
