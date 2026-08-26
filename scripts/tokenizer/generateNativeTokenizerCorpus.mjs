@@ -230,7 +230,7 @@ const corpus = JSON.stringify(
     2,
 )
 
-const fixturePath = 'src/ts/tokenizer/nativeTokenizerCorpus.json'
+const fixturePath = 'benchmarks/tokenizer/native-tokenizer-corpus.json'
 process.stdout.write(`*** Begin Patch\n*** Add File: ${fixturePath}\n`)
 for (const line of corpus.split('\n')) process.stdout.write(`+${line}\n`)
 process.stdout.write('*** End Patch\n')

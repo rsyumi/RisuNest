@@ -1,7 +1,7 @@
 import { Tiktoken } from '@dqbd/tiktoken'
 import cl100kBase from '@dqbd/tiktoken/encoders/cl100k_base.json'
 import o200kBase from '../../etc/o200k_base.json'
-import corpus from './nativeTokenizerCorpus.json'
+import corpus from '../../../benchmarks/tokenizer/native-tokenizer-corpus.json'
 import {
     invokeNativeTokenizerBatch,
     resolveNativeTokenizerRoute,

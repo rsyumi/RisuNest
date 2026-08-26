@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import corpus from '../../src/ts/tokenizer/nativeTokenizerCorpus.json' with { type: 'json' }
+import corpus from './native-tokenizer-corpus.json' with { type: 'json' }
 
 const CDP_HOST = '127.0.0.1'
 const TEMP_PREFIX = 'risunest-tokenizer-tauri-'

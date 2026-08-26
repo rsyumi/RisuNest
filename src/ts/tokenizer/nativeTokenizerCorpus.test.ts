@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import { Tiktoken } from '@dqbd/tiktoken'
 import cl100kBase from '@dqbd/tiktoken/encoders/cl100k_base.json'
 import o200kBase from '../../etc/o200k_base.json'
-import corpus from './nativeTokenizerCorpus.json'
+import corpus from '../../../benchmarks/tokenizer/native-tokenizer-corpus.json'
 import { NATIVE_TOKENIZER_FINGERPRINTS } from './nativeTokenizer'
 
 type TokenizerId = 'cl100k_base' | 'o200k_base'

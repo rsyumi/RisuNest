@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn successful_corpus_entries_have_exact_native_ids() {
         let corpus: Corpus = serde_json::from_str(include_str!(
-            "../../src/ts/tokenizer/nativeTokenizerCorpus.json"
+            "../../benchmarks/tokenizer/native-tokenizer-corpus.json"
         ))
         .expect("checked-in tokenizer corpus should parse");
 
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn special_token_errors_match_the_oracle_and_report_the_batch_index() {
         let corpus: Corpus = serde_json::from_str(include_str!(
-            "../../src/ts/tokenizer/nativeTokenizerCorpus.json"
+            "../../benchmarks/tokenizer/native-tokenizer-corpus.json"
         ))
         .expect("checked-in tokenizer corpus should parse");
 
