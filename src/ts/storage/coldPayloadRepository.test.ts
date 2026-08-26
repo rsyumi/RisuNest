@@ -3,10 +3,12 @@ import { RevisionConflictError } from './persistentDataStore'
 import type { ColdAlias, PersistentRoot } from './persistentDataStore'
 import { createCompleteColdPayloadStore } from './coldPayloadRepository'
 
+const INITIAL_HASH = '039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81'
+
 function alias(overrides: Partial<ColdAlias> = {}): ColdAlias {
     return {
         key: 'cold-1',
-        objectHash: 'ab'.repeat(32),
+        objectHash: INITIAL_HASH,
         size: 3,
         metadata: { source: 'fixture' },
         ...overrides,
@@ -97,14 +99,23 @@ describe('revisioned cold payload repository', () => {
 
     it('rejects a missing or wrong-sized immutable object without legacy rollback', async () => {
         const fixture = harness(alias())
-        fixture.objects.delete('ab'.repeat(32))
+        fixture.objects.delete(INITIAL_HASH)
         fixture.legacyValues.set('cold-1', Uint8Array.of(9, 9, 9))
 
         await expect(fixture.store.read('cold-1')).rejects.toThrow('immutable object is missing')
         expect(fixture.legacy.read).not.toHaveBeenCalled()
 
-        fixture.objects.set('ab'.repeat(32), Uint8Array.of(1))
+        fixture.objects.set(INITIAL_HASH, Uint8Array.of(1))
         await expect(fixture.store.read('cold-1')).rejects.toThrow('size mismatch')
+    })
+
+    it('rejects same-sized immutable object corruption without legacy rollback', async () => {
+        const fixture = harness(alias())
+        fixture.objects.set(INITIAL_HASH, Uint8Array.of(9, 9, 9))
+        fixture.legacyValues.set('cold-1', Uint8Array.of(1, 2, 3))
+
+        await expect(fixture.store.read('cold-1')).rejects.toThrow('hash mismatch')
+        expect(fixture.legacy.read).not.toHaveBeenCalled()
     })
 
     it('prepares owned bytes before publishing one alias and retains opaque metadata', async () => {
@@ -135,6 +146,28 @@ describe('revisioned cold payload repository', () => {
         expect(fixture.catalog.commitColdAlias).toHaveBeenCalledTimes(2)
     })
 
+    it('does not overwrite an alias concurrently created after an absent read', async () => {
+        const fixture = harness()
+        const concurrent = alias({ metadata: { owner: 'concurrent' } })
+        fixture.catalog.readColdAlias
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce({ revision: 5, value: concurrent })
+        fixture.catalog.readRoot
+            .mockResolvedValueOnce({ revision: 4, value: {} as PersistentRoot })
+            .mockResolvedValueOnce({ revision: 5, value: {} as PersistentRoot })
+        fixture.catalog.commitColdAlias
+            .mockRejectedValueOnce(new RevisionConflictError(4, 5))
+            .mockResolvedValueOnce({ revision: 6 })
+
+        await fixture.store.write('cold-1', Uint8Array.of(1, 2, 3))
+
+        expect(fixture.catalog.commitColdAlias).toHaveBeenCalledTimes(2)
+        expect(fixture.catalog.commitColdAlias).toHaveBeenLastCalledWith(
+            expect.objectContaining({ metadata: { owner: 'concurrent' } }),
+            5,
+        )
+    })
+
     it('lists and removes only revisioned aliases without enumerating or deleting payload files', async () => {
         const fixture = harness(alias())
 
@@ -143,7 +176,7 @@ describe('revisioned cold payload repository', () => {
         await fixture.store.remove('cold-1')
         expect(fixture.current()).toBeUndefined()
         expect(fixture.legacy.remove).not.toHaveBeenCalled()
-        expect(fixture.objects.get('ab'.repeat(32))).toEqual(Uint8Array.of(1, 2, 3))
+        expect(fixture.objects.get(INITIAL_HASH)).toEqual(Uint8Array.of(1, 2, 3))
     })
 
     it.each(['', 'nul\0key'])('rejects an invalid logical key %j before storage work', async (key) => {

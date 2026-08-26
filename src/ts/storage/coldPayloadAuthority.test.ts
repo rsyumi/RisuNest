@@ -4,6 +4,7 @@ import {
     parseColdPayloadAuthorityState,
     selectColdPayloadAuthority,
 } from './coldPayloadAuthority'
+import { validateColdAlias } from './persistentDataStore'
 
 function completeStore(): ColdPayloadStore {
     return {
@@ -110,5 +111,37 @@ describe('cold payload authority selection', () => {
             { format: 'legacy', migrationId: 'unexpected' } as never,
             { legacy: completeStore() },
         )).toThrow(TypeError)
+    })
+})
+
+describe('cold alias metadata', () => {
+    const validAlias = (metadata: Record<string, unknown>) => ({
+        key: 'cold',
+        objectHash: 'ab'.repeat(32),
+        size: 1,
+        metadata,
+    })
+
+    it('accepts recursively JSON-compatible metadata', () => {
+        expect(() => validateColdAlias(validAlias({
+            nested: [{ value: null }, true, 7, 'text'],
+        }))).not.toThrow()
+    })
+
+    it.each([
+        { date: new Date(0) },
+        { map: new Map() },
+        { value: undefined },
+        { value: BigInt(1) },
+        { value: Number.NaN },
+    ])('rejects metadata that cannot round-trip through native JSON %#', (metadata) => {
+        expect(() => validateColdAlias(validAlias(metadata))).toThrow(TypeError)
+    })
+
+    it('rejects cyclic metadata', () => {
+        const metadata: Record<string, unknown> = {}
+        metadata.self = metadata
+
+        expect(() => validateColdAlias(validAlias(metadata))).toThrow(TypeError)
     })
 })

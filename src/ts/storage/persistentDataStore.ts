@@ -48,6 +48,29 @@ export interface ColdPayloadMigrationInput {
     coldAliases: ColdAlias[]
 }
 
+function validateJsonValue(value: unknown, ancestors: Set<object>): void {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return
+    if (typeof value === 'number') {
+        if (Number.isFinite(value)) return
+        throw new TypeError('Cold alias metadata numbers must be finite')
+    }
+    if (typeof value !== 'object') {
+        throw new TypeError('Cold alias metadata must contain only JSON values')
+    }
+    const prototype = Object.getPrototypeOf(value)
+    if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError('Cold alias metadata objects must be plain JSON objects')
+    }
+    if (ancestors.has(value)) {
+        throw new TypeError('Cold alias metadata must not contain cycles')
+    }
+    ancestors.add(value)
+    for (const child of Array.isArray(value) ? value : Object.values(value)) {
+        validateJsonValue(child, ancestors)
+    }
+    ancestors.delete(value)
+}
+
 export function validateColdAlias(alias: ColdAlias): void {
     if (typeof alias.key !== 'string' || alias.key.length === 0 || alias.key.includes('\0')) {
         throw new TypeError('Cold alias key must be nonempty and contain no NUL characters')
@@ -61,6 +84,7 @@ export function validateColdAlias(alias: ColdAlias): void {
     if (alias.metadata === null || typeof alias.metadata !== 'object' || Array.isArray(alias.metadata)) {
         throw new TypeError('Cold alias metadata must be an object')
     }
+    validateJsonValue(alias.metadata, new Set())
 }
 
 export interface AssetAliasIdentity {

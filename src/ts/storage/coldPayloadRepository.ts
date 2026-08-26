@@ -1,5 +1,5 @@
 import type { ColdPayloadStore } from './coldPayloadStore'
-import type { ImmutablePayloadCas } from './payloadCas'
+import { hashPayloadBytes, type ImmutablePayloadCas } from './payloadCas'
 import {
     RevisionConflictError,
     validateColdAlias,
@@ -72,6 +72,9 @@ export function createCompleteColdPayloadStore(input: {
             if (data.byteLength !== alias.size) {
                 throw new Error(`Cold payload immutable object size mismatch for ${key}`)
             }
+            if (await hashPayloadBytes(data) !== alias.objectHash) {
+                throw new Error(`Cold payload immutable object hash mismatch for ${key}`)
+            }
             return data
         },
         async write(key, data) {
@@ -82,11 +85,12 @@ export function createCompleteColdPayloadStore(input: {
                 throw new Error(`Prepared cold payload size mismatch for ${key}`)
             }
             for (;;) {
+                const root = await input.catalog.readRoot()
                 const existing = validateVersionedAlias(
                     await input.catalog.readColdAlias(key),
                     key,
                 )
-                const revision = existing?.revision ?? (await input.catalog.readRoot()).revision
+                if (existing && existing.revision !== root.revision) continue
                 const alias: ColdAlias = {
                     key,
                     objectHash: prepared.contentHash,
@@ -95,7 +99,7 @@ export function createCompleteColdPayloadStore(input: {
                 }
                 validateColdAlias(alias)
                 try {
-                    await input.catalog.commitColdAlias(alias, revision)
+                    await input.catalog.commitColdAlias(alias, root.revision)
                     return
                 } catch (error) {
                     if (!(error instanceof RevisionConflictError)) throw error
