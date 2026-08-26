@@ -792,8 +792,8 @@ function preflightPreparedNativeCard(card: PreparedNativeCharacterCardMetadata, 
             else if(asset.uri.startsWith('embeded://')){
                 requirePreparedNativeAsset(asset.uri.slice('embeded://'.length), assetDict)
             }
-            else if(asset.uri === 'ccdefault:' && asset.type === 'icon' && asset.name === 'main' && !portraitLogicalId){
-                throw new Error('Prepared native main icon requires a portrait logical ID')
+            else if(asset.uri === 'ccdefault:' && !portraitLogicalId){
+                throw new Error('Prepared native ccdefault asset requires a portrait logical ID')
             }
         }
         return

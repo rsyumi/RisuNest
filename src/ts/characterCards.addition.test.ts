@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
         mocks.database.characters.push(character)
         return character.chaId
     }),
+    alertConfirm: vi.fn(),
     readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
     saveAsset: vi.fn(),
     compressImage: vi.fn(async (_data: Uint8Array) => new Uint8Array([99])),
@@ -31,7 +32,7 @@ vi.mock('./storage/database.svelte', () => ({
 }))
 vi.mock('./alert', () => ({
     alertCardExport: vi.fn(),
-    alertConfirm: vi.fn(),
+    alertConfirm: mocks.alertConfirm,
     alertError: vi.fn(),
     alertInput: vi.fn(),
     alertMd: vi.fn(),
@@ -139,6 +140,7 @@ describe('character card additions', () => {
         mocks.pngWrites = []
         mocks.downloads = []
         vi.clearAllMocks()
+        mocks.alertConfirm.mockResolvedValue(true)
         mocks.commitDetachedCharacter.mockImplementation(async (character, _reason) => {
             mocks.database.characters.push(character)
             return character.chaId
@@ -262,6 +264,25 @@ describe('character card additions', () => {
         expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
     })
 
+    it('returns false when prepared native low-level access is declined', async () => {
+        const card = JSON.parse(goldenCardJson)
+        card.data.extensions.risuai.lowLevelAccess = true
+        mocks.alertConfirm.mockResolvedValue(false)
+
+        const mapped = await mapPreparedNativeCharacterCard({
+            card,
+            assets: [
+                { token: 'assets/Portrait.JPEG', logicalId: 'asset://portrait' },
+                { token: 'assets/config.JSON', logicalId: 'asset://config' },
+            ],
+        })
+
+        expect(mapped).toBe(false)
+        expect(mocks.alertConfirm).toHaveBeenCalledOnce()
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+    })
+
     it('rejects prepared native v3 data URIs before payload work', async () => {
         const card = JSON.parse(goldenCardJson)
         card.data.assets[0].uri = 'data:image/png;base64,AA=='
@@ -271,6 +292,23 @@ describe('character card additions', () => {
             assets: [{ token: 'assets/config.JSON', logicalId: 'asset://config' }],
         })).rejects.toThrow(/data URI/i)
         expect(mocks.saveAsset).not.toHaveBeenCalled()
+    })
+
+    it('rejects non-main ccdefault assets without a prepared portrait', async () => {
+        const card = JSON.parse(goldenCardJson)
+        card.data.assets[0] = {
+            type: 'emotion',
+            uri: 'ccdefault:',
+            name: 'fallback',
+            ext: 'JPEG',
+        }
+
+        await expect(mapPreparedNativeCharacterCard({
+            card,
+            assets: [{ token: 'assets/config.JSON', logicalId: 'asset://config' }],
+        })).rejects.toThrow(/portrait logical ID/i)
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
     })
 
     it('rejects prepared native v2 inline base64 before payload work', async () => {
