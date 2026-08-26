@@ -38,7 +38,7 @@ pub(crate) struct NativeJobError {
 }
 
 impl NativeJobError {
-    fn new(code: &str, message: impl AsRef<str>) -> Self {
+    pub(crate) fn new(code: &str, message: impl AsRef<str>) -> Self {
         Self {
             code: code.to_owned(),
             message: bounded_message(message.as_ref()),
@@ -114,6 +114,13 @@ pub(crate) enum NativeFileJobStartRequest {
     PrepareContentImport {
         source: JobSource,
         display_name: String,
+    },
+    KeiBackupUpload {
+        lease: String,
+        expected_revision: i64,
+        url: String,
+        expected_account_id: String,
+        token: String,
     },
 }
 
@@ -790,6 +797,39 @@ impl NativeFileJobState {
                     "native content import is not active",
                 ));
             }
+            NativeFileJobStartRequest::KeiBackupUpload {
+                lease,
+                expected_revision,
+                url,
+                expected_account_id,
+                token,
+            } => {
+                #[cfg(feature = "native-kei-upload-pilot")]
+                {
+                    let prepared = crate::persistent_store::commands::with_store_mut(
+                        app.state(),
+                        |store| {
+                            store.prepare_kei_job_upload(
+                                &lease,
+                                expected_revision,
+                                &url,
+                                &expected_account_id,
+                                &token,
+                            )
+                        },
+                    )
+                    .map_err(native_store_error)?;
+                    NativeFileJobTask::KeiBackup { prepared }
+                }
+                #[cfg(not(feature = "native-kei-upload-pilot"))]
+                {
+                    let _ = (lease, expected_revision, url, expected_account_id, token);
+                    return Err(NativeJobError::new(
+                        "capability-unavailable",
+                        "native KEI backup jobs are not compiled in this build",
+                    ));
+                }
+            }
         };
         self.spawn(task, true)
     }
@@ -1021,6 +1061,10 @@ impl NativeFileJobState {
                 .and_then(|prepared| {
                     export::export_block_risu_save(prepared, &destination, omit_account, &job)
                 }),
+                #[cfg(feature = "native-kei-upload-pilot")]
+                NativeFileJobTask::KeiBackup { prepared } => {
+                    crate::persistent_store::kei::run_job(prepared, Arc::clone(&job))
+                }
             };
             let mut cleanup_errors = Vec::new();
             if let Err(error) =
@@ -1226,6 +1270,10 @@ enum NativeFileJobTask {
         omit_account: bool,
         app: AppHandle,
     },
+    #[cfg(feature = "native-kei-upload-pilot")]
+    KeiBackup {
+        prepared: crate::persistent_store::kei::PreparedKeiUpload,
+    },
 }
 
 impl NativeFileJobTask {
@@ -1233,6 +1281,8 @@ impl NativeFileJobTask {
         match self {
             Self::Restore { .. } => JobKind::RestoreBlockRisuSave,
             Self::Export { .. } => JobKind::ExportBlockRisuSave,
+            #[cfg(feature = "native-kei-upload-pilot")]
+            Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
         }
     }
 
@@ -1244,6 +1294,8 @@ impl NativeFileJobTask {
             | Self::Export {
                 expected_revision, ..
             } => *expected_revision,
+            #[cfg(feature = "native-kei-upload-pilot")]
+            Self::KeiBackup { prepared } => prepared.revision(),
         }
     }
 }
@@ -1467,6 +1519,7 @@ pub(crate) enum JobKind {
     RestoreBlockRisuSave,
     ExportBlockRisuSave,
     PrepareContentImport,
+    KeiBackupUpload,
 }
 
 #[allow(dead_code)]
@@ -1921,6 +1974,7 @@ impl JobControl {
             JobKind::RestoreBlockRisuSave => JobPhase::ReadingSource,
             JobKind::ExportBlockRisuSave => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,
+            JobKind::KeiBackupUpload => JobPhase::WritingExport,
         };
         if status.state != JobState::Queued || phase != expected {
             return Err("native job can only start from queued".to_owned());

@@ -15,9 +15,9 @@ const productionDependencies: NativeFileJobRecoveryDependencies = {
 export function shouldReconcileNativeFileJobs(
     isDesktop: boolean,
     isAndroid: boolean,
-    isAndroidSafEnabled: boolean,
+    _isAndroidSafEnabled: boolean,
 ): boolean {
-    return isDesktop || (isAndroid && isAndroidSafEnabled)
+    return isDesktop || isAndroid
 }
 
 function isTerminal(status: NativeFileJobStatus): boolean {
@@ -71,7 +71,7 @@ export async function reconcileNativeRestoresBeforeBootstrap(
     const jobs = await dependencies.invoke('native_file_job_list') as NativeFileJobStatus[]
     const pendingAcknowledgements: string[] = []
     for (const job of jobs) {
-        if (job.kind === 'export-block-risu-save') {
+        if (job.kind === 'export-block-risu-save' || job.kind === 'kei-backup-upload') {
             void reconcileExportInBackground(job, dependencies).catch((error) => {
                 console.error('Native export reconciliation failed', error)
             })

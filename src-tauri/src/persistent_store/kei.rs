@@ -2,15 +2,24 @@ use super::{
     checkpoint_after_detached_release, compare_plugin_storage_keys, RevisionReadLease, StoreError,
     StoreResult,
 };
+use crate::native_file_jobs::{
+    JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError,
+};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::{Body, Url};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -69,18 +78,22 @@ fn write_canonical_value(writer: &mut impl Write, value: &Value) -> StoreResult<
     Ok(())
 }
 
-pub(super) struct PreparedKeiUpload {
+pub(crate) struct PreparedKeiUpload {
     database_path: PathBuf,
     output_directory: PathBuf,
-    reader: RevisionReadLease,
+    reader: Option<RevisionReadLease>,
     revision: i64,
     url: Url,
+    expected_account_id: String,
     token: String,
 }
 
 pub(super) struct KeiPayloadFile {
     path: PathBuf,
     bytes: u64,
+    sha256: String,
+    character_count: u64,
+    preset_count: u64,
     armed: bool,
 }
 
@@ -116,24 +129,77 @@ pub(super) fn prepare_upload(
     expected_account_id: &str,
     token: &str,
 ) -> Result<PreparedKeiUpload, (StoreError, RevisionReadLease)> {
+    prepare_upload_inner(
+        snapshots_dir,
+        lease,
+        reader,
+        None,
+        url,
+        expected_account_id,
+        token,
+        true,
+    )
+}
+
+pub(super) fn prepare_job_upload(
+    snapshots_dir: &Path,
+    lease: &str,
+    reader: RevisionReadLease,
+    expected_revision: i64,
+    url: &str,
+    expected_account_id: &str,
+    token: &str,
+) -> Result<PreparedKeiUpload, (StoreError, RevisionReadLease)> {
+    prepare_upload_inner(
+        snapshots_dir,
+        lease,
+        reader,
+        Some(expected_revision),
+        url,
+        expected_account_id,
+        token,
+        false,
+    )
+}
+
+fn prepare_upload_inner(
+    snapshots_dir: &Path,
+    lease: &str,
+    reader: RevisionReadLease,
+    expected_revision: Option<i64>,
+    url: &str,
+    expected_account_id: &str,
+    token: &str,
+    validate_root: bool,
+) -> Result<PreparedKeiUpload, (StoreError, RevisionReadLease)> {
     let result = (|| -> StoreResult<(PathBuf, PathBuf, Url)> {
         if !lease.starts_with("snapshot-") {
             return Err(StoreError::Validation {
                 message: "revision lease must be a snapshot lease".to_owned(),
             });
         }
-        let root: String = reader
-            .connection
-            .query_row(
-                "SELECT value FROM root WHERE generation = ?1",
-                [&reader.target.generation],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::Validation {
-                message: "Pinned generation has no persistent root".to_owned(),
-            })?;
-        validate_account(&root, expected_account_id, token)?;
+        if let Some(expected_revision) = expected_revision {
+            if reader.target.revision != expected_revision {
+                return Err(StoreError::RevisionConflict {
+                    expected: expected_revision,
+                    actual: reader.target.revision,
+                });
+            }
+        }
+        if validate_root {
+            let root: String = reader
+                .connection
+                .query_row(
+                    "SELECT value FROM root WHERE generation = ?1",
+                    [&reader.target.generation],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| StoreError::Validation {
+                    message: "Pinned generation has no persistent root".to_owned(),
+                })?;
+            validate_account(&root, expected_account_id, token)?;
+        }
         let url = Url::parse(url).map_err(|_| StoreError::Validation {
             message: "KEI backup URL is invalid".to_owned(),
         })?;
@@ -157,8 +223,9 @@ pub(super) fn prepare_upload(
             database_path,
             output_directory,
             revision: reader.target.revision,
-            reader,
+            reader: Some(reader),
             url,
+            expected_account_id: expected_account_id.to_owned(),
             token: token.to_owned(),
         }),
         Err(error) => Err((error, reader)),
@@ -213,8 +280,32 @@ fn validate_account(root: &str, expected_account_id: &str, token: &str) -> Store
 }
 
 impl PreparedKeiUpload {
+    pub(crate) fn revision(&self) -> i64 {
+        self.revision
+    }
+
     pub(super) fn create_payload(&self) -> StoreResult<KeiPayloadFile> {
+        self.create_payload_controlled(|| false)
+    }
+
+    fn create_payload_controlled(
+        &self,
+        is_cancelled: impl Fn() -> bool,
+    ) -> StoreResult<KeiPayloadFile> {
         fs::create_dir_all(&self.output_directory)?;
+        let reader = self.reader.as_ref().ok_or(StoreError::SnapshotReleased)?;
+        let root: String = reader
+            .connection
+            .query_row(
+                "SELECT value FROM root WHERE generation = ?1",
+                [&reader.target.generation],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::Validation {
+                message: "Pinned generation has no persistent root".to_owned(),
+            })?;
+        validate_account(&root, &self.expected_account_id, &self.token)?;
         let path = self
             .output_directory
             .join(format!("kei-{}.json.tmp", Uuid::new_v4()));
@@ -223,31 +314,59 @@ impl PreparedKeiUpload {
             .create_new(true)
             .open(&path)?;
         let mut guard = PayloadOutputGuard::new(path.clone());
+        let mut writer = HashingWriter::new(CancellableWriter {
+            inner: &mut file,
+            is_cancelled,
+        });
         write_payload(
-            &self.reader.connection,
-            &self.reader.target.generation,
+            &reader.connection,
+            &reader.target.generation,
             &self.token,
-            &mut file,
+            &mut writer,
         )?;
+        let (bytes, sha256) = writer.finish();
         file.flush()?;
         file.sync_all()?;
         drop(file);
-        let bytes = fs::metadata(&path)?.len();
+        if fs::metadata(&path)?.len() != bytes {
+            return Err(StoreError::Store {
+                message: "KEI payload length changed after serialization".to_owned(),
+            });
+        }
+        let character_count = record_count(
+            &reader.connection,
+            "characters",
+            &reader.target.generation,
+        )?;
+        let preset_count = record_count(
+            &reader.connection,
+            "bot_presets",
+            &reader.target.generation,
+        )?;
         guard.disarm();
         Ok(KeiPayloadFile {
             path,
             bytes,
+            sha256,
+            character_count,
+            preset_count,
             armed: true,
         })
     }
 
-    pub(super) async fn upload(self) -> StoreResult<KeiUploadResult> {
+    fn release_reader(&mut self) -> StoreResult<()> {
+        let Some(reader) = self.reader.take() else {
+            return Ok(());
+        };
+        checkpoint_after_detached_release_after_close(&self.database_path, reader)
+    }
+
+    pub(super) async fn upload(mut self) -> StoreResult<KeiUploadResult> {
         let revision = self.revision;
         let url = self.url.clone();
         let payload = tokio::task::spawn_blocking(move || {
             let payload = self.create_payload();
-            let release =
-                checkpoint_after_detached_release_after_close(&self.database_path, self.reader);
+            let release = self.release_reader();
             match (payload, release) {
                 (Ok(payload), Ok(())) => Ok(payload),
                 (Err(error), _) => Err(error),
@@ -271,6 +390,278 @@ impl PreparedKeiUpload {
             bytes,
             status,
         })
+    }
+}
+
+impl Drop for PreparedKeiUpload {
+    fn drop(&mut self) {
+        let _ = self.release_reader();
+    }
+}
+
+pub(crate) fn run_job(
+    mut prepared: PreparedKeiUpload,
+    job: Arc<JobControl>,
+) -> Result<JobResultSummary, NativeJobError> {
+    if job.is_cancel_requested() {
+        return Err(cancelled("KEI backup cancelled before serialization"));
+    }
+    job.start(JobPhase::WritingExport).map_err(job_error)?;
+    let revision = prepared.revision;
+    let payload = prepared
+        .create_payload_controlled(|| job.is_cancel_requested())
+        .map_err(|error| {
+            if job.is_cancel_requested() {
+                cancelled("KEI backup cancelled during serialization")
+            } else {
+                store_error(error)
+            }
+        })?;
+    if let Err(error) = prepared.release_reader() {
+        return cleanup_job_payload(payload, Err(store_error(error)));
+    }
+    if job.is_cancel_requested() {
+        return cleanup_job_payload(
+            payload,
+            Err(cancelled("KEI backup cancelled before upload")),
+        );
+    }
+    job.set_phase(JobPhase::PublishingDestination)
+        .map_err(job_error)?;
+    job.set_progress(JobProgress {
+        completed_bytes: 0,
+        total_bytes: Some(payload.bytes),
+        completed_items: 1,
+        total_items: Some(2),
+    })
+    .map_err(job_error)?;
+
+    let upload = tauri::async_runtime::block_on(upload_payload_for_job(
+        &prepared.url,
+        &payload,
+        Arc::clone(&job),
+        Duration::from_secs(120),
+    ));
+    let outcome = match upload {
+        Ok(_) => {
+            if job.is_cancel_requested() {
+                Err(cancelled("KEI backup cancelled during upload"))
+            } else {
+                job.set_phase(JobPhase::FinalizingExport)
+                    .map_err(job_error)?;
+                job.set_progress(JobProgress {
+                    completed_bytes: payload.bytes,
+                    total_bytes: Some(payload.bytes),
+                    completed_items: 2,
+                    total_items: Some(2),
+                })
+                .map_err(job_error)?;
+                Ok(JobResultSummary {
+                    revision,
+                    source_bytes: payload.bytes,
+                    source_sha256: payload.sha256.clone(),
+                    character_count: payload.character_count,
+                    preset_count: payload.preset_count,
+                    warning_codes: Vec::new(),
+                })
+            }
+        }
+        Err(_) if job.is_cancel_requested() => {
+            Err(cancelled("KEI backup cancelled during upload"))
+        }
+        Err(error) => Err(store_error(error)),
+    };
+    cleanup_job_payload(payload, outcome)
+}
+
+fn cleanup_job_payload(
+    payload: KeiPayloadFile,
+    outcome: Result<JobResultSummary, NativeJobError>,
+) -> Result<JobResultSummary, NativeJobError> {
+    let cleanup = payload.cleanup();
+    match (outcome, cleanup) {
+        (Ok(mut result), Err(_)) => {
+            result.warning_codes.push("cleanup-failed".to_owned());
+            Ok(result)
+        }
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Err(cleanup)) => Err(NativeJobError::new(
+            "cleanup-failed",
+            format!("{}; KEI payload cleanup failed: {cleanup}", error.message),
+        )),
+        (Err(error), Ok(())) => Err(error),
+    }
+}
+
+async fn upload_payload_for_job(
+    url: &Url,
+    payload: &KeiPayloadFile,
+    job: Arc<JobControl>,
+    timeout: Duration,
+) -> StoreResult<u16> {
+    let file = tokio::fs::File::open(&payload.path).await?;
+    let body = Body::wrap_stream(ReaderStream::new(JobPayloadReader {
+        file,
+        job,
+        completed: 0,
+        total: payload.bytes,
+    }));
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|error| StoreError::Store {
+            message: format!("KEI backup HTTP client could not be created: {error}"),
+        })?;
+    let response = client
+        .post(url.clone())
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, payload.bytes)
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| {
+            let summary = if error.is_timeout() {
+                "KEI backup upload timed out"
+            } else if error.is_connect() {
+                "KEI backup endpoint is unavailable"
+            } else if error.is_body() {
+                "KEI backup payload could not be streamed"
+            } else {
+                "KEI backup upload failed"
+            };
+            StoreError::Store {
+                message: format!("{summary}: {error}"),
+            }
+        })?;
+    Ok(response.status().as_u16())
+}
+
+struct JobPayloadReader {
+    file: tokio::fs::File,
+    job: Arc<JobControl>,
+    completed: u64,
+    total: u64,
+}
+
+impl AsyncRead for JobPayloadReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.job.is_cancel_requested() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "KEI backup upload cancelled",
+            )));
+        }
+        let before = buffer.filled().len();
+        match Pin::new(&mut self.file).poll_read(context, buffer) {
+            Poll::Ready(Ok(())) => {
+                let read = buffer.filled().len().saturating_sub(before) as u64;
+                self.completed = self.completed.saturating_add(read);
+                if let Err(error) = self.job.set_progress(JobProgress {
+                    completed_bytes: self.completed,
+                    total_bytes: Some(self.total),
+                    completed_items: 1,
+                    total_items: Some(2),
+                }) {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, error)));
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+struct HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+    bytes: u64,
+}
+
+struct CancellableWriter<W, F> {
+    inner: W,
+    is_cancelled: F,
+}
+
+impl<W: Write, F: Fn() -> bool> Write for CancellableWriter<W, F> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if (self.is_cancelled)() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "KEI backup serialization cancelled",
+            ));
+        }
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if (self.is_cancelled)() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "KEI backup serialization cancelled",
+            ));
+        }
+        self.inner.flush()
+    }
+}
+
+impl<W> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, String) {
+        (self.bytes, hex::encode(self.hasher.finalize()))
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.hasher.update(&buffer[..written]);
+        self.bytes = self.bytes.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn record_count(connection: &Connection, table: &str, generation: &str) -> StoreResult<u64> {
+    let count = connection.query_row(
+        &format!("SELECT COUNT(*) FROM {table} WHERE generation = ?1"),
+        [generation],
+        |row| row.get::<_, i64>(0),
+    )?;
+    u64::try_from(count).map_err(|_| StoreError::Validation {
+        message: format!("Pinned {table} count is invalid"),
+    })
+}
+
+fn cancelled(message: &str) -> NativeJobError {
+    NativeJobError::new("cancelled", message)
+}
+
+fn job_error(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("job-error", message)
+}
+
+fn store_error(error: StoreError) -> NativeJobError {
+    match error {
+        StoreError::RevisionConflict { .. } => {
+            NativeJobError::new("revision-conflict", error.to_string())
+        }
+        StoreError::SnapshotReleased => NativeJobError::new("store-error", error.to_string()),
+        StoreError::Validation { .. } => NativeJobError::new("invalid-input", error.to_string()),
+        StoreError::Store { .. } => NativeJobError::new("transport-failed", error.to_string()),
     }
 }
 
@@ -639,7 +1030,8 @@ fn write_stored_value(writer: &mut impl Write, serialized: &str) -> StoreResult<
 
 #[cfg(test)]
 mod tests {
-    use super::write_canonical_value;
+    use super::{run_job, write_canonical_value};
+    use crate::native_file_jobs::{JobKind, JobPhase, JobRegistry};
     use crate::persistent_store::{AssetAlias, PersistentStore, WorkingSetCommit};
     use serde_json::json;
     use std::fs;
@@ -974,6 +1366,180 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "KEI account changed before the pinned backup"
+        );
+    }
+
+    #[test]
+    fn native_job_defers_root_validation_until_off_mutex_serialization() {
+        let (_directory, mut store, source_lease) = open_store_with_fixture();
+
+        let prepared = store
+            .prepare_kei_job_upload(
+                &source_lease,
+                1,
+                "http://127.0.0.1:9/autobackup/save",
+                "another-account",
+                "secret-token",
+            )
+            .expect("transfer reader without parsing the root");
+        let output_directory = prepared.output_directory.clone();
+
+        let error = prepared
+            .create_payload()
+            .err()
+            .expect("reject account mismatch during serialization");
+
+        assert_eq!(
+            error.to_string(),
+            "KEI account changed before the pinned backup"
+        );
+        assert!(
+            !output_directory.exists()
+                || fs::read_dir(output_directory)
+                    .expect("read upload directory")
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[test]
+    fn native_job_releases_its_reader_before_waiting_for_upload() {
+        let (_directory, mut store, source_lease) = open_store_with_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock endpoint");
+        let address = listener.local_addr().expect("mock address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let (respond_tx, respond_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                assert!(read > 0, "request ended before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8(request[..header_end].to_vec()).expect("headers");
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .expect("content length header");
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut buffer).expect("read body");
+                assert!(read > 0, "request ended before body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            request_tx
+                .send(request[header_end..header_end + content_length].to_vec())
+                .expect("send request body");
+            respond_rx.recv().expect("wait to release response");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write response");
+        });
+        let prepared = store
+            .prepare_kei_job_upload(
+                &source_lease,
+                1,
+                &format!("http://{address}/autobackup/save"),
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare job upload");
+        store
+            .release_revision(&source_lease)
+            .expect("release renderer handoff lease");
+        let mut root = store.read_root(None).expect("read current root").value;
+        root["z"] = json!({ "changed": true });
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root: Some(root),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                asset_owner_heads: None,
+                plugin_storage: None,
+            })
+            .expect("advance live revision");
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::KeiBackupUpload)
+            .expect("create job");
+        let job_for_worker = job.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            result_tx
+                .send(run_job(prepared, job_for_worker))
+                .expect("send job result");
+        });
+
+        let body = request_rx.recv().expect("receive request body");
+        assert_eq!(store.active_readers.active_count(), 0);
+        assert!(store
+            .active_readers
+            .detached_asset_roots()
+            .expect("read detached roots")
+            .is_empty());
+        respond_tx.send(()).expect("release response");
+        let result = result_rx
+            .recv()
+            .expect("receive job result")
+            .expect("run KEI job");
+        worker.join().expect("join job worker");
+        server.join().expect("join server");
+
+        assert_eq!(body, EXPECTED_PAYLOAD.as_bytes());
+        assert_eq!(result.revision, 1);
+        assert_eq!(result.source_bytes, body.len() as u64);
+        assert_eq!(result.source_sha256.len(), 64);
+        assert_eq!(result.character_count, 1);
+        assert_eq!(result.preset_count, 1);
+        assert_eq!(job.status().phase, JobPhase::FinalizingExport);
+    }
+
+    #[test]
+    fn cancelled_native_job_releases_its_reader_without_writing_a_payload() {
+        let (_directory, mut store, source_lease) = open_store_with_fixture();
+        let prepared = store
+            .prepare_kei_job_upload(
+                &source_lease,
+                1,
+                "http://127.0.0.1:9/autobackup/save",
+                "account-1",
+                "secret-token",
+            )
+            .expect("prepare job upload");
+        let output_directory = prepared.output_directory.clone();
+        store
+            .release_revision(&source_lease)
+            .expect("release renderer handoff lease");
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::KeiBackupUpload)
+            .expect("create job");
+        registry.cancel(&job.id()).expect("cancel job");
+
+        let error = run_job(prepared, job).expect_err("cancelled job must fail");
+
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(store.active_readers.active_count(), 0);
+        assert!(
+            !output_directory.exists()
+                || fs::read_dir(output_directory)
+                    .expect("read upload directory")
+                    .next()
+                    .is_none()
         );
     }
 

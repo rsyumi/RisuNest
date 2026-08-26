@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { nativePersistentRevisionLease } from '../storage/nativePersistentExport'
 import type { PersistentDataRuntime } from '../storage/persistentDataRuntime'
 import type { PersistentRevisionLease } from '../storage/persistentDataStore'
-import { tryNativeKeiBackup } from './nativeBackup'
+import { runNativeKeiBackupJob, tryNativeKeiBackup } from './nativeBackup'
 
 function nativeRuntime() {
     const release = vi.fn(async () => undefined)
@@ -159,5 +159,128 @@ describe('tryNativeKeiBackup', () => {
         ).rejects.toBe(uploadError)
 
         expect(harness.release).toHaveBeenCalledOnce()
+    })
+})
+
+describe('runNativeKeiBackupJob', () => {
+    it('starts a lease-owned job, releases the handoff lease, and waits for success', async () => {
+        const harness = nativeRuntime()
+        const invoke = vi.fn()
+            .mockResolvedValueOnce({ jobId: 'kei-job-1', warningCodes: [] })
+            .mockResolvedValueOnce({
+                jobId: 'kei-job-1',
+                kind: 'kei-backup-upload',
+                state: 'running',
+                phase: 'writing-export',
+                progress: {
+                    completedBytes: 10,
+                    completedItems: 1,
+                },
+            })
+            .mockResolvedValueOnce({
+                jobId: 'kei-job-1',
+                kind: 'kei-backup-upload',
+                state: 'succeeded',
+                phase: 'complete',
+                progress: {
+                    completedBytes: 20,
+                    totalBytes: 20,
+                    completedItems: 2,
+                    totalItems: 2,
+                },
+                result: {
+                    revision: 7,
+                    sourceBytes: 20,
+                    sourceSha256: 'a'.repeat(64),
+                    characterCount: 1,
+                    presetCount: 2,
+                    warningCodes: [],
+                },
+            })
+            .mockResolvedValueOnce(true)
+        const wait = vi.fn(async () => undefined)
+
+        await expect(runNativeKeiBackupJob(
+            {
+                runtime: harness.runtime,
+                url: 'https://kei.example/autobackup/save',
+                accountId: 'account-1',
+                token: 'secret-token',
+            },
+            { isTauri: () => true, invoke, wait },
+        )).resolves.toBe(true)
+
+        expect(harness.flushPendingData).toHaveBeenCalledWith('kei-auto-backup')
+        expect(invoke.mock.calls).toEqual([
+            ['native_file_job_start', {
+                request: {
+                    kind: 'kei-backup-upload',
+                    lease: 'lease-7',
+                    expectedRevision: 7,
+                    url: 'https://kei.example/autobackup/save',
+                    expectedAccountId: 'account-1',
+                    token: 'secret-token',
+                },
+            }],
+            ['native_file_job_status', { jobId: 'kei-job-1' }],
+            ['native_file_job_status', { jobId: 'kei-job-1' }],
+            ['native_file_job_forget', { jobId: 'kei-job-1' }],
+        ])
+        expect(harness.release).toHaveBeenCalledOnce()
+        expect(wait).toHaveBeenCalledOnce()
+    })
+
+    it('falls back only when native capability is unavailable before a job is accepted', async () => {
+        const harness = nativeRuntime()
+        const invoke = vi.fn().mockRejectedValueOnce({
+            code: 'capability-unavailable',
+            message: 'native jobs disabled',
+        })
+
+        await expect(runNativeKeiBackupJob(
+            {
+                runtime: harness.runtime,
+                url: 'https://kei.example/autobackup/save',
+                accountId: 'account-1',
+                token: 'secret-token',
+            },
+            { isTauri: () => true, invoke, wait: vi.fn() },
+        )).resolves.toBe(false)
+
+        expect(harness.release).toHaveBeenCalledOnce()
+    })
+
+    it('does not expose a fallback after an accepted job fails', async () => {
+        const harness = nativeRuntime()
+        const invoke = vi.fn()
+            .mockResolvedValueOnce({ jobId: 'kei-job-1', warningCodes: [] })
+            .mockResolvedValueOnce({
+                jobId: 'kei-job-1',
+                kind: 'kei-backup-upload',
+                state: 'failed',
+                phase: 'complete',
+                progress: { completedBytes: 10, completedItems: 1 },
+                error: { code: 'transport-failed', message: 'connection reset' },
+            })
+            .mockResolvedValueOnce(true)
+
+        await expect(runNativeKeiBackupJob(
+            {
+                runtime: harness.runtime,
+                url: 'https://kei.example/autobackup/save',
+                accountId: 'account-1',
+                token: 'secret-token',
+            },
+            { isTauri: () => true, invoke, wait: vi.fn() },
+        )).rejects.toMatchObject({
+            name: 'NativeKeiBackupJobError',
+            code: 'transport-failed',
+            message: 'connection reset',
+        })
+
+        expect(harness.release).toHaveBeenCalledOnce()
+        expect(invoke).toHaveBeenLastCalledWith('native_file_job_forget', {
+            jobId: 'kei-job-1',
+        })
     })
 })

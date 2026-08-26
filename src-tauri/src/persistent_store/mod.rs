@@ -2,7 +2,7 @@ pub(crate) mod commands;
 mod commit;
 pub(crate) mod export;
 #[cfg(feature = "native-kei-upload-pilot")]
-mod kei;
+pub(crate) mod kei;
 mod query;
 mod schema;
 mod snapshot;
@@ -1123,6 +1123,36 @@ impl PersistentStore {
             &self.snapshots_dir,
             lease,
             reader,
+            url,
+            expected_account_id,
+            token,
+        ) {
+            Ok(prepared) => Ok(prepared),
+            Err((error, reader)) => {
+                self.revision_leases.insert(lease.to_owned(), reader);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(feature = "native-kei-upload-pilot")]
+    pub(crate) fn prepare_kei_job_upload(
+        &mut self,
+        lease: &str,
+        expected_revision: i64,
+        url: &str,
+        expected_account_id: &str,
+        token: &str,
+    ) -> StoreResult<kei::PreparedKeiUpload> {
+        let reader = self
+            .revision_leases
+            .remove(lease)
+            .ok_or(StoreError::SnapshotReleased)?;
+        match kei::prepare_job_upload(
+            &self.snapshots_dir,
+            lease,
+            reader,
+            expected_revision,
             url,
             expected_account_id,
             token,

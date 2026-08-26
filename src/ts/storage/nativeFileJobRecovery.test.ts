@@ -30,10 +30,10 @@ function restoreStatus(
 }
 
 describe('native restore bootstrap reconciliation', () => {
-    it('reconciles persisted jobs on desktop and Android without widening to other targets', () => {
+    it('reconciles persisted jobs on every Tauri target without widening to web', () => {
         expect(shouldReconcileNativeFileJobs(true, false, false)).toBe(true)
         expect(shouldReconcileNativeFileJobs(false, true, true)).toBe(true)
-        expect(shouldReconcileNativeFileJobs(false, true, false)).toBe(false)
+        expect(shouldReconcileNativeFileJobs(false, true, false)).toBe(true)
         expect(shouldReconcileNativeFileJobs(false, false, true)).toBe(false)
     })
 
@@ -90,7 +90,10 @@ describe('native restore bootstrap reconciliation', () => {
         expect(forgotten).toEqual(['restore-failed'])
     })
 
-    it('returns without waiting for an active export and cleans it up in the background', async () => {
+    it.each([
+        ['export-block-risu-save', 'export-1'],
+        ['kei-backup-upload', 'kei-1'],
+    ] as const)('returns without waiting for an active %s job and cleans it up in the background', async (kind, jobId) => {
         let resumePolling!: () => void
         const pollingGate = new Promise<void>((resolve) => resumePolling = resolve)
         const calls: string[] = []
@@ -98,12 +101,12 @@ describe('native restore bootstrap reconciliation', () => {
             invoke: vi.fn(async (command: string) => {
                 calls.push(command)
                 if (command === 'native_file_job_list') return [{
-                    ...restoreStatus('export-1', 'running', 'writing-export'),
-                    kind: 'export-block-risu-save',
+                    ...restoreStatus(jobId, 'running', 'writing-export'),
+                    kind,
                 }]
                 if (command === 'native_file_job_status') return {
-                    ...restoreStatus('export-1', 'succeeded', 'complete'),
-                    kind: 'export-block-risu-save',
+                    ...restoreStatus(jobId, 'succeeded', 'complete'),
+                    kind,
                 }
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)

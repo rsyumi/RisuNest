@@ -26,7 +26,7 @@ export interface NativeFileJobResult {
 
 export interface NativeFileJobStatus {
     jobId: string
-    kind: 'restore-block-risu-save' | 'export-block-risu-save'
+    kind: 'restore-block-risu-save' | 'export-block-risu-save' | 'kei-backup-upload'
     expectedRevision?: number
     warningCodes?: string[]
     state: NativeFileJobState

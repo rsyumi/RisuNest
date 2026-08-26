@@ -5,7 +5,7 @@ let database: Partial<Database>
 let persistentDatabase: Partial<Database>
 const materializePersistentDatabaseSnapshot = vi.fn()
 const getPersistentDataRuntime = vi.fn()
-const tryNativeKeiBackup = vi.fn()
+const runNativeKeiBackupJob = vi.fn()
 
 vi.mock('../storage/database.svelte', () => ({
     getDatabase: () => database,
@@ -18,7 +18,7 @@ vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     getPersistentDataRuntime,
 }))
 vi.mock('./nativeBackup', () => ({
-    tryNativeKeiBackup,
+    runNativeKeiBackupJob,
 }))
 
 const fetchMock = vi.fn(async () => new Response(''))
@@ -48,7 +48,7 @@ describe('saveDbKei', () => {
         } as Partial<Database>
         materializePersistentDatabaseSnapshot.mockReset().mockResolvedValue(persistentDatabase)
         getPersistentDataRuntime.mockReset().mockReturnValue({ revision: 7 })
-        tryNativeKeiBackup.mockReset().mockResolvedValue(false)
+        runNativeKeiBackupJob.mockReset().mockResolvedValue(false)
     })
 
     afterEach(() => {
@@ -72,15 +72,46 @@ describe('saveDbKei', () => {
         })
     })
 
-    it('keeps the default backup route on the existing JavaScript implementation', async () => {
+    it('uses the native job without materializing the database when it is available', async () => {
         const saveDbKei = await loadSaveDbKei()
-        tryNativeKeiBackup.mockResolvedValueOnce(true)
+        runNativeKeiBackupJob.mockResolvedValueOnce(true)
 
         await saveDbKei()
 
-        expect(tryNativeKeiBackup).not.toHaveBeenCalled()
+        expect(runNativeKeiBackupJob).toHaveBeenCalledWith({
+            runtime: { revision: 7 },
+            url: 'https://kei.example/autobackup/save',
+            accountId: 'acc',
+            token: 'secret-token',
+        })
+        expect(materializePersistentDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    it('keeps the JavaScript backup as the pre-request capability fallback', async () => {
+        const saveDbKei = await loadSaveDbKei()
+
+        await saveDbKei()
+
+        expect(runNativeKeiBackupJob).toHaveBeenCalledOnce()
         expect(materializePersistentDatabaseSnapshot).toHaveBeenCalledWith('kei-auto-backup')
         expect(fetchMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not retry in JavaScript after an accepted native job fails', async () => {
+        const saveDbKei = await loadSaveDbKei()
+        const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        runNativeKeiBackupJob.mockRejectedValueOnce(new Error('native request failed'))
+
+        await saveDbKei()
+
+        expect(materializePersistentDatabaseSnapshot).not.toHaveBeenCalled()
+        expect(fetchMock).not.toHaveBeenCalled()
+        expect(consoleError).toHaveBeenCalledWith(
+            'Kei auto backup failed:',
+            expect.objectContaining({ message: 'native request failed' }),
+        )
+        consoleError.mockRestore()
     })
 
     it('does nothing without an account or with the kei flag off', async () => {
