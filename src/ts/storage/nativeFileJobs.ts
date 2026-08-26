@@ -31,6 +31,23 @@ export interface NativeFileJobResult {
     recoveryPath?: string
 }
 
+export interface PreparedContentAssetDescriptor {
+    referenceKey: string
+    token: string
+    logicalId: string
+    objectHash: string
+    byteSize: number
+    mime: string
+    name: string
+    ext: string
+}
+
+export interface PreparedNativeContent {
+    format: 'json-card'
+    metadata: Record<string, unknown>
+    assets: PreparedContentAssetDescriptor[]
+}
+
 export interface NativeFileJobStatus {
     jobId: string
     kind:
@@ -38,6 +55,7 @@ export interface NativeFileJobStatus {
         | 'export-block-risu-save'
         | 'restore-lossless-backup'
         | 'export-lossless-backup'
+        | 'prepare-content-import'
         | 'kei-backup-upload'
     expectedRevision?: number
     warningCodes?: string[]
@@ -45,6 +63,7 @@ export interface NativeFileJobStatus {
     phase:
         | 'queued'
         | 'reading-source'
+        | 'awaiting-content-mapping'
         | 'staging-database'
         | 'awaiting-activation'
         | 'activating-database'
@@ -59,6 +78,7 @@ export interface NativeFileJobStatus {
         totalItems?: number
     }
     result?: NativeFileJobResult
+    preparedContent?: PreparedNativeContent
     error?: {
         code: string
         message: string
@@ -83,6 +103,14 @@ export interface NativeFileJobOptions {
     signal?: AbortSignal
     pollIntervalMs?: number
     onStatus?(status: NativeFileJobStatus): void
+}
+
+export interface PreparedNativeContentReceipt {
+    readonly jobId: string
+    readonly content: PreparedNativeContent
+    readonly warningCodes: string[]
+    confirmActivated(): Promise<void>
+    cancel(): Promise<void>
 }
 
 export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
@@ -143,6 +171,104 @@ export class NativeFileJobActivationCommittedError extends NativeFileJobError {
 
 function abortError(): Error {
     return new DOMException('Native file job was cancelled', 'AbortError')
+}
+
+function isTerminalJob(status: NativeFileJobStatus): boolean {
+    return status.state === 'succeeded'
+        || status.state === 'failed'
+        || status.state === 'cancelled'
+}
+
+function preparedContentError(message: string): NativeFileJobError {
+    return new NativeFileJobError('invalid-prepared-content', message)
+}
+
+function requiredDescriptorString(
+    value: unknown,
+    field: keyof PreparedContentAssetDescriptor,
+): string {
+    if (typeof value !== 'string' || value.length === 0) {
+        throw preparedContentError(`Prepared content asset ${field} must be a nonempty string`)
+    }
+    return value
+}
+
+function validatePreparedContent(value: unknown): PreparedNativeContent {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw preparedContentError('Prepared content must be an object')
+    }
+    const content = value as Record<string, unknown>
+    if (content.format !== 'json-card') {
+        throw preparedContentError('Prepared content format is unsupported')
+    }
+    if (
+        typeof content.metadata !== 'object'
+        || content.metadata === null
+        || Array.isArray(content.metadata)
+    ) {
+        throw preparedContentError('Prepared content metadata must be an object')
+    }
+    if (!Array.isArray(content.assets)) {
+        throw preparedContentError('Prepared content assets must be an array')
+    }
+    const expectedFields = [
+        'referenceKey',
+        'token',
+        'logicalId',
+        'objectHash',
+        'byteSize',
+        'mime',
+        'name',
+        'ext',
+    ].sort()
+    const tokens = new Set<string>()
+    const assets = content.assets.map((value, index): PreparedContentAssetDescriptor => {
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+            throw preparedContentError(`Prepared content asset ${index} must be an object`)
+        }
+        const asset = value as Record<string, unknown>
+        if (Object.keys(asset).sort().join('\0') !== expectedFields.join('\0')) {
+            throw preparedContentError(`Prepared content asset ${index} fields are invalid`)
+        }
+        const objectHash = requiredDescriptorString(asset.objectHash, 'objectHash')
+        if (!/^[0-9a-f]{64}$/.test(objectHash)) {
+            throw preparedContentError(`Prepared content asset ${index} objectHash is invalid`)
+        }
+        if (!Number.isSafeInteger(asset.byteSize) || (asset.byteSize as number) < 0) {
+            throw preparedContentError(`Prepared content asset ${index} byteSize is invalid`)
+        }
+        const token = requiredDescriptorString(asset.token, 'token')
+        if (tokens.has(token)) {
+            throw preparedContentError(`Prepared content asset ${index} token is duplicated`)
+        }
+        tokens.add(token)
+        const ext = requiredDescriptorString(asset.ext, 'ext')
+        if (ext.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(ext)) {
+            throw preparedContentError(`Prepared content asset ${index} ext is invalid`)
+        }
+        const logicalId = requiredDescriptorString(asset.logicalId, 'logicalId')
+        if (logicalId !== `assets/${objectHash}.${ext}`) {
+            throw preparedContentError(`Prepared content asset ${index} logicalId does not match its object`)
+        }
+        if (typeof asset.name !== 'string') {
+            throw preparedContentError(`Prepared content asset ${index} name must be a string`)
+        }
+        return {
+            referenceKey: requiredDescriptorString(asset.referenceKey, 'referenceKey'),
+            token,
+            logicalId,
+            objectHash,
+            byteSize: asset.byteSize as number,
+            mime: requiredDescriptorString(asset.mime, 'mime'),
+            name: asset.name,
+            ext,
+        }
+    })
+    return {
+        format: 'json-card',
+        metadata: content.metadata as Record<string, unknown>,
+        assets,
+    }
 }
 
 async function invokeNative(
@@ -572,6 +698,109 @@ export async function runNativeLosslessBackupExport(
                 ]
             }
             else if (!outcomeFailed) throw error
+        }
+    }
+}
+
+export async function prepareNativeContentImport(
+    source: NativeFileJobSource,
+    displayName: string,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<PreparedNativeContentReceipt> {
+    if (!dependencies.isTauri()) {
+        throw new Error('Native content preparation requires Tauri')
+    }
+    if (options.signal?.aborted) throw abortError()
+
+    const started = await invokeNative(dependencies, 'native_file_job_start', {
+        request: {
+            kind: 'prepare-content-import',
+            source,
+            displayName,
+        },
+    }) as { jobId: string; warningCodes?: string[] }
+    let cancellationRequested = false
+
+    const forget = async (): Promise<void> => {
+        await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
+    }
+    const forgetBestEffort = async (): Promise<void> => {
+        try {
+            await forget()
+        }
+        catch {}
+    }
+    const cancelAndDrain = async (): Promise<void> => {
+        if (!cancellationRequested) {
+            cancellationRequested = true
+            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
+        }
+        while (true) {
+            const status = await invokeNative(dependencies, 'native_file_job_status', {
+                jobId: started.jobId,
+            }) as NativeFileJobStatus
+            options.onStatus?.(status)
+            if (isTerminalJob(status)) break
+            await dependencies.wait(options.pollIntervalMs ?? 100)
+        }
+        await forgetBestEffort()
+    }
+
+    while (true) {
+        if (options.signal?.aborted) {
+            await cancelAndDrain()
+            throw abortError()
+        }
+        const status = await invokeNative(dependencies, 'native_file_job_status', {
+            jobId: started.jobId,
+        }) as NativeFileJobStatus
+        options.onStatus?.(status)
+        if (options.signal?.aborted) {
+            if (isTerminalJob(status)) await forgetBestEffort()
+            else await cancelAndDrain()
+            throw abortError()
+        }
+        if (!isTerminalJob(status)) {
+            await dependencies.wait(options.pollIntervalMs ?? 100)
+            continue
+        }
+        if (status.state === 'cancelled') {
+            await forgetBestEffort()
+            throw abortError()
+        }
+        if (status.state === 'failed') {
+            const error = new NativeFileJobError(
+                status.error?.code ?? 'content-prepare-failed',
+                status.error?.message ?? 'Native content preparation failed',
+            )
+            await forgetBestEffort()
+            throw error
+        }
+
+        let content: PreparedNativeContent
+        try {
+            content = validatePreparedContent(status.preparedContent)
+        }
+        catch (error) {
+            await forgetBestEffort()
+            throw error
+        }
+        let forgotten = false
+        const acknowledge = async (): Promise<void> => {
+            if (forgotten) return
+            await forget()
+            forgotten = true
+        }
+        return {
+            jobId: started.jobId,
+            content,
+            warningCodes: [...new Set([
+                ...(started.warningCodes ?? []),
+                ...(status.warningCodes ?? []),
+            ])].slice(0, 16),
+            confirmActivated: acknowledge,
+            cancel: acknowledge,
         }
     }
 }

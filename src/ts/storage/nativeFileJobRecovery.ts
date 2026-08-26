@@ -74,12 +74,33 @@ async function reconcileExportInBackground(
     }
 }
 
+async function discardContentJob(
+    initial: NativeFileJobStatus,
+    dependencies: NativeFileJobRecoveryDependencies,
+): Promise<void> {
+    let status = initial
+    if (!isTerminal(status)) {
+        await dependencies.invoke('native_file_job_cancel', { jobId: status.jobId })
+        do {
+            status = await dependencies.invoke('native_file_job_status', {
+                jobId: status.jobId,
+            }) as NativeFileJobStatus
+            if (!isTerminal(status)) await dependencies.wait(100)
+        } while (!isTerminal(status))
+    }
+    await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
+}
+
 export async function reconcileNativeRestoresBeforeBootstrap(
     dependencies: NativeFileJobRecoveryDependencies = productionDependencies,
 ): Promise<string[]> {
     const jobs = await dependencies.invoke('native_file_job_list') as NativeFileJobStatus[]
     const pendingAcknowledgements: string[] = []
     for (const job of jobs) {
+        if (job.kind === 'prepare-content-import') {
+            await discardContentJob(job, dependencies)
+            continue
+        }
         if (
             job.kind === 'export-block-risu-save'
             || job.kind === 'export-lossless-backup'

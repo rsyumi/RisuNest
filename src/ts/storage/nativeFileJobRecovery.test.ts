@@ -90,6 +90,55 @@ describe('native restore bootstrap reconciliation', () => {
         expect(forgotten).toEqual(['restore-failed'])
     })
 
+    it('cancels and drains a nonterminal content preparation without restore finalization', async () => {
+        const calls: string[] = []
+        const pending = await reconcileNativeRestoresBeforeBootstrap({
+            invoke: vi.fn(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('content-1', 'waitingForInput', 'awaiting-content-mapping'),
+                    kind: 'prepare-content-import' as const,
+                }]
+                if (command === 'native_file_job_cancel') return 'requested'
+                if (command === 'native_file_job_status') return {
+                    ...restoreStatus('content-1', 'cancelled', 'complete'),
+                    kind: 'prepare-content-import' as const,
+                }
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        })
+
+        expect(pending).toEqual([])
+        expect(calls).toEqual([
+            'native_file_job_list',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+        expect(calls).not.toContain('native_file_job_finalize')
+    })
+
+    it('forgets terminal content jobs without adding restore acknowledgement', async () => {
+        const calls: string[] = []
+        const pending = await reconcileNativeRestoresBeforeBootstrap({
+            invoke: vi.fn(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('content-1', 'failed', 'complete'),
+                    kind: 'prepare-content-import' as const,
+                }]
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        })
+
+        expect(pending).toEqual([])
+        expect(calls).toEqual(['native_file_job_list', 'native_file_job_forget'])
+    })
+
     it.each([
         ['export-block-risu-save', 'export-1'],
         ['kei-backup-upload', 'kei-1'],
