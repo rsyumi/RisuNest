@@ -32,11 +32,15 @@
     const sourceEnabled = $derived(!!(
         capabilities?.productionEnabled
         && capabilities.sourceReady
+        && capabilities.losslessBackupReady
+        && capabilities.httpTransportReady
         && capabilities.largeFixturePassed
     ))
     const targetEnabled = $derived(!!(
         capabilities?.productionEnabled
         && capabilities.atomicActivationReady
+        && capabilities.losslessBackupReady
+        && capabilities.httpTransportReady
         && capabilities.largeFixturePassed
     ))
     const progressMaximum = $derived(cloneState.target.totalBytes ?? Math.max(1, cloneState.target.completedBytes))

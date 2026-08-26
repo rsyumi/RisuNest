@@ -59,6 +59,8 @@ describe('PeerClone facade', () => {
                 desktop: true,
                 sourceReady: true,
                 atomicActivationReady: true,
+                losslessBackupReady: true,
+                httpTransportReady: true,
                 largeFixturePassed: true,
                 productionEnabled: true,
             }
@@ -89,6 +91,8 @@ describe('PeerClone facade', () => {
             desktop: true,
             sourceReady: false,
             atomicActivationReady: false,
+            losslessBackupReady: false,
+            httpTransportReady: false,
             largeFixturePassed: false,
             productionEnabled: false,
         } as T))
@@ -104,6 +108,30 @@ describe('PeerClone facade', () => {
         expect(invoke.mock.calls).toEqual([
             ['peer_clone_capabilities'],
             ['peer_clone_capabilities'],
+            ['peer_clone_capabilities'],
+            ['peer_clone_capabilities'],
+        ])
+    })
+
+    it.each([
+        { name: 'lossless backup', losslessBackupReady: false, httpTransportReady: true },
+        { name: 'HTTP transport', losslessBackupReady: true, httpTransportReady: false },
+    ])('does not trust productionEnabled when the $name gate is closed', async ({ name: _name, ...gate }) => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(): Promise<T> => ({
+            desktop: true,
+            sourceReady: true,
+            atomicActivationReady: true,
+            largeFixturePassed: true,
+            productionEnabled: true,
+            ...gate,
+        } as T))
+        const facade = createPeerCloneFacade({ platform: 'desktop', invoke: invoke as unknown as PeerCloneInvoke })
+
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+        await expect(facade.prepare()).rejects.toThrow('not enabled')
+        await expect(facade.download()).rejects.toThrow('not enabled')
+        expect(invoke.mock.calls).toEqual([
             ['peer_clone_capabilities'],
             ['peer_clone_capabilities'],
         ])

@@ -545,6 +545,72 @@ fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
 }
 
 #[test]
+fn lan_object_routes_only_serve_exact_manifest_chunk_boundaries() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[CLONE_CHUNK_SIZE as usize + 1]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let base = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let client = Client::new();
+    let claim: Value = client
+        .post(format!("{base}/v1/sessions/{}/claim", pairing.session_id))
+        .json(&json!({"claim": pairing.claim}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let bearer = claim["bearer"].as_str().unwrap();
+    let object = host.manifest().payloads[0].object.clone();
+    let object_url = format!("{base}/v1/sessions/{}/objects/{object}", pairing.session_id);
+
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth(bearer)
+            .header("range", format!("bytes=0-{}", CLONE_CHUNK_SIZE - 1))
+            .send()
+            .unwrap()
+            .status(),
+        206
+    );
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth(bearer)
+            .header(
+                "range",
+                format!("bytes={}-{}", CLONE_CHUNK_SIZE, CLONE_CHUNK_SIZE),
+            )
+            .send()
+            .unwrap()
+            .status(),
+        206
+    );
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth(bearer)
+            .header("range", format!("bytes=1-{}", CLONE_CHUNK_SIZE - 1))
+            .send()
+            .unwrap()
+            .status(),
+        416
+    );
+    assert_eq!(
+        client
+            .get(&object_url)
+            .bearer_auth(bearer)
+            .header("range", "bytes=0-0,2-3")
+            .send()
+            .unwrap()
+            .status(),
+        416
+    );
+    host.stop().unwrap();
+}
+
+#[test]
 fn lan_client_claims_without_putting_secret_in_request_urls_and_authenticates_reads() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();

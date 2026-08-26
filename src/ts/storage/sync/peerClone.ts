@@ -47,6 +47,8 @@ export interface PeerCloneNativeCapabilities {
     desktop: true
     sourceReady: boolean
     atomicActivationReady: boolean
+    losslessBackupReady: boolean
+    httpTransportReady: boolean
     largeFixturePassed: boolean
     productionEnabled: boolean
 }
@@ -259,13 +261,25 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     }
     const requireSourceReady = async () => {
         const current = await capabilities()
-        if (!current.productionEnabled || !current.sourceReady || !current.largeFixturePassed) {
+        if (
+            !current.productionEnabled
+            || !current.sourceReady
+            || !current.losslessBackupReady
+            || !current.httpTransportReady
+            || !current.largeFixturePassed
+        ) {
             throw new Error('Peer clone source is not enabled by native production gates')
         }
     }
     const requireTargetReady = async () => {
         const current = await capabilities()
-        if (!current.productionEnabled || !current.atomicActivationReady || !current.largeFixturePassed) {
+        if (
+            !current.productionEnabled
+            || !current.atomicActivationReady
+            || !current.losslessBackupReady
+            || !current.httpTransportReady
+            || !current.largeFixturePassed
+        ) {
             throw new Error('Peer clone target is not enabled by native production gates')
         }
     }
