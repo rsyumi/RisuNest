@@ -557,6 +557,12 @@ export async function loadPlugins() {
     await applyPluginLoad({ nextProfile, pluginV2, pluginV3 })
 }
 
+export async function loadPluginsAfterAuthoritativeRestore() {
+    const db = getDatabase()
+    pluginCompatibility.initialize(selectPluginCompatibilityProfile(db.plugins ?? []))
+    await loadPlugins()
+}
+
 function loadPluginsFromV2(): Promise<void> {
     return pluginLoadReentrancy.settle(loadPlugins())
 }

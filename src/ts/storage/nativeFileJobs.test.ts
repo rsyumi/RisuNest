@@ -25,11 +25,41 @@ function status(
     }
 }
 
+function restoreRuntime(
+    revision: number,
+    options: {
+        capture?: () => void | Promise<void>
+        refresh?: (revision: number) => void | Promise<void>
+        acquire?: () => void | Promise<void>
+        release?: () => void
+    } = {},
+) {
+    return {
+        capturePersistentMutationToken: async () => {
+            await options.capture?.()
+            return { revision, mutationGeneration: 1 }
+        },
+        acquireDestructiveReplacementFence: async () => {
+            await options.acquire?.()
+            return {
+                refreshCommittedWorkingSet: async (committedRevision: number) => {
+                    await options.refresh?.(committedRevision)
+                },
+                release: () => options.release?.(),
+            }
+        },
+    }
+}
+
 describe('native file jobs', () => {
     it('restores from a descriptor without sending file or database bytes through IPC', async () => {
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
         const statuses = [
             status('running'),
+            {
+                ...status('waitingForInput'),
+                phase: 'awaiting-activation' as const,
+            },
             status('succeeded', {
                 revision: 4,
                 sourceBytes: 128,
@@ -40,15 +70,14 @@ describe('native file jobs', () => {
             }),
         ]
         const refreshed: number[] = []
-        const runtime = {
-            revision: 3,
-            flushPendingData: async (reason: string) => {
-                calls.push([`flush:${reason}`, undefined])
+        const runtime = restoreRuntime(3, {
+            capture: () => {
+                calls.push(['capture:native-block-risu-save-restore', undefined])
             },
-            refreshActiveWorkingSet: async (revision: number) => {
+            refresh: (revision) => {
                 refreshed.push(revision)
             },
-        }
+        })
 
         const result = await runNativeBlockRisuSaveRestore(
             runtime,
@@ -62,6 +91,7 @@ describe('native file jobs', () => {
                         return { jobId: 'job-1', warningCodes: ['cleanup-failed'] }
                     }
                     if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_finalize') return 'requested'
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -73,7 +103,7 @@ describe('native file jobs', () => {
         expect(result.warningCodes).toEqual(['cleanup-failed'])
         expect(refreshed).toEqual([4])
         expect(calls).toEqual([
-            ['flush:native-block-risu-save-restore', undefined],
+            ['capture:native-block-risu-save-restore', undefined],
             ['native_file_job_start', {
                 request: {
                     kind: 'restore-block-risu-save',
@@ -82,6 +112,8 @@ describe('native file jobs', () => {
                 },
             }],
             ['native_file_job_status', { jobId: 'job-1' }],
+            ['native_file_job_status', { jobId: 'job-1' }],
+            ['native_file_job_finalize', { jobId: 'job-1' }],
             ['native_file_job_status', { jobId: 'job-1' }],
             ['native_file_job_forget', { jobId: 'job-1' }],
         ])
@@ -94,13 +126,11 @@ describe('native file jobs', () => {
         const commands: string[] = []
         let statusCount = 0
         const promise = runNativeBlockRisuSaveRestore(
-            {
-                revision: 7,
-                flushPendingData: async () => undefined,
-                refreshActiveWorkingSet: async () => {
+            restoreRuntime(7, {
+                refresh: () => {
                     throw new Error('cancelled restore must not refresh')
                 },
-            },
+            }),
             { type: 'androidSpool', token: '2c4d33fe-2e29-4625-bb1e-c8d1084f9557' },
             { signal: controller.signal },
             {
@@ -137,11 +167,7 @@ describe('native file jobs', () => {
         const commands: string[] = []
 
         await expect(runNativeBlockRisuSaveRestore(
-            {
-                revision: 2,
-                flushPendingData: async () => controller.abort(),
-                refreshActiveWorkingSet: async () => undefined,
-            },
+            restoreRuntime(2, { capture: () => controller.abort() }),
             { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
             { signal: controller.signal },
             {
@@ -156,8 +182,107 @@ describe('native file jobs', () => {
         expect(commands).toEqual([])
     })
 
-    it('forgets a committed job and exposes recovery state when refreshing fails', async () => {
+    it('cancels staged data instead of activating when a live edit invalidates the token', async () => {
         const commands: string[] = []
+        const statuses = [
+            { ...status('waitingForInput'), phase: 'awaiting-activation' as const },
+            status('cancelled'),
+        ]
+
+        await expect(runNativeBlockRisuSaveRestore(
+            restoreRuntime(3, {
+                acquire: () => {
+                    throw new Error('mutation generation changed')
+                },
+            }),
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            undefined,
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_cancel') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )).rejects.toMatchObject({ code: 'revision-conflict' })
+
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_file_job_cancel',
+            'native_file_job_status',
+            'native_file_job_forget',
+        ])
+        expect(commands).not.toContain('native_file_job_finalize')
+    })
+
+    it('holds the replacement fence through refresh, plugin reload, and acknowledgement', async () => {
+        const events: string[] = []
+        const observedPhases: string[] = []
+        let statusCount = 0
+        const committed = {
+            revision: 9,
+            sourceBytes: 128,
+            sourceSha256: 'f'.repeat(64),
+            characterCount: 1,
+            presetCount: 0,
+            warningCodes: [],
+        }
+
+        await runNativeBlockRisuSaveRestore(
+            restoreRuntime(8, {
+                acquire: () => { events.push('fence-acquired') },
+                refresh: () => { events.push('working-set-refreshed') },
+                release: () => events.push('fence-released'),
+            }),
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
+            {
+                afterRefresh: () => { events.push('plugins-reloaded') },
+                onStatus: (status) => observedPhases.push(status.phase),
+            },
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    if (command === 'native_file_job_start') return { jobId: 'job-1' }
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        return statusCount === 1
+                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
+                            : status('succeeded', committed)
+                    }
+                    if (command === 'native_file_job_finalize') {
+                        events.push('native-finalized')
+                        return 'requested'
+                    }
+                    if (command === 'native_file_job_forget') {
+                        events.push('terminal-acknowledged')
+                        return true
+                    }
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(events).toEqual([
+            'fence-acquired',
+            'native-finalized',
+            'working-set-refreshed',
+            'plugins-reloaded',
+            'terminal-acknowledged',
+            'fence-released',
+        ])
+        expect(observedPhases).toContain('activating-database')
+    })
+
+    it('retains a committed job and exposes recovery state when refreshing fails', async () => {
+        const commands: string[] = []
+        let statusCount = 0
         const committed = {
             revision: 9,
             sourceBytes: 128,
@@ -168,13 +293,11 @@ describe('native file jobs', () => {
         }
 
         const promise = runNativeBlockRisuSaveRestore(
-            {
-                revision: 8,
-                flushPendingData: async () => undefined,
-                refreshActiveWorkingSet: async () => {
+            restoreRuntime(8, {
+                refresh: () => {
                     throw new Error('refresh unavailable')
                 },
-            },
+            }),
             { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
             undefined,
             {
@@ -182,7 +305,13 @@ describe('native file jobs', () => {
                 invoke: async (command) => {
                     commands.push(command)
                     if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                    if (command === 'native_file_job_status') return status('succeeded', committed)
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        return statusCount === 1
+                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
+                            : status('succeeded', committed)
+                    }
+                    if (command === 'native_file_job_finalize') return 'requested'
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -199,12 +328,14 @@ describe('native file jobs', () => {
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
-            'native_file_job_forget',
+            'native_file_job_finalize',
+            'native_file_job_status',
         ])
     })
 
     it('keeps committed success when terminal acknowledgement fails', async () => {
         const commands: string[] = []
+        let statusCount = 0
         const committed = {
             revision: 9,
             sourceBytes: 128,
@@ -215,11 +346,7 @@ describe('native file jobs', () => {
         }
 
         const result = await runNativeBlockRisuSaveRestore(
-            {
-                revision: 8,
-                flushPendingData: async () => undefined,
-                refreshActiveWorkingSet: async () => undefined,
-            },
+            restoreRuntime(8),
             { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
             undefined,
             {
@@ -227,7 +354,13 @@ describe('native file jobs', () => {
                 invoke: async (command) => {
                     commands.push(command)
                     if (command === 'native_file_job_start') return { jobId: 'job-1' }
-                    if (command === 'native_file_job_status') return status('succeeded', committed)
+                    if (command === 'native_file_job_status') {
+                        statusCount++
+                        return statusCount === 1
+                            ? { ...status('waitingForInput'), phase: 'awaiting-activation' }
+                            : status('succeeded', committed)
+                    }
+                    if (command === 'native_file_job_finalize') return 'requested'
                     if (command === 'native_file_job_forget') {
                         throw { code: 'store-error', message: 'terminal acknowledgement failed' }
                     }
@@ -244,6 +377,8 @@ describe('native file jobs', () => {
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
+            'native_file_job_finalize',
+            'native_file_job_status',
             'native_file_job_forget',
         ])
     })
@@ -254,11 +389,7 @@ describe('native file jobs', () => {
         failed.error = { code: 'corrupt-input', message: 'invalid gzip data' }
 
         await expect(runNativeBlockRisuSaveRestore(
-            {
-                revision: 3,
-                flushPendingData: async () => undefined,
-                refreshActiveWorkingSet: async () => undefined,
-            },
+            restoreRuntime(3),
             { type: 'desktopPath', path: 'C:\\chosen\\backup.risudat' },
             undefined,
             {
@@ -278,11 +409,7 @@ describe('native file jobs', () => {
 
     it('preserves structured native command errors at the facade boundary', async () => {
         await expect(runNativeBlockRisuSaveRestore(
-            {
-                revision: 1,
-                flushPendingData: async () => undefined,
-                refreshActiveWorkingSet: async () => undefined,
-            },
+            restoreRuntime(1),
             { type: 'desktopPath', path: 'C:\\missing\\backup.risudat' },
             undefined,
             {

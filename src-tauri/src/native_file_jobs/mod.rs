@@ -3,11 +3,11 @@ pub mod charx;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
@@ -98,33 +98,69 @@ pub(crate) struct NativeFileJobStarted {
     pub(crate) warning_codes: Vec<String>,
 }
 
-fn resolve_source(job_root: &Path, source: &JobSource) -> Result<PathBuf, NativeJobError> {
+#[derive(Debug)]
+pub(crate) struct OpenedJobSource {
+    pub(crate) file: File,
+    pub(crate) total_bytes: u64,
+}
+
+fn open_regular_file_no_follow(path: &Path) -> Result<OpenedJobSource, NativeJobError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|error| {
+        invalid_source_error(format!(
+            "source cannot be opened without following links: {error}"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        invalid_source_error(format!("source metadata is unavailable: {error}"))
+    })?;
+    #[cfg(windows)]
+    let is_reparse_point = {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(windows))]
+    let is_reparse_point = false;
+    if metadata.file_type().is_symlink() || is_reparse_point || !metadata.is_file() {
+        return Err(invalid_source_error("source must be a regular file"));
+    }
+    Ok(OpenedJobSource {
+        file,
+        total_bytes: metadata.len(),
+    })
+}
+
+pub(crate) fn open_job_source(
+    job_root: &Path,
+    source: &JobSource,
+) -> Result<OpenedJobSource, NativeJobError> {
     match source {
         JobSource::DesktopPath { path } => {
-            let path = Path::new(path).canonicalize().map_err(|error| {
-                NativeJobError::new(
-                    "invalid-source",
-                    format!("desktop source is unavailable: {error}"),
-                )
-            })?;
-            if !path
-                .metadata()
-                .map_err(|error| {
-                    NativeJobError::new(
-                        "invalid-source",
-                        format!("desktop source metadata is unavailable: {error}"),
-                    )
-                })?
-                .is_file()
-            {
-                return Err(NativeJobError::new(
-                    "invalid-source",
-                    "desktop source must be a regular file",
+            let path = Path::new(path);
+            if !path.is_absolute() || path.file_name().is_none() {
+                return Err(invalid_source_error(
+                    "desktop source must be an absolute file path",
                 ));
             }
-            Ok(path)
+            open_regular_file_no_follow(path)
         }
-        JobSource::AndroidSpool { token } => resolve_spool_source(job_root, token),
+        JobSource::AndroidSpool { token } => {
+            let path = resolve_spool_source(job_root, token)?;
+            open_regular_file_no_follow(&path)
+        }
     }
 }
 
@@ -434,9 +470,9 @@ impl NativeFileJobState {
                 source,
                 expected_revision,
             } => {
-                let source_path = resolve_source(&self.root, &source)?;
+                let opened_source = open_job_source(&self.root, &source)?;
                 NativeFileJobTask::Restore {
-                    source_path,
+                    opened_source,
                     source,
                     expected_revision,
                     sink: RestoreJobSink::Persistent(app),
@@ -468,7 +504,7 @@ impl NativeFileJobState {
                 }
             }
         };
-        self.spawn(task)
+        self.spawn(task, true)
     }
 
     #[cfg(test)]
@@ -487,22 +523,39 @@ impl NativeFileJobState {
                 "test replacement sink only supports restore jobs",
             ));
         };
-        let source_path = resolve_source(&self.root, &source)?;
-        self.spawn(NativeFileJobTask::Restore {
-            source_path,
-            source,
-            expected_revision,
-            sink: RestoreJobSink::Test(sink),
-        })
+        let opened_source = open_job_source(&self.root, &source)?;
+        self.spawn(
+            NativeFileJobTask::Restore {
+                opened_source,
+                source,
+                expected_revision,
+                sink: RestoreJobSink::Test(sink),
+            },
+            false,
+        )
     }
 
-    fn spawn(&self, task: NativeFileJobTask) -> Result<NativeFileJobStarted, NativeJobError> {
+    fn spawn(
+        &self,
+        task: NativeFileJobTask,
+        require_restore_finalization: bool,
+    ) -> Result<NativeFileJobStarted, NativeJobError> {
         let worker_permit =
             WorkerPermit::acquire(Arc::clone(&self.active_workers), self.max_concurrent_jobs)?;
         let kind = task.kind();
+        let warning_codes = self
+            .startup_warnings
+            .iter()
+            .map(|warning| warning.code.clone())
+            .collect::<Vec<_>>();
         let job = self
             .registry
-            .create(kind)
+            .create_internal(
+                kind,
+                Some(task.expected_revision()),
+                warning_codes.clone(),
+                require_restore_finalization && kind == JobKind::RestoreBlockRisuSave,
+            )
             .map_err(|error| NativeJobError::new("store-error", error))?;
         let job_id = job.id();
         let owned_directory = match create_owned_directory(&self.root.join("jobs"), &job_id) {
@@ -520,20 +573,20 @@ impl NativeFileJobState {
             let cleanup_source = task.cleanup_source();
             let outcome = match task {
                 NativeFileJobTask::Restore {
-                    source_path,
+                    opened_source,
                     expected_revision,
                     sink,
                     ..
                 } => match sink {
                     RestoreJobSink::Persistent(app) => restore::restore_block_risu_save(
-                        &source_path,
+                        opened_source,
                         expected_revision,
                         &job,
                         &PersistentReplacementSink { app },
                     ),
                     #[cfg(test)]
                     RestoreJobSink::Test(sink) => restore::restore_block_risu_save(
-                        &source_path,
+                        opened_source,
                         expected_revision,
                         &job,
                         sink.as_ref(),
@@ -595,17 +648,25 @@ impl NativeFileJobState {
         });
         Ok(NativeFileJobStarted {
             job_id,
-            warning_codes: self
-                .startup_warnings
-                .iter()
-                .map(|warning| warning.code.clone())
-                .collect(),
+            warning_codes,
         })
     }
 
     pub(crate) fn status(&self, job_id: &str) -> Result<JobStatus, NativeJobError> {
         self.registry
             .status(job_id)
+            .map_err(|error| NativeJobError::new("store-error", error))
+    }
+
+    pub(crate) fn list(&self) -> Result<Vec<JobStatus>, NativeJobError> {
+        self.registry
+            .list()
+            .map_err(|error| NativeJobError::new("store-error", error))
+    }
+
+    pub(crate) fn finalize(&self, job_id: &str) -> Result<FinalizeOutcome, NativeJobError> {
+        self.registry
+            .finalize(job_id)
             .map_err(|error| NativeJobError::new("store-error", error))
     }
 
@@ -630,7 +691,7 @@ enum RestoreJobSink {
 
 enum NativeFileJobTask {
     Restore {
-        source_path: PathBuf,
+        opened_source: OpenedJobSource,
         source: JobSource,
         expected_revision: i64,
         sink: RestoreJobSink,
@@ -648,6 +709,17 @@ impl NativeFileJobTask {
         match self {
             Self::Restore { .. } => JobKind::RestoreBlockRisuSave,
             Self::Export { .. } => JobKind::ExportBlockRisuSave,
+        }
+    }
+
+    fn expected_revision(&self) -> i64 {
+        match self {
+            Self::Restore {
+                expected_revision, ..
+            }
+            | Self::Export {
+                expected_revision, ..
+            } => *expected_revision,
         }
     }
 
@@ -869,6 +941,21 @@ pub(crate) fn native_file_job_status(
 }
 
 #[tauri::command(async)]
+pub(crate) fn native_file_job_list(
+    state: State<'_, NativeFileJobState>,
+) -> Result<Vec<JobStatus>, NativeJobError> {
+    state.list()
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_file_job_finalize(
+    state: State<'_, NativeFileJobState>,
+    job_id: String,
+) -> Result<FinalizeOutcome, NativeJobError> {
+    state.finalize(&job_id)
+}
+
+#[tauri::command(async)]
 pub(crate) fn native_file_job_cancel(
     state: State<'_, NativeFileJobState>,
     job_id: String,
@@ -910,6 +997,7 @@ pub(crate) enum JobPhase {
     Queued,
     ReadingSource,
     StagingDatabase,
+    AwaitingActivation,
     ActivatingDatabase,
     WritingExport,
     PublishingDestination,
@@ -934,6 +1022,9 @@ pub(crate) struct JobStatus {
     pub(crate) state: JobState,
     pub(crate) phase: JobPhase,
     pub(crate) progress: JobProgress,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expected_revision: Option<i64>,
+    pub(crate) warning_codes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) result: Option<JobResultSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -968,6 +1059,16 @@ pub(crate) enum CancelOutcome {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum FinalizeOutcome {
+    Requested,
+    AlreadyRequested,
+    TooEarly,
+    Terminal,
+    Missing,
+}
+
 pub(crate) struct JobRegistry {
     jobs: Mutex<HashMap<String, Arc<JobControl>>>,
     max_terminal_jobs: usize,
@@ -989,11 +1090,41 @@ impl JobRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn create(&self, kind: JobKind) -> Result<Arc<JobControl>, String> {
+        self.create_internal(kind, None, Vec::new(), false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_with_context(
+        &self,
+        kind: JobKind,
+        expected_revision: Option<i64>,
+        warning_codes: Vec<String>,
+    ) -> Result<Arc<JobControl>, String> {
+        self.create_internal(
+            kind,
+            expected_revision,
+            warning_codes,
+            kind == JobKind::RestoreBlockRisuSave,
+        )
+    }
+
+    fn create_internal(
+        &self,
+        kind: JobKind,
+        expected_revision: Option<i64>,
+        warning_codes: Vec<String>,
+        requires_restore_finalization: bool,
+    ) -> Result<Arc<JobControl>, String> {
         self.prune()?;
+        validate_warning_codes(&warning_codes)?;
         let id = Uuid::new_v4().to_string();
         let job = Arc::new(JobControl {
             cancel_requested: AtomicBool::new(false),
+            requires_restore_finalization,
+            restore_finalized: Mutex::new(false),
+            restore_finalization_changed: Condvar::new(),
             terminal_at: Mutex::new(None),
             status: Mutex::new(JobStatus {
                 job_id: id.clone(),
@@ -1001,6 +1132,8 @@ impl JobRegistry {
                 state: JobState::Queued,
                 phase: JobPhase::Queued,
                 progress: JobProgress::default(),
+                expected_revision,
+                warning_codes,
                 result: None,
                 error: None,
             }),
@@ -1010,6 +1143,20 @@ impl JobRegistry {
             .map_err(|error| format!("native job registry mutex poisoned: {error}"))?
             .insert(id, Arc::clone(&job));
         Ok(job)
+    }
+
+    pub(crate) fn list(&self) -> Result<Vec<JobStatus>, String> {
+        self.prune()?;
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|error| format!("native job registry mutex poisoned: {error}"))?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut statuses = jobs.into_iter().map(|job| job.status()).collect::<Vec<_>>();
+        statuses.sort_by(|left, right| left.job_id.cmp(&right.job_id));
+        Ok(statuses)
     }
 
     pub(crate) fn status(&self, id: &str) -> Result<JobStatus, String> {
@@ -1026,6 +1173,14 @@ impl JobRegistry {
             return Ok(CancelOutcome::Missing);
         };
         job.request_cancel()
+    }
+
+    pub(crate) fn finalize(&self, id: &str) -> Result<FinalizeOutcome, String> {
+        self.prune()?;
+        let Some(job) = self.lookup(id)? else {
+            return Ok(FinalizeOutcome::Missing);
+        };
+        job.request_finalize()
     }
 
     pub(crate) fn forget(&self, id: &str) -> Result<bool, String> {
@@ -1080,6 +1235,9 @@ impl JobRegistry {
 
 pub(crate) struct JobControl {
     cancel_requested: AtomicBool,
+    requires_restore_finalization: bool,
+    restore_finalized: Mutex<bool>,
+    restore_finalization_changed: Condvar,
     terminal_at: Mutex<Option<Instant>>,
     status: Mutex<JobStatus>,
 }
@@ -1118,7 +1276,90 @@ impl JobControl {
             return Ok(CancelOutcome::AlreadyRequested);
         }
         status.state = JobState::Cancelling;
+        drop(status);
+        self.restore_finalization_changed.notify_all();
         Ok(CancelOutcome::Requested)
+    }
+
+    fn request_finalize(&self) -> Result<FinalizeOutcome, String> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        if status.state.is_terminal() {
+            return Ok(FinalizeOutcome::Terminal);
+        }
+        if status.kind != JobKind::RestoreBlockRisuSave {
+            return Ok(FinalizeOutcome::TooEarly);
+        }
+        if matches!(
+            status.phase,
+            JobPhase::ActivatingDatabase | JobPhase::Complete
+        ) {
+            return Ok(FinalizeOutcome::AlreadyRequested);
+        }
+        if status.state != JobState::WaitingForInput || status.phase != JobPhase::AwaitingActivation
+        {
+            return Ok(FinalizeOutcome::TooEarly);
+        }
+        if self.cancel_requested.load(Ordering::Acquire) {
+            return Ok(FinalizeOutcome::TooEarly);
+        }
+        let mut finalized = self
+            .restore_finalized
+            .lock()
+            .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?;
+        if *finalized {
+            return Ok(FinalizeOutcome::AlreadyRequested);
+        }
+        *finalized = true;
+        status.state = JobState::Running;
+        status.phase = JobPhase::ActivatingDatabase;
+        drop(finalized);
+        drop(status);
+        self.restore_finalization_changed.notify_all();
+        Ok(FinalizeOutcome::Requested)
+    }
+
+    pub(crate) fn wait_for_restore_finalization(&self) -> Result<(), String> {
+        {
+            let mut status = self
+                .status
+                .lock()
+                .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+            if status.kind != JobKind::RestoreBlockRisuSave
+                || status.state != JobState::Running
+                || status.phase != JobPhase::StagingDatabase
+            {
+                return Err("native restore cannot activate from its current state".to_owned());
+            }
+            if self.cancel_requested.load(Ordering::Acquire) {
+                return Err("native restore was cancelled before activation".to_owned());
+            }
+            if !self.requires_restore_finalization {
+                status.phase = JobPhase::ActivatingDatabase;
+                return Ok(());
+            }
+            status.state = JobState::WaitingForInput;
+            status.phase = JobPhase::AwaitingActivation;
+        }
+
+        let mut finalized = self
+            .restore_finalized
+            .lock()
+            .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?;
+        loop {
+            if self.cancel_requested.load(Ordering::Acquire) {
+                return Err("native restore was cancelled before activation".to_owned());
+            }
+            if *finalized {
+                return Ok(());
+            }
+            finalized = self
+                .restore_finalization_changed
+                .wait(finalized)
+                .map_err(|error| format!("native restore finalization mutex poisoned: {error}"))?;
+        }
     }
 
     pub(crate) fn start(&self, phase: JobPhase) -> Result<(), String> {
@@ -1199,7 +1440,15 @@ impl JobControl {
         Ok(())
     }
 
-    pub(crate) fn finish_success(&self, result: JobResultSummary) -> Result<(), String> {
+    pub(crate) fn finish_success(&self, mut result: JobResultSummary) -> Result<(), String> {
+        validate_result(&result)?;
+        let context_warnings = self.status().warning_codes;
+        for warning in context_warnings {
+            if !result.warning_codes.contains(&warning) {
+                result.warning_codes.push(warning);
+            }
+        }
+        result.warning_codes.truncate(MAX_WARNING_CODES);
         validate_result(&result)?;
         let mut status = self
             .status
@@ -1258,9 +1507,7 @@ impl JobControl {
 }
 
 fn validate_result(result: &JobResultSummary) -> Result<(), String> {
-    if result.warning_codes.len() > MAX_WARNING_CODES {
-        return Err("native job result has too many warning codes".to_owned());
-    }
+    validate_warning_codes(&result.warning_codes)?;
     if result.source_sha256.len() != 64
         || !result
             .source_sha256
@@ -1269,12 +1516,18 @@ fn validate_result(result: &JobResultSummary) -> Result<(), String> {
     {
         return Err("native job result has an invalid source hash".to_owned());
     }
-    if result
-        .warning_codes
+    Ok(())
+}
+
+fn validate_warning_codes(warning_codes: &[String]) -> Result<(), String> {
+    if warning_codes.len() > MAX_WARNING_CODES {
+        return Err("native job has too many warning codes".to_owned());
+    }
+    if warning_codes
         .iter()
         .any(|code| code.is_empty() || code.len() > MAX_CODE_BYTES)
     {
-        return Err("native job result has an invalid warning code".to_owned());
+        return Err("native job has an invalid warning code".to_owned());
     }
     Ok(())
 }
@@ -1303,8 +1556,9 @@ impl JobPhase {
             Self::Queued => 0,
             Self::ReadingSource | Self::WritingExport => 1,
             Self::StagingDatabase | Self::PublishingDestination => 2,
-            Self::ActivatingDatabase | Self::FinalizingExport => 3,
-            Self::Complete => 4,
+            Self::AwaitingActivation | Self::FinalizingExport => 3,
+            Self::ActivatingDatabase => 4,
+            Self::Complete => 5,
         }
     }
 }
@@ -1357,6 +1611,92 @@ mod tests {
         assert_eq!(status.state, JobState::Running);
         assert_eq!(status.phase, JobPhase::ReadingSource);
         assert_eq!(status.progress.completed_bytes, 8);
+    }
+
+    #[test]
+    fn registry_lists_active_and_terminal_jobs_without_a_known_job_id() {
+        let registry = JobRegistry::default();
+        let active = registry
+            .create_with_context(
+                JobKind::RestoreBlockRisuSave,
+                Some(7),
+                vec!["cleanup-failed".to_owned()],
+            )
+            .unwrap();
+        active.start(JobPhase::ReadingSource).unwrap();
+        let terminal = registry
+            .create_with_context(JobKind::ExportBlockRisuSave, Some(8), Vec::new())
+            .unwrap();
+        terminal.start(JobPhase::WritingExport).unwrap();
+        terminal.finish_success(result(8)).unwrap();
+
+        let listed = registry.list().unwrap();
+
+        assert_eq!(listed.len(), 2);
+        let mut expected_ids = vec![active.id(), terminal.id()];
+        expected_ids.sort();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|status| status.job_id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids,
+        );
+        let restore = listed
+            .iter()
+            .find(|status| status.job_id == active.id())
+            .unwrap();
+        assert_eq!(restore.expected_revision, Some(7));
+        assert_eq!(restore.warning_codes, vec!["cleanup-failed"]);
+        assert_eq!(restore.state, JobState::Running);
+        assert_eq!(
+            listed
+                .iter()
+                .find(|status| status.job_id == terminal.id())
+                .unwrap()
+                .state,
+            JobState::Succeeded,
+        );
+    }
+
+    #[test]
+    fn restore_waits_for_explicit_finalize_and_cancel_wakes_the_waiter() {
+        let registry = Arc::new(JobRegistry::default());
+        let job = registry
+            .create_with_context(JobKind::RestoreBlockRisuSave, Some(3), Vec::new())
+            .unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        job.set_phase(JobPhase::StagingDatabase).unwrap();
+        let waiter = Arc::clone(&job);
+        let waited = std::thread::spawn(move || waiter.wait_for_restore_finalization());
+
+        while job.status().state != JobState::WaitingForInput {
+            std::thread::yield_now();
+        }
+        assert_eq!(job.status().phase, JobPhase::AwaitingActivation);
+        assert_eq!(
+            registry.finalize(&job.id()).unwrap(),
+            FinalizeOutcome::Requested
+        );
+        assert_eq!(waited.join().unwrap(), Ok(()));
+        assert_eq!(job.status().state, JobState::Running);
+        assert_eq!(job.status().phase, JobPhase::ActivatingDatabase);
+
+        let cancelled = registry
+            .create_with_context(JobKind::RestoreBlockRisuSave, Some(4), Vec::new())
+            .unwrap();
+        cancelled.start(JobPhase::ReadingSource).unwrap();
+        cancelled.set_phase(JobPhase::StagingDatabase).unwrap();
+        let waiter = Arc::clone(&cancelled);
+        let waited = std::thread::spawn(move || waiter.wait_for_restore_finalization());
+        while cancelled.status().state != JobState::WaitingForInput {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            registry.cancel(&cancelled.id()).unwrap(),
+            CancelOutcome::Requested
+        );
+        assert!(waited.join().unwrap().is_err());
     }
 
     #[test]
@@ -1495,15 +1835,15 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let desktop_file = directory.path().join("desktop.risudat");
         fs::write(&desktop_file, b"RISUSAVE\0").unwrap();
-        let resolved = resolve_source(
+        let opened = open_job_source(
             directory.path(),
             &JobSource::DesktopPath {
                 path: desktop_file.to_string_lossy().into_owned(),
             },
         )
         .unwrap();
-        assert_eq!(resolved, desktop_file.canonicalize().unwrap());
-        assert!(resolve_source(
+        assert_eq!(opened.total_bytes, 9);
+        assert!(open_job_source(
             directory.path(),
             &JobSource::AndroidSpool {
                 token: "../outside".to_owned(),
@@ -1526,7 +1866,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(resolve_source(
+        assert!(open_job_source(
             directory.path(),
             &JobSource::AndroidSpool {
                 token: token.clone(),
@@ -1546,8 +1886,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_source(directory.path(), &JobSource::AndroidSpool { token },).unwrap(),
-            spool.join("source.risudat").canonicalize().unwrap(),
+            open_job_source(directory.path(), &JobSource::AndroidSpool { token })
+                .unwrap()
+                .total_bytes,
+            9,
         );
     }
 
@@ -1565,12 +1907,34 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &spool).unwrap();
 
         let error =
-            resolve_source(directory.path(), &JobSource::AndroidSpool { token }).unwrap_err();
+            open_job_source(directory.path(), &JobSource::AndroidSpool { token }).unwrap_err();
 
         assert!(
             error.message.contains("owned directory"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn desktop_source_symlink_is_rejected_without_following() {
+        let directory = TempDir::new().unwrap();
+        let target = directory.path().join("target.risudat");
+        let selected = directory.path().join("selected.risudat");
+        fs::write(&target, b"RISUSAVE\0").unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &selected).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &selected).unwrap();
+
+        let error = open_job_source(
+            directory.path(),
+            &JobSource::DesktopPath {
+                path: selected.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "invalid-source");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
+import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
 import { ActiveWorkingSet, type CharacterActivationOptions } from './activeWorkingSet.svelte'
 import type { ActiveConversationSession } from './activeConversationSession'
 import type {
@@ -11,6 +12,7 @@ import type {
 } from './persistentDataStore'
 import {
     SaveCoordinator,
+    PersistentMutationFencedError,
     type CharacterAdditionRequest,
     type OfficialRevisionPublisher,
     type PersistentPresetMutation,
@@ -318,6 +320,9 @@ export interface PersistentDataRuntime {
         reason: string,
     ): Promise<PersistentSelectedConversation | null>
     capturePersistentMutationToken(reason: string): Promise<PersistentMutationToken>
+    acquireDestructiveReplacementFence(
+        expected: PersistentMutationToken,
+    ): Promise<PersistentDestructiveReplacementFence>
     materializePersistentDatabaseSnapshot(reason: string): Promise<Database>
     materializePersistentDatabaseSnapshotWithRevision(
         reason: string,
@@ -329,6 +334,11 @@ export interface PersistentDataRuntime {
     ): Promise<boolean>
     publishCurrentOfficialRevision(): Promise<void>
     hasPendingOfficialPublication(): boolean
+}
+
+export interface PersistentDestructiveReplacementFence {
+    refreshCommittedWorkingSet(revision: DataRevision): Promise<void>
+    release(): void
 }
 
 export interface MaximumCompatibilityWorkingSetDependencies {
@@ -495,30 +505,50 @@ export function createPersistentDataRuntime(
             },
         } : undefined)
     }
+    const refreshCommittedWorkingSet = async (
+        revision: DataRevision,
+        fenceOwner?: symbol,
+    ): Promise<void> => {
+        if (fenceOwner === undefined && coordinator.hasDestructiveReplacementFence) {
+            throw new PersistentMutationFencedError()
+        }
+        if (fenceOwner !== undefined) {
+            coordinator.assertDestructiveReplacementFence(fenceOwner)
+        }
+        const selectedCharacterId = dependencies.state.getSelectedCharacterId() ?? null
+        const selectedConversationId =
+            dependencies.state.getSelectedConversationId?.() ?? null
+        const activeCharacterIds = workingSet.activeCharacterIds
+        let database = await projectScalableWorkingSetAtRevision(
+            dependencies.store,
+            revision,
+            {
+                selectedCharacterId,
+                selectedConversationId,
+                activeCharacterIds,
+            },
+        )
+        if (
+            selectPluginCompatibilityProfile(database.plugins ?? []) ===
+            'maximum-compatibility'
+        ) {
+            database = await dependencies.store.materializeDatabase(revision)
+        }
+        if (fenceOwner !== undefined) {
+            coordinator.assertDestructiveReplacementFence(fenceOwner)
+        }
+        workingSet.invalidateNavigation()
+        dependencies.state.replaceDatabase(database, activeCharacterIds, true)
+        workingSet.installCommittedWorkingSet(database, revision)
+    }
     return {
         store: dependencies.store,
         get revision() {
             return coordinator.revision
         },
         initializeActiveWorkingSet: (database) => workingSet.initializeActiveWorkingSet(database),
-        async refreshActiveWorkingSetFromStore(revision) {
-            const selectedCharacterId = dependencies.state.getSelectedCharacterId() ?? null
-            const selectedConversationId =
-                dependencies.state.getSelectedConversationId?.() ?? null
-            const activeCharacterIds = workingSet.activeCharacterIds
-            const database = await projectScalableWorkingSetAtRevision(
-                dependencies.store,
-                revision,
-                {
-                    selectedCharacterId,
-                    selectedConversationId,
-                    activeCharacterIds,
-                },
-            )
-            workingSet.invalidateNavigation()
-            dependencies.state.replaceDatabase(database, activeCharacterIds, true)
-            workingSet.installCommittedWorkingSet(database, revision)
-        },
+        refreshActiveWorkingSetFromStore: (revision) =>
+            refreshCommittedWorkingSet(revision),
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
@@ -581,6 +611,25 @@ export function createPersistentDataRuntime(
             coordinator.readPersistentSelectedConversation(characterId, reason),
         capturePersistentMutationToken: (reason) =>
             coordinator.capturePersistentMutationToken(reason),
+        async acquireDestructiveReplacementFence(expected) {
+            const owner = await coordinator.acquireDestructiveReplacementFence(expected)
+            let released = false
+            return {
+                refreshCommittedWorkingSet(revision) {
+                    if (released) {
+                        return Promise.reject(
+                            new Error('Destructive persistent replacement fence was released'),
+                        )
+                    }
+                    return refreshCommittedWorkingSet(revision, owner)
+                },
+                release() {
+                    if (released) return
+                    coordinator.releaseDestructiveReplacementFence(owner)
+                    released = true
+                },
+            }
+        },
         materializePersistentDatabaseSnapshot: (reason) =>
             coordinator.materializePersistentDatabaseSnapshot(reason),
         materializePersistentDatabaseSnapshotWithRevision: (reason) =>

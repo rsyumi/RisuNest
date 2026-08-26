@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
-    NativeFileJobActivationCommittedError,
     NativeFileJobError,
 } from './nativeFileJobs'
 import {
@@ -16,7 +15,14 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         runtime: () => ({
             revision: 4,
             flushPendingData: vi.fn(async () => undefined),
-            refreshActiveWorkingSetFromStore: vi.fn(async () => undefined),
+            capturePersistentMutationToken: vi.fn(async () => ({
+                revision: 4,
+                mutationGeneration: 1,
+            })),
+            acquireDestructiveReplacementFence: vi.fn(async () => ({
+                refreshCommittedWorkingSet: vi.fn(async () => undefined),
+                release: vi.fn(),
+            })),
             replacePersistentDatabase: vi.fn(async () => undefined),
         }),
         chooseNativeImport: vi.fn(async () => 'C:\\chosen\\source.risudat'),
@@ -25,14 +31,30 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
             name: 'source.risudat',
             arrayBuffer: async () => Uint8Array.from([1, 2, 3]).buffer,
         }]),
-        runNativeImport: vi.fn(async () => ({
-            revision: 5,
-            sourceBytes: 4096,
-            sourceSha256: 'a'.repeat(64),
-            characterCount: 2,
-            presetCount: 1,
-            warningCodes: [],
-        })),
+        runNativeImport: vi.fn(async (_runtime, _source, options) => {
+            try {
+                await options.afterRefresh?.()
+            }
+            catch (error) {
+                const committed = new Error('committed refresh failed') as Error & {
+                    name: string
+                    committedRevision: number
+                    recoveryRequired: boolean
+                }
+                committed.name = 'NativeFileJobActivationCommittedError'
+                committed.committedRevision = 5
+                committed.recoveryRequired = true
+                throw committed
+            }
+            return {
+                revision: 5,
+                sourceBytes: 4096,
+                sourceSha256: 'a'.repeat(64),
+                characterCount: 2,
+                presetCount: 1,
+                warningCodes: [],
+            }
+        }),
         runNativeExport: vi.fn(async () => ({
             revision: 4,
             sourceBytes: 8192,
@@ -45,6 +67,7 @@ function dependencies(platform: 'native-desktop' | 'web'): RisuSaveFileRouteDepe
         collectWebExport: vi.fn(async () => Uint8Array.from([4, 5, 6])),
         downloadWebExport: vi.fn(async () => undefined),
         reloadPlugins: vi.fn(async () => undefined),
+        reloadPluginsAfterNativeRestore: vi.fn(async () => undefined),
     }
 }
 
@@ -58,11 +81,16 @@ describe('RisuSave picker route', () => {
         expect(deps.runNativeImport).toHaveBeenCalledWith(
             expect.objectContaining({ revision: 4 }),
             { type: 'desktopPath', path: 'C:\\chosen\\source.risudat' },
-            expect.objectContaining({ onStatus: undefined, signal: undefined }),
+            expect.objectContaining({
+                afterRefresh: deps.reloadPluginsAfterNativeRestore,
+                onStatus: undefined,
+                signal: undefined,
+            }),
         )
         expect(deps.decodeRisuSave).not.toHaveBeenCalled()
         expect(deps.chooseWebImport).not.toHaveBeenCalled()
-        expect(deps.reloadPlugins).toHaveBeenCalledOnce()
+        expect(deps.reloadPluginsAfterNativeRestore).toHaveBeenCalledOnce()
+        expect(deps.reloadPlugins).not.toHaveBeenCalled()
     })
 
     it('publishes desktop export through the native job with omit-account unchanged', async () => {
@@ -120,16 +148,44 @@ describe('RisuSave picker route', () => {
         expect(runtime.replacePersistentDatabase).toHaveBeenCalledOnce()
     })
 
+    it('uses a separate Web picker with the JavaScript codec for unsupported formats', async () => {
+        const deps = dependencies('native-desktop')
+        vi.mocked(deps.runNativeImport).mockRejectedValueOnce(
+            new NativeFileJobError('unsupported-format', 'not a block save'),
+        )
+
+        const result = await importRisuSaveFromPicker({}, deps)
+
+        expect(result?.mode).toBe('web')
+        expect(deps.chooseWebImport).toHaveBeenCalledOnce()
+        expect(deps.decodeRisuSave).toHaveBeenCalledWith(Uint8Array.from([1, 2, 3]))
+    })
+
+    it('does not fall back for invalid block input', async () => {
+        const deps = dependencies('native-desktop')
+        vi.mocked(deps.runNativeImport).mockRejectedValueOnce(
+            new NativeFileJobError('corrupt-input', 'invalid gzip stream'),
+        )
+
+        await expect(importRisuSaveFromPicker({}, deps)).rejects.toMatchObject({
+            code: 'corrupt-input',
+        })
+        expect(deps.chooseWebImport).not.toHaveBeenCalled()
+        expect(deps.decodeRisuSave).not.toHaveBeenCalled()
+    })
+
     it('reports plugin refresh failure as post-commit recovery instead of restore failure', async () => {
         const deps = dependencies('native-desktop')
-        vi.mocked(deps.reloadPlugins).mockRejectedValueOnce(new Error('plugin refresh failed'))
+        vi.mocked(deps.reloadPluginsAfterNativeRestore).mockRejectedValueOnce(
+            new Error('plugin refresh failed'),
+        )
 
         await expect(importRisuSaveFromPicker({}, deps)).rejects.toEqual(
             expect.objectContaining({
                 name: 'NativeFileJobActivationCommittedError',
                 committedRevision: 5,
                 recoveryRequired: true,
-            } satisfies Partial<NativeFileJobActivationCommittedError>),
+            }),
         )
     })
 

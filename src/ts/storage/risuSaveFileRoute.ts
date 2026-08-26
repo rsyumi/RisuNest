@@ -1,12 +1,11 @@
 import type { Database } from './database.svelte'
 import type { PersistentDataRuntime } from './persistentDataRuntime.svelte'
 import {
-    NativeFileJobActivationCommittedError,
     NativeFileJobError,
     type NativeFileExportJobOptions,
-    type NativeFileJobOptions,
     type NativeFileJobResult,
     type NativeFileJobSource,
+    type NativeFileRestoreJobOptions,
 } from './nativeFileJobs'
 
 type FileLike = {
@@ -18,7 +17,8 @@ type FileRouteRuntime = Pick<
     PersistentDataRuntime,
     | 'revision'
     | 'flushPendingData'
-    | 'refreshActiveWorkingSetFromStore'
+    | 'capturePersistentMutationToken'
+    | 'acquireDestructiveReplacementFence'
     | 'replacePersistentDatabase'
 >
 
@@ -31,7 +31,7 @@ export interface RisuSaveFileRouteDependencies {
     runNativeImport(
         runtime: FileRouteRuntime,
         source: NativeFileJobSource,
-        options: NativeFileJobOptions,
+        options: NativeFileRestoreJobOptions,
     ): Promise<NativeFileJobResult>
     runNativeExport(
         runtime: FileRouteRuntime,
@@ -42,9 +42,10 @@ export interface RisuSaveFileRouteDependencies {
     collectWebExport(omitAccount: boolean): Promise<Uint8Array>
     downloadWebExport(name: string, bytes: Uint8Array): Promise<void>
     reloadPlugins(): void | Promise<void>
+    reloadPluginsAfterNativeRestore(): void | Promise<void>
 }
 
-export interface RisuSaveFileRouteOptions extends NativeFileJobOptions {
+export interface RisuSaveFileRouteOptions extends NativeFileRestoreJobOptions {
     omitAccount?: boolean
 }
 
@@ -62,14 +63,16 @@ function isCapabilityUnavailable(error: unknown): boolean {
     return error instanceof NativeFileJobError && error.code === 'capability-unavailable'
 }
 
-async function importWithWebCodec(
+function isNativeCompatibilityFallback(error: unknown): boolean {
+    return isCapabilityUnavailable(error)
+        || error instanceof NativeFileJobError && error.code === 'unsupported-format'
+}
+
+async function importWithBytes(
     runtime: FileRouteRuntime,
+    bytes: Uint8Array,
     dependencies: RisuSaveFileRouteDependencies,
-): Promise<RisuSaveFileRouteResult | null> {
-    const files = await dependencies.chooseWebImport()
-    const file = files?.[0]
-    if (!file) return null
-    const bytes = new Uint8Array(await file.arrayBuffer())
+): Promise<RisuSaveFileRouteResult> {
     const database = await dependencies.decodeRisuSave(bytes) as Database
     await runtime.replacePersistentDatabase(
         database,
@@ -78,6 +81,17 @@ async function importWithWebCodec(
     )
     await dependencies.reloadPlugins()
     return { mode: 'web', warningCodes: [], bytes: bytes.byteLength }
+}
+
+async function importWithWebCodec(
+    runtime: FileRouteRuntime,
+    dependencies: RisuSaveFileRouteDependencies,
+): Promise<RisuSaveFileRouteResult | null> {
+    const files = await dependencies.chooseWebImport()
+    const file = files?.[0]
+    if (!file) return null
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    return importWithBytes(runtime, bytes, dependencies)
 }
 
 async function exportWithWebCodec(
@@ -107,18 +121,16 @@ export async function importRisuSaveFromPicker(
                     signal: options.signal,
                     pollIntervalMs: options.pollIntervalMs,
                     onStatus: options.onStatus,
+                    onBlockingChange: options.onBlockingChange,
+                    afterRefresh: dependencies.reloadPluginsAfterNativeRestore,
                 },
             )
         }
         catch (error) {
-            if (isCapabilityUnavailable(error)) return importWithWebCodec(runtime, dependencies)
+            if (isNativeCompatibilityFallback(error)) {
+                return importWithWebCodec(runtime, dependencies)
+            }
             throw error
-        }
-        try {
-            await dependencies.reloadPlugins()
-        }
-        catch (error) {
-            throw new NativeFileJobActivationCommittedError(result.revision, error)
         }
         return {
             mode: 'native',

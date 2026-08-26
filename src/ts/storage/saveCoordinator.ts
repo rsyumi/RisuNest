@@ -594,6 +594,13 @@ export interface PersistentMutationToken {
     mutationGeneration: number
 }
 
+export class PersistentMutationFencedError extends Error {
+    constructor() {
+        super('A destructive persistent replacement is active')
+        this.name = 'PersistentMutationFencedError'
+    }
+}
+
 export interface PersistentDatabaseSnapshot extends PersistentMutationToken {
     database: Database
 }
@@ -656,6 +663,13 @@ export class SaveCoordinator {
     private reservedCharacterAddition: ReservedCharacterAddition | null = null
     private pendingResidentCompensations: PendingResidentCompensation[] = []
     private lastBackgroundErrorMessage: string | null = null
+    private destructiveReplacementFence: {
+        owner: symbol
+        state: 'acquiring' | 'held'
+        acceptsPostPublicationDirty: boolean
+        queuedPostPublicationDirty: boolean
+        blockedPrePublicationDirty: boolean
+    } | null = null
 
     constructor(private readonly dependencies: SaveCoordinatorDependencies) {
         this.clock = dependencies.clock ?? defaultClock()
@@ -672,6 +686,10 @@ export class SaveCoordinator {
 
     get mutationGeneration(): number {
         return this.dirtyGeneration
+    }
+
+    get hasDestructiveReplacementFence(): boolean {
+        return this.destructiveReplacementFence !== null
     }
 
     initialize(revision: DataRevision, database?: Database): void {
@@ -693,6 +711,11 @@ export class SaveCoordinator {
         this.reservedCharacterAddition = null
         this.pendingResidentCompensations = []
         this.lastBackgroundErrorMessage = null
+        if (this.destructiveReplacementFence?.state === 'held') {
+            this.destructiveReplacementFence.acceptsPostPublicationDirty = true
+            this.destructiveReplacementFence.queuedPostPublicationDirty = false
+            this.destructiveReplacementFence.blockedPrePublicationDirty = false
+        }
         this.armPublicationCleanupRetryIfNeeded()
     }
 
@@ -702,6 +725,7 @@ export class SaveCoordinator {
         character: CompleteCharacter,
     ): boolean {
         if (
+            this.destructiveReplacementFence !== null ||
             this.currentRevision !== revision ||
             this.dirtyGeneration !== mutationGeneration
         ) return false
@@ -716,6 +740,7 @@ export class SaveCoordinator {
         database: Database,
     ): boolean {
         if (
+            this.destructiveReplacementFence !== null ||
             this.currentRevision !== revision ||
             this.dirtyGeneration !== mutationGeneration
         ) return false
@@ -729,11 +754,23 @@ export class SaveCoordinator {
 
     markPersistentDataDirty(estimatedBytes: number): void {
         this.assertInitialized()
+        const fence = this.destructiveReplacementFence
+        if (fence?.state === 'held') {
+            if (!fence.acceptsPostPublicationDirty) {
+                if (!this.captureMatchesBaseline()) {
+                    fence.blockedPrePublicationDirty = true
+                }
+                throw new PersistentMutationFencedError()
+            }
+            if (this.captureMatchesBaseline()) return
+            fence.queuedPostPublicationDirty = true
+        }
         this.dirtyGeneration++
         const bytes = Number.isFinite(estimatedBytes) && estimatedBytes > 0 ? estimatedBytes : 0
         const previousBytes = this.pendingByteCount
         this.pendingByteCount = Math.max(previousBytes, bytes)
         this.cancelDebounce()
+        if (fence) return
         if (this.pendingByteCount >= PENDING_BYTE_LIMIT && previousBytes < PENDING_BYTE_LIMIT) {
             this.startBackgroundFlush('byte-limit')
             return
@@ -743,6 +780,7 @@ export class SaveCoordinator {
 
     flushPendingData(reason: string): Promise<void> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         if (this.additionPromise) return this.additionPromise
         if (this.flushPromise) return this.flushPromise
@@ -815,6 +853,7 @@ export class SaveCoordinator {
         options: PersistentReplacementOptions = {},
     ): Promise<void> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         const expectationError = this.replacementExpectationError(options)
         if (expectationError) return Promise.reject(expectationError)
         if (!options.authoritative && this.dependencies.isIncompleteWorkingSet?.(database)) {
@@ -854,6 +893,7 @@ export class SaveCoordinator {
         options: PersistentReplacementOptions = {},
     ): Promise<void> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         const expectationError = this.replacementExpectationError(options)
         if (expectationError) return Promise.reject(expectationError)
         const before = this.capture()
@@ -901,6 +941,7 @@ export class SaveCoordinator {
         mutate: PersistentPresetMutation,
     ): Promise<void> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -991,6 +1032,7 @@ export class SaveCoordinator {
         mutations: readonly PluginStorageMutation[],
     ): Promise<void> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1035,6 +1077,7 @@ export class SaveCoordinator {
         mutate: PersistentCharacterDetailMutation,
     ): Promise<boolean> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1111,6 +1154,7 @@ export class SaveCoordinator {
         reason: string,
     ): Promise<boolean> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1248,6 +1292,7 @@ export class SaveCoordinator {
         mutate: PersistentCompleteCharacterMutation,
     ): Promise<boolean> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1309,6 +1354,7 @@ export class SaveCoordinator {
         options: PersistentCompleteCharacterUpsertOptions = {},
     ): Promise<boolean> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1387,6 +1433,7 @@ export class SaveCoordinator {
         reason: string,
     ): Promise<CharacterDetail | null> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1406,6 +1453,7 @@ export class SaveCoordinator {
         reason: string,
     ): Promise<CompleteCharacter | null> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1426,6 +1474,7 @@ export class SaveCoordinator {
         reason: string,
     ): Promise<Chat | null> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1449,6 +1498,7 @@ export class SaveCoordinator {
         reason: string,
     ): Promise<Chat | null> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         if (!Number.isInteger(orderedPosition) || orderedPosition < 0) {
             return Promise.reject(new RangeError('Conversation position must be a nonnegative integer'))
         }
@@ -1468,6 +1518,7 @@ export class SaveCoordinator {
         reason: string,
     ): Promise<PersistentSelectedConversation | null> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1502,6 +1553,7 @@ export class SaveCoordinator {
 
     capturePersistentMutationToken(reason: string): Promise<PersistentMutationToken> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1512,10 +1564,83 @@ export class SaveCoordinator {
         })
     }
 
+    acquireDestructiveReplacementFence(expected: PersistentMutationToken): Promise<symbol> {
+        this.assertInitialized()
+        if (this.destructiveReplacementFence) throw new PersistentMutationFencedError()
+        const owner = Symbol('destructive-persistent-replacement')
+        this.destructiveReplacementFence = {
+            owner,
+            state: 'acquiring',
+            acceptsPostPublicationDirty: false,
+            queuedPostPublicationDirty: false,
+            blockedPrePublicationDirty: false,
+        }
+        this.cancelDebounce()
+        return this.enqueue(async () => {
+            try {
+                await this.flushIterations('destructive-persistent-replacement', true)
+                if (this.revision !== expected.revision) {
+                    throw new RevisionConflictError(expected.revision, this.revision)
+                }
+                if (this.dirtyGeneration !== expected.mutationGeneration) {
+                    throw new Error(
+                        `Expected mutation generation ${expected.mutationGeneration}, ` +
+                        `but current generation is ${this.dirtyGeneration}`,
+                    )
+                }
+                if (this.destructiveReplacementFence?.owner !== owner) {
+                    throw new Error('Destructive persistent replacement fence ownership changed')
+                }
+                this.destructiveReplacementFence.state = 'held'
+                return owner
+            } catch (error) {
+                if (this.destructiveReplacementFence?.owner === owner) {
+                    this.destructiveReplacementFence = null
+                }
+                throw error
+            }
+        })
+    }
+
+    assertDestructiveReplacementFence(owner: symbol): void {
+        if (
+            this.destructiveReplacementFence?.owner !== owner ||
+            this.destructiveReplacementFence.state !== 'held'
+        ) {
+            throw new Error('Destructive persistent replacement fence is not held')
+        }
+        if (this.destructiveReplacementFence.blockedPrePublicationDirty) {
+            throw new PersistentMutationFencedError()
+        }
+        if (
+            !this.destructiveReplacementFence.acceptsPostPublicationDirty
+            && !this.captureMatchesBaseline()
+        ) {
+            this.destructiveReplacementFence.blockedPrePublicationDirty = true
+            throw new PersistentMutationFencedError()
+        }
+    }
+
+    releaseDestructiveReplacementFence(owner: symbol): void {
+        if (
+            this.destructiveReplacementFence?.owner !== owner
+            || this.destructiveReplacementFence.state !== 'held'
+        ) {
+            throw new Error('Destructive persistent replacement fence is not held')
+        }
+        const queuedPostPublicationDirty =
+            this.destructiveReplacementFence.queuedPostPublicationDirty
+        this.destructiveReplacementFence = null
+        if (queuedPostPublicationDirty && !this.flushPromise && !this.additionPromise) {
+            this.armDebounce()
+        }
+    }
+
     materializePersistentDatabaseSnapshotWithRevision(
         reason: string,
     ): Promise<PersistentDatabaseSnapshot> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         this.cancelDebounce()
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
@@ -1540,6 +1665,7 @@ export class SaveCoordinator {
 
     publishCurrentOfficialRevision(): Promise<void> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         if (!this.dependencies.officialPublisher) return Promise.resolve()
         return this.enqueue(async () => {
             await this.applyDeferredPublication()
@@ -1554,6 +1680,7 @@ export class SaveCoordinator {
 
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void> {
         this.assertInitialized()
+        this.assertPersistentMutationAllowed()
         if (!request.characterId) {
             throw new Error('Character addition requires a nonempty character ID')
         }
@@ -2721,5 +2848,25 @@ export class SaveCoordinator {
 
     private assertInitialized(): void {
         if (this.currentRevision === null) throw new Error('Save coordinator is not initialized')
+    }
+
+    private assertPersistentMutationAllowed(): void {
+        if (this.destructiveReplacementFence) {
+            throw new PersistentMutationFencedError()
+        }
+    }
+
+    private captureMatchesBaseline(): boolean {
+        const captured = this.capture()
+        return captured.rootCanonical === this.rootBaseline
+            && (
+                captured.pluginStorageCanonical === null
+                || captured.pluginStorageCanonical === this.pluginStorageBaseline
+            )
+            && (
+                captured.presetsCanonical === null
+                || captured.presetsCanonical === this.presetsBaseline
+            )
+            && captured.characterCanonical === this.characterBaseline
     }
 }

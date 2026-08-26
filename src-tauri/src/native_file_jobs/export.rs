@@ -276,6 +276,7 @@ mod tests {
     use super::*;
     use crate::native_file_jobs::{JobKind, JobRegistry};
     use crate::persistent_store::PersistentStore;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -289,48 +290,82 @@ mod tests {
             .replace_put_root(
                 &staging,
                 &json!({
-                    "username": "Native Job Export",
+                    "username": "Native Export",
                     "account": { "token": "secret" },
                     "modules": [{ "name": "Module" }],
-                    "plugins": []
+                    "loadouts": [{ "name": "Loadout" }],
+                    "plugins": [{ "name": "Plugin" }],
+                    "pluginCustomStorage": { "plugin": { "enabled": true } }
                 }),
             )
             .unwrap();
         store
-            .replace_put_presets(&staging, &[json!({ "name": "Preset" })])
+            .replace_put_presets(
+                &staging,
+                &[json!({ "name": "Preset A" }), json!({ "name": "Preset B" })],
+            )
             .unwrap();
         store
             .replace_add_characters(
                 &staging,
-                &[json!({
-                    "type": "character",
-                    "chaId": "native-job-character",
-                    "name": "Native Job Character",
-                    "chats": [{
-                        "id": "chat-1",
-                        "name": "Chat",
-                        "message": [{ "role": "user", "data": "hello", "chatId": "m1" }]
-                    }]
-                })],
+                &[
+                    json!({
+                        "type": "character",
+                        "chaId": "trash-first",
+                        "name": "Trash First",
+                        "trashTime": 10,
+                        "chats": [{
+                            "id": "trash-chat",
+                            "name": "Trash Chat",
+                            "message": [{ "role": "user", "data": "trash", "chatId": "t1" }]
+                        }]
+                    }),
+                    json!({
+                        "type": "character",
+                        "chaId": "live-second",
+                        "name": "Live Second",
+                        "chats": [{
+                            "id": "live-chat",
+                            "name": "Live Chat",
+                            "message": [
+                                { "role": "user", "data": "hello", "chatId": "l1" },
+                                { "role": "char", "data": "world", "chatId": "l2" }
+                            ]
+                        }]
+                    }),
+                ],
             )
             .unwrap();
         let revision = store.replace_commit(&staging, None).unwrap().revision;
         (directory, store, revision)
     }
 
+    fn frozen_export(omit_account: bool) -> (&'static str, usize, &'static str) {
+        if omit_account {
+            (
+                include_str!("../../fixtures/risusave/pre-native-job-export-omit-account-true.b64"),
+                796,
+                "29dfc33b0f964cd3d54791fb92a12565f393e7710f713622cd52b667e66d3921",
+            )
+        } else {
+            (
+                include_str!(
+                    "../../fixtures/risusave/pre-native-job-export-omit-account-false.b64"
+                ),
+                813,
+                "2b84dcc0abeafc7354354e0d1fb3360443011bc73bb364ffa24180f29f0e0baa",
+            )
+        }
+    }
+
     #[test]
     fn desktop_job_preserves_current_block_bytes_and_omit_account_semantics() {
         for omit_account in [false, true] {
             let (directory, mut store, revision) = fixture();
-            let baseline_lease = store.acquire_revision(revision).unwrap().lease;
-            let baseline = store
-                .export_risu_save(&baseline_lease, omit_account)
-                .unwrap();
-            let expected = fs::read(&baseline.path).unwrap();
-            store
-                .cleanup_risu_save_export(Path::new(&baseline.path))
-                .unwrap();
-            store.release_revision(&baseline_lease).unwrap();
+            let (encoded_golden, expected_length, expected_sha256) = frozen_export(omit_account);
+            let expected = STANDARD.decode(encoded_golden.trim()).unwrap();
+            assert_eq!(expected.len(), expected_length);
+            assert_eq!(hex::encode(Sha256::digest(&expected)), expected_sha256);
 
             let prepared = store.prepare_risu_save_export(revision).unwrap();
             let chosen = directory.path().join("chosen");
@@ -346,9 +381,9 @@ mod tests {
             assert_eq!(fs::read(&destination).unwrap(), expected);
             assert_eq!(result.revision, revision);
             assert_eq!(result.source_bytes, expected.len() as u64);
-            assert_eq!(result.source_sha256, hex::encode(Sha256::digest(&expected)),);
-            assert_eq!(result.character_count, 1);
-            assert_eq!(result.preset_count, 1);
+            assert_eq!(result.source_sha256, expected_sha256);
+            assert_eq!(result.character_count, 2);
+            assert_eq!(result.preset_count, 2);
             assert_eq!(job.status().phase, JobPhase::FinalizingExport);
             let exports = directory.path().join("persistent").join("exports");
             assert!(fs::read_dir(exports).unwrap().next().is_none());

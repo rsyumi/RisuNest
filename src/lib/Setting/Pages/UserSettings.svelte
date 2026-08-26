@@ -34,16 +34,17 @@
     import {
         exportRisuSaveFromSystemPicker,
         importRisuSaveFromSystemPicker,
+        nativeFileOperation,
     } from "src/ts/storage/risuSaveFileRouteProduction.svelte";
+    import { cancelActiveNativeFileOperation } from "src/ts/storage/nativeFileJobManager";
     import { onDestroy } from "svelte";
     let openIframe = $state(false)
     let openIframeURL = $state('')
     const drivePopup = createHubPopupController()
     let accountIframe = $state<HTMLIFrameElement>()
     let nativeAccountBusy = $state(false)
-    let risuSaveOperation = $state<'import' | 'export' | null>(null)
-    let risuSaveController = $state<AbortController>()
-    let risuSaveStatus = $state<NativeFileJobStatus>()
+    let risuSaveOperation = $derived($nativeFileOperation?.kind ?? null)
+    let risuSaveStatus = $derived($nativeFileOperation?.status)
 
     async function runNativeAccountOperation<T>(operation: () => Promise<T>): Promise<T | undefined> {
         if (nativeAccountBusy) return undefined
@@ -85,17 +86,10 @@
             if(!await alertConfirm(language.risuSaveImportConfirm)) return
             if(!await alertConfirm(language.backupLoadConfirm2)) return
         }
-        risuSaveOperation = kind
-        risuSaveStatus = undefined
-        risuSaveController = new AbortController()
         try {
-            const options = {
-                signal: risuSaveController.signal,
-                onStatus: (status: NativeFileJobStatus) => risuSaveStatus = status,
-            }
             const result = kind === 'import'
-                ? await importRisuSaveFromSystemPicker(options)
-                : await exportRisuSaveFromSystemPicker(options)
+                ? await importRisuSaveFromSystemPicker()
+                : await exportRisuSaveFromSystemPicker()
             if(!result) return
             alertNormal(
                 result.warningCodes.includes('cleanup-failed')
@@ -106,16 +100,11 @@
             )
         } catch(error) {
             showRisuSaveError(error)
-        } finally {
-            risuSaveOperation = null
-            risuSaveController = undefined
-            risuSaveStatus = undefined
         }
     }
 
     onDestroy(() => {
         drivePopup.close()
-        risuSaveController?.abort()
     })
 </script>
 
@@ -202,7 +191,7 @@
             <Button
                 styled="outlined"
                 size="sm"
-                onclick={() => risuSaveController?.abort()}>
+                onclick={cancelActiveNativeFileOperation}>
                 {language.cancelRisuSaveOperation}
             </Button>
         </div>

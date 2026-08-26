@@ -1948,6 +1948,111 @@ describe('SaveCoordinator', () => {
         })
     })
 
+    it('rejects a stale destructive replacement token after flushing the newer live edit', async () => {
+        const database = makeDatabase()
+        const store = {
+            commit: vi.fn(async ({ expectedRevision }) => ({
+                revision: expectedRevision + 1,
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(12)
+        const token = await coordinator.capturePersistentMutationToken('native-restore-start')
+        database.username = 'Live edit during native parse'
+        coordinator.markPersistentDataDirty(1)
+
+        await expect(
+            coordinator.acquireDestructiveReplacementFence(token),
+        ).rejects.toThrow(/revision|mutation generation/i)
+
+        expect(coordinator.revision).toBe(13)
+        expect(() => coordinator.markPersistentDataDirty(1)).not.toThrow()
+    })
+
+    it('blocks ordinary saves until the owning destructive fence is released', async () => {
+        const database = makeDatabase()
+        const store = makeStore(vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        })))
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage ?? {},
+            capturePresets: () => database.botPresets,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(12)
+        const token = await coordinator.capturePersistentMutationToken('native-restore-start')
+        const fence = await coordinator.acquireDestructiveReplacementFence(token)
+
+        expect(() => coordinator.markPersistentDataDirty(1)).toThrow(
+            /replacement is active/i,
+        )
+        expect(() => coordinator.flushPendingData('ordinary-save')).toThrow(
+            /replacement is active/i,
+        )
+        expect(() => coordinator.replacePersistentDatabase(
+            makeDatabase(),
+            'ordinary-replacement',
+            { authoritative: true },
+        )).toThrow(/replacement is active/i)
+
+        coordinator.initialize(13, database)
+        expect(() => coordinator.markPersistentDataDirty(1)).not.toThrow()
+        expect(coordinator.mutationGeneration).toBe(0)
+
+        database.username = 'Edit after authoritative publication'
+        expect(() => coordinator.markPersistentDataDirty(1)).not.toThrow()
+        expect(coordinator.mutationGeneration).toBe(1)
+        expect(() => coordinator.flushPendingData('ordinary-save')).toThrow(
+            /replacement is active/i,
+        )
+
+        coordinator.releaseDestructiveReplacementFence(fence)
+        await coordinator.flushPendingData('post-fence-edit')
+        expect(store.commit).toHaveBeenCalledWith(expect.objectContaining({
+            expectedRevision: 13,
+            root: expect.objectContaining({
+                username: 'Edit after authoritative publication',
+            }),
+        }))
+    })
+
+    it('admits an already-applied edit while the exact fence is still acquiring', async () => {
+        const database = makeDatabase()
+        const store = makeStore(vi.fn(async ({ expectedRevision }) => ({
+            revision: expectedRevision + 1,
+        })))
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            capturePluginStorage: () => database.pluginCustomStorage ?? {},
+            capturePresets: () => database.botPresets,
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: vi.fn(),
+        })
+        coordinator.initialize(12)
+        const token = await coordinator.capturePersistentMutationToken('native-restore-start')
+
+        const acquiring = coordinator.acquireDestructiveReplacementFence(token)
+        expect(() => coordinator.mutatePersistentPresets(
+            'queued-preset-mutation',
+            () => undefined,
+        )).toThrow(/replacement is active/i)
+        database.username = 'Edit completed during final handshake'
+        expect(() => coordinator.markPersistentDataDirty(2 * 1024 * 1024)).not.toThrow()
+
+        await expect(acquiring).rejects.toThrow(/revision|mutation generation/i)
+        expect(coordinator.revision).toBe(13)
+        expect(database.username).toBe('Edit completed during final handshake')
+    })
+
     it('returns the snapshot revision atomically before a queued replacement advances it', async () => {
         const database = makeDatabase()
         const snapshot = makeDatabase()

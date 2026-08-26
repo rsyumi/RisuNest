@@ -31,6 +31,7 @@ import {
     createPersistentDataRuntime,
     publishPersistentCharacterMutationToWorkingSet,
     restoreStableWorkingSetSelection,
+    type PersistentDestructiveReplacementFence,
     type PersistentDataRuntime,
     type PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
@@ -50,6 +51,7 @@ import {
 } from './persistentConversationRead'
 
 export type {
+    PersistentDestructiveReplacementFence,
     PersistentDataRuntime,
     PersistentDataRuntimeStateAdapter,
 } from './persistentDataRuntime'
@@ -444,6 +446,10 @@ export const capturePersistentMutationToken = (
     reason: string,
 ): Promise<PersistentMutationToken> =>
     getPersistentDataRuntime().capturePersistentMutationToken(reason)
+export const acquireDestructiveReplacementFence = (
+    expected: PersistentMutationToken,
+): Promise<PersistentDestructiveReplacementFence> =>
+    getPersistentDataRuntime().acquireDestructiveReplacementFence(expected)
 export const materializePersistentDatabaseSnapshot = (reason: string): Promise<Database> =>
     getPersistentDataRuntime().materializePersistentDatabaseSnapshot(reason)
 export const materializePersistentDatabaseSnapshotWithRevision = (

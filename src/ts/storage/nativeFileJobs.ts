@@ -27,11 +27,14 @@ export interface NativeFileJobResult {
 export interface NativeFileJobStatus {
     jobId: string
     kind: 'restore-block-risu-save' | 'export-block-risu-save'
+    expectedRevision?: number
+    warningCodes?: string[]
     state: NativeFileJobState
     phase:
         | 'queued'
         | 'reading-source'
         | 'staging-database'
+        | 'awaiting-activation'
         | 'activating-database'
         | 'writing-export'
         | 'publishing-destination'
@@ -51,15 +54,28 @@ export interface NativeFileJobStatus {
 }
 
 export interface NativeBlockRestoreRuntime {
-    readonly revision: number
-    flushPendingData(reason: string): Promise<void>
-    refreshActiveWorkingSet(revision: number): Promise<void>
+    capturePersistentMutationToken(reason: string): Promise<{
+        revision: number
+        mutationGeneration: number
+    }>
+    acquireDestructiveReplacementFence(token: {
+        revision: number
+        mutationGeneration: number
+    }): Promise<{
+        refreshCommittedWorkingSet(revision: number): Promise<void>
+        release(): void
+    }>
 }
 
 export interface NativeFileJobOptions {
     signal?: AbortSignal
     pollIntervalMs?: number
     onStatus?(status: NativeFileJobStatus): void
+}
+
+export interface NativeFileRestoreJobOptions extends NativeFileJobOptions {
+    afterRefresh?(): void | Promise<void>
+    onBlockingChange?(blocking: boolean): void
 }
 
 export interface NativeFileExportJobOptions extends NativeFileJobOptions {
@@ -130,7 +146,7 @@ async function invokeNative(
 export async function runNativeBlockRisuSaveRestore(
     runtime: NativeBlockRestoreRuntime,
     source: NativeFileJobSource,
-    options: NativeFileJobOptions = {},
+    options: NativeFileRestoreJobOptions = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
     if (!dependencies.isTauri()) {
@@ -138,74 +154,108 @@ export async function runNativeBlockRisuSaveRestore(
     }
     if (options.signal?.aborted) throw abortError()
 
-    await runtime.flushPendingData('native-block-risu-save-restore')
+    const mutationToken = await runtime.capturePersistentMutationToken(
+        'native-block-risu-save-restore',
+    )
     if (options.signal?.aborted) throw abortError()
-    const expectedRevision = runtime.revision
     const started = await invokeNative(dependencies, 'native_file_job_start', {
         request: {
             kind: 'restore-block-risu-save',
             source,
-            expectedRevision,
+            expectedRevision: mutationToken.revision,
         },
     }) as { jobId: string; warningCodes?: string[] }
     let cancellationRequested = false
     let terminal: NativeFileJobStatus | undefined
-
-    while (!terminal) {
-        if (options.signal?.aborted && !cancellationRequested) {
-            cancellationRequested = true
-            await invokeNative(dependencies, 'native_file_job_cancel', { jobId: started.jobId })
-        }
-        const status = await invokeNative(dependencies, 'native_file_job_status', {
-            jobId: started.jobId,
-        }) as NativeFileJobStatus
-        options.onStatus?.(status)
-        if (status.state === 'succeeded' || status.state === 'failed' || status.state === 'cancelled') {
-            terminal = status
-            break
-        }
-        await dependencies.wait(options.pollIntervalMs ?? 100)
-    }
-
-    let outcomeFailed = false
-    let committedResult: NativeFileJobResult | undefined
+    let mutationConflict: NativeFileJobError | undefined
+    let replacementFence: Awaited<ReturnType<
+        NativeBlockRestoreRuntime['acquireDestructiveReplacementFence']
+    >> | undefined
     try {
+        while (!terminal) {
+            if (options.signal?.aborted && !cancellationRequested) {
+                cancellationRequested = true
+                await invokeNative(dependencies, 'native_file_job_cancel', {
+                    jobId: started.jobId,
+                })
+            }
+            const status = await invokeNative(dependencies, 'native_file_job_status', {
+                jobId: started.jobId,
+            }) as NativeFileJobStatus
+            options.onStatus?.(status)
+            if (
+                status.state === 'waitingForInput'
+                && status.phase === 'awaiting-activation'
+                && !replacementFence
+                && !cancellationRequested
+            ) {
+                try {
+                    replacementFence = await runtime.acquireDestructiveReplacementFence(
+                        mutationToken,
+                    )
+                }
+                catch (error) {
+                    mutationConflict = new NativeFileJobError(
+                        'revision-conflict',
+                        error instanceof Error ? error.message : String(error),
+                    )
+                    cancellationRequested = true
+                    await invokeNative(dependencies, 'native_file_job_cancel', {
+                        jobId: started.jobId,
+                    })
+                    continue
+                }
+                options.onBlockingChange?.(true)
+                await invokeNative(dependencies, 'native_file_job_finalize', {
+                    jobId: started.jobId,
+                })
+                options.onStatus?.({
+                    ...status,
+                    state: 'running',
+                    phase: 'activating-database',
+                })
+            }
+            if (
+                status.state === 'succeeded'
+                || status.state === 'failed'
+                || status.state === 'cancelled'
+            ) {
+                terminal = status
+                break
+            }
+            await dependencies.wait(options.pollIntervalMs ?? 100)
+        }
+
         if (terminal.state === 'succeeded') {
             if (!terminal.result) {
                 throw new NativeFileJobError('missing-result', 'Native restore returned no result')
             }
+            if (!replacementFence) {
+                throw new NativeFileJobError(
+                    'missing-activation-fence',
+                    'Native restore committed without a renderer replacement fence',
+                )
+            }
             try {
-                await runtime.refreshActiveWorkingSet(terminal.result.revision)
+                await replacementFence.refreshCommittedWorkingSet(terminal.result.revision)
+                await options.afterRefresh?.()
             }
             catch (error) {
                 throw new NativeFileJobActivationCommittedError(terminal.result.revision, error)
             }
-            committedResult = {
+            const committedResult = {
                 ...terminal.result,
                 warningCodes: [...new Set([
                     ...(started.warningCodes ?? []),
                     ...terminal.result.warningCodes,
                 ])].slice(0, 16),
             }
-            return committedResult
-        }
-
-        if (terminal.state === 'cancelled') throw abortError()
-        throw new NativeFileJobError(
-            terminal.error?.code ?? 'restore-failed',
-            terminal.error?.message ?? 'Native block RisuSave restore failed',
-        )
-    }
-    catch (error) {
-        outcomeFailed = true
-        throw error
-    }
-    finally {
-        try {
-            await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-        }
-        catch (error) {
-            if (committedResult) {
+            try {
+                await invokeNative(dependencies, 'native_file_job_forget', {
+                    jobId: started.jobId,
+                })
+            }
+            catch {
                 committedResult.warningCodes = [
                     ...committedResult.warningCodes
                         .filter((code) => code !== 'cleanup-failed')
@@ -213,13 +263,34 @@ export async function runNativeBlockRisuSaveRestore(
                     'cleanup-failed',
                 ]
             }
-            else if (!outcomeFailed) throw error
+            return committedResult
         }
+
+        const error = mutationConflict ?? (terminal.state === 'cancelled'
+            ? abortError()
+            : new NativeFileJobError(
+                terminal.error?.code ?? 'restore-failed',
+                terminal.error?.message ?? 'Native block RisuSave restore failed',
+            ))
+        try {
+            await invokeNative(dependencies, 'native_file_job_forget', {
+                jobId: started.jobId,
+            })
+        }
+        catch {}
+        throw error
+    }
+    finally {
+        replacementFence?.release()
+        options.onBlockingChange?.(false)
     }
 }
 
 export async function runNativeBlockRisuSaveExport(
-    runtime: Pick<NativeBlockRestoreRuntime, 'revision' | 'flushPendingData'>,
+    runtime: {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
     destination: string,
     options: NativeFileExportJobOptions = {},
     dependencies: NativeFileJobDependencies = productionDependencies,

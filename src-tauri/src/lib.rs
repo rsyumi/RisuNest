@@ -505,6 +505,8 @@ pub fn run() {
             native_media::native_media_write_inlay_image,
             native_file_jobs::native_file_job_start,
             native_file_jobs::native_file_job_status,
+            native_file_jobs::native_file_job_list,
+            native_file_jobs::native_file_job_finalize,
             native_file_jobs::native_file_job_cancel,
             native_file_jobs::native_file_job_forget,
             persistent_store::commands::pds_open,

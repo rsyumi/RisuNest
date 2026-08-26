@@ -2,8 +2,15 @@ import { open, save } from '@tauri-apps/plugin-dialog'
 
 import { downloadFile } from '../globalApi.svelte'
 import { isTauriDesktop } from '../platform'
-import { loadPlugins } from '../plugins/plugins.svelte'
+import {
+    loadPlugins,
+    loadPluginsAfterAuthoritativeRestore,
+} from '../plugins/plugins.svelte'
 import { selectFileByDom } from '../util'
+import {
+    nativeFileOperation,
+    runSharedNativeFileOperation,
+} from './nativeFileJobManager'
 import {
     runNativeBlockRisuSaveExport,
     runNativeBlockRisuSaveRestore,
@@ -34,16 +41,7 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
         filters: [{ name: 'RisuSave', extensions: ['risudat'] }],
     }),
     chooseWebImport: () => selectFileByDom(['risudat'], 'single'),
-    runNativeImport: (runtime, source, options) => runNativeBlockRisuSaveRestore(
-        {
-            get revision() { return runtime.revision },
-            flushPendingData: (reason) => runtime.flushPendingData(reason),
-            refreshActiveWorkingSet: (revision) =>
-                runtime.refreshActiveWorkingSetFromStore(revision),
-        },
-        source,
-        options,
-    ),
+    runNativeImport: runNativeBlockRisuSaveRestore,
     runNativeExport: runNativeBlockRisuSaveExport,
     decodeRisuSave,
     collectWebExport: (omitAccount) => withFlushedRisuSaveExport(
@@ -53,10 +51,33 @@ const productionDependencies: RisuSaveFileRouteDependencies = {
     ),
     downloadWebExport: downloadFile,
     reloadPlugins: loadPlugins,
+    reloadPluginsAfterNativeRestore: loadPluginsAfterAuthoritativeRestore,
 }
 
+export { nativeFileOperation }
+
 export const importRisuSaveFromSystemPicker = (options: RisuSaveFileRouteOptions = {}) =>
-    importRisuSaveFromPicker(options, productionDependencies)
+    runSharedNativeFileOperation('import', ({ signal, onStatus, setBlocking }) =>
+        importRisuSaveFromPicker({
+            ...options,
+            signal,
+            onStatus: (status) => {
+                onStatus(status)
+                options.onStatus?.(status)
+            },
+            onBlockingChange: (blocking) => {
+                setBlocking(blocking)
+                options.onBlockingChange?.(blocking)
+            },
+        }, productionDependencies))
 
 export const exportRisuSaveFromSystemPicker = (options: RisuSaveFileRouteOptions = {}) =>
-    exportRisuSaveFromPicker(options, productionDependencies)
+    runSharedNativeFileOperation('export', ({ signal, onStatus }) =>
+        exportRisuSaveFromPicker({
+            ...options,
+            signal,
+            onStatus: (status) => {
+                onStatus(status)
+                options.onStatus?.(status)
+            },
+        }, productionDependencies))

@@ -83,6 +83,10 @@ import { getSyncConflictBackupStore } from "./storage/sync/syncConflictBackup";
 import { formatNameList, summarizePinnedSyncConflict } from "./storage/sync/syncConflictSummary";
 import { withPersistentRevisionLease } from "./storage/persistentRecordIterator";
 import { initializePersistentStorage } from "./storage/persistentStorageRuntime";
+import {
+    acknowledgeRecoveredNativeRestores,
+    reconcileNativeRestoresBeforeBootstrap,
+} from "./storage/nativeFileJobRecovery";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
     initializeOfficialAccountBootstrap,
@@ -130,6 +134,9 @@ export async function loadData() {
         }
 
         await initializePersistentStorage()
+        const recoveredNativeRestoreJobs = isTauriDesktop
+            ? await reconcileNativeRestoresBeforeBootstrap()
+            : []
         const runtime = getPersistentDataRuntime()
         const resolvePersistentWorkingSet = () => bootstrapPersistentDatabase({
             store: runtime.store,
@@ -423,10 +430,20 @@ export async function loadData() {
 
         performance.mark('boot:cold-storage-ready')
         LoadingStatusState.text = 'Loading Plugins...'
+        let pluginsLoaded = false
         try {
             await loadPlugins()
+            pluginsLoaded = true
         } catch (error) {
             console.error(error)
+        }
+        if (pluginsLoaded && recoveredNativeRestoreJobs.length > 0) {
+            try {
+                await acknowledgeRecoveredNativeRestores(recoveredNativeRestoreJobs)
+            }
+            catch (error) {
+                console.error('Native restore acknowledgement failed', error)
+            }
         }
         performance.mark('boot:plugins-ready')
         if (!isTauri && getDatabase().account) {

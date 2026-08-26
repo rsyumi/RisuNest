@@ -1,13 +1,11 @@
-use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
+use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError, OpenedJobSource};
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
 use flate2::bufread::GzDecoder;
 use rmpv::Value as MessagePackValue;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
-use std::fs::File;
 use std::io::{self, BufReader, Read};
-use std::path::Path;
 
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 const LEGACY_RISU_SAVE_PREFIX: &[u8] = b"\0RISUSAVE\0";
@@ -41,22 +39,14 @@ pub(crate) trait ReplacementSink: Send + Sync {
 }
 
 pub(crate) fn restore_block_risu_save(
-    source: &Path,
+    source: OpenedJobSource,
     expected_revision: i64,
     job: &JobControl,
     sink: &dyn ReplacementSink,
 ) -> Result<JobResultSummary, NativeJobError> {
-    restore_risu_save(source, expected_revision, job, sink)
-}
-
-pub(crate) fn restore_risu_save(
-    source: &Path,
-    expected_revision: i64,
-    job: &JobControl,
-    sink: &dyn ReplacementSink,
-) -> Result<JobResultSummary, NativeJobError> {
-    restore_risu_save_with_limits(
-        source,
+    restore_risu_save_reader(
+        source.file,
+        source.total_bytes,
         expected_revision,
         job,
         sink,
@@ -65,33 +55,81 @@ pub(crate) fn restore_risu_save(
 }
 
 #[cfg(test)]
-pub(crate) fn restore_block_risu_save_with_limits(
-    source: &Path,
+pub(crate) fn restore_risu_save(
+    source: &std::path::Path,
     expected_revision: i64,
     job: &JobControl,
     sink: &dyn ReplacementSink,
-    limits: RestoreLimits,
 ) -> Result<JobResultSummary, NativeJobError> {
-    restore_risu_save_with_limits(source, expected_revision, job, sink, limits)
+    let source = super::open_regular_file_no_follow(source)?;
+    restore_risu_save_reader(
+        source.file,
+        source.total_bytes,
+        expected_revision,
+        job,
+        sink,
+        RestoreLimits::default(),
+    )
 }
 
+#[cfg(test)]
 fn restore_risu_save_with_limits(
-    source: &Path,
+    source: &std::path::Path,
     expected_revision: i64,
     job: &JobControl,
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
 ) -> Result<JobResultSummary, NativeJobError> {
-    let total_bytes = source
-        .metadata()
-        .map_err(|error| invalid_source(format!("source metadata is unavailable: {error}")))?
-        .len();
-    if total_bytes < RISU_SAVE_HEADER.len() as u64 {
-        return Err(truncated("truncated block RisuSave header"));
-    }
-    let file = File::open(source)
-        .map_err(|error| invalid_source(format!("source cannot be opened: {error}")))?;
-    restore_risu_save_reader(file, total_bytes, expected_revision, job, sink, limits)
+    let source = super::open_regular_file_no_follow(source)?;
+    restore_risu_save_reader(
+        source.file,
+        source.total_bytes,
+        expected_revision,
+        job,
+        sink,
+        limits,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn restore_block_risu_save_with_limits(
+    source: OpenedJobSource,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<JobResultSummary, NativeJobError> {
+    restore_block_risu_save_reader(
+        source.file,
+        source.total_bytes,
+        expected_revision,
+        job,
+        sink,
+        limits,
+    )
+}
+
+#[cfg(test)]
+fn restore_block_risu_save_path(
+    source: &std::path::Path,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+) -> Result<JobResultSummary, NativeJobError> {
+    let source = super::open_regular_file_no_follow(source)?;
+    restore_block_risu_save(source, expected_revision, job, sink)
+}
+
+#[cfg(test)]
+fn restore_block_risu_save_path_with_limits(
+    source: &std::path::Path,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<JobResultSummary, NativeJobError> {
+    let source = super::open_regular_file_no_follow(source)?;
+    restore_block_risu_save_with_limits(source, expected_revision, job, sink, limits)
 }
 
 #[cfg(test)]
@@ -142,10 +180,11 @@ fn restore_risu_save_reader<R: Read>(
                 parse_and_stage_compressed_legacy(&mut reader, &staging_id, job, sink, limits)?
             }
         };
+        reader.require_eof()?;
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
-        job.set_phase(JobPhase::ActivatingDatabase)
+        job.wait_for_restore_finalization()
             .map_err(|error| job_error(job, error))?;
         let revision = sink
             .commit(&staging_id, expected_revision)
@@ -195,7 +234,7 @@ fn read_risu_save_format<R: Read>(
         return Err(invalid("invalid RisuSave header"));
     }
     if first[0] != 0 {
-        return Err(invalid("unframed RisuSave input is unsupported"));
+        return Err(unsupported("unframed RisuSave input is unsupported"));
     }
 
     let mut second = [0u8; 1];
@@ -702,6 +741,11 @@ fn parse_and_stage<R: Read>(
                 }
                 plugin_storage = Some(value);
             }
+            3 | 6 | 8 => {
+                return Err(unsupported(format!(
+                    "block type {block_type} for {name} requires the compatibility parser"
+                )))
+            }
             _ => {
                 return Err(invalid(format!(
                     "unsupported block type {block_type} for {name}"
@@ -942,9 +986,16 @@ impl<'a, R: Read> TrackedReader<'a, R> {
         if self.job.is_cancel_requested() {
             return Err(cancelled("restore cancelled while reading source"));
         }
+        let remaining = self.total.saturating_sub(self.completed);
+        if remaining == 0 {
+            return Err(truncated("truncated block RisuSave source"));
+        }
+        let read_limit = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         let read = self
             .source
-            .read(buffer)
+            .read(&mut buffer[..read_limit])
             .map_err(|error| invalid_source(format!("source read failed: {error}")))?;
         if read == 0 {
             return Err(truncated("truncated block RisuSave source"));
@@ -960,6 +1011,20 @@ impl<'a, R: Read> TrackedReader<'a, R> {
             })
             .map_err(|error| job_error(self.job, error))?;
         Ok(read)
+    }
+
+    fn require_eof(&mut self) -> Result<(), NativeJobError> {
+        if self.completed != self.total {
+            return Err(truncated("truncated block RisuSave source"));
+        }
+        let mut extra = [0u8; 1];
+        match self.source.read(&mut extra) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(corrupt(
+                "source bytes were appended after the selected file was opened",
+            )),
+            Err(error) => Err(invalid_source(format!("source EOF check failed: {error}"))),
+        }
     }
 
     fn complete_item(&mut self) -> Result<(), NativeJobError> {
@@ -1067,6 +1132,10 @@ fn compatibility_fallback(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("compatibility-fallback", message)
 }
 
+fn unsupported(message: impl AsRef<str>) -> NativeJobError {
+    NativeJobError::new("unsupported-format", message)
+}
+
 fn truncated(message: impl AsRef<str>) -> NativeJobError {
     NativeJobError::new("truncated-input", message)
 }
@@ -1115,6 +1184,7 @@ mod tests {
     use super::super::*;
     use super::*;
     use crate::persistent_store::{PersistentStore, RevisionResult, StagingResult, StoreResult};
+    use base64::Engine;
     use flate2::{write::GzEncoder, Compression, GzBuilder};
     use serde_json::{json, Value};
     use std::fs;
@@ -1303,7 +1373,7 @@ mod tests {
         let registry = JobRegistry::default();
         let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
 
-        let error = restore_block_risu_save(&source, 1, &job, &sink).unwrap_err();
+        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
 
         assert!(
             error.message.contains(expected),
@@ -1398,7 +1468,7 @@ mod tests {
         let registry = JobRegistry::default();
         let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
 
-        let result = restore_block_risu_save(&source, 1, &job, &sink).unwrap();
+        let result = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
 
         assert_eq!(result.revision, 2);
         assert_eq!(result.character_count, 1);
@@ -1913,7 +1983,7 @@ mod tests {
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
 
-        let result = restore_block_risu_save(&exported_path, 1, &job, &sink).unwrap();
+        let result = restore_block_risu_save_path(&exported_path, 1, &job, &sink).unwrap();
 
         assert_eq!(result.revision, 2);
         assert_eq!(result.character_count, 1);
@@ -1931,6 +2001,28 @@ mod tests {
         let mut duplicate = valid_blocks();
         duplicate.push(block(4, false, "preset", &json!([])));
         assert_failed_restore_preserves_active(&save_bytes(duplicate), "duplicate block");
+    }
+
+    #[test]
+    fn js_compatible_subset_block_requests_structured_fallback() {
+        let mut blocks = valid_blocks();
+        blocks.push(block(
+            8,
+            false,
+            "custom-root-component",
+            &json!({ "key": "customField", "data": { "retained": true } }),
+        ));
+        let (directory, sink) = fixture();
+        let source = directory.path().join("root-component.risudat");
+        fs::write(&source, save_bytes(blocks)).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
+
+        assert_eq!(error.code, "unsupported-format");
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
     }
 
     #[test]
@@ -1976,6 +2068,106 @@ mod tests {
     }
 
     #[test]
+    fn legacy_header_is_restored_through_the_native_job_entrypoint() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("legacy.risudat");
+        let raw_fixture = base64::engine::general_purpose::STANDARD
+            .decode(include_str!(
+                "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/risusave-raw-v4.input.base64"
+            ).trim())
+            .unwrap();
+        fs::write(&source, raw_fixture).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        assert!(result.character_count > 0);
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 2);
+    }
+
+    #[test]
+    fn opened_source_identity_survives_path_replacement_without_reopening() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("selected.risudat");
+        valid_save(&source);
+        let opened = open_job_source(
+            directory.path(),
+            &JobSource::DesktopPath {
+                path: source.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        let moved = directory.path().join("selected-original.risudat");
+        fs::rename(&source, &moved).unwrap();
+        fs::write(&source, b"replacement path bytes").unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_block_risu_save(opened, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        assert_eq!(result.character_count, 1);
+    }
+
+    #[test]
+    fn bytes_appended_after_single_open_are_rejected_before_activation() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("selected.risudat");
+        valid_save(&source);
+        let opened = open_job_source(
+            directory.path(),
+            &JobSource::DesktopPath {
+                path: source.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        let mut append = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        append.write_all(b"appended after picker open").unwrap();
+        append.sync_all().unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let error = restore_block_risu_save(opened, 1, &job, &sink).unwrap_err();
+
+        assert_eq!(error.code, "corrupt-input");
+        assert!(error.message.contains("appended"));
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+    }
+
+    #[test]
+    fn source_shrunk_after_single_open_is_truncated_before_activation() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("selected.risudat");
+        valid_save(&source);
+        let opened = open_job_source(
+            directory.path(),
+            &JobSource::DesktopPath {
+                path: source.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(RISU_SAVE_HEADER.len() as u64)
+            .unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let error = restore_block_risu_save(opened, 1, &job, &sink).unwrap_err();
+
+        assert_eq!(error.code, "truncated-input");
+        assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
+    }
+
+    #[test]
     fn strict_restore_rejects_invalid_required_block_shapes() {
         let mut modules = valid_blocks();
         modules[2] = block(5, false, "modules", &json!({ "not": "an array" }));
@@ -1996,7 +2188,7 @@ mod tests {
         let registry = JobRegistry::default();
         let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
         registry.cancel(&job.id()).unwrap();
-        let error = restore_block_risu_save(&source, 1, &job, &sink).unwrap_err();
+        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
         assert_eq!(error.code, "cancelled");
         assert!(error.message.contains("cancelled"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
@@ -2007,7 +2199,7 @@ mod tests {
         let job = JobRegistry::default()
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
-        let error = restore_block_risu_save(&source, 0, &job, &sink).unwrap_err();
+        let error = restore_block_risu_save_path(&source, 0, &job, &sink).unwrap_err();
         assert_eq!(error.code, "revision-conflict");
         assert!(error.message.contains("revision conflict"));
         assert_eq!(sink.store.lock().unwrap().revision().unwrap(), 1);
@@ -2059,7 +2251,7 @@ mod tests {
             job: &job,
         };
 
-        let error = restore_block_risu_save(&source, 1, &job, &cancelling).unwrap_err();
+        let error = restore_block_risu_save_path(&source, 1, &job, &cancelling).unwrap_err();
 
         assert_eq!(error.code, "cancelled");
         assert_eq!(sink.abort_calls.load(Ordering::Acquire), 1);
@@ -2102,7 +2294,7 @@ mod tests {
         let job = JobRegistry::default()
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
-        let error = restore_block_risu_save_with_limits(
+        let error = restore_block_risu_save_path_with_limits(
             &source,
             1,
             &job,
@@ -2140,7 +2332,7 @@ mod tests {
             .create(JobKind::RestoreBlockRisuSave)
             .unwrap();
 
-        let error = restore_block_risu_save(&source, 1, &job, &sink).unwrap_err();
+        let error = restore_block_risu_save_path(&source, 1, &job, &sink).unwrap_err();
 
         assert_eq!(error.code, "store-error");
         assert!(error.message.contains("simulated disk full"));
