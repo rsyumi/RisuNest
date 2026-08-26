@@ -151,7 +151,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
     }
 
     readAssetAlias(key: string): Promise<Versioned<AssetAlias> | null> {
-        return invokeStore('pds_read_asset_alias', { key })
+        return invokeStore('pds_read_asset_alias', { kind: 'asset', key })
     }
 
     readAssetOwnerHead(
@@ -274,7 +274,7 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             },
             readAssetAlias: async (key) => {
                 assertActive()
-                return invokeStore('pds_read_asset_alias', { key, lease })
+                return invokeStore('pds_read_asset_alias', { kind: 'asset', key, lease })
             },
             readAssetOwnerHead: async (owner) => {
                 assertActive()

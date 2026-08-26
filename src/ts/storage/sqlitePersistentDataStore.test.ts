@@ -88,7 +88,7 @@ describe('SqlitePersistentDataStore', () => {
             ['pds_read_conversation_window', { query: windowQuery }],
             ['pds_query_plugin_storage', {}],
             ['pds_read_plugin_storage', { key: 'memory' }],
-            ['pds_read_asset_alias', { key: alias.key }],
+            ['pds_read_asset_alias', { kind: 'asset', key: alias.key }],
             ['pds_read_asset_owner_head', { owner }],
             ['pds_commit_asset_alias', { alias, expectedRevision: 8 }],
             ['pds_commit', { commit }],
@@ -313,7 +313,10 @@ describe('SqlitePersistentDataStore', () => {
             ],
             ['pds_query_plugin_storage', { lease: 'lease-7' }],
             ['pds_read_plugin_storage', { key: 'memory', lease: 'lease-7' }],
-            ['pds_read_asset_alias', { key: 'assets/pinned.bin', lease: 'lease-7' }],
+            [
+                'pds_read_asset_alias',
+                { kind: 'asset', key: 'assets/pinned.bin', lease: 'lease-7' },
+            ],
             [
                 'pds_read_asset_owner_head',
                 { owner: { kind: 'root-module-assets', index: 0 }, lease: 'lease-7' },

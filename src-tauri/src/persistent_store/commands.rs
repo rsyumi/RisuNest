@@ -231,17 +231,6 @@ pub(crate) fn pds_read_asset_owner_head(
 }
 
 #[tauri::command(async)]
-pub(crate) fn pds_read_asset_owner_head(
-    state: State<'_, PersistentStoreState>,
-    owner: AssetOwnerLocator,
-    lease: Option<String>,
-) -> Result<Option<Versioned<AssetOwnerHead>>, StoreError> {
-    with_store(state, |store| {
-        store.read_asset_owner_head(&owner, lease.as_deref())
-    })
-}
-
-#[tauri::command(async)]
 pub(crate) fn pds_commit_asset_alias(
     state: State<'_, PersistentStoreState>,
     alias: AssetAlias,

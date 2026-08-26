@@ -29,7 +29,6 @@ pub(super) fn commit_asset_alias(
 }
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
 
 pub(super) fn commit(
     connection: &mut Connection,

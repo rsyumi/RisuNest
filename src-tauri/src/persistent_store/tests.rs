@@ -5069,6 +5069,7 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
     let generation = super::active_generation(&store.connection).expect("read active generation");
     let manifest_hash = "a".repeat(64);
     let object_hash = "b".repeat(64);
+    let cold_object_hash = "c".repeat(64);
     store
         .connection
         .execute(
@@ -5109,6 +5110,14 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
     store
         .connection
         .execute(
+            "INSERT INTO cold_aliases (generation, key, object_hash, size, metadata)
+             VALUES (?1, 'cold-chat', ?2, 1, '{}')",
+            rusqlite::params![generation, cold_object_hash],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
             "INSERT INTO asset_owner_heads (
                 generation, owner_kind, owner_locator, present, manifest_hash, entry_count
              ) VALUES (?1, 'root-module-assets', 'module-1', 1, ?2, 1)",
@@ -5132,7 +5141,10 @@ fn snapshot_creation_persists_asset_roots_before_returning() {
 
     assert_eq!(sidecar.revision, 1);
     assert_eq!(sidecar.roots.manifest_hashes, [manifest_hash].into());
-    assert_eq!(sidecar.roots.object_hashes, [object_hash].into());
+    assert_eq!(
+        sidecar.roots.object_hashes,
+        [object_hash, cold_object_hash].into()
+    );
     assert_eq!(
         sidecar.roots.legacy_asset_keys,
         [
@@ -5179,6 +5191,7 @@ fn asset_gc_dry_run_keeps_leased_generation_roots_until_release() {
         inlay_type: None,
         width: None,
         height: None,
+        metadata: json!({}),
     };
     let first = store.commit_asset_alias(&original, 0).unwrap();
     let lease = store.acquire_revision(first.revision).unwrap();

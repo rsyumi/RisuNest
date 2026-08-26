@@ -405,6 +405,11 @@ pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetR
         &mut roots.manifest_hashes,
     )?;
     scan_asset_alias_roots(connection, &mut roots)?;
+    scan_optional_hash_column(
+        connection,
+        "SELECT object_hash FROM cold_aliases WHERE object_hash IS NOT NULL",
+        &mut roots.object_hashes,
+    )?;
 
     for query in [
         "SELECT value FROM root",
