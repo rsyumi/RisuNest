@@ -310,19 +310,17 @@ fn stage_legacy_database(
     job: &JobControl,
     sink: &dyn ReplacementSink,
 ) -> Result<ParsedCounts, NativeJobError> {
-    let mut root = value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| invalid("legacy MessagePack database must be an object"))?;
-    let characters = root
-        .remove("characters")
-        .and_then(|value| value.as_array().cloned())
-        .ok_or_else(|| invalid("legacy MessagePack characters must be an array"))?;
+    let mut root = match value {
+        Value::Object(root) => root,
+        _ => return Err(invalid("legacy MessagePack database must be an object")),
+    };
+    let characters = match root.remove("characters") {
+        Some(Value::Array(characters)) => characters,
+        _ => return Err(invalid("legacy MessagePack characters must be an array")),
+    };
     let presets = match root.remove("botPresets") {
-        Some(value) => value
-            .as_array()
-            .cloned()
-            .ok_or_else(|| invalid("legacy MessagePack botPresets must be an array"))?,
+        Some(Value::Array(presets)) => presets,
+        Some(_) => return Err(invalid("legacy MessagePack botPresets must be an array")),
         None => Vec::new(),
     };
     if let Some(storage) = root.get("pluginCustomStorage") {
