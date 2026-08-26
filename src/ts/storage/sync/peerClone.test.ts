@@ -514,6 +514,102 @@ describe('PeerClone facade', () => {
         expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_finalize')).toBe(false)
     })
 
+    it('locks one target identity before the first download await and uses one captured claim', async () => {
+        let releaseCapabilities: (() => void) | undefined
+        const capabilitiesBlocked = new Promise<void>((resolve) => {
+            releaseCapabilities = resolve
+        })
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') {
+                await capabilitiesBlocked
+                return productionCapabilities() as T
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(),
+        })
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+
+        const downloading = facade.download()
+        await Promise.resolve()
+        expect(() => facade.join(
+            pairingUri.replace('123e4567-e89b-12d3-a456-426614174000', '223e4567-e89b-42d3-a456-426614174000'),
+        )).toThrow('already owned')
+        releaseCapabilities?.()
+        await downloading
+
+        expect(invoke).toHaveBeenCalledWith('peer_clone_claim_client', {
+            endpoint: 'http://192.168.1.4:43123/',
+            sessionId: '123e4567-e89b-12d3-a456-426614174000',
+            manifestId: 'a'.repeat(64),
+            claim,
+        })
+        expect(invoke).toHaveBeenCalledWith('peer_clone_download', {
+            endpoint: 'http://192.168.1.4:43123/',
+            sessionId: '123e4567-e89b-12d3-a456-426614174000',
+            manifestId: 'a'.repeat(64),
+        })
+    })
+
+    it('discards a stale target status response after a different unowned pairing joins', async () => {
+        let resolveStatus: ((value: unknown) => void) | undefined
+        const status = new Promise((resolve) => {
+            resolveStatus = resolve
+        })
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_target_status') return await status as T
+            if (command === 'peer_clone_finalize') throw new Error('stale response finalized')
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(),
+        })
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+        const polling = facade.targetStatus()
+        const other = pairingUri.replace(
+            '123e4567-e89b-12d3-a456-426614174000',
+            '223e4567-e89b-42d3-a456-426614174000',
+        )
+        facade.join(other)
+        resolveStatus?.({ phase: 'awaitingActivation', completedBytes: 10, totalBytes: 10 })
+        await polling
+
+        expect(facade.getState().target).toMatchObject({
+            phase: 'joined',
+            pairing: { sessionId: '223e4567-e89b-42d3-a456-426614174000' },
+        })
+        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_finalize')).toBe(false)
+    })
+
+    it('retains a bounded native post-commit warning after refreshing the committed revision', async () => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_target_status') {
+                return { phase: 'awaitingActivation', completedBytes: 10, totalBytes: 10 } as T
+            }
+            if (command === 'peer_clone_finalize') {
+                return { revision: 42, warning: 'activation ledger cleanup failed' } as T
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(),
+        })
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+
+        await expect(facade.targetStatus()).resolves.toMatchObject({ phase: 'completed' })
+        expect(facade.getWarning()).toBe('activation ledger cleanup failed')
+    })
+
     it('reports web and Android as explicitly unsupported without invoking native commands', async () => {
         const invoke = vi.fn()
         expect(createPeerCloneFacade({ platform: 'web', invoke }).status()).toEqual({ kind: 'unsupported', platform: 'web' })

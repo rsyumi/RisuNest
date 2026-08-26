@@ -1,0 +1,212 @@
+import {
+    createPeerCloneFacade,
+    initialPeerCloneState,
+    type PeerCloneNativeCapabilities,
+    type PeerCloneReplacementRuntime,
+    type PeerCloneSourceStatus,
+    type PeerCloneState,
+} from './peerClone'
+
+type PeerCloneFacade = ReturnType<typeof createPeerCloneFacade>
+
+export interface PeerCloneControllerSnapshot {
+    capabilities?: PeerCloneNativeCapabilities
+    sourceStatus: PeerCloneSourceStatus
+    state: PeerCloneState
+    sourcePairingUri: string
+    error: string
+    warning: string
+}
+
+export interface PeerCloneControllerOptions {
+    facade: PeerCloneFacade
+    targetPollMilliseconds?: number
+    sourcePollMilliseconds?: number
+}
+
+export function createPeerCloneController(options: PeerCloneControllerOptions) {
+    const facade = options.facade
+    const listeners = new Set<(snapshot: PeerCloneControllerSnapshot) => void>()
+    let snapshot: PeerCloneControllerSnapshot = {
+        sourceStatus: { phase: 'idle', devices: [] },
+        state: initialPeerCloneState,
+        sourcePairingUri: '',
+        error: '',
+        warning: '',
+    }
+    let initialized = false
+    let initialization: Promise<void> | undefined
+    let sourceTimer: ReturnType<typeof setInterval> | undefined
+    let targetTimer: ReturnType<typeof setInterval> | undefined
+    let sourcePolling = false
+    let targetPolling = false
+
+    const publish = () => {
+        snapshot = {
+            ...snapshot,
+            state: facade.getState(),
+            warning: facade.getWarning(),
+        }
+        for (const listener of listeners) listener(snapshot)
+    }
+    const failure = (cause: unknown) => {
+        snapshot = { ...snapshot, error: cause instanceof Error ? cause.message : String(cause) }
+        publish()
+    }
+    const success = () => {
+        snapshot = { ...snapshot, error: '' }
+        publish()
+    }
+    const stopSourcePolling = () => {
+        if (sourceTimer) clearInterval(sourceTimer)
+        sourceTimer = undefined
+    }
+    const stopTargetPolling = () => {
+        if (targetTimer) clearInterval(targetTimer)
+        targetTimer = undefined
+    }
+    const pollSource = async () => {
+        if (sourcePolling) return
+        sourcePolling = true
+        try {
+            const sourceStatus = await facade.sourceStatus()
+            snapshot = { ...snapshot, sourceStatus, error: '' }
+            if (sourceStatus.phase !== 'running' && sourceStatus.phase !== 'stopping') {
+                stopSourcePolling()
+            }
+            publish()
+        } catch (cause) {
+            failure(cause)
+        } finally {
+            sourcePolling = false
+        }
+    }
+    const pollTarget = async () => {
+        if (targetPolling) return
+        targetPolling = true
+        try {
+            await facade.targetStatus()
+            success()
+            const phase = facade.getState().target.phase
+            if (phase === 'completed' || phase === 'failed') stopTargetPolling()
+        } catch (cause) {
+            failure(cause)
+            if (facade.getState().target.phase === 'failed') stopTargetPolling()
+        } finally {
+            targetPolling = false
+        }
+    }
+    const beginSourcePolling = () => {
+        if (!sourceTimer) {
+            sourceTimer = setInterval(() => void pollSource(), options.sourcePollMilliseconds ?? 1_000)
+        }
+    }
+    const beginTargetPolling = () => {
+        if (!targetTimer) {
+            targetTimer = setInterval(() => void pollTarget(), options.targetPollMilliseconds ?? 500)
+        }
+    }
+    const run = async <T>(operation: () => Promise<T>): Promise<T> => {
+        try {
+            const result = await operation()
+            success()
+            return result
+        } catch (cause) {
+            failure(cause)
+            throw cause
+        }
+    }
+
+    return {
+        snapshot: () => snapshot,
+        subscribe(listener: (value: PeerCloneControllerSnapshot) => void): () => void {
+            listeners.add(listener)
+            listener(snapshot)
+            return () => listeners.delete(listener)
+        },
+        initialize(): Promise<void> {
+            if (initialized) return initialization ?? Promise.resolve()
+            initialized = true
+            initialization = Promise.all([
+                facade.capabilities().then((capabilities) => {
+                    snapshot = { ...snapshot, capabilities }
+                }),
+                facade.sourceStatus().then((sourceStatus) => {
+                    snapshot = { ...snapshot, sourceStatus }
+                    if (sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
+                        beginSourcePolling()
+                    }
+                }),
+            ]).then(() => success()).catch((cause) => failure(cause))
+            return initialization
+        },
+        clearError(): void {
+            success()
+        },
+        join(pairingUri: string): void {
+            facade.join(pairingUri)
+            success()
+        },
+        confirmDestructiveReplace(): void {
+            facade.confirmDestructiveReplace()
+            success()
+        },
+        prepare: () => run(async () => {
+            const sourceStatus = await facade.prepare()
+            snapshot = { ...snapshot, sourceStatus }
+            return sourceStatus
+        }),
+        start: (sessionId: string) => run(async () => {
+            const sourceStatus = await facade.start(sessionId)
+            snapshot = {
+                ...snapshot,
+                sourceStatus,
+                sourcePairingUri: sourceStatus.pairingUri ?? '',
+            }
+            beginSourcePolling()
+            return sourceStatus
+        }),
+        stop: (sessionId: string) => run(async () => {
+            try {
+                await facade.stop(sessionId)
+            } finally {
+                const sourceStatus = await facade.sourceStatus()
+                snapshot = { ...snapshot, sourceStatus }
+                if (sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
+                    beginSourcePolling()
+                } else {
+                    stopSourcePolling()
+                }
+            }
+            snapshot = { ...snapshot, sourcePairingUri: '' }
+        }),
+        revoke: (sessionId: string, deviceId: string) => run(async () => {
+            await facade.revoke(sessionId, deviceId)
+            snapshot = { ...snapshot, sourceStatus: await facade.sourceStatus() }
+        }),
+        download: () => run(async () => {
+            await facade.download()
+            beginTargetPolling()
+        }),
+        resume: () => run(async () => {
+            await facade.resume()
+            beginTargetPolling()
+        }),
+        cancel: () => run(async () => {
+            await facade.cancel()
+            stopTargetPolling()
+        }),
+    }
+}
+
+let desktopPeerCloneController: ReturnType<typeof createPeerCloneController> | undefined
+
+export function getDesktopPeerCloneController(runtime: PeerCloneReplacementRuntime) {
+    desktopPeerCloneController ??= createPeerCloneController({
+        facade: createPeerCloneFacade({
+            platform: 'desktop',
+            runtime,
+        }),
+    })
+    return desktopPeerCloneController
+}

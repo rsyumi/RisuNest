@@ -4,31 +4,27 @@
     import { language } from 'src/lang'
     import { alertConfirm } from 'src/ts/alert'
     import {
-        createPeerCloneFacade,
         initialPeerCloneState,
         pairingUriForQr,
         type PeerCloneNativeCapabilities,
         type PeerCloneSourceStatus,
         type PeerCloneState,
     } from 'src/ts/storage/sync/peerClone'
+    import { getDesktopPeerCloneController } from 'src/ts/storage/sync/peerCloneController'
     import {
         consumePendingPeerCloneUri,
         subscribePeerCloneUri,
     } from 'src/ts/storage/sync/peerCloneDeepLink'
-    import Button from 'src/lib/UI/GUI/Button.svelte'
     import {
         acquireDestructiveReplacementFence,
         capturePersistentMutationToken,
         flushPendingData,
     } from 'src/ts/storage/persistentDataRuntime.svelte'
-
-    const facade = createPeerCloneFacade({
-        platform: 'desktop',
-        runtime: {
-            flushPendingData,
-            capturePersistentMutationToken,
-            acquireDestructiveReplacementFence,
-        },
+    import Button from 'src/lib/UI/GUI/Button.svelte'
+    const controller = getDesktopPeerCloneController({
+        flushPendingData,
+        capturePersistentMutationToken,
+        acquireDestructiveReplacementFence,
     })
     let capabilities = $state<PeerCloneNativeCapabilities>()
     let sourceStatus = $state<PeerCloneSourceStatus>({ phase: 'idle', devices: [] })
@@ -38,8 +34,6 @@
     let qrDataUrl = $state('')
     let busy = $state(false)
     let error = $state('')
-    let progressTimer: ReturnType<typeof setInterval> | undefined
-    let sourceTimer: ReturnType<typeof setInterval> | undefined
 
     const sourceEnabled = $derived(!!(
         capabilities?.productionEnabled
@@ -60,14 +54,19 @@
     }
 
     function refreshState(): void {
-        cloneState = facade.getState()
+        const snapshot = controller.snapshot()
+        cloneState = snapshot.state
+        sourceStatus = snapshot.sourceStatus
+        capabilities = snapshot.capabilities
+        sourcePairingUri = snapshot.sourcePairingUri
+        error = snapshot.error || snapshot.warning
     }
 
     function acceptPairingUri(uri: string): void {
         pairingInput = uri
         error = ''
         try {
-            facade.join(uri)
+            controller.join(uri)
             refreshState()
         } catch {
             error = language.peerClone.invalidLink
@@ -90,119 +89,79 @@
 
     async function prepareSource(): Promise<void> {
         await withBusy(async () => {
-            sourceStatus = await facade.prepare()
+            sourceStatus = await controller.prepare()
         })
     }
 
     async function startSource(): Promise<void> {
         if (!sourceStatus.sessionId) return
         await withBusy(async () => {
-            sourceStatus = await facade.start(sourceStatus.sessionId!)
+            sourceStatus = await controller.start(sourceStatus.sessionId!)
             sourcePairingUri = sourceStatus.pairingUri ?? ''
-            if (sourcePairingUri) {
-                const { default: QRCode } = await import('qrcode')
-                qrDataUrl = await QRCode.toDataURL(pairingUriForQr(sourcePairingUri), { margin: 1, width: 256 })
-            }
-            beginSourcePolling()
+            await updateSourceQr(sourcePairingUri)
         })
+    }
+
+    async function updateSourceQr(pairingUri: string): Promise<void> {
+        if (!pairingUri) return
+        const { default: QRCode } = await import('qrcode')
+        qrDataUrl = await QRCode.toDataURL(pairingUriForQr(pairingUri), { margin: 1, width: 256 })
+    }
+
+    async function restoreSourceQr(): Promise<void> {
+        const pairingUri = controller.snapshot().sourcePairingUri
+        if (!pairingUri || qrDataUrl) return
+        await updateSourceQr(pairingUri)
     }
 
     async function stopSource(): Promise<void> {
         if (!sourceStatus.sessionId) return
         await withBusy(async () => {
-            await facade.stop(sourceStatus.sessionId!)
-            sourceStatus = { ...sourceStatus, phase: 'stopped', devices: [] }
+            await controller.stop(sourceStatus.sessionId!)
+            refreshState()
             sourcePairingUri = ''
             qrDataUrl = ''
-            if (sourceTimer) clearInterval(sourceTimer)
-            sourceTimer = undefined
         })
     }
 
     async function revokeDevice(deviceId: string): Promise<void> {
         if (!sourceStatus.sessionId) return
         await withBusy(async () => {
-            await facade.revoke(sourceStatus.sessionId!, deviceId)
-            sourceStatus = await facade.sourceStatus()
+            await controller.revoke(sourceStatus.sessionId!, deviceId)
+            refreshState()
         })
-    }
-
-    function beginProgressPolling(): void {
-        if (progressTimer) clearInterval(progressTimer)
-        progressTimer = setInterval(() => {
-            void facade.targetStatus()
-                .then(() => {
-                    refreshState()
-                    if (cloneState.target.phase === 'completed' || cloneState.target.phase === 'failed') {
-                        if (progressTimer) clearInterval(progressTimer)
-                        progressTimer = undefined
-                    }
-                })
-                .catch((cause) => {
-                    refreshState()
-                    if (cloneState.target.phase === 'failed') {
-                        if (progressTimer) clearInterval(progressTimer)
-                        progressTimer = undefined
-                    }
-                    reportError(cause)
-                })
-        }, 500)
-    }
-
-    function beginSourcePolling(): void {
-        if (sourceTimer) clearInterval(sourceTimer)
-        sourceTimer = setInterval(() => {
-            void facade.sourceStatus()
-                .then((value) => {
-                    sourceStatus = value
-                    if (value.phase !== 'running') {
-                        if (sourceTimer) clearInterval(sourceTimer)
-                        sourceTimer = undefined
-                    }
-                })
-                .catch((cause) => {
-                    if (sourceTimer) clearInterval(sourceTimer)
-                    sourceTimer = undefined
-                    reportError(cause)
-                })
-        }, 1000)
     }
 
     async function downloadClone(): Promise<void> {
         if (!await alertConfirm(language.peerClone.replacementConfirm)) return
-        facade.confirmDestructiveReplace()
+        controller.confirmDestructiveReplace()
         await withBusy(async () => {
-            await facade.download()
-            beginProgressPolling()
+            await controller.download()
         })
     }
 
     async function resumeClone(): Promise<void> {
         await withBusy(async () => {
-            await facade.resume()
-            beginProgressPolling()
+            await controller.resume()
         })
     }
 
     async function cancelClone(): Promise<void> {
         await withBusy(async () => {
-            await facade.cancel()
-            if (progressTimer) clearInterval(progressTimer)
-            progressTimer = undefined
+            await controller.cancel()
         })
     }
 
     onMount(() => {
+        const unsubscribeController = controller.subscribe(() => refreshState())
+        void controller.initialize()
+        void restoreSourceQr().catch(reportError)
         const pendingUri = consumePendingPeerCloneUri()
         if (pendingUri) acceptPairingUri(pendingUri)
         const unsubscribe = subscribePeerCloneUri(acceptPairingUri)
-        void facade.capabilities().then((value) => {
-            capabilities = value
-        }).catch(reportError)
         return () => {
             unsubscribe()
-            if (progressTimer) clearInterval(progressTimer)
-            if (sourceTimer) clearInterval(sourceTimer)
+            unsubscribeController()
         }
     })
 </script>
@@ -228,7 +187,7 @@
             >{language.peerClone.start}</Button>
             <Button
                 styled="danger"
-                disabled={busy || sourceStatus.phase !== 'running'}
+                disabled={busy || !['prepared', 'running', 'stopping'].includes(sourceStatus.phase)}
                 onclick={stopSource}
             >{language.peerClone.stop}</Button>
         </div>

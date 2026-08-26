@@ -273,6 +273,9 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
     const nativeInvoke = options.invoke ?? invoke
     let state = initialPeerCloneState
     let finalization: Promise<PeerCloneTargetStatus> | undefined
+    let targetIdentityEpoch = 0
+    let warning = ''
+    let ownedTarget: { endpoint: string; sessionId: string; manifestId: string } | undefined
     let pendingRefresh: {
         request: { endpoint: string; sessionId: string; manifestId: string }
         revision: number
@@ -285,6 +288,13 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         }
         const { endpoint, sessionId, manifestId } = state.target.pairing
         return { endpoint, sessionId, manifestId }
+    }
+    const ownTarget = (request: { endpoint: string; sessionId: string; manifestId: string }) => {
+        if (ownedTarget && !sameTargetRequest(ownedTarget, request)) {
+            throw new Error('Another peer clone target job is already owned')
+        }
+        ownedTarget ??= request
+        return request
     }
     const capabilities = async (): Promise<PeerCloneNativeCapabilities> => {
         supported()
@@ -313,8 +323,9 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 }
                 if (revision === undefined) {
                     nativeStarted = true
-                    const result = await nativeInvoke<{ revision: number }>('peer_clone_finalize', request)
+                    const result = await nativeInvoke<{ revision: number; warning?: string }>('peer_clone_finalize', request)
                     revision = result.revision
+                    warning = result.warning ?? ''
                     pendingRefresh = { request, revision, fence }
                 }
                 await fence.refreshCommittedWorkingSet(revision)
@@ -323,6 +334,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 fence = undefined
                 const completed = { ...awaiting, phase: 'completed' as const }
                 state = reducePeerCloneState(state, { type: 'target-completed' })
+                ownedTarget = undefined
                 return completed
             } catch (error) {
                 if (nativeStarted && !pendingRefresh) {
@@ -366,12 +378,22 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 : { kind: 'unsupported', platform: options.platform }
         },
         getState: () => state,
+        getWarning: () => warning,
         capabilities,
         join(pairingUri: string): PeerCloneState {
             if (finalization || pendingRefresh) {
                 throw new Error('Peer clone target finalization is still active')
             }
-            state = reducePeerCloneState(state, { type: 'target-joined', pairing: parsePeerCloneUri(pairingUri) })
+            const pairing = parsePeerCloneUri(pairingUri)
+            if (ownedTarget) {
+                if (!sameTargetRequest(ownedTarget, pairing)) {
+                    throw new Error('Another peer clone target job is already owned')
+                }
+                return state
+            }
+            warning = ''
+            targetIdentityEpoch += 1
+            state = reducePeerCloneState(state, { type: 'target-joined', pairing })
             return state
         },
         confirmDestructiveReplace(): PeerCloneState {
@@ -410,56 +432,61 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         },
         async download(): Promise<void> {
             supported()
-            const args = targetArgs()
-            await requireTargetReady()
-            const pairing = state.target.pairing!
-            await nativeInvoke('peer_clone_claim_client', {
+            const pairing = state.target.pairing
+            if (!state.target.destructiveConfirmed || !pairing) {
+                throw new Error('Peer clone target requires destructive replacement confirmation')
+            }
+            const args = ownTarget({
                 endpoint: pairing.endpoint,
                 sessionId: pairing.sessionId,
                 manifestId: pairing.manifestId,
-                claim: pairing.claim,
+            })
+            const pairingClaim = pairing.claim
+            await requireTargetReady()
+            await nativeInvoke('peer_clone_claim_client', {
+                ...args,
+                claim: pairingClaim,
             })
             await nativeInvoke('peer_clone_download', args)
             state = reducePeerCloneState(state, { type: 'target-resumed' })
         },
         async resume(): Promise<void> {
             supported()
-            const args = targetArgs()
+            const args = ownTarget(targetArgs())
             await requireTargetReady()
             await nativeInvoke('peer_clone_resume', args)
             state = reducePeerCloneState(state, { type: 'target-resumed' })
         },
         async cancel(): Promise<void> {
             supported()
-            await nativeInvoke('peer_clone_cancel', targetArgs())
+            await nativeInvoke('peer_clone_cancel', ownTarget(targetArgs()))
             state = reducePeerCloneState(state, { type: 'target-cancelled' })
         },
         async targetStatus(): Promise<PeerCloneTargetStatus> {
             supported()
             const pairing = state.target.pairing
             if (!pairing) throw new Error('Peer clone target has not joined a pairing')
-            const result = await nativeInvoke<PeerCloneTargetStatus>('peer_clone_target_status', {
+            const request = {
                 endpoint: pairing.endpoint,
                 sessionId: pairing.sessionId,
                 manifestId: pairing.manifestId,
+            }
+            const identityEpoch = targetIdentityEpoch
+            const result = await nativeInvoke<PeerCloneTargetStatus>('peer_clone_target_status', {
+                ...request,
             })
+            if (identityEpoch !== targetIdentityEpoch
+                || !state.target.pairing
+                || !sameTargetRequest(state.target.pairing, request)) return result
             if (result.phase === 'awaitingActivation') {
                 state = reducePeerCloneState(state, {
                     type: 'target-progress',
                     completedBytes: result.completedBytes,
                     totalBytes: result.totalBytes,
                 })
-                return finalizeTarget(result, {
-                    endpoint: pairing.endpoint,
-                    sessionId: pairing.sessionId,
-                    manifestId: pairing.manifestId,
-                })
+                return finalizeTarget(result, request)
             } else if (result.phase === 'completed' && pendingRefresh) {
-                return finalizeTarget(result, {
-                    endpoint: pairing.endpoint,
-                    sessionId: pairing.sessionId,
-                    manifestId: pairing.manifestId,
-                })
+                return finalizeTarget(result, request)
             } else if (result.phase === 'downloading' || result.phase === 'activating') {
                 state = reducePeerCloneState(state, {
                     type: 'target-progress',
@@ -470,6 +497,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 state = reducePeerCloneState(state, { type: 'target-cancelled' })
             } else if (result.phase === 'completed') {
                 state = reducePeerCloneState(state, { type: 'target-completed' })
+                ownedTarget = undefined
             } else if (result.phase === 'failed') {
                 state = reducePeerCloneState(state, { type: 'target-failed' })
             }
