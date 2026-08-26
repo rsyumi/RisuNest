@@ -23,6 +23,7 @@ import {
     createOfficialAssociationMarkers,
     type OfficialAccountSnapshotDependencies,
     type OfficialAssociationMarkers,
+    type OfficialNativeDatabasePublisher,
     type OfficialSyncConflictBackupInput,
     type OfficialSyncConflictContext,
     type OfficialSyncConflictHandler,
@@ -137,6 +138,9 @@ interface HarnessOptions {
     association?: OfficialAssociationMarkers
     conflict?: OfficialSyncConflictHandler
     now?: () => number
+    nativeDatabasePublisher?: OfficialNativeDatabasePublisher
+    flushPublicationMetadata?: () => Promise<void>
+    events?: string[]
 }
 
 function memoryLedgerStorage(): LedgerStorage {
@@ -170,7 +174,7 @@ async function makeHarness(options: HarnessOptions = {}) {
         ['cold-message', { message: [{ data: 'local message' }] }],
     ])
     const remoteCold = options.remoteCold ?? new Map<string, unknown>()
-    const events: string[] = []
+    const events = options.events ?? []
     const writes: Array<{ key: string; bytes?: Uint8Array; value?: unknown }> = []
     const readItem = vi.fn(async (key: string): Promise<AccountReadResult> => {
         if (key === databaseKey) {
@@ -207,6 +211,8 @@ async function makeHarness(options: HarnessOptions = {}) {
         association: options.association,
         conflict: options.conflict,
         now: options.now,
+        nativeDatabasePublisher: options.nativeDatabasePublisher,
+        flushPublicationMetadata: options.flushPublicationMetadata,
     }
     const adapter = new OfficialAccountSnapshotAdapter(dependencies)
     return {
@@ -230,6 +236,171 @@ async function makeHarness(options: HarnessOptions = {}) {
 }
 
 describe('OfficialAccountSnapshotAdapter publication', () => {
+    it('publishes the exact replacement projection natively and finalizes it durably in order', async () => {
+        const events: string[] = []
+        const fingerprint = 'a'.repeat(64)
+        const association: OfficialAssociationMarkers = {
+            load: vi.fn(() => null),
+            save: vi.fn(() => events.push('association')),
+        }
+        const acknowledge = vi.fn(async () => { events.push('acknowledge') })
+        const completeReload = vi.fn(async () => { events.push('reload') })
+        const nativeDatabasePublisher = vi.fn<OfficialNativeDatabasePublisher>(async () => {
+            events.push('native-database')
+            return { databaseFingerprint: fingerprint, acknowledge, completeReload }
+        })
+        const harness = await makeHarness({
+            accountId: 'account-1',
+            association,
+            nativeDatabasePublisher,
+            flushPublicationMetadata: vi.fn(async () => { events.push('metadata-flush') }),
+            events,
+        })
+        harness.markPublished.mockImplementation(async () => { events.push('mark-published') })
+        const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        const lease = await acquireRevision.mock.results[0].value
+        const releaseLease = lease.release.bind(lease)
+        vi.spyOn(lease, 'release').mockImplementation(async () => {
+            events.push('lease-release')
+            await releaseLease()
+        })
+
+        await publication.publish()
+
+        expect(nativeDatabasePublisher).toHaveBeenCalledOnce()
+        const input = nativeDatabasePublisher.mock.calls[0][0]
+        expect(input).toMatchObject({
+            revision: harness.imported.revision,
+            accountId: 'account-1',
+        })
+        expect(input).not.toHaveProperty('bytes')
+        expect(input).not.toHaveProperty('path')
+        expect(Object.keys(input.resourceReplacements)).toEqual(
+            Object.keys(input.resourceReplacements).sort(),
+        )
+        for (const [local, remote] of Object.entries(input.resourceReplacements)) {
+            expect(local).toMatch(/^assets\//)
+            expect(remote).toBe(`remote/${local}`)
+        }
+        expect(harness.writeItem.mock.calls.some(([key]) => key === databaseKey)).toBe(false)
+        expect(events.slice(-7)).toEqual([
+            'native-database',
+            'mark-published',
+            'association',
+            'metadata-flush',
+            'acknowledge',
+            'lease-release',
+            'reload',
+        ])
+    })
+
+    it('falls back before native job acceptance but never after a native publication failure', async () => {
+        const unavailable = vi.fn<OfficialNativeDatabasePublisher>(async () => null)
+        const fallback = await makeHarness({
+            accountId: 'account-1',
+            nativeDatabasePublisher: unavailable,
+        })
+
+        await (await fallback.adapter.pin(fallback.imported.revision)).publish()
+
+        expect(unavailable).toHaveBeenCalledOnce()
+        expect(fallback.writeItem.mock.calls.some(([key]) => key === databaseKey)).toBe(true)
+
+        const failed = vi.fn<OfficialNativeDatabasePublisher>(async () => {
+            throw new Error('native publication failed after acceptance')
+        })
+        const noFallback = await makeHarness({
+            accountId: 'account-1',
+            nativeDatabasePublisher: failed,
+        })
+        const publication = await noFallback.adapter.pin(noFallback.imported.revision)
+
+        await expect(publication.publish()).rejects.toThrow(
+            'native publication failed after acceptance',
+        )
+        expect(noFallback.writeItem.mock.calls.some(([key]) => key === databaseKey)).toBe(false)
+        expect(noFallback.markPublished).not.toHaveBeenCalled()
+    })
+
+    it('retries only local finalization after a native remote commit', async () => {
+        const events: string[] = []
+        const acknowledge = vi.fn(async () => { events.push('acknowledge') })
+        const nativeDatabasePublisher = vi.fn<OfficialNativeDatabasePublisher>(async () => {
+            events.push('native-database')
+            return {
+                databaseFingerprint: 'b'.repeat(64),
+                acknowledge,
+                completeReload: vi.fn(async () => { events.push('reload') }),
+            }
+        })
+        let flushAttempts = 0
+        const harness = await makeHarness({
+            accountId: 'account-1',
+            nativeDatabasePublisher,
+            flushPublicationMetadata: async () => {
+                events.push('metadata-flush')
+                if (flushAttempts++ === 0) throw new Error('metadata unavailable')
+            },
+        })
+        const publication = await harness.adapter.pin(harness.imported.revision)
+
+        await expect(publication.publish()).rejects.toThrow('metadata unavailable')
+        expect(nativeDatabasePublisher).toHaveBeenCalledOnce()
+        expect(acknowledge).not.toHaveBeenCalled()
+
+        await expect(publication.publish()).resolves.toBeUndefined()
+
+        expect(nativeDatabasePublisher).toHaveBeenCalledOnce()
+        expect(harness.markPublished).toHaveBeenCalledOnce()
+        expect(acknowledge).toHaveBeenCalledOnce()
+        expect(events).toEqual([
+            'native-database',
+            'metadata-flush',
+            'metadata-flush',
+            'acknowledge',
+            'reload',
+        ])
+    })
+
+    it('aborts an in-flight native publication and releases its lease only after the job settles', async () => {
+        let finishCancellation: () => void = () => undefined
+        const cancellationSettled = new Promise<void>((resolve) => {
+            finishCancellation = resolve
+        })
+        const aborted = new DOMException('native job cancelled', 'AbortError')
+        const nativeDatabasePublisher = vi.fn<OfficialNativeDatabasePublisher>(async ({ signal }) => {
+            await new Promise<void>((resolve) => {
+                if (signal?.aborted) return resolve()
+                signal?.addEventListener('abort', () => resolve(), { once: true })
+            })
+            await cancellationSettled
+            throw aborted
+        })
+        const harness = await makeHarness({
+            accountId: 'account-1',
+            nativeDatabasePublisher,
+        })
+        const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
+        const publication = await harness.adapter.pin(harness.imported.revision)
+        const lease = await acquireRevision.mock.results[0].value
+        const release = vi.spyOn(lease, 'release')
+
+        const publishing = publication.publish()
+        await vi.waitFor(() => expect(nativeDatabasePublisher).toHaveBeenCalledOnce())
+        const disposing = publication.dispose()
+        await vi.waitFor(() => expect(
+            nativeDatabasePublisher.mock.calls[0][0].signal?.aborted,
+        ).toBe(true))
+        expect(release).not.toHaveBeenCalled()
+
+        finishCancellation()
+        await expect(publishing).rejects.toBe(aborted)
+        await expect(disposing).resolves.toBeUndefined()
+        expect(release).toHaveBeenCalledOnce()
+        expect(harness.markPublished).not.toHaveBeenCalled()
+    })
+
     it('owns one exact lease, resolves one concrete BlobStore per pin, and releases after DB-last success', async () => {
         const harness = await makeHarness()
         const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')

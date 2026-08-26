@@ -32,7 +32,7 @@ type CompleteCharacter = character | groupChat
 type RootDatabase = PersistentRoot
 
 export interface PinnedPublication {
-    publish(): Promise<void>
+    publish(signal?: AbortSignal): Promise<void>
     dispose(): Promise<void>
 }
 

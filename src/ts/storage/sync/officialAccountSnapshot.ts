@@ -88,7 +88,26 @@ export interface OfficialAccountSnapshotDependencies {
     /** Decides diverged pulls and archives the overwritten side; absent means keep local. */
     conflict?: OfficialSyncConflictHandler
     now?(): number
+    nativeDatabasePublisher?: OfficialNativeDatabasePublisher
+    flushPublicationMetadata?(): Promise<void>
 }
+
+export interface OfficialNativeDatabasePublicationInput {
+    revision: DataRevision
+    accountId: string
+    resourceReplacements: Readonly<Record<string, string>>
+    signal?: AbortSignal
+}
+
+export interface OfficialNativeDatabasePublicationReceipt {
+    databaseFingerprint: string
+    acknowledge(): Promise<void>
+    completeReload(): Promise<void>
+}
+
+export type OfficialNativeDatabasePublisher = (
+    input: OfficialNativeDatabasePublicationInput,
+) => Promise<OfficialNativeDatabasePublicationReceipt | null>
 
 export type OfficialPullResult =
     | { kind: 'missing' }
@@ -149,6 +168,32 @@ async function fingerprintDatabase(bytes: Uint8Array): Promise<string> {
 function throwIfAborted(signal?: AbortSignal): void {
     if (!signal?.aborted) return
     throw signal.reason ?? new DOMException('The operation was aborted', 'AbortError')
+}
+
+function linkAbortSignals(signals: readonly (AbortSignal | undefined)[]): {
+    signal: AbortSignal
+    dispose(): void
+} {
+    const controller = new AbortController()
+    const listeners: Array<{ signal: AbortSignal; listener: () => void }> = []
+    for (const signal of signals) {
+        if (!signal) continue
+        if (signal.aborted) {
+            controller.abort(signal.reason)
+            break
+        }
+        const listener = () => controller.abort(signal.reason)
+        signal.addEventListener('abort', listener, { once: true })
+        listeners.push({ signal, listener })
+    }
+    return {
+        signal: controller.signal,
+        dispose() {
+            for (const { signal, listener } of listeners) {
+                signal.removeEventListener('abort', listener)
+            }
+        },
+    }
 }
 
 function requireWriteSuccess(result: AccountWriteResult, key: string): string {
@@ -273,6 +318,14 @@ class OfficialPinnedPublication implements PinnedPublication {
     private disposed = false
     private published = false
     private publicationCommitted = false
+    private nativeReceipt: OfficialNativeDatabasePublicationReceipt | null = null
+    private markedPublished = false
+    private associationApplied = false
+    private metadataFlushed = false
+    private acknowledged = false
+    private reloadCompleted = false
+    private inFlight: Promise<void> | null = null
+    private readonly disposalController = new AbortController()
 
     constructor(
         private readonly revision: DataRevision,
@@ -280,6 +333,7 @@ class OfficialPinnedPublication implements PinnedPublication {
         private readonly blobs: BlobStore,
         private readonly assets: readonly PinnedAsset[],
         private readonly coldValues: ReadonlyMap<string, PinnedColdValue>,
+        private readonly accountId: string | undefined,
         private readonly dependencies: OfficialAccountSnapshotDependencies,
         private readonly onPublished: (
             revision: DataRevision,
@@ -291,52 +345,115 @@ class OfficialPinnedPublication implements PinnedPublication {
         }
     }
 
-    async publish(): Promise<void> {
+    async publish(signal?: AbortSignal): Promise<void> {
         if (this.disposed) throw new Error('Official publication has been disposed')
         if (this.published) return
-        if (this.publicationCommitted) {
-            await this.release()
-            this.published = true
-            return
-        }
+        if (this.inFlight) return this.inFlight
+        const linked = linkAbortSignals([this.disposalController.signal, signal])
+        this.inFlight = this.publishOnce(linked.signal).finally(() => {
+            linked.dispose()
+            this.inFlight = null
+        })
+        return this.inFlight
+    }
 
+    private async publishOnce(signal: AbortSignal): Promise<void> {
+        if (this.publicationCommitted) return this.finalizePublication()
         for (const asset of this.assets) {
             if (this.replacements.has(asset.key)) continue
+            throwIfAborted(signal)
             const bytes = await this.blobs.read(asset.localKey)
+            throwIfAborted(signal)
             if (!bytes) throw new Error(`Missing pinned asset payload: ${asset.key}`)
-            const result = await this.dependencies.account.writeItem(asset.key, bytes)
+            const result = await this.dependencies.account.writeItem(asset.key, bytes, { signal })
             const replacementKey = requireWriteSuccess(result, asset.key)
             this.replacements.set(asset.key, replacementKey)
             this.dependencies.ledger.record(asset.key, replacementKey)
+            throwIfAborted(signal)
         }
 
         const replacementRecord = Object.fromEntries(this.replacements)
         for (const [key, pinned] of this.coldValues) {
             if (this.completedColdKeys.has(key)) continue
+            throwIfAborted(signal)
             const projected = replaceColdStoragePayloadResources(pinned.value, replacementRecord)
             const digest = await fingerprintText(canonicalJson(projected))
             if (digest !== this.dependencies.ledger.coldDigest(key)) {
-                await this.dependencies.cold.writeRemote(key, projected)
+                await this.dependencies.cold.writeRemote(key, projected, signal)
                 this.dependencies.ledger.recordCold(key, digest)
             }
             this.completedColdKeys.add(key)
+            throwIfAborted(signal)
+        }
+
+        throwIfAborted(signal)
+        if (this.dependencies.nativeDatabasePublisher && this.accountId) {
+            const receipt = await this.dependencies.nativeDatabasePublisher({
+                revision: this.revision,
+                accountId: this.accountId,
+                resourceReplacements: replacementRecord,
+                signal,
+            })
+            if (receipt) {
+                this.nativeReceipt = receipt
+                this.databaseFingerprint = receipt.databaseFingerprint
+                this.publicationCommitted = true
+                return this.finalizePublication()
+            }
         }
 
         this.databaseBytes ??= await concatenate(streamRisuSaveFromLease(this.lease, {
             replaceResources: replacementRecord,
         }))
+        throwIfAborted(signal)
         this.databaseFingerprint ??= await fingerprintDatabase(this.databaseBytes)
-        const result = await this.dependencies.account.writeItem(databaseKey, this.databaseBytes)
+        const result = await this.dependencies.account.writeItem(
+            databaseKey,
+            this.databaseBytes,
+            { signal },
+        )
         requireWriteSuccess(result, databaseKey)
-        await this.dependencies.markPublished(this.revision)
-        this.onPublished(this.revision, this.databaseFingerprint)
         this.publicationCommitted = true
+        return this.finalizePublication()
+    }
+
+    private async finalizePublication(): Promise<void> {
+        if (!this.databaseFingerprint) {
+            throw new Error('Official publication completed without a database fingerprint')
+        }
+        if (!this.markedPublished) {
+            await this.dependencies.markPublished(this.revision)
+            this.markedPublished = true
+        }
+        if (!this.associationApplied) {
+            this.onPublished(this.revision, this.databaseFingerprint)
+            this.associationApplied = true
+        }
+        if (this.nativeReceipt) {
+            if (!this.dependencies.flushPublicationMetadata) {
+                throw new Error('Native official publication metadata flush is not configured')
+            }
+            if (!this.metadataFlushed) {
+                await this.dependencies.flushPublicationMetadata()
+                this.metadataFlushed = true
+            }
+            if (!this.acknowledged) {
+                await this.nativeReceipt.acknowledge()
+                this.acknowledged = true
+            }
+        }
         await this.release()
+        if (this.nativeReceipt && !this.reloadCompleted) {
+            await this.nativeReceipt.completeReload()
+            this.reloadCompleted = true
+        }
         this.published = true
     }
 
     async dispose(): Promise<void> {
         if (this.disposed) return
+        this.disposalController.abort(new DOMException('Publication disposed', 'AbortError'))
+        if (this.inFlight) await this.inFlight.catch(() => undefined)
         await this.release()
         this.disposed = true
     }
@@ -459,6 +576,7 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
                 blobs,
                 assets,
                 coldValues,
+                references.accountId,
                 this.dependencies,
                 (publishedRevision, databaseFingerprint) => {
                     this.rememberAssociation(references.accountId, {
