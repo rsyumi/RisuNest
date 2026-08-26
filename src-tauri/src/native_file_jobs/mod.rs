@@ -806,9 +806,8 @@ impl NativeFileJobState {
             } => {
                 #[cfg(feature = "native-kei-upload-pilot")]
                 {
-                    let prepared = crate::persistent_store::commands::with_store_mut(
-                        app.state(),
-                        |store| {
+                    let prepared =
+                        crate::persistent_store::commands::with_store_mut(app.state(), |store| {
                             store.prepare_kei_job_upload(
                                 &lease,
                                 expected_revision,
@@ -816,9 +815,8 @@ impl NativeFileJobState {
                                 &expected_account_id,
                                 &token,
                             )
-                        },
-                    )
-                    .map_err(native_store_error)?;
+                        })
+                        .map_err(native_store_error)?;
                     NativeFileJobTask::KeiBackup { prepared }
                 }
                 #[cfg(not(feature = "native-kei-upload-pilot"))]

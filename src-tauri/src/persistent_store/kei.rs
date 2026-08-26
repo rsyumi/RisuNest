@@ -306,6 +306,10 @@ impl PreparedKeiUpload {
                 message: "Pinned generation has no persistent root".to_owned(),
             })?;
         validate_account(&root, &self.expected_account_id, &self.token)?;
+        let character_count =
+            record_count(&reader.connection, "characters", &reader.target.generation)?;
+        let preset_count =
+            record_count(&reader.connection, "bot_presets", &reader.target.generation)?;
         let path = self
             .output_directory
             .join(format!("kei-{}.json.tmp", Uuid::new_v4()));
@@ -333,16 +337,6 @@ impl PreparedKeiUpload {
                 message: "KEI payload length changed after serialization".to_owned(),
             });
         }
-        let character_count = record_count(
-            &reader.connection,
-            "characters",
-            &reader.target.generation,
-        )?;
-        let preset_count = record_count(
-            &reader.connection,
-            "bot_presets",
-            &reader.target.generation,
-        )?;
         guard.disarm();
         Ok(KeiPayloadFile {
             path,
@@ -406,7 +400,9 @@ pub(crate) fn run_job(
     if job.is_cancel_requested() {
         return Err(cancelled("KEI backup cancelled before serialization"));
     }
-    job.start(JobPhase::WritingExport).map_err(job_error)?;
+    job.start(JobPhase::WritingExport).map_err(|error| {
+        job_control_error(&job, "KEI backup cancelled before serialization", error)
+    })?;
     let revision = prepared.revision;
     let payload = prepared
         .create_payload_controlled(|| job.is_cancel_requested())
@@ -426,15 +422,21 @@ pub(crate) fn run_job(
             Err(cancelled("KEI backup cancelled before upload")),
         );
     }
-    job.set_phase(JobPhase::PublishingDestination)
-        .map_err(job_error)?;
-    job.set_progress(JobProgress {
-        completed_bytes: 0,
-        total_bytes: Some(payload.bytes),
-        completed_items: 1,
-        total_items: Some(2),
-    })
-    .map_err(job_error)?;
+    set_job_phase(
+        &job,
+        JobPhase::PublishingDestination,
+        "KEI backup cancelled before upload",
+    )?;
+    set_job_progress(
+        &job,
+        JobProgress {
+            completed_bytes: 0,
+            total_bytes: Some(payload.bytes),
+            completed_items: 1,
+            total_items: Some(2),
+        },
+        "KEI backup cancelled before upload",
+    )?;
 
     let upload = tauri::async_runtime::block_on(upload_payload_for_job(
         &prepared.url,
@@ -447,15 +449,21 @@ pub(crate) fn run_job(
             if job.is_cancel_requested() {
                 Err(cancelled("KEI backup cancelled during upload"))
             } else {
-                job.set_phase(JobPhase::FinalizingExport)
-                    .map_err(job_error)?;
-                job.set_progress(JobProgress {
-                    completed_bytes: payload.bytes,
-                    total_bytes: Some(payload.bytes),
-                    completed_items: 2,
-                    total_items: Some(2),
-                })
-                .map_err(job_error)?;
+                set_job_phase(
+                    &job,
+                    JobPhase::FinalizingExport,
+                    "KEI backup cancelled during upload",
+                )?;
+                set_job_progress(
+                    &job,
+                    JobProgress {
+                        completed_bytes: payload.bytes,
+                        total_bytes: Some(payload.bytes),
+                        completed_items: 2,
+                        total_items: Some(2),
+                    },
+                    "KEI backup cancelled during upload",
+                )?;
                 Ok(JobResultSummary {
                     revision,
                     source_bytes: payload.bytes,
@@ -466,12 +474,40 @@ pub(crate) fn run_job(
                 })
             }
         }
-        Err(_) if job.is_cancel_requested() => {
-            Err(cancelled("KEI backup cancelled during upload"))
-        }
+        Err(_) if job.is_cancel_requested() => Err(cancelled("KEI backup cancelled during upload")),
         Err(error) => Err(store_error(error)),
     };
     cleanup_job_payload(payload, outcome)
+}
+
+fn set_job_phase(
+    job: &JobControl,
+    phase: JobPhase,
+    cancellation_message: &str,
+) -> Result<(), NativeJobError> {
+    job.set_phase(phase)
+        .map_err(|error| job_control_error(job, cancellation_message, error))
+}
+
+fn set_job_progress(
+    job: &JobControl,
+    progress: JobProgress,
+    cancellation_message: &str,
+) -> Result<(), NativeJobError> {
+    job.set_progress(progress)
+        .map_err(|error| job_control_error(job, cancellation_message, error))
+}
+
+fn job_control_error(
+    job: &JobControl,
+    cancellation_message: &str,
+    error: impl AsRef<str>,
+) -> NativeJobError {
+    if job.is_cancel_requested() {
+        cancelled(cancellation_message)
+    } else {
+        job_error(error)
+    }
 }
 
 fn cleanup_job_payload(
@@ -509,8 +545,8 @@ async fn upload_payload_for_job(
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .build()
-        .map_err(|error| StoreError::Store {
-            message: format!("KEI backup HTTP client could not be created: {error}"),
+        .map_err(|_| StoreError::Store {
+            message: "KEI backup HTTP client could not be created".to_owned(),
         })?;
     let response = client
         .post(url.clone())
@@ -519,21 +555,23 @@ async fn upload_payload_for_job(
         .body(body)
         .send()
         .await
-        .map_err(|error| {
-            let summary = if error.is_timeout() {
-                "KEI backup upload timed out"
-            } else if error.is_connect() {
-                "KEI backup endpoint is unavailable"
-            } else if error.is_body() {
-                "KEI backup payload could not be streamed"
-            } else {
-                "KEI backup upload failed"
-            };
-            StoreError::Store {
-                message: format!("{summary}: {error}"),
-            }
-        })?;
+        .map_err(sanitized_upload_error)?;
     Ok(response.status().as_u16())
+}
+
+fn sanitized_upload_error(error: reqwest::Error) -> StoreError {
+    let message = if error.is_timeout() {
+        "KEI backup upload timed out"
+    } else if error.is_connect() {
+        "KEI backup endpoint is unavailable"
+    } else if error.is_body() {
+        "KEI backup payload could not be streamed"
+    } else {
+        "KEI backup upload failed"
+    };
+    StoreError::Store {
+        message: message.to_owned(),
+    }
 }
 
 struct JobPayloadReader {
@@ -1030,8 +1068,8 @@ fn write_stored_value(writer: &mut impl Write, serialized: &str) -> StoreResult<
 
 #[cfg(test)]
 mod tests {
-    use super::{run_job, write_canonical_value};
-    use crate::native_file_jobs::{JobKind, JobPhase, JobRegistry};
+    use super::{run_job, set_job_phase, set_job_progress, write_canonical_value};
+    use crate::native_file_jobs::{JobKind, JobPhase, JobProgress, JobRegistry};
     use crate::persistent_store::{AssetAlias, PersistentStore, WorkingSetCommit};
     use serde_json::json;
     use std::fs;
@@ -1568,5 +1606,80 @@ mod tests {
         assert!(!payload_path.exists());
         assert_eq!(fs::read(unrelated).expect("read unrelated file"), b"keep");
         drop(reopened);
+    }
+
+    #[test]
+    fn accepted_cancellation_maps_phase_and_progress_races_to_cancelled() {
+        let phase_registry = JobRegistry::default();
+        let phase_job = phase_registry
+            .create(JobKind::KeiBackupUpload)
+            .expect("create phase-race job");
+        phase_job
+            .start(JobPhase::WritingExport)
+            .expect("start phase-race job");
+        phase_registry
+            .cancel(&phase_job.id())
+            .expect("cancel phase-race job");
+
+        let phase_error = set_job_phase(
+            &phase_job,
+            JobPhase::PublishingDestination,
+            "KEI backup cancelled before upload",
+        )
+        .expect_err("accepted cancellation must reject the phase transition");
+
+        assert_eq!(phase_error.code, "cancelled");
+
+        let progress_registry = JobRegistry::default();
+        let progress_job = progress_registry
+            .create(JobKind::KeiBackupUpload)
+            .expect("create progress-race job");
+        progress_job
+            .start(JobPhase::WritingExport)
+            .expect("start progress-race job");
+        progress_registry
+            .cancel(&progress_job.id())
+            .expect("cancel progress-race job");
+
+        let progress_error = set_job_progress(
+            &progress_job,
+            JobProgress {
+                completed_bytes: 0,
+                total_bytes: Some(1),
+                completed_items: 1,
+                total_items: Some(2),
+            },
+            "KEI backup cancelled before upload",
+        )
+        .expect_err("accepted cancellation must reject the progress transition");
+
+        assert_eq!(progress_error.code, "cancelled");
+    }
+
+    #[test]
+    fn managed_transport_failure_does_not_expose_the_request_url() {
+        let (_directory, mut store, source_lease) = open_store_with_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve closed endpoint");
+        let address = listener.local_addr().expect("closed endpoint address");
+        drop(listener);
+        let secret = "do-not-log-this-query-secret";
+        let url = format!("http://{address}/autobackup/save?api_key={secret}");
+        let prepared = store
+            .prepare_kei_job_upload(&source_lease, 1, &url, "account-1", "secret-token")
+            .expect("prepare job upload");
+        store
+            .release_revision(&source_lease)
+            .expect("release renderer handoff lease");
+        let registry = JobRegistry::default();
+        let job = registry
+            .create(JobKind::KeiBackupUpload)
+            .expect("create job");
+
+        let error = run_job(prepared, job).expect_err("closed endpoint must fail");
+
+        assert_eq!(error.code, "transport-failed");
+        assert_eq!(error.message, "KEI backup endpoint is unavailable");
+        assert!(!error.message.contains(secret));
+        assert!(!error.message.contains(&url));
     }
 }
