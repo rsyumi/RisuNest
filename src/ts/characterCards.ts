@@ -17,8 +17,10 @@ import type { OnnxModelFiles } from "./process/transformers"
 import { CharXImporter, CharXWriter } from "./process/processzip"
 import { exportModuleLegacy, readModule, type RisuModule } from "./process/modules"
 import { readFile } from "@tauri-apps/plugin-fs"
-import { onOpenUrl } from '@tauri-apps/plugin-deep-link';
+import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
+import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
+import { publishPeerCloneUri } from "./storage/sync/peerCloneDeepLink"
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -526,18 +528,24 @@ export async function characterURLImport() {
     }
     
     if(isTauri){
-        await onOpenUrl((urls) => {
+        const handleUrls = (urls: string[]) => {
             for(const url of urls){
-                const splited = url.split('/')
-                const id = splited[splited.length - 1]
-                const type = splited[splited.length - 2]
-                switch(type){
-                    case 'realm':{
-                        downloadRisuHub(id)
-                    }
-                }
+                dispatchRisuLocalUrl(url, {
+                    onRealm: (id) => void downloadRisuHub(id),
+                    onPeerClone: (uri) => {
+                        publishPeerCloneUri(uri)
+                        SettingsMenuIndex.set(0)
+                        settingsOpen.set(true)
+                    },
+                })
             }
-        })
+        }
+        try {
+            handleUrls(await getCurrent() ?? [])
+            await onOpenUrl(handleUrls)
+        } catch (error) {
+            console.warn('Failed to initialize deep links:', error)
+        }
     }
 
     async function importFile(name:string, data:Uint8Array) {

@@ -72,7 +72,7 @@ vi.mock('./process/processzip', () => ({
 }))
 vi.mock('./process/modules', () => ({ exportModuleLegacy: vi.fn(), readModule: vi.fn() }))
 vi.mock('@tauri-apps/plugin-fs', () => ({ readFile: vi.fn() }))
-vi.mock('@tauri-apps/plugin-deep-link', () => ({ onOpenUrl: vi.fn() }))
+vi.mock('@tauri-apps/plugin-deep-link', () => ({ getCurrent: vi.fn(), onOpenUrl: vi.fn() }))
 vi.mock('./storage/accountStorage', () => ({ AccountStorage: class {} }))
 vi.mock('./realmAccess', () => ({
     fetchRealmResource: vi.fn(),

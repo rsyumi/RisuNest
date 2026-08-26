@@ -416,8 +416,8 @@ export async function loadData() {
             } else {
                 setUsingSw(false)
             }
-            if (getDatabase().didFirstSetup) characterURLImport()
         }
+        if (getDatabase().didFirstSetup) void characterURLImport()
 
         LoadingStatusState.text = 'Checking For Format Update...'
         const fullDatabaseResident = pluginCompatibility.profile === 'maximum-compatibility'
