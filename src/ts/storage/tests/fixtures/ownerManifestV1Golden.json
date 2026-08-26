@@ -1,0 +1,18 @@
+{
+  "entries": [
+    {
+      "tuple": ["A", "assets\\MiXeD/é.PNG", "PNG"],
+      "payloadHashHex": null
+    },
+    {
+      "tuple": ["A", "assets\\MiXeD/é.PNG", "PNG"],
+      "payloadHashHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    },
+    {
+      "tuple": ["", "/Case", ""],
+      "payloadHashHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ],
+  "canonicalHex": "524f4d4601030000000100000041130000006173736574735c4d695865442fc3a92e504e4703000000504e47000100000041130000006173736574735c4d695865442fc3a92e504e4703000000504e4701000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f00000000050000002f436173650000000001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "manifestHash": "68189c923b06cf974f7913e176613e01475e2d83c99f2cc62ec4745422e20adb"
+}
