@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 
 const inlayMocks = vi.hoisted(() => ({
@@ -17,8 +17,34 @@ vi.mock('src/ts/platform', () => ({ get isTauri() { return platform.isTauri } })
 import InlayFilePreview from './InlayFilePreview.svelte'
 import InlayFilePreviewHarness from './InlayFilePreviewHarness.test.svelte'
 
+class TestIntersectionObserver {
+    static instance: TestIntersectionObserver | undefined
+    readonly disconnect = vi.fn()
+    constructor(private readonly callback: IntersectionObserverCallback) {
+        TestIntersectionObserver.instance = this
+    }
+    observe = vi.fn()
+    unobserve = vi.fn()
+    takeRecords = () => []
+    readonly root = null
+    readonly rootMargin = '0px'
+    readonly thresholds = [0]
+    setVisible(element: Element, visible: boolean) {
+        this.callback([{
+            target: element,
+            isIntersecting: visible,
+            intersectionRatio: visible ? 1 : 0,
+        } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+    }
+}
+
 describe('InlayFilePreview', () => {
     let mounted: ReturnType<typeof mount> | undefined
+
+    beforeEach(() => {
+        TestIntersectionObserver.instance = undefined
+        vi.stubGlobal('IntersectionObserver', undefined)
+    })
 
     afterEach(async () => {
         if (mounted) await unmount(mounted)
@@ -78,5 +104,39 @@ describe('InlayFilePreview', () => {
         await unmount(mounted)
         mounted = undefined
         expect(revokeObjectURL).toHaveBeenCalledWith('blob:second')
+    })
+
+    test('owns a browser preview URL only while the attachment is near the viewport', async () => {
+        platform.isTauri = false
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob(['image'], { type: 'image/png' }),
+            ext: 'png',
+            name: 'image.png',
+            type: 'image',
+        })
+        const createObjectURL = vi.fn()
+            .mockReturnValueOnce('blob:visible-first')
+            .mockReturnValueOnce('blob:visible-second')
+        const revokeObjectURL = vi.fn()
+        vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL })
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(InlayFilePreview, { target, props: { id: 'image-id' } })
+        await tick()
+        const root = target.querySelector('[data-inlay-file-preview]')!
+        expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
+
+        TestIntersectionObserver.instance?.setVisible(root, true)
+        await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:visible-first'))
+        TestIntersectionObserver.instance?.setVisible(root, false)
+        await tick()
+        expect(target.querySelector('img')).toBeNull()
+        expect(revokeObjectURL).toHaveBeenCalledOnce()
+        expect(revokeObjectURL).toHaveBeenCalledWith('blob:visible-first')
+
+        TestIntersectionObserver.instance?.setVisible(root, true)
+        await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:visible-second'))
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2)
     })
 })

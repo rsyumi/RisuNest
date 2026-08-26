@@ -42,6 +42,7 @@ import { DeferredInlayMarkerRegistry, mountDeferredInlaySources } from '../../pr
 describe('deferred inlay parser integration', () => {
     beforeEach(() => {
         vi.clearAllMocks()
+        vi.stubGlobal('IntersectionObserver', undefined)
         databaseState.db.hideAllImages = false
         inlayMocks.getInlayAssetMetadata.mockResolvedValue({
             key: 'image-id',

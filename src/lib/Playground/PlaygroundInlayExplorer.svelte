@@ -19,7 +19,7 @@
   let loading = $state(true)
   let loadMoreSentinel: HTMLDivElement | null = $state(null)
   let previewSources = $state<Map<string, InlayRenderSource>>(new Map())
-  const pendingPreviews = new Map<string, Promise<string | null>>()
+  const pendingPreviews = new Map<string, { generation: number; promise: Promise<string | null> }>()
   const previewGenerations = new Map<string, number>()
   let destroyed = false
   let selection = $state<Set<string>>(new SvelteSet())
@@ -32,9 +32,9 @@
     const id = asset.key
     const cached = previewSources.get(id)
     if (cached) return cached.url
-    const existing = pendingPreviews.get(id)
-    if (existing) return existing
     const generation = previewGenerations.get(id) ?? 0
+    const existing = pendingPreviews.get(id)
+    if (existing?.generation === generation) return existing.promise
     let pending: Promise<string | null>
     pending = (async () => {
       const source = await getInlayRenderSource(id, isTauri, asset)
@@ -43,16 +43,16 @@
         if (source.objectUrl) URL.revokeObjectURL(source.url)
         return null
       }
-      previewSources.set(id, source)
+      previewSources = new Map(previewSources).set(id, source)
       return source.url
     })()
       .catch(() => null)
       .finally(() => {
-        if (pendingPreviews.get(id) === pending) {
+        if (pendingPreviews.get(id)?.promise === pending) {
           pendingPreviews.delete(id)
         }
       })
-    pendingPreviews.set(id, pending)
+    pendingPreviews.set(id, { generation, promise: pending })
     return pending
   }
 
@@ -60,7 +60,7 @@
     previewGenerations.set(id, (previewGenerations.get(id) ?? 0) + 1)
     const source = previewSources.get(id)
     if (source?.objectUrl) URL.revokeObjectURL(source.url)
-    previewSources.delete(id)
+    if (previewSources.delete(id)) previewSources = new Map(previewSources)
   }
 
   const toggleSelect = (id: string) => {
@@ -108,10 +108,71 @@
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
   }
 
-  let observer: IntersectionObserver | null = null
+  const previewTargets = new Map<Element, InlayBlobMetadata>()
+  const visiblePreviewTargets = new Set<Element>()
+  let previewObserver: IntersectionObserver | null = null
+
+  const ensurePreviewObserver = () => {
+    if (previewObserver || typeof IntersectionObserver === 'undefined') return previewObserver
+    previewObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const asset = previewTargets.get(entry.target)
+          if (!asset) continue
+          if (entry.isIntersecting) {
+            visiblePreviewTargets.add(entry.target)
+            void getPreviewURL(asset)
+          } else {
+            visiblePreviewTargets.delete(entry.target)
+            removePreview(asset.key)
+          }
+        }
+      },
+      { root: null, rootMargin: '256px 0px', threshold: 0 }
+    )
+    return previewObserver
+  }
+
+  const observePreview = (node: HTMLElement, asset: InlayBlobMetadata) => {
+    let current = asset
+    const attach = () => {
+      previewTargets.set(node, current)
+      const currentObserver = ensurePreviewObserver()
+      if (currentObserver) currentObserver.observe(node)
+      else {
+        visiblePreviewTargets.add(node)
+        void getPreviewURL(current)
+      }
+    }
+    const detach = () => {
+      previewObserver?.unobserve(node)
+      previewTargets.delete(node)
+      visiblePreviewTargets.delete(node)
+      removePreview(current.key)
+    }
+    attach()
+    return {
+      update(next: InlayBlobMetadata) {
+        if (next.key === current.key) {
+          current = next
+          previewTargets.set(node, current)
+          if (visiblePreviewTargets.has(node) && !previewSources.has(current.key) && !pendingPreviews.has(current.key)) {
+            void getPreviewURL(current)
+          }
+          return
+        }
+        detach()
+        current = next
+        attach()
+      },
+      destroy: detach,
+    }
+  }
+
+  let loadMoreObserver: IntersectionObserver | null = null
   $effect(() => {
     if (!loadMoreSentinel || !hasMore) {
-      observer?.disconnect()
+      loadMoreObserver?.disconnect()
       return
     }
 
@@ -127,8 +188,8 @@
       })
     }
 
-    observer?.disconnect()
-    observer = new IntersectionObserver(
+    loadMoreObserver?.disconnect()
+    loadMoreObserver = new IntersectionObserver(
       (entries) => {
         if (entries[0]?.isIntersecting) {
           loadMore()
@@ -140,11 +201,11 @@
         threshold: 0,
       }
     )
-    observer.observe(loadMoreSentinel)
+    loadMoreObserver.observe(loadMoreSentinel)
 
     return () => {
-      observer?.disconnect()
-      observer = null
+      loadMoreObserver?.disconnect()
+      loadMoreObserver = null
     }
   })
 
@@ -156,7 +217,11 @@
     previewSources.clear()
     pendingPreviews.clear()
     previewGenerations.clear()
-    observer?.disconnect()
+    previewObserver?.disconnect()
+    previewObserver = null
+    previewTargets.clear()
+    visiblePreviewTargets.clear()
+    loadMoreObserver?.disconnect()
   })
 
   const loadAssets = async () => {
@@ -193,8 +258,11 @@
 {:else}
   <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
     {#each displayedAssets as asset (asset.key)}
-      {#key selection.has(asset.key)}
-        <div class="border border-darkborderc rounded-lg p-4 bg-darkbg">
+      <div
+        class="border border-darkborderc rounded-lg p-4 bg-darkbg"
+        data-inlay-preview-id={asset.key}
+        use:observePreview={asset}
+      >
           <div class="flex items-center gap-2 mb-3">
             <CheckInput check={selection.has(asset.key)} hiddenName margin={false} onChange={() => toggleSelect(asset.key)} />
             <span class="px-2 py-1 text-xs rounded bg-darkbutton text-textcolor2">
@@ -203,29 +271,23 @@
           </div>
           <div class="mb-3">
             {#if asset.inlayType === 'image'}
-              {#await getPreviewURL(asset) then url}
-                {#if url}
-                  <img alt={asset.name} class="w-full h-40 object-contain rounded bg-black/20" src={url} />
-                {/if}
-              {/await}
+              {#if previewSources.get(asset.key)?.url}
+                <img alt={asset.name} class="w-full h-40 object-contain rounded bg-black/20" src={previewSources.get(asset.key)?.url} />
+              {/if}
             {:else if asset.inlayType === 'video'}
-              {#await getPreviewURL(asset) then url}
-                {#if url}
-                  <video class="w-full h-40 object-contain rounded bg-black/20" controls>
-                    <source src={url} type={asset.mime} />
-                    <track kind="captions" />
-                  </video>
-                {/if}
-              {/await}
+              {#if previewSources.get(asset.key)?.url}
+                <video class="w-full h-40 object-contain rounded bg-black/20" controls>
+                  <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
+                  <track kind="captions" />
+                </video>
+              {/if}
             {:else if asset.inlayType === 'audio'}
-              {#await getPreviewURL(asset) then url}
-                {#if url}
-                  <audio class="w-full" controls>
-                    <source src={url} type={asset.mime} />
-                    <track kind="captions" />
-                  </audio>
-                {/if}
-              {/await}
+              {#if previewSources.get(asset.key)?.url}
+                <audio class="w-full" controls>
+                  <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
+                  <track kind="captions" />
+                </audio>
+              {/if}
             {/if}
           </div>
 
@@ -246,8 +308,7 @@
           </div>
 
           <Button onclick={() => deleteAsset(asset.key, asset.name)} styled="danger" size="sm">Delete</Button>
-        </div>
-      {/key}
+      </div>
     {/each}
   </div>
 

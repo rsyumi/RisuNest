@@ -12,7 +12,7 @@ import { selectedCharID } from '../stores.svelte';
 import { calcString } from '../process/infunctions';
 import { findCharacterbyId, getPersonaPrompt, getUserIcon, getUserName, pickHashRand, replaceAsync} from '../util';
 import { getInlayAssetMetadata } from '../process/files/inlays';
-import { DeferredInlayMarkerRegistry, getInlayRenderSources, renderDeferredInlaySourceMarkup, renderInlaySourceMarkup, type InlayRenderSource } from '../process/files/inlayRenderSource';
+import { DeferredInlayMarkerRegistry, getInlayRenderSources, renderDeferredInlaySourceMarkup, type InlayRenderSource } from '../process/files/inlayRenderSource';
 import { getModuleAssets, getModuleLorebooks, getModules, type RisuModule } from '../process/modules';
 import hljs from 'highlight.js/lib/core'
 import 'highlight.js/styles/atom-one-dark.min.css'
@@ -655,13 +655,13 @@ async function parseInlayAssets(data:string, deferredInlays?:DeferredInlayMarker
                         data = data.replace(inlay, '')
                         break
                     }
-                    data = data.replace(inlay, `${prefix}${isTauri ? renderInlaySourceMarkup(source) : renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
+                    data = data.replace(inlay, `${prefix}${renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
                     break
                 case 'video':
-                    data = data.replace(inlay, `${prefix}${isTauri ? renderInlaySourceMarkup(source) : renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
+                    data = data.replace(inlay, `${prefix}${renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
                     break
                 case 'audio':
-                    data = data.replace(inlay, `${prefix}${isTauri ? renderInlaySourceMarkup(source) : renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
+                    data = data.replace(inlay, `${prefix}${renderDeferredInlaySourceMarkup(id, source, markerRegistry)}${postfix}`)
                     break
             }
             

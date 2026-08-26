@@ -308,7 +308,7 @@
         if(!settings.newImageHandlingBeta || !bodyRoot){
             return
         }
-        const imgs = bodyRoot.querySelectorAll('img:not([src^="data:"]):not([src^="http:"]):not([src^="https:"]):not([src^="blob:"]):not([src^="file:"]):not([src^="tauri:"]):not([noimage])') as NodeListOf<HTMLImageElement>
+        const imgs = bodyRoot.querySelectorAll('img:not([data-risu-inlay-token]):not([data-risu-managed-media]):not([src^="data:"]):not([src^="http:"]):not([src^="https:"]):not([src^="blob:"]):not([src^="file:"]):not([src^="tauri:"]):not([noimage])') as NodeListOf<HTMLImageElement>
         
         if (imgs.length > 0) {
             const currentCharacter = captureContext ? null : getCurrentCharacter()

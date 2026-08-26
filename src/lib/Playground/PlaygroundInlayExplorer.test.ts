@@ -38,10 +38,37 @@ vi.mock('src/lang', () => ({
 
 import PlaygroundInlayExplorer from './PlaygroundInlayExplorer.svelte'
 
+class TestIntersectionObserver {
+    static instances: TestIntersectionObserver[] = []
+    readonly observed = new Set<Element>()
+    readonly disconnect = vi.fn(() => this.observed.clear())
+
+    constructor(private readonly callback: IntersectionObserverCallback) {
+        TestIntersectionObserver.instances.push(this)
+    }
+
+    observe = (element: Element) => this.observed.add(element)
+    unobserve = (element: Element) => this.observed.delete(element)
+    takeRecords = () => []
+    readonly root = null
+    readonly rootMargin = '0px'
+    readonly thresholds = [0]
+
+    setVisible(element: Element, visible: boolean): void {
+        this.callback([{
+            target: element,
+            isIntersecting: visible,
+            intersectionRatio: visible ? 1 : 0,
+        } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+    }
+}
+
 describe('PlaygroundInlayExplorer native previews', () => {
     let mounted: ReturnType<typeof mount> | undefined
 
     beforeEach(() => {
+        TestIntersectionObserver.instances = []
+        vi.stubGlobal('IntersectionObserver', undefined)
         platformMocks.isTauri = true
         inlayMocks.listInlayAssets.mockResolvedValue([])
         inlayMocks.listInlayAssetMetadata.mockResolvedValue([{
@@ -63,6 +90,7 @@ describe('PlaygroundInlayExplorer native previews', () => {
         mounted = undefined
         document.body.replaceChildren()
         vi.restoreAllMocks()
+        vi.unstubAllGlobals()
         vi.clearAllMocks()
     })
 
@@ -123,6 +151,29 @@ describe('PlaygroundInlayExplorer native previews', () => {
 
         expect(revokeObjectURL).not.toHaveBeenCalled()
     })
+
+    test('detaches and reattaches an original native preview as its gallery card leaves the viewport', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL')
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(PlaygroundInlayExplorer, { target })
+        await vi.waitFor(() => expect(target.querySelector('[data-inlay-preview-id="photo-id"]')).not.toBeNull())
+        const card = target.querySelector('[data-inlay-preview-id="photo-id"]')!
+        const observer = TestIntersectionObserver.instances[0]
+        expect(target.querySelector('img')).toBeNull()
+
+        observer.setVisible(card, true)
+        await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('http://risuasset.localhost/photo-id'))
+        observer.setVisible(card, false)
+        await tick()
+        expect(target.querySelector('img')).toBeNull()
+        expect(revokeObjectURL).not.toHaveBeenCalled()
+
+        observer.setVisible(card, true)
+        await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('http://risuasset.localhost/photo-id'))
+        expect(inlayMocks.getInlayAssetRenderUrl).toHaveBeenCalledTimes(2)
+    })
 })
 
 describe('PlaygroundInlayExplorer browser preview ownership', () => {
@@ -148,6 +199,8 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
     }
 
     beforeEach(() => {
+        TestIntersectionObserver.instances = []
+        vi.stubGlobal('IntersectionObserver', undefined)
         platformMocks.isTauri = false
         inlayMocks.listInlayAssetMetadata.mockResolvedValue([metadata])
         inlayMocks.removeInlayAsset.mockResolvedValue(undefined)
@@ -162,6 +215,7 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         document.body.replaceChildren()
         platformMocks.isTauri = true
         vi.restoreAllMocks()
+        vi.unstubAllGlobals()
         vi.clearAllMocks()
     })
 
@@ -228,7 +282,8 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         expect(target.querySelector('img')).toBeNull()
     })
 
-    test('resolves concurrent callers to null after a shared failure, then retries', async () => {
+    test('resolves concurrent callers to null after a shared failure, then retries on re-entry', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
         let rejectAsset!: (reason: Error) => void
         inlayMocks.getInlayAssetBlob
             .mockReturnValueOnce(new Promise((_, reject) => {
@@ -239,9 +294,12 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         document.body.appendChild(target)
         mounted = mount(PlaygroundInlayExplorer, { target })
 
+        await vi.waitFor(() => expect(target.querySelector('[data-inlay-preview-id="photo-id"]')).not.toBeNull())
+        const card = target.querySelector('[data-inlay-preview-id="photo-id"]')!
+        const observer = TestIntersectionObserver.instances[0]
+        observer.setVisible(card, true)
         await vi.waitFor(() => expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledOnce())
-        target.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click()
-        await tick()
+        observer.setVisible(card, true)
         expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledOnce()
 
         rejectAsset(new Error('preview failed'))
@@ -249,9 +307,36 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         await tick()
         expect(target.querySelector('img')).toBeNull()
 
-        target.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click()
+        observer.setVisible(card, false)
+        observer.setVisible(card, true)
 
         await vi.waitFor(() => expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2))
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:photo-preview'))
+    })
+
+    test('revokes an offscreen browser preview and creates a fresh URL on re-entry', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        inlayMocks.getInlayAssetBlob.mockResolvedValue(asset)
+        vi.mocked(URL.createObjectURL)
+            .mockReturnValueOnce('blob:photo-first')
+            .mockReturnValueOnce('blob:photo-second')
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(PlaygroundInlayExplorer, { target })
+        await vi.waitFor(() => expect(target.querySelector('[data-inlay-preview-id="photo-id"]')).not.toBeNull())
+        const card = target.querySelector('[data-inlay-preview-id="photo-id"]')!
+        const observer = TestIntersectionObserver.instances[0]
+
+        observer.setVisible(card, true)
+        await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:photo-first'))
+        observer.setVisible(card, false)
+        await tick()
+        expect(target.querySelector('img')).toBeNull()
+        expect(URL.revokeObjectURL).toHaveBeenCalledOnce()
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:photo-first')
+
+        observer.setVisible(card, true)
+        await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:photo-second'))
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2)
     })
 })

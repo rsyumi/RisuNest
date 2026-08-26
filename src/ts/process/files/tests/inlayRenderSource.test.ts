@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 const inlayMocks = vi.hoisted(() => ({
     getInlayAssetBlob: vi.fn(),
@@ -19,14 +19,258 @@ import {
     renderInlaySourceMarkup,
 } from '../inlayRenderSource'
 
+class TestIntersectionObserver {
+    static instances: TestIntersectionObserver[] = []
+    readonly observed = new Set<Element>()
+    readonly disconnect = vi.fn(() => this.observed.clear())
+
+    constructor(
+        private readonly callback: IntersectionObserverCallback,
+        _options?: IntersectionObserverInit,
+    ) {
+        TestIntersectionObserver.instances.push(this)
+    }
+
+    observe = (element: Element) => this.observed.add(element)
+    unobserve = (element: Element) => this.observed.delete(element)
+    takeRecords = () => []
+    readonly root = null
+    readonly rootMargin = '0px'
+    readonly thresholds = [0]
+
+    setVisible(element: Element, isIntersecting: boolean): void {
+        this.callback([{
+            target: element,
+            isIntersecting,
+            intersectionRatio: isIntersecting ? 1 : 0,
+        } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+    }
+}
+
 describe('getInlayRenderSource', () => {
     beforeEach(() => {
         vi.clearAllMocks()
+        TestIntersectionObserver.instances = []
+        vi.stubGlobal('IntersectionObserver', undefined)
         vi.stubGlobal('URL', {
             ...URL,
             createObjectURL: vi.fn(() => 'blob:web-preview'),
             revokeObjectURL: vi.fn(),
         })
+    })
+
+    afterEach(() => {
+        vi.unstubAllGlobals()
+    })
+
+    test('attaches a native original only while its marker is visible', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = renderDeferredInlaySourceMarkup('native-image', {
+            url: 'http://risuasset.localhost/native-image',
+            mime: 'image/webp',
+            type: 'image',
+            name: 'native.webp',
+            size: 42,
+            objectUrl: false,
+        }, registry)
+        document.body.append(root)
+        const image = root.querySelector('img')!
+
+        const cleanup = mountDeferredInlaySources(root, registry)
+        const observer = TestIntersectionObserver.instances[0]
+        expect(image.getAttribute('src')).toBeNull()
+
+        observer.setVisible(image, true)
+        await Promise.resolve()
+        expect(image.getAttribute('src')).toBe('http://risuasset.localhost/native-image')
+        expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
+
+        observer.setVisible(image, false)
+        expect(image.getAttribute('src')).toBeNull()
+        expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+
+        observer.setVisible(image, true)
+        await Promise.resolve()
+        expect(image.getAttribute('src')).toBe('http://risuasset.localhost/native-image')
+        expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalled()
+
+        cleanup()
+        expect(observer.disconnect).toHaveBeenCalledOnce()
+        expect(image.getAttribute('src')).toBeNull()
+        root.remove()
+    })
+
+    test('keeps a shared browser object URL until its last visible marker exits', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob(['shared'], { type: 'image/png' }),
+            type: 'image',
+            name: 'shared.png',
+        })
+        const create = vi.fn()
+            .mockReturnValueOnce('blob:shared-first')
+            .mockReturnValueOnce('blob:shared-second')
+        const revoke = vi.fn()
+        vi.stubGlobal('URL', { ...URL, createObjectURL: create, revokeObjectURL: revoke })
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = [0, 1].map(() => renderDeferredInlaySourceMarkup('shared', {
+            url: '', mime: 'image/png', type: 'image', name: 'shared.png', size: 6, objectUrl: false,
+        }, registry)).join('')
+        document.body.append(root)
+        const images = [...root.querySelectorAll('img')]
+
+        const cleanup = mountDeferredInlaySources(root, registry)
+        const observer = TestIntersectionObserver.instances[0]
+        observer.setVisible(images[0], true)
+        observer.setVisible(images[1], true)
+        await Promise.resolve(); await Promise.resolve()
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(1)
+        expect(images.map((image) => image.getAttribute('src'))).toEqual(['blob:shared-first', 'blob:shared-first'])
+
+        observer.setVisible(images[0], false)
+        expect(revoke).not.toHaveBeenCalled()
+        expect(images[1].getAttribute('src')).toBe('blob:shared-first')
+
+        observer.setVisible(images[1], false)
+        expect(revoke).toHaveBeenCalledOnce()
+        expect(revoke).toHaveBeenCalledWith('blob:shared-first')
+
+        observer.setVisible(images[0], true)
+        await Promise.resolve(); await Promise.resolve()
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2)
+        expect(images[0].getAttribute('src')).toBe('blob:shared-second')
+
+        cleanup()
+        expect(revoke).toHaveBeenCalledTimes(2)
+        expect(revoke).toHaveBeenLastCalledWith('blob:shared-second')
+        root.remove()
+    })
+
+    test.each(['audio', 'video'] as const)('pauses and unloads offscreen %s resources', async (type) => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = renderDeferredInlaySourceMarkup(`native-${type}`, {
+            url: `http://risuasset.localhost/native-${type}`,
+            mime: `${type}/webm`,
+            type,
+            name: `native.${type}`,
+            size: 42,
+            objectUrl: false,
+        }, registry)
+        document.body.append(root)
+        const media = root.querySelector(type) as HTMLMediaElement
+        media.pause = vi.fn()
+        media.load = vi.fn()
+        const source = media.querySelector('source')!
+
+        mountDeferredInlaySources(root, registry)
+        const observer = TestIntersectionObserver.instances[0]
+        observer.setVisible(media, true)
+        await Promise.resolve()
+        expect(source.getAttribute('src')).toContain(`native-${type}`)
+
+        observer.setVisible(media, false)
+        expect(media.pause).toHaveBeenCalledOnce()
+        expect(source.getAttribute('src')).toBeNull()
+        expect(media.load).toHaveBeenCalledTimes(2)
+        root.remove()
+    })
+
+    test('ignores late visibility and blob completion after navigation cleanup', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        let resolve: (value: any) => void
+        inlayMocks.getInlayAssetBlob.mockReturnValue(new Promise((done) => { resolve = done }))
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = renderDeferredInlaySourceMarkup('late-navigation', {
+            url: '', mime: 'image/png', type: 'image', name: 'late.png', size: 1, objectUrl: false,
+        }, registry)
+        document.body.append(root)
+        const image = root.querySelector('img')!
+
+        const cleanup = mountDeferredInlaySources(root, registry)
+        const observer = TestIntersectionObserver.instances[0]
+        observer.setVisible(image, true)
+        expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledOnce()
+        cleanup()
+        root.remove()
+
+        observer.setVisible(image, true)
+        resolve!({ data: new Blob(['late']), type: 'image', name: 'late.png' })
+        await Promise.resolve(); await Promise.resolve()
+        expect(image.getAttribute('src')).toBeNull()
+        expect(URL.createObjectURL).not.toHaveBeenCalled()
+        expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+    })
+
+    test('detaches an existing original asset URL offscreen without changing its markup layout', () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const root = document.createElement('div')
+        root.innerHTML = '<figure class="custom-bot-layout"><img class="portrait" src="http://risuasset.localhost/assets/original.png"><figcaption>caption</figcaption></figure>'
+        document.body.append(root)
+        const image = root.querySelector('img')!
+
+        const cleanup = mountDeferredInlaySources(root, new DeferredInlayMarkerRegistry())
+        const observer = TestIntersectionObserver.instances[0]
+        expect(image.getAttribute('src')).toBeNull()
+        expect(root.querySelector('figure')?.className).toBe('custom-bot-layout')
+        expect(root.querySelector('figcaption')?.textContent).toBe('caption')
+
+        observer.setVisible(image, true)
+        expect(image.getAttribute('src')).toBe('http://risuasset.localhost/assets/original.png')
+        observer.setVisible(image, false)
+        expect(image.getAttribute('src')).toBeNull()
+        expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+
+        cleanup()
+        root.remove()
+    })
+
+    test('keeps live browser object URLs bounded across repeated gallery-style visits', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob(['gallery'], { type: 'image/png' }),
+            type: 'image',
+            name: 'gallery.png',
+        })
+        let liveUrls = 0
+        let peakLiveUrls = 0
+        let nextUrl = 0
+        const create = vi.fn(() => {
+            liveUrls++
+            peakLiveUrls = Math.max(peakLiveUrls, liveUrls)
+            return `blob:gallery-${nextUrl++}`
+        })
+        const revoke = vi.fn(() => {
+            liveUrls--
+        })
+        vi.stubGlobal('URL', { ...URL, createObjectURL: create, revokeObjectURL: revoke })
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = renderDeferredInlaySourceMarkup('gallery', {
+            url: '', mime: 'image/png', type: 'image', name: 'gallery.png', size: 7, objectUrl: false,
+        }, registry)
+        document.body.append(root)
+        const image = root.querySelector('img')!
+
+        const cleanup = mountDeferredInlaySources(root, registry)
+        const observer = TestIntersectionObserver.instances[0]
+        for (let visit = 0; visit < 1_000; visit++) {
+            observer.setVisible(image, true)
+            await Promise.resolve(); await Promise.resolve()
+            observer.setVisible(image, false)
+        }
+
+        expect(create).toHaveBeenCalledTimes(1_000)
+        expect(revoke).toHaveBeenCalledTimes(1_000)
+        expect(peakLiveUrls).toBe(1)
+        expect(liveUrls).toBe(0)
+        cleanup()
+        root.remove()
     })
 
     test('uses the native render URL and stored MIME without reading payload bytes', async () => {

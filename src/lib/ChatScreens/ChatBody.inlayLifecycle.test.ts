@@ -53,6 +53,27 @@ const imageSource = {
     objectUrl: false,
 }
 
+class TestIntersectionObserver {
+    static instance: TestIntersectionObserver | undefined
+    constructor(private readonly callback: IntersectionObserverCallback) {
+        TestIntersectionObserver.instance = this
+    }
+    observe = vi.fn()
+    unobserve = vi.fn()
+    disconnect = vi.fn()
+    takeRecords = () => []
+    readonly root = null
+    readonly rootMargin = '0px'
+    readonly thresholds = [0]
+    setVisible(element: Element, visible: boolean) {
+        this.callback([{
+            target: element,
+            isIntersecting: visible,
+            intersectionRatio: visible ? 1 : 0,
+        } as IntersectionObserverEntry], this as unknown as IntersectionObserver)
+    }
+}
+
 function deferred<T>() {
     let resolve!: (value: T) => void
     const promise = new Promise<T>((done) => { resolve = done })
@@ -121,6 +142,7 @@ describe('ChatBody deferred inlay lifecycle', () => {
 
     beforeEach(() => {
         vi.clearAllMocks()
+        vi.stubGlobal('IntersectionObserver', undefined)
         chatState.db = {}
         target = document.createElement('div')
         document.body.append(target)
@@ -179,6 +201,24 @@ describe('ChatBody deferred inlay lifecycle', () => {
         mounted = undefined
 
         expect(revokeObjectURL.mock.calls.filter(([url]) => url === 'blob:first')).toHaveLength(1)
+    })
+
+    test('does not reinterpret a viewport-managed inlay as an unresolved bot asset', async () => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        chatState.db = { newImageHandlingBeta: true }
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob(['first']), type: 'image', name: 'first.png',
+        })
+        mounted = mount(ChatBodyInlayHarness, { target })
+        await vi.waitFor(() => expect(target.querySelector('img')?.dataset.risuInlayToken).toBeTruthy())
+        const image = target.querySelector('img')!
+
+        expect(image.hasAttribute('noimage')).toBe(false)
+        expect(image.getAttribute('src')).toBeNull()
+        TestIntersectionObserver.instance?.setVisible(image, true)
+        await vi.waitFor(() => expect(image.getAttribute('src')).toBe('blob:first'))
+        expect(image.hasAttribute('noimage')).toBe(false)
+        expect(liveRenderMocks.getFileSrc).not.toHaveBeenCalled()
     })
 
     test.each(['rerender', 'raw switch', 'destroy'] as const)(

@@ -15,6 +15,7 @@ export interface InlayRenderSource {
 interface DeferredInlayMarker {
     readonly id: string
     readonly type: InlayBlobType
+    readonly source: InlayRenderSource
 }
 
 export class DeferredInlayMarkerRegistry {
@@ -22,10 +23,10 @@ export class DeferredInlayMarkerRegistry {
     #nextSlot = 0
     #disposed = false
 
-    register(id: string, type: InlayBlobType): string | undefined {
+    register(id: string, source: InlayRenderSource): string | undefined {
         if (this.#disposed) return undefined
         const slot = (this.#nextSlot++).toString(36)
-        this.#markers.set(slot, Object.freeze({ id, type }))
+        this.#markers.set(slot, Object.freeze({ id, type: source.type, source: { ...source } }))
         return slot
     }
 
@@ -46,12 +47,15 @@ export function renderDeferredInlaySourceMarkup(
     source: InlayRenderSource,
     registry?: DeferredInlayMarkerRegistry,
 ): string {
-    const slot = registry?.register(id, source.type)
+    const slot = registry?.register(id, source)
     const marker = slot === undefined ? '' : ` data-risu-inlay-slot="${slot}"`
     const assetId = escapeHtmlAttribute(id)
     const mime = escapeHtmlAttribute(source.mime)
+    const dimensions = source.width && source.height
+        ? ` width="${Math.floor(source.width)}" height="${Math.floor(source.height)}"`
+        : ''
     switch (source.type) {
-        case 'image': return `<img data-risu-inlay-id="${assetId}"${marker}/>`
+        case 'image': return `<img data-risu-inlay-id="${assetId}"${marker}${dimensions} loading="lazy"/>`
         case 'video': return `<video controls><source data-risu-inlay-id="${assetId}"${marker} type="${mime}"></video>`
         case 'audio': return `<audio controls><source data-risu-inlay-id="${assetId}"${marker} type="${mime}"></audio>`
         default: return ''
@@ -61,10 +65,9 @@ export function renderDeferredInlaySourceMarkup(
 function startDeferredInlaySources(
     root: ParentNode,
     registry?: DeferredInlayMarkerRegistry,
-    options: { rejectOnError?: boolean } = {},
+    options: { rejectOnError?: boolean, viewportAware?: boolean } = {},
 ): { cleanup: () => void, settled: Promise<void> } {
     let disposed = false
-    const urls = new Set<string>()
     const markers = new Map<HTMLElement, DeferredInlayMarker & { token: string }>()
     for (const element of root.querySelectorAll<HTMLElement>('[data-risu-inlay-slot]')) {
         const slot = element.dataset.risuInlaySlot ?? ''
@@ -79,61 +82,183 @@ function startDeferredInlaySources(
         markers.set(element, marker)
     }
     registry?.clear()
-    let elements = [...markers.keys()]
-    const ids = [...new Set([...markers.values()].map((marker) => marker.id))]
-    const settled = Promise.all(ids.map(async (id) => {
-        let url: string | undefined
+    const markerTargets = new Map<Element, HTMLElement[]>()
+    for (const element of markers.keys()) {
+        const target = element instanceof HTMLSourceElement && element.parentElement instanceof HTMLMediaElement
+            ? element.parentElement
+            : element
+        const elements = markerTargets.get(target) ?? []
+        elements.push(element)
+        markerTargets.set(target, elements)
+    }
+    const originalSources = new Map<Element, Array<{ element: HTMLElement, url: string }>>()
+    const isManagedOriginalUrl = (url: string) => {
+        if (url.startsWith('data:') || url.startsWith('risuasset:') || url.includes('://risuasset.localhost/')) return true
         try {
-            const asset = await getInlayAssetBlob(id)
-            if (!asset) return
-            const attachable = elements.filter((element) => {
-                const marker = markers.get(element)
-                const validKind = marker?.type === 'image' && element instanceof HTMLImageElement
-                    || marker?.type === 'video' && element instanceof HTMLSourceElement && element.parentElement instanceof HTMLVideoElement
-                    || marker?.type === 'audio' && element instanceof HTMLSourceElement && element.parentElement instanceof HTMLAudioElement
-                return element.isConnected
-                    && element.dataset.risuInlayToken === marker?.token
-                    && marker.id === id
-                    && marker.type === asset.type
-                    && validKind
-            })
-            if (disposed || attachable.length === 0) return
-            url = URL.createObjectURL(asset.data)
-            if (disposed) return URL.revokeObjectURL(url)
-            let attached = 0
-            for (const element of attachable) {
-                const marker = markers.get(element)
-                const validKind = marker?.type === 'image' && element instanceof HTMLImageElement
-                    || marker?.type === 'video' && element instanceof HTMLSourceElement && element.parentElement instanceof HTMLVideoElement
-                    || marker?.type === 'audio' && element instanceof HTMLSourceElement && element.parentElement instanceof HTMLAudioElement
-                if (element.isConnected
-                    && element.dataset.risuInlayToken === marker?.token
-                    && marker?.id === id
-                    && marker.type === asset.type
-                    && validKind) {
-                    element.setAttribute('src', url)
-                    attached++
-                    if (element instanceof HTMLSourceElement) {
-                        const media = element.parentElement
-                        if (media instanceof HTMLMediaElement) media.load()
-                    }
+            return new URL(url, document.baseURI).hostname === 'risuasset.localhost'
+        }
+        catch {
+            return false
+        }
+    }
+    const visibleById = new Map<string, Set<HTMLElement>>()
+    const resources = new Map<string, { url: string, objectUrl: boolean }>()
+    const pending = new Map<string, Promise<void>>()
+
+    const isValid = (element: HTMLElement, marker: DeferredInlayMarker & { token: string }) => {
+        const validKind = marker.type === 'image' && element instanceof HTMLImageElement
+            || marker.type === 'video' && element instanceof HTMLSourceElement && element.parentElement instanceof HTMLVideoElement
+            || marker.type === 'audio' && element instanceof HTMLSourceElement && element.parentElement instanceof HTMLAudioElement
+        return element.isConnected
+            && element.dataset.risuInlayToken === marker.token
+            && validKind
+    }
+    const attach = (element: HTMLElement, url: string) => {
+        element.setAttribute('src', url)
+        if (element instanceof HTMLSourceElement && element.parentElement instanceof HTMLMediaElement) {
+            element.parentElement.load()
+        }
+    }
+    const detach = (element: HTMLElement) => {
+        if (element instanceof HTMLSourceElement && element.parentElement instanceof HTMLMediaElement) {
+            element.parentElement.pause()
+            element.removeAttribute('src')
+            element.parentElement.load()
+            return
+        }
+        element.removeAttribute('src')
+    }
+    const releaseResource = (id: string) => {
+        const resource = resources.get(id)
+        if (resource?.objectUrl) URL.revokeObjectURL(resource.url)
+        resources.delete(id)
+    }
+    const loadResource = (id: string) => {
+        const existing = pending.get(id)
+        if (existing) return existing
+        const marker = [...markers.values()].find((candidate) => candidate.id === id)
+        if (!marker) return Promise.resolve()
+        const load = (async () => {
+            let resource: { url: string, objectUrl: boolean } | undefined
+            let createdObjectUrl: string | undefined
+            try {
+                if (marker.source.url && !marker.source.objectUrl) {
+                    resource = { url: marker.source.url, objectUrl: false }
+                }
+                else {
+                    const asset = await getInlayAssetBlob(id)
+                    if (!asset || asset.type !== marker.type || disposed) return
+                    const visible = visibleById.get(id)
+                    if (!visible?.size) return
+                    createdObjectUrl = URL.createObjectURL(asset.data)
+                    resource = { url: createdObjectUrl, objectUrl: true }
+                }
+                if (disposed) {
+                    if (createdObjectUrl) URL.revokeObjectURL(createdObjectUrl)
+                    return
+                }
+                const visible = visibleById.get(id)
+                const attachable = visible
+                    ? [...visible].filter((element) => {
+                        const candidate = markers.get(element)
+                        return candidate?.id === id && isValid(element, candidate)
+                    })
+                    : []
+                if (attachable.length === 0) {
+                    if (createdObjectUrl) URL.revokeObjectURL(createdObjectUrl)
+                    return
+                }
+                resources.set(id, resource)
+                for (const element of attachable) attach(element, resource.url)
+            }
+            catch (error) {
+                if (createdObjectUrl && resources.get(id)?.url !== createdObjectUrl) {
+                    URL.revokeObjectURL(createdObjectUrl)
+                }
+                if (options.rejectOnError) throw error
+            }
+        })().finally(() => {
+            if (pending.get(id) === load) pending.delete(id)
+        })
+        pending.set(id, load)
+        return load
+    }
+    const setVisible = (element: HTMLElement, visible: boolean) => {
+        const marker = markers.get(element)
+        if (disposed || !marker || !isValid(element, marker)) return
+        let visibleElements = visibleById.get(marker.id)
+        if (visible) {
+            if (!visibleElements) {
+                visibleElements = new Set()
+                visibleById.set(marker.id, visibleElements)
+            }
+            visibleElements.add(element)
+            const resource = resources.get(marker.id)
+            if (resource) attach(element, resource.url)
+            else void loadResource(marker.id)
+            return
+        }
+        detach(element)
+        visibleElements?.delete(element)
+        if (!visibleElements?.size) {
+            visibleById.delete(marker.id)
+            releaseResource(marker.id)
+        }
+    }
+
+    const useViewport = options.viewportAware && typeof IntersectionObserver !== 'undefined'
+    if (useViewport) {
+        for (const element of root.querySelectorAll<HTMLElement>('img[src], source[src]')) {
+            const url = element.getAttribute('src') ?? ''
+            if (!isManagedOriginalUrl(url)) continue
+            const target = element instanceof HTMLSourceElement && element.parentElement instanceof HTMLMediaElement
+                ? element.parentElement
+                : element
+            const sources = originalSources.get(target) ?? []
+            sources.push({ element, url })
+            originalSources.set(target, sources)
+            element.dataset.risuManagedMedia = 'true'
+            if (element instanceof HTMLImageElement && !element.hasAttribute('loading')) element.loading = 'lazy'
+            detach(element)
+        }
+    }
+
+    let observer: IntersectionObserver | null = null
+    if (useViewport) {
+        observer = new IntersectionObserver((entries) => {
+            if (disposed) return
+            for (const entry of entries) {
+                for (const element of markerTargets.get(entry.target) ?? []) {
+                    setVisible(element, entry.isIntersecting)
+                }
+                for (const source of originalSources.get(entry.target) ?? []) {
+                    if (entry.isIntersecting) attach(source.element, source.url)
+                    else detach(source.element)
                 }
             }
-            if (attached === 0) URL.revokeObjectURL(url)
-            else urls.add(url)
-        }
-        catch (error) {
-            if (url && !urls.has(url)) URL.revokeObjectURL(url)
-            if (options.rejectOnError) throw error
-        }
-    })).then(() => undefined)
+        }, { root: null, rootMargin: '256px 0px', threshold: 0 })
+        for (const target of markerTargets.keys()) observer.observe(target)
+        for (const target of originalSources.keys()) observer.observe(target)
+    }
+    else {
+        for (const element of markers.keys()) setVisible(element, true)
+    }
+
+    const settled = Promise.all([...pending.values()]).then(() => undefined)
     const cleanup = () => {
         if (disposed) return
         disposed = true
-        for (const url of urls) URL.revokeObjectURL(url)
-        urls.clear()
+        observer?.disconnect()
+        observer = null
+        for (const element of markers.keys()) detach(element)
+        for (const sources of originalSources.values()) {
+            for (const source of sources) detach(source.element)
+        }
+        for (const id of resources.keys()) releaseResource(id)
+        visibleById.clear()
         registry?.clear()
-        elements = []
+        markerTargets.clear()
+        originalSources.clear()
         markers.clear()
     }
     return { cleanup, settled }
@@ -143,7 +268,7 @@ export function mountDeferredInlaySources(
     root: ParentNode,
     registry?: DeferredInlayMarkerRegistry,
 ): () => void {
-    return startDeferredInlaySources(root, registry).cleanup
+    return startDeferredInlaySources(root, registry, { viewportAware: true }).cleanup
 }
 
 export async function resolveDeferredInlaySources(

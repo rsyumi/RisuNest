@@ -36,6 +36,7 @@ describe('DeferredMarkdown', () => {
     })
 
     test('owns browser inlay attachment and revokes it on destruction', async () => {
+        vi.stubGlobal('IntersectionObserver', undefined)
         inlayMocks.getInlayAssetBlob.mockResolvedValue({
             data: new Blob(['x'], { type: 'image/png' }), type: 'image', name: 'x.png',
         })
