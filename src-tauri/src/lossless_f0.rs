@@ -1060,15 +1060,17 @@ fn validate_payload_descriptor(payload: &F0PayloadDescriptor) -> Result<(), F0Er
         code: F0ErrorCode::InvalidInventory,
         message: format!("F0 payload metadata must be an object: {}", payload.key),
     })?;
-    for field in ["name", "ext", "mime"] {
-        if !metadata.get(field).is_some_and(Value::is_string) {
-            return Err(F0Error {
-                code: F0ErrorCode::InvalidInventory,
-                message: format!(
-                    "F0 payload metadata field {field} must be a string: {}",
-                    payload.key
-                ),
-            });
+    if payload.kind != F0PayloadKind::Cold {
+        for field in ["name", "ext", "mime"] {
+            if !metadata.get(field).is_some_and(Value::is_string) {
+                return Err(F0Error {
+                    code: F0ErrorCode::InvalidInventory,
+                    message: format!(
+                        "F0 payload metadata field {field} must be a string: {}",
+                        payload.key
+                    ),
+                });
+            }
         }
     }
     let inlay_type = metadata.get("inlayType").and_then(Value::as_str);
@@ -1082,7 +1084,7 @@ fn validate_payload_descriptor(payload: &F0PayloadDescriptor) -> Result<(), F0Er
                 ),
             });
         }
-    } else if inlay_type.is_some() {
+    } else if payload.kind == F0PayloadKind::Asset && inlay_type.is_some() {
         return Err(F0Error {
             code: F0ErrorCode::InvalidInventory,
             message: format!(
@@ -1613,6 +1615,7 @@ mod tests {
         let mut cold = payload(F0PayloadKind::Cold, "cold-key");
         cold.sha256 = hex::encode(Sha256::digest(&cold_bytes));
         cold.byte_length = cold_bytes.len() as u64;
+        cold.metadata = json!({ "source": "legacy-cold", "ordinal": 4 });
         cold.cold_source = Some(cold_path.clone());
         let payloads = [
             cold,

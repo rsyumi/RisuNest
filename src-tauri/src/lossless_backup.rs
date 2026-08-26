@@ -10,8 +10,8 @@ use crate::{
         JobPhase, JobProgress,
     },
     persistent_store::{
-        AssetAlias, ColdAlias, PersistentStore, RevisionResult, StagingResult, StoreError,
-        StoreResult,
+        AssetAlias, AssetOwnerHead, AssetOwnerLocator, ColdAlias, PersistentStore, RevisionResult,
+        StagingResult, StoreError, StoreResult,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,7 @@ pub(crate) enum PayloadKind {
     Asset,
     Inlay,
     Cold,
+    OwnerManifest,
 }
 
 impl PayloadKind {
@@ -52,6 +53,7 @@ impl PayloadKind {
             Self::Asset => Some("asset"),
             Self::Inlay => Some("inlay"),
             Self::Cold => Some("cold"),
+            Self::OwnerManifest => None,
         }
     }
 }
@@ -271,6 +273,92 @@ pub(crate) fn project_cold_aliases(
             })
         })
         .collect()
+}
+
+pub(crate) fn project_asset_owner_heads(
+    entries: &[StagedLosslessEntry],
+) -> Result<Vec<AssetOwnerHead>, LosslessError> {
+    entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
+        .map(parse_owner_head_entry)
+        .collect()
+}
+
+fn parse_owner_head_entry(entry: &StagedLosslessEntry) -> Result<AssetOwnerHead, LosslessError> {
+    let manifest = LosslessManifestEntry {
+        logical_path: entry.logical_path.clone(),
+        logical_key: entry.logical_key.clone(),
+        kind: entry.kind,
+        byte_length: entry.byte_length,
+        sha256: entry.sha256.clone(),
+        metadata: entry.metadata.clone(),
+    };
+    let head = parse_owner_head_manifest_entry(&manifest)?;
+    let staged = entry.immutable_object.as_ref().ok_or_else(|| {
+        invalid_manifest("lossless owner manifest is not staged in immutable storage")
+    })?;
+    if staged.content_hash != entry.sha256 || staged.byte_size != entry.byte_length {
+        return Err(LosslessError::new(
+            LosslessErrorCode::HashMismatch,
+            "lossless owner manifest differs from immutable staged object",
+        ));
+    }
+    Ok(head)
+}
+
+fn parse_owner_head_manifest_entry(
+    entry: &LosslessManifestEntry,
+) -> Result<AssetOwnerHead, LosslessError> {
+    let head: AssetOwnerHead = serde_json::from_value(entry.metadata.clone())
+        .map_err(|error| invalid_manifest(format!("invalid lossless asset owner head: {error}")))?;
+    if serde_json::to_value(&head).map_err(|error| invalid_manifest(error.to_string()))?
+        != entry.metadata
+    {
+        return Err(invalid_manifest(
+            "lossless asset owner head metadata has unsupported fields",
+        ));
+    }
+    let logical_key = entry.logical_key.as_deref().ok_or_else(|| {
+        invalid_manifest("lossless owner manifest entry is missing its logical key")
+    })?;
+    if logical_key != owner_head_logical_key(&head.owner) {
+        return Err(invalid_manifest(
+            "lossless owner manifest logical key differs from its owner",
+        ));
+    }
+    match (head.present, head.manifest_hash.as_deref()) {
+        (true, Some(hash)) if hash == entry.sha256 => {}
+        (true, _) => {
+            return Err(LosslessError::new(
+                LosslessErrorCode::HashMismatch,
+                "lossless owner manifest hash differs from its owner head",
+            ))
+        }
+        (false, None)
+            if entry.byte_length == 0 && entry.sha256 == hex::encode(Sha256::digest([])) => {}
+        (false, _) => {
+            return Err(invalid_manifest(
+                "absent lossless asset owner head requires an empty marker entry",
+            ))
+        }
+    }
+    Ok(head)
+}
+
+fn owner_head_logical_key(owner: &AssetOwnerLocator) -> String {
+    match owner {
+        AssetOwnerLocator::CharacterAdditionalAssets { character_id } => format!(
+            "character-additional-assets/{}",
+            hex::encode(character_id.as_bytes())
+        ),
+        AssetOwnerLocator::RootModuleAssets { index } => {
+            format!("root-module-assets/{index}")
+        }
+        AssetOwnerLocator::PersonaEmbeddedModuleAssets { index } => {
+            format!("persona-embedded-module-assets/{index}")
+        }
+    }
 }
 
 struct LosslessRestoreControl<'a> {
@@ -672,11 +760,15 @@ pub(crate) fn restore_lossless_package_v1(
         stage_block_database(store, &staging_id, database, cancellation)?;
         let aliases = project_payload_aliases(&incoming.entries)?;
         let cold_aliases = project_cold_aliases(&incoming.entries)?;
+        let owner_heads = project_asset_owner_heads(&incoming.entries)?;
         store
             .replace_put_asset_aliases(&staging_id, &aliases)
             .map_err(store_error)?;
         store
             .replace_put_cold_aliases(&staging_id, &cold_aliases)
+            .map_err(store_error)?;
+        store
+            .replace_put_asset_owner_heads(&staging_id, &owner_heads)
             .map_err(store_error)?;
         check_cancelled(cancellation)?;
         let staged_database = store
@@ -800,7 +892,12 @@ fn staged_f0_payloads(
 ) -> Result<Vec<F0PayloadDescriptor>, LosslessError> {
     entries
         .iter()
-        .filter(|entry| entry.kind != PayloadKind::Database)
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                PayloadKind::Asset | PayloadKind::Inlay | PayloadKind::Cold
+            )
+        })
         .map(|entry| {
             let prepared = entry.immutable_object.as_ref().ok_or_else(|| {
                 LosslessError::new(
@@ -849,9 +946,9 @@ fn f0_payload_kind(kind: PayloadKind) -> Result<F0PayloadKind, LosslessError> {
         PayloadKind::Asset => Ok(F0PayloadKind::Asset),
         PayloadKind::Inlay => Ok(F0PayloadKind::Inlay),
         PayloadKind::Cold => Ok(F0PayloadKind::Cold),
-        PayloadKind::Database => Err(invalid_manifest(
-            "database entry cannot be used as an F0 payload",
-        )),
+        PayloadKind::Database | PayloadKind::OwnerManifest => {
+            Err(invalid_manifest("entry cannot be used as an F0 payload"))
+        }
     }
 }
 
@@ -917,8 +1014,14 @@ fn create_and_verify_pre_replacement_backup(
     check_cancelled(cancellation)?;
     let database = store.materialize_lease(lease).map_err(store_error)?;
     let assets = store.list_asset_aliases(Some(lease)).map_err(store_error)?;
+    let owner_heads = store
+        .list_asset_owner_heads(Some(lease))
+        .map_err(store_error)?;
     let cold = store.list_cold_aliases(Some(lease)).map_err(store_error)?;
-    if assets.revision != expected_revision || cold.revision != expected_revision {
+    if assets.revision != expected_revision
+        || owner_heads.revision != expected_revision
+        || cold.revision != expected_revision
+    {
         return Err(LosslessError::new(
             LosslessErrorCode::RevisionConflict,
             "pre-replacement inventory is not pinned to the expected revision",
@@ -927,35 +1030,28 @@ fn create_and_verify_pre_replacement_backup(
     let exported = store.export_risu_save(lease, false).map_err(store_error)?;
     let export_path = PathBuf::from(&exported.path);
     let outcome = (|| {
-        let (entries, payloads) =
-            pinned_backup_entries(&export_path, &assets.value, &cold.value, cas, cancellation)?;
+        let absent_owner_marker = create_empty_job_file(job_staging_root)?;
+        let (entries, payloads) = pinned_backup_entries(
+            &export_path,
+            &assets.value,
+            &owner_heads.value,
+            &cold.value,
+            absent_owner_marker.as_ref(),
+            cas,
+            cancellation,
+        )?;
         let diagnostic = rebuild_f0_v1(&database, &payloads, &[]).map_err(f0_error)?;
-        let mut seen_missing = HashSet::new();
-        let expected_missing = diagnostic
+        if diagnostic
             .references
             .iter()
-            .filter(|reference| reference.status == F0ReferenceStatus::UnexpectedMissing)
-            .filter_map(|reference| {
-                let target = (reference.target_kind.clone(), reference.target_key.clone());
-                seen_missing
-                    .insert(target.clone())
-                    .then_some(F0ExpectedMissing {
-                        target_kind: target.0,
-                        target_key: target.1,
-                    })
-            })
-            .collect::<Vec<_>>();
-        let validation =
-            validate_f0_v1(&database, &payloads, &expected_missing).map_err(f0_error)?;
-        let warnings = if expected_missing.is_empty() {
-            Vec::new()
-        } else {
-            vec![LosslessWarning {
-                code: "expected-missing-reference".to_owned(),
-                message: "pre-replacement database contains legacy references whose payloads are already missing".to_owned(),
-                metadata: serde_json::json!({ "targetCount": expected_missing.len() }),
-            }]
-        };
+            .any(|reference| reference.status == F0ReferenceStatus::UnexpectedMissing)
+        {
+            return Err(LosslessError::new(
+                LosslessErrorCode::BackupIncomplete,
+                "pre-replacement payload absence is not proved across legacy and alias stores",
+            ));
+        }
+        let validation = validate_f0_v1(&database, &payloads, &[]).map_err(f0_error)?;
         let compatibility = LosslessCompatibility {
             oracle_version: FORMAT_VERSION,
             canonical_database_sha256: validation.canonical_database_sha256.clone(),
@@ -972,12 +1068,13 @@ fn create_and_verify_pre_replacement_backup(
             &entries,
             compatibility,
             references,
-            warnings,
+            Vec::new(),
             serde_json::json!({ "sourceRevision": expected_revision }),
             cancellation,
         )?;
         output_guard.sync()?;
         validate_payload_manifest(&written.manifest, &payloads)?;
+        validate_owner_head_manifest(&written.manifest, &owner_heads.value)?;
         let verified_bytes = verify_pre_replacement_backup(
             output_path,
             &written.manifest,
@@ -1014,11 +1111,13 @@ fn create_and_verify_pre_replacement_backup(
 fn pinned_backup_entries(
     database_path: &Path,
     assets: &[AssetAlias],
+    owner_heads: &[AssetOwnerHead],
     cold: &[ColdAlias],
+    absent_owner_marker: &Path,
     cas: &PayloadCas,
     cancellation: &dyn CancellationProbe,
 ) -> Result<(Vec<LosslessWriteEntry>, Vec<F0PayloadDescriptor>), LosslessError> {
-    let mut entries = Vec::with_capacity(1 + assets.len() + cold.len());
+    let mut entries = Vec::with_capacity(1 + assets.len() + owner_heads.len() + cold.len());
     let mut payloads = Vec::with_capacity(assets.len() + cold.len());
     entries.push(LosslessWriteEntry {
         logical_path: DATABASE_PATH.to_owned(),
@@ -1076,6 +1175,37 @@ fn pinned_backup_entries(
             byte_length,
             metadata: alias.metadata.clone(),
             cold_source: Some(source),
+        });
+    }
+    for head in owner_heads {
+        check_cancelled(cancellation)?;
+        let logical_key = owner_head_logical_key(&head.owner);
+        let source = match (head.present, head.manifest_hash.as_deref()) {
+            (true, Some(hash)) => cas
+                .object_path(hash)
+                .map_err(LosslessError::io)?
+                .ok_or_else(|| {
+                    LosslessError::new(
+                        LosslessErrorCode::BackupIncomplete,
+                        format!("pre-replacement owner manifest object is missing: {logical_key}"),
+                    )
+                })?,
+            (false, None) => absent_owner_marker.to_path_buf(),
+            _ => {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::BackupIncomplete,
+                    format!("pre-replacement asset owner head is invalid: {logical_key}"),
+                ))
+            }
+        };
+        entries.push(LosslessWriteEntry {
+            logical_path: backup_logical_path(PayloadKind::OwnerManifest, &logical_key),
+            logical_key: Some(logical_key),
+            kind: PayloadKind::OwnerManifest,
+            metadata: serde_json::to_value(head).map_err(|error| {
+                LosslessError::new(LosslessErrorCode::BackupIncomplete, error.to_string())
+            })?,
+            source,
         });
     }
     Ok((entries, payloads))
@@ -1164,6 +1294,7 @@ fn backup_logical_path(kind: PayloadKind, logical_key: &str) -> String {
         PayloadKind::Asset => "assets",
         PayloadKind::Inlay => "inlays",
         PayloadKind::Cold => "cold",
+        PayloadKind::OwnerManifest => "owner-manifests",
     };
     format!("{namespace}/{}", hex::encode(logical_key.as_bytes()))
 }
@@ -1175,7 +1306,12 @@ fn validate_payload_manifest(
     let package_payloads = manifest
         .entries
         .iter()
-        .filter(|entry| entry.kind != PayloadKind::Database)
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                PayloadKind::Asset | PayloadKind::Inlay | PayloadKind::Cold
+            )
+        })
         .collect::<Vec<_>>();
     if package_payloads.len() != payloads.len() {
         return Err(LosslessError::new(
@@ -1236,6 +1372,12 @@ fn verify_pre_replacement_backup(
             "pre-replacement package manifest changed during verification",
         ));
     }
+    let expected_owner_heads = expected_manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
+        .map(parse_owner_head_manifest_entry)
+        .collect::<Result<Vec<_>, _>>()?;
     let verification_root = JobOwnedDirectory::create(job_staging_root)?;
     let mut raw = File::open(backup_path).map_err(LosslessError::io)?;
     let staged = read_lossless_package_v1(&mut raw, verification_root.as_ref(), cas, cancellation)?;
@@ -1256,6 +1398,16 @@ fn verify_pre_replacement_backup(
                 "pre-replacement database does not decode to the pinned expected revision",
             ));
         }
+        let owner_heads = project_asset_owner_heads(&staged.entries)?;
+        if owner_heads != expected_owner_heads {
+            return Err(LosslessError::new(
+                LosslessErrorCode::BackupIncomplete,
+                "pre-replacement asset owner heads do not match the pinned inventory",
+            ));
+        }
+        store
+            .replace_put_asset_owner_heads(&verification_staging, &owner_heads)
+            .map_err(store_error)?;
         validate_staged_f0(&staged.manifest, &staged.entries, &decoded, cas)?;
         Ok(())
     })();
@@ -1509,7 +1661,9 @@ fn validate_manifest(manifest: &LosslessManifest) -> Result<(), LosslessError> {
                 ));
             }
             validate_payload_metadata(entry)?;
-            payload_targets.insert((entry.kind.target_kind().unwrap(), logical_key));
+            if let Some(target_kind) = entry.kind.target_kind() {
+                payload_targets.insert((target_kind, logical_key));
+            }
         }
     }
     match database_count {
@@ -1585,11 +1739,13 @@ fn validate_payload_metadata(entry: &LosslessManifestEntry) -> Result<(), Lossle
     let metadata = entry.metadata.as_object().ok_or_else(|| {
         invalid_manifest("lossless package payload metadata must be a JSON object")
     })?;
-    for field in ["name", "ext", "mime"] {
-        if !metadata.get(field).is_some_and(Value::is_string) {
-            return Err(invalid_manifest(format!(
-                "lossless package payload metadata field {field} must be a string"
-            )));
+    if matches!(entry.kind, PayloadKind::Asset | PayloadKind::Inlay) {
+        for field in ["name", "ext", "mime"] {
+            if !metadata.get(field).is_some_and(Value::is_string) {
+                return Err(invalid_manifest(format!(
+                    "lossless package payload metadata field {field} must be a string"
+                )));
+            }
         }
     }
     let inlay_type = metadata.get("inlayType").and_then(Value::as_str);
@@ -1599,9 +1755,31 @@ fn validate_payload_metadata(entry: &LosslessManifestEntry) -> Result<(), Lossle
                 "lossless package Inlay metadata requires a supported inlayType",
             ));
         }
-    } else if inlay_type.is_some() {
+    } else if entry.kind == PayloadKind::Asset && inlay_type.is_some() {
         return Err(invalid_manifest(
             "lossless package non-Inlay metadata cannot declare inlayType",
+        ));
+    }
+    if entry.kind == PayloadKind::OwnerManifest {
+        parse_owner_head_manifest_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_owner_head_manifest(
+    manifest: &LosslessManifest,
+    expected: &[AssetOwnerHead],
+) -> Result<(), LosslessError> {
+    let actual = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
+        .map(parse_owner_head_manifest_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    if actual != expected {
+        return Err(LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            "pre-replacement asset owner-head inventory differs from its package",
         ));
     }
     Ok(())
@@ -1935,6 +2113,19 @@ fn write_all_checked(
 #[derive(Debug)]
 pub(crate) struct JobOwnedFile {
     path: PathBuf,
+}
+
+fn create_empty_job_file(root: &Path) -> Result<JobOwnedFile, LosslessError> {
+    let staging = prepare_staging_directory(root)?;
+    let path = staging.join(format!("{}.owner-empty", uuid::Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(LosslessError::io)?;
+    file.sync_all().map_err(LosslessError::io)?;
+    drop(file);
+    Ok(JobOwnedFile::new(path))
 }
 
 impl JobOwnedFile {
@@ -2281,6 +2472,31 @@ mod tests {
                 assert_eq!(asset.value.metadata["nested"]["label"], "New-asset");
                 assert_eq!(inlay.value.metadata["nested"]["label"], "New-inlay");
                 assert_eq!(cold.value.metadata["nested"]["label"], "New-cold");
+                let owner = reopened
+                    .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+                    .unwrap()
+                    .unwrap();
+                assert!(owner.value.present);
+                assert_eq!(owner.value.entry_count, 1);
+                assert_eq!(
+                    cas.read_object(owner.value.manifest_hash.as_ref().unwrap())
+                        .unwrap()
+                        .unwrap(),
+                    b"New-owner-manifest"
+                );
+                assert_eq!(
+                    reopened
+                        .read_asset_owner_head(
+                            &AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 },
+                            None,
+                        )
+                        .unwrap()
+                        .unwrap()
+                        .value,
+                    AssetOwnerHead::absent(AssetOwnerLocator::PersonaEmbeddedModuleAssets {
+                        index: 0,
+                    })
+                );
                 assert_eq!(
                     cas.read_object(asset.value.object_hash.as_ref().unwrap())
                         .unwrap()
@@ -2300,13 +2516,48 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(backup.manifest.extensions["sourceRevision"], 1);
-                assert_eq!(backup.manifest.entries.len(), 4);
+                assert_eq!(backup.manifest.entries.len(), 6);
                 assert!(backup
                     .manifest
                     .entries
                     .iter()
                     .any(|entry| entry.kind == PayloadKind::Cold
                         && entry.logical_key.as_deref() == Some("shared")));
+                let backup_cold = backup
+                    .manifest
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.kind == PayloadKind::Cold
+                            && entry.logical_key.as_deref() == Some("shared")
+                    })
+                    .unwrap();
+                assert_eq!(backup_cold.metadata["source"], "legacy-cold");
+                assert_eq!(backup_cold.metadata["ordinal"], 7);
+                assert!(backup_cold.metadata.get("name").is_none());
+                assert_eq!(
+                    backup
+                        .manifest
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
+                        .count(),
+                    2
+                );
+                let backup_owner = backup
+                    .manifest
+                    .entries
+                    .iter()
+                    .find(|entry| {
+                        entry.kind == PayloadKind::OwnerManifest
+                            && entry.metadata["present"] == true
+                    })
+                    .unwrap();
+                assert_eq!(
+                    backup_owner.sha256,
+                    hex::encode(Sha256::digest(b"Old-owner-manifest"))
+                );
+                assert_eq!(backup_owner.byte_length, b"Old-owner-manifest".len() as u64);
             }
         }
     }
@@ -2805,7 +3056,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_replacement_backup_marks_already_missing_legacy_payloads_expected() {
+    fn present_unaliased_legacy_payload_fails_closed_before_replacement() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("staging");
         let repository = directory.path().join("repository");
@@ -2815,9 +3066,12 @@ mod tests {
         let cas = PayloadCas::new(repository).unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         stage_f0_database(&mut store, "OldMissing");
+        let legacy_asset = directory.path().join("blobstore").join("assets");
+        fs::create_dir_all(&legacy_asset).unwrap();
+        fs::write(legacy_asset.join("shared"), b"legacy-present").unwrap();
         let backup_path = directory.path().join("legacy-missing.lossless");
 
-        restore_lossless_package_v1(
+        let error = restore_lossless_package_v1(
             &mut Cursor::new(incoming),
             &staging,
             &cas,
@@ -2826,31 +3080,13 @@ mod tests {
             &backup_path,
             &NeverCancelled,
         )
-        .unwrap();
+        .unwrap_err();
 
-        let backup =
-            verify_lossless_package_v1(&mut File::open(&backup_path).unwrap(), &NeverCancelled)
-                .unwrap();
-        assert!(backup
-            .manifest
-            .warnings
-            .iter()
-            .any(|warning| warning.code == "expected-missing-reference"));
-        assert!(backup.manifest.references.iter().any(|reference| {
-            reference.target_kind == "asset"
-                && reference.target_key == "shared"
-                && reference.status == ReferenceStatus::ExpectedMissing
-        }));
-        assert!(backup.manifest.references.iter().any(|reference| {
-            reference.target_kind == "inlay"
-                && reference.target_key == "shared"
-                && reference.status == ReferenceStatus::ExpectedMissing
-        }));
-        assert!(backup.manifest.references.iter().any(|reference| {
-            reference.target_kind == "cold"
-                && reference.target_key == "shared"
-                && reference.status == ReferenceStatus::ExpectedMissing
-        }));
+        assert_eq!(error.code, LosslessErrorCode::BackupIncomplete);
+        assert!(error.message.contains("absence is not proved"));
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "OldMissing");
+        assert!(!backup_path.exists());
     }
 
     #[test]
@@ -3023,10 +3259,22 @@ mod tests {
         let asset_path = root.join(format!("package-asset-{username}"));
         let inlay_path = root.join(format!("package-inlay-{username}"));
         let cold_path = root.join(format!("package-cold-{username}"));
+        let owner_manifest_bytes = format!("{username}-owner-manifest").into_bytes();
+        let owner_manifest_path = root.join(format!("package-owner-manifest-{username}"));
+        let absent_owner_path = root.join(format!("package-absent-owner-{username}"));
         fs::write(&asset_path, &asset_bytes).unwrap();
         fs::write(&inlay_path, &inlay_bytes).unwrap();
         fs::write(&cold_path, &cold_bytes).unwrap();
+        fs::write(&owner_manifest_path, &owner_manifest_bytes).unwrap();
+        fs::write(&absent_owner_path, []).unwrap();
         let metadata = payload_metadata(username);
+        let present_owner = AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            hex::encode(Sha256::digest(&owner_manifest_bytes)),
+            1,
+        );
+        let absent_owner =
+            AssetOwnerHead::absent(AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 });
         let entries = vec![
             LosslessWriteEntry {
                 logical_path: DATABASE_PATH.to_owned(),
@@ -3055,6 +3303,26 @@ mod tests {
                 kind: PayloadKind::Cold,
                 metadata: metadata.2.clone(),
                 source: cold_path.clone(),
+            },
+            LosslessWriteEntry {
+                logical_path: backup_logical_path(
+                    PayloadKind::OwnerManifest,
+                    &owner_head_logical_key(&present_owner.owner),
+                ),
+                logical_key: Some(owner_head_logical_key(&present_owner.owner)),
+                kind: PayloadKind::OwnerManifest,
+                metadata: serde_json::to_value(&present_owner).unwrap(),
+                source: owner_manifest_path,
+            },
+            LosslessWriteEntry {
+                logical_path: backup_logical_path(
+                    PayloadKind::OwnerManifest,
+                    &owner_head_logical_key(&absent_owner.owner),
+                ),
+                logical_key: Some(owner_head_logical_key(&absent_owner.owner)),
+                kind: PayloadKind::OwnerManifest,
+                metadata: serde_json::to_value(&absent_owner).unwrap(),
+                source: absent_owner_path,
             },
         ];
         let payloads = vec![
@@ -3108,6 +3376,8 @@ mod tests {
         let asset = cas.prepare_bytes(&asset_bytes).unwrap();
         let inlay = cas.prepare_bytes(&inlay_bytes).unwrap();
         let cold = cas.prepare_bytes(&cold_bytes).unwrap();
+        let owner_manifest_bytes = format!("{username}-owner-manifest").into_bytes();
+        let owner_manifest = cas.prepare_bytes(&owner_manifest_bytes).unwrap();
         let metadata = payload_metadata(username);
         let staging = store.replace_begin().unwrap().staging_id;
         put_f0_database(store, &staging, username);
@@ -3151,8 +3421,27 @@ mod tests {
                     key: "shared".to_owned(),
                     object_hash: Some(cold.content_hash),
                     size: cold_bytes.len() as i64,
-                    metadata: metadata.2,
+                    metadata: json!({
+                        "source": "legacy-cold",
+                        "ordinal": 7,
+                        "nested": { "label": format!("{username}-cold") }
+                    }),
                 }],
+            )
+            .unwrap();
+        store
+            .replace_put_asset_owner_heads(
+                &staging,
+                &[
+                    AssetOwnerHead::present(
+                        AssetOwnerLocator::RootModuleAssets { index: 0 },
+                        owner_manifest.content_hash,
+                        1,
+                    ),
+                    AssetOwnerHead::absent(AssetOwnerLocator::PersonaEmbeddedModuleAssets {
+                        index: 0,
+                    }),
+                ],
             )
             .unwrap();
         store.replace_commit(&staging, Some(0)).unwrap();
@@ -3171,12 +3460,20 @@ mod tests {
                 &json!({
                     "username": username,
                     "botPresetsId": 0,
-                    "personas": [{ "id": "persona" }],
+                    "personas": [{
+                        "id": "persona",
+                        "embeddedModule": { "id": "embedded", "name": "Embedded" }
+                    }],
                     "selectedPersona": 0,
                     "enabledModules": [],
                     "characterOrder": [],
                     "userIcon": "shared",
-                    "modules": [],
+                    "modules": [{
+                        "id": "module",
+                        "name": "Module",
+                        "description": "",
+                        "assets": [["shared", "shared", "BIN"]]
+                    }],
                     "loadouts": [],
                     "plugins": [],
                     "pluginCustomStorage": {

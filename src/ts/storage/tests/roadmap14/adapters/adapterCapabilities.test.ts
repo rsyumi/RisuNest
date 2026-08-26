@@ -271,16 +271,29 @@ const EXPECTED_ADAPTER_CAPABILITY_MATRIX = {
         {
             id: 'lossless-package-v1',
             oracleStatus: 'known-gap',
-            resultWarning: 'The private native foundation preserves payload bytes, but legacy block staging normalizes top-level database key order and its serde_json validator does not cover JavaScript-only values or synthetic card containers. Production routing remains disabled.',
+            resultWarning: 'The private native foundation preserves alias-backed payload and owner-manifest bytes, but fails closed when legacy payload absence cannot be proved. Legacy block staging also normalizes top-level database key order, and its serde_json validator does not cover JavaScript-only values or synthetic card containers. Production routing remains disabled.',
             capabilities: [
                 {
                     feature: 'database',
                     category: 'partial',
                     warning: 'Validation covers serde_json values, but legacy block staging normalizes top-level key order. JavaScript undefined, sparse holes, and ABSENT are outside the production validator domain.',
                 },
-                { feature: 'ordinary-assets', category: 'preserved' },
-                { feature: 'inlays', category: 'preserved' },
-                { feature: 'cold-payloads', category: 'preserved' },
+                {
+                    feature: 'ordinary-assets',
+                    category: 'partial',
+                    warning: 'Alias-backed bytes are preserved exactly. Replacement fails closed when a database reference has no alias because the native foundation cannot prove whether a legacy BlobStore payload is present.',
+                },
+                {
+                    feature: 'inlays',
+                    category: 'partial',
+                    warning: 'Alias-backed Inlays are preserved exactly. Replacement fails closed for unaliased legacy Inlays.',
+                },
+                {
+                    feature: 'cold-payloads',
+                    category: 'partial',
+                    warning: 'Alias-backed cold payload bytes and arbitrary object metadata are preserved. Replacement fails closed for unaliased legacy cold payloads.',
+                },
+                { feature: 'asset-owner-manifests', category: 'preserved' },
                 {
                     feature: 'synthetic-card-containers',
                     category: 'unsupported',

@@ -663,6 +663,67 @@ fn staged_payload_namespaces_with_the_same_key_activate_atomically() {
 }
 
 #[test]
+fn staged_owner_heads_activate_and_remain_pinned_with_their_database_generation() {
+    let directory = tempfile::tempdir().expect("create staged owner-head directory");
+    let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
+    let staging = store.replace_begin().expect("begin staged replacement");
+    store
+        .replace_put_root(
+            &staging.staging_id,
+            &json!({
+                "modules": [{
+                    "id": "module",
+                    "name": "Module",
+                    "assets": [["asset", "shared", "BIN"]]
+                }],
+                "personas": [{
+                    "id": "persona",
+                    "embeddedModule": { "id": "embedded", "name": "Embedded" }
+                }]
+            }),
+        )
+        .expect("stage owner-head root");
+    store
+        .replace_put_presets(&staging.staging_id, &[])
+        .expect("stage empty presets");
+    store
+        .replace_add_characters(&staging.staging_id, &[])
+        .expect("stage empty characters");
+    let present = AssetOwnerHead::present(
+        AssetOwnerLocator::RootModuleAssets { index: 0 },
+        "91".repeat(32),
+        1,
+    );
+    let absent =
+        AssetOwnerHead::absent(AssetOwnerLocator::PersonaEmbeddedModuleAssets { index: 0 });
+    store
+        .replace_put_asset_owner_heads(&staging.staging_id, &[present.clone(), absent.clone()])
+        .expect("stage owner heads");
+    let committed = store
+        .replace_commit(&staging.staging_id, Some(0))
+        .expect("activate owner-head generation");
+    let lease = store
+        .acquire_revision(committed.revision)
+        .expect("pin owner-head generation");
+
+    let expected = vec![absent, present];
+    assert_eq!(
+        store
+            .list_asset_owner_heads(None)
+            .expect("list current owner heads")
+            .value,
+        expected
+    );
+    assert_eq!(
+        store
+            .list_asset_owner_heads(Some(&lease.lease))
+            .expect("list pinned owner heads")
+            .value,
+        expected
+    );
+}
+
+#[test]
 fn committing_one_alias_kind_preserves_the_sibling_kind_and_pinned_revision() {
     let directory = tempfile::tempdir().expect("create alias namespace directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");

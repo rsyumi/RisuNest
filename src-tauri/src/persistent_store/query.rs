@@ -251,6 +251,74 @@ pub(super) fn list_asset_aliases(
     })
 }
 
+pub(super) fn list_asset_owner_heads(
+    connection: &Connection,
+    lease: Option<&str>,
+) -> StoreResult<Versioned<Vec<AssetOwnerHead>>> {
+    let target = read_target(connection, lease)?;
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT owner_kind, owner_locator, present, manifest_hash, entry_count
+             FROM asset_owner_heads WHERE generation = ?1
+             ORDER BY owner_kind ASC, owner_locator ASC",
+        )?;
+        let rows = statement
+            .query_map([&target.generation], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let values = rows
+        .into_iter()
+        .map(
+            |(owner_kind, owner_locator, present, manifest_hash, entry_count)| {
+                let owner = match owner_kind.as_str() {
+                    "character-additional-assets" => AssetOwnerLocator::CharacterAdditionalAssets {
+                        character_id: owner_locator,
+                    },
+                    "root-module-assets" => AssetOwnerLocator::RootModuleAssets {
+                        index: owner_locator.parse().map_err(|_| StoreError::Validation {
+                            message: "Stored root module asset owner locator is invalid".to_owned(),
+                        })?,
+                    },
+                    "persona-embedded-module-assets" => {
+                        AssetOwnerLocator::PersonaEmbeddedModuleAssets {
+                            index: owner_locator.parse().map_err(|_| StoreError::Validation {
+                                message: "Stored persona module asset owner locator is invalid"
+                                    .to_owned(),
+                            })?,
+                        }
+                    }
+                    _ => {
+                        return Err(StoreError::Validation {
+                            message: "Stored asset owner kind is invalid".to_owned(),
+                        })
+                    }
+                };
+                let value = AssetOwnerHead {
+                    owner,
+                    present,
+                    manifest_hash,
+                    entry_count,
+                };
+                value.validate()?;
+                Ok(value)
+            },
+        )
+        .collect::<StoreResult<Vec<_>>>()?;
+    Ok(Versioned {
+        revision: target.revision,
+        value: values,
+    })
+}
+
 pub(super) fn list_cold_aliases(
     connection: &Connection,
     lease: Option<&str>,

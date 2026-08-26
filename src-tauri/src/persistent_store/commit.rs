@@ -329,6 +329,96 @@ pub(super) fn replace_put_asset_aliases(
     Ok(())
 }
 
+pub(super) fn replace_put_asset_owner_heads(
+    connection: &mut Connection,
+    staging_id: &str,
+    heads: &[AssetOwnerHead],
+) -> StoreResult<()> {
+    let database = super::query::materialize_staging(connection, staging_id)?;
+    validate_staged_owner_heads(&database, heads)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_staging(&transaction, staging_id)?;
+    transaction.execute(
+        "DELETE FROM asset_owner_heads WHERE generation = ?1",
+        [staging_id],
+    )?;
+    for head in heads {
+        put_asset_owner_head(&transaction, staging_id, head)?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_staged_owner_heads(database: &Value, heads: &[AssetOwnerHead]) -> StoreResult<()> {
+    let mut identities = HashSet::new();
+    for head in heads {
+        head.validate()?;
+        if !identities.insert(head.owner.storage_identity()) {
+            return Err(validation("Duplicate asset owner head"));
+        }
+        let entries = staged_owner_entries(database, &head.owner)?;
+        if head.present != entries.is_some() {
+            return Err(validation(
+                "Asset owner head property presence does not match its staged parent",
+            ));
+        }
+        if head.present && head.entry_count != entries.map_or(0, |value| value.len() as i64) {
+            return Err(validation(
+                "Asset owner head entryCount does not match its staged parent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn staged_owner_entries<'a>(
+    database: &'a Value,
+    owner: &AssetOwnerLocator,
+) -> StoreResult<Option<&'a Vec<Value>>> {
+    let root = database
+        .as_object()
+        .ok_or_else(|| validation("Staged database must be an object"))?;
+    let parent = match owner {
+        AssetOwnerLocator::CharacterAdditionalAssets { character_id } => root
+            .get("characters")
+            .and_then(Value::as_array)
+            .and_then(|characters| {
+                characters.iter().find_map(|character| {
+                    character.as_object().filter(|character| {
+                        character.get("chaId").and_then(Value::as_str)
+                            == Some(character_id.as_str())
+                    })
+                })
+            })
+            .ok_or_else(|| validation("Character asset owner occurrence does not exist"))?,
+        AssetOwnerLocator::RootModuleAssets { index } => root
+            .get("modules")
+            .and_then(Value::as_array)
+            .and_then(|modules| modules.get(*index as usize))
+            .and_then(Value::as_object)
+            .ok_or_else(|| validation("Root module asset owner occurrence does not exist"))?,
+        AssetOwnerLocator::PersonaEmbeddedModuleAssets { index } => root
+            .get("personas")
+            .and_then(Value::as_array)
+            .and_then(|personas| personas.get(*index as usize))
+            .and_then(Value::as_object)
+            .and_then(|persona| persona.get("embeddedModule"))
+            .and_then(Value::as_object)
+            .ok_or_else(|| validation("Persona module asset owner occurrence does not exist"))?,
+    };
+    parent
+        .get(match owner {
+            AssetOwnerLocator::CharacterAdditionalAssets { .. } => "additionalAssets",
+            _ => "assets",
+        })
+        .map(|entries| {
+            entries
+                .as_array()
+                .ok_or_else(|| validation("Asset owner property must be an array when present"))
+        })
+        .transpose()
+}
+
 pub(super) fn replace_put_cold_aliases(
     connection: &mut Connection,
     staging_id: &str,

@@ -850,6 +850,13 @@ impl PersistentStore {
         query::list_asset_aliases(&self.connection, lease)
     }
 
+    pub(crate) fn list_asset_owner_heads(
+        &self,
+        lease: Option<&str>,
+    ) -> StoreResult<Versioned<Vec<AssetOwnerHead>>> {
+        query::list_asset_owner_heads(&self.connection, lease)
+    }
+
     pub(crate) fn list_cold_aliases(
         &self,
         lease: Option<&str>,
@@ -903,6 +910,14 @@ impl PersistentStore {
         aliases: &[AssetAlias],
     ) -> StoreResult<()> {
         commit::replace_put_asset_aliases(&mut self.connection, staging_id, aliases)
+    }
+
+    pub(crate) fn replace_put_asset_owner_heads(
+        &mut self,
+        staging_id: &str,
+        heads: &[AssetOwnerHead],
+    ) -> StoreResult<()> {
+        commit::replace_put_asset_owner_heads(&mut self.connection, staging_id, heads)
     }
 
     pub(crate) fn replace_put_cold_aliases(
