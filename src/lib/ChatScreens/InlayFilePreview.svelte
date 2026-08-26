@@ -9,17 +9,42 @@
 
     let { id }: Props = $props()
     let source: InlayRenderSource | null = $state(null)
+    let descriptor: InlayRenderSource | null = $state(null)
     let previewRoot: HTMLDivElement | null = $state(null)
     let visible = $state(typeof IntersectionObserver === 'undefined')
+    let playing = $state(false)
+    const shouldLoad = $derived(visible || playing)
+    const placeholderStyle = $derived.by(() => {
+        if (descriptor?.type === 'audio') return 'width: 192px; height: 96px'
+        const width = descriptor?.width
+        const height = descriptor?.height
+        if (!width || !height) return 'width: 192px; height: 192px'
+        const scale = Math.min(1, 192 / width, 192 / height)
+        return `width: ${Math.max(1, Math.round(width * scale))}px; height: ${Math.max(1, Math.round(height * scale))}px; aspect-ratio: ${width} / ${height}`
+    })
 
     const unloadMedia = () => {
         const media = previewRoot?.querySelectorAll<HTMLMediaElement>('audio, video') ?? []
         for (const element of media) {
-            element.pause()
+            if (!element.paused && !element.ended) element.pause()
             for (const child of element.querySelectorAll('source')) child.removeAttribute('src')
             element.load()
         }
     }
+
+    const markPlaying = () => {
+        playing = true
+    }
+
+    const markStopped = () => {
+        playing = false
+    }
+
+    $effect(() => {
+        id
+        descriptor = null
+        playing = false
+    })
 
     $effect(() => {
         const root = previewRoot
@@ -41,11 +66,11 @@
 
     $effect(() => {
         const assetId = id
-        const shouldLoad = visible
+        const load = shouldLoad
         let disposed = false
         let objectUrl: string | null = null
         source = null
-        if (!shouldLoad) {
+        if (!load) {
             unloadMedia()
             return
         }
@@ -55,6 +80,7 @@
                 return
             }
             source = nextSource
+            if (nextSource) descriptor = { ...nextSource, url: '', objectUrl: false }
             objectUrl = nextSource?.objectUrl ? nextSource.url : null
         })
         return () => {
@@ -66,20 +92,22 @@
 </script>
 
 <div bind:this={previewRoot} data-inlay-file-preview>
-    {#if source?.type === 'image'}
-        <img src={source.url} alt="Inlay" class="max-w-48 max-h-48 border border-darkborderc">
-    {:else if source?.type === 'video'}
-        <video controls class="max-w-48 max-h-48 border border-darkborderc">
-            <source src={source.url} type={source.mime} />
-            <track kind="captions" />
-            Your browser does not support the video tag.
-        </video>
-    {:else if source?.type === 'audio'}
-        <audio controls class="max-w-48 max-h-24 border border-darkborderc">
-            <source src={source.url} type={source.mime} />
-            Your browser does not support the audio tag.
-        </audio>
-    {:else if source}
-        <div class="max-w-24 max-h-24">{id}</div>
-    {/if}
+    <div data-inlay-file-preview-box style={placeholderStyle}>
+        {#if descriptor?.type === 'image'}
+            <img src={source?.url} alt="Inlay" class="w-full h-full object-contain border border-darkborderc">
+        {:else if descriptor?.type === 'video'}
+            <video controls class="w-full h-full border border-darkborderc" onplay={markPlaying} onpause={markStopped} onended={markStopped}>
+                <source src={source?.url} type={descriptor.mime} />
+                <track kind="captions" />
+                Your browser does not support the video tag.
+            </video>
+        {:else if descriptor?.type === 'audio'}
+            <audio controls class="w-full max-h-24 border border-darkborderc" onplay={markPlaying} onpause={markStopped} onended={markStopped}>
+                <source src={source?.url} type={descriptor.mime} />
+                Your browser does not support the audio tag.
+            </audio>
+        {:else if descriptor}
+            <div class="max-w-24 max-h-24">{id}</div>
+        {/if}
+    </div>
 </div>

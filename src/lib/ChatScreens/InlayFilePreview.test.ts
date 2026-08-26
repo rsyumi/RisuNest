@@ -114,6 +114,8 @@ describe('InlayFilePreview', () => {
             ext: 'png',
             name: 'image.png',
             type: 'image',
+            width: 800,
+            height: 600,
         })
         const createObjectURL = vi.fn()
             .mockReturnValueOnce('blob:visible-first')
@@ -131,12 +133,64 @@ describe('InlayFilePreview', () => {
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:visible-first'))
         TestIntersectionObserver.instance?.setVisible(root, false)
         await tick()
-        expect(target.querySelector('img')).toBeNull()
+        const placeholder = target.querySelector<HTMLElement>('[data-inlay-file-preview-box]')
+        expect(placeholder).not.toBeNull()
+        expect(placeholder?.style.aspectRatio).toBe('800 / 600')
+        expect(target.querySelector('img')).not.toBeNull()
+        expect(target.querySelector('img')?.getAttribute('src')).toBeNull()
         expect(revokeObjectURL).toHaveBeenCalledOnce()
         expect(revokeObjectURL).toHaveBeenCalledWith('blob:visible-first')
 
         TestIntersectionObserver.instance?.setVisible(root, true)
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:visible-second'))
         expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2)
+    })
+
+    test.each([
+        ['audio', 'pause'],
+        ['video', 'ended'],
+    ] as const)('pins a playing %s preview until %s offscreen', async (type, stopEvent) => {
+        platform.isTauri = false
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob([type], { type: `${type}/webm` }),
+            ext: 'webm',
+            name: `clip.${type}`,
+            type,
+            width: 640,
+            height: 360,
+        })
+        const revokeObjectURL = vi.fn()
+        vi.stubGlobal('URL', { ...URL, createObjectURL: vi.fn(() => `blob:${type}`), revokeObjectURL })
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(InlayFilePreview, { target, props: { id: `${type}-id` } })
+        await tick()
+        const root = target.querySelector('[data-inlay-file-preview]')!
+
+        TestIntersectionObserver.instance?.setVisible(root, true)
+        await vi.waitFor(() => expect(target.querySelector('source')?.getAttribute('src')).toBe(`blob:${type}`))
+        const media = target.querySelector(type) as HTMLMediaElement
+        let paused = false
+        let ended = false
+        Object.defineProperties(media, {
+            paused: { configurable: true, get: () => paused },
+            ended: { configurable: true, get: () => ended },
+        })
+        media.pause = vi.fn(() => { paused = true })
+        media.load = vi.fn()
+        media.dispatchEvent(new Event('play'))
+
+        TestIntersectionObserver.instance?.setVisible(root, false)
+        await tick()
+        expect(media.pause).not.toHaveBeenCalled()
+        expect(target.querySelector('source')?.getAttribute('src')).toBe(`blob:${type}`)
+        expect(revokeObjectURL).not.toHaveBeenCalled()
+
+        if (stopEvent === 'pause') paused = true
+        else ended = true
+        media.dispatchEvent(new Event(stopEvent))
+        await vi.waitFor(() => expect(target.querySelector('source')?.getAttribute('src')).toBeNull())
+        expect(revokeObjectURL).toHaveBeenCalledOnce()
     })
 })

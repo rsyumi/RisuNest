@@ -119,9 +119,20 @@ function startDeferredInlaySources(
             element.parentElement.load()
         }
     }
-    const detach = (element: HTMLElement) => {
+    const mediaElementFor = (element: HTMLElement): HTMLMediaElement | null => {
+        return element instanceof HTMLSourceElement && element.parentElement instanceof HTMLMediaElement
+            ? element.parentElement
+            : null
+    }
+    const isPlaying = (element: HTMLElement) => {
+        const media = mediaElementFor(element)
+        return media !== null && !media.paused && !media.ended
+    }
+    const detach = (element: HTMLElement, stopPlayback = false) => {
         if (element instanceof HTMLSourceElement && element.parentElement instanceof HTMLMediaElement) {
-            element.parentElement.pause()
+            if (stopPlayback && !element.parentElement.paused && !element.parentElement.ended) {
+                element.parentElement.pause()
+            }
             element.removeAttribute('src')
             element.parentElement.load()
             return
@@ -198,6 +209,7 @@ function startDeferredInlaySources(
             else void loadResource(marker.id)
             return
         }
+        if (isPlaying(element)) return
         detach(element)
         visibleElements?.delete(element)
         if (!visibleElements?.size) {
@@ -223,17 +235,39 @@ function startDeferredInlaySources(
         }
     }
 
+    const targetVisibility = new Map<Element, boolean>()
+    const playbackListeners: Array<{ media: HTMLMediaElement, release: () => void }> = []
+    const releaseOffscreenTarget = (target: Element) => {
+        if (disposed || targetVisibility.get(target) !== false) return
+        for (const element of markerTargets.get(target) ?? []) setVisible(element, false)
+        if (target instanceof HTMLMediaElement && !target.paused && !target.ended) return
+        for (const source of originalSources.get(target) ?? []) detach(source.element)
+    }
+    if (useViewport) {
+        const targets = new Set([...markerTargets.keys(), ...originalSources.keys()])
+        for (const target of targets) {
+            if (!(target instanceof HTMLMediaElement)) continue
+            const release = () => releaseOffscreenTarget(target)
+            target.addEventListener('pause', release)
+            target.addEventListener('ended', release)
+            playbackListeners.push({ media: target, release })
+        }
+    }
+
     let observer: IntersectionObserver | null = null
     if (useViewport) {
         observer = new IntersectionObserver((entries) => {
             if (disposed) return
             for (const entry of entries) {
+                targetVisibility.set(entry.target, entry.isIntersecting)
                 for (const element of markerTargets.get(entry.target) ?? []) {
                     setVisible(element, entry.isIntersecting)
                 }
                 for (const source of originalSources.get(entry.target) ?? []) {
                     if (entry.isIntersecting) attach(source.element, source.url)
-                    else detach(source.element)
+                    else if (!(entry.target instanceof HTMLMediaElement && !entry.target.paused && !entry.target.ended)) {
+                        detach(source.element)
+                    }
                 }
             }
         }, { root: null, rootMargin: '256px 0px', threshold: 0 })
@@ -250,12 +284,18 @@ function startDeferredInlaySources(
         disposed = true
         observer?.disconnect()
         observer = null
-        for (const element of markers.keys()) detach(element)
+        for (const { media, release } of playbackListeners) {
+            media.removeEventListener('pause', release)
+            media.removeEventListener('ended', release)
+        }
+        playbackListeners.length = 0
+        for (const element of markers.keys()) detach(element, true)
         for (const sources of originalSources.values()) {
-            for (const source of sources) detach(source.element)
+            for (const source of sources) detach(source.element, true)
         }
         for (const id of resources.keys()) releaseResource(id)
         visibleById.clear()
+        targetVisibility.clear()
         registry?.clear()
         markerTargets.clear()
         originalSources.clear()

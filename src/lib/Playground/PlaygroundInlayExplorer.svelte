@@ -110,7 +110,24 @@
 
   const previewTargets = new Map<Element, InlayBlobMetadata>()
   const visiblePreviewTargets = new Set<Element>()
+  const playingPreviewIds = new Set<string>()
   let previewObserver: IntersectionObserver | null = null
+
+  const isPreviewVisible = (id: string) => {
+    for (const target of visiblePreviewTargets) {
+      if (previewTargets.get(target)?.key === id) return true
+    }
+    return false
+  }
+
+  const markPreviewPlaying = (id: string) => {
+    playingPreviewIds.add(id)
+  }
+
+  const markPreviewStopped = (id: string) => {
+    playingPreviewIds.delete(id)
+    if (!isPreviewVisible(id)) removePreview(id)
+  }
 
   const ensurePreviewObserver = () => {
     if (previewObserver || typeof IntersectionObserver === 'undefined') return previewObserver
@@ -124,7 +141,7 @@
             void getPreviewURL(asset)
           } else {
             visiblePreviewTargets.delete(entry.target)
-            removePreview(asset.key)
+            if (!playingPreviewIds.has(asset.key)) removePreview(asset.key)
           }
         }
       },
@@ -148,6 +165,7 @@
       previewObserver?.unobserve(node)
       previewTargets.delete(node)
       visiblePreviewTargets.delete(node)
+      playingPreviewIds.delete(current.key)
       removePreview(current.key)
     }
     attach()
@@ -221,6 +239,7 @@
     previewObserver = null
     previewTargets.clear()
     visiblePreviewTargets.clear()
+    playingPreviewIds.clear()
     loadMoreObserver?.disconnect()
   })
 
@@ -271,23 +290,17 @@
           </div>
           <div class="mb-3">
             {#if asset.inlayType === 'image'}
-              {#if previewSources.get(asset.key)?.url}
-                <img alt={asset.name} class="w-full h-40 object-contain rounded bg-black/20" src={previewSources.get(asset.key)?.url} />
-              {/if}
+              <img alt={asset.name} class="w-full h-40 object-contain rounded bg-black/20" src={previewSources.get(asset.key)?.url} width={asset.width} height={asset.height} />
             {:else if asset.inlayType === 'video'}
-              {#if previewSources.get(asset.key)?.url}
-                <video class="w-full h-40 object-contain rounded bg-black/20" controls>
-                  <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
-                  <track kind="captions" />
-                </video>
-              {/if}
+              <video class="w-full h-40 object-contain rounded bg-black/20" controls onplay={() => markPreviewPlaying(asset.key)} onpause={() => markPreviewStopped(asset.key)} onended={() => markPreviewStopped(asset.key)}>
+                <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
+                <track kind="captions" />
+              </video>
             {:else if asset.inlayType === 'audio'}
-              {#if previewSources.get(asset.key)?.url}
-                <audio class="w-full" controls>
-                  <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
-                  <track kind="captions" />
-                </audio>
-              {/if}
+              <audio class="w-full min-h-12" controls onplay={() => markPreviewPlaying(asset.key)} onpause={() => markPreviewStopped(asset.key)} onended={() => markPreviewStopped(asset.key)}>
+                <source src={previewSources.get(asset.key)?.url} type={asset.mime} />
+                <track kind="captions" />
+              </audio>
             {/if}
           </div>
 

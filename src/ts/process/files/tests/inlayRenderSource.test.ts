@@ -149,7 +149,59 @@ describe('getInlayRenderSource', () => {
         root.remove()
     })
 
-    test.each(['audio', 'video'] as const)('pauses and unloads offscreen %s resources', async (type) => {
+    test.each(['audio', 'video'] as const)('keeps playing deferred %s pinned until playback stops offscreen', async (type) => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        const registry = new DeferredInlayMarkerRegistry()
+        const root = document.createElement('div')
+        root.innerHTML = renderDeferredInlaySourceMarkup(`native-${type}`, {
+            url: `http://risuasset.localhost/native-${type}`,
+            mime: `${type}/webm`,
+            type,
+            name: `native.${type}`,
+            size: 42,
+            objectUrl: false,
+        }, registry)
+        document.body.append(root)
+        const media = root.querySelector(type) as HTMLMediaElement
+        let paused = false
+        let ended = false
+        Object.defineProperties(media, {
+            paused: { configurable: true, get: () => paused },
+            ended: { configurable: true, get: () => ended },
+        })
+        media.pause = vi.fn(() => { paused = true })
+        media.load = vi.fn()
+        const source = media.querySelector('source')!
+
+        mountDeferredInlaySources(root, registry)
+        const observer = TestIntersectionObserver.instances[0]
+        observer.setVisible(media, true)
+        await Promise.resolve()
+        expect(source.getAttribute('src')).toContain(`native-${type}`)
+
+        media.dispatchEvent(new Event('play'))
+        observer.setVisible(media, false)
+        expect(media.pause).not.toHaveBeenCalled()
+        expect(source.getAttribute('src')).toContain(`native-${type}`)
+
+        paused = true
+        media.dispatchEvent(new Event('pause'))
+        expect(source.getAttribute('src')).toBeNull()
+        expect(media.load).toHaveBeenCalledTimes(2)
+
+        observer.setVisible(media, true)
+        await Promise.resolve()
+        paused = false
+        ended = false
+        media.dispatchEvent(new Event('play'))
+        observer.setVisible(media, false)
+        ended = true
+        media.dispatchEvent(new Event('ended'))
+        expect(source.getAttribute('src')).toBeNull()
+        root.remove()
+    })
+
+    test.each(['audio', 'video'] as const)('unloads non-playing deferred %s when it leaves the viewport', async (type) => {
         vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
         const registry = new DeferredInlayMarkerRegistry()
         const root = document.createElement('div')
@@ -171,10 +223,9 @@ describe('getInlayRenderSource', () => {
         const observer = TestIntersectionObserver.instances[0]
         observer.setVisible(media, true)
         await Promise.resolve()
-        expect(source.getAttribute('src')).toContain(`native-${type}`)
-
         observer.setVisible(media, false)
-        expect(media.pause).toHaveBeenCalledOnce()
+
+        expect(media.pause).not.toHaveBeenCalled()
         expect(source.getAttribute('src')).toBeNull()
         expect(media.load).toHaveBeenCalledTimes(2)
         root.remove()

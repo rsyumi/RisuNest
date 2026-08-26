@@ -161,13 +161,16 @@ describe('PlaygroundInlayExplorer native previews', () => {
         await vi.waitFor(() => expect(target.querySelector('[data-inlay-preview-id="photo-id"]')).not.toBeNull())
         const card = target.querySelector('[data-inlay-preview-id="photo-id"]')!
         const observer = TestIntersectionObserver.instances[0]
-        expect(target.querySelector('img')).toBeNull()
+        expect(target.querySelector('img')).not.toBeNull()
+        expect(target.querySelector('img')?.getAttribute('src')).toBeNull()
 
         observer.setVisible(card, true)
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('http://risuasset.localhost/photo-id'))
         observer.setVisible(card, false)
         await tick()
-        expect(target.querySelector('img')).toBeNull()
+        expect(target.querySelector('img')).not.toBeNull()
+        expect(target.querySelector('img')?.getAttribute('src')).toBeNull()
+        expect(target.querySelector('img')?.classList.contains('h-40')).toBe(true)
         expect(revokeObjectURL).not.toHaveBeenCalled()
 
         observer.setVisible(card, true)
@@ -305,7 +308,8 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         rejectAsset(new Error('preview failed'))
         await new Promise((resolve) => setTimeout(resolve, 0))
         await tick()
-        expect(target.querySelector('img')).toBeNull()
+        expect(target.querySelector('img')).not.toBeNull()
+        expect(target.querySelector('img')?.getAttribute('src')).toBeNull()
 
         observer.setVisible(card, false)
         observer.setVisible(card, true)
@@ -331,12 +335,67 @@ describe('PlaygroundInlayExplorer browser preview ownership', () => {
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:photo-first'))
         observer.setVisible(card, false)
         await tick()
-        expect(target.querySelector('img')).toBeNull()
+        expect(target.querySelector('img')).not.toBeNull()
+        expect(target.querySelector('img')?.getAttribute('src')).toBeNull()
         expect(URL.revokeObjectURL).toHaveBeenCalledOnce()
         expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:photo-first')
 
         observer.setVisible(card, true)
         await vi.waitFor(() => expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:photo-second'))
         expect(inlayMocks.getInlayAssetBlob).toHaveBeenCalledTimes(2)
+    })
+
+    test.each([
+        ['audio', 'pause'],
+        ['video', 'ended'],
+    ] as const)('pins a playing %s preview until %s offscreen', async (type, stopEvent) => {
+        vi.stubGlobal('IntersectionObserver', TestIntersectionObserver)
+        inlayMocks.listInlayAssetMetadata.mockResolvedValue([{
+            ...metadata,
+            mime: `${type}/webm`,
+            name: `clip.${type}`,
+            ext: 'webm',
+            inlayType: type,
+            width: 640,
+            height: 360,
+        }])
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            ...asset,
+            data: new Blob([type], { type: `${type}/webm` }),
+            type,
+            name: `clip.${type}`,
+            width: 640,
+            height: 360,
+        })
+        vi.mocked(URL.createObjectURL).mockReturnValue(`blob:${type}`)
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(PlaygroundInlayExplorer, { target })
+        await vi.waitFor(() => expect(target.querySelector('[data-inlay-preview-id="photo-id"]')).not.toBeNull())
+        const card = target.querySelector('[data-inlay-preview-id="photo-id"]')!
+        const observer = TestIntersectionObserver.instances[0]
+        observer.setVisible(card, true)
+        await vi.waitFor(() => expect(target.querySelector('source')?.getAttribute('src')).toBe(`blob:${type}`))
+        const media = target.querySelector(type) as HTMLMediaElement
+        let paused = false
+        let ended = false
+        Object.defineProperties(media, {
+            paused: { configurable: true, get: () => paused },
+            ended: { configurable: true, get: () => ended },
+        })
+        media.pause = vi.fn(() => { paused = true })
+        media.dispatchEvent(new Event('play'))
+
+        observer.setVisible(card, false)
+        await tick()
+        expect(media.pause).not.toHaveBeenCalled()
+        expect(target.querySelector('source')?.getAttribute('src')).toBe(`blob:${type}`)
+        expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+
+        if (stopEvent === 'pause') paused = true
+        else ended = true
+        media.dispatchEvent(new Event(stopEvent))
+        await vi.waitFor(() => expect(target.querySelector('source')?.getAttribute('src')).toBeNull())
+        expect(URL.revokeObjectURL).toHaveBeenCalledWith(`blob:${type}`)
     })
 })
