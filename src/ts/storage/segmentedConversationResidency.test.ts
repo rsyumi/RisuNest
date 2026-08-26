@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { Message } from './database.svelte'
+import { DisposableConversationSnapshot } from './persistentConversationSegments'
 import { SegmentedConversationResidency } from './segmentedConversationResidency'
 
 function message(data: string): Message {
@@ -497,4 +498,50 @@ describe('SegmentedConversationResidency', () => {
         expect(residency.readRange(0, 1)).toEqual([message('dirty')])
         expect(residency.missingPersistentRanges(0, 1)).toEqual([])
     })
+
+    it('returns a 10,000-message compatibility snapshot to the resident budget after release', () => {
+        const totalMessages = 10_000
+        const residentBudget = 256
+        const messages = Array.from({ length: totalMessages }, (_, index) => message(String(index)))
+        const residency = createResidency({ totalMessages, maxResidentBytes: residentBudget })
+        const viewportPin = residency.pinRange(
+            totalMessages - residentBudget,
+            totalMessages,
+            'viewport',
+        )
+        const compatibilityPin = residency.pinRange(0, totalMessages, 'compatibility')
+        const snapshot = new DisposableConversationSnapshot(structuredClone(messages))
+
+        for (let startIndex = 0; startIndex < totalMessages; startIndex += 128) {
+            residency.storeRange({
+                revision: 7,
+                startIndex,
+                totalMessages,
+                messages: messages.slice(startIndex, startIndex + 128),
+            })
+        }
+
+        expect(snapshot.residentMessageCount).toBe(totalMessages)
+        expect(residency.pinCount('compatibility')).toBe(1)
+        expect(residency.residentBytes).toBe(totalMessages)
+
+        snapshot.dispose()
+        compatibilityPin.release()
+
+        expect(snapshot.residentMessageCount).toBe(0)
+        expect(residency.pinCount('compatibility')).toBe(0)
+        expect(residency.residentBytes).toBe(residentBudget)
+        expect(residency.readRange(totalMessages - residentBudget, residentBudget)).toEqual(
+            messages.slice(totalMessages - residentBudget),
+        )
+        expect(residency.readRange(0, 1)).toBeNull()
+        expect(residency.residentIntervals).toHaveLength(1)
+        expect(residency.residentIntervals[0]).toMatchObject({
+            startIndex: totalMessages - residentBudget,
+            endIndex: totalMessages,
+            byteSize: residentBudget,
+        })
+
+        viewportPin.release()
+    }, 15_000)
 })

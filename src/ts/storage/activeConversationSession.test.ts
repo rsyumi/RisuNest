@@ -814,6 +814,7 @@ describe('ActiveConversationSession', () => {
             'pending-save',
             'streaming',
             'transaction',
+            'prompt',
             'compatibility',
         ]
         const pins = reasons.map((reason) => session.acquirePin(reason))
