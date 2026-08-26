@@ -50,6 +50,7 @@ class SessionConversationHistoryOperation implements ConversationHistoryOperatio
         session: ActiveConversationSession,
         readonly source: ConversationHistoryOperationSource,
         private readonly ownsSession: boolean,
+        private idProjectionTargets: Message[] | null,
     ) {
         this.session = session
         this.characterId = session.characterId
@@ -91,7 +92,16 @@ class SessionConversationHistoryOperation implements ConversationHistoryOperatio
     }
 
     ensureMessageId(locator: MessageLocator, createId: () => string): Message {
-        return this.requireCurrentSession().ensureMessageId(locator, createId)
+        const message = this.requireCurrentSession().ensureMessageId(locator, createId)
+        const target = this.idProjectionTargets?.[locator.absoluteIndex]
+        if (!target) return message
+        if (target.chatId) {
+            message.chatId = target.chatId
+            locator.expectedMessageId = target.chatId
+        } else {
+            target.chatId = message.chatId
+        }
+        return message
     }
 
     assertCurrent(): void {
@@ -103,6 +113,8 @@ class SessionConversationHistoryOperation implements ConversationHistoryOperatio
         if (!session) return
         this.pin?.release()
         this.pin = null
+        this.idProjectionTargets?.splice(0)
+        this.idProjectionTargets = null
         if (this.ownsSession) session.invalidate()
         this.session = null
     }
@@ -127,7 +139,7 @@ class SessionConversationHistoryOperation implements ConversationHistoryOperatio
 export function beginPinnedConversationHistoryOperation(
     session: ActiveConversationSession,
 ): ConversationHistoryOperation {
-    return new SessionConversationHistoryOperation(session, 'active-session', false)
+    return new SessionConversationHistoryOperation(session, 'active-session', false, null)
 }
 
 export function createCompatibilityConversationHistorySnapshot(options: {
@@ -149,5 +161,10 @@ export function createCompatibilityConversationHistorySnapshot(options: {
         conversation,
         storeRevision: options.storeRevision,
     })
-    return new SessionConversationHistoryOperation(session, 'compatibility-snapshot', true)
+    return new SessionConversationHistoryOperation(
+        session,
+        'compatibility-snapshot',
+        true,
+        [...options.messages],
+    )
 }

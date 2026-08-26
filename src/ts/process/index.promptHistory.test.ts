@@ -353,6 +353,22 @@ describe('sendChat prompt history characterization', () => {
         expect(previewFormated.some((message) => message.memo === 'replacement')).toBe(false)
     })
 
+    it('persists a compatibility-snapshot ID across prompt builds without an active session', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        testState.activeSession = null
+        mockTriggerClone()
+
+        expect(await sendChat(-1, { preview: true })).toBe(true)
+        const firstMemo = previewFormated[0].memo
+        expect(firstMemo).toBeTruthy()
+        expect(selectedCharacter.chats[0].message[3].chatId).toBe(firstMemo)
+
+        expect(await sendChat(-1, { preview: true })).toBe(true)
+        expect(previewFormated[0].memo).toBe(firstMemo)
+        expect(selectedCharacter.chats[0].message[3].chatId).toBe(firstMemo)
+    })
+
     it.each(['edit', 'delete'] as const)(
         'fails closed before formatting another cached page entry after a same-page session %s',
         async (mutation) => {
