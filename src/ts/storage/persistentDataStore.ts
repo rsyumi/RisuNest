@@ -41,6 +41,13 @@ export interface ColdAlias {
     metadata: Record<string, unknown>
 }
 
+export interface ColdPayloadMigrationInput {
+    sourceRevision: DataRevision
+    migrationId: string
+    compatibilityHash: string
+    coldAliases: ColdAlias[]
+}
+
 export function validateColdAlias(alias: ColdAlias): void {
     if (typeof alias.key !== 'string' || alias.key.length === 0 || alias.key.includes('\0')) {
         throw new TypeError('Cold alias key must be nonempty and contain no NUL characters')
