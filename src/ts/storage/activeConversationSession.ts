@@ -498,7 +498,7 @@ export class ActiveConversationTransaction {
         private readonly sourceLocatorRegistry: ConversationLocatorRegistry,
         sessionVersion: number,
     ) {
-        this.currentMessages = safeStructuredClone([...sourceMessages])
+        this.currentMessages = [...sourceMessages]
         this.currentVersion = sessionVersion
         this.locatorRegistry = sourceLocatorRegistry.fork()
     }

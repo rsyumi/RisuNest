@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
+import { ChatRenderIdentityRegistry } from '../chatRenderIdentity'
 import type { Chat, Message } from './database.svelte'
 import {
     ActiveConversationSession,
@@ -394,6 +395,28 @@ describe('ActiveConversationSession', () => {
             sessionVersion: 2,
             commands: ['edit', 'append'],
         }))
+    })
+
+    it('preserves untouched legacy message identities across edits and appends', () => {
+        const originalMessages = [
+            message(undefined, 'zero'),
+            message(undefined, 'one'),
+            message(undefined, 'two'),
+        ]
+        const { conversation, session } = createSession(chat(originalMessages))
+        const registry = new ChatRenderIdentityRegistry()
+        const before = registry.register('conversation-a', conversation.message).toArray()
+
+        session.transaction((transaction) => {
+            transaction.edit(transaction.locate(0), message(undefined, 'edited zero'))
+            transaction.append(message(undefined, 'three'))
+        })
+        const after = registry.register('conversation-a', conversation.message).toArray()
+
+        expect(conversation.message[1]).toBe(originalMessages[1])
+        expect(conversation.message[2]).toBe(originalMessages[2])
+        expect(after[1]).toBe(before[1])
+        expect(after[2]).toBe(before[2])
     })
 
     it('isolates nested draft message state when a transaction throws', () => {
