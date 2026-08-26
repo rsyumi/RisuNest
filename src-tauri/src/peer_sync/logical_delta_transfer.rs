@@ -1,5 +1,5 @@
 use super::PeerSyncError;
-use crate::asset_repository::PayloadCas;
+use crate::{asset_repository::PayloadCas, peer_sync::logical_delta::decode_logical_record_key};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -211,18 +211,23 @@ fn validate_ready_plan(plan: &ReadyLogicalDeltaPlan) -> Result<(), PeerSyncError
         &plan.next_base_manifest_hash,
         "logical delta next base manifest hash",
     )?;
-    validate_generation_sequence(&plan.next_base_generation_sequence)?;
+    validate_generation_sequence(
+        &plan.next_base_generation_sequence,
+        "logical delta next base generation sequence",
+    )?;
     if plan.expected_remote_generation.is_empty() {
         return validation("logical delta expected remote generation must be nonempty");
     }
 
     let mut required_objects = BTreeSet::new();
+    let mut operation_keys = BTreeSet::new();
+    let mut previous_operation_key: Option<&str> = None;
     for operation in &plan.apply {
-        match operation {
+        let key = match operation {
             LogicalDeltaApplyOperation::Put {
+                key,
                 object_hash,
                 dependencies,
-                ..
             } => {
                 validate_hash(object_hash, "logical delta record object hash")?;
                 required_objects.insert(object_hash.clone());
@@ -237,9 +242,43 @@ fn validate_ready_plan(plan: &ReadyLogicalDeltaPlan) -> Result<(), PeerSyncError
                     required_objects.insert(dependency.clone());
                     previous = Some(dependency);
                 }
+                key
             }
-            LogicalDeltaApplyOperation::Delete { .. } => {}
+            LogicalDeltaApplyOperation::Delete {
+                key,
+                deleted_generation_sequence,
+            } => {
+                validate_generation_sequence(
+                    deleted_generation_sequence,
+                    "logical delta deleted generation sequence",
+                )?;
+                key
+            }
+        };
+        decode_logical_record_key(key).map_err(|error| {
+            PeerSyncError::Validation(format!("logical delta record key is invalid: {error}"))
+        })?;
+        if previous_operation_key.is_some_and(|previous| previous >= key.as_str()) {
+            return validation("logical delta apply keys must be sorted and unique");
         }
+        previous_operation_key = Some(key);
+        operation_keys.insert(key.clone());
+    }
+
+    let mut previous_preserved_key: Option<&str> = None;
+    for key in &plan.preserve_local_keys {
+        decode_logical_record_key(key).map_err(|error| {
+            PeerSyncError::Validation(format!(
+                "logical delta preserved record key is invalid: {error}"
+            ))
+        })?;
+        if previous_preserved_key.is_some_and(|previous| previous >= key.as_str()) {
+            return validation("logical delta preserved keys must be sorted and unique");
+        }
+        if operation_keys.contains(key) {
+            return validation("logical delta cannot both apply and preserve one record key");
+        }
+        previous_preserved_key = Some(key);
     }
     let candidates = plan
         .candidate_object_hashes
@@ -275,7 +314,7 @@ fn validate_hash(hash: &str, description: &str) -> Result<(), PeerSyncError> {
     ))
 }
 
-fn validate_generation_sequence(sequence: &str) -> Result<(), PeerSyncError> {
+fn validate_generation_sequence(sequence: &str, description: &str) -> Result<(), PeerSyncError> {
     let canonical = sequence == "0"
         || (sequence.len() <= 64
             && sequence
@@ -286,7 +325,7 @@ fn validate_generation_sequence(sequence: &str) -> Result<(), PeerSyncError> {
     if canonical {
         return Ok(());
     }
-    validation("logical delta next base generation sequence must be canonical unsigned decimal")
+    validation(format!("{description} must be canonical unsigned decimal"))
 }
 
 fn validation<T>(message: impl Into<String>) -> Result<T, PeerSyncError> {
@@ -628,6 +667,53 @@ mod tests {
 
         assert!(
             matches!(error, PeerSyncError::Validation(message) if message.contains("generation sequence"))
+        );
+    }
+
+    #[test]
+    fn ready_plan_rejects_invalid_or_duplicate_record_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let invalid_tombstone = ready_plan(
+            vec![LogicalDeltaApplyOperation::Delete {
+                key: "r1:root".to_owned(),
+                deleted_generation_sequence: "08".to_owned(),
+            }],
+            vec![],
+        );
+        let error = select_missing_logical_delta_objects(
+            &invalid_tombstone,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PeerSyncError::Validation(message) if message.contains("deleted generation sequence"))
+        );
+
+        let duplicate_key = ready_plan(
+            vec![
+                LogicalDeltaApplyOperation::Delete {
+                    key: "r1:root".to_owned(),
+                    deleted_generation_sequence: "8".to_owned(),
+                },
+                LogicalDeltaApplyOperation::Delete {
+                    key: "r1:root".to_owned(),
+                    deleted_generation_sequence: "8".to_owned(),
+                },
+            ],
+            vec![],
+        );
+        let error = select_missing_logical_delta_objects(
+            &duplicate_key,
+            &BTreeSet::new(),
+            &cas,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PeerSyncError::Validation(message) if message.contains("sorted and unique"))
         );
     }
 
