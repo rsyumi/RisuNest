@@ -4,6 +4,7 @@ pub mod screenshot_output;
 #[cfg(test)]
 mod screenshot_output_test;
 
+use crate::asset_repository::PayloadCas;
 use crate::import_export_jobs::{
     classify_content, parse_json_card, ContentKind, FormatError, FormatErrorKind, ImportLimits,
     JobStaging, ParsedJsonCard,
@@ -146,7 +147,12 @@ pub(crate) enum PreparedContentFormat {
 pub(crate) struct PreparedContentAsset {
     pub(crate) reference_key: String,
     pub(crate) token: String,
+    pub(crate) logical_id: String,
+    pub(crate) object_hash: String,
     pub(crate) byte_size: u64,
+    pub(crate) mime: String,
+    pub(crate) name: String,
+    pub(crate) ext: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -860,6 +866,16 @@ impl NativeFileJobState {
                 "content import display name is invalid",
             ));
         }
+        let repository_root = self
+            .root
+            .parent()
+            .ok_or_else(|| {
+                NativeJobError::new(
+                    "capability-unavailable",
+                    "native content repository root is unavailable",
+                )
+            })?
+            .to_path_buf();
         let opened_source = match &source {
             JobSource::DesktopPath { .. } => open_job_source(&self.root, &source)?,
             JobSource::AndroidSpool { .. } => {
@@ -897,12 +913,16 @@ impl NativeFileJobState {
         let root = self.root.clone();
         let registry = Arc::clone(&self.registry);
         std::thread::spawn(move || {
-            let _worker_permit = worker_permit;
-            let outcome =
-                prepare_json_content(opened_source, &display_name, &owned_directory, &job)
-                    .and_then(|prepared| job.wait_for_content_abort(prepared));
+            let outcome = prepare_json_content(
+                opened_source,
+                &display_name,
+                &owned_directory,
+                &repository_root,
+                &job,
+            );
             let cleanup =
                 cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id());
+            drop(worker_permit);
             let _ = job.finish_content_job(outcome, cleanup);
             let _ = registry.prune();
         });
@@ -1145,6 +1165,7 @@ fn prepare_json_content(
     mut source: OpenedJobSource,
     display_name: &str,
     owned_directory: &Path,
+    repository_root: &Path,
     job: &JobControl,
 ) -> Result<PreparedContent, NativeJobError> {
     if job.is_cancel_requested() {
@@ -1184,7 +1205,7 @@ fn prepare_json_content(
         job.is_cancel_requested()
     })
     .map_err(native_format_error)?;
-    let prepared = prepared_json_content(parsed)?;
+    let prepared = promote_json_content(parsed, owned_directory, repository_root, job)?;
     job.set_progress(JobProgress {
         completed_bytes: source.total_bytes,
         total_bytes: Some(source.total_bytes),
@@ -1213,29 +1234,63 @@ fn content_import_limits() -> ImportLimits {
     }
 }
 
-fn prepared_json_content(parsed: ParsedJsonCard) -> Result<PreparedContent, NativeJobError> {
-    let assets = parsed
-        .payloads
-        .into_iter()
-        .map(|payload| {
-            let token = payload
-                .payload
-                .staged_name
-                .strip_suffix(".payload")
-                .filter(|token| Uuid::parse_str(token).is_ok())
-                .ok_or_else(|| {
-                    NativeJobError::new("store-error", "staged payload token is invalid")
-                })?;
-            Ok(PreparedContentAsset {
-                reference_key: payload.reference_key,
-                token: token.to_owned(),
-                byte_size: payload.payload.byte_size,
-            })
-        })
-        .collect::<Result<Vec<_>, NativeJobError>>()?;
+fn promote_json_content(
+    parsed: ParsedJsonCard,
+    staging_root: &Path,
+    repository_root: &Path,
+    job: &JobControl,
+) -> Result<PreparedContent, NativeJobError> {
+    let cas = PayloadCas::new(repository_root)
+        .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
+    let ParsedJsonCard { metadata, payloads } = parsed;
+    let mut assets = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        if job.is_cancel_requested() {
+            return Err(content_cancelled());
+        }
+        let staged_path = staging_root.join(&payload.payload.staged_name);
+        let mut staged = open_regular_file_no_follow(&staged_path)?.file;
+        let promoted = cas
+            .prepare_reader(&mut staged)
+            .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
+        if promoted.content_hash != payload.payload.sha256
+            || promoted.byte_size != payload.payload.byte_size
+        {
+            return Err(NativeJobError::new(
+                "store-error",
+                "promoted content does not match its staged payload",
+            ));
+        }
+        if job.is_cancel_requested() {
+            return Err(content_cancelled());
+        }
+        let name_pointer = payload
+            .json_pointer
+            .strip_suffix("/uri")
+            .map(|pointer| format!("{pointer}/name"));
+        let name = name_pointer
+            .as_deref()
+            .and_then(|pointer| metadata.pointer(pointer))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let reference_key = payload.reference_key;
+        let object_hash = promoted.content_hash;
+        let logical_id = format!("assets/{object_hash}.{}", payload.extension);
+        assets.push(PreparedContentAsset {
+            token: reference_key.clone(),
+            reference_key,
+            logical_id,
+            object_hash,
+            byte_size: promoted.byte_size,
+            mime: payload.media_type,
+            name,
+            ext: payload.extension,
+        });
+    }
     Ok(PreparedContent {
         format: PreparedContentFormat::JsonCard,
-        metadata: parsed.metadata,
+        metadata,
         assets,
     })
 }
@@ -1764,10 +1819,15 @@ impl JobRegistry {
             .jobs
             .lock()
             .map_err(|error| format!("native job registry mutex poisoned: {error}"))?;
-        let mut terminal = jobs
-            .iter()
-            .filter_map(|(id, job)| job.terminal_time().map(|time| (id.clone(), time)))
-            .collect::<Vec<_>>();
+        let mut terminal = Vec::new();
+        for (id, job) in jobs.iter() {
+            if job.retains_prepared_content_until_forget()? {
+                continue;
+            }
+            if let Some(time) = job.terminal_time() {
+                terminal.push((id.clone(), time));
+            }
+        }
         for (id, completed_at) in &terminal {
             if now.saturating_duration_since(*completed_at) >= self.max_terminal_age {
                 jobs.remove(id);
@@ -1806,6 +1866,16 @@ impl JobControl {
 
     pub(crate) fn is_cancel_requested(&self) -> bool {
         self.cancel_requested.load(Ordering::Acquire)
+    }
+
+    fn retains_prepared_content_until_forget(&self) -> Result<bool, String> {
+        let status = self
+            .status
+            .lock()
+            .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
+        Ok(status.kind == JobKind::PrepareContentImport
+            && status.state == JobState::Succeeded
+            && status.prepared_content.is_some())
     }
 
     fn request_cancel(&self) -> Result<CancelOutcome, String> {
@@ -1917,56 +1987,6 @@ impl JobControl {
         }
     }
 
-    fn wait_for_content_abort(
-        &self,
-        prepared_content: PreparedContent,
-    ) -> Result<(), NativeJobError> {
-        {
-            let mut status = self.status.lock().map_err(|error| {
-                NativeJobError::new(
-                    "store-error",
-                    format!("native job status mutex poisoned: {error}"),
-                )
-            })?;
-            if self.is_cancel_requested() {
-                return Err(content_cancelled());
-            }
-            if status.kind != JobKind::PrepareContentImport
-                || status.state != JobState::Running
-                || status.phase != JobPhase::ReadingSource
-            {
-                return Err(NativeJobError::new(
-                    "store-error",
-                    "content preparation cannot wait from its current state",
-                ));
-            }
-            status.state = JobState::WaitingForInput;
-            status.phase = JobPhase::AwaitingContentMapping;
-            status.prepared_content = Some(prepared_content);
-        }
-
-        let mut wait = self.restore_finalized.lock().map_err(|error| {
-            NativeJobError::new(
-                "store-error",
-                format!("native content wait mutex poisoned: {error}"),
-            )
-        })?;
-        loop {
-            if self.is_cancel_requested() {
-                return Err(content_cancelled());
-            }
-            wait = self
-                .restore_finalization_changed
-                .wait(wait)
-                .map_err(|error| {
-                    NativeJobError::new(
-                        "store-error",
-                        format!("native content wait mutex poisoned: {error}"),
-                    )
-                })?;
-        }
-    }
-
     pub(crate) fn start(&self, phase: JobPhase) -> Result<(), String> {
         let mut status = self
             .status
@@ -2050,7 +2070,7 @@ impl JobControl {
 
     fn finish_content_job(
         &self,
-        outcome: Result<(), NativeJobError>,
+        outcome: Result<PreparedContent, NativeJobError>,
         cleanup: Result<(), String>,
     ) -> Result<(), String> {
         let mut status = self
@@ -2060,34 +2080,42 @@ impl JobControl {
         if status.kind != JobKind::PrepareContentImport || status.state.is_terminal() {
             return Err("native content job cannot finish from its current state".to_owned());
         }
-        let failure = match (outcome, cleanup) {
-            (Err(error), Err(cleanup)) => Some(JobFailure {
-                code: "cleanup-failed".to_owned(),
-                message: bounded_message(&format!("{}; cleanup failed: {cleanup}", error.message)),
-            }),
-            (Ok(()), Err(cleanup)) => Some(JobFailure {
-                code: "cleanup-failed".to_owned(),
-                message: bounded_message(&cleanup),
-            }),
-            (_, Ok(())) if self.is_cancel_requested() => None,
-            (Err(error), Ok(())) => Some(JobFailure {
-                code: error.code,
-                message: error.message,
-            }),
-            (Ok(()), Ok(())) => Some(JobFailure {
-                code: "store-error".to_owned(),
-                message: "content preparation ended without an abort".to_owned(),
-            }),
+        let (state, failure, prepared_content) = match (outcome, cleanup) {
+            (Err(error), Err(cleanup)) => (
+                JobState::Failed,
+                Some(JobFailure {
+                    code: "cleanup-failed".to_owned(),
+                    message: bounded_message(&format!(
+                        "{}; cleanup failed: {cleanup}",
+                        error.message
+                    )),
+                }),
+                None,
+            ),
+            (Ok(_), Err(cleanup)) => (
+                JobState::Failed,
+                Some(JobFailure {
+                    code: "cleanup-failed".to_owned(),
+                    message: bounded_message(&cleanup),
+                }),
+                None,
+            ),
+            (_, Ok(())) if self.is_cancel_requested() => (JobState::Cancelled, None, None),
+            (Err(error), Ok(())) => (
+                JobState::Failed,
+                Some(JobFailure {
+                    code: error.code,
+                    message: error.message,
+                }),
+                None,
+            ),
+            (Ok(prepared), Ok(())) => (JobState::Succeeded, None, Some(prepared)),
         };
-        status.state = if failure.is_some() {
-            JobState::Failed
-        } else {
-            JobState::Cancelled
-        };
+        status.state = state;
         status.phase = JobPhase::Complete;
         status.result = None;
         status.error = failure;
-        status.prepared_content = None;
+        status.prepared_content = prepared_content;
         drop(status);
         self.mark_terminal()
     }
@@ -2606,7 +2634,7 @@ mod tests {
     }
 
     #[test]
-    fn content_prepare_exposes_only_bounded_metadata_tokens_until_abort() {
+    fn content_prepare_promotes_assets_and_succeeds_with_logical_descriptors() {
         let directory = TempDir::new().unwrap();
         let source = directory.path().join("card.json");
         fs::write(
@@ -2627,14 +2655,15 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let prepared = loop {
             let status = state.status(&started.job_id).unwrap();
-            if status.state == JobState::WaitingForInput {
+            if status.state.is_terminal() {
                 break status;
             }
             assert!(Instant::now() < deadline, "content preparation timed out");
             thread::yield_now();
         };
         assert_eq!(prepared.kind, JobKind::PrepareContentImport);
-        assert_eq!(prepared.phase, JobPhase::AwaitingContentMapping);
+        assert_eq!(prepared.state, JobState::Succeeded);
+        assert_eq!(prepared.phase, JobPhase::Complete);
         let content = prepared
             .prepared_content
             .as_ref()
@@ -2643,7 +2672,18 @@ mod tests {
         assert_eq!(content.assets.len(), 1);
         assert_eq!(content.assets[0].byte_size, 4);
         assert_eq!(content.assets[0].reference_key, "native-data-0");
-        assert!(content.assets[0].token.parse::<Uuid>().is_ok());
+        assert_eq!(content.assets[0].token, "native-data-0");
+        assert_eq!(
+            content.assets[0].object_hash,
+            "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
+        );
+        assert_eq!(
+            content.assets[0].logical_id,
+            "assets/9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a.png"
+        );
+        assert_eq!(content.assets[0].mime, "image/png");
+        assert_eq!(content.assets[0].name, "main");
+        assert_eq!(content.assets[0].ext, "png");
         assert_eq!(
             content
                 .metadata
@@ -2654,36 +2694,34 @@ mod tests {
         let encoded = serde_json::to_string(&prepared).unwrap();
         assert!(!encoded.contains("stagedPath"));
         assert!(!encoded.contains(".payload"));
-        assert!(directory
-            .path()
-            .join("native-file-jobs/jobs")
-            .join(&started.job_id)
-            .is_dir());
-
-        assert_eq!(
-            state.cancel(&started.job_id).unwrap(),
-            CancelOutcome::Requested
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let status = state.status(&started.job_id).unwrap();
-            if status.state == JobState::Cancelled {
-                assert!(status.prepared_content.is_none());
-                break;
-            }
-            assert!(Instant::now() < deadline, "content abort timed out");
-            thread::yield_now();
-        }
+        assert!(!encoded.contains("AQIDBA"));
         assert!(!directory
             .path()
             .join("native-file-jobs/jobs")
             .join(&started.job_id)
             .exists());
+        assert_eq!(state.active_workers.load(Ordering::Acquire), 0);
+        let cas = crate::asset_repository::PayloadCas::new(directory.path()).unwrap();
+        assert_eq!(
+            cas.read_object(&content.assets[0].object_hash).unwrap(),
+            Some(vec![1, 2, 3, 4])
+        );
+
+        assert_eq!(
+            state.cancel(&started.job_id).unwrap(),
+            CancelOutcome::Terminal
+        );
+        assert!(state.forget(&started.job_id).unwrap());
+        assert!(state.status(&started.job_id).is_err());
     }
 
     #[test]
     fn content_cancel_during_preparation_finishes_cancelled_and_cleans_staging() {
         let directory = TempDir::new().unwrap();
+        let persistent = directory.path().join("persistent");
+        fs::create_dir(&persistent).unwrap();
+        let active_database = persistent.join("active.sqlite3");
+        fs::write(&active_database, b"unchanged-active-database").unwrap();
         let source = directory.path().join("large-card.json");
         let description = "x".repeat(7 * 1024 * 1024);
         fs::write(
@@ -2736,6 +2774,10 @@ mod tests {
             .join("native-file-jobs/jobs")
             .join(&started.job_id)
             .exists());
+        assert_eq!(
+            fs::read(active_database).unwrap(),
+            b"unchanged-active-database"
+        );
     }
 
     #[test]
@@ -2760,7 +2802,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_request_coordinates_with_content_wait_mutex() {
+    fn cancel_request_coordinates_with_finalization_mutex() {
         let registry = JobRegistry::default();
         let job = registry.create(JobKind::PrepareContentImport).unwrap();
         job.start(JobPhase::ReadingSource).unwrap();
@@ -2916,6 +2958,54 @@ mod tests {
         job.start(JobPhase::ReadingSource).unwrap();
         job.finish_success(result(1)).unwrap();
         assert!(expiring.status(&id).is_err());
+    }
+
+    #[test]
+    fn prepared_content_success_is_retained_until_explicit_forget() {
+        let registry = JobRegistry::with_retention(0, Duration::ZERO);
+        let content = registry.create(JobKind::PrepareContentImport).unwrap();
+        let content_id = content.id();
+        content.start(JobPhase::ReadingSource).unwrap();
+        content
+            .finish_content_job(
+                Ok(PreparedContent {
+                    format: PreparedContentFormat::JsonCard,
+                    metadata: serde_json::json!({"spec": "chara_card_v3"}),
+                    assets: Vec::new(),
+                }),
+                Ok(()),
+            )
+            .unwrap();
+
+        let ordinary = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+        let ordinary_id = ordinary.id();
+        ordinary.start(JobPhase::ReadingSource).unwrap();
+        ordinary.finish_success(result(1)).unwrap();
+
+        let cancelled = registry.create(JobKind::PrepareContentImport).unwrap();
+        let cancelled_id = cancelled.id();
+        cancelled.start(JobPhase::ReadingSource).unwrap();
+        assert_eq!(
+            cancelled.request_cancel().unwrap(),
+            CancelOutcome::Requested
+        );
+        cancelled
+            .finish_content_job(Err(content_cancelled()), Ok(()))
+            .unwrap();
+
+        assert!(registry.status(&ordinary_id).is_err());
+        assert!(registry.status(&cancelled_id).is_err());
+        assert_eq!(
+            registry.status(&content_id).unwrap().state,
+            JobState::Succeeded
+        );
+        assert!(registry
+            .list()
+            .unwrap()
+            .iter()
+            .any(|status| status.job_id == content_id));
+        assert!(registry.forget(&content_id).unwrap());
+        assert!(registry.status(&content_id).is_err());
     }
 
     #[test]
