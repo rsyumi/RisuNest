@@ -33,7 +33,9 @@ vi.mock('src/ts/globalApi.svelte', () => ({
     getFetchLogs: () => [],
     openURL: vi.fn(),
 }))
-vi.mock('src/ts/tokenizer', () => ({ tokenize: vi.fn() }))
+vi.mock('src/ts/tokenizer', () => ({
+    tokenize: vi.fn(async (text: string) => `tokens:${text}`),
+}))
 vi.mock('src/ts/gui/colorscheme', async () => {
     const { writable } = await import('svelte/store')
     return { ColorSchemeTypeStore: writable(false) }
@@ -70,7 +72,7 @@ vi.mock('../UI/GUI/TextInput.svelte', async () => ({
     default: (await import('./AlertCompDependencyStub.test.svelte')).default,
 }))
 vi.mock('../UI/GUI/Button.svelte', async () => ({
-    default: (await import('./AlertCompDependencyStub.test.svelte')).default,
+    default: (await import('./AlertCompButtonStub.test.svelte')).default,
 }))
 vi.mock('../UI/GUI/SelectInput.svelte', async () => ({
     default: (await import('./AlertCompDependencyStub.test.svelte')).default,
@@ -91,6 +93,7 @@ vi.mock('./Help.svelte', async () => ({
     default: (await import('./AlertCompDependencyStub.test.svelte')).default,
 }))
 
+import { alertGenerationInfoStore } from '../../ts/alert'
 import AlertComp from './AlertComp.svelte'
 
 function deferred<T>() {
@@ -177,5 +180,38 @@ describe('AlertComp branch view', () => {
         expect(target.querySelectorAll('[role="table"]')).toHaveLength(0)
         reopenedResult.resolve([branch('fresh reopened result')])
         await vi.waitFor(() => expect(target.querySelectorAll('[role="table"]')).toHaveLength(1))
+    })
+
+    it('keeps generation details available after the live conversation is released', async () => {
+        alertGenerationInfoStore.set({
+            idx: 42,
+            genInfo: {
+                model: 'test-model',
+                generationId: 'generation-a',
+                inputTokens: 3,
+                outputTokens: 5,
+                maxContext: 100,
+            },
+            message: {
+                role: 'char',
+                data: 'detached generation message',
+                chatId: 'message-a',
+                saying: 'speaker-a',
+                time: 123,
+            },
+        })
+        alertStore.set({ type: 'requestdata', msg: 'generation-a' })
+        const target = document.createElement('div')
+        document.body.appendChild(target)
+        mounted = mount(AlertComp, { target })
+
+        const buttons = target.querySelectorAll('button')
+        expect(buttons.length).toBeGreaterThanOrEqual(4)
+        buttons[1].click()
+        await tick()
+
+        expect(target.textContent).toContain('message-a')
+        expect(target.textContent).toContain('speaker-a')
+        expect(target.textContent).toContain('detached generation message')
     })
 })

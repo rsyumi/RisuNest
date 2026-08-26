@@ -39,6 +39,7 @@
         type CapturedChatMessageTarget,
     } from "../../ts/chatMessageUi"
     import type { DeepReadonly, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
+    import { safeStructuredClone } from 'src/ts/polyfill'
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -439,13 +440,21 @@
             <button class="text-sm p-1 text-textcolor2 border-darkborderc float-end mr-2 my-1
                     hover:ring-darkbutton hover:ring-3 rounded-md hover:text-textcolor transition-all flex justify-center items-center" 
                     onclick={() => {
-                        const currentGenerationInfo = idx >= 0 ? 
-                            DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[idx].generationInfo :
-                            messageGenerationInfo
+                        const currentMessage = captureMessage ?? (
+                            idx >= 0
+                                ? DBState.db.characters[$selectedCharID]
+                                    ?.chats[DBState.db.characters[$selectedCharID].chatPage]
+                                    ?.message[idx]
+                                : undefined
+                        )
+                        const currentGenerationInfo = currentMessage?.generationInfo
+                            ?? messageGenerationInfo
+                        if (!currentMessage || !currentGenerationInfo) return
 
                         alertRequestData({
                             genInfo: currentGenerationInfo,
                             idx: idx,
+                            message: safeStructuredClone(currentMessage) as Message,
                         })
                     }}
             >

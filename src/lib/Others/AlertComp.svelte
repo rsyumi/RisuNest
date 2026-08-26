@@ -479,15 +479,15 @@
                     <span class="text-amber-500">Model</span>
                     <span class="text-amber-500 justify-self-end">{$alertGenerationInfoStore.genInfo.model}</span>
                     <span class="text-green-500">ID</span>
-                    <span class="text-green-500 justify-self-end">{DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].chatId ?? "None"}</span>
+                    <span class="text-green-500 justify-self-end">{$alertGenerationInfoStore.message.chatId ?? "None"}</span>
                     <span class="text-red-500">GenID</span>
                     <span class="text-red-500 justify-self-end">{$alertGenerationInfoStore.genInfo.generationId}</span>
                     <span class="text-cyan-500">Saying</span>
-                    <span class="text-cyan-500 justify-self-end">{DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].saying}</span>
+                    <span class="text-cyan-500 justify-self-end">{$alertGenerationInfoStore.message.saying}</span>
                     <span class="text-purple-500">Size</span>
-                    <span class="text-purple-500 justify-self-end">{JSON.stringify(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx]).length} Bytes</span>
+                    <span class="text-purple-500 justify-self-end">{JSON.stringify($alertGenerationInfoStore.message).length} Bytes</span>
                     <span class="text-yellow-500">Time</span>
-                    <span class="text-yellow-500 justify-self-end">{(new Date(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].time ?? 0)).toLocaleString()}</span>
+                    <span class="text-yellow-500 justify-self-end">{(new Date($alertGenerationInfoStore.message.time ?? 0)).toLocaleString()}</span>
                     {#if $alertGenerationInfoStore.genInfo.stageTiming}
                         {@const stage1 = parseFloat(((($alertGenerationInfoStore.genInfo.stageTiming.stage1 ?? 0) / 1000).toFixed(1)))}
                         {@const stage2 = parseFloat(((($alertGenerationInfoStore.genInfo.stageTiming.stage2 ?? 0) / 1000).toFixed(1)))}
@@ -505,7 +505,7 @@
                     {/if}
 
                     <span class="text-green-500">Tokens</span>
-                    {#await tokenize(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].data)}
+                    {#await tokenize($alertGenerationInfoStore.message.data)}
                         <span class="text-green-500 justify-self-end">Loading</span>
                     {:then tokens} 
                         <span class="text-green-500 justify-self-end">{tokens}</span>
@@ -528,19 +528,19 @@
                     {/await}
                 {/if}
                 {#if generationInfoMenuIndex === 3}
-                    {#if Object.keys(DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].promptInfo || {}).length === 0}
+                    {#if Object.keys($alertGenerationInfoStore.message.promptInfo || {}).length === 0}
                         <div class="text-gray-300 text-lg mt-2">{language.promptInfoEmptyMessage}</div>
                     {:else}
                         <div class="grid grid-cols-2 gap-y-2 gap-x-4 mt-4">
                             <span class="text-blue-500">Preset Name</span>
-                            <span class="text-blue-500 justify-self-end">{DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].promptInfo.promptName}</span>
+                            <span class="text-blue-500 justify-self-end">{$alertGenerationInfoStore.message.promptInfo.promptName}</span>
                             <span class="text-purple-500">Toggles</span>
                             <div class="col-span-2 max-h-32 overflow-y-auto border border-stone-500 rounded-sm p-2 bg-gray-900">
-                                {#if DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].promptInfo.promptToggles.length === 0}
+                                {#if $alertGenerationInfoStore.message.promptInfo.promptToggles.length === 0}
                                     <div class="text-gray-500 italic text-center py-4">{language.promptInfoEmptyToggle}</div>
                                 {:else}
                                     <div class="grid grid-cols-2 gap-y-2 gap-x-4">
-                                        {#each DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].promptInfo.promptToggles as toggle}
+                                        {#each $alertGenerationInfoStore.message.promptInfo.promptToggles as toggle}
                                         <span class="text-gray-200 truncate">{toggle.key}</span>
                                         <span class="text-gray-200 justify-self-end truncate">{toggle.value}</span>
                                         {/each}
@@ -549,10 +549,10 @@
                             </div>
                             <span class="text-red-500">Prompt Text</span>
                             <div class="col-span-2 max-h-80 overflow-y-auto border border-stone-500 rounded-sm p-4 bg-gray-900">
-                                {#if !DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].promptInfo.promptText}
+                                {#if !$alertGenerationInfoStore.message.promptInfo.promptText}
                                     <div class="text-gray-500 italic text-center py-4">{language.promptInfoEmptyText}</div>
                                 {:else}
-                                    {#each DBState.db.characters[$selectedCharID].chats[DBState.db.characters[$selectedCharID].chatPage].message[$alertGenerationInfoStore.idx].promptInfo.promptText as block}
+                                    {#each $alertGenerationInfoStore.message.promptInfo.promptText as block}
                                         <div class="mb-2">
                                             <div class="font-bold text-gray-600">{block.role}</div>
                                             <pre class="whitespace-pre-wrap text-sm bg-stone-900 p-2 rounded-sm border border-stone-500">{block.content}</pre>

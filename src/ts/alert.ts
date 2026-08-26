@@ -2,7 +2,7 @@ import { get, writable } from "svelte/store"
 import { sleep } from "./util"
 import { language } from "../lang"
 import { isTauri, isNodeServer } from "src/ts/platform"
-import { getDatabase, type MessageGenerationInfo } from "./storage/database.svelte"
+import { getDatabase, type Message, type MessageGenerationInfo } from "./storage/database.svelte"
 import { alertStore as alertStoreImported } from "./stores.svelte"
 
 export interface alertData{
@@ -17,9 +17,10 @@ export interface alertData{
     defaultValue?: string
 }
 
-type AlertGenerationInfoStoreData = {
+export type AlertGenerationInfoStoreData = {
     genInfo: MessageGenerationInfo,
     idx: number
+    message: Message
 }
 export const alertGenerationInfoStore = writable<AlertGenerationInfoStoreData>(null)
 export const alertStore = {
