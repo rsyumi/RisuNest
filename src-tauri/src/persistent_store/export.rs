@@ -8,6 +8,9 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+#[allow(dead_code)]
+mod destination;
+
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
 
 const CONFIG: u8 = 0;
