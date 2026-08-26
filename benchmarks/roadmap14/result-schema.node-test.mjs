@@ -14,6 +14,7 @@ import {
 import { convertExistingWindowsMeasurements } from './windows.mjs'
 
 test('the shared schema accepts a completed Windows result', () => {
+    const saveLarge = getRoadmap14Scenario('save-large')
     const result = {
         schemaVersion: 1,
         kind: 'risunest-roadmap14-platform-result',
@@ -21,10 +22,10 @@ test('the shared schema accepts a completed Windows result', () => {
         scenario: 'save-large',
         recordedAt: '2026-08-26T00:00:00.000Z',
         fixture: {
-            name: 'save-large',
-            version: 1,
-            identitySha256: 'a'.repeat(64),
-            descriptor: {},
+            name: saveLarge.name,
+            version: saveLarge.version,
+            identitySha256: saveLarge.identitySha256,
+            descriptor: saveLarge.descriptor,
         },
         build: {
             identity: '742fb370-release',
@@ -254,6 +255,21 @@ test('schema validation rejects unknown fields and malformed timestamps', () => 
     assert.ok(errors.includes('$.recordedAt must be an ISO 8601 date-time'))
     assert.ok(errors.includes('$.unexpected is not allowed'))
     assert.ok(errors.includes('$.memory.unexpected is not allowed'))
+})
+
+test('schema validation rejects a descriptor that does not match its fixture identity', () => {
+    const [result] = createPendingAndroidResults({
+        sourceRevision: '742fb370',
+        appVersion: '1.0.0',
+        recordedAt: '2026-08-26T00:00:00.000Z',
+    })
+    result.fixture.descriptor.characters += 1
+
+    assert.ok(
+        validateRoadmap14Result(result).includes(
+            '$.fixture.identitySha256 does not match the fixture descriptor',
+        ),
+    )
 })
 
 test('the Android invocation contract rejects non-Android or incomplete scenario sets', () => {

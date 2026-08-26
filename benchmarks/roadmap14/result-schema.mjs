@@ -1,5 +1,7 @@
 import { readFile } from 'node:fs/promises'
 
+import { fixtureIdentity } from './scenarios.mjs'
+
 const SHA256_PATTERN = /^[0-9a-f]{64}$/
 const SCENARIOS = new Set([
     'library-many',
@@ -64,6 +66,16 @@ export function validateRoadmap14Result(result) {
         expectPositiveInteger(errors, result.fixture.version, '$.fixture.version')
         expectSha256(errors, result.fixture.identitySha256, '$.fixture.identitySha256')
         expectRecord(errors, result.fixture.descriptor, '$.fixture.descriptor')
+        if (isRecord(result.fixture.descriptor)) {
+            const actualIdentity = fixtureIdentity({
+                name: result.fixture.name,
+                version: result.fixture.version,
+                descriptor: result.fixture.descriptor,
+            })
+            if (result.fixture.identitySha256 !== actualIdentity) {
+                errors.push('$.fixture.identitySha256 does not match the fixture descriptor')
+            }
+        }
     }
     if (isRecord(result.build)) {
         expectAllowedKeys(errors, result.build, [
