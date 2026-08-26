@@ -2,14 +2,17 @@ use crc32fast::Hasher as Crc32Hasher;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use zip::ZipArchive;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const CANCELLED_IO_MESSAGE: &str = "CharX parsing was cancelled";
 
 #[derive(Clone, Copy, Debug)]
 pub struct CharXLimits {
@@ -161,6 +164,80 @@ struct OwnedStagingDirectory {
     keep: bool,
 }
 
+struct Cancellation<F> {
+    callback: Rc<RefCell<F>>,
+}
+
+impl<F> Clone for Cancellation<F> {
+    fn clone(&self) -> Self {
+        Self {
+            callback: Rc::clone(&self.callback),
+        }
+    }
+}
+
+impl<F> Cancellation<F>
+where
+    F: FnMut() -> bool,
+{
+    fn new(callback: F) -> Self {
+        Self {
+            callback: Rc::new(RefCell::new(callback)),
+        }
+    }
+
+    fn check(&self) -> Result<(), CharXParseError> {
+        if (self.callback.borrow_mut())() {
+            return Err(CharXParseError::new(
+                CharXParseErrorCode::Cancelled,
+                CANCELLED_IO_MESSAGE,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_io(&self) -> io::Result<()> {
+        self.check()
+            .map_err(|_| io::Error::other(CANCELLED_IO_MESSAGE))
+    }
+}
+
+struct CancellableReader<R, F> {
+    inner: R,
+    cancellation: Cancellation<F>,
+}
+
+impl<R, F> CancellableReader<R, F> {
+    fn new(inner: R, cancellation: Cancellation<F>) -> Self {
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+}
+
+impl<R, F> Read for CancellableReader<R, F>
+where
+    R: Read,
+    F: FnMut() -> bool,
+{
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.cancellation.check_io()?;
+        self.inner.read(buffer)
+    }
+}
+
+impl<R, F> Seek for CancellableReader<R, F>
+where
+    R: Seek,
+    F: FnMut() -> bool,
+{
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.cancellation.check_io()?;
+        self.inner.seek(position)
+    }
+}
+
 impl OwnedStagingDirectory {
     fn create(root: &Path) -> Result<Self, CharXParseError> {
         fs::create_dir_all(root).map_err(|error| io_error("create staging root", error))?;
@@ -188,12 +265,13 @@ pub fn inspect_charx_file<F>(
     original_name: &str,
     staging_root: &Path,
     limits: CharXLimits,
-    mut is_cancelled: F,
+    is_cancelled: F,
 ) -> Result<CharXInspection, CharXParseError>
 where
     F: FnMut() -> bool,
 {
-    require_not_cancelled(&mut is_cancelled)?;
+    let cancellation = Cancellation::new(is_cancelled);
+    cancellation.check()?;
     validate_limits(limits)?;
 
     let source_length = fs::metadata(source_path)
@@ -202,7 +280,7 @@ where
     let extension = extension_of(original_name);
     let normalized_extension = extension.as_ref().map(|value| value.to_ascii_lowercase());
     let jpeg_name = matches!(normalized_extension.as_deref(), Some("jpg" | "jpeg"));
-    let jpeg_signature = has_jpeg_signature(source_path)?;
+    let jpeg_signature = has_jpeg_signature(source_path, &cancellation)?;
 
     if jpeg_name && !jpeg_signature {
         return Err(CharXParseError::new(
@@ -211,8 +289,9 @@ where
         ));
     }
 
-    let archive_file =
-        File::open(source_path).map_err(|error| io_error("open CharX source", error))?;
+    let archive_file = File::open(source_path)
+        .map(|file| CancellableReader::new(file, cancellation.clone()))
+        .map_err(|error| io_error("open CharX source", error))?;
     let mut archive = match ZipArchive::new(archive_file) {
         Ok(archive) => archive,
         Err(_error) if jpeg_name && jpeg_signature => {
@@ -229,7 +308,7 @@ where
         Err(error) => return Err(zip_error("open CharX archive", error)),
     };
 
-    require_not_cancelled(&mut is_cancelled)?;
+    cancellation.check()?;
     if archive.len() > limits.max_entries {
         return Err(CharXParseError::new(
             CharXParseErrorCode::TooManyEntries,
@@ -241,7 +320,7 @@ where
         ));
     }
     let archive_offset = archive.offset();
-    let has_card_entry = archive_has_card_entry(&mut archive, &mut is_cancelled)?;
+    let has_card_entry = archive_has_card_entry(&mut archive, &cancellation)?;
     if jpeg_name && (!has_card_entry || archive_offset == 0) {
         return Ok(CharXInspection::OrdinaryJpegAsset(
             OrdinaryJpegAssetDescriptor {
@@ -257,7 +336,9 @@ where
     let container_kind = if archive_offset == 0 {
         CharXContainerKind::CharX
     } else {
-        if !jpeg_signature || !jpeg_prefix_has_end_marker(source_path, archive_offset)? {
+        if !jpeg_signature
+            || !jpeg_prefix_has_end_marker(source_path, archive_offset, &cancellation)?
+        {
             return Err(CharXParseError::new(
                 CharXParseErrorCode::InvalidArchive,
                 "data before the CharX archive is not a complete JPEG prefix",
@@ -273,14 +354,14 @@ where
         ));
     }
 
-    let entries = inspect_entries(source_path, &mut archive, limits, &mut is_cancelled)?;
+    let entries = inspect_entries(source_path, &mut archive, limits, &cancellation)?;
     let staging = OwnedStagingDirectory::create(staging_root)?;
     let mut total_actual_decoded = 0_u64;
     let mut card_json = None;
     let mut payloads = Vec::new();
 
     for entry in &entries {
-        require_not_cancelled(&mut is_cancelled)?;
+        cancellation.check()?;
         if entry.is_directory {
             continue;
         }
@@ -292,7 +373,7 @@ where
                 limits.max_metadata_bytes,
                 &mut total_actual_decoded,
                 limits.max_total_decoded_bytes,
-                &mut is_cancelled,
+                &cancellation,
             )?;
             let text = String::from_utf8(bytes).map_err(|_| {
                 CharXParseError::new(
@@ -313,7 +394,7 @@ where
             &staged_path,
             &mut total_actual_decoded,
             limits.max_total_decoded_bytes,
-            &mut is_cancelled,
+            &cancellation,
         )?;
         payloads.push(payload);
     }
@@ -368,14 +449,14 @@ fn validate_limits(limits: CharXLimits) -> Result<(), CharXParseError> {
 
 fn archive_has_card_entry<R, F>(
     archive: &mut ZipArchive<R>,
-    is_cancelled: &mut F,
+    cancellation: &Cancellation<F>,
 ) -> Result<bool, CharXParseError>
 where
     R: Read + Seek,
     F: FnMut() -> bool,
 {
     for index in 0..archive.len() {
-        require_not_cancelled(is_cancelled)?;
+        cancellation.check()?;
         let entry = archive
             .by_index(index)
             .map_err(|error| zip_error("inspect CharX entry", error))?;
@@ -396,7 +477,7 @@ fn inspect_entries<R, F>(
     source_path: &Path,
     archive: &mut ZipArchive<R>,
     limits: CharXLimits,
-    is_cancelled: &mut F,
+    cancellation: &Cancellation<F>,
 ) -> Result<Vec<EntryMetadata>, CharXParseError>
 where
     R: Read + Seek,
@@ -419,12 +500,12 @@ where
     let mut entries = Vec::with_capacity(archive.len());
 
     for index in 0..archive.len() {
-        require_not_cancelled(is_cancelled)?;
+        cancellation.check()?;
         let entry = archive
             .by_index(index)
             .map_err(|error| zip_error("inspect CharX entry", error))?;
         let raw_name = entry.name_raw();
-        let local_name = read_local_entry_name(source_path, entry.header_start())?;
+        let local_name = read_local_entry_name(source_path, entry.header_start(), cancellation)?;
         if raw_name != local_name.as_slice() {
             return Err(CharXParseError::new(
                 CharXParseErrorCode::InvalidPath,
@@ -577,12 +658,17 @@ fn has_drive_prefix(name: &str) -> bool {
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
-fn read_local_entry_name(
+fn read_local_entry_name<F>(
     source_path: &Path,
     header_start: u64,
-) -> Result<Vec<u8>, CharXParseError> {
-    let mut source =
-        File::open(source_path).map_err(|error| io_error("open local ZIP header", error))?;
+    cancellation: &Cancellation<F>,
+) -> Result<Vec<u8>, CharXParseError>
+where
+    F: FnMut() -> bool,
+{
+    let mut source = File::open(source_path)
+        .map(|file| CancellableReader::new(file, cancellation.clone()))
+        .map_err(|error| io_error("open local ZIP header", error))?;
     source
         .seek(SeekFrom::Start(header_start))
         .map_err(|error| io_error("seek local ZIP header", error))?;
@@ -610,7 +696,7 @@ fn read_entry_to_memory<R, F>(
     byte_limit: u64,
     aggregate_actual: &mut u64,
     aggregate_limit: u64,
-    is_cancelled: &mut F,
+    cancellation: &Cancellation<F>,
 ) -> Result<Vec<u8>, CharXParseError>
 where
     R: Read + Seek,
@@ -629,7 +715,7 @@ where
         byte_limit,
         aggregate_actual,
         aggregate_limit,
-        is_cancelled,
+        cancellation,
         |bytes| {
             output.extend_from_slice(bytes);
             Ok(())
@@ -644,7 +730,7 @@ fn stage_entry<R, F>(
     staged_path: &Path,
     aggregate_actual: &mut u64,
     aggregate_limit: u64,
-    is_cancelled: &mut F,
+    cancellation: &Cancellation<F>,
 ) -> Result<StagedPayloadDescriptor, CharXParseError>
 where
     R: Read + Seek,
@@ -664,7 +750,7 @@ where
         entry.decoded_size,
         aggregate_actual,
         aggregate_limit,
-        is_cancelled,
+        cancellation,
         |bytes| {
             if sniff.len() < 512 {
                 let count = (512 - sniff.len()).min(bytes.len());
@@ -705,7 +791,7 @@ fn read_entry<R, F, W>(
     byte_limit: u64,
     aggregate_actual: &mut u64,
     aggregate_limit: u64,
-    is_cancelled: &mut F,
+    cancellation: &Cancellation<F>,
     mut write_chunk: W,
 ) -> Result<(u64, u32), CharXParseError>
 where
@@ -721,7 +807,7 @@ where
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
 
     loop {
-        require_not_cancelled(is_cancelled)?;
+        cancellation.check()?;
         let count = entry.read(&mut buffer).map_err(|error| {
             if error.to_string().contains("Invalid checksum") {
                 CharXParseError::new(
@@ -868,8 +954,16 @@ fn extension_of(name: &str) -> Option<String> {
     Some(final_segment[separator + 1..].to_owned())
 }
 
-fn has_jpeg_signature(path: &Path) -> Result<bool, CharXParseError> {
-    let mut file = File::open(path).map_err(|error| io_error("open JPEG source", error))?;
+fn has_jpeg_signature<F>(
+    path: &Path,
+    cancellation: &Cancellation<F>,
+) -> Result<bool, CharXParseError>
+where
+    F: FnMut() -> bool,
+{
+    let mut file = File::open(path)
+        .map(|file| CancellableReader::new(file, cancellation.clone()))
+        .map_err(|error| io_error("open JPEG source", error))?;
     let mut signature = [0_u8; 3];
     match file.read_exact(&mut signature) {
         Ok(()) => Ok(signature == [0xff, 0xd8, 0xff]),
@@ -878,8 +972,17 @@ fn has_jpeg_signature(path: &Path) -> Result<bool, CharXParseError> {
     }
 }
 
-fn jpeg_prefix_has_end_marker(path: &Path, archive_offset: u64) -> Result<bool, CharXParseError> {
-    let mut file = File::open(path).map_err(|error| io_error("open appended JPEG", error))?;
+fn jpeg_prefix_has_end_marker<F>(
+    path: &Path,
+    archive_offset: u64,
+    cancellation: &Cancellation<F>,
+) -> Result<bool, CharXParseError>
+where
+    F: FnMut() -> bool,
+{
+    let mut file = File::open(path)
+        .map(|file| CancellableReader::new(file, cancellation.clone()))
+        .map_err(|error| io_error("open appended JPEG", error))?;
     let mut remaining = archive_offset;
     let mut previous = None;
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
@@ -952,26 +1055,19 @@ fn detect_mime(prefix: &[u8], extension: Option<&str>) -> &'static str {
     }
 }
 
-fn require_not_cancelled<F>(is_cancelled: &mut F) -> Result<(), CharXParseError>
-where
-    F: FnMut() -> bool,
-{
-    if is_cancelled() {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::Cancelled,
-            "CharX parsing was cancelled",
-        ));
-    }
-    Ok(())
-}
-
 fn io_error(context: &str, error: io::Error) -> CharXParseError {
+    if error.to_string() == CANCELLED_IO_MESSAGE {
+        return CharXParseError::new(CharXParseErrorCode::Cancelled, CANCELLED_IO_MESSAGE);
+    }
     CharXParseError::new(CharXParseErrorCode::Io, format!("{context}: {error}"))
 }
 
 fn zip_error(context: &str, error: zip::result::ZipError) -> CharXParseError {
-    CharXParseError::new(
-        CharXParseErrorCode::InvalidArchive,
-        format!("{context}: {error}"),
-    )
+    match error {
+        zip::result::ZipError::Io(error) => io_error(context, error),
+        error => CharXParseError::new(
+            CharXParseErrorCode::InvalidArchive,
+            format!("{context}: {error}"),
+        ),
+    }
 }

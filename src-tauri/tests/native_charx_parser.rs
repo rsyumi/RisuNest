@@ -349,6 +349,28 @@ fn cancellation_is_checked_during_payload_copy_and_cleans_partial_files() {
 }
 
 #[test]
+fn cancellation_can_interrupt_archive_directory_parsing_before_format_errors_win() {
+    let directory = TempDir::new().expect("source directory");
+    let staging = directory.path().join("jobs");
+    fs::create_dir(&staging).expect("staging root");
+    let source = write_source(&directory, "cancel-directory.charx", b"not a ZIP archive");
+    let checks = AtomicUsize::new(0);
+
+    let error = inspect_charx_file(
+        &source,
+        "cancel-directory.charx",
+        &staging,
+        CharXLimits::default(),
+        || checks.fetch_add(1, Ordering::Relaxed) >= 2,
+    )
+    .expect_err("directory parsing must observe cancellation");
+
+    assert_eq!(error.code(), CharXParseErrorCode::Cancelled);
+    assert!(checks.load(Ordering::Relaxed) >= 3);
+    assert_eq!(fs::read_dir(staging).expect("read staging root").count(), 0);
+}
+
+#[test]
 fn rejects_missing_invalid_or_unreferenced_card_metadata() {
     let missing = zip_bytes(
         &[("assets/payload.bin", b"asset", CompressionMethod::Stored)],
