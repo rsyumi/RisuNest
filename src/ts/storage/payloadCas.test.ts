@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest'
 import {
     createBlobKeyValuePayloadBackend,
     createImmutablePayloadCas,
+    createProcessLocalPayloadKeyLock,
     createShadowCopyBlobStore,
     type ImmutablePayloadBackend,
 } from './payloadCas'
@@ -207,8 +208,9 @@ describe('immutable payload CAS', () => {
             },
             async remove() {},
         }
+        const lock = createProcessLocalPayloadKeyLock()
         const cas = createImmutablePayloadCas(
-            createBlobKeyValuePayloadBackend(blobBackend),
+            createBlobKeyValuePayloadBackend(blobBackend, lock),
         )
 
         const first = await cas.prepare(new Uint8Array([7]))
@@ -216,6 +218,46 @@ describe('immutable payload CAS', () => {
 
         expect(first.deduplicated).toBe(false)
         expect(second.deduplicated).toBe(true)
+        expect(writes).toBe(1)
+        expect(values).toHaveLength(1)
+    })
+
+    test('a shared process lock coordinates concurrent prepares across adapter callers', async () => {
+        const values = new Map<string, Uint8Array>()
+        let writes = 0
+        const blobBackend: BlobKeyValueBackend = {
+            async write(key, value) {
+                writes += 1
+                values.set(key, value.slice())
+            },
+            async read(key) {
+                return values.get(key)?.slice() ?? null
+            },
+            async size(key) {
+                const size = values.get(key)?.byteLength ?? null
+                await Promise.resolve()
+                return size
+            },
+            async keys() {
+                throw new Error('object enumeration is forbidden')
+            },
+            async remove() {},
+        }
+        const lock = createProcessLocalPayloadKeyLock()
+        const firstCas = createImmutablePayloadCas(
+            createBlobKeyValuePayloadBackend(blobBackend, lock),
+        )
+        const secondCas = createImmutablePayloadCas(
+            createBlobKeyValuePayloadBackend(blobBackend, lock),
+        )
+
+        const prepared = await Promise.all([
+            firstCas.prepare(new Uint8Array([8, 9])),
+            secondCas.prepare(new Uint8Array([8, 9])),
+        ])
+
+        expect(lock.scope).toBe('process-local')
+        expect(prepared.filter((result) => !result.deduplicated)).toHaveLength(1)
         expect(writes).toBe(1)
         expect(values).toHaveLength(1)
     })

@@ -6,6 +6,12 @@ export interface ImmutablePayloadBackend {
     stat(key: string): Promise<number | null>
 }
 
+export interface PayloadKeyLock {
+    /** All adapters for one backend must share this lock. Process-local locks do not coordinate tabs or workers. */
+    readonly scope: 'process-local' | 'cross-context'
+    withExclusive<T>(key: string, operation: () => Promise<T>): Promise<T>
+}
+
 export interface PreparedImmutablePayload {
     contentHash: string
     byteSize: number
@@ -77,6 +83,7 @@ export function createImmutablePayloadCas(backend: ImmutablePayloadBackend): Imm
 
 export function createBlobKeyValuePayloadBackend(
     backend: BlobKeyValueBackend,
+    lock: PayloadKeyLock,
 ): ImmutablePayloadBackend {
     const exists = async (key: string): Promise<boolean> => {
         if (backend.size) return await backend.size(key) !== null
@@ -84,14 +91,38 @@ export function createBlobKeyValuePayloadBackend(
     }
     return {
         async putIfAbsent(key, data) {
-            if (await exists(key)) return false
-            await backend.write(key, data.slice())
-            return true
+            return lock.withExclusive(key, async () => {
+                if (await exists(key)) return false
+                await backend.write(key, data.slice())
+                return true
+            })
         },
         read: (key) => backend.read(key),
         async stat(key) {
             if (backend.size) return backend.size(key)
             return (await backend.read(key))?.byteLength ?? null
+        },
+    }
+}
+
+export function createProcessLocalPayloadKeyLock(): PayloadKeyLock {
+    const tails = new Map<string, Promise<void>>()
+    return {
+        scope: 'process-local',
+        async withExclusive(key, operation) {
+            const previous = tails.get(key) ?? Promise.resolve()
+            let release = (): void => {}
+            const current = new Promise<void>((resolve) => {
+                release = resolve
+            })
+            tails.set(key, current)
+            await previous
+            try {
+                return await operation()
+            } finally {
+                release()
+                if (tails.get(key) === current) tails.delete(key)
+            }
         },
     }
 }
