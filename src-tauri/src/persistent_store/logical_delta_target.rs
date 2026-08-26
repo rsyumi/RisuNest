@@ -160,7 +160,7 @@ pub(crate) fn establish_logical_common_base(
     }
     let remote_base = PeerBase {
         generation_id: remote_manifest.generation.clone(),
-        manifest_hash: remote_manifest_hash,
+        manifest_hash: remote_manifest_hash.clone(),
         generation_sequence: remote_manifest.generation_sequence.clone(),
     };
 
