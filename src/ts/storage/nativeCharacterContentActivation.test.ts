@@ -1,0 +1,242 @@
+import { describe, expect, it, vi } from 'vitest'
+
+vi.mock('../characterCards', () => ({
+    mapPreparedNativeCharacterCard: vi.fn(),
+}))
+vi.mock('./nativeAssetRepository', () => ({
+    createNativeImmutablePayloadCas: vi.fn(),
+}))
+vi.mock('./persistentDataRuntime.svelte', () => ({
+    upsertPersistentCompleteCharacter: vi.fn(),
+}))
+
+import type { character } from './database.svelte'
+import type { PreparedImmutablePayload } from './payloadCas'
+import {
+    activatePreparedNativeCharacterContent,
+    UnsupportedPreparedNativeCharacterCardError,
+    type NativeCharacterContentActivationDependencies,
+} from './nativeCharacterContentActivation'
+import type { PreparedNativeContent } from './nativeFileJobs'
+import { decodeOwnerManifest, ownerManifestIdentity } from './ownerManifestCodec'
+
+const firstHash = '11'.repeat(32)
+const secondHash = '22'.repeat(32)
+
+const content: PreparedNativeContent = {
+    format: 'json-card',
+    metadata: {
+        spec: 'chara_card_v3',
+        spec_version: '3.0',
+        data: { name: 'Native Card', extensions: {} },
+    },
+    assets: [
+        {
+            referenceKey: 'data.assets.0.uri',
+            token: 'native-data-0',
+            logicalId: `assets/${firstHash}.png`,
+            objectHash: firstHash,
+            byteSize: 4,
+            mime: 'image/png',
+            name: 'portrait',
+            ext: 'png',
+        },
+        {
+            referenceKey: 'data.assets.1.uri',
+            token: 'native-data-1',
+            logicalId: `assets/${secondHash}.json`,
+            objectHash: secondHash,
+            byteSize: 9,
+            mime: 'application/json',
+            name: 'config',
+            ext: 'json',
+        },
+        {
+            referenceKey: 'data.assets.2.uri',
+            token: 'native-data-2',
+            logicalId: `assets/${secondHash}.json`,
+            objectHash: secondHash,
+            byteSize: 9,
+            mime: 'application/json',
+            name: 'config',
+            ext: 'json',
+        },
+    ],
+}
+
+function mappedCharacter(): character {
+    return {
+        type: 'character',
+        chaId: 'character-1',
+        name: 'Native Card',
+        chats: [],
+        additionalAssets: [
+            ['config', `assets/${secondHash}.json`, 'json'],
+            ['config duplicate', `assets/${secondHash}.json`, 'json'],
+        ],
+    } as character
+}
+
+function dependencies(
+    overrides: Partial<NativeCharacterContentActivationDependencies> = {},
+): NativeCharacterContentActivationDependencies {
+    return {
+        map: vi.fn(async () => mappedCharacter()),
+        prepareManifest: vi.fn(async (bytes): Promise<PreparedImmutablePayload> => ({
+            contentHash: await ownerManifestIdentity(bytes),
+            byteSize: bytes.byteLength,
+            physicalKey: 'unused-by-activation',
+            deduplicated: false,
+        })),
+        upsert: vi.fn(async () => true),
+        ...overrides,
+    }
+}
+
+describe('prepared native character content activation', () => {
+    it('commits ordinary aliases and the exact ordered owner manifest with the character', async () => {
+        const deps = dependencies()
+
+        const result = await activatePreparedNativeCharacterContent(content, deps)
+
+        expect(result).toEqual({ characterId: 'character-1' })
+        expect(deps.map).toHaveBeenCalledWith({
+            card: content.metadata,
+            assets: content.assets.map(({ token, logicalId }) => ({ token, logicalId })),
+        })
+        expect(deps.prepareManifest).toHaveBeenCalledOnce()
+        const manifestBytes = vi.mocked(deps.prepareManifest).mock.calls[0][0]
+        expect(decodeOwnerManifest(manifestBytes)).toEqual([
+            {
+                tuple: ['config', `assets/${secondHash}.json`, 'json'],
+                payloadHash: Uint8Array.from({ length: 32 }, () => 0x22),
+            },
+            {
+                tuple: ['config duplicate', `assets/${secondHash}.json`, 'json'],
+                payloadHash: Uint8Array.from({ length: 32 }, () => 0x22),
+            },
+        ])
+        const expectedManifestHash = await ownerManifestIdentity(manifestBytes)
+        expect(deps.upsert).toHaveBeenCalledWith(
+            'character-1',
+            'native-content-import',
+            expect.any(Function),
+            {
+                assetAliases: [
+                    {
+                        kind: 'asset',
+                        key: `assets/${firstHash}.png`,
+                        objectHash: firstHash,
+                        size: 4,
+                        mime: 'image/png',
+                        name: 'portrait',
+                        ext: 'png',
+                    },
+                    {
+                        kind: 'asset',
+                        key: `assets/${secondHash}.json`,
+                        objectHash: secondHash,
+                        size: 9,
+                        mime: 'application/json',
+                        name: 'config',
+                        ext: 'json',
+                    },
+                ],
+                assetOwnerHeads: [{
+                    owner: {
+                        kind: 'character-additional-assets',
+                        characterId: 'character-1',
+                    },
+                    present: true,
+                    manifestHash: expectedManifestHash,
+                    entryCount: 2,
+                }],
+            },
+        )
+        const create = vi.mocked(deps.upsert).mock.calls[0][2]
+        expect(await create(null)).toEqual(mappedCharacter())
+    })
+
+    it('returns a normal declined outcome without preparing or publishing anything', async () => {
+        const deps = dependencies({ map: vi.fn(async (): Promise<false> => false) })
+
+        await expect(activatePreparedNativeCharacterContent(content, deps)).resolves.toBeNull()
+
+        expect(deps.prepareManifest).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('classifies off-spec JSON before calling the character card mapper', async () => {
+        const deps = dependencies()
+
+        await expect(activatePreparedNativeCharacterContent({
+            ...content,
+            metadata: { name: 'Legacy Tavern Card' },
+        }, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
+
+        expect(deps.map).not.toHaveBeenCalled()
+        expect(deps.prepareManifest).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('commits a present empty additional-assets manifest', async () => {
+        const character = mappedCharacter()
+        character.additionalAssets = []
+        const deps = dependencies({ map: vi.fn(async () => character) })
+
+        await activatePreparedNativeCharacterContent(content, deps)
+
+        const manifestBytes = vi.mocked(deps.prepareManifest).mock.calls[0][0]
+        expect(decodeOwnerManifest(manifestBytes)).toEqual([])
+        expect(deps.upsert).toHaveBeenCalledWith(
+            'character-1',
+            'native-content-import',
+            expect.any(Function),
+            expect.objectContaining({
+                assetOwnerHeads: [expect.objectContaining({
+                    present: true,
+                    entryCount: 0,
+                })],
+            }),
+        )
+    })
+
+    it('fails closed when an additional asset does not have a prepared ordinary alias', async () => {
+        const character = mappedCharacter()
+        character.additionalAssets = [['missing', 'assets/missing.bin', 'bin']]
+        const deps = dependencies({ map: vi.fn(async () => character) })
+
+        await expect(activatePreparedNativeCharacterContent(content, deps))
+            .rejects.toThrow(/missing prepared asset alias/i)
+
+        expect(deps.prepareManifest).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('rejects a manifest CAS identity mismatch before the database commit', async () => {
+        const deps = dependencies({
+            prepareManifest: vi.fn(async (bytes) => ({
+                contentHash: 'ff'.repeat(32),
+                byteSize: bytes.byteLength,
+                physicalKey: 'wrong-object',
+                deduplicated: false,
+            })),
+        })
+
+        await expect(activatePreparedNativeCharacterContent(content, deps))
+            .rejects.toThrow(/manifest CAS identity mismatch/i)
+
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('leaves activation failure visible to the retained native job coordinator', async () => {
+        const deps = dependencies({
+            upsert: vi.fn(async () => {
+                throw new Error('revision conflict')
+            }),
+        })
+
+        await expect(activatePreparedNativeCharacterContent(content, deps))
+            .rejects.toThrow('revision conflict')
+    })
+})
