@@ -1,29 +1,41 @@
 import type {
   LuaWorkerHostMessage,
   LuaWorkerBoundedContext,
+  LuaWorkerEngineDescriptor,
   LuaWorkerInvocation,
   LuaWorkerInvocationResult,
   LuaWorkerJsonValue,
   LuaWorkerMutation,
   LuaWorkerPolicy,
+  LuaWorkerProtocolLimits,
   LuaWorkerRequest,
 } from './luaWorkerProtocol'
 import {
+  assertLuaWorkerMutationInContextWindow,
   canonicalizeLuaWorkerJson,
+  createLuaWorkerEngineKey,
   isLuaWorkerMetrics,
   isLuaWorkerMutation,
+  LuaWorkerContextWindowError,
 } from './luaWorkerProtocol'
 
-export { createLuaWorkerEngineKey } from './luaWorkerProtocol'
+export {
+  createLuaWorkerEngineKey,
+  getLuaWorkerContextLength,
+  readLuaWorkerContextMessage,
+  readLuaWorkerRecentMessages,
+} from './luaWorkerProtocol'
 
 export type {
   LuaWorkerHostMessage,
   LuaWorkerBoundedContext,
+  LuaWorkerEngineDescriptor,
   LuaWorkerInvocation,
   LuaWorkerInvocationResult,
   LuaWorkerJsonValue,
   LuaWorkerMutation,
   LuaWorkerPolicy,
+  LuaWorkerProtocolLimits,
   LuaWorkerRequest,
 } from './luaWorkerProtocol'
 
@@ -38,10 +50,36 @@ export const MAX_LUA_WORKER_SOURCE_BYTES = 256 * 1024
 export const MAX_LUA_WORKER_CONTEXT_MESSAGES = 256
 export const MAX_LUA_WORKER_CONTEXT_BYTES = 1024 * 1024
 export const MAX_LUA_WORKER_RESULT_BYTES = 2 * 1024 * 1024
+export const MAX_LUA_WORKER_RESULT_ENVELOPE_BYTES = 2 * 1024 * 1024
+export const MAX_LUA_WORKER_ERROR_MESSAGE_BYTES = 8 * 1024
+export const MAX_LUA_WORKER_ERROR_BYTES = 16 * 1024
 export const MAX_LUA_WORKER_MUTATIONS = 256
 export const MAX_LUA_WORKER_MUTATION_BYTES = 512 * 1024
+export const MAX_LUA_WORKER_METRICS = 64
+export const MAX_LUA_WORKER_METRIC_KEY_BYTES = 256
+export const MAX_LUA_WORKER_METRICS_BYTES = 4 * 1024
 export const MAX_LUA_WORKER_HOST_CALLS = 16
+export const MAX_LUA_WORKER_HOST_ARGUMENT_BYTES = 1024 * 1024
+export const MAX_LUA_WORKER_HOST_CALL_ENVELOPE_BYTES = 1024 * 1024
 export const MAX_LUA_WORKER_HOST_RESPONSE_BYTES = 1024 * 1024
+export const LUA_WORKER_PROTOCOL_LIMITS = Object.freeze({
+  sourceBytes: MAX_LUA_WORKER_SOURCE_BYTES,
+  contextMessages: MAX_LUA_WORKER_CONTEXT_MESSAGES,
+  invocationContextBytes: MAX_LUA_WORKER_CONTEXT_BYTES,
+  resultValueBytes: MAX_LUA_WORKER_RESULT_BYTES,
+  resultEnvelopeBytes: MAX_LUA_WORKER_RESULT_ENVELOPE_BYTES,
+  errorMessageBytes: MAX_LUA_WORKER_ERROR_MESSAGE_BYTES,
+  errorEnvelopeBytes: MAX_LUA_WORKER_ERROR_BYTES,
+  mutationCount: MAX_LUA_WORKER_MUTATIONS,
+  mutationBytes: MAX_LUA_WORKER_MUTATION_BYTES,
+  metricCount: MAX_LUA_WORKER_METRICS,
+  metricKeyBytes: MAX_LUA_WORKER_METRIC_KEY_BYTES,
+  metricsBytes: MAX_LUA_WORKER_METRICS_BYTES,
+  hostCallCount: MAX_LUA_WORKER_HOST_CALLS,
+  hostArgumentBytes: MAX_LUA_WORKER_HOST_ARGUMENT_BYTES,
+  hostCallEnvelopeBytes: MAX_LUA_WORKER_HOST_CALL_ENVELOPE_BYTES,
+  hostResponseBytes: MAX_LUA_WORKER_HOST_RESPONSE_BYTES,
+}) satisfies LuaWorkerProtocolLimits
 const LUA_WORKER_MODES = new Set(['editRequest', 'editInput', 'editOutput', 'editDisplay'])
 
 export class LuaWorkerHarnessError extends Error {
@@ -62,7 +100,7 @@ export interface LuaWorkerLike {
 }
 
 export interface LuaWorkerHarnessOptions {
-  engineKey: string
+  engine: LuaWorkerEngineDescriptor
   source: string
   policy?: LuaWorkerPolicy
   syntheticLLMMain?: (args: LuaWorkerJsonValue) => LuaWorkerJsonValue | Promise<LuaWorkerJsonValue>
@@ -82,6 +120,10 @@ interface ActiveInvocation {
   id: number
   contextVersion: number
   mode: LuaWorkerInvocation['mode']
+  boundedContext: LuaWorkerBoundedContext
+  lowLevelAccess: boolean
+  phase: 'running' | 'committing'
+  postCommitFailure?: unknown
   options: LuaWorkerInvokeOptions
   abortListener?: () => void
   hostCallIds: Set<number>
@@ -100,26 +142,64 @@ interface PendingInvocation {
 }
 
 export class LuaWorkerHarnessClient {
+  private readonly options: LuaWorkerHarnessOptions
   private worker: LuaWorkerLike | undefined
   private active: ActiveInvocation | undefined
   private readonly pending: PendingInvocation[] = []
   private nextInvocationId = 1
+  private disposed = false
   private workerListeners: {
     worker: LuaWorkerLike
     message: EventListener
     error: EventListener
   } | undefined
 
-  constructor(private readonly options: LuaWorkerHarnessOptions) {}
+  constructor(options: LuaWorkerHarnessOptions) {
+    this.options = {
+      ...options,
+      engine: Object.freeze({ ...options.engine }),
+      policy: options.policy === undefined ? undefined : Object.freeze({ ...options.policy }),
+    }
+  }
+
+  dispose(): void {
+    if (this.disposed) {
+      return
+    }
+    this.disposed = true
+    this.failWorker(new LuaWorkerHarnessError(
+      'lua_worker_disposed',
+      'Lua Worker harness client was disposed',
+    ))
+  }
+
+  terminate(): void {
+    this.dispose()
+  }
 
   invoke(
     invocation: LuaWorkerInvocation,
     options: LuaWorkerInvokeOptions,
   ): Promise<LuaWorkerInvocationResult> {
+    if (this.disposed) {
+      return Promise.reject(new LuaWorkerHarnessError(
+        'lua_worker_disposed',
+        'Lua Worker harness client is disposed',
+      ))
+    }
     if (options.signal?.aborted) {
       return Promise.reject(new LuaWorkerHarnessError(
         'lua_worker_abort',
         'Lua Worker invocation was aborted',
+      ))
+    }
+    try {
+      invocation = deepFreeze(structuredClone(invocation))
+    }
+    catch (error) {
+      return Promise.reject(new LuaWorkerHarnessError(
+        'lua_worker_malformed_input',
+        error instanceof Error ? error.message : String(error),
       ))
     }
     const policy = this.options.policy ?? DEFAULT_LUA_WORKER_POLICY
@@ -149,7 +229,13 @@ export class LuaWorkerHarnessClient {
         `Lua Worker mode is unsupported: ${invocation.mode}`,
       ))
     }
-    if (invocation.lowLevelAccess === true && this.options.syntheticLLMMain === undefined) {
+    if (invocation.mode !== this.options.engine.mode) {
+      return Promise.reject(new LuaWorkerHarnessError(
+        'lua_worker_mode',
+        `Lua Worker invocation mode ${invocation.mode} does not match engine mode ${this.options.engine.mode}`,
+      ))
+    }
+    if (hasLuaWorkerLlmAccess(invocation) && this.options.syntheticLLMMain === undefined) {
       return Promise.reject(new LuaWorkerHarnessError(
         'lua_worker_capability',
         'Lua Worker low-level access requires the synthetic LLM capability',
@@ -173,6 +259,15 @@ export class LuaWorkerHarnessClient {
       return Promise.reject(new LuaWorkerHarnessError(
         'lua_worker_malformed_input',
         'Lua Worker bounded context must contain a messages array',
+      ))
+    }
+    if (!Number.isSafeInteger(context.startIndex) || context.startIndex < 0
+      || !Number.isSafeInteger(context.totalMessages) || context.totalMessages < 0
+      || context.startIndex > context.totalMessages
+      || context.startIndex + context.messages.length > context.totalMessages) {
+      return Promise.reject(new LuaWorkerHarnessError(
+        'lua_worker_malformed_input',
+        'Lua Worker bounded context has invalid absolute window metadata',
       ))
     }
     if (context.messages.length > MAX_LUA_WORKER_CONTEXT_MESSAGES) {
@@ -209,7 +304,12 @@ export class LuaWorkerHarnessClient {
     }
 
     return new Promise((resolve, reject) => {
-      const pending: PendingInvocation = { invocation, options, resolve, reject }
+      const pending: PendingInvocation = {
+        invocation,
+        options,
+        resolve,
+        reject,
+      }
       if (this.active === undefined) {
         this.startInvocation(pending)
       }
@@ -259,10 +359,13 @@ export class LuaWorkerHarnessClient {
     }, timeoutMs)
     const active: ActiveInvocation = {
       id,
+      boundedContext: pending.invocation.boundedContext,
       contextVersion: pending.invocation.contextVersion,
       hostCallIds: new Set(),
       hostResponseBytes: 0,
       mode: pending.invocation.mode,
+      lowLevelAccess: hasLuaWorkerLlmAccess(pending.invocation),
+      phase: 'running',
       options: pending.options,
       timeout,
       resolve: pending.resolve,
@@ -284,6 +387,7 @@ export class LuaWorkerHarnessClient {
         type: 'invoke',
         id,
         mode,
+        lowLevelAccess: hasLuaWorkerLlmAccess(pending.invocation),
         data,
         meta,
         contextVersion,
@@ -305,13 +409,17 @@ export class LuaWorkerHarnessClient {
 
     const worker = this.options.workerFactory()
     const messageListener = ((event: MessageEvent<LuaWorkerHostMessage>) => {
-      this.handleMessage(event.data)
+      if (this.worker === worker) {
+        void this.handleMessage(event.data)
+      }
     }) as EventListener
     const errorListener = ((event: ErrorEvent) => {
-      this.failWorker(new LuaWorkerHarnessError(
-        'lua_worker_crash',
-        event.message || 'Lua Worker crashed',
-      ))
+      if (this.worker === worker) {
+        this.failWorker(new LuaWorkerHarnessError(
+          'lua_worker_crash',
+          event.message || 'Lua Worker crashed',
+        ))
+      }
     }) as EventListener
     worker.addEventListener('message', messageListener)
     worker.addEventListener('error', errorListener)
@@ -320,7 +428,12 @@ export class LuaWorkerHarnessClient {
     try {
       worker.postMessage({
         type: 'register',
-        engineKey: this.options.engineKey,
+        engineKey: createLuaWorkerEngineKey(
+          this.options.engine.ownerChaId,
+          this.options.engine.mode,
+          this.options.engine.exactSourceHash,
+        ),
+        limits: LUA_WORKER_PROTOCOL_LIMITS,
         source: this.options.source,
         policy: this.options.policy ?? DEFAULT_LUA_WORKER_POLICY,
       })
@@ -351,12 +464,40 @@ export class LuaWorkerHarnessClient {
     if (message.id !== active.id) {
       return
     }
+    if (active.phase === 'committing') {
+      return
+    }
     if (message.type === 'error') {
       if (typeof message.category !== 'string' || !message.category.startsWith('lua_worker_')
         || typeof message.message !== 'string') {
         this.failWorker(new LuaWorkerHarnessError(
           'lua_worker_malformed_result',
           'Lua Worker returned a malformed invocation error',
+        ))
+        return
+      }
+      let errorBytes: number
+      try {
+        errorBytes = canonicalByteLength(message)
+      }
+      catch (error) {
+        this.failWorker(new LuaWorkerHarnessError(
+          'lua_worker_malformed_result',
+          error instanceof Error ? error.message : String(error),
+        ))
+        return
+      }
+      if (errorBytes > MAX_LUA_WORKER_ERROR_BYTES) {
+        this.failWorker(new LuaWorkerHarnessError(
+          'lua_worker_output_limit',
+          'Lua Worker error envelope exceeds 16 KiB',
+        ))
+        return
+      }
+      if (utf8ByteLength(message.message) > MAX_LUA_WORKER_ERROR_MESSAGE_BYTES) {
+        this.failWorker(new LuaWorkerHarnessError(
+          'lua_worker_output_limit',
+          'Lua Worker error message exceeds 8 KiB',
         ))
         return
       }
@@ -371,6 +512,28 @@ export class LuaWorkerHarnessClient {
       return
     }
     if (message.type !== 'result') {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_malformed_result',
+        'Lua Worker posted an unknown message type',
+      ))
+      return
+    }
+    let resultEnvelopeBytes: number
+    try {
+      resultEnvelopeBytes = canonicalByteLength(message)
+    }
+    catch (error) {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_malformed_result',
+        error instanceof Error ? error.message : String(error),
+      ))
+      return
+    }
+    if (resultEnvelopeBytes > MAX_LUA_WORKER_RESULT_ENVELOPE_BYTES) {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_output_limit',
+        'Lua Worker result envelope exceeds 2 MiB',
+      ))
       return
     }
     if (typeof message.stopSending !== 'boolean') {
@@ -387,6 +550,16 @@ export class LuaWorkerHarnessClient {
       ))
       return
     }
+    const metricKeys = Object.keys(message.metrics)
+    if (metricKeys.length > MAX_LUA_WORKER_METRICS
+      || metricKeys.some((key) => utf8ByteLength(key) > MAX_LUA_WORKER_METRIC_KEY_BYTES)
+      || canonicalByteLength(message.metrics) > MAX_LUA_WORKER_METRICS_BYTES) {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_output_limit',
+        'Lua Worker result metrics exceed their bounded envelope',
+      ))
+      return
+    }
     let canonicalResult: string
     try {
       canonicalResult = canonicalizeLuaWorkerJson(message.res)
@@ -398,7 +571,7 @@ export class LuaWorkerHarnessClient {
       ))
       return
     }
-    if (new TextEncoder().encode(canonicalResult).byteLength > MAX_LUA_WORKER_RESULT_BYTES) {
+    if (utf8ByteLength(canonicalResult) > MAX_LUA_WORKER_RESULT_BYTES) {
       this.failWorker(new LuaWorkerHarnessError(
         'lua_worker_output_limit',
         'Lua Worker result exceeds 2 MiB',
@@ -435,6 +608,18 @@ export class LuaWorkerHarnessClient {
       ))
       return
     }
+    try {
+      for (const mutation of message.orderedMutations) {
+        assertLuaWorkerMutationInContextWindow(active.boundedContext, mutation)
+      }
+    }
+    catch (error) {
+      if (error instanceof LuaWorkerContextWindowError) {
+        this.failWorker(new LuaWorkerHarnessError(error.category, error.message))
+        return
+      }
+      throw error
+    }
     let canonicalMutations: string
     try {
       canonicalMutations = canonicalizeLuaWorkerJson(message.orderedMutations)
@@ -446,7 +631,7 @@ export class LuaWorkerHarnessClient {
       ))
       return
     }
-    if (new TextEncoder().encode(canonicalMutations).byteLength > MAX_LUA_WORKER_MUTATION_BYTES) {
+    if (utf8ByteLength(canonicalMutations) > MAX_LUA_WORKER_MUTATION_BYTES) {
       this.failWorker(new LuaWorkerHarnessError(
         'lua_worker_mutation_limit',
         'Lua Worker mutation batch exceeds 512 KiB',
@@ -454,6 +639,7 @@ export class LuaWorkerHarnessClient {
       return
     }
 
+    active.phase = 'committing'
     this.cleanupActive(active)
     try {
       const committed = await active.options.commitMutations(
@@ -478,7 +664,12 @@ export class LuaWorkerHarnessClient {
     finally {
       if (this.active === active) {
         this.active = undefined
-        this.startNextInvocation()
+        if (active.postCommitFailure !== undefined) {
+          this.rejectPending(active.postCommitFailure)
+        }
+        else {
+          this.startNextInvocation()
+        }
       }
     }
   }
@@ -494,6 +685,34 @@ export class LuaWorkerHarnessClient {
     message: Extract<LuaWorkerHostMessage, { type: 'hostCall' }>,
     active: ActiveInvocation,
   ): Promise<void> {
+    let argumentBytes: number
+    let envelopeBytes: number
+    try {
+      argumentBytes = canonicalByteLength(message.args)
+      envelopeBytes = canonicalByteLength(message)
+    }
+    catch (error) {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_malformed_result',
+        error instanceof Error ? error.message : String(error),
+      ))
+      return
+    }
+    if (argumentBytes > MAX_LUA_WORKER_HOST_ARGUMENT_BYTES
+      || envelopeBytes > MAX_LUA_WORKER_HOST_CALL_ENVELOPE_BYTES) {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_host_limit',
+        'Lua Worker host-call envelope exceeds 1 MiB',
+      ))
+      return
+    }
+    if (!active.lowLevelAccess) {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_capability',
+        'Lua Worker invocation did not grant low-level host access',
+      ))
+      return
+    }
     if (message.name !== 'LLMMain' || this.options.syntheticLLMMain === undefined) {
       this.failWorker(new LuaWorkerHarnessError(
         'lua_worker_unsupported_callback',
@@ -519,12 +738,19 @@ export class LuaWorkerHarnessClient {
 
     try {
       const result = await this.options.syntheticLLMMain(message.args)
-      if (this.active !== active || this.worker === undefined) {
+      if (this.active !== active || this.worker === undefined || active.phase !== 'running') {
         return
       }
-      let responseBytes: number
+      const hostResult = {
+        type: 'hostResult' as const,
+        id: message.id,
+        callId: message.callId,
+        result,
+      }
       try {
-        responseBytes = new TextEncoder().encode(canonicalizeLuaWorkerJson(result)).byteLength
+        if (!this.reserveHostResponse(active, hostResult)) {
+          return
+        }
       }
       catch (error) {
         this.failWorker(new LuaWorkerHarnessError(
@@ -533,47 +759,50 @@ export class LuaWorkerHarnessClient {
         ))
         return
       }
-      active.hostResponseBytes += responseBytes
-      if (active.hostResponseBytes > MAX_LUA_WORKER_HOST_RESPONSE_BYTES) {
-        this.failWorker(new LuaWorkerHarnessError(
-          'lua_worker_host_limit',
-          'Lua Worker synthetic host responses exceed 1 MiB',
-        ))
-        return
-      }
-      this.postHostResult({
-        type: 'hostResult',
-        id: message.id,
-        callId: message.callId,
-        result,
-      })
+      this.postHostResult(hostResult)
     }
     catch (error) {
-      if (this.active !== active || this.worker === undefined) {
+      if (this.active !== active || this.worker === undefined || active.phase !== 'running') {
         return
       }
       const hostError = {
         category: 'lua_worker_host_error',
         message: error instanceof Error ? error.message : String(error),
       }
-      const responseBytes = new TextEncoder().encode(
-        canonicalizeLuaWorkerJson(hostError),
-      ).byteLength
-      active.hostResponseBytes += responseBytes
-      if (active.hostResponseBytes > MAX_LUA_WORKER_HOST_RESPONSE_BYTES) {
+      if (utf8ByteLength(hostError.message) > MAX_LUA_WORKER_ERROR_MESSAGE_BYTES) {
         this.failWorker(new LuaWorkerHarnessError(
           'lua_worker_host_limit',
-          'Lua Worker synthetic host responses exceed 1 MiB',
+          'Lua Worker synthetic host error exceeds 8 KiB',
         ))
         return
       }
-      this.postHostResult({
+      const hostResult = {
         type: 'hostResult',
         id: message.id,
         callId: message.callId,
         error: hostError,
-      })
+      } as const
+      if (!this.reserveHostResponse(active, hostResult)) {
+        return
+      }
+      this.postHostResult(hostResult)
     }
+  }
+
+  private reserveHostResponse(
+    active: ActiveInvocation,
+    message: Extract<LuaWorkerRequest, { type: 'hostResult' }>,
+  ): boolean {
+    const responseBytes = canonicalByteLength(message)
+    active.hostResponseBytes += responseBytes
+    if (active.hostResponseBytes > MAX_LUA_WORKER_HOST_RESPONSE_BYTES) {
+      this.failWorker(new LuaWorkerHarnessError(
+        'lua_worker_host_limit',
+        'Lua Worker synthetic host response envelopes exceed 1 MiB',
+      ))
+      return false
+    }
+    return true
   }
 
   private postHostResult(message: Extract<LuaWorkerRequest, { type: 'hostResult' }>): void {
@@ -599,11 +828,19 @@ export class LuaWorkerHarnessClient {
     }
 
     const active = this.active
+    if (active?.phase === 'committing') {
+      active.postCommitFailure ??= error
+      return
+    }
     this.active = undefined
     if (active !== undefined) {
       this.cleanupActive(active)
       active.reject(error)
     }
+    this.rejectPending(error)
+  }
+
+  private rejectPending(error: unknown): void {
     for (const pending of this.pending.splice(0)) {
       this.cleanupPending(pending)
       pending.reject(error)
@@ -623,4 +860,26 @@ export class LuaWorkerHarnessClient {
       pending.abortListener = undefined
     }
   }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const nested of Object.values(value)) {
+      deepFreeze(nested)
+    }
+  }
+  return value
+}
+
+function canonicalByteLength(value: unknown): number {
+  return utf8ByteLength(canonicalizeLuaWorkerJson(value))
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength
+}
+
+function hasLuaWorkerLlmAccess(invocation: LuaWorkerInvocation): boolean {
+  return invocation.lowLevelAccess === true && invocation.mode !== 'editDisplay'
 }

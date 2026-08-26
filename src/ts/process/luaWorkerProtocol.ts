@@ -13,6 +13,25 @@ export interface LuaWorkerPolicy {
   cpuDeadlineMs: number
 }
 
+export interface LuaWorkerProtocolLimits {
+  sourceBytes: number
+  contextMessages: number
+  invocationContextBytes: number
+  resultValueBytes: number
+  resultEnvelopeBytes: number
+  errorMessageBytes: number
+  errorEnvelopeBytes: number
+  mutationCount: number
+  mutationBytes: number
+  metricCount: number
+  metricKeyBytes: number
+  metricsBytes: number
+  hostCallCount: number
+  hostArgumentBytes: number
+  hostCallEnvelopeBytes: number
+  hostResponseBytes: number
+}
+
 export type LuaWorkerMutation =
   | { type: 'setChatVar', key: string, value: string }
   | { type: 'setChatVarChanged', key: string, value: string }
@@ -28,12 +47,22 @@ export interface LuaWorkerMetrics {
   [key: string]: number
 }
 
+export interface LuaWorkerEngineDescriptor {
+  ownerChaId: string
+  mode: LuaWorkerMode
+  exactSourceHash: string
+}
+
+export interface LuaWorkerContextMessage {
+  role: 'user' | 'char'
+  data: string
+  time?: number
+}
+
 export interface LuaWorkerBoundedContext {
-  messages: Array<{
-    role: 'user' | 'char'
-    data: string
-    time?: number
-  }>
+  messages: LuaWorkerContextMessage[]
+  startIndex: number
+  totalMessages: number
   chatVars?: Record<string, string>
   globalVars?: Record<string, string>
 }
@@ -43,10 +72,12 @@ export type LuaWorkerRequest = {
   engineKey: string
   source: string
   policy: LuaWorkerPolicy
+  limits: LuaWorkerProtocolLimits
 } | {
   type: 'invoke'
   id: number
   mode: LuaWorkerMode
+  lowLevelAccess: boolean
   data: LuaWorkerJsonValue
   meta: LuaWorkerJsonValue
   contextVersion: number
@@ -101,6 +132,108 @@ export function createLuaWorkerEngineKey(
   exactSourceHash: string,
 ): string {
   return JSON.stringify([ownerChaId, mode, exactSourceHash])
+}
+
+export class LuaWorkerContextWindowError extends Error {
+  readonly category = 'lua_worker_context_window'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'LuaWorkerContextWindowError'
+  }
+}
+
+export function getLuaWorkerContextLength(context: LuaWorkerBoundedContext): number {
+  return context.totalMessages
+}
+
+export function readLuaWorkerContextMessage(
+  context: LuaWorkerBoundedContext,
+  index: number,
+): LuaWorkerContextMessage {
+  const absoluteIndex = normalizeLuaWorkerContextIndex(context, index)
+  const message = context.messages[absoluteIndex - context.startIndex]
+  if (message === undefined) {
+    throw new LuaWorkerContextWindowError(
+      `Lua Worker chat index ${absoluteIndex} is outside the bounded context window`,
+    )
+  }
+  return message
+}
+
+export function readLuaWorkerRecentMessages(
+  context: LuaWorkerBoundedContext,
+  count: number,
+): LuaWorkerContextMessage[] {
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new LuaWorkerContextWindowError('Lua Worker recent chat count must be a non-negative integer')
+  }
+  const firstIndex = Math.max(0, context.totalMessages - count)
+  const windowEnd = context.startIndex + context.messages.length
+  if (context.startIndex > firstIndex || windowEnd < context.totalMessages) {
+    throw new LuaWorkerContextWindowError(
+      `Lua Worker recent ${count} chats are outside the bounded context window`,
+    )
+  }
+  return context.messages.slice(firstIndex - context.startIndex)
+}
+
+export function assertLuaWorkerMutationInContextWindow(
+  context: LuaWorkerBoundedContext,
+  mutation: LuaWorkerMutation,
+): void {
+  switch (mutation.type) {
+    case 'setChat':
+    case 'setChatRole':
+    case 'removeChat':
+      readLuaWorkerContextMessage(context, mutation.index)
+      return
+    case 'insertChat':
+      assertLuaWorkerContextBoundary(context, mutation.index, 'insertChat')
+      return
+    case 'cutChat': {
+      const start = assertLuaWorkerContextBoundary(context, mutation.start, 'cutChat start')
+      const end = assertLuaWorkerContextBoundary(context, mutation.end, 'cutChat end')
+      if (end < start) {
+        throw new LuaWorkerContextWindowError('Lua Worker cutChat end precedes its start')
+      }
+      return
+    }
+    default:
+      return
+  }
+}
+
+function normalizeLuaWorkerContextIndex(
+  context: LuaWorkerBoundedContext,
+  index: number,
+): number {
+  if (!Number.isSafeInteger(index)) {
+    throw new LuaWorkerContextWindowError('Lua Worker chat index must be a safe integer')
+  }
+  const absoluteIndex = index < 0 ? context.totalMessages + index : index
+  if (absoluteIndex < 0 || absoluteIndex >= context.totalMessages) {
+    throw new LuaWorkerContextWindowError(`Lua Worker chat index ${index} is out of range`)
+  }
+  return absoluteIndex
+}
+
+function assertLuaWorkerContextBoundary(
+  context: LuaWorkerBoundedContext,
+  index: number,
+  operation: string,
+): number {
+  if (!Number.isSafeInteger(index)) {
+    throw new LuaWorkerContextWindowError(`Lua Worker ${operation} index must be a safe integer`)
+  }
+  const absoluteIndex = index < 0 ? context.totalMessages + index : index
+  const windowEnd = context.startIndex + context.messages.length
+  if (absoluteIndex < context.startIndex || absoluteIndex > windowEnd) {
+    throw new LuaWorkerContextWindowError(
+      `Lua Worker ${operation} index ${absoluteIndex} is outside the bounded context window`,
+    )
+  }
+  return absoluteIndex
 }
 
 export function canonicalizeLuaWorkerJson(value: unknown): string {

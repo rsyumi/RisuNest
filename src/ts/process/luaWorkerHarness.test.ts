@@ -5,18 +5,65 @@ import {
   DEFAULT_LUA_WORKER_POLICY,
   MAX_LUA_WORKER_CONTEXT_BYTES,
   MAX_LUA_WORKER_CONTEXT_MESSAGES,
+  MAX_LUA_WORKER_ERROR_BYTES,
+  MAX_LUA_WORKER_ERROR_MESSAGE_BYTES,
+  MAX_LUA_WORKER_HOST_ARGUMENT_BYTES,
+  MAX_LUA_WORKER_HOST_CALL_ENVELOPE_BYTES,
   MAX_LUA_WORKER_RESULT_BYTES,
+  MAX_LUA_WORKER_RESULT_ENVELOPE_BYTES,
+  MAX_LUA_WORKER_METRIC_KEY_BYTES,
+  MAX_LUA_WORKER_METRICS,
+  MAX_LUA_WORKER_METRICS_BYTES,
   MAX_LUA_WORKER_MUTATIONS,
   MAX_LUA_WORKER_MUTATION_BYTES,
   MAX_LUA_WORKER_HOST_CALLS,
   MAX_LUA_WORKER_HOST_RESPONSE_BYTES,
   MAX_LUA_WORKER_SOURCE_BYTES,
+  LUA_WORKER_PROTOCOL_LIMITS,
+  getLuaWorkerContextLength,
+  readLuaWorkerContextMessage,
+  readLuaWorkerRecentMessages,
   LuaWorkerHarnessError,
-  LuaWorkerHarnessClient,
+  LuaWorkerHarnessClient as ProductionLuaWorkerHarnessClient,
+  type LuaWorkerHarnessOptions,
   type LuaWorkerHostMessage,
   type LuaWorkerLike,
   type LuaWorkerRequest,
 } from './luaWorkerHarness'
+
+type TestEngineMode = 'editRequest' | 'editInput' | 'editOutput' | 'editDisplay'
+type TestHarnessOptions = Omit<LuaWorkerHarnessOptions, 'engine'> & {
+  engineKey: string
+  engineMode?: TestEngineMode
+}
+
+class LuaWorkerHarnessClient extends ProductionLuaWorkerHarnessClient {
+  constructor({ engineKey, engineMode = 'editInput', ...options }: TestHarnessOptions) {
+    let engine = {
+      ownerChaId: 'fixture-owner',
+      mode: engineMode,
+      exactSourceHash: engineKey,
+    }
+    try {
+      const parsed = JSON.parse(engineKey) as unknown
+      if (Array.isArray(parsed) && parsed.length === 3
+        && typeof parsed[0] === 'string'
+        && (parsed[1] === 'editRequest' || parsed[1] === 'editInput'
+          || parsed[1] === 'editOutput' || parsed[1] === 'editDisplay')
+        && typeof parsed[2] === 'string') {
+        engine = {
+          ownerChaId: parsed[0],
+          mode: parsed[1],
+          exactSourceHash: parsed[2],
+        }
+      }
+    }
+    catch {
+      // Short fixture labels become deterministic exact-source hashes.
+    }
+    super({ ...options, engine })
+  }
+}
 
 class FakeLuaWorker implements LuaWorkerLike {
   readonly requests: LuaWorkerRequest[] = []
@@ -62,6 +109,15 @@ class FakeLuaWorker implements LuaWorkerLike {
     }
   }
 
+  captureMessageDispatcher(): (message: LuaWorkerHostMessage) => void {
+    const listeners = [...this.messageListeners]
+    return (message) => {
+      for (const listener of listeners) {
+        listener({ data: message } as MessageEvent<LuaWorkerHostMessage>)
+      }
+    }
+  }
+
   get listenerCount(): number {
     return this.messageListeners.size + this.errorListeners.size
   }
@@ -96,7 +152,11 @@ class HostResultFailureLuaWorker extends FakeLuaWorker {
 
 function invocation() {
   return {
-    boundedContext: { messages: [] },
+    boundedContext: {
+      messages: [{ role: 'user' as const, data: 'existing' }],
+      startIndex: 0,
+      totalMessages: 1,
+    },
     contextVersion: 4,
     data: 'input',
     meta: { source: 'fixture' },
@@ -109,6 +169,91 @@ describe('LuaWorkerHarnessClient', () => {
     expect(createLuaWorkerEngineKey('owner', 'editInput', 'sha256:abc')).toBe(
       '["owner","editInput","sha256:abc"]',
     )
+  })
+
+  it('exposes absolute bounded-window reads and rejects unavailable chat access', () => {
+    const middleWindow = {
+      messages: [
+        { role: 'user' as const, data: 'absolute eight' },
+        { role: 'char' as const, data: 'absolute nine' },
+      ],
+      startIndex: 8,
+      totalMessages: 12,
+    }
+
+    expect(getLuaWorkerContextLength(middleWindow)).toBe(12)
+    expect(readLuaWorkerContextMessage(middleWindow, 8)).toMatchObject({
+      data: 'absolute eight',
+    })
+    expect(() => readLuaWorkerContextMessage(middleWindow, 0)).toThrowError(
+      expect.objectContaining({ category: 'lua_worker_context_window' }),
+    )
+    expect(() => readLuaWorkerContextMessage(middleWindow, -1)).toThrowError(
+      expect.objectContaining({ category: 'lua_worker_context_window' }),
+    )
+    expect(() => readLuaWorkerRecentMessages(middleWindow, 2)).toThrowError(
+      expect.objectContaining({ category: 'lua_worker_context_window' }),
+    )
+
+    const tailWindow = {
+      ...middleWindow,
+      startIndex: 10,
+    }
+    expect(readLuaWorkerRecentMessages(tailWindow, 2)).toEqual(tailWindow.messages)
+    expect(readLuaWorkerContextMessage(tailWindow, -1)).toMatchObject({
+      data: 'absolute nine',
+    })
+  })
+
+  it('rejects invocation mode that differs from the registered engine descriptor', async () => {
+    const workerFactory = vi.fn(() => new FakeLuaWorker())
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'mode-bound-engine',
+      engineMode: 'editInput',
+      source: 'fixture source',
+      workerFactory,
+    })
+
+    await expect(client.invoke({
+      ...invocation(),
+      mode: 'editOutput',
+    }, {
+      commitMutations: () => true,
+    })).rejects.toEqual(expect.objectContaining({ category: 'lua_worker_mode' }))
+    expect(workerFactory).not.toHaveBeenCalled()
+  })
+
+  it('snapshots the exact engine descriptor when the client is created', async () => {
+    const worker = new FakeLuaWorker()
+    const engine: LuaWorkerHarnessOptions['engine'] = {
+      ownerChaId: 'original-owner',
+      mode: 'editInput',
+      exactSourceHash: 'original-hash',
+    }
+    const client = new ProductionLuaWorkerHarnessClient({
+      engine,
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    engine.ownerChaId = 'mutated-owner'
+    engine.mode = 'editOutput'
+    engine.exactSourceHash = 'mutated-hash'
+
+    const pending = client.invoke(invocation(), { commitMutations: () => true })
+    expect(worker.requests[0]).toMatchObject({
+      type: 'register',
+      engineKey: '["original-owner","editInput","original-hash"]',
+    })
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'complete',
+      stopSending: false,
+    })
+    await expect(pending).resolves.toMatchObject({ res: 'complete' })
   })
 
   it('registers one engine and routes its active invocation result', async () => {
@@ -126,6 +271,7 @@ describe('LuaWorkerHarnessClient', () => {
     expect(worker.requests[0]).toEqual({
       type: 'register',
       engineKey: '["owner","editInput","source-hash"]',
+      limits: LUA_WORKER_PROTOCOL_LIMITS,
       source: 'listenEdit("editInput", function(id, value) return value end)',
       policy: DEFAULT_LUA_WORKER_POLICY,
     })
@@ -324,6 +470,8 @@ describe('LuaWorkerHarnessClient', () => {
           data: 'fixture',
           role: 'user',
         })),
+        startIndex: 0,
+        totalMessages: MAX_LUA_WORKER_CONTEXT_MESSAGES + 1,
       },
     }, {
       commitMutations: () => true,
@@ -508,6 +656,44 @@ describe('LuaWorkerHarnessClient', () => {
     expect(applied).toEqual([])
   })
 
+  it('rejects mutation indices outside the admitted absolute context window', async () => {
+    const worker = new FakeLuaWorker()
+    const commitMutations = vi.fn(() => true)
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'mutation-window-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke({
+      ...invocation(),
+      boundedContext: {
+        messages: [
+          { role: 'user', data: 'five' },
+          { role: 'char', data: 'six' },
+        ],
+        startIndex: 5,
+        totalMessages: 10,
+      },
+    }, { commitMutations })
+    const outcome = pending.catch((error) => error)
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [{ type: 'setChat', index: 2, value: 'outside' }],
+      res: null,
+      stopSending: false,
+    })
+
+    await expect(outcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_context_window',
+    }))
+    expect(commitMutations).not.toHaveBeenCalled()
+    expect(worker.terminated).toBe(true)
+  })
+
   it('terminates on a malformed result and applies zero mutations', async () => {
     const worker = new FakeLuaWorker()
     const commitMutations = vi.fn(() => true)
@@ -562,6 +748,80 @@ describe('LuaWorkerHarnessClient', () => {
     }))
     expect(commitMutations).not.toHaveBeenCalled()
     expect(worker.terminated).toBe(true)
+  })
+
+  it('bounds the complete result envelope even when each field is below its own limit', async () => {
+    const worker = new FakeLuaWorker()
+    const commitMutations = vi.fn(() => true)
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'result-envelope-limit-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke(invocation(), { commitMutations })
+    const outcome = pending.catch((error) => error)
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [{
+        type: 'setChatVar',
+        key: 'bounded',
+        value: 'm'.repeat(400 * 1024),
+      }],
+      res: 'r'.repeat(MAX_LUA_WORKER_RESULT_ENVELOPE_BYTES - 400 * 1024),
+      stopSending: false,
+    })
+
+    await expect(outcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_output_limit',
+    }))
+    expect(commitMutations).not.toHaveBeenCalled()
+    expect(worker.terminated).toBe(true)
+  })
+
+  it('bounds metric count, key bytes, and canonical metric bytes before mutation CAS', async () => {
+    const cases = [
+      Object.fromEntries(Array.from({ length: MAX_LUA_WORKER_METRICS + 1 }, (_, index) => (
+        [`metric-${index}`, index]
+      ))),
+      { ['k'.repeat(MAX_LUA_WORKER_METRIC_KEY_BYTES + 1)]: 1 },
+      Object.fromEntries(Array.from({ length: 20 }, (_, index) => (
+        [`${index}-${'k'.repeat(240)}`, index]
+      ))),
+    ]
+    expect(new TextEncoder().encode(JSON.stringify(cases[2])).byteLength).toBeGreaterThan(
+      MAX_LUA_WORKER_METRICS_BYTES,
+    )
+
+    for (const metrics of cases) {
+      const worker = new FakeLuaWorker()
+      const commitMutations = vi.fn(() => true)
+      const client = new LuaWorkerHarnessClient({
+        engineKey: `metrics-envelope-${cases.indexOf(metrics)}`,
+        source: 'fixture source',
+        workerFactory: () => worker,
+      })
+      const pending = client.invoke(invocation(), { commitMutations })
+      const outcome = pending.catch((error) => error)
+      const request = worker.requests.find((message) => message.type === 'invoke')!
+      worker.respond({
+        type: 'result',
+        id: request.id,
+        metrics,
+        orderedMutations: [],
+        res: null,
+        stopSending: false,
+      })
+
+      await expect(outcome).resolves.toEqual(expect.objectContaining({
+        category: 'lua_worker_output_limit',
+      }))
+      expect(commitMutations).not.toHaveBeenCalled()
+      expect(worker.terminated).toBe(true)
+    }
   })
 
   it('discards a batch beyond the 256 mutation limit', async () => {
@@ -683,6 +943,43 @@ describe('LuaWorkerHarnessClient', () => {
     expect(worker.terminated).toBe(false)
   })
 
+  it('bounds invocation error messages and their complete envelope', async () => {
+    const errors = [
+      {
+        category: 'lua_worker_handler',
+        message: 'e'.repeat(MAX_LUA_WORKER_ERROR_MESSAGE_BYTES + 1),
+      },
+      {
+        category: `lua_worker_${'c'.repeat(MAX_LUA_WORKER_ERROR_BYTES)}`,
+        message: 'bounded',
+      },
+    ]
+
+    for (const error of errors) {
+      const worker = new FakeLuaWorker()
+      const commitMutations = vi.fn(() => true)
+      const client = new LuaWorkerHarnessClient({
+        engineKey: `error-envelope-${errors.indexOf(error)}`,
+        source: 'fixture source',
+        workerFactory: () => worker,
+      })
+      const pending = client.invoke(invocation(), { commitMutations })
+      const outcome = pending.catch((reason) => reason)
+      const request = worker.requests.find((message) => message.type === 'invoke')!
+      worker.respond({
+        type: 'error',
+        id: request.id,
+        ...error,
+      })
+
+      await expect(outcome).resolves.toEqual(expect.objectContaining({
+        category: 'lua_worker_output_limit',
+      }))
+      expect(commitMutations).not.toHaveBeenCalled()
+      expect(worker.terminated).toBe(true)
+    }
+  })
+
   it('routes a bounded synthetic LLM host call and result to the active invocation', async () => {
     const worker = new FakeLuaWorker()
     const syntheticLLMMain = vi.fn(async () => ({ success: true, result: 'synthetic' }))
@@ -730,6 +1027,103 @@ describe('LuaWorkerHarnessClient', () => {
       stopSending: false,
     })
     await expect(pending).resolves.toMatchObject({ res: 'complete' })
+  })
+
+  it('rejects LLMMain unless the active invocation granted low-level access', async () => {
+    const worker = new FakeLuaWorker()
+    const syntheticLLMMain = vi.fn(async () => 'must not run')
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'per-invocation-host-capability-engine',
+      source: 'fixture source',
+      syntheticLLMMain,
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke(invocation(), { commitMutations: () => true })
+    const outcome = pending.catch((error) => error)
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'hostCall',
+      id: request.id,
+      callId: 1,
+      name: 'LLMMain',
+      args: null,
+    })
+
+    await expect(outcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_capability',
+    }))
+    expect(syntheticLLMMain).not.toHaveBeenCalled()
+    expect(worker.terminated).toBe(true)
+  })
+
+  it('applies the per-invocation LLMMain gate to editDisplay', async () => {
+    const worker = new FakeLuaWorker()
+    const syntheticLLMMain = vi.fn(async () => 'must not run')
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'edit-display-host-capability-engine',
+      engineMode: 'editDisplay',
+      source: 'fixture source',
+      syntheticLLMMain,
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke({
+      ...invocation(),
+      lowLevelAccess: true,
+      mode: 'editDisplay',
+    }, {
+      commitMutations: () => true,
+    })
+    const outcome = pending.catch((error) => error)
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+    expect(request).toMatchObject({ lowLevelAccess: false, mode: 'editDisplay' })
+    worker.respond({
+      type: 'hostCall',
+      id: request.id,
+      callId: 1,
+      name: 'LLMMain',
+      args: null,
+    })
+
+    await expect(outcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_capability',
+    }))
+    expect(syntheticLLMMain).not.toHaveBeenCalled()
+  })
+
+  it('bounds canonical host arguments and the full host-call envelope before host work', async () => {
+    const argumentCases = [
+      'a'.repeat(MAX_LUA_WORKER_HOST_ARGUMENT_BYTES),
+      'a'.repeat(MAX_LUA_WORKER_HOST_CALL_ENVELOPE_BYTES - 2),
+    ]
+    for (const args of argumentCases) {
+      const worker = new FakeLuaWorker()
+      const syntheticLLMMain = vi.fn(async () => 'must not run')
+      const client = new LuaWorkerHarnessClient({
+        engineKey: `host-argument-envelope-${argumentCases.indexOf(args)}`,
+        source: 'fixture source',
+        syntheticLLMMain,
+        workerFactory: () => worker,
+      })
+      const pending = client.invoke({ ...invocation(), lowLevelAccess: true }, {
+        commitMutations: () => true,
+      })
+      const outcome = pending.catch((error) => error)
+      const request = worker.requests.find((message) => message.type === 'invoke')!
+      worker.respond({
+        type: 'hostCall',
+        id: request.id,
+        callId: 1,
+        name: 'LLMMain',
+        args,
+      })
+
+      await expect(outcome).resolves.toEqual(expect.objectContaining({
+        category: 'lua_worker_host_limit',
+      }))
+      expect(syntheticLLMMain).not.toHaveBeenCalled()
+      expect(worker.terminated).toBe(true)
+    }
   })
 
   it('rejects unsupported callback names explicitly and applies zero mutations', async () => {
@@ -894,6 +1288,7 @@ describe('LuaWorkerHarnessClient', () => {
     const commitMutations = vi.fn(() => true)
     const client = new LuaWorkerHarnessClient({
       engineKey: 'edit-display-capability-engine',
+      engineMode: 'editDisplay',
       source: 'fixture source',
       workerFactory: () => worker,
     })
@@ -957,6 +1352,221 @@ describe('LuaWorkerHarnessClient', () => {
     if (secondRequest.type !== 'invoke') {
       throw new Error('Expected second invocation')
     }
+    worker.respond({
+      type: 'result',
+      id: secondRequest.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'second',
+      stopSending: false,
+    })
+    await expect(second).resolves.toMatchObject({ res: 'second' })
+  })
+
+  it('claims a validated result once while mutation CAS is pending', async () => {
+    const worker = new FakeLuaWorker()
+    let finishCommit!: (committed: boolean) => void
+    const commitMutations = vi.fn(() => new Promise<boolean>((resolve) => {
+      finishCommit = resolve
+    }))
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'single-result-claim-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke(invocation(), { commitMutations })
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+    const result: LuaWorkerHostMessage = {
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [{ type: 'setChatVar', key: 'fixture', value: 'value' }],
+      res: 'complete',
+      stopSending: false,
+    }
+
+    worker.respond(result)
+    worker.respond(result)
+
+    await vi.waitFor(() => expect(commitMutations).toHaveBeenCalledTimes(1))
+    finishCommit(true)
+    await expect(pending).resolves.toMatchObject({ res: 'complete' })
+    expect(commitMutations).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores a late host completion after a result claimed settlement', async () => {
+    const worker = new FakeLuaWorker()
+    let finishHost!: (value: string) => void
+    let finishCommit!: (committed: boolean) => void
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'claimed-result-host-engine',
+      source: 'fixture source',
+      syntheticLLMMain: () => new Promise((resolve) => {
+        finishHost = resolve
+      }),
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke({ ...invocation(), lowLevelAccess: true }, {
+      commitMutations: () => new Promise((resolve) => {
+        finishCommit = resolve
+      }),
+    })
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+    worker.respond({
+      type: 'hostCall',
+      id: request.id,
+      callId: 1,
+      name: 'LLMMain',
+      args: null,
+    })
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'claimed',
+      stopSending: false,
+    })
+    await vi.waitFor(() => expect(finishCommit).toBeTypeOf('function'))
+
+    finishHost('late')
+    await Promise.resolve()
+    expect(worker.requests.filter((message) => message.type === 'hostResult')).toHaveLength(0)
+    finishCommit(true)
+    await expect(pending).resolves.toMatchObject({ res: 'claimed' })
+  })
+
+  it('lets a claimed result finish atomically when the Worker crashes during CAS', async () => {
+    const worker = new FakeLuaWorker()
+    let finishCommit!: (committed: boolean) => void
+    const commitMutations = vi.fn(() => new Promise<boolean>((resolve) => {
+      finishCommit = resolve
+    }))
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'commit-crash-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const active = client.invoke(invocation(), { commitMutations })
+    const queued = client.invoke({ ...invocation(), data: 'queued' }, {
+      commitMutations: () => true,
+    })
+    const queuedOutcome = queued.catch((error) => error)
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'claimed',
+      stopSending: false,
+    })
+    await vi.waitFor(() => expect(commitMutations).toHaveBeenCalledTimes(1))
+    worker.crash('crash after validated result')
+    finishCommit(true)
+
+    await expect(active).resolves.toMatchObject({ res: 'claimed' })
+    await expect(queuedOutcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_crash',
+    }))
+    expect(commitMutations).toHaveBeenCalledTimes(1)
+    expect(worker.terminated).toBe(true)
+  })
+
+  it('ignores abort after a validated result owns settlement', async () => {
+    const worker = new FakeLuaWorker()
+    const controller = new AbortController()
+    let finishCommit!: (committed: boolean) => void
+    const commitMutations = vi.fn(() => new Promise<boolean>((resolve) => {
+      finishCommit = resolve
+    }))
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'commit-abort-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const pending = client.invoke(invocation(), {
+      commitMutations,
+      signal: controller.signal,
+    })
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'claimed',
+      stopSending: false,
+    })
+    await vi.waitFor(() => expect(commitMutations).toHaveBeenCalledTimes(1))
+    controller.abort()
+    finishCommit(true)
+
+    await expect(pending).resolves.toMatchObject({ res: 'claimed' })
+    expect(commitMutations).toHaveBeenCalledTimes(1)
+    expect(worker.terminated).toBe(false)
+  })
+
+  it('deeply snapshots queued invocation data at admission', async () => {
+    const worker = new FakeLuaWorker()
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'snapshot-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const first = client.invoke(invocation(), { commitMutations: () => true })
+    const mutable = {
+      ...invocation(),
+      boundedContext: {
+        messages: [{ role: 'user' as const, data: 'original message' }],
+        startIndex: 0,
+        totalMessages: 1,
+      },
+      data: { nested: ['original'] },
+      meta: { nested: { value: 'original' } },
+    }
+    const second = client.invoke(mutable, { commitMutations: () => true })
+
+    mutable.contextVersion = 99
+    const mutableMode = mutable as unknown as { mode: TestEngineMode }
+    mutableMode.mode = 'editOutput'
+    mutable.data.nested[0] = 'x'.repeat(MAX_LUA_WORKER_CONTEXT_BYTES)
+    mutable.meta.nested.value = 'mutated'
+    mutable.boundedContext.messages[0].data = 'mutated message'
+
+    const firstRequest = worker.requests.find((message) => message.type === 'invoke')!
+    worker.respond({
+      type: 'result',
+      id: firstRequest.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'first',
+      stopSending: false,
+    })
+    await first
+    await vi.waitFor(() => {
+      expect(worker.requests.filter((message) => message.type === 'invoke')).toHaveLength(2)
+    })
+    const secondRequest = worker.requests.at(-1)!
+    expect(secondRequest).toMatchObject({
+      type: 'invoke',
+      mode: 'editInput',
+      contextVersion: 4,
+      data: { nested: ['original'] },
+      meta: { nested: { value: 'original' } },
+      boundedContext: {
+        messages: [{ role: 'user', data: 'original message' }],
+        startIndex: 0,
+        totalMessages: 1,
+      },
+    })
+    if (secondRequest.type !== 'invoke') {
+      throw new Error('Expected second invocation')
+    }
+    expect(Object.isFrozen(secondRequest.data)).toBe(true)
+    expect(Object.isFrozen(secondRequest.boundedContext.messages[0])).toBe(true)
     worker.respond({
       type: 'result',
       id: secondRequest.id,
@@ -1220,5 +1830,102 @@ describe('LuaWorkerHarnessClient', () => {
     }))
     expect(worker.terminated).toBe(true)
     expect(commitMutations).not.toHaveBeenCalled()
+  })
+
+  it('disposes an idle Worker and rejects later invocations', async () => {
+    const worker = new FakeLuaWorker()
+    const workerFactory = vi.fn(() => worker)
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'dispose-idle-engine',
+      source: 'fixture source',
+      workerFactory,
+    })
+    const first = client.invoke(invocation(), { commitMutations: () => true })
+    const request = worker.requests.find((message) => message.type === 'invoke')!
+    worker.respond({
+      type: 'result',
+      id: request.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'complete',
+      stopSending: false,
+    })
+    await first
+
+    client.dispose()
+
+    expect(worker.terminated).toBe(true)
+    expect(worker.listenerCount).toBe(0)
+    await expect(client.invoke(invocation(), {
+      commitMutations: () => true,
+    })).rejects.toEqual(expect.objectContaining({ category: 'lua_worker_disposed' }))
+    expect(workerFactory).toHaveBeenCalledTimes(1)
+  })
+
+  it('rejects active and queued work when terminated before result claim', async () => {
+    const worker = new FakeLuaWorker()
+    const commitMutations = vi.fn(() => true)
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'terminate-active-engine',
+      source: 'fixture source',
+      workerFactory: () => worker,
+    })
+    const active = client.invoke(invocation(), { commitMutations })
+    const queued = client.invoke({ ...invocation(), data: 'queued' }, { commitMutations })
+    const activeOutcome = active.catch((error) => error)
+    const queuedOutcome = queued.catch((error) => error)
+
+    client.terminate()
+
+    await expect(activeOutcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_disposed',
+    }))
+    await expect(queuedOutcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_disposed',
+    }))
+    expect(commitMutations).not.toHaveBeenCalled()
+    expect(worker.terminated).toBe(true)
+  })
+
+  it('ignores captured messages from a replaced Worker identity', async () => {
+    const firstWorker = new FakeLuaWorker()
+    const secondWorker = new FakeLuaWorker()
+    const workers = [firstWorker, secondWorker]
+    const client = new LuaWorkerHarnessClient({
+      engineKey: 'worker-identity-engine',
+      source: 'fixture source',
+      workerFactory: () => workers.shift()!,
+    })
+    const first = client.invoke(invocation(), { commitMutations: () => true })
+    const firstOutcome = first.catch((error) => error)
+    const staleDispatch = firstWorker.captureMessageDispatcher()
+    firstWorker.crash('replace first Worker')
+    await expect(firstOutcome).resolves.toEqual(expect.objectContaining({
+      category: 'lua_worker_crash',
+    }))
+
+    const commitMutations = vi.fn(() => true)
+    const second = client.invoke({ ...invocation(), data: 'second' }, { commitMutations })
+    const secondRequest = secondWorker.requests.find((message) => message.type === 'invoke')!
+    staleDispatch({
+      type: 'result',
+      id: secondRequest.id,
+      metrics: {},
+      orderedMutations: [{ type: 'setChatVar', key: 'stale', value: 'must not commit' }],
+      res: 'stale',
+      stopSending: false,
+    })
+    expect(commitMutations).not.toHaveBeenCalled()
+
+    secondWorker.respond({
+      type: 'result',
+      id: secondRequest.id,
+      metrics: {},
+      orderedMutations: [],
+      res: 'current',
+      stopSending: false,
+    })
+    await expect(second).resolves.toMatchObject({ res: 'current' })
+    expect(commitMutations).toHaveBeenCalledTimes(1)
   })
 })
