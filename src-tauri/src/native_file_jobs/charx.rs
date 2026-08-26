@@ -229,8 +229,19 @@ where
         Err(error) => return Err(zip_error("open CharX archive", error)),
     };
 
+    require_not_cancelled(&mut is_cancelled)?;
+    if archive.len() > limits.max_entries {
+        return Err(CharXParseError::new(
+            CharXParseErrorCode::TooManyEntries,
+            format!(
+                "CharX has {} entries, limit is {}",
+                archive.len(),
+                limits.max_entries
+            ),
+        ));
+    }
     let archive_offset = archive.offset();
-    let has_card_entry = archive_has_card_entry(&mut archive)?;
+    let has_card_entry = archive_has_card_entry(&mut archive, &mut is_cancelled)?;
     if jpeg_name && (!has_card_entry || archive_offset == 0) {
         return Ok(CharXInspection::OrdinaryJpegAsset(
             OrdinaryJpegAssetDescriptor {
@@ -355,10 +366,16 @@ fn validate_limits(limits: CharXLimits) -> Result<(), CharXParseError> {
     Ok(())
 }
 
-fn archive_has_card_entry<R: Read + Seek>(
+fn archive_has_card_entry<R, F>(
     archive: &mut ZipArchive<R>,
-) -> Result<bool, CharXParseError> {
+    is_cancelled: &mut F,
+) -> Result<bool, CharXParseError>
+where
+    R: Read + Seek,
+    F: FnMut() -> bool,
+{
     for index in 0..archive.len() {
+        require_not_cancelled(is_cancelled)?;
         let entry = archive
             .by_index(index)
             .map_err(|error| zip_error("inspect CharX entry", error))?;
@@ -867,7 +884,7 @@ fn jpeg_prefix_has_end_marker(path: &Path, archive_offset: u64) -> Result<bool, 
     let mut previous = None;
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     while remaining > 0 {
-        let requested = usize::try_from(remaining.min(COPY_BUFFER_BYTES as u64)).unwrap();
+        let requested = remaining.min(COPY_BUFFER_BYTES as u64) as usize;
         let count = file
             .read(&mut buffer[..requested])
             .map_err(|error| io_error("read appended JPEG prefix", error))?;
