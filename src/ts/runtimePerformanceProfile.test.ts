@@ -15,6 +15,7 @@ describe('runtime performance profile', () => {
         expect(getRuntimePerformanceProfile()).toBe('normal')
         expect(getRuntimePerformanceBudgets()).toEqual({
             browserAssetDataUrlCacheBytes: 16 * 1024 * 1024,
+            chatMountedMessageBudget: 64,
             regexPlanCacheEntries: 32,
             scriptResultCacheBytes: 8 * 1024 * 1024,
             scriptResultCacheEntries: 1000,
@@ -24,6 +25,8 @@ describe('runtime performance profile', () => {
         const normal = getRuntimePerformanceBudgets()
         setRuntimePerformanceProfile('low-spec')
         const lowSpec = getRuntimePerformanceBudgets()
+
+        expect(lowSpec.chatMountedMessageBudget).toBe(40)
 
         for (const key of Object.keys(normal) as Array<keyof typeof normal>) {
             expect(lowSpec[key]).toBeLessThan(normal[key])

@@ -2,6 +2,7 @@ export type RuntimePerformanceProfile = 'normal' | 'low-spec'
 
 export interface RuntimePerformanceBudgets {
     browserAssetDataUrlCacheBytes: number
+    chatMountedMessageBudget: number
     regexPlanCacheEntries: number
     scriptResultCacheBytes: number
     scriptResultCacheEntries: number
@@ -11,6 +12,7 @@ export interface RuntimePerformanceBudgets {
 const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerformanceBudgets> = {
     normal: {
         browserAssetDataUrlCacheBytes: 16 * 1024 * 1024,
+        chatMountedMessageBudget: 64,
         regexPlanCacheEntries: 32,
         scriptResultCacheBytes: 8 * 1024 * 1024,
         scriptResultCacheEntries: 1000,
@@ -18,6 +20,7 @@ const runtimePerformanceBudgets: Record<RuntimePerformanceProfile, RuntimePerfor
     },
     'low-spec': {
         browserAssetDataUrlCacheBytes: 8 * 1024 * 1024,
+        chatMountedMessageBudget: 40,
         regexPlanCacheEntries: 8,
         scriptResultCacheBytes: 2 * 1024 * 1024,
         scriptResultCacheEntries: 250,
