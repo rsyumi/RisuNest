@@ -152,7 +152,7 @@ beforeEach(() => {
     mocks.isTauri = false
     mocks.localforage.createInstance.mockReset().mockReturnValue(mocks.cachedForage)
     localStorage.clear()
-    vi.spyOn(Date, 'now').mockReturnValue(1_725_000_000_123)
+    vi.spyOn(Date, 'now').mockReset().mockReturnValue(1_725_000_000_123)
 })
 
 afterEach(() => {
@@ -171,6 +171,312 @@ function cancellableResponse(
 }
 
 describe('AccountStorage structured wire contract', () => {
+    it('passes a safe credential, save date, session, and signal to a native database attempt', async () => {
+        const signal = new AbortController().signal
+        const attempt = vi.fn(async () => ({
+            kind: 'written' as const,
+            session: 'session-42',
+            replacementKey: 'database/database.bin',
+            warning: null,
+            reloadSession: false,
+            receipt: { jobId: 'job-1' },
+        }))
+        const credentialRouting = {
+            getToken: vi.fn(() => 'native-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            databaseCache: mocks.cachedForage,
+            assetCache: mocks.localforage,
+            credentialRouting,
+        })
+
+        const result = await storage.writeOfficialDatabaseFromNative(attempt, { signal })
+
+        expect(attempt).toHaveBeenCalledWith({
+            credential: { kind: 'risu-auth', token: 'native-token' },
+            session: null,
+            saveDate: '1725000000123',
+            signal,
+        })
+        expect(result).toEqual({
+            kind: 'written',
+            replacementKey: 'database/database.bin',
+            receipt: { jobId: 'job-1' },
+            completeReload: expect.any(Function),
+        })
+        await expect(result?.kind === 'auth-warning' ? undefined : result?.completeReload())
+            .resolves.toBeUndefined()
+        expect(mocks.alertNormalWait).not.toHaveBeenCalled()
+    })
+
+    it('declines a native database attempt before invocation when legacy authentication is unsafe', async () => {
+        const attempt = vi.fn()
+        const { AccountStorage } = await loadStorage()
+        localStorage.setItem('ignoreRisuAuth', 'true')
+        const ignoredLegacyAuth = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'legacy-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+
+        await expect(ignoredLegacyAuth.writeOfficialDatabaseFromNative(attempt))
+            .resolves.toBeNull()
+
+        localStorage.removeItem('ignoreRisuAuth')
+        const missingLegacyAuth = new AccountStorage({
+            credentialRouting: {
+                getToken: () => null,
+                reauthenticate: vi.fn(),
+            },
+        })
+        await expect(missingLegacyAuth.writeOfficialDatabaseFromNative(attempt))
+            .resolves.toBeNull()
+        expect(attempt).not.toHaveBeenCalled()
+    })
+
+    it('shares a native attempt session with following JavaScript account writes', async () => {
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'native-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+        await storage.writeOfficialDatabaseFromNative(async () => ({
+            kind: 'written',
+            session: 'session-from-native',
+            replacementKey: 'database/database.bin',
+            receipt: undefined,
+        }))
+        mocks.fetchProtectedResource.mockResolvedValueOnce(response('assets/next.png'))
+
+        await storage.writeItem('assets/next.png', Uint8Array.of(1))
+
+        expect(mocks.fetchProtectedResource).toHaveBeenCalledTimes(1)
+        expect(mocks.fetchProtectedResource.mock.calls[0][1].headers['x-risu-session'])
+            .toBe('session-from-native')
+    })
+
+    it('passes a JavaScript-acquired session to the next native database attempt', async () => {
+        mocks.fetchProtectedResource
+            .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 'session-from-js' }), 200, {
+                'content-type': 'application/json',
+            }))
+            .mockResolvedValueOnce(response('assets/first.png'))
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'native-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+        await storage.writeItem('assets/first.png', Uint8Array.of(1))
+        const attempt = vi.fn(async () => ({
+            kind: 'written' as const,
+            session: 'session-from-js',
+            replacementKey: 'database/database.bin',
+            receipt: undefined,
+        }))
+
+        await storage.writeOfficialDatabaseFromNative(attempt)
+
+        expect(attempt).toHaveBeenCalledWith(expect.objectContaining({
+            session: 'session-from-js',
+        }))
+    })
+
+    it('reauthenticates an ordinary native 403 and retries with fresh credentials and save date', async () => {
+        let token = 'old-token'
+        vi.spyOn(Date, 'now')
+            .mockReturnValueOnce(1000)
+            .mockReturnValueOnce(1001)
+        const attempt = vi.fn()
+            .mockResolvedValueOnce({
+                kind: 'reauthentication-needed',
+                session: 'session-42',
+            })
+            .mockResolvedValueOnce({
+                kind: 'written',
+                session: 'session-42',
+                replacementKey: 'database/database.bin',
+                receipt: { jobId: 'job-2' },
+            })
+        const credentialRouting = {
+            getToken: vi.fn(() => token),
+            reauthenticate: vi.fn(async () => {
+                token = 'new-token'
+            }),
+        }
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({ credentialRouting })
+
+        await expect(storage.writeOfficialDatabaseFromNative(attempt)).resolves.toEqual({
+            kind: 'written',
+            replacementKey: 'database/database.bin',
+            receipt: { jobId: 'job-2' },
+            completeReload: expect.any(Function),
+        })
+
+        expect(mocks.alertLogin).toHaveBeenCalledOnce()
+        expect(credentialRouting.reauthenticate).toHaveBeenCalledWith('new-token')
+        expect(attempt.mock.calls).toEqual([
+            [{
+                credential: { kind: 'risu-auth', token: 'old-token' },
+                session: null,
+                saveDate: '1000',
+                signal: undefined,
+            }],
+            [{
+                credential: { kind: 'risu-auth', token: 'new-token' },
+                session: 'session-42',
+                saveDate: '1001',
+                signal: undefined,
+            }],
+        ])
+    })
+
+    it('preserves the shared session when a native auth outcome has no acquired session', async () => {
+        let token = 'old-token'
+        const credentialRouting = {
+            getToken: () => token,
+            reauthenticate: vi.fn(async () => {
+                token = 'new-token'
+            }),
+        }
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({ credentialRouting })
+        await storage.writeOfficialDatabaseFromNative(async () => ({
+            kind: 'written',
+            session: 'shared-session',
+            replacementKey: 'database/database.bin',
+            receipt: undefined,
+        }))
+        const attempt = vi.fn()
+            .mockResolvedValueOnce({
+                kind: 'reauthentication-needed',
+                session: null,
+            })
+            .mockResolvedValueOnce({
+                kind: 'written',
+                session: 'shared-session',
+                replacementKey: 'database/database.bin',
+                receipt: undefined,
+            })
+
+        await storage.writeOfficialDatabaseFromNative(attempt)
+
+        expect(attempt.mock.calls[1][0].session).toBe('shared-session')
+    })
+
+    it('returns a native auth warning without reauthentication', async () => {
+        const credentialRouting = {
+            getToken: vi.fn(() => 'native-token'),
+            reauthenticate: vi.fn(async () => undefined),
+        }
+        const attempt = vi.fn(async () => ({
+            kind: 'auth-warning' as const,
+            session: 'warning-session',
+        }))
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({ credentialRouting })
+
+        await expect(storage.writeOfficialDatabaseFromNative(attempt)).resolves.toEqual({
+            kind: 'auth-warning',
+        })
+
+        expect(attempt).toHaveBeenCalledOnce()
+        expect(mocks.alertLogin).not.toHaveBeenCalled()
+        expect(credentialRouting.reauthenticate).not.toHaveBeenCalled()
+    })
+
+    it('returns native not-modified success with its opaque receipt', async () => {
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'native-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+
+        const result = await storage.writeOfficialDatabaseFromNative(async () => ({
+            kind: 'not-modified',
+            session: 'session-304',
+            replacementKey: 'database/database.bin',
+            receipt: { jobId: 'job-304' },
+        }))
+
+        expect(result).toEqual({
+            kind: 'not-modified',
+            replacementKey: 'database/database.bin',
+            receipt: { jobId: 'job-304' },
+            completeReload: expect.any(Function),
+        })
+    })
+
+    it('publishes each native success warning through the shared deduplicated warning store', async () => {
+        const { AccountStorage, AccountWarning, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'native-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+        const seen: string[] = []
+        const unsubscribe = AccountWarning.subscribe((value) => seen.push(value))
+        const attempt = async () => ({
+            kind: 'written' as const,
+            session: 'warning-session',
+            replacementKey: 'database/database.bin',
+            warning: 'quota nearing limit',
+            receipt: undefined,
+        })
+
+        await storage.writeOfficialDatabaseFromNative(attempt)
+        await storage.writeOfficialDatabaseFromNative(attempt)
+        unsubscribe()
+
+        expect(seen).toEqual(['', 'quota nearing limit'])
+    })
+
+    it('defers native reload-session handling until durable finalization calls the callback', async () => {
+        const { AccountStorage, resetAccountStorageSession } = await loadStorage()
+        resetAccountStorageSession()
+        const storage = new AccountStorage({
+            credentialRouting: {
+                getToken: () => 'native-token',
+                reauthenticate: vi.fn(),
+            },
+        })
+        const result = await storage.writeOfficialDatabaseFromNative(async () => ({
+            kind: 'written',
+            session: 'reload-session',
+            replacementKey: 'database/database.bin',
+            reloadSession: true,
+            receipt: { jobId: 'job-reload' },
+        }))
+        if (!result || result.kind === 'auth-warning') throw new Error('Expected native write success')
+        expect(mocks.alertNormalWait).not.toHaveBeenCalled()
+        let settled = false
+
+        void result.completeReload().finally(() => {
+            settled = true
+        })
+
+        await vi.waitFor(() => expect(mocks.alertNormalWait).toHaveBeenCalledOnce())
+        expect(settled).toBe(false)
+    })
+
     it('writes with the exact session and save-date headers', async () => {
         mocks.fetchProtectedResource
             .mockResolvedValueOnce(response(JSON.stringify({ sessionNumber: 42 }), 200, {

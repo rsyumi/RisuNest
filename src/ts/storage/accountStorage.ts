@@ -42,6 +42,38 @@ export interface AccountWriteOptions {
     signal?: AbortSignal
 }
 
+export interface AccountNativeOfficialWriteAttemptContext {
+    credential: { kind: 'risu-auth'; token: string }
+    session: string | null
+    saveDate: string
+    signal?: AbortSignal
+}
+
+export type AccountNativeOfficialWriteAttemptResult<T> =
+    | {
+        kind: 'written' | 'not-modified'
+        session: string | null
+        replacementKey: string
+        warning?: string | null
+        reloadSession?: boolean
+        receipt: T
+    }
+    | { kind: 'auth-warning'; session: string | null }
+    | { kind: 'reauthentication-needed'; session: string | null }
+
+export type AccountNativeOfficialWriteResult<T> =
+    | {
+        kind: 'written' | 'not-modified'
+        replacementKey: string
+        receipt: T
+        completeReload(): Promise<void>
+    }
+    | { kind: 'auth-warning' }
+
+export type AccountNativeOfficialWriteAttempt<T> = (
+    context: AccountNativeOfficialWriteAttemptContext,
+) => Promise<AccountNativeOfficialWriteAttemptResult<T>>
+
 export interface AccountStorageCache {
     getItem(key: string): Promise<unknown | null>
     setItem(key: string, value: unknown): Promise<unknown>
@@ -74,6 +106,20 @@ async function discardResponseBody(response: Response): Promise<void> {
 
 function waitForever(): Promise<never> {
     return new Promise(() => {})
+}
+
+function publishAccountWarning(warning: string | null | undefined): void {
+    if (!warning || seenWarnings.includes(warning)) return
+    seenWarnings.push(warning)
+    AccountWarning.set(warning)
+}
+
+async function applyAccountReload(reloadSession: boolean): Promise<void> {
+    if (!reloadSession) return
+    void alertNormalWait(language.activeTabChange).then(() => {
+        location.reload()
+    })
+    await waitForever()
 }
 
 async function cacheDatabaseWrite(
@@ -170,18 +216,8 @@ export class AccountStorage{
 
             if(isJsonResponse(da)){
                 const json = JSON.parse(await getDaText())
-                if(json?.warning){
-                    if(!seenWarnings.includes(json.warning)){
-                        seenWarnings.push(json.warning)
-                        AccountWarning.set(json.warning)
-                    }
-                }
-                if(json?.reloadSession){
-                    void alertNormalWait(language.activeTabChange).then(() => {
-                        location.reload()
-                    })
-                    await waitForever()
-                }
+                publishAccountWarning(json?.warning)
+                await applyAccountReload(Boolean(json?.reloadSession))
             }
 
             const replacementKey = await getDaText()
@@ -193,6 +229,36 @@ export class AccountStorage{
         }
 
         throw new Error('Account write did not complete')
+    }
+
+    async writeOfficialDatabaseFromNative<T>(
+        attempt: AccountNativeOfficialWriteAttempt<T>,
+        options: AccountWriteOptions = {},
+    ): Promise<AccountNativeOfficialWriteResult<T> | null> {
+        while (true) {
+            this.checkAuth()
+            if (localStorage.getItem('ignoreRisuAuth') === 'true' || !this.auth) return null
+
+            const result = await attempt({
+                credential: { kind: 'risu-auth', token: this.auth },
+                session: risuSession || null,
+                saveDate: Date.now().toFixed(0),
+                signal: options.signal,
+            })
+            if (result.session !== null) risuSession = result.session
+            if (result.kind === 'reauthentication-needed') {
+                await this.reauthenticate()
+                continue
+            }
+            if (result.kind === 'auth-warning') return { kind: 'auth-warning' }
+            publishAccountWarning(result.warning)
+            return {
+                kind: result.kind,
+                replacementKey: result.replacementKey,
+                receipt: result.receipt,
+                completeReload: () => applyAccountReload(result.reloadSession ?? false),
+            }
+        }
     }
 
     async getItem(key:string, callback?:(status:number) => void):Promise<Buffer|null> {
