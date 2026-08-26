@@ -1,14 +1,17 @@
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
 use crate::persistent_store::{RevisionResult, StagingResult, StoreError, StoreResult};
 use flate2::bufread::GzDecoder;
+use rmpv::Value as MessagePackValue;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
 const RISU_SAVE_HEADER: &[u8] = b"RISUSAVE\0";
+const LEGACY_RISU_SAVE_PREFIX: &[u8] = b"\0RISUSAVE\0";
+const HISTORICAL_RISU_PREFIX: &[u8] = b"\0\0RISU";
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 const CHARACTER_BATCH_COUNT: usize = 16;
 const CHARACTER_BATCH_BYTES: usize = 8 * 1024 * 1024;
@@ -43,7 +46,16 @@ pub(crate) fn restore_block_risu_save(
     job: &JobControl,
     sink: &dyn ReplacementSink,
 ) -> Result<JobResultSummary, NativeJobError> {
-    restore_block_risu_save_with_limits(
+    restore_risu_save(source, expected_revision, job, sink)
+}
+
+pub(crate) fn restore_risu_save(
+    source: &Path,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+) -> Result<JobResultSummary, NativeJobError> {
+    restore_risu_save_with_limits(
         source,
         expected_revision,
         job,
@@ -52,7 +64,18 @@ pub(crate) fn restore_block_risu_save(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn restore_block_risu_save_with_limits(
+    source: &Path,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<JobResultSummary, NativeJobError> {
+    restore_risu_save_with_limits(source, expected_revision, job, sink, limits)
+}
+
+fn restore_risu_save_with_limits(
     source: &Path,
     expected_revision: i64,
     job: &JobControl,
@@ -68,10 +91,22 @@ pub(crate) fn restore_block_risu_save_with_limits(
     }
     let file = File::open(source)
         .map_err(|error| invalid_source(format!("source cannot be opened: {error}")))?;
-    restore_block_risu_save_reader(file, total_bytes, expected_revision, job, sink, limits)
+    restore_risu_save_reader(file, total_bytes, expected_revision, job, sink, limits)
 }
 
+#[cfg(test)]
 fn restore_block_risu_save_reader<R: Read>(
+    source: R,
+    total_bytes: u64,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<JobResultSummary, NativeJobError> {
+    restore_risu_save_reader(source, total_bytes, expected_revision, job, sink, limits)
+}
+
+fn restore_risu_save_reader<R: Read>(
     source: R,
     total_bytes: u64,
     expected_revision: i64,
@@ -88,15 +123,22 @@ fn restore_block_risu_save_reader<R: Read>(
     job.start(JobPhase::ReadingSource)
         .map_err(|error| job_error(job, error))?;
     let mut reader = TrackedReader::new(source, total_bytes, job);
-    let mut header = [0u8; RISU_SAVE_HEADER.len()];
-    reader.read_exact_checked(&mut header)?;
-    if header != RISU_SAVE_HEADER {
-        return Err(invalid("invalid block RisuSave header"));
-    }
+    let format = read_risu_save_format(&mut reader)?;
 
     let staging_id = sink.begin().map_err(store_error)?.staging_id;
     let outcome = (|| {
-        let parsed = parse_and_stage(&mut reader, &staging_id, job, sink, limits)?;
+        let parsed = match format {
+            RisuSaveFormat::Block => parse_and_stage(&mut reader, &staging_id, job, sink, limits)?,
+            RisuSaveFormat::LegacyRaw => {
+                parse_and_stage_legacy(&mut reader, &staging_id, job, sink, limits)?
+            }
+            RisuSaveFormat::HistoricalPrefixed => {
+                return Err(invalid("historical RisuSave codec is not enabled"))
+            }
+            RisuSaveFormat::LegacyCompressed | RisuSaveFormat::LegacyStream => {
+                return Err(invalid("compressed legacy RisuSave codecs are not enabled"))
+            }
+        };
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
@@ -127,9 +169,339 @@ fn restore_block_risu_save_reader<R: Read>(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RisuSaveFormat {
+    Block,
+    LegacyRaw,
+    LegacyCompressed,
+    LegacyStream,
+    HistoricalPrefixed,
+}
+
+fn read_risu_save_format<R: Read>(
+    reader: &mut TrackedReader<'_, R>,
+) -> Result<RisuSaveFormat, NativeJobError> {
+    let mut first = [0u8; 1];
+    reader.read_exact_checked(&mut first)?;
+    if first[0] == RISU_SAVE_HEADER[0] {
+        let mut rest = [0u8; RISU_SAVE_HEADER.len() - 1];
+        reader.read_exact_checked(&mut rest)?;
+        if rest == RISU_SAVE_HEADER[1..] {
+            return Ok(RisuSaveFormat::Block);
+        }
+        return Err(invalid("invalid RisuSave header"));
+    }
+    if first[0] != 0 {
+        return Err(invalid("unframed RisuSave input is unsupported"));
+    }
+
+    let mut second = [0u8; 1];
+    reader.read_exact_checked(&mut second)?;
+    if second[0] == 0 {
+        let mut rest = [0u8; HISTORICAL_RISU_PREFIX.len() - 2];
+        reader.read_exact_checked(&mut rest)?;
+        if rest == HISTORICAL_RISU_PREFIX[2..] {
+            return Ok(RisuSaveFormat::HistoricalPrefixed);
+        }
+        return Err(invalid("invalid historical RisuSave header"));
+    }
+    if second[0] != LEGACY_RISU_SAVE_PREFIX[1] {
+        return Err(invalid("invalid legacy RisuSave header"));
+    }
+    let mut rest = [0u8; LEGACY_RISU_SAVE_PREFIX.len() - 2];
+    reader.read_exact_checked(&mut rest)?;
+    if rest != LEGACY_RISU_SAVE_PREFIX[2..] {
+        return Err(invalid("invalid legacy RisuSave header"));
+    }
+    let mut kind = [0u8; 1];
+    reader.read_exact_checked(&mut kind)?;
+    match kind[0] {
+        7 => Ok(RisuSaveFormat::LegacyRaw),
+        8 => Ok(RisuSaveFormat::LegacyCompressed),
+        9 => Ok(RisuSaveFormat::LegacyStream),
+        value => Err(invalid(format!("unsupported legacy RisuSave kind {value}"))),
+    }
+}
+
 struct ParsedCounts {
     character_count: u64,
     preset_count: u64,
+}
+
+fn parse_and_stage_legacy<R: Read>(
+    reader: &mut TrackedReader<'_, R>,
+    staging_id: &str,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+) -> Result<ParsedCounts, NativeJobError> {
+    let remaining = reader.total.saturating_sub(reader.completed);
+    if remaining > limits.max_decoded_block_bytes {
+        return Err(invalid("decoded legacy RisuSave limit exceeded"));
+    }
+    let source = RemainingSourceReader { reader, remaining };
+    let decoded = DecodedLimitReader::new(
+        source,
+        limits.max_decoded_block_bytes,
+        job,
+        "legacy RisuSave",
+    );
+    let value = decode_messagepack(decoded, job)?.0;
+    reader.complete_item()?;
+    stage_legacy_database(value, staging_id, job, sink)
+}
+
+fn decode_messagepack<'a, R: Read>(
+    decoded: DecodedLimitReader<'a, R>,
+    job: &JobControl,
+) -> Result<(Value, DecodedLimitReader<'a, R>), NativeJobError> {
+    let mut buffered = BufReader::with_capacity(READ_CHUNK_BYTES, decoded);
+    let packed =
+        rmpv::decode::read_value(&mut buffered).map_err(|error| messagepack_error(error, job))?;
+    let mut trailing = [0u8; 1];
+    let read = buffered
+        .read(&mut trailing)
+        .map_err(|error| messagepack_io_error(error, job))?;
+    if read != 0 {
+        return Err(corrupt("trailing data after legacy MessagePack value"));
+    }
+    let value = match messagepack_to_json(packed)? {
+        JsonSlot::Value(value) => value,
+        JsonSlot::Undefined => {
+            return Err(invalid("legacy MessagePack database cannot be undefined"))
+        }
+    };
+    Ok((value, buffered.into_inner()))
+}
+
+fn stage_legacy_database(
+    value: Value,
+    staging_id: &str,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+) -> Result<ParsedCounts, NativeJobError> {
+    let mut root = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| invalid("legacy MessagePack database must be an object"))?;
+    let characters = root
+        .remove("characters")
+        .and_then(|value| value.as_array().cloned())
+        .ok_or_else(|| invalid("legacy MessagePack characters must be an array"))?;
+    let presets = match root.remove("botPresets") {
+        Some(value) => value
+            .as_array()
+            .cloned()
+            .ok_or_else(|| invalid("legacy MessagePack botPresets must be an array"))?,
+        None => Vec::new(),
+    };
+    if let Some(storage) = root.get("pluginCustomStorage") {
+        if !storage.is_object() {
+            return Err(invalid(
+                "legacy MessagePack pluginCustomStorage must be an object",
+            ));
+        }
+    }
+
+    let mut start = 0;
+    while start < characters.len() {
+        if job.is_cancel_requested() {
+            return Err(cancelled("restore cancelled while staging legacy database"));
+        }
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < characters.len() && end - start < CHARACTER_BATCH_COUNT {
+            let character_bytes = serde_json::to_vec(&characters[end])
+                .map_err(|error| corrupt(format!("legacy character is not JSON: {error}")))?
+                .len();
+            if end > start && bytes.saturating_add(character_bytes) > CHARACTER_BATCH_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(character_bytes);
+            end += 1;
+        }
+        sink.add_characters(staging_id, &characters[start..end])
+            .map_err(store_error)?;
+        start = end;
+    }
+
+    job.set_phase(JobPhase::StagingDatabase)
+        .map_err(|error| job_error(job, error))?;
+    sink.put_root(staging_id, &Value::Object(root))
+        .map_err(store_error)?;
+    sink.put_presets(staging_id, &presets)
+        .map_err(store_error)?;
+    Ok(ParsedCounts {
+        character_count: characters.len() as u64,
+        preset_count: presets.len() as u64,
+    })
+}
+
+enum JsonSlot {
+    Value(Value),
+    Undefined,
+}
+
+fn messagepack_to_json(value: MessagePackValue) -> Result<JsonSlot, NativeJobError> {
+    match value {
+        MessagePackValue::Nil => Ok(JsonSlot::Value(Value::Null)),
+        MessagePackValue::Boolean(value) => Ok(JsonSlot::Value(Value::Bool(value))),
+        MessagePackValue::Integer(value) => {
+            let number = if let Some(value) = value.as_i64() {
+                js_number(value as f64)
+            } else if let Some(value) = value.as_u64() {
+                js_number(value as f64)
+            } else {
+                return Err(corrupt("invalid legacy MessagePack integer"));
+            };
+            Ok(JsonSlot::Value(number))
+        }
+        MessagePackValue::F32(value) => Ok(JsonSlot::Value(js_number(value as f64))),
+        MessagePackValue::F64(value) => Ok(JsonSlot::Value(js_number(value))),
+        MessagePackValue::String(value) => value
+            .into_str()
+            .map(|value| JsonSlot::Value(Value::String(value)))
+            .ok_or_else(|| corrupt("invalid UTF-8 legacy MessagePack string")),
+        MessagePackValue::Binary(_) => Err(invalid(
+            "binary values are unsupported in a legacy MessagePack database",
+        )),
+        MessagePackValue::Array(values) => {
+            let mut output = Vec::with_capacity(values.len());
+            for value in values {
+                output.push(match messagepack_to_json(value)? {
+                    JsonSlot::Value(value) => value,
+                    JsonSlot::Undefined => Value::Null,
+                });
+            }
+            Ok(JsonSlot::Value(Value::Array(output)))
+        }
+        MessagePackValue::Map(entries) => messagepack_map_to_json(entries),
+        MessagePackValue::Ext(kind, bytes) if kind == 0 && bytes == [0] => Ok(JsonSlot::Undefined),
+        MessagePackValue::Ext(-1, bytes) => {
+            Ok(JsonSlot::Value(Value::String(timestamp_to_iso(&bytes)?)))
+        }
+        MessagePackValue::Ext(kind, _) => Err(invalid(format!(
+            "unsupported legacy MessagePack extension {kind}"
+        ))),
+    }
+}
+
+fn messagepack_map_to_json(
+    entries: Vec<(MessagePackValue, MessagePackValue)>,
+) -> Result<JsonSlot, NativeJobError> {
+    let mut indexed = BTreeMap::<u32, (String, Value)>::new();
+    let mut ordinary = serde_json::Map::new();
+    for (key, value) in entries {
+        let key = key
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| invalid("legacy MessagePack object keys must be strings"))?;
+        let JsonSlot::Value(value) = messagepack_to_json(value)? else {
+            continue;
+        };
+        if let Some(index) = javascript_array_index(&key) {
+            indexed.insert(index, (key, value));
+        } else {
+            ordinary.insert(key, value);
+        }
+    }
+    let mut output = serde_json::Map::new();
+    for (_, (key, value)) in indexed {
+        output.insert(key, value);
+    }
+    output.extend(ordinary);
+    Ok(JsonSlot::Value(Value::Object(output)))
+}
+
+fn javascript_array_index(value: &str) -> Option<u32> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return None;
+    }
+    let index = value.parse::<u32>().ok()?;
+    (index != u32::MAX && index.to_string() == value).then_some(index)
+}
+
+fn js_number(value: f64) -> Value {
+    if !value.is_finite() {
+        return Value::Null;
+    }
+    if value == 0.0 {
+        return Value::Number(0.into());
+    }
+    if value.fract() == 0.0 {
+        if value >= i64::MIN as f64 && value < 9_223_372_036_854_775_808.0 {
+            return Value::Number((value as i64).into());
+        }
+        if value >= 0.0 && value < 18_446_744_073_709_551_616.0 {
+            return Value::Number((value as u64).into());
+        }
+    }
+    Value::Number(
+        serde_json::Number::from_f64(value)
+            .expect("finite MessagePack number must be representable as JSON"),
+    )
+}
+
+fn timestamp_to_iso(bytes: &[u8]) -> Result<String, NativeJobError> {
+    let (seconds, nanoseconds) = match bytes.len() {
+        4 => (u32::from_be_bytes(bytes.try_into().unwrap()) as i64, 0),
+        8 => {
+            let packed = u64::from_be_bytes(bytes.try_into().unwrap());
+            ((packed & 0x3_ffff_ffff) as i64, (packed >> 34) as u32)
+        }
+        12 => (
+            i64::from_be_bytes(bytes[4..].try_into().unwrap()),
+            u32::from_be_bytes(bytes[..4].try_into().unwrap()),
+        ),
+        _ => return Err(corrupt("invalid MessagePack timestamp extension length")),
+    };
+    if nanoseconds >= 1_000_000_000 {
+        return Err(corrupt("invalid MessagePack timestamp nanoseconds"));
+    }
+    let datetime = time::OffsetDateTime::from_unix_timestamp(seconds)
+        .and_then(|value| value.replace_nanosecond(nanoseconds))
+        .map_err(|_| invalid("MessagePack timestamp is outside the supported Date range"))?;
+    let year = datetime.year();
+    let year = if (0..=9999).contains(&year) {
+        format!("{year:04}")
+    } else {
+        format!(
+            "{}{abs:06}",
+            if year < 0 { '-' } else { '+' },
+            abs = year.abs()
+        )
+    };
+    Ok(format!(
+        "{year}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        datetime.month() as u8,
+        datetime.day(),
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second(),
+        datetime.millisecond(),
+    ))
+}
+
+struct RemainingSourceReader<'a, 'b, R: Read> {
+    reader: &'a mut TrackedReader<'b, R>,
+    remaining: u64,
+}
+
+impl<R: Read> Read for RemainingSourceReader<'_, '_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buffer.is_empty() {
+            return Ok(0);
+        }
+        let allowed = buffer
+            .len()
+            .min(self.remaining.min(READ_CHUNK_BYTES as u64) as usize);
+        let read = self
+            .reader
+            .read_chunk(&mut buffer[..allowed])
+            .map_err(native_error_to_io)?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
 }
 
 fn parse_and_stage<R: Read>(
@@ -542,6 +914,45 @@ fn native_error_to_io(error: NativeJobError) -> io::Error {
     io::Error::new(kind, error)
 }
 
+fn messagepack_error(error: rmpv::decode::Error, job: &JobControl) -> NativeJobError {
+    if job.is_cancel_requested() {
+        return cancelled("restore cancelled while decoding legacy MessagePack");
+    }
+    let message = error.to_string();
+    if message.contains("decoded legacy RisuSave limit exceeded") {
+        return invalid(message);
+    }
+    if message.contains("source read failed") {
+        return invalid_source(message);
+    }
+    if message.contains("truncated block RisuSave source")
+        || message.contains("failed to fill whole buffer")
+        || message.contains("unexpected end")
+    {
+        return truncated("truncated legacy MessagePack payload");
+    }
+    corrupt(format!("invalid legacy MessagePack: {error}"))
+}
+
+fn messagepack_io_error(error: io::Error, job: &JobControl) -> NativeJobError {
+    if job.is_cancel_requested() || error.kind() == io::ErrorKind::Interrupted {
+        return cancelled("restore cancelled while decoding legacy MessagePack");
+    }
+    let message = error.to_string();
+    if message.contains("decoded legacy RisuSave limit exceeded") {
+        return invalid(message);
+    }
+    if message.contains("source read failed") {
+        return invalid_source(message);
+    }
+    if error.kind() == io::ErrorKind::UnexpectedEof
+        || message.contains("truncated block RisuSave source")
+    {
+        return truncated("truncated legacy MessagePack payload");
+    }
+    corrupt(format!("invalid legacy MessagePack: {error}"))
+}
+
 fn json_error(
     name: &str,
     compression: u8,
@@ -640,6 +1051,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    const MSGPACKR_PARITY_FIXTURE: &str = include_str!(
+        "../../../src/ts/storage/tests/roadmap14/adapters/fixtures/legacy/msgpackr-parity-v1.json"
+    );
 
     struct StoreSink {
         store: Mutex<PersistentStore>,
@@ -784,6 +1199,16 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn msgpackr_parity_fixture() -> Value {
+        serde_json::from_str(MSGPACKR_PARITY_FIXTURE).unwrap()
+    }
+
+    fn legacy_wire(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0, b'R', b'I', b'S', b'U', b'S', b'A', b'V', b'E', 0, kind];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
     fn assert_failed_restore_preserves_active(bytes: &[u8], expected: &str) {
         let (directory, sink) = fixture();
         let source = directory.path().join("invalid.risudat");
@@ -800,6 +1225,35 @@ mod tests {
         let store = sink.store.lock().unwrap();
         assert_eq!(store.revision().unwrap(), 1);
         assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
+    }
+
+    fn assert_failed_general_restore_preserves_active(bytes: &[u8], expected: &str) {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("invalid-general.risudat");
+        fs::write(&source, bytes).unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+
+        let error = restore_risu_save(&source, 1, &job, &sink).unwrap_err();
+
+        assert!(
+            error.message.contains(expected),
+            "unexpected error: {error}"
+        );
+        let store = sink.store.lock().unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
+    }
+
+    fn persistent_projection(value: Value) -> Value {
+        let mut database = value.as_object().unwrap().clone();
+        let characters = database.remove("characters").unwrap();
+        let presets = database.remove("botPresets").unwrap();
+        let plugin_storage = database.remove("pluginCustomStorage").unwrap();
+        database.insert("characters".to_owned(), characters);
+        database.insert("botPresets".to_owned(), presets);
+        database.insert("pluginCustomStorage".to_owned(), plugin_storage);
+        Value::Object(database)
     }
 
     #[test]
@@ -823,6 +1277,73 @@ mod tests {
         assert_eq!(restored["modules"][0]["name"], "Module");
         assert_eq!(restored["pluginCustomStorage"]["plugin"]["enabled"], true);
         assert_eq!(restored["characters"][0]["chaId"], "char-1");
+    }
+
+    #[test]
+    fn strict_raw_msgpackr_restore_preserves_parity_and_block_round_trip() {
+        use base64::Engine;
+
+        let parity = msgpackr_parity_fixture();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(parity["payloadBase64"].as_str().unwrap())
+            .unwrap();
+        let (directory, sink) = fixture();
+        let source = directory.path().join("raw-parity.risudat");
+        fs::write(&source, legacy_wire(7, &payload)).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+
+        let result = restore_risu_save(&source, 1, &job, &sink).unwrap();
+
+        assert_eq!(result.revision, 2);
+        let first = sink.store.lock().unwrap().materialize(Some(2)).unwrap();
+        let expected = persistent_projection(parity["expectedProjection"].clone());
+        assert_eq!(first, expected);
+        assert_eq!(
+            first["roadmap14Unknown"]["persistedDate"],
+            "2020-01-02T03:04:05.678Z"
+        );
+        assert!(first["roadmap14Unknown"].get("omitted").is_none());
+        assert_eq!(
+            first["roadmap14Unknown"]["ordered"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["2", "10", "zeta", "01", "alpha"]
+        );
+
+        let exported_path = {
+            let mut store = sink.store.lock().unwrap();
+            let lease = store.acquire_revision(2).unwrap().lease;
+            let exported = store.export_risu_save(&lease, false).unwrap();
+            store.release_revision(&lease).unwrap();
+            PathBuf::from(exported.path)
+        };
+        let second_job = JobRegistry::default()
+            .create(JobKind::RestoreBlockRisuSave)
+            .unwrap();
+        let second = restore_risu_save(&exported_path, 2, &second_job, &sink).unwrap();
+        assert_eq!(second.revision, 3);
+        assert_eq!(
+            sink.store.lock().unwrap().materialize(Some(3)).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn strict_raw_msgpackr_restore_rejects_unknown_extensions_without_activation() {
+        use base64::Engine;
+
+        let parity = msgpackr_parity_fixture();
+        let payload = base64::engine::general_purpose::STANDARD
+            .decode(parity["unknownExtensionBase64"].as_str().unwrap())
+            .unwrap();
+        let bytes = legacy_wire(7, &payload);
+
+        assert_failed_general_restore_preserves_active(&bytes, "extension 42");
     }
 
     #[test]

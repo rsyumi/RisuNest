@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "msgpackrVersion": "1.10.1",
+  "expectedCanonicalSha256": "a8af6ac48d3abe48248a8f1a81055022429e01447ab4e59d5f7248ab1d91009d",
+  "payloadBase64": "3gALqHVzZXJuYW1lsk1lc3NhZ2VQYWNrIHBhcml0ea1mb3JtYXR2ZXJzaW9uBKdhcGlUeXBlsGZpeHR1cmUtcHJvdmlkZXKwcm9hZG1hcDE0VW5rbm93bt4ACadzYWZlTWF4y0M/////////r3JvdW5kZWRQb3NpdGl2ZdMAIAAAAAAAAa9yb3VuZGVkTmVnYXRpdmXT/9////////+rdW5zaWduZWRNYXjP//////////+nb3JkZXJlZN4ABaEyo3R3b6IxMKN0ZW6kemV0YQGiMDGjb25lpWFscGhhAq1wZXJzaXN0ZWREYXRl1/+hpdYAXg1dpadvbWl0dGVk1AAAsmFycmF5V2l0aFVuZGVmaW5lZJPUAADCAK1uZXN0ZWRVbmtub3du3gABpmZ1dHVyZalwcmVzZXJ2ZWSqYm90UHJlc2V0c5HeAAKkbmFtZa1QYXJpdHkgcHJlc2V0sHJvYWRtYXAxNFVua25vd27eAAGlZW1wdHneAACsYm90UHJlc2V0c0lkAKdtb2R1bGVzkd4AAqRuYW1lrVBhcml0eSBtb2R1bGWwcm9hZG1hcDE0VW5rbm93bpKpZHVwbGljYXRlqWR1cGxpY2F0Zahsb2Fkb3V0c5CncGx1Z2luc5CzcGx1Z2luQ3VzdG9tU3RvcmFnZd4ABaEyo3R3b6IxMKN0ZW6kemV0Yd4AAadlbmFibGVkwqIwMQClYWxwaGHAqmNoYXJhY3RlcnOR3gAFpHR5cGWpY2hhcmFjdGVypWNoYUlkq3Bhcml0eS1jaGFypG5hbWWwUGFyaXR5IGNoYXJhY3RlcqVjaGF0c5HeAAOiaWSrcGFyaXR5LWNoYXSkbmFtZatQYXJpdHkgY2hhdKdtZXNzYWdlkd4ABKRyb2xlpHVzZXKkZGF0YaVoZWxsb6ZjaGF0SWSucGFyaXR5LW1lc3NhZ2Wwcm9hZG1hcDE0VW5rbm93bt4AAaV2YWx1ZQCwcm9hZG1hcDE0VW5rbm93bt4AAapmYWxzZVZhbHVlwg==",
+  "expectedProjection": {
+    "username": "MessagePack parity",
+    "formatversion": 4,
+    "apiType": "fixture-provider",
+    "roadmap14Unknown": {
+      "safeMax": 9007199254740991,
+      "roundedPositive": 9007199254740992,
+      "roundedNegative": -9007199254740992,
+      "unsignedMax": 18446744073709552000,
+      "ordered": {
+        "2": "two",
+        "10": "ten",
+        "zeta": 1,
+        "01": "one",
+        "alpha": 2
+      },
+      "persistedDate": "2020-01-02T03:04:05.678Z",
+      "arrayWithUndefined": [
+        null,
+        false,
+        0
+      ],
+      "nestedUnknown": {
+        "future": "preserved"
+      }
+    },
+    "botPresets": [
+      {
+        "name": "Parity preset",
+        "roadmap14Unknown": {
+          "empty": {}
+        }
+      }
+    ],
+    "botPresetsId": 0,
+    "modules": [
+      {
+        "name": "Parity module",
+        "roadmap14Unknown": [
+          "duplicate",
+          "duplicate"
+        ]
+      }
+    ],
+    "loadouts": [],
+    "plugins": [],
+    "pluginCustomStorage": {
+      "2": "two",
+      "10": "ten",
+      "zeta": {
+        "enabled": false
+      },
+      "01": 0,
+      "alpha": null
+    },
+    "characters": [
+      {
+        "type": "character",
+        "chaId": "parity-char",
+        "name": "Parity character",
+        "chats": [
+          {
+            "id": "parity-chat",
+            "name": "Parity chat",
+            "message": [
+              {
+                "role": "user",
+                "data": "hello",
+                "chatId": "parity-message",
+                "roadmap14Unknown": {
+                  "value": 0
+                }
+              }
+            ]
+          }
+        ],
+        "roadmap14Unknown": {
+          "falseValue": false
+        }
+      }
+    ]
+  },
+  "expectedObjectKeys": {
+    "root": [
+      "username",
+      "formatversion",
+      "apiType",
+      "roadmap14Unknown",
+      "botPresets",
+      "botPresetsId",
+      "modules",
+      "loadouts",
+      "plugins",
+      "pluginCustomStorage",
+      "characters"
+    ],
+    "unknown": [
+      "safeMax",
+      "roundedPositive",
+      "roundedNegative",
+      "unsignedMax",
+      "ordered",
+      "persistedDate",
+      "omitted",
+      "arrayWithUndefined",
+      "nestedUnknown"
+    ],
+    "ordered": [
+      "2",
+      "10",
+      "zeta",
+      "01",
+      "alpha"
+    ],
+    "pluginStorage": [
+      "2",
+      "10",
+      "zeta",
+      "01",
+      "alpha"
+    ]
+  },
+  "unknownExtensionBase64": "1CoA"
+}
