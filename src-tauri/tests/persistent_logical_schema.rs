@@ -66,6 +66,8 @@ fn creates_and_validates_compact_logical_schema() {
     assert_eq!(
         tables,
         vec![
+            "logical_generation_session_pins",
+            "logical_library_head",
             "logical_message_page_sources",
             "logical_peer_common_bases",
             "logical_record_dependencies",
