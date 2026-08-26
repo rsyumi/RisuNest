@@ -199,6 +199,49 @@ pub(super) fn cleanup(snapshots_dir: &Path, path: &Path) -> StoreResult<()> {
     }
 }
 
+#[cfg(feature = "official-publication-upload-pilot")]
+pub(super) fn open_for_upload(
+    connection: &Connection,
+    snapshots_dir: &Path,
+    path: &Path,
+) -> StoreResult<(File, u64)> {
+    let exports_dir = export_directory(snapshots_dir)?;
+    let Some((id, ManagedFileKind::Completed)) = managed_file(path) else {
+        return Err(StoreError::Validation {
+            message: "Official publication source is not a managed RisuSave export".to_owned(),
+        });
+    };
+    if path.parent() != Some(exports_dir.as_path()) {
+        return Err(StoreError::Validation {
+            message: "Official publication source is outside the export directory".to_owned(),
+        });
+    }
+    let source_metadata = fs::symlink_metadata(path)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(StoreError::Validation {
+            message: "Official publication source is not a regular export file".to_owned(),
+        });
+    }
+    let ownership_path = exports_dir.join(format!("risusave-{id}.lease"));
+    let ownership_metadata = fs::symlink_metadata(&ownership_path)?;
+    if ownership_metadata.file_type().is_symlink()
+        || !ownership_metadata.is_file()
+        || ownership_metadata.len() > 4096
+    {
+        return Err(StoreError::Validation {
+            message: "Official publication source has no valid ownership marker".to_owned(),
+        });
+    }
+    let ownership: ExportOwnership = serde_json::from_slice(&fs::read(&ownership_path)?)?;
+    if ownership.export_id != id {
+        return Err(StoreError::Validation {
+            message: "Official publication source ownership does not match its export".to_owned(),
+        });
+    }
+    read_target(connection, Some(&ownership.lease))?;
+    Ok((File::open(path)?, source_metadata.len()))
+}
+
 pub(super) fn sweep_abandoned(
     connection: &mut Connection,
     snapshots_dir: &Path,
@@ -723,6 +766,39 @@ mod tests {
         )
         .is_err());
         cleanup(&store.snapshots_dir, Path::new(&second.path)).unwrap();
+    }
+
+    #[cfg(feature = "official-publication-upload-pilot")]
+    #[test]
+    fn opens_only_a_managed_completed_export_with_its_live_lease() {
+        let (directory, mut store, _revision, lease) = fixture();
+        let exported = create(&store.connection, &store.snapshots_dir, &lease, false).unwrap();
+
+        let (mut source, bytes) = open_for_upload(
+            &store.connection,
+            &store.snapshots_dir,
+            Path::new(&exported.path),
+        )
+        .unwrap();
+        let mut body = Vec::new();
+        source.read_to_end(&mut body).unwrap();
+        assert_eq!(bytes, exported.bytes);
+        assert_eq!(body.len() as u64, exported.bytes);
+
+        let external = directory
+            .path()
+            .join(Path::new(&exported.path).file_name().unwrap());
+        fs::copy(&exported.path, &external).unwrap();
+        assert!(open_for_upload(&store.connection, &store.snapshots_dir, &external).is_err());
+
+        store.release_revision(&lease).unwrap();
+        assert!(open_for_upload(
+            &store.connection,
+            &store.snapshots_dir,
+            Path::new(&exported.path),
+        )
+        .is_err());
+        cleanup(&store.snapshots_dir, Path::new(&exported.path)).unwrap();
     }
 
     #[test]

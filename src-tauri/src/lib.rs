@@ -6,6 +6,8 @@ mod local_backup;
 mod native_file_jobs;
 mod native_media;
 mod persistent_store;
+#[cfg(feature = "official-publication-upload-pilot")]
+mod publication_upload;
 
 use base64::{engine::general_purpose, Engine as _};
 use oauth2::basic::{BasicClient, BasicErrorResponseType, BasicTokenType};
@@ -525,6 +527,8 @@ pub fn run() {
             persistent_store::commands::pds_release_revision,
             persistent_store::commands::pds_export_risu_save,
             persistent_store::commands::pds_export_risu_save_cleanup,
+            #[cfg(feature = "official-publication-upload-pilot")]
+            persistent_store::commands::official_publication_upload_file,
             persistent_store::commands::pds_checkpoint,
             persistent_store::commands::pds_snapshot_create,
             persistent_store::commands::pds_snapshot_list,

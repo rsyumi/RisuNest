@@ -10,6 +10,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
+#[cfg(feature = "official-publication-upload-pilot")]
+use crate::publication_upload::{
+    upload_open_file_attempt, OfficialPublicationUploadError, OfficialPublicationUploadRequest,
+    OfficialPublicationUploadResult,
+};
+
 pub(crate) struct PersistentStoreState {
     store: Mutex<Option<PersistentStore>>,
     snapshot_operations: Mutex<()>,
@@ -336,6 +342,21 @@ pub(crate) fn pds_export_risu_save_cleanup(
     with_store(state, |store| {
         store.cleanup_risu_save_export(Path::new(&path))
     })
+}
+
+#[cfg(feature = "official-publication-upload-pilot")]
+#[tauri::command]
+pub(crate) async fn official_publication_upload_file(
+    state: State<'_, PersistentStoreState>,
+    request: OfficialPublicationUploadRequest,
+) -> Result<OfficialPublicationUploadResult, OfficialPublicationUploadError> {
+    let (source, bytes) = with_store(state, |store| {
+        store.open_risu_save_export_for_upload(Path::new(&request.path))
+    })
+    .map_err(|error| OfficialPublicationUploadError::Source {
+        message: error.to_string(),
+    })?;
+    upload_open_file_attempt(request, source, bytes).await
 }
 
 #[tauri::command(async)]

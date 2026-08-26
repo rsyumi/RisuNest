@@ -739,6 +739,14 @@ impl PersistentStore {
         export::cleanup(&self.snapshots_dir, path)
     }
 
+    #[cfg(feature = "official-publication-upload-pilot")]
+    pub(crate) fn open_risu_save_export_for_upload(
+        &self,
+        path: &Path,
+    ) -> StoreResult<(std::fs::File, u64)> {
+        export::open_for_upload(&self.connection, &self.snapshots_dir, path)
+    }
+
     pub(crate) fn checkpoint(&self, mode: CheckpointMode) -> StoreResult<()> {
         snapshot::checkpoint(&self.connection, mode)
     }

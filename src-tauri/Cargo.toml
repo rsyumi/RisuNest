@@ -36,6 +36,7 @@ tauri-plugin-shell = "2.3.5"
 tauri-plugin-http = "2.5.9"
 oauth2 = "5.0.0"
 tokio = { version = "1.47.1", features = ["time"] }
+tokio-util = { version = "0.7.19", features = ["io"], optional = true }
 hex = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 webp = "0.3.1"
@@ -45,6 +46,12 @@ crc32fast = "1.5.0"
 # this feature is used for production builds or when `devPath` points to the filesystem
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
+official-publication-upload-pilot = [
+    "dep:tokio-util",
+    "reqwest/stream",
+    "tokio/fs",
+    "tokio/io-util",
+]
 
 [lib]
 name = "risuai_lib"
