@@ -127,6 +127,47 @@ describe('native restore bootstrap reconciliation', () => {
         })
     })
 
+    it('cleans an abandoned Android lossless handoff before forgetting its terminal job', async () => {
+        let resumePolling!: () => void
+        const pollingGate = new Promise<void>((resolve) => resumePolling = resolve)
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const handoffPath = 'C:\\app\\persistent\\exports\\risusave-lossless.risudat'
+        const dependencies = {
+            invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('lossless-export', 'running', 'writing-export'),
+                    kind: 'export-lossless-backup' as const,
+                }]
+                if (command === 'native_file_job_status') return {
+                    ...restoreStatus('lossless-export', 'succeeded', 'complete'),
+                    kind: 'export-lossless-backup' as const,
+                    result: {
+                        ...restoreStatus('lossless-export', 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }
+                if (command === 'pds_export_risu_save_cleanup') return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => pollingGate),
+        }
+
+        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+        expect(calls).toEqual([['native_file_job_list', undefined]])
+
+        resumePolling()
+        await vi.waitFor(() => {
+            expect(calls).toEqual([
+                ['native_file_job_list', undefined],
+                ['native_file_job_status', { jobId: 'lossless-export' }],
+                ['pds_export_risu_save_cleanup', { path: handoffPath }],
+                ['native_file_job_forget', { jobId: 'lossless-export' }],
+            ])
+        })
+    })
+
     it('forgets committed restores only after the caller reports successful plugin loading', async () => {
         const calls: string[] = []
         const dependencies = {

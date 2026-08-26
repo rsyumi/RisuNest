@@ -62,7 +62,16 @@ async function reconcileExportInBackground(
             jobId: status.jobId,
         }) as NativeFileJobStatus
     }
-    await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
+    try {
+        if (status.kind === 'export-lossless-backup' && status.result?.handoffPath) {
+            await dependencies.invoke('pds_export_risu_save_cleanup', {
+                path: status.result.handoffPath,
+            })
+        }
+    }
+    finally {
+        await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
+    }
 }
 
 export async function reconcileNativeRestoresBeforeBootstrap(
@@ -71,7 +80,11 @@ export async function reconcileNativeRestoresBeforeBootstrap(
     const jobs = await dependencies.invoke('native_file_job_list') as NativeFileJobStatus[]
     const pendingAcknowledgements: string[] = []
     for (const job of jobs) {
-        if (job.kind === 'export-block-risu-save' || job.kind === 'kei-backup-upload') {
+        if (
+            job.kind === 'export-block-risu-save'
+            || job.kind === 'export-lossless-backup'
+            || job.kind === 'kei-backup-upload'
+        ) {
             void reconcileExportInBackground(job, dependencies).catch((error) => {
                 console.error('Native export reconciliation failed', error)
             })
