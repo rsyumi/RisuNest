@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::io::{self, Read};
 
 const RPACK_MAP: &[u8; 512] = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
+const METADATA_READ_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RisumAsset {
@@ -217,8 +218,12 @@ fn read_exact_vec(
     let mut offset = 0;
     while offset < bytes.len() {
         check_cancel(cancelled)?;
+        let end = offset
+            .checked_add(METADATA_READ_BYTES)
+            .unwrap_or(bytes.len())
+            .min(bytes.len());
         let read = reader
-            .read(&mut bytes[offset..])
+            .read(&mut bytes[offset..end])
             .map_err(|error| map_required_read(error, description))?;
         if read == 0 {
             return Err(FormatError::invalid(format!("truncated {description}")));

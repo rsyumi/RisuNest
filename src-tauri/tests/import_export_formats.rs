@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     cell::Cell,
-    io::{Cursor, Read, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     rc::Rc,
 };
 use zip::{write::FileOptions, CompressionMethod, ZipWriter};
@@ -26,6 +26,7 @@ fn limits() -> ImportLimits {
         max_aggregate_payload_bytes: 4 * 1024,
         max_payload_count: 8,
         max_container_entries: 16,
+        max_container_directory_bytes: 256 * 1024,
         charx_probe_metadata_bytes: 4 * 1024,
     }
 }
@@ -71,6 +72,69 @@ fn charx(entries: &[(&str, &[u8])]) -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
+fn charx_with_many_entries(entry_count: usize) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = ZipWriter::new(cursor);
+    for index in 0..entry_count {
+        let name = if index == 0 {
+            "card.json".to_string()
+        } else {
+            format!("assets/{index:05}.bin")
+        };
+        writer
+            .start_file(
+                name,
+                FileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .unwrap();
+        if index == 0 {
+            writer
+                .write_all(br#"{"spec":"chara_card_v3","data":{"name":"fixture"}}"#)
+                .unwrap();
+        } else {
+            writer.write_all(b"x").unwrap();
+        }
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn promote_classic_zip_to_zip64(mut archive: Vec<u8>) -> Vec<u8> {
+    let eocd = archive.len() - 22;
+    assert_eq!(&archive[eocd..eocd + 4], b"PK\x05\x06");
+    let entries = u16::from_le_bytes(archive[eocd + 10..eocd + 12].try_into().unwrap()) as u64;
+    let directory_size =
+        u32::from_le_bytes(archive[eocd + 12..eocd + 16].try_into().unwrap()) as u64;
+    let directory_offset =
+        u32::from_le_bytes(archive[eocd + 16..eocd + 20].try_into().unwrap()) as u64;
+    archive.truncate(eocd);
+
+    archive.extend_from_slice(b"PK\x06\x06");
+    archive.extend_from_slice(&44_u64.to_le_bytes());
+    archive.extend_from_slice(&45_u16.to_le_bytes());
+    archive.extend_from_slice(&45_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&entries.to_le_bytes());
+    archive.extend_from_slice(&entries.to_le_bytes());
+    archive.extend_from_slice(&directory_size.to_le_bytes());
+    archive.extend_from_slice(&directory_offset.to_le_bytes());
+
+    archive.extend_from_slice(b"PK\x06\x07");
+    archive.extend_from_slice(&0_u32.to_le_bytes());
+    archive.extend_from_slice(&(eocd as u64).to_le_bytes());
+    archive.extend_from_slice(&1_u32.to_le_bytes());
+
+    archive.extend_from_slice(b"PK\x05\x06");
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive.extend_from_slice(&u16::MAX.to_le_bytes());
+    archive.extend_from_slice(&u16::MAX.to_le_bytes());
+    archive.extend_from_slice(&u32::MAX.to_le_bytes());
+    archive.extend_from_slice(&u32::MAX.to_le_bytes());
+    archive.extend_from_slice(&0_u16.to_le_bytes());
+    archive
+}
+
 struct OneByteReader {
     bytes: Cursor<Vec<u8>>,
     reads: Rc<Cell<usize>>,
@@ -84,6 +148,41 @@ impl Read for OneByteReader {
         let read = self.bytes.read(&mut buffer[..1])?;
         self.reads.set(self.reads.get() + usize::from(read > 0));
         Ok(read)
+    }
+}
+
+struct ChunkedSeekReader {
+    bytes: Cursor<Vec<u8>>,
+    max_read: usize,
+    bytes_read: Rc<Cell<usize>>,
+    max_requested: Rc<Cell<usize>>,
+}
+
+impl ChunkedSeekReader {
+    fn new(bytes: Vec<u8>, max_read: usize) -> Self {
+        Self {
+            bytes: Cursor::new(bytes),
+            max_read,
+            bytes_read: Rc::new(Cell::new(0)),
+            max_requested: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
+impl Read for ChunkedSeekReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.max_requested
+            .set(self.max_requested.get().max(buffer.len()));
+        let allowed = buffer.len().min(self.max_read);
+        let read = self.bytes.read(&mut buffer[..allowed])?;
+        self.bytes_read.set(self.bytes_read.get() + read);
+        Ok(read)
+    }
+}
+
+impl Seek for ChunkedSeekReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.bytes.seek(position)
     }
 }
 
@@ -274,6 +373,29 @@ fn risum_checks_cancellation_while_reading_main_metadata() {
 }
 
 #[test]
+fn risum_caps_each_main_metadata_read_at_64_kib() {
+    let root = tempfile::tempdir().unwrap();
+    let staging = JobStaging::open(root.path()).unwrap();
+    let main = json!({
+        "type": "risuModule",
+        "module": {"name": "x".repeat(192 * 1024), "assets": []}
+    });
+    let bytes = risum(&main, &[], true);
+    let mut reader = ChunkedSeekReader::new(bytes, usize::MAX);
+    let max_requested = Rc::clone(&reader.max_requested);
+    let mut large = limits();
+    large.max_metadata_bytes = 256 * 1024;
+
+    parse_risum(&mut reader, &staging, &large, &|| false).unwrap();
+
+    assert!(
+        max_requested.get() <= 64 * 1024,
+        "requested {} metadata bytes in one read",
+        max_requested.get()
+    );
+}
+
+#[test]
 fn json_card_extracts_data_uris_to_bounded_job_staging() {
     let root = tempfile::tempdir().unwrap();
     let staging = JobStaging::open(root.path()).unwrap();
@@ -372,6 +494,30 @@ fn json_card_rejects_invalid_data_uris_and_cleans_partial_payloads() {
         assert_eq!(error.kind, FormatErrorKind::InvalidFormat, "{uri}");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0, "{uri}");
     }
+}
+
+#[test]
+fn json_card_rejects_a_present_non_string_declared_extension() {
+    let root = tempfile::tempdir().unwrap();
+    let staging = JobStaging::open(root.path()).unwrap();
+    let document = json!({
+        "spec": "chara_card_v3",
+        "data": {"assets": [{
+            "ext": 7,
+            "uri": format!("data:image/png;base64,{}", STANDARD.encode([1, 2, 3]))
+        }]}
+    });
+
+    let error = parse_json_card(
+        &mut Cursor::new(serde_json::to_vec(&document).unwrap()),
+        &staging,
+        &limits(),
+        &|| false,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind, FormatErrorKind::InvalidFormat);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -550,6 +696,37 @@ fn extension_routing_is_case_insensitive_but_content_sniffing_is_authoritative()
 }
 
 #[test]
+fn content_sniffing_fills_its_prefix_across_short_reads() {
+    let module = risum(
+        &json!({"type":"risuModule","module":{"assets":[]}}),
+        &[],
+        true,
+    );
+    let jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
+
+    assert_eq!(
+        classify_content(
+            "misleading.jpeg",
+            &mut ChunkedSeekReader::new(module, 1),
+            &limits(),
+            &|| false,
+        )
+        .unwrap(),
+        ContentKind::RisuModule
+    );
+    assert_eq!(
+        classify_content(
+            "misleading.risum",
+            &mut ChunkedSeekReader::new(jpeg, 1),
+            &limits(),
+            &|| false,
+        )
+        .unwrap(),
+        ContentKind::JpegAsset
+    );
+}
+
+#[test]
 fn appended_charx_jpeg_requires_a_bounded_valid_v3_card() {
     let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
     let valid_card = br#"{"spec":"chara_card_v3","spec_version":"3.0","data":{"name":"fixture"}}"#;
@@ -599,6 +776,38 @@ fn appended_charx_jpeg_requires_a_bounded_valid_v3_card() {
 }
 
 #[test]
+fn appended_charx_probe_accepts_checked_zip64_count_and_offset() {
+    let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
+    let card = br#"{"spec":"chara_card_v3","data":{"name":"fixture"}}"#;
+    let zip64 = promote_classic_zip_to_zip64(charx(&[("card.json", card)]));
+    let mut appended = jpeg.to_vec();
+    appended.extend_from_slice(&zip64);
+
+    assert_eq!(
+        classify_content("card.jpeg", &mut Cursor::new(&appended), &limits(), &|| {
+            false
+        })
+        .unwrap(),
+        ContentKind::AppendedCharxJpeg
+    );
+
+    let locator_offset = appended.len() - 22 - 20 + 8;
+    let wrong_offset = u64::from_le_bytes(
+        appended[locator_offset..locator_offset + 8]
+            .try_into()
+            .unwrap(),
+    ) + 1;
+    appended[locator_offset..locator_offset + 8].copy_from_slice(&wrong_offset.to_le_bytes());
+    assert_eq!(
+        classify_content("card.jpeg", &mut Cursor::new(appended), &limits(), &|| {
+            false
+        })
+        .unwrap(),
+        ContentKind::JpegAsset
+    );
+}
+
+#[test]
 fn appended_charx_probe_rejects_an_archive_beyond_the_entry_limit() {
     let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
     let valid_card = br#"{"spec":"chara_card_v3","data":{"name":"fixture"}}"#;
@@ -617,4 +826,57 @@ fn appended_charx_probe_rejects_an_archive_beyond_the_entry_limit() {
         classify_content("card.jpeg", &mut Cursor::new(appended), &bounded, &|| false).unwrap(),
         ContentKind::JpegAsset
     );
+}
+
+#[test]
+fn charx_entry_preflight_rejects_before_reading_the_large_central_directory() {
+    let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
+    let mut appended = jpeg.to_vec();
+    appended.extend_from_slice(&charx_with_many_entries(2_000));
+    let mut bounded = limits();
+    bounded.max_container_entries = 4;
+    let mut reader = ChunkedSeekReader::new(appended, usize::MAX);
+    let bytes_read = Rc::clone(&reader.bytes_read);
+
+    assert_eq!(
+        classify_content("card.jpeg", &mut reader, &bounded, &|| false).unwrap(),
+        ContentKind::JpegAsset
+    );
+    assert!(
+        bytes_read.get() <= 70 * 1024,
+        "read {} bytes before rejecting the entry count",
+        bytes_read.get()
+    );
+}
+
+#[test]
+fn charx_entry_preflight_checks_cancellation_between_tail_reads() {
+    let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
+    let mut appended = jpeg.to_vec();
+    appended.extend_from_slice(&charx_with_many_entries(2_000));
+    let mut reader = ChunkedSeekReader::new(appended, 64 * 1024);
+    let bytes_read = Rc::clone(&reader.bytes_read);
+    let cancelled = || bytes_read.get() >= 64 * 1024;
+
+    let error = classify_content("card.jpeg", &mut reader, &limits(), &cancelled).unwrap_err();
+
+    assert_eq!(error.kind, FormatErrorKind::Cancelled);
+}
+
+#[test]
+fn charx_entry_preflight_caps_central_directory_bytes_before_ziparchive() {
+    let jpeg = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x02, 0xff, 0xd9];
+    let mut appended = jpeg.to_vec();
+    appended.extend_from_slice(&charx_with_many_entries(2_000));
+    let mut bounded = limits();
+    bounded.max_container_entries = 4_000;
+    bounded.max_container_directory_bytes = 1024;
+    let mut reader = ChunkedSeekReader::new(appended, usize::MAX);
+    let bytes_read = Rc::clone(&reader.bytes_read);
+
+    assert_eq!(
+        classify_content("card.jpeg", &mut reader, &bounded, &|| false).unwrap(),
+        ContentKind::JpegAsset
+    );
+    assert!(bytes_read.get() <= 70 * 1024);
 }

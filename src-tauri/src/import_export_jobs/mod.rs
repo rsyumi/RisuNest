@@ -19,5 +19,6 @@ pub struct ImportLimits {
     pub max_aggregate_payload_bytes: u64,
     pub max_payload_count: usize,
     pub max_container_entries: usize,
+    pub max_container_directory_bytes: u64,
     pub charx_probe_metadata_bytes: u64,
 }

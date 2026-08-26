@@ -65,11 +65,15 @@ pub fn parse_json_card(
         }
 
         let data_uri = parse_data_uri(&uri)?;
-        let declared_extension = asset
-            .get("ext")
-            .and_then(Value::as_str)
-            .map(validate_extension)
-            .transpose()?;
+        let declared_extension = match asset.get("ext") {
+            None => None,
+            Some(Value::String(extension)) => Some(validate_extension(extension)?),
+            Some(_) => {
+                return Err(FormatError::invalid(
+                    "JSON card asset declared extension must be a string",
+                ))
+            }
+        };
         let extension = declared_extension
             .clone()
             .unwrap_or_else(|| extension_for_media_type(data_uri.media_type).to_string());
