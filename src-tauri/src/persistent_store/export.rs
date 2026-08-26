@@ -89,18 +89,9 @@ pub(super) fn create(
     )?;
     root.remove("characters");
     root.remove("botPresets");
-    let modules = root.get("modules").cloned();
-    let loadouts = root.get("loadouts").cloned();
-    let plugins = root.get("plugins").cloned();
-    if modules.is_some() {
-        root.insert("modules".to_owned(), Value::Null);
-    }
-    if loadouts.is_some() {
-        root.insert("loadouts".to_owned(), Value::Null);
-    }
-    if plugins.is_some() {
-        root.insert("plugins".to_owned(), Value::Null);
-    }
+    let modules = take_root_block_value(&mut root, "modules");
+    let loadouts = take_root_block_value(&mut root, "loadouts");
+    let plugins = take_root_block_value(&mut root, "plugins");
     root.remove("pluginCustomStorage");
     let plugin_storage = plugin_storage_value(connection, &target.generation)?;
     if omit_account {
@@ -628,6 +619,10 @@ fn into_object(value: Value, message: &str) -> StoreResult<Map<String, Value>> {
         })
 }
 
+fn take_root_block_value(root: &mut Map<String, Value>, key: &str) -> Option<Value> {
+    root.get_mut(key).map(Value::take)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,6 +775,32 @@ mod tests {
         assert_eq!(blocks[6].value["chats"][0]["message"][0]["data"], "trash");
         assert_eq!(blocks[7].value["chats"][0]["message"][1]["data"], "world");
         assert_eq!(exported.bytes, fs::metadata(&exported.path).unwrap().len());
+    }
+
+    #[test]
+    fn moves_large_root_block_value_without_cloning_its_payload() {
+        let payload = "x".repeat(2 * 1024 * 1024);
+        let mut root = json!({
+            "before": 1,
+            "modules": [{ "payload": payload }],
+            "after": 2,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let original_payload = root["modules"][0]["payload"].as_str().unwrap().as_ptr();
+
+        let modules = take_root_block_value(&mut root, "modules").unwrap();
+
+        assert!(root["modules"].is_null());
+        assert_eq!(
+            root.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["before", "modules", "after"]
+        );
+        assert_eq!(
+            modules[0]["payload"].as_str().unwrap().as_ptr(),
+            original_payload
+        );
     }
 
     #[test]
