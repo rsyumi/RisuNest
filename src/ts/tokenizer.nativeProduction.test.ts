@@ -57,16 +57,26 @@ describe('strong ban native batch routing', () => {
     })
 
     it('uses one large native IDs batch and applies every ordered result', async () => {
-        harness.nativeBatch.mockImplementation(async (texts: string[]) =>
-            texts.map((_, index) => [10_000 + index]),
-        )
+        harness.nativeBatch.mockImplementation(async (candidate) => {
+            const texts = candidate.buildTexts()
+            expect(candidate.itemCount).toBe(texts.length)
+            expect(candidate.aggregateInputBytes()).toBe(
+                texts.reduce(
+                    (total: number, text: string) =>
+                        total + new TextEncoder().encode(text).byteLength,
+                    0,
+                ),
+            )
+            return texts.map((_: string, index: number) => [10_000 + index])
+        })
         const bias = { 42: -5 }
 
         const result = await strongBan('target', bias)
 
         expect(harness.nativeBatch).toHaveBeenCalledTimes(1)
-        const [texts, context] = harness.nativeBatch.mock.calls[0]
-        expect(texts.length).toBeGreaterThanOrEqual(100)
+        const [candidate, context] = harness.nativeBatch.mock.calls[0]
+        const texts = candidate.buildTexts()
+        expect(candidate.itemCount).toBeGreaterThanOrEqual(100)
         expect(context).toEqual({
             isTauri: expect.any(Boolean),
             aiModel: 'gpt-4',

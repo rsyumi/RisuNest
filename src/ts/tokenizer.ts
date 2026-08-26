@@ -532,15 +532,40 @@ export async function strongBan(data:string, bias:{[key:number]:number}) {
         }
     }
 
-    const texts:string[] = []
-    for(const char of banChars){
-        texts.push(char)
+    let banCharacterCount = 0
+    for(const _char of banChars){
+        banCharacterCount++
     }
-    for(const char of banChars){
-        texts.push(char)
-        for(const alt of charAlt){
-            texts.push(alt + char, char + alt)
-        }
+    const nativeBatchCandidate = {
+        itemCount: banCharacterCount * (2 + charAlt.length * 2),
+        aggregateInputBytes: () => {
+            const encoder = new TextEncoder()
+            let banCharacterBytes = 0
+            for(const char of banChars){
+                banCharacterBytes += encoder.encode(char).byteLength
+            }
+            const alternateBytes = charAlt.reduce(
+                (total, alternate) => total + encoder.encode(alternate).byteLength,
+                0,
+            )
+            return (
+                2 * (charAlt.length + 1) * banCharacterBytes +
+                2 * banCharacterCount * alternateBytes
+            )
+        },
+        buildTexts: () => {
+            const texts:string[] = []
+            for(const char of banChars){
+                texts.push(char)
+            }
+            for(const char of banChars){
+                texts.push(char)
+                for(const alt of charAlt){
+                    texts.push(alt + char, char + alt)
+                }
+            }
+            return texts
+        },
     }
 
     const db = getDatabase()
@@ -552,7 +577,7 @@ export async function strongBan(data:string, bias:{[key:number]:number}) {
             : null
     let nativeIds:number[][]|null = null
     try {
-        nativeIds = await tryNativeTokenizerIdsBatch(texts, {
+        nativeIds = await tryNativeTokenizerIdsBatch(nativeBatchCandidate, {
             isTauri,
             aiModel: db.aiModel,
             customTokenizer: db.customTokenizer,

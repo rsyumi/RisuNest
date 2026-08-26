@@ -6,6 +6,14 @@ import {
 } from './nativeTokenizer'
 
 export const NATIVE_TOKENIZER_MIN_BATCH_ITEMS = 100
+export const NATIVE_TOKENIZER_MAX_BATCH_ITEMS = 1_000
+export const NATIVE_TOKENIZER_MAX_AGGREGATE_INPUT_BYTES = 1_048_576
+
+export type NativeTokenizerIdsBatchCandidate = {
+    itemCount: number
+    aggregateInputBytes: () => number
+    buildTexts: () => string[]
+}
 
 export type ProductionNativeTokenizerContext = {
     isTauri: boolean
@@ -35,11 +43,14 @@ export function resolveProductionNativeTokenizerId(
 }
 
 export async function tryNativeTokenizerIdsBatch(
-    texts: string[],
+    candidate: NativeTokenizerIdsBatchCandidate,
     context: ProductionNativeTokenizerContext,
     invokeCommand?: NativeTokenizerInvoke,
 ): Promise<number[][] | null> {
-    if (texts.length < NATIVE_TOKENIZER_MIN_BATCH_ITEMS) {
+    if (
+        candidate.itemCount < NATIVE_TOKENIZER_MIN_BATCH_ITEMS ||
+        candidate.itemCount > NATIVE_TOKENIZER_MAX_BATCH_ITEMS
+    ) {
         return null
     }
     const tokenizerId = resolveProductionNativeTokenizerId(context)
@@ -50,6 +61,10 @@ export async function tryNativeTokenizerIdsBatch(
     if (route.kind !== 'native-tiktoken') {
         return null
     }
+    if (candidate.aggregateInputBytes() > NATIVE_TOKENIZER_MAX_AGGREGATE_INPUT_BYTES) {
+        return null
+    }
+    const texts = candidate.buildTexts()
     const response = await invokeNativeTokenizerBatch(route, texts, 'ids', invokeCommand)
     return response.mode === 'ids' ? response.ids : null
 }

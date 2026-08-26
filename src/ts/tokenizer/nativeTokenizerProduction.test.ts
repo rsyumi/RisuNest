@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+    NATIVE_TOKENIZER_MAX_AGGREGATE_INPUT_BYTES,
+    NATIVE_TOKENIZER_MAX_BATCH_ITEMS,
     NATIVE_TOKENIZER_MIN_BATCH_ITEMS,
     resolveProductionNativeTokenizerId,
     tryNativeTokenizerIdsBatch,
+    type NativeTokenizerIdsBatchCandidate,
     type ProductionNativeTokenizerContext,
 } from './nativeTokenizerProduction'
 import { NATIVE_TOKENIZER_FINGERPRINTS } from './nativeTokenizer'
@@ -14,25 +17,102 @@ const cl100kContext: ProductionNativeTokenizerContext = {
     modelTokenizerId: 'cl100k_base',
 }
 
+function candidate(texts: string[]): NativeTokenizerIdsBatchCandidate {
+    return {
+        itemCount: texts.length,
+        aggregateInputBytes: () =>
+            texts.reduce((total, text) => total + new TextEncoder().encode(text).byteLength, 0),
+        buildTexts: () => texts,
+    }
+}
+
 describe('production native tokenizer eligibility', () => {
     it('keeps small batches and Web on the existing JavaScript route', async () => {
         const invoke = vi.fn()
+        const smallMeasure = vi.fn(() => 0)
+        const smallBuild = vi.fn(() => [] as string[])
+        const webMeasure = vi.fn(() => 0)
+        const webBuild = vi.fn(() => [] as string[])
 
         await expect(
             tryNativeTokenizerIdsBatch(
-                Array.from({ length: NATIVE_TOKENIZER_MIN_BATCH_ITEMS - 1 }, (_, index) => `${index}`),
+                {
+                    itemCount: NATIVE_TOKENIZER_MIN_BATCH_ITEMS - 1,
+                    aggregateInputBytes: smallMeasure,
+                    buildTexts: smallBuild,
+                },
                 cl100kContext,
                 invoke,
             ),
         ).resolves.toBeNull()
         await expect(
             tryNativeTokenizerIdsBatch(
-                Array.from({ length: NATIVE_TOKENIZER_MIN_BATCH_ITEMS }, (_, index) => `${index}`),
+                {
+                    itemCount: NATIVE_TOKENIZER_MIN_BATCH_ITEMS,
+                    aggregateInputBytes: webMeasure,
+                    buildTexts: webBuild,
+                },
                 { ...cl100kContext, isTauri: false },
                 invoke,
             ),
         ).resolves.toBeNull()
         expect(invoke).not.toHaveBeenCalled()
+        expect(smallMeasure).not.toHaveBeenCalled()
+        expect(smallBuild).not.toHaveBeenCalled()
+        expect(webMeasure).not.toHaveBeenCalled()
+        expect(webBuild).not.toHaveBeenCalled()
+    })
+
+    it('rejects unsupported and oversized candidates before building a batch or invoking IPC', async () => {
+        const invoke = vi.fn()
+        const unsupportedMeasure = vi.fn(() => 0)
+        const unsupportedBuild = vi.fn(() => [] as string[])
+        const tooManyMeasure = vi.fn(() => 0)
+        const tooManyBuild = vi.fn(() => [] as string[])
+        const oversizedMeasure = vi.fn(() => NATIVE_TOKENIZER_MAX_AGGREGATE_INPUT_BYTES + 1)
+        const oversizedBuild = vi.fn(() => [] as string[])
+
+        await expect(
+            tryNativeTokenizerIdsBatch(
+                {
+                    itemCount: NATIVE_TOKENIZER_MIN_BATCH_ITEMS,
+                    aggregateInputBytes: unsupportedMeasure,
+                    buildTexts: unsupportedBuild,
+                },
+                { ...cl100kContext, modelTokenizerId: null },
+                invoke,
+            ),
+        ).resolves.toBeNull()
+        await expect(
+            tryNativeTokenizerIdsBatch(
+                {
+                    itemCount: NATIVE_TOKENIZER_MAX_BATCH_ITEMS + 1,
+                    aggregateInputBytes: tooManyMeasure,
+                    buildTexts: tooManyBuild,
+                },
+                cl100kContext,
+                invoke,
+            ),
+        ).resolves.toBeNull()
+        await expect(
+            tryNativeTokenizerIdsBatch(
+                {
+                    itemCount: NATIVE_TOKENIZER_MIN_BATCH_ITEMS,
+                    aggregateInputBytes: oversizedMeasure,
+                    buildTexts: oversizedBuild,
+                },
+                cl100kContext,
+                invoke,
+            ),
+        ).resolves.toBeNull()
+
+        expect(invoke).not.toHaveBeenCalled()
+        expect(unsupportedMeasure).not.toHaveBeenCalled()
+        expect(unsupportedBuild).not.toHaveBeenCalled()
+        expect(tooManyMeasure).not.toHaveBeenCalled()
+        expect(tooManyBuild).not.toHaveBeenCalled()
+        expect(oversizedMeasure).toHaveBeenCalledTimes(1)
+        expect(oversizedBuild).not.toHaveBeenCalled()
     })
 
     it.each([
@@ -86,7 +166,7 @@ describe('production native tokenizer eligibility', () => {
             ids,
         }))
 
-        await expect(tryNativeTokenizerIdsBatch(texts, cl100kContext, invoke)).resolves.toEqual(ids)
+        await expect(tryNativeTokenizerIdsBatch(candidate(texts), cl100kContext, invoke)).resolves.toEqual(ids)
         expect(invoke).toHaveBeenCalledTimes(1)
         expect(invoke).toHaveBeenCalledWith('tokenize_batch', {
             request: {
@@ -106,7 +186,12 @@ describe('production native tokenizer eligibility', () => {
 
         await expect(
             tryNativeTokenizerIdsBatch(
-                Array.from({ length: NATIVE_TOKENIZER_MIN_BATCH_ITEMS }, (_, index) => `${index}`),
+                candidate(
+                    Array.from(
+                        { length: NATIVE_TOKENIZER_MIN_BATCH_ITEMS },
+                        (_, index) => `${index}`,
+                    ),
+                ),
                 cl100kContext,
                 invoke,
             ),
