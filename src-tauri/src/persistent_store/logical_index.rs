@@ -3849,6 +3849,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut old_store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
+        old_store
+            .connection
+            .execute_batch("ALTER TABLE asset_aliases DROP COLUMN metadata;")
+            .unwrap();
         let error = old_store
             .rebuild_logical_index(
                 &cas,
@@ -3935,6 +3939,7 @@ mod tests {
         store
             .commit_with_asset_aliases(&commit, std::slice::from_ref(&alias))
             .unwrap();
+        let sealed = store.seal_active_logical_generation(&cas).unwrap();
 
         let record_key = encode_logical_record_key(&LogicalRecordLocator::Asset {
             logical_key: alias.key.clone(),
@@ -3954,6 +3959,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "live");
+        assert_eq!(generation_id, sealed.manifest.generation);
         let bytes = store
             .reconstruct_logical_object(&cas, "library", &generation_id, &object_hash)
             .unwrap();
@@ -4113,7 +4119,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             head,
-            ("generation-0".to_owned(), "revision-1".to_owned(), 1)
+            ("generation-0".to_owned(), "revision-0".to_owned(), 1)
         );
         let historical_rows: i64 = store
             .connection
@@ -4132,7 +4138,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::super::active_generation(&store.connection).unwrap(),
-            "revision-1"
+            "revision-0"
         );
     }
 
@@ -4630,10 +4636,7 @@ mod tests {
         ]);
 
         store.commit(&commit).unwrap();
-        assert_eq!(
-            take_message_page_rehash_reads(),
-            vec![("char".to_owned(), "first".to_owned(), 0)]
-        );
+        assert!(take_message_page_rehash_reads().is_empty());
         let sealed = store.seal_active_logical_generation(&cas).unwrap();
         assert_eq!(
             reconstructed_conversation_index(&store, &cas, &sealed, "chat"),

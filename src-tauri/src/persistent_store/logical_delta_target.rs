@@ -96,7 +96,7 @@ pub(crate) enum PersistentLogicalDeltaStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PeerBase {
+pub(super) struct PeerBase {
     generation_id: String,
     manifest_hash: String,
     generation_sequence: String,
