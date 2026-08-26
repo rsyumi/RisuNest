@@ -5,6 +5,7 @@ import { ActiveConversationSession, ConversationSessionStaleError } from '../sto
 import { beginPinnedConversationHistoryOperation } from '../storage/conversationHistoryOperation'
 import {
     adoptTriggeredChat,
+    createLivePromptHistoryCompatibilitySnapshot,
     ensurePromptHistoryEntryId,
     iteratePromptHistory,
     readLivePromptHistoryMessage,
@@ -198,6 +199,27 @@ describe('prompt history paging', () => {
         expect(session.matchesConversation('character-a', adopted)).toBe(true)
         const operation = beginPinnedConversationHistoryOperation(session)
         expect(operation.readLatest(1).messages[0].data).toBe('triggered')
+        operation.dispose()
+    })
+
+    it('retains and disposes the exact selected message references for compatibility', () => {
+        const messages = [message('first'), message('retained'), message('tail')]
+        const session = sessionFor(messages)
+        const operation = beginPinnedConversationHistoryOperation(session)
+        const selection = selectPromptHistory(operation)
+        const retained = messages[1]
+        const snapshot = createLivePromptHistoryCompatibilitySnapshot(messages, selection)
+
+        messages.splice(1, 1, message('replacement'))
+        retained.data = 'mutated-through-retained-reference'
+
+        expect(snapshot.entries.map((entry) => entry.message.data)).toEqual([
+            'first',
+            'mutated-through-retained-reference',
+            'tail',
+        ])
+        snapshot.dispose()
+        expect(snapshot.entries).toEqual([])
         operation.dispose()
     })
 })

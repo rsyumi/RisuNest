@@ -17,6 +17,11 @@ export interface PromptHistoryEntry {
     message: Message
 }
 
+export interface PromptHistoryCompatibilitySnapshot {
+    readonly entries: PromptHistoryEntry[]
+    dispose(): void
+}
+
 export function readLivePromptHistoryMessage(
     messages: Message[],
     entry: PromptHistoryEntry,
@@ -34,10 +39,47 @@ export function ensurePromptHistoryEntryId(
     createId: () => string,
 ): string {
     const liveMessage = readLivePromptHistoryMessage(messages, entry)
-    const id = liveMessage.chatId || createId()
-    liveMessage.chatId = id
+    const id = ensurePromptHistoryMessageId(liveMessage, createId)
     entry.message.chatId = id
     return id
+}
+
+export function ensurePromptHistoryMessageId(
+    message: Message,
+    createId: () => string,
+): string {
+    const id = message.chatId || createId()
+    message.chatId = id
+    return id
+}
+
+export function createLivePromptHistoryCompatibilitySnapshot(
+    messages: Message[],
+    selection: PromptHistorySelection,
+): PromptHistoryCompatibilitySnapshot {
+    const entries: PromptHistoryEntry[] = []
+    for (
+        let absoluteIndex = selection.startIndex;
+        absoluteIndex < selection.endIndex;
+        absoluteIndex += 1
+    ) {
+        const message = messages[absoluteIndex]
+        if (!message) {
+            throw new RangeError(`Prompt history message ${absoluteIndex} is missing`)
+        }
+        if (message.disabled === true || message.disabled === 'allBefore') continue
+        entries.push({
+            absoluteIndex,
+            relativeIndex: entries.length,
+            message,
+        })
+    }
+    return {
+        entries,
+        dispose() {
+            entries.length = 0
+        },
+    }
 }
 
 export function adoptTriggeredChat(target: Chat, replacement: Chat): Chat {

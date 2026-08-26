@@ -324,7 +324,13 @@ describe('sendChat prompt history characterization', () => {
         testState.pluginV2.editprocess.add((content) => {
             pluginCalls += 1
             if (pluginCalls === 1) {
-                liveChat.message[4].data = `plugin-mutated ${TAIL_TOKEN}`
+                const retainedSecondMessage = liveChat.message[4]
+                retainedSecondMessage.data = `plugin-mutated ${TAIL_TOKEN}`
+                liveChat.message.splice(4, 1, {
+                    role: 'char',
+                    data: `replacement must not enter prompt ${TAIL_TOKEN}`,
+                    chatId: 'replacement',
+                })
             }
             return `${content}|PLUGIN`
         })
@@ -340,5 +346,6 @@ describe('sendChat prompt history characterization', () => {
         expect(previewFormated[0].content).toBe('entry-000 CBS_REGEX|PLUGIN')
         expect(previewFormated[1].content).toBe('plugin-mutated CBS_REGEX|PLUGIN')
         expect(previewFormated[ACTIVE_MESSAGE_COUNT - 1].content).toBe('CBS_REGEX|PLUGIN')
+        expect(previewFormated.some((message) => message.memo === 'replacement')).toBe(false)
     })
 })
