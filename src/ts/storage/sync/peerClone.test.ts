@@ -79,6 +79,7 @@ describe('PeerClone facade', () => {
         expect(invoke).toHaveBeenCalledWith('peer_clone_claim_client', {
             endpoint: 'http://192.168.1.4:43123/',
             sessionId: '123e4567-e89b-12d3-a456-426614174000',
+            manifestId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
             claim,
         })
         expect(invoke).toHaveBeenCalledWith('peer_clone_download', {

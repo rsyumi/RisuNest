@@ -379,6 +379,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             await nativeInvoke('peer_clone_claim_client', {
                 endpoint: pairing.endpoint,
                 sessionId: pairing.sessionId,
+                manifestId: pairing.manifestId,
                 claim: pairing.claim,
             })
             await nativeInvoke('peer_clone_download', args)
