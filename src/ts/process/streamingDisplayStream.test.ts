@@ -199,4 +199,55 @@ describe('sendChat streaming response boundary', () => {
         expect(characters[0].chats[0].message[0].data).toBe('replacement')
         expect(result.completed).toBe(false)
     })
+
+    it('waits for active balanced processing to settle after the outer signal aborts', async () => {
+        const abortController = new AbortController()
+        let releaseSemantic!: () => void
+        const semanticReleased = new Promise<void>((resolve) => { releaseSemantic = resolve })
+        let markSemanticStarted!: () => void
+        const semanticStarted = new Promise<void>((resolve) => { markSemanticStarted = resolve })
+        let releasePendingRead!: (read: ReadableStreamReadResult<{ text: string }>) => void
+        let markPendingReadStarted!: () => void
+        const pendingReadStarted = new Promise<void>((resolve) => { markPendingReadStarted = resolve })
+        let readCount = 0
+        const cancel = vi.fn(async () => {
+            releasePendingRead?.({ done: true, value: undefined })
+        })
+        const reader: StreamingDisplayReader<{ text: string }> = {
+            cancel,
+            async read() {
+                if (readCount++ === 0) return { done: false, value: { text: 'late' } }
+                markPendingReadStarted()
+                return new Promise((resolve) => { releasePendingRead = resolve })
+            },
+        }
+        let committed = 'previous'
+
+        const consuming = consumeStreamingDisplayStream({
+            mode: 'balanced',
+            reader,
+            abortSignal: abortController.signal,
+            getSnapshot: (value) => value.text,
+            isOwned: () => true,
+            processSemantic: async ({ value }, context) => {
+                markSemanticStarted()
+                await semanticReleased
+                if (context.canCommit()) committed = value
+            },
+            processPreview: async () => {},
+        })
+        await Promise.all([semanticStarted, pendingReadStarted])
+
+        abortController.abort()
+        let settled = false
+        void consuming.then(() => { settled = true })
+        await new Promise((resolve) => setTimeout(resolve, 0))
+
+        expect(cancel).toHaveBeenCalled()
+        expect(settled).toBe(false)
+
+        releaseSemantic()
+        await expect(consuming).resolves.toMatchObject({ completed: false })
+        expect(committed).toBe('previous')
+    })
 })

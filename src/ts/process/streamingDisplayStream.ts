@@ -101,9 +101,11 @@ export async function consumeStreamingDisplayStream<T>(
             void options.reader.cancel().catch(() => {})
         },
     })
+    let abortPromise: Promise<void> | null = null
+    const abortDisplay = () => abortPromise ??= controller.abort()
     const abort = () => {
         aborted = true
-        void controller.abort()
+        void abortDisplay()
         void options.reader.cancel().catch(() => {})
     }
 
@@ -117,7 +119,7 @@ export async function consumeStreamingDisplayStream<T>(
             }
             catch (error) {
                 if (options.abortSignal.aborted || aborted) break
-                await controller.abort()
+                await abortDisplay()
                 throw error
             }
             if (read.value !== undefined) {
@@ -138,7 +140,7 @@ export async function consumeStreamingDisplayStream<T>(
                 await controller.finish()
             }
             else {
-                await controller.abort()
+                await abortDisplay()
             }
         }
         finally {
