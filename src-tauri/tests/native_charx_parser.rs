@@ -396,7 +396,7 @@ fn cancellation_can_interrupt_archive_directory_parsing_before_format_errors_win
     let directory = TempDir::new().expect("source directory");
     let staging = directory.path().join("jobs");
     fs::create_dir(&staging).expect("staging root");
-    let source = write_source(&directory, "cancel-directory.charx", b"not a ZIP archive");
+    let source = write_source(&directory, "cancel-directory.charx", &[0_u8; 128]);
     let checks = AtomicUsize::new(0);
 
     let error = inspect_charx_file(
