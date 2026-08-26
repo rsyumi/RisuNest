@@ -1,30 +1,54 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::{self, Metadata};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+use url::Url;
 
-#[derive(Debug, PartialEq, Eq)]
+const OUTPUT_LIMIT: usize = 64 * 1024;
+const OUTPUT_CHANNEL_CHUNKS: usize = 16;
+const SUPERVISOR_POLL: Duration = Duration::from_millis(25);
+const SYSTEM_POLL: Duration = Duration::from_millis(10);
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TunnelError {
     CloudflaredNotInstalled,
+    UntrustedCloudflared,
     InvalidOriginPort,
-    InvalidPersistentConfiguration,
     Launch(String),
+    Readiness {
+        reason: String,
+        output: String,
+    },
     Stop {
         process: Option<String>,
         peer_session: Option<String>,
     },
+    SupervisorUnavailable,
+    SupervisorTimeout,
 }
 
 impl fmt::Display for TunnelError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CloudflaredNotInstalled => formatter.write_str("cloudflared is not installed"),
-            Self::InvalidOriginPort => formatter.write_str("peer origin port must not be zero"),
-            Self::InvalidPersistentConfiguration => {
-                formatter.write_str("persistent tunnel configuration must not be empty")
+            Self::UntrustedCloudflared => {
+                formatter.write_str("cloudflared is not in a trusted installed location")
             }
+            Self::InvalidOriginPort => formatter.write_str("peer origin port must not be zero"),
             Self::Launch(error) => write!(formatter, "failed to launch cloudflared: {error}"),
+            Self::Readiness { reason, .. } => {
+                write!(formatter, "cloudflared did not become ready: {reason}")
+            }
             Self::Stop {
                 process,
                 peer_session,
@@ -34,11 +58,22 @@ impl fmt::Display for TunnelError {
                 process.as_deref().unwrap_or("ok"),
                 peer_session.as_deref().unwrap_or("ok")
             ),
+            Self::SupervisorUnavailable => formatter.write_str("tunnel supervisor is unavailable"),
+            Self::SupervisorTimeout => formatter.write_str("tunnel supervisor timed out"),
         }
     }
 }
 
 impl std::error::Error for TunnelError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedExecutable(PathBuf);
+
+impl VerifiedExecutable {
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
 
 fn cloudflared_executable_name() -> &'static str {
     if cfg!(windows) {
@@ -48,104 +83,398 @@ fn cloudflared_executable_name() -> &'static str {
     }
 }
 
-fn is_executable(path: &Path) -> bool {
-    if !path.is_file() {
+fn is_executable(metadata: &Metadata) -> bool {
+    if !metadata.is_file() || is_reparse_point(metadata) {
         return false;
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return path
-            .metadata()
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
+        metadata.permissions().mode() & 0o111 != 0
     }
 
     #[cfg(not(unix))]
     true
 }
 
+#[cfg(windows)]
+fn is_reparse_point(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn canonical_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter(|root| root.is_absolute())
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect()
+}
+
+fn verify_candidate(candidate: &Path, trusted_roots: &[PathBuf]) -> Option<VerifiedExecutable> {
+    if !candidate.is_absolute() {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(candidate).ok()?;
+    if !is_executable(&metadata) {
+        return None;
+    }
+    let canonical = fs::canonicalize(candidate).ok()?;
+    if !canonical.is_absolute() || !trusted_roots.iter().any(|root| canonical.starts_with(root)) {
+        return None;
+    }
+    Some(VerifiedExecutable(canonical))
+}
+
 fn discover_in_paths<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
-) -> Result<PathBuf, TunnelError> {
-    paths
-        .into_iter()
-        .map(|directory| directory.join(cloudflared_executable_name()))
-        .find(|candidate| is_executable(candidate))
-        .ok_or(TunnelError::CloudflaredNotInstalled)
-}
+    trusted_roots: &[PathBuf],
+) -> Result<VerifiedExecutable, TunnelError> {
+    let trusted_roots = canonical_roots(trusted_roots);
+    let mut found_untrusted = false;
 
-fn discover_cloudflared() -> Result<PathBuf, TunnelError> {
-    let Some(path) = env::var_os("PATH") else {
-        return Err(TunnelError::CloudflaredNotInstalled);
-    };
-    let paths = env::split_paths(&path).collect::<Vec<_>>();
-    discover_in_paths(paths.iter().map(PathBuf::as_path))
-}
+    for directory in paths {
+        if !directory.is_absolute() {
+            continue;
+        }
+        let candidate = directory.join(cloudflared_executable_name());
+        if fs::symlink_metadata(directory)
+            .map(|metadata| is_reparse_point(&metadata))
+            .unwrap_or(false)
+        {
+            if candidate.exists() {
+                found_untrusted = true;
+            }
+            continue;
+        }
+        if !candidate.exists() {
+            continue;
+        }
+        if let Some(executable) = verify_candidate(&candidate, &trusted_roots) {
+            return Ok(executable);
+        }
+        found_untrusted = true;
+    }
 
-trait CloudflaredDiscovery {
-    fn discover(&self) -> Result<PathBuf, TunnelError>;
-}
-
-struct PathCloudflaredDiscovery;
-
-impl CloudflaredDiscovery for PathCloudflaredDiscovery {
-    fn discover(&self) -> Result<PathBuf, TunnelError> {
-        discover_cloudflared()
+    if found_untrusted {
+        Err(TunnelError::UntrustedCloudflared)
+    } else {
+        Err(TunnelError::CloudflaredNotInstalled)
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum TunnelPersistence {
-    OneShotExperimental,
-    PersistentConfiguration,
+fn system_trusted_roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        [r"C:\Program Files", r"C:\Program Files (x86)"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    #[cfg(not(windows))]
+    {
+        ["/usr/bin", "/usr/local/bin"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+}
+
+trait CloudflaredDiscovery {
+    fn discover(&self) -> Result<VerifiedExecutable, TunnelError>;
+}
+
+struct PathCloudflaredDiscovery {
+    trusted_roots: Vec<PathBuf>,
+}
+
+impl PathCloudflaredDiscovery {
+    fn system() -> Self {
+        Self {
+            trusted_roots: system_trusted_roots(),
+        }
+    }
+}
+
+impl CloudflaredDiscovery for PathCloudflaredDiscovery {
+    fn discover(&self) -> Result<VerifiedExecutable, TunnelError> {
+        let Some(path) = env::var_os("PATH") else {
+            return Err(TunnelError::CloudflaredNotInstalled);
+        };
+        let paths = env::split_paths(&path).collect::<Vec<_>>();
+        discover_in_paths(paths.iter().map(PathBuf::as_path), &self.trusted_roots)
+    }
 }
 
 enum TunnelMode {
     Quick,
-    RemoteToken(String),
-    RemoteTokenFile(PathBuf),
-    Named { config: PathBuf, tunnel: String },
 }
 
 struct LaunchSpec {
     args: Vec<OsString>,
+    env_remove: [&'static str; 2],
     origin: String,
-    persistence: TunnelPersistence,
 }
 
-trait TunnelProcess {
-    fn stop(&mut self) -> Result<(), String>;
+impl TunnelMode {
+    fn launch(&self, origin_port: u16) -> Result<LaunchSpec, TunnelError> {
+        if origin_port == 0 {
+            return Err(TunnelError::InvalidOriginPort);
+        }
+
+        Ok(LaunchSpec {
+            args: vec![
+                "tunnel".into(),
+                "--no-autoupdate".into(),
+                "--url".into(),
+                format!("http://127.0.0.1:{origin_port}").into(),
+            ],
+            env_remove: ["TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE"],
+            origin: format!("http://127.0.0.1:{origin_port}"),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TunnelReady {
+    transport_url: Url,
+}
+
+trait TunnelProcess: Send + 'static {
+    fn wait_ready(
+        &mut self,
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Result<TunnelReady, TunnelError>;
+    fn poll_exit(&mut self, timeout: Duration) -> Result<Option<ExitStatus>, String>;
+    fn stop(&mut self, timeout: Duration) -> Result<(), String>;
 }
 
 trait TunnelProcessLauncher {
     type Process: TunnelProcess;
 
-    fn launch(&self, executable: &Path, launch: &LaunchSpec) -> Result<Self::Process, TunnelError>;
+    fn launch(
+        &self,
+        executable: &VerifiedExecutable,
+        launch: &LaunchSpec,
+    ) -> Result<Self::Process, TunnelError>;
 }
 
-trait PeerSession {
+trait PeerSession: Send + 'static {
     fn revoke(&mut self) -> Result<(), String>;
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedOutput {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.limit == 0 {
+            return;
+        }
+        if chunk.len() >= self.limit {
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&chunk[chunk.len() - self.limit..]);
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(self.limit);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+        }
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+fn parse_quick_tunnel_url(output: &str) -> Option<Url> {
+    let mut offset = 0;
+    while let Some(found) = output[offset..].find("https://") {
+        let start = offset + found;
+        let tail = &output[start..];
+        let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+        let candidate = tail[..end].trim_end_matches([')', ']', '}', ',', ';', '"', '\'']);
+        if let Ok(url) = Url::parse(candidate) {
+            let host = url.host_str().unwrap_or_default();
+            let prefix = host.strip_suffix(".trycloudflare.com");
+            if url.scheme() == "https"
+                && prefix.is_some_and(|value| !value.is_empty())
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port().is_none()
+                && matches!(url.path(), "" | "/")
+                && url.query().is_none()
+                && url.fragment().is_none()
+            {
+                return Some(url);
+            }
+        }
+        offset = start + "https://".len();
+    }
+    None
 }
 
 struct SystemTunnelProcess {
     child: Child,
+    output_rx: Receiver<Vec<u8>>,
+    output: BoundedOutput,
+}
+
+impl SystemTunnelProcess {
+    fn capture_output(&mut self) {
+        while let Ok(chunk) = self.output_rx.try_recv() {
+            self.output.push(&chunk);
+        }
+    }
+
+    fn exited_error(&self, status: ExitStatus) -> TunnelError {
+        TunnelError::Readiness {
+            reason: format!("process exited with {}", exit_label(status)),
+            output: self.output.text(),
+        }
+    }
 }
 
 impl TunnelProcess for SystemTunnelProcess {
-    fn stop(&mut self) -> Result<(), String> {
-        match self.child.try_wait().map_err(|error| error.to_string())? {
-            Some(_) => Ok(()),
-            None => {
-                self.child.kill().map_err(|error| error.to_string())?;
-                self.child
-                    .wait()
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+    fn wait_ready(
+        &mut self,
+        timeout: Duration,
+        output_limit: usize,
+    ) -> Result<TunnelReady, TunnelError> {
+        let deadline = Instant::now() + timeout;
+        self.output.limit = output_limit;
+
+        loop {
+            self.capture_output();
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| TunnelError::Readiness {
+                    reason: error.to_string(),
+                    output: self.output.text(),
+                })?
+            {
+                self.capture_output();
+                return Err(self.exited_error(status));
+            }
+            if let Some(transport_url) = parse_quick_tunnel_url(&self.output.text()) {
+                return Ok(TunnelReady { transport_url });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(TunnelError::Readiness {
+                    reason: "startup timeout".into(),
+                    output: self.output.text(),
+                });
+            }
+            let wait = deadline.saturating_duration_since(now).min(SYSTEM_POLL);
+            if let Ok(chunk) = self.output_rx.recv_timeout(wait) {
+                self.output.push(&chunk);
             }
         }
     }
+
+    fn poll_exit(&mut self, timeout: Duration) -> Result<Option<ExitStatus>, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.capture_output();
+            if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(SYSTEM_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+
+    fn stop(&mut self, timeout: Duration) -> Result<(), String> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.child.kill() {
+            if self
+                .child
+                .try_wait()
+                .map_err(|wait| wait.to_string())?
+                .is_some()
+            {
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("process stop timeout".into());
+            }
+            thread::sleep(SYSTEM_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+}
+
+fn exit_label(status: ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| format!("code {code}"))
+        .unwrap_or_else(|| "no exit code".into())
+}
+
+fn output_channel() -> (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) {
+    mpsc::sync_channel(OUTPUT_CHANNEL_CHUNKS)
+}
+
+fn spawn_reader(mut reader: impl Read + Send + 'static, output_tx: SyncSender<Vec<u8>>) {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if output_tx.send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 struct SystemTunnelProcessLauncher;
@@ -153,18 +482,89 @@ struct SystemTunnelProcessLauncher;
 impl TunnelProcessLauncher for SystemTunnelProcessLauncher {
     type Process = SystemTunnelProcess;
 
-    fn launch(&self, executable: &Path, launch: &LaunchSpec) -> Result<Self::Process, TunnelError> {
-        let child = Command::new(executable)
+    fn launch(
+        &self,
+        executable: &VerifiedExecutable,
+        launch: &LaunchSpec,
+    ) -> Result<Self::Process, TunnelError> {
+        let mut command = Command::new(executable.as_path());
+        command
             .args(&launch.args)
+            .env_remove(launch.env_remove[0])
+            .env_remove(launch.env_remove[1])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_no_window(&mut command);
+
+        let mut child = command
             .spawn()
             .map_err(|error| TunnelError::Launch(error.to_string()))?;
-        Ok(SystemTunnelProcess { child })
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| TunnelError::Launch("stdout pipe unavailable".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| TunnelError::Launch("stderr pipe unavailable".into()))?;
+        let (output_tx, output_rx) = output_channel();
+        spawn_reader(stdout, output_tx.clone());
+        spawn_reader(stderr, output_tx);
+        Ok(SystemTunnelProcess {
+            child,
+            output_rx,
+            output: BoundedOutput::new(OUTPUT_LIMIT),
+        })
+    }
+}
+
+#[cfg(windows)]
+fn configure_no_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_no_window(_command: &mut Command) {}
+
+struct TunnelStartFailure<P, S> {
+    error: TunnelError,
+    process: Option<P>,
+    peer_session: S,
+    process_cleanup_error: Option<String>,
+}
+
+impl<P, S> TunnelStartFailure<P, S> {
+    fn into_peer_session(self) -> Result<S, Self> {
+        if self.process.is_none() {
+            Ok(self.peer_session)
+        } else {
+            Err(self)
+        }
+    }
+}
+
+impl<P, S> TunnelStartFailure<P, S>
+where
+    P: TunnelProcess,
+{
+    fn retry_process_stop(&mut self, timeout: Duration) -> Result<(), String> {
+        let Some(process) = &mut self.process else {
+            return Ok(());
+        };
+        process.stop(timeout)?;
+        self.process = None;
+        self.process_cleanup_error = None;
+        Ok(())
     }
 }
 
 struct TunnelAdapter<D, L> {
     discovery: D,
     launcher: L,
+    startup_timeout: Duration,
+    startup_cleanup_timeout: Duration,
 }
 
 impl<D, L> TunnelAdapter<D, L> {
@@ -172,6 +572,8 @@ impl<D, L> TunnelAdapter<D, L> {
         Self {
             discovery,
             launcher,
+            startup_timeout: Duration::from_secs(15),
+            startup_cleanup_timeout: DEFAULT_STOP_TIMEOUT,
         }
     }
 }
@@ -186,501 +588,221 @@ where
         mode: TunnelMode,
         origin_port: u16,
         peer_session: S,
-    ) -> Result<RunningTunnel<L::Process, S>, TunnelError>
+    ) -> Result<RunningTunnel, TunnelStartFailure<L::Process, S>>
     where
         S: PeerSession,
     {
-        let launch = mode.launch(origin_port)?;
-        let executable = self.discovery.discover()?;
-        let process = self.launcher.launch(&executable, &launch)?;
-        Ok(RunningTunnel {
-            process,
-            peer_session,
-            active: true,
-        })
+        let launch = match mode.launch(origin_port) {
+            Ok(launch) => launch,
+            Err(error) => {
+                return Err(TunnelStartFailure {
+                    error,
+                    process: None,
+                    peer_session,
+                    process_cleanup_error: None,
+                });
+            }
+        };
+        let executable = match self.discovery.discover() {
+            Ok(executable) => executable,
+            Err(error) => {
+                return Err(TunnelStartFailure {
+                    error,
+                    process: None,
+                    peer_session,
+                    process_cleanup_error: None,
+                });
+            }
+        };
+        let mut process = match self.launcher.launch(&executable, &launch) {
+            Ok(process) => process,
+            Err(error) => {
+                return Err(TunnelStartFailure {
+                    error,
+                    process: None,
+                    peer_session,
+                    process_cleanup_error: None,
+                });
+            }
+        };
+        let ready = match process.wait_ready(self.startup_timeout, OUTPUT_LIMIT) {
+            Ok(ready) => ready,
+            Err(error) => {
+                let process_cleanup_error = process.stop(self.startup_cleanup_timeout).err();
+                return Err(TunnelStartFailure {
+                    error,
+                    process: process_cleanup_error.as_ref().map(|_| process),
+                    peer_session,
+                    process_cleanup_error,
+                });
+            }
+        };
+
+        Ok(RunningTunnel::spawn(process, peer_session, ready))
     }
 }
 
 impl TunnelAdapter<PathCloudflaredDiscovery, SystemTunnelProcessLauncher> {
     fn system() -> Self {
-        Self::new(PathCloudflaredDiscovery, SystemTunnelProcessLauncher)
+        Self::new(
+            PathCloudflaredDiscovery::system(),
+            SystemTunnelProcessLauncher,
+        )
     }
 }
 
-struct RunningTunnel<P, S>
-where
-    P: TunnelProcess,
-    S: PeerSession,
-{
-    process: P,
-    peer_session: S,
-    active: bool,
+enum SupervisorCommand {
+    Stop {
+        timeout: Duration,
+        response: Sender<Result<(), TunnelError>>,
+    },
 }
 
-impl<P, S> RunningTunnel<P, S>
-where
-    P: TunnelProcess,
-    S: PeerSession,
-{
-    fn stop(mut self) -> Result<(), TunnelError> {
-        self.stop_resources()
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TerminalReason {
+    ProcessExited(Option<i32>),
+    Stopped,
+}
 
-    fn stop_resources(&mut self) -> Result<(), TunnelError> {
-        if !self.active {
-            return Ok(());
+struct RunningTunnel {
+    ready: TunnelReady,
+    command_tx: Sender<SupervisorCommand>,
+    terminal_rx: Receiver<TerminalReason>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RunningTunnel {
+    fn spawn<P, S>(process: P, peer_session: S, ready: TunnelReady) -> Self
+    where
+        P: TunnelProcess,
+        S: PeerSession,
+    {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (terminal_tx, terminal_rx) = mpsc::channel();
+        let thread =
+            thread::spawn(move || supervise(process, peer_session, command_rx, terminal_tx));
+        Self {
+            ready,
+            command_tx,
+            terminal_rx,
+            thread: Some(thread),
         }
-        self.active = false;
-
-        let process = self.process.stop().err();
-        let peer_session = self.peer_session.revoke().err();
-        if process.is_none() && peer_session.is_none() {
-            Ok(())
-        } else {
-            Err(TunnelError::Stop {
-                process,
-                peer_session,
-            })
-        }
     }
-}
 
-impl<P, S> Drop for RunningTunnel<P, S>
-where
-    P: TunnelProcess,
-    S: PeerSession,
-{
-    fn drop(&mut self) {
-        let _ = self.stop_resources();
+    fn transport_url(&self) -> &Url {
+        &self.ready.transport_url
     }
-}
 
-impl TunnelMode {
-    fn launch(&self, origin_port: u16) -> Result<LaunchSpec, TunnelError> {
-        if origin_port == 0 {
-            return Err(TunnelError::InvalidOriginPort);
-        }
-        let invalid_persistent_configuration = match self {
-            Self::Quick => false,
-            Self::RemoteToken(token) => token.trim().is_empty(),
-            Self::RemoteTokenFile(path) => path.as_os_str().is_empty(),
-            Self::Named { config, tunnel } => {
-                config.as_os_str().is_empty() || tunnel.trim().is_empty()
+    fn stop(&mut self, timeout: Duration) -> Result<(), TunnelError> {
+        let (response, result) = mpsc::channel();
+        self.command_tx
+            .send(SupervisorCommand::Stop { timeout, response })
+            .map_err(|_| TunnelError::SupervisorUnavailable)?;
+        match result.recv_timeout(timeout.saturating_add(DEFAULT_STOP_TIMEOUT)) {
+            Ok(Ok(())) => {
+                self.join_supervisor();
+                Ok(())
             }
-        };
-        if invalid_persistent_configuration {
-            return Err(TunnelError::InvalidPersistentConfiguration);
+            Ok(Err(error)) => Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(TunnelError::SupervisorTimeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TunnelError::SupervisorUnavailable),
+        }
+    }
+
+    fn wait_terminal(&mut self, timeout: Duration) -> Result<TerminalReason, TunnelError> {
+        let reason = self
+            .terminal_rx
+            .recv_timeout(timeout)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => TunnelError::SupervisorTimeout,
+                mpsc::RecvTimeoutError::Disconnected => TunnelError::SupervisorUnavailable,
+            })?;
+        self.join_supervisor();
+        Ok(reason)
+    }
+
+    fn join_supervisor(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for RunningTunnel {
+    fn drop(&mut self) {
+        for _ in 0..3 {
+            if self.thread.is_none() || self.stop(DEFAULT_STOP_TIMEOUT).is_ok() {
+                break;
+            }
+            thread::sleep(SUPERVISOR_POLL);
+        }
+    }
+}
+
+fn supervise<P, S>(
+    mut process: P,
+    mut peer_session: S,
+    command_rx: Receiver<SupervisorCommand>,
+    terminal_tx: Sender<TerminalReason>,
+) where
+    P: TunnelProcess,
+    S: PeerSession,
+{
+    let mut process_done = false;
+    let mut peer_done = false;
+
+    loop {
+        if let Ok(SupervisorCommand::Stop { timeout, response }) = command_rx.try_recv() {
+            let process_error = if process_done {
+                None
+            } else {
+                match process.stop(timeout) {
+                    Ok(()) => {
+                        process_done = true;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            };
+            let peer_error = if peer_done {
+                None
+            } else {
+                match peer_session.revoke() {
+                    Ok(()) => {
+                        peer_done = true;
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            };
+            if process_done && peer_done {
+                let _ = response.send(Ok(()));
+                let _ = terminal_tx.send(TerminalReason::Stopped);
+                return;
+            }
+            let _ = response.send(Err(TunnelError::Stop {
+                process: process_error,
+                peer_session: peer_error,
+            }));
+            continue;
         }
 
-        let (args, persistence): (Vec<OsString>, TunnelPersistence) = match self {
-            Self::Quick => (
-                vec![
-                    "tunnel".into(),
-                    "--no-autoupdate".into(),
-                    "--url".into(),
-                    format!("http://127.0.0.1:{origin_port}").into(),
-                ],
-                TunnelPersistence::OneShotExperimental,
-            ),
-            Self::RemoteToken(token) => (
-                vec![
-                    "tunnel".into(),
-                    "--no-autoupdate".into(),
-                    "run".into(),
-                    "--token".into(),
-                    token.clone().into(),
-                ],
-                TunnelPersistence::PersistentConfiguration,
-            ),
-            Self::RemoteTokenFile(path) => (
-                vec![
-                    "tunnel".into(),
-                    "--no-autoupdate".into(),
-                    "run".into(),
-                    "--token-file".into(),
-                    path.as_os_str().to_owned(),
-                ],
-                TunnelPersistence::PersistentConfiguration,
-            ),
-            Self::Named { config, tunnel } => (
-                vec![
-                    "tunnel".into(),
-                    "--no-autoupdate".into(),
-                    "--config".into(),
-                    config.as_os_str().to_owned(),
-                    "run".into(),
-                    tunnel.clone().into(),
-                ],
-                TunnelPersistence::PersistentConfiguration,
-            ),
-        };
-
-        Ok(LaunchSpec {
-            args,
-            origin: format!("http://127.0.0.1:{origin_port}"),
-            persistence,
-        })
+        if !process_done {
+            if let Ok(Some(status)) = process.poll_exit(SUPERVISOR_POLL) {
+                process_done = true;
+                if !peer_done && peer_session.revoke().is_ok() {
+                    peer_done = true;
+                }
+                if peer_done {
+                    let _ = terminal_tx.send(TerminalReason::ProcessExited(status.code()));
+                    return;
+                }
+            }
+        } else {
+            thread::sleep(SUPERVISOR_POLL);
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
-    use tempfile::tempdir;
-
-    #[derive(Default)]
-    struct FakeState {
-        launches: Vec<(PathBuf, Vec<OsString>)>,
-        process_stops: usize,
-        session_revokes: usize,
-    }
-
-    struct FakeDiscovery {
-        executable: Option<PathBuf>,
-    }
-
-    impl CloudflaredDiscovery for FakeDiscovery {
-        fn discover(&self) -> Result<PathBuf, TunnelError> {
-            self.executable
-                .clone()
-                .ok_or(TunnelError::CloudflaredNotInstalled)
-        }
-    }
-
-    struct FakeLauncher {
-        state: Arc<Mutex<FakeState>>,
-        stop_error: Option<String>,
-    }
-
-    impl TunnelProcessLauncher for FakeLauncher {
-        type Process = FakeProcess;
-
-        fn launch(
-            &self,
-            executable: &Path,
-            launch: &LaunchSpec,
-        ) -> Result<Self::Process, TunnelError> {
-            self.state
-                .lock()
-                .unwrap()
-                .launches
-                .push((executable.to_owned(), launch.args.clone()));
-            Ok(FakeProcess {
-                state: Arc::clone(&self.state),
-                stop_error: self.stop_error.clone(),
-            })
-        }
-    }
-
-    struct FakeProcess {
-        state: Arc<Mutex<FakeState>>,
-        stop_error: Option<String>,
-    }
-
-    impl TunnelProcess for FakeProcess {
-        fn stop(&mut self) -> Result<(), String> {
-            self.state.lock().unwrap().process_stops += 1;
-            match &self.stop_error {
-                Some(error) => Err(error.clone()),
-                None => Ok(()),
-            }
-        }
-    }
-
-    struct FakePeerSession {
-        state: Arc<Mutex<FakeState>>,
-    }
-
-    impl PeerSession for FakePeerSession {
-        fn revoke(&mut self) -> Result<(), String> {
-            self.state.lock().unwrap().session_revokes += 1;
-            Ok(())
-        }
-    }
-
-    fn make_executable(path: &Path) {
-        fs::write(path, b"test executable").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(path, permissions).unwrap();
-        }
-    }
-
-    #[test]
-    fn quick_tunnel_is_one_shot_and_uses_only_the_loopback_origin() {
-        let launch = TunnelMode::Quick.launch(32145).unwrap();
-
-        assert_eq!(
-            launch.args,
-            [
-                "tunnel",
-                "--no-autoupdate",
-                "--url",
-                "http://127.0.0.1:32145"
-            ]
-        );
-        assert_eq!(launch.persistence, TunnelPersistence::OneShotExperimental);
-    }
-
-    #[test]
-    fn tunnel_rejects_a_zero_origin_port() {
-        assert!(matches!(
-            TunnelMode::Quick.launch(0),
-            Err(TunnelError::InvalidOriginPort)
-        ));
-    }
-
-    #[test]
-    fn remotely_managed_token_tunnel_is_a_persistent_configuration() {
-        let launch = TunnelMode::RemoteToken("tunnel-token".into())
-            .launch(32145)
-            .unwrap();
-
-        assert_eq!(
-            launch.args,
-            [
-                "tunnel",
-                "--no-autoupdate",
-                "run",
-                "--token",
-                "tunnel-token"
-            ]
-        );
-        assert_eq!(
-            launch.persistence,
-            TunnelPersistence::PersistentConfiguration
-        );
-        assert_eq!(launch.origin, "http://127.0.0.1:32145");
-    }
-
-    #[test]
-    fn remotely_managed_token_file_is_a_persistent_configuration() {
-        let launch = TunnelMode::RemoteTokenFile(PathBuf::from("configured-token.txt"))
-            .launch(32145)
-            .unwrap();
-
-        assert_eq!(
-            launch.args,
-            [
-                "tunnel",
-                "--no-autoupdate",
-                "run",
-                "--token-file",
-                "configured-token.txt"
-            ]
-        );
-        assert_eq!(
-            launch.persistence,
-            TunnelPersistence::PersistentConfiguration
-        );
-        assert_eq!(launch.origin, "http://127.0.0.1:32145");
-    }
-
-    #[test]
-    fn named_tunnel_uses_an_explicit_persistent_config() {
-        let launch = TunnelMode::Named {
-            config: PathBuf::from("configured-tunnel.yml"),
-            tunnel: "risunest-sync".into(),
-        }
-        .launch(32145)
-        .unwrap();
-
-        assert_eq!(
-            launch.args,
-            [
-                "tunnel",
-                "--no-autoupdate",
-                "--config",
-                "configured-tunnel.yml",
-                "run",
-                "risunest-sync"
-            ]
-        );
-        assert_eq!(
-            launch.persistence,
-            TunnelPersistence::PersistentConfiguration
-        );
-        assert_eq!(launch.origin, "http://127.0.0.1:32145");
-    }
-
-    #[test]
-    fn persistent_tunnels_reject_empty_configuration() {
-        let invalid_modes = [
-            TunnelMode::RemoteToken("   ".into()),
-            TunnelMode::RemoteTokenFile(PathBuf::new()),
-            TunnelMode::Named {
-                config: PathBuf::from("configured-tunnel.yml"),
-                tunnel: " ".into(),
-            },
-            TunnelMode::Named {
-                config: PathBuf::new(),
-                tunnel: "risunest-sync".into(),
-            },
-        ];
-
-        for mode in invalid_modes {
-            assert!(mode.launch(32145).is_err());
-        }
-    }
-
-    #[test]
-    fn discovery_accepts_only_an_existing_cloudflared_executable() {
-        let directory = tempdir().unwrap();
-        make_executable(&directory.path().join(cloudflared_executable_name()));
-        make_executable(&directory.path().join("cloudflared-update.exe"));
-
-        let discovered = discover_in_paths([directory.path()]).unwrap();
-
-        assert_eq!(
-            discovered,
-            directory.path().join(cloudflared_executable_name())
-        );
-    }
-
-    #[test]
-    fn discovery_does_not_install_or_accept_similarly_named_files() {
-        let directory = tempdir().unwrap();
-        make_executable(&directory.path().join("cloudflared-installer.exe"));
-        make_executable(&directory.path().join("cloudflared-update.exe"));
-
-        assert_eq!(
-            discover_in_paths([directory.path()]),
-            Err(TunnelError::CloudflaredNotInstalled)
-        );
-    }
-
-    #[test]
-    fn adapter_launches_only_the_discovered_executable() {
-        let state = Arc::new(Mutex::new(FakeState::default()));
-        let adapter = TunnelAdapter::new(
-            FakeDiscovery {
-                executable: Some(PathBuf::from("C:/Tools/cloudflared.exe")),
-            },
-            FakeLauncher {
-                state: Arc::clone(&state),
-                stop_error: None,
-            },
-        );
-
-        let running = adapter
-            .start(
-                TunnelMode::Quick,
-                32145,
-                FakePeerSession {
-                    state: Arc::clone(&state),
-                },
-            )
-            .unwrap();
-
-        assert_eq!(
-            state.lock().unwrap().launches,
-            [(
-                PathBuf::from("C:/Tools/cloudflared.exe"),
-                vec![
-                    "tunnel".into(),
-                    "--no-autoupdate".into(),
-                    "--url".into(),
-                    "http://127.0.0.1:32145".into(),
-                ]
-            )]
-        );
-        running.stop().unwrap();
-    }
-
-    #[test]
-    fn missing_executable_leaves_the_peer_session_unchanged() {
-        let state = Arc::new(Mutex::new(FakeState::default()));
-        let adapter = TunnelAdapter::new(
-            FakeDiscovery { executable: None },
-            FakeLauncher {
-                state: Arc::clone(&state),
-                stop_error: None,
-            },
-        );
-
-        let result = adapter.start(
-            TunnelMode::Quick,
-            32145,
-            FakePeerSession {
-                state: Arc::clone(&state),
-            },
-        );
-
-        assert!(matches!(result, Err(TunnelError::CloudflaredNotInstalled)));
-        let state = state.lock().unwrap();
-        assert!(state.launches.is_empty());
-        assert_eq!(state.session_revokes, 0);
-    }
-
-    #[test]
-    fn stop_attempts_tunnel_shutdown_and_peer_revoke_together() {
-        let state = Arc::new(Mutex::new(FakeState::default()));
-        let adapter = TunnelAdapter::new(
-            FakeDiscovery {
-                executable: Some(PathBuf::from("cloudflared.exe")),
-            },
-            FakeLauncher {
-                state: Arc::clone(&state),
-                stop_error: Some("process stop failed".into()),
-            },
-        );
-        let running = adapter
-            .start(
-                TunnelMode::Quick,
-                32145,
-                FakePeerSession {
-                    state: Arc::clone(&state),
-                },
-            )
-            .unwrap();
-
-        let error = running.stop().unwrap_err();
-
-        assert_eq!(
-            error,
-            TunnelError::Stop {
-                process: Some("process stop failed".into()),
-                peer_session: None,
-            }
-        );
-        let state = state.lock().unwrap();
-        assert_eq!(state.process_stops, 1);
-        assert_eq!(state.session_revokes, 1);
-    }
-
-    #[test]
-    fn dropping_a_running_tunnel_stops_and_revokes_both_resources() {
-        let state = Arc::new(Mutex::new(FakeState::default()));
-        let adapter = TunnelAdapter::new(
-            FakeDiscovery {
-                executable: Some(PathBuf::from("cloudflared.exe")),
-            },
-            FakeLauncher {
-                state: Arc::clone(&state),
-                stop_error: None,
-            },
-        );
-
-        drop(
-            adapter
-                .start(
-                    TunnelMode::Quick,
-                    32145,
-                    FakePeerSession {
-                        state: Arc::clone(&state),
-                    },
-                )
-                .unwrap(),
-        );
-
-        let state = state.lock().unwrap();
-        assert_eq!(state.process_stops, 1);
-        assert_eq!(state.session_revokes, 1);
-    }
-}
+mod tests;
