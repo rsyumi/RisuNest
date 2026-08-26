@@ -5,6 +5,8 @@ import type {
     AssetAliasListQuery,
     AssetRepositoryMigrationInput,
     AssetOwnerLocator,
+    ColdAlias,
+    ColdPayloadMigrationInput,
     CharacterPage,
     CharacterQuery,
     ConversationPage,
@@ -46,12 +48,21 @@ export function createMutationGatedPersistentDataStore(
         listAssetAliases: (input: AssetAliasListQuery) => store.listAssetAliases(input),
         readAssetRepositoryAuthority: () => store.readAssetRepositoryAuthority(),
         readAssetOwnerHead: (owner: AssetOwnerLocator) => store.readAssetOwnerHead(owner),
+        readColdPayloadAuthority: () => store.readColdPayloadAuthority(),
+        readColdAlias: (key: string) => store.readColdAlias(key),
+        listColdAliases: () => store.listColdAliases(),
         commitAssetAlias: (alias: AssetAlias, expectedRevision: DataRevision) =>
             gate.runWrite(() => store.commitAssetAlias(alias, expectedRevision)),
         deleteAssetAlias: (identity: AssetAliasIdentity, expectedRevision: DataRevision) =>
             gate.runWrite(() => store.deleteAssetAlias(identity, expectedRevision)),
         activateAssetRepositoryMigration: (input: AssetRepositoryMigrationInput) =>
             gate.runTransition(() => store.activateAssetRepositoryMigration(input)),
+        commitColdAlias: (alias: ColdAlias, expectedRevision: DataRevision) =>
+            gate.runWrite(() => store.commitColdAlias(alias, expectedRevision)),
+        deleteColdAlias: (key: string, expectedRevision: DataRevision) =>
+            gate.runWrite(() => store.deleteColdAlias(key, expectedRevision)),
+        activateColdPayloadMigration: (input: ColdPayloadMigrationInput) =>
+            gate.runTransition(() => store.activateColdPayloadMigration(input)),
         commit: (input: WorkingSetCommit) => gate.runWrite(() => store.commit(input)),
         replaceFromDatabase: (
             database: Database,

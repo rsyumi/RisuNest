@@ -441,6 +441,9 @@ export interface PersistentRevisionReader {
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
     readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
+    readColdPayloadAuthority(): Promise<Versioned<ColdPayloadAuthorityState>>
+    readColdAlias(key: string): Promise<Versioned<ColdAlias> | null>
+    listColdAliases(): Promise<Versioned<ColdAlias[]>>
 }
 
 export interface PersistentRevisionLease extends PersistentRevisionReader {
@@ -465,6 +468,9 @@ export interface PersistentDataStore {
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
     readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
+    readColdPayloadAuthority(): Promise<Versioned<ColdPayloadAuthorityState>>
+    readColdAlias(key: string): Promise<Versioned<ColdAlias> | null>
+    listColdAliases(): Promise<Versioned<ColdAlias[]>>
     commitAssetAlias(alias: AssetAlias, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
     deleteAssetAlias(
         identity: AssetAliasIdentity,
@@ -472,6 +478,11 @@ export interface PersistentDataStore {
     ): Promise<{ revision: DataRevision }>
     activateAssetRepositoryMigration(
         input: AssetRepositoryMigrationInput,
+    ): Promise<{ revision: DataRevision }>
+    commitColdAlias(alias: ColdAlias, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
+    deleteColdAlias(key: string, expectedRevision: DataRevision): Promise<{ revision: DataRevision }>
+    activateColdPayloadMigration(
+        input: ColdPayloadMigrationInput,
     ): Promise<{ revision: DataRevision }>
     commit(input: WorkingSetCommit): Promise<{ revision: DataRevision }>
     replaceFromDatabase(

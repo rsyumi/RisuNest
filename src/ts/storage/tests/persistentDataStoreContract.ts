@@ -3,6 +3,7 @@ import type { Database, groupChat } from '../database.svelte'
 import type {
     AssetAlias,
     AssetOwnerHead,
+    ColdAlias,
     PersistentDataStore,
 } from '../persistentDataStore'
 import { RevisionConflictError, SnapshotReleasedError } from '../persistentDataStore'
@@ -667,6 +668,163 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             expect(await store.readAssetRepositoryAuthority()).toEqual({
                 revision: changed.revision,
                 value: { format: 'legacy' },
+            })
+        })
+
+        it('activates cold aliases and v2 authority in one revision', async () => {
+            const { store, reopen } = await createHarness()
+            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const lease = await store.acquireRevision(initial.revision)
+            const aliases: ColdAlias[] = [
+                {
+                    key: 'conversation/alpha',
+                    objectHash: '31'.repeat(32),
+                    size: 17,
+                    metadata: { codec: 'gzip', nested: { version: 1 } },
+                },
+                {
+                    key: 'conversation/empty',
+                    objectHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+                    size: 0,
+                    metadata: {},
+                },
+            ]
+
+            expect(await store.readColdPayloadAuthority()).toEqual({
+                revision: initial.revision,
+                value: { format: 'legacy' },
+            })
+            const activated = await store.activateColdPayloadMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'cold-atomic',
+                compatibilityHash: '42'.repeat(32),
+                coldAliases: aliases,
+            })
+
+            expect(await store.readColdPayloadAuthority()).toEqual({
+                revision: activated.revision,
+                value: {
+                    format: 'v2',
+                    migrationId: 'cold-atomic',
+                    compatibilityHash: '42'.repeat(32),
+                },
+            })
+            expect(await store.listColdAliases()).toEqual({
+                revision: activated.revision,
+                value: aliases,
+            })
+            expect(await store.readColdAlias('conversation/alpha')).toEqual({
+                revision: activated.revision,
+                value: aliases[0],
+            })
+            expect(await lease.readColdPayloadAuthority()).toEqual({
+                revision: initial.revision,
+                value: { format: 'legacy' },
+            })
+            expect(await lease.readColdAlias('conversation/alpha')).toBeNull()
+            await lease.release()
+
+            const reopened = await reopen()
+            expect(await reopened.readColdPayloadAuthority()).toEqual({
+                revision: activated.revision,
+                value: {
+                    format: 'v2',
+                    migrationId: 'cold-atomic',
+                    compatibilityHash: '42'.repeat(32),
+                },
+            })
+            expect(await reopened.listColdAliases()).toEqual({
+                revision: activated.revision,
+                value: aliases,
+            })
+        })
+
+        it('copy-on-write isolates cold alias commits and deletes from a pinned revision', async () => {
+            const { store } = await createHarness()
+            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const original: ColdAlias[] = [
+                {
+                    key: 'conversation/alpha',
+                    objectHash: '51'.repeat(32),
+                    size: 10,
+                    metadata: { codec: 'gzip' },
+                },
+                {
+                    key: 'conversation/beta',
+                    objectHash: '52'.repeat(32),
+                    size: 20,
+                    metadata: { codec: 'gzip' },
+                },
+            ]
+            const activated = await store.activateColdPayloadMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'cold-cow',
+                compatibilityHash: '53'.repeat(32),
+                coldAliases: original,
+            })
+            const lease = await store.acquireRevision(activated.revision)
+            const replacement: ColdAlias = {
+                key: original[0].key,
+                objectHash: '54'.repeat(32),
+                size: 30,
+                metadata: { codec: 'gzip', arbitrary: ['kept', 2, true] },
+            }
+
+            const committed = await store.commitColdAlias(replacement, activated.revision)
+            const deleted = await store.deleteColdAlias(original[1].key, committed.revision)
+
+            expect(await store.listColdAliases()).toEqual({
+                revision: deleted.revision,
+                value: [replacement],
+            })
+            expect(await lease.listColdAliases()).toEqual({
+                revision: activated.revision,
+                value: original,
+            })
+            expect(await lease.readColdAlias(original[0].key)).toEqual({
+                revision: activated.revision,
+                value: original[0],
+            })
+            expect(await lease.readColdAlias(original[1].key)).toEqual({
+                revision: activated.revision,
+                value: original[1],
+            })
+            await lease.release()
+        })
+
+        it('rejects legacy cold mutations and invalid migration batches atomically', async () => {
+            const { store } = await createHarness()
+            const initial = await store.replaceFromDatabase(structuredClone(fixtureDatabase))
+            const valid: ColdAlias = {
+                key: 'conversation/valid',
+                objectHash: '61'.repeat(32),
+                size: 1,
+                metadata: {},
+            }
+
+            await expect(store.commitColdAlias(valid, initial.revision)).rejects.toThrow('v2')
+            await expect(store.deleteColdAlias(valid.key, initial.revision)).rejects.toThrow('v2')
+            await expect(store.activateColdPayloadMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'cold-null-payload',
+                compatibilityHash: '62'.repeat(32),
+                coldAliases: [{ ...valid, objectHash: null }],
+            })).rejects.toThrow('objectHash')
+            await expect(store.activateColdPayloadMigration({
+                sourceRevision: initial.revision,
+                migrationId: 'cold-duplicate',
+                compatibilityHash: '63'.repeat(32),
+                coldAliases: [valid, { ...valid, objectHash: '64'.repeat(32) }],
+            })).rejects.toThrow('Duplicate cold alias')
+
+            expect((await store.readRoot()).revision).toBe(initial.revision)
+            expect(await store.readColdPayloadAuthority()).toEqual({
+                revision: initial.revision,
+                value: { format: 'legacy' },
+            })
+            expect(await store.listColdAliases()).toEqual({
+                revision: initial.revision,
+                value: [],
             })
         })
 

@@ -21,6 +21,12 @@ function makeStore() {
         readConversationWindow: vi.fn(),
         queryPluginStorage: vi.fn(),
         readPluginStorage: vi.fn(),
+        readColdPayloadAuthority: vi.fn(),
+        readColdAlias: vi.fn(),
+        listColdAliases: vi.fn(),
+        commitColdAlias: vi.fn(),
+        deleteColdAlias: vi.fn(),
+        activateColdPayloadMigration: vi.fn(),
     } as unknown as PersistentDataStore
 }
 
@@ -99,5 +105,36 @@ describe('createMutationGatedPersistentDataStore', () => {
         const gated = createMutationGatedPersistentDataStore(store, gate)
 
         await expect(gated.commit({ expectedRevision: 1 })).rejects.toBe(failure)
+    })
+
+    it('gates cold alias writes and cold authority transitions', async () => {
+        const store = makeStore()
+        const gate = {
+            runWrite: vi.fn(async <T>(operation: () => Promise<T>) => operation()),
+            runKeyedWrite: vi.fn(async <T>(_key: string, operation: () => Promise<T>) => operation()),
+            runTransition: vi.fn(async <T>(operation: () => Promise<T>) => operation()),
+        } as StorageMutationGate
+        const alias = {
+            key: 'cold/item',
+            objectHash: 'ab'.repeat(32),
+            size: 1,
+            metadata: {},
+        }
+        vi.mocked(store.commitColdAlias).mockResolvedValue({ revision: 2 })
+        vi.mocked(store.deleteColdAlias).mockResolvedValue({ revision: 3 })
+        vi.mocked(store.activateColdPayloadMigration).mockResolvedValue({ revision: 4 })
+        const gated = createMutationGatedPersistentDataStore(store, gate)
+
+        await gated.commitColdAlias(alias, 1)
+        await gated.deleteColdAlias(alias.key, 2)
+        await gated.activateColdPayloadMigration({
+            sourceRevision: 3,
+            migrationId: 'migration',
+            compatibilityHash: 'cd'.repeat(32),
+            coldAliases: [alias],
+        })
+
+        expect(gate.runWrite).toHaveBeenCalledTimes(2)
+        expect(gate.runTransition).toHaveBeenCalledOnce()
     })
 })

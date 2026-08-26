@@ -402,6 +402,43 @@ async function createVersion9AliasDatabase(
     database.close()
 }
 
+async function createVersion11ColdlessDatabase(
+    indexedDB: IDBFactory,
+    databaseName: string,
+): Promise<void> {
+    await createVersion7Database(indexedDB, databaseName)
+    const openRequest = indexedDB.open(databaseName, 11)
+    openRequest.onupgradeneeded = () => {
+        const aliases = openRequest.result.createObjectStore('assetAliases', { keyPath: 'key' })
+        aliases.createIndex('byGeneration', 'generation')
+        aliases.createIndex('byGenerationKindKey', ['generation', 'value.kind', 'value.key'])
+        const heads = openRequest.result.createObjectStore('assetOwnerHeads', { keyPath: 'key' })
+        heads.createIndex('byGeneration', 'generation')
+        const authority = openRequest.result.createObjectStore('assetRepositoryAuthority', {
+            keyPath: 'key',
+        })
+        authority.createIndex('byGeneration', 'generation')
+        authority.put({
+            key: 'revision-5',
+            generation: 'revision-5',
+            value: { format: 'legacy' },
+        })
+        authority.put({
+            key: 'snapshot-5-migrated',
+            generation: 'snapshot-5-migrated',
+            value: { format: 'legacy' },
+        })
+    }
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        openRequest.onsuccess = () => resolve(openRequest.result)
+        openRequest.onerror = () => reject(openRequest.error)
+    })
+    const transaction = database.transaction('meta', 'readwrite')
+    transaction.objectStore('meta').put({ key: 'schemaVersion', value: 11 })
+    await completeTransaction(transaction)
+    database.close()
+}
+
 persistentDataStoreContract(async () => {
     const indexedDB = new IDBFactory()
     const databaseName = `persistent-store-contract-${databaseSequence++}`
@@ -586,7 +623,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(11)
+        expect(database.version).toBe(12)
         const transaction = database.transaction(
             ['assetAliases', 'assetOwnerHeads', 'assetRepositoryAuthority'],
             'readonly',
@@ -636,7 +673,7 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         }
 
         const database = await openDatabase(indexedDB, databaseName)
-        expect(database.version).toBe(11)
+        expect(database.version).toBe(12)
         const transaction = database.transaction('assetOwnerHeads', 'readonly')
         const heads = transaction.objectStore('assetOwnerHeads')
         expect(heads.indexNames.contains('byGeneration')).toBe(true)
@@ -647,6 +684,85 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         })).resolves.toBe(0)
         await completeTransaction(transaction)
         database.close()
+    })
+
+    it('upgrades version 11 with cold stores and legacy markers for active and leased generations', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `version-11-cold-authority-${databaseSequence++}`
+        await createVersion11ColdlessDatabase(indexedDB, databaseName)
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+
+        await store.open()
+
+        const database = await openDatabase(indexedDB, databaseName)
+        expect(database.version).toBe(12)
+        const transaction = database.transaction(
+            ['coldAliases', 'coldPayloadAuthority'],
+            'readonly',
+        )
+        expect(transaction.objectStore('coldAliases').indexNames.contains('byGeneration')).toBe(true)
+        expect(
+            transaction.objectStore('coldPayloadAuthority').indexNames.contains('byGeneration'),
+        ).toBe(true)
+        await completeTransaction(transaction)
+        database.close()
+
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'coldPayloadAuthority',
+            'revision-5',
+        )).toEqual({
+            key: 'revision-5',
+            generation: 'revision-5',
+            value: { format: 'legacy' },
+        })
+        expect(await readRawRecord(
+            indexedDB,
+            databaseName,
+            'coldPayloadAuthority',
+            'snapshot-5-migrated',
+        )).toEqual({
+            key: 'snapshot-5-migrated',
+            generation: 'snapshot-5-migrated',
+            value: { format: 'legacy' },
+        })
+    })
+
+    it('fails closed when cold authority is preparing or malformed', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `invalid-cold-authority-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        const alias = {
+            key: 'conversation/blocked',
+            objectHash: '81'.repeat(32),
+            size: 1,
+            metadata: {},
+        }
+        await writeRawRecords(indexedDB, databaseName, 'coldPayloadAuthority', [{
+            key: 'revision-0',
+            generation: 'revision-0',
+            value: { format: 'preparing', migrationId: 'blocked', sourceRevision: 0 },
+        }])
+
+        await expect(store.commitColdAlias(alias, 0)).rejects.toThrow('v2')
+        await expect(store.activateColdPayloadMigration({
+            sourceRevision: 0,
+            migrationId: 'cannot-reenter',
+            compatibilityHash: '82'.repeat(32),
+            coldAliases: [alias],
+        })).rejects.toThrow('legacy')
+        expect((await store.readRoot()).revision).toBe(0)
+
+        await writeRawRecords(indexedDB, databaseName, 'coldPayloadAuthority', [{
+            key: 'revision-0',
+            generation: 'revision-0',
+            value: { format: 'v2', migrationId: 'malformed', compatibilityHash: 'no' },
+        }])
+        await expect(store.readColdPayloadAuthority()).rejects.toThrow('compatibilityHash')
+        await expect(store.deleteColdAlias(alias.key, 0)).rejects.toThrow('compatibilityHash')
+        expect((await store.readRoot()).revision).toBe(0)
     })
 
     it('migrates version 9 aliases to kind-aware keys without losing same-key siblings', async () => {

@@ -180,6 +180,12 @@ function makeDatabaseLease(database: Database, revision: number): PersistentRevi
             value: { format: 'legacy' as const },
         })),
         readAssetOwnerHead: vi.fn(async () => null),
+        readColdPayloadAuthority: vi.fn(async () => ({
+            revision,
+            value: { format: 'legacy' as const },
+        })),
+        readColdAlias: vi.fn(async () => null),
+        listColdAliases: vi.fn(async () => ({ revision, value: [] })),
         release: vi.fn(async () => undefined),
     }
 }

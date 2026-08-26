@@ -16,6 +16,9 @@ import type {
     ConversationSummary,
     ConversationWindow,
     ConversationWindowQuery,
+    ColdAlias,
+    ColdPayloadAuthorityState,
+    ColdPayloadMigrationInput,
     DataRevision,
     AssetRepositoryAuthorityState,
     AssetRepositoryMigrationInput,
@@ -32,6 +35,7 @@ import type {
 import {
     RevisionConflictError,
     SnapshotReleasedError,
+    validateColdAlias,
     validateAssetAlias,
     validateAssetAliasIdentity,
     assetOwnerLocatorKey,
@@ -39,8 +43,9 @@ import {
     validateAssetOwnerHead,
 } from './persistentDataStore'
 import { parseAssetRepositoryAuthorityState } from './assetRepositoryAuthority'
+import { parseColdPayloadAuthorityState } from './coldPayloadAuthority'
 
-const DATABASE_VERSION = 11
+const DATABASE_VERSION = 12
 const MESSAGE_PAGE_SIZE = 128
 const SNAPSHOT_LEASE_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_INDEX_VALUE = Number.MAX_SAFE_INTEGER
@@ -56,6 +61,8 @@ const INDEXED_GENERATION_STORE_NAMES = [
     'assetAliases',
     'assetOwnerHeads',
     'assetRepositoryAuthority',
+    'coldAliases',
+    'coldPayloadAuthority',
 ] as const
 const DATA_STORE_NAMES = ['root', ...INDEXED_GENERATION_STORE_NAMES] as const
 const STORE_NAMES = ['meta', ...DATA_STORE_NAMES] as const
@@ -162,6 +169,12 @@ const textEncoder = new TextEncoder()
 
 function serializedByteSize(value: unknown): number {
     return textEncoder.encode(JSON.stringify(value) ?? 'null').byteLength
+}
+
+function validateColdAliasKey(key: string): void {
+    if (typeof key !== 'string' || key.length === 0 || key.includes('\0')) {
+        throw new TypeError('Cold alias key must be nonempty and contain no NUL characters')
+    }
 }
 
 function arrayIndexKey(key: string): number | null {
@@ -371,6 +384,16 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                 'byGeneration',
                 'generation',
             )
+            this.createIndex(
+                transaction.objectStore('coldAliases'),
+                'byGeneration',
+                'generation',
+            )
+            this.createIndex(
+                transaction.objectStore('coldPayloadAuthority'),
+                'byGeneration',
+                'generation',
+            )
             if (event.oldVersion < 7) {
                 this.backfillCharacterSummaries(transaction)
                 this.backfillOrderKeys<StoredConversation>(
@@ -386,6 +409,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (event.oldVersion > 0 && event.oldVersion < 11) {
                 this.backfillAssetRepositoryAuthority(transaction)
             }
+            if (event.oldVersion > 0 && event.oldVersion < 12) {
+                this.backfillColdPayloadAuthority(transaction)
+            }
         }
         this.database = await requestResult(request)
         this.database.onversionchange = () => {
@@ -394,7 +420,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
 
         const transaction = this.database.transaction(
-            ['meta', 'root', 'assetRepositoryAuthority'],
+            ['meta', 'root', 'assetRepositoryAuthority', 'coldPayloadAuthority'],
             'readwrite',
         )
         const meta = transaction.objectStore('meta')
@@ -406,6 +432,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             meta.put({ key: 'currentRevision', value: 0 })
             transaction.objectStore('root').put({ key: generation, generation, value: {} })
             this.putAssetRepositoryAuthority(transaction, generation, { format: 'legacy' })
+            this.putColdPayloadAuthority(transaction, generation, { format: 'legacy' })
         }
         await transactionDone(transaction)
         await this.sweepTemporaryGenerations()
@@ -530,6 +557,34 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return this.readAssetOwnerHeadFromTransaction(transaction, revision, generation, owner)
     }
 
+    async readColdPayloadAuthority(): Promise<Versioned<ColdPayloadAuthorityState>> {
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'coldPayloadAuthority'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readColdPayloadAuthorityFromTransaction(transaction, revision, generation)
+    }
+
+    async readColdAlias(key: string): Promise<Versioned<ColdAlias> | null> {
+        validateColdAliasKey(key)
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'coldAliases'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readColdAliasFromTransaction(transaction, revision, generation, key)
+    }
+
+    async listColdAliases(): Promise<Versioned<ColdAlias[]>> {
+        const transaction = this.requireDatabase().transaction(
+            ['meta', 'coldAliases'],
+            'readonly',
+        )
+        const { revision, generation } = await this.readActive(transaction)
+        return this.listColdAliasesFromTransaction(transaction, revision, generation)
+    }
+
     async commitAssetAlias(
         alias: AssetAlias,
         expectedRevision: DataRevision,
@@ -634,6 +689,134 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             if (!(await this.generationIsLeased(transaction, active.generation))) {
                 await this.deleteGenerationFromTransaction(transaction, active.generation)
             }
+            this.setActive(transaction, revision, generation)
+            await transactionDone(transaction)
+            return { revision }
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async commitColdAlias(
+        alias: ColdAlias,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        validateColdAlias(alias)
+        const transaction = this.requireDatabase().transaction([...STORE_NAMES], 'readwrite')
+        try {
+            const active = await this.readActive(transaction)
+            if (active.revision !== expectedRevision) {
+                throw new RevisionConflictError(expectedRevision, active.revision)
+            }
+            await this.requireColdPayloadAuthority(
+                transaction,
+                active.generation,
+                'v2',
+                'Cold alias mutation requires v2 authority',
+            )
+            const revision = active.revision + 1
+            const generation = await this.ensureWritableGeneration(
+                transaction,
+                active.generation,
+                revision,
+            )
+            this.putColdAlias(transaction, generation, alias)
+            this.setActive(transaction, revision, generation)
+            await transactionDone(transaction)
+            return { revision }
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async deleteColdAlias(
+        key: string,
+        expectedRevision: DataRevision,
+    ): Promise<{ revision: DataRevision }> {
+        validateColdAliasKey(key)
+        const transaction = this.requireDatabase().transaction([...STORE_NAMES], 'readwrite')
+        try {
+            const active = await this.readActive(transaction)
+            if (active.revision !== expectedRevision) {
+                throw new RevisionConflictError(expectedRevision, active.revision)
+            }
+            await this.requireColdPayloadAuthority(
+                transaction,
+                active.generation,
+                'v2',
+                'Cold alias mutation requires v2 authority',
+            )
+            const revision = active.revision + 1
+            const generation = await this.ensureWritableGeneration(
+                transaction,
+                active.generation,
+                revision,
+            )
+            transaction.objectStore('coldAliases').delete(this.coldAliasKey(generation, key))
+            this.setActive(transaction, revision, generation)
+            await transactionDone(transaction)
+            return { revision }
+        } catch (error) {
+            try {
+                transaction.abort()
+            } catch {}
+            throw error
+        }
+    }
+
+    async activateColdPayloadMigration(
+        input: ColdPayloadMigrationInput,
+    ): Promise<{ revision: DataRevision }> {
+        const authority = parseColdPayloadAuthorityState({
+            format: 'v2',
+            migrationId: input.migrationId,
+            compatibilityHash: input.compatibilityHash,
+        })
+        const keys = new Set<string>()
+        for (const alias of input.coldAliases) {
+            validateColdAlias(alias)
+            if (alias.objectHash === null) {
+                throw new TypeError('Cold payload migration alias objectHash cannot be null')
+            }
+            if (keys.has(alias.key)) throw new TypeError(`Duplicate cold alias ${alias.key}`)
+            keys.add(alias.key)
+        }
+
+        const transaction = this.requireDatabase().transaction([...STORE_NAMES], 'readwrite')
+        try {
+            const active = await this.readActive(transaction)
+            if (active.revision !== input.sourceRevision) {
+                throw new RevisionConflictError(input.sourceRevision, active.revision)
+            }
+            await this.requireColdPayloadAuthority(
+                transaction,
+                active.generation,
+                'legacy',
+                'Cold payload migration requires legacy authority',
+            )
+            const revision = active.revision + 1
+            const generation = await this.ensureWritableGeneration(
+                transaction,
+                active.generation,
+                revision,
+            )
+            await this.deleteIndexRange(
+                transaction.objectStore('coldAliases').index('byGeneration'),
+                this.keyRangeFactory.only(generation),
+            )
+            this.putColdPayloadAuthority(transaction, generation, {
+                format: 'preparing',
+                migrationId: input.migrationId,
+                sourceRevision: input.sourceRevision,
+            })
+            for (const alias of input.coldAliases) this.putColdAlias(transaction, generation, alias)
+            this.putColdPayloadAuthority(transaction, generation, authority)
             this.setActive(transaction, revision, generation)
             await transactionDone(transaction)
             return { revision }
@@ -1074,6 +1257,47 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     owner,
                 )
             },
+            readColdPayloadAuthority: async () => {
+                assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'coldPayloadAuthority'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                return this.readColdPayloadAuthorityFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                )
+            },
+            readColdAlias: async (key) => {
+                assertActive()
+                validateColdAliasKey(key)
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'coldAliases'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                return this.readColdAliasFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                    key,
+                )
+            },
+            listColdAliases: async () => {
+                assertActive()
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'coldAliases'],
+                    'readonly',
+                )
+                await this.validateSnapshotLease(transaction, lease, generation, revision)
+                return this.listColdAliasesFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                )
+            },
             release: async () => {
                 if (releasePromise) return releasePromise
                 releasePromise = this.releaseSnapshotLease(lease).then(
@@ -1261,6 +1485,87 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         return { revision, value: structuredClone(record.value) }
     }
 
+    private async readColdPayloadAuthorityFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+    ): Promise<Versioned<ColdPayloadAuthorityState>> {
+        const authority = await this.readColdPayloadAuthorityRecord(transaction, generation)
+        await transactionDone(transaction)
+        return { revision, value: authority }
+    }
+
+    private async readColdAliasFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+        key: string,
+    ): Promise<Versioned<ColdAlias> | null> {
+        const record = (await requestResult(
+            transaction.objectStore('coldAliases').get(this.coldAliasKey(generation, key)),
+        )) as StoredRecord<ColdAlias> | undefined
+        await transactionDone(transaction)
+        if (!record) return null
+        if (record.generation !== generation) {
+            throw new TypeError('Cold alias stored generation does not match its lookup key')
+        }
+        if (record.value.key !== key) {
+            throw new TypeError('Cold alias stored logical key does not match its lookup key')
+        }
+        validateColdAlias(record.value)
+        return { revision, value: structuredClone(record.value) }
+    }
+
+    private async listColdAliasesFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+    ): Promise<Versioned<ColdAlias[]>> {
+        const records = (await requestResult(
+            transaction.objectStore('coldAliases').index('byGeneration').getAll(generation),
+        )) as StoredRecord<ColdAlias>[]
+        await transactionDone(transaction)
+        const value = records.map((record) => {
+            if (record.generation !== generation) {
+                throw new TypeError('Cold alias stored generation does not match its index')
+            }
+            validateColdAlias(record.value)
+            if (record.key !== this.coldAliasKey(generation, record.value.key)) {
+                throw new TypeError('Cold alias stored logical key does not match its lookup key')
+            }
+            return structuredClone(record.value)
+        })
+        value.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0))
+        return { revision, value }
+    }
+
+    private async readColdPayloadAuthorityRecord(
+        transaction: IDBTransaction,
+        generation: string,
+    ): Promise<ColdPayloadAuthorityState> {
+        const record = (await requestResult(
+            transaction.objectStore('coldPayloadAuthority').get(generation),
+        )) as StoredRecord<ColdPayloadAuthorityState> | undefined
+        if (!record) {
+            throw new TypeError('Persistent cold payload authority marker is missing')
+        }
+        if (record.generation !== generation) {
+            throw new TypeError('Persistent cold payload authority marker generation is invalid')
+        }
+        return parseColdPayloadAuthorityState(record.value)
+    }
+
+    private async requireColdPayloadAuthority(
+        transaction: IDBTransaction,
+        generation: string,
+        format: ColdPayloadAuthorityState['format'],
+        message: string,
+    ): Promise<ColdPayloadAuthorityState> {
+        const authority = await this.readColdPayloadAuthorityRecord(transaction, generation)
+        if (authority.format !== format) throw new Error(message)
+        return authority
+    }
+
     private async replaceChangedOwnerHeads(
         transaction: IDBTransaction,
         generation: string,
@@ -1313,6 +1618,30 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
             generation,
             value: structuredClone(authority),
         } satisfies StoredRecord<AssetRepositoryAuthorityState>)
+    }
+
+    private putColdAlias(
+        transaction: IDBTransaction,
+        generation: string,
+        alias: ColdAlias,
+    ): void {
+        transaction.objectStore('coldAliases').put({
+            key: this.coldAliasKey(generation, alias.key),
+            generation,
+            value: structuredClone(alias),
+        } satisfies StoredRecord<ColdAlias>)
+    }
+
+    private putColdPayloadAuthority(
+        transaction: IDBTransaction,
+        generation: string,
+        authority: ColdPayloadAuthorityState,
+    ): void {
+        transaction.objectStore('coldPayloadAuthority').put({
+            key: generation,
+            generation,
+            value: structuredClone(authority),
+        } satisfies StoredRecord<ColdPayloadAuthorityState>)
     }
 
     private deleteAssetOwnerHeadKind(
@@ -1628,6 +1957,7 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const { characters, botPresets, pluginCustomStorage, ...root } = databaseValue
         this.putRoot(transaction, generation, root)
         this.putAssetRepositoryAuthority(transaction, generation, { format: 'legacy' })
+        this.putColdPayloadAuthority(transaction, generation, { format: 'legacy' })
         this.writePresetRows(transaction, generation, botPresets ?? [])
         this.writePluginStorageRows(transaction, generation, pluginCustomStorage ?? {})
         for (const alias of assetAliases) {
@@ -2620,6 +2950,40 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
     }
 
+    private backfillColdPayloadAuthority(transaction: IDBTransaction): void {
+        const authority = transaction.objectStore('coldPayloadAuthority')
+        const generations = new Set<string>()
+        const request = transaction.objectStore('meta').openCursor()
+        request.onsuccess = () => {
+            const cursor = request.result
+            if (!cursor) {
+                for (const generation of generations) {
+                    authority.put({
+                        key: generation,
+                        generation,
+                        value: { format: 'legacy' },
+                    } satisfies StoredRecord<ColdPayloadAuthorityState>)
+                }
+                return
+            }
+            const record = cursor.value as { key: string; value: unknown }
+            if (record.key === 'activeGeneration' && typeof record.value === 'string') {
+                generations.add(record.value)
+            } else if (record.key.startsWith('snapshotLease:')) {
+                if (typeof record.value === 'string') {
+                    generations.add(record.value)
+                } else if (
+                    record.value !== null
+                    && typeof record.value === 'object'
+                    && typeof (record.value as { generation?: unknown }).generation === 'string'
+                ) {
+                    generations.add((record.value as { generation: string }).generation)
+                }
+            }
+            cursor.continue()
+        }
+    }
+
     private backfillOrderKeys<T>(
         store: IDBObjectStore,
         summaryFrom: (record: StoredRecord<T>) => { configuredIndex: number; recentAt: number },
@@ -2775,5 +3139,9 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
 
     private assetOwnerHeadKey(generation: string, ownerKey: string): string {
         return `${generation}:asset-owner-head:${ownerKey}`
+    }
+
+    private coldAliasKey(generation: string, key: string): string {
+        return `${generation}:cold-alias:${key}`
     }
 }
