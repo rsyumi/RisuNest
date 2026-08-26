@@ -323,13 +323,24 @@ describe('logical delta pull planner', () => {
         })
     })
 
-    it('rejects an implicit deletion of a base-live record', async () => {
-        const base = manifest('generation-1', '1', [live(keys.root, hashes.base)], 1)
-        const local = manifest('local-1', '1', [live(keys.root, hashes.base)], 1)
-        const remote = manifest('generation-2', '2', [], 8)
+    it.each(['local', 'remote'] as const)(
+        'rejects implicit deletion of a base-live record by the %s descendant',
+        async (side) => {
+            const baseRecord = live(keys.root, hashes.base)
+            const base = manifest('generation-1', '1', [baseRecord], 1)
+            const local = manifest('local-2', '2', [baseRecord], 2)
+            const remote = manifest('generation-2', '2', [baseRecord], 8)
+            if (side === 'local') {
+                local.records = []
+                local.objects = []
+            } else {
+                remote.records = []
+                remote.objects = []
+            }
 
-        await expect(plan({ base, local, remote })).rejects.toThrow('tombstone')
-    })
+            await expect(plan({ base, local, remote })).rejects.toThrow('tombstone')
+        },
+    )
 
     it('rejects a stale or mismatched common-base identity before planning', async () => {
         const base = manifest('generation-1', '1', [], 1)

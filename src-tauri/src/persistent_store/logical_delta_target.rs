@@ -3349,6 +3349,53 @@ mod tests {
     }
 
     #[test]
+    fn exact_plan_rejects_omission_of_a_base_live_record_from_either_descendant() {
+        let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            storage_key: "live-plugin".to_owned(),
+        })
+        .unwrap();
+        let base = LogicalManifest {
+            schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+            library_id: "library".to_owned(),
+            generation: "base".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records: vec![LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key,
+                state: "live".to_owned(),
+                object_hash: "a".repeat(64),
+                dependencies: vec![],
+            })],
+            objects: vec![LogicalManifestObject {
+                hash: "a".repeat(64),
+                size: 1,
+            }],
+        };
+        let mut local = base.clone();
+        local.generation = "local".to_owned();
+        local.generation_sequence = "2".to_owned();
+        let mut remote = base.clone();
+        remote.generation = "remote".to_owned();
+        remote.generation_sequence = "2".to_owned();
+
+        local.records.clear();
+        local.objects.clear();
+        assert!(matches!(
+            derive_exact_three_way_plan(&base, &local, &remote),
+            Err(PeerSyncError::Validation(_))
+        ));
+
+        local = base.clone();
+        remote.records.clear();
+        remote.objects.clear();
+        assert!(matches!(
+            derive_exact_three_way_plan(&base, &local, &remote),
+            Err(PeerSyncError::Validation(_))
+        ));
+    }
+
+    #[test]
     fn exact_plan_treats_an_absent_zero_byte_object_as_a_put() {
         let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
             storage_key: "empty-plugin".to_owned(),
