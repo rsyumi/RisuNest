@@ -22,7 +22,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -49,6 +49,7 @@ pub(crate) enum PayloadKind {
     Inlay,
     Cold,
     OwnerManifest,
+    OwnerPayload,
 }
 
 impl PayloadKind {
@@ -58,7 +59,7 @@ impl PayloadKind {
             Self::Asset => Some("asset"),
             Self::Inlay => Some("inlay"),
             Self::Cold => Some("cold"),
-            Self::OwnerManifest => None,
+            Self::OwnerManifest | Self::OwnerPayload => None,
         }
     }
 }
@@ -918,6 +919,30 @@ fn validate_staged_owner_manifests(
     database: &Value,
     cas: &PayloadCas,
 ) -> Result<(), LosslessError> {
+    let carried_hashes = entries
+        .iter()
+        .filter(|entry| {
+            !matches!(
+                entry.kind,
+                PayloadKind::Database | PayloadKind::OwnerPayload
+            )
+        })
+        .map(|entry| entry.sha256.as_str())
+        .collect::<HashSet<_>>();
+    let owner_payloads = entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::OwnerPayload)
+        .map(|entry| entry.sha256.as_str())
+        .collect::<HashSet<_>>();
+    if owner_payloads
+        .iter()
+        .any(|hash| carried_hashes.contains(hash))
+    {
+        return Err(invalid_manifest(
+            "lossless owner payload duplicates another package entry",
+        ));
+    }
+    let mut used_owner_payloads = HashSet::new();
     for entry in entries
         .iter()
         .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
@@ -930,18 +955,12 @@ fn validate_staged_owner_manifests(
             .manifest_hash
             .as_deref()
             .expect("validated present owner head has a manifest hash");
-        let canonical = cas
-            .read_object(hash)
-            .map_err(LosslessError::io)?
-            .ok_or_else(|| {
-                LosslessError::new(
-                    LosslessErrorCode::MissingReference,
-                    "lossless owner manifest object is missing after staging",
-                )
-            })?;
-        let decoded = decode_owner_manifest(&canonical).map_err(|error| {
-            invalid_manifest(format!("invalid lossless owner manifest payload: {error}"))
-        })?;
+        let decoded = read_bounded_owner_manifest(
+            cas,
+            hash,
+            LosslessErrorCode::InvalidManifest,
+            "lossless owner manifest",
+        )?;
         let parent = materialized_asset_owner_entries(database, &head.owner)
             .map_err(store_error)?
             .ok_or_else(|| {
@@ -952,8 +971,70 @@ fn validate_staged_owner_manifests(
                 "lossless owner manifest tuples differ from the staged parent",
             ));
         }
+        for owner_entry in decoded {
+            let Some(payload_hash) = owner_entry.payload_hash else {
+                continue;
+            };
+            let payload_hash = hex::encode(payload_hash);
+            if carried_hashes.contains(payload_hash.as_str()) {
+                continue;
+            }
+            if owner_payloads.contains(payload_hash.as_str()) {
+                used_owner_payloads.insert(payload_hash);
+                continue;
+            }
+            return Err(LosslessError::new(
+                LosslessErrorCode::MissingReference,
+                "lossless owner manifest historical payload is missing from the package",
+            ));
+        }
+    }
+    if used_owner_payloads.len() != owner_payloads.len() {
+        return Err(invalid_manifest(
+            "lossless package contains an unreferenced owner payload",
+        ));
     }
     Ok(())
+}
+
+fn read_bounded_owner_manifest(
+    cas: &PayloadCas,
+    hash: &str,
+    code: LosslessErrorCode,
+    context: &str,
+) -> Result<Vec<OwnerManifestEntry>, LosslessError> {
+    let file = cas
+        .open_object(hash)
+        .map_err(|error| LosslessError::new(code, format!("{context} cannot be opened: {error}")))?
+        .ok_or_else(|| LosslessError::new(code, format!("{context} is missing")))?;
+    let length = file
+        .metadata()
+        .map_err(|error| LosslessError::new(code, format!("{context} cannot be read: {error}")))?
+        .len();
+    if length > MAX_OWNER_MANIFEST_BYTES {
+        return Err(LosslessError::new(
+            code,
+            format!("{context} exceeds the decode limit"),
+        ));
+    }
+    let mut canonical = Vec::with_capacity(length as usize);
+    file.take(MAX_OWNER_MANIFEST_BYTES + 1)
+        .read_to_end(&mut canonical)
+        .map_err(|error| LosslessError::new(code, format!("{context} cannot be read: {error}")))?;
+    if canonical.len() as u64 != length || canonical.len() as u64 > MAX_OWNER_MANIFEST_BYTES {
+        return Err(LosslessError::new(
+            code,
+            format!("{context} changed while being read"),
+        ));
+    }
+    if hex::encode(Sha256::digest(&canonical)) != hash {
+        return Err(LosslessError::new(
+            code,
+            format!("{context} content hash differs from its identity"),
+        ));
+    }
+    decode_owner_manifest(&canonical)
+        .map_err(|error| LosslessError::new(code, format!("invalid {context}: {error}")))
 }
 
 fn owner_tuples_match(parent: &[Value], decoded: &[OwnerManifestEntry]) -> bool {
@@ -1029,7 +1110,7 @@ fn f0_payload_kind(kind: PayloadKind) -> Result<F0PayloadKind, LosslessError> {
         PayloadKind::Asset => Ok(F0PayloadKind::Asset),
         PayloadKind::Inlay => Ok(F0PayloadKind::Inlay),
         PayloadKind::Cold => Ok(F0PayloadKind::Cold),
-        PayloadKind::Database | PayloadKind::OwnerManifest => {
+        PayloadKind::Database | PayloadKind::OwnerManifest | PayloadKind::OwnerPayload => {
             Err(invalid_manifest("entry cannot be used as an F0 payload"))
         }
     }
@@ -1202,6 +1283,7 @@ fn pinned_backup_entries(
 ) -> Result<(Vec<LosslessWriteEntry>, Vec<F0PayloadDescriptor>), LosslessError> {
     let mut entries = Vec::with_capacity(1 + assets.len() + owner_heads.len() + cold.len());
     let mut payloads = Vec::with_capacity(assets.len() + cold.len());
+    let mut packaged_hashes = HashSet::new();
     entries.push(LosslessWriteEntry {
         logical_path: DATABASE_PATH.to_owned(),
         logical_key: None,
@@ -1222,6 +1304,7 @@ fn pinned_backup_entries(
             }
         };
         let hash = required_backup_object_hash(alias.object_hash.as_deref(), &alias.key)?;
+        packaged_hashes.insert(hash.to_owned());
         let (source, byte_length) = pinned_object(cas, hash, alias.size, &alias.key)?;
         let metadata = lossless_asset_metadata(alias)?;
         entries.push(LosslessWriteEntry {
@@ -1243,6 +1326,7 @@ fn pinned_backup_entries(
     for alias in cold {
         check_cancelled(cancellation)?;
         let hash = required_backup_object_hash(alias.object_hash.as_deref(), &alias.key)?;
+        packaged_hashes.insert(hash.to_owned());
         let (source, byte_length) = pinned_object(cas, hash, alias.size, &alias.key)?;
         entries.push(LosslessWriteEntry {
             logical_path: backup_logical_path(PayloadKind::Cold, &alias.key),
@@ -1260,20 +1344,48 @@ fn pinned_backup_entries(
             cold_source: Some(source),
         });
     }
+    packaged_hashes.extend(
+        owner_heads
+            .iter()
+            .filter(|head| head.present)
+            .filter_map(|head| head.manifest_hash.clone()),
+    );
+    if owner_heads.iter().any(|head| !head.present) {
+        packaged_hashes.insert(hex::encode(Sha256::digest([])));
+    }
     for head in owner_heads {
         check_cancelled(cancellation)?;
         let logical_key = owner_head_logical_key(&head.owner);
-        let source = match (head.present, head.manifest_hash.as_deref()) {
-            (true, Some(hash)) => cas
-                .object_path(hash)
-                .map_err(LosslessError::io)?
-                .ok_or_else(|| {
-                    LosslessError::new(
+        let (source, decoded) = match (head.present, head.manifest_hash.as_deref()) {
+            (true, Some(hash)) => {
+                let source = cas
+                    .object_path(hash)
+                    .map_err(LosslessError::io)?
+                    .ok_or_else(|| {
+                        LosslessError::new(
+                            LosslessErrorCode::BackupIncomplete,
+                            format!(
+                                "pre-replacement owner manifest object is missing: {logical_key}"
+                            ),
+                        )
+                    })?;
+                let decoded = read_bounded_owner_manifest(
+                    cas,
+                    hash,
+                    LosslessErrorCode::BackupIncomplete,
+                    "pre-replacement owner manifest",
+                )?;
+                if usize::try_from(head.entry_count).ok() != Some(decoded.len()) {
+                    return Err(LosslessError::new(
                         LosslessErrorCode::BackupIncomplete,
-                        format!("pre-replacement owner manifest object is missing: {logical_key}"),
-                    )
-                })?,
-            (false, None) => absent_owner_marker.to_path_buf(),
+                        format!(
+                            "pre-replacement owner manifest count differs from its head: {logical_key}"
+                        ),
+                    ));
+                }
+                (source, decoded)
+            }
+            (false, None) => (absent_owner_marker.to_path_buf(), Vec::new()),
             _ => {
                 return Err(LosslessError::new(
                     LosslessErrorCode::BackupIncomplete,
@@ -1290,6 +1402,55 @@ fn pinned_backup_entries(
             })?,
             source,
         });
+        for owner_entry in decoded {
+            check_cancelled(cancellation)?;
+            let Some(payload_hash) = owner_entry.payload_hash else {
+                continue;
+            };
+            let payload_hash = hex::encode(payload_hash);
+            if !packaged_hashes.insert(payload_hash.clone()) {
+                continue;
+            }
+            if entries.len() >= MAX_ENTRIES {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::BackupIncomplete,
+                    "pre-replacement owner payload inventory exceeds the package entry limit",
+                ));
+            }
+            let source = cas
+                .object_path(&payload_hash)
+                .map_err(LosslessError::io)?
+                .ok_or_else(|| {
+                    LosslessError::new(
+                        LosslessErrorCode::BackupIncomplete,
+                        format!(
+                            "pre-replacement owner historical payload is missing: {payload_hash}"
+                        ),
+                    )
+                })?;
+            let byte_length = fs::metadata(&source).map_err(LosslessError::io)?.len();
+            if byte_length > u32::MAX as u64 {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::BackupIncomplete,
+                    format!(
+                        "pre-replacement owner historical payload exceeds the V1 limit: {payload_hash}"
+                    ),
+                ));
+            }
+            entries.push(LosslessWriteEntry {
+                logical_path: backup_logical_path(PayloadKind::OwnerPayload, &payload_hash),
+                logical_key: Some(payload_hash),
+                kind: PayloadKind::OwnerPayload,
+                metadata: Value::Object(serde_json::Map::new()),
+                source,
+            });
+        }
+    }
+    if entries.len() > MAX_ENTRIES {
+        return Err(LosslessError::new(
+            LosslessErrorCode::BackupIncomplete,
+            "pre-replacement inventory exceeds the package entry limit",
+        ));
     }
     Ok((entries, payloads))
 }
@@ -1384,12 +1545,16 @@ fn pinned_object(
 }
 
 fn backup_logical_path(kind: PayloadKind, logical_key: &str) -> String {
+    if kind == PayloadKind::OwnerPayload {
+        return format!("owner-payloads/{logical_key}");
+    }
     let namespace = match kind {
         PayloadKind::Database => "database",
         PayloadKind::Asset => "assets",
         PayloadKind::Inlay => "inlays",
         PayloadKind::Cold => "cold",
         PayloadKind::OwnerManifest => "owner-manifests",
+        PayloadKind::OwnerPayload => unreachable!("handled above"),
     };
     format!("{namespace}/{}", hex::encode(logical_key.as_bytes()))
 }
@@ -1580,6 +1745,13 @@ impl JobOwnedDirectory {
         let parent = fs::canonicalize(parent).map_err(LosslessError::io)?;
         let path = parent.join(format!("lossless-verify-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).map_err(LosslessError::io)?;
+        let metadata = fs::symlink_metadata(&path).map_err(LosslessError::io)?;
+        if !metadata.is_dir() || is_link_like(&metadata) {
+            return Err(LosslessError::new(
+                LosslessErrorCode::InvalidPath,
+                "lossless verification root is not an owned plain directory",
+            ));
+        }
         let path = fs::canonicalize(path).map_err(LosslessError::io)?;
         if path.parent() != Some(parent.as_path()) {
             return Err(LosslessError::new(
@@ -1599,7 +1771,11 @@ impl AsRef<Path> for JobOwnedDirectory {
 
 impl Drop for JobOwnedDirectory {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
+            if metadata.is_dir() && !is_link_like(&metadata) {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
     }
 }
 
@@ -1768,6 +1944,19 @@ fn validate_manifest(manifest: &LosslessManifest) -> Result<(), LosslessError> {
                 ));
             }
             validate_payload_metadata(entry)?;
+            if entry.kind == PayloadKind::OwnerPayload
+                && (logical_key != entry.sha256
+                    || entry.logical_path
+                        != backup_logical_path(PayloadKind::OwnerPayload, logical_key)
+                    || !entry
+                        .metadata
+                        .as_object()
+                        .is_some_and(|metadata| metadata.is_empty()))
+            {
+                return Err(invalid_manifest(
+                    "lossless owner payload must use its SHA-256 identity and empty metadata",
+                ));
+            }
             if let Some(target_kind) = entry.kind.target_kind() {
                 payload_targets.insert((target_kind, logical_key));
             }
@@ -2097,19 +2286,26 @@ fn prepare_staging_directory(root: &Path) -> Result<PathBuf, LosslessError> {
         else {
             continue;
         };
-        let file_type = candidate.file_type().map_err(LosslessError::io)?;
-        if uuid::Uuid::parse_str(id).is_err() || !file_type.is_dir() || file_type.is_symlink() {
+        let metadata = fs::symlink_metadata(candidate.path()).map_err(LosslessError::io)?;
+        if uuid::Uuid::parse_str(id).is_err() || !metadata.is_dir() || is_link_like(&metadata) {
             continue;
         }
         let path = fs::canonicalize(candidate.path()).map_err(LosslessError::io)?;
         if path.parent() == Some(root.as_path()) {
-            fs::remove_dir_all(path).map_err(LosslessError::io)?;
+            fs::remove_dir_all(candidate.path()).map_err(LosslessError::io)?;
         }
     }
     let staging = root.join("lossless-v1");
     fs::create_dir_all(&staging).map_err(LosslessError::io)?;
+    let staging_metadata = fs::symlink_metadata(&staging).map_err(LosslessError::io)?;
+    if !staging_metadata.is_dir() || is_link_like(&staging_metadata) {
+        return Err(LosslessError::new(
+            LosslessErrorCode::InvalidPath,
+            "lossless package staging directory is not an owned plain directory",
+        ));
+    }
     let staging = fs::canonicalize(staging).map_err(LosslessError::io)?;
-    if !staging.starts_with(root) {
+    if staging.parent() != Some(root.as_path()) {
         return Err(LosslessError::new(
             LosslessErrorCode::InvalidPath,
             "lossless package staging directory escapes its owned root",
@@ -2127,13 +2323,25 @@ fn prepare_staging_directory(root: &Path) -> Result<PathBuf, LosslessError> {
         else {
             continue;
         };
-        if uuid::Uuid::parse_str(id).is_ok()
-            && candidate.file_type().map_err(LosslessError::io)?.is_file()
-        {
+        let metadata = fs::symlink_metadata(candidate.path()).map_err(LosslessError::io)?;
+        if uuid::Uuid::parse_str(id).is_ok() && metadata.is_file() && !is_link_like(&metadata) {
             fs::remove_file(candidate.path()).map_err(LosslessError::io)?;
         }
     }
     Ok(staging)
+}
+
+#[cfg(windows)]
+fn is_link_like(metadata: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_like(metadata: &Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn normalize_logical_path(path: &str) -> Result<String, LosslessError> {
@@ -2643,52 +2851,151 @@ mod tests {
     }
 
     #[test]
-    fn owner_manifest_payload_hash_is_preserved_without_rebinding_to_current_alias() {
-        for payload_hash in [Some([0x77; 32]), None] {
-            let directory = tempfile::tempdir().unwrap();
-            let staging = directory.path().join("job-staging");
-            let repository = directory.path().join("repository");
-            fs::create_dir(&staging).unwrap();
-            fs::create_dir(&repository).unwrap();
-            let owner_manifest = encode_owner_manifest(&[OwnerManifestEntry {
-                tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
-                payload_hash,
-            }])
-            .unwrap();
-            let incoming = production_package_with_owner_manifest(
-                directory.path(),
-                "New",
-                b"new",
-                Some(owner_manifest.clone()),
-            );
-            let backup_path = directory.path().join("pre-replacement.lossless");
-            let mut store = PersistentStore::open(directory.path()).unwrap();
-            let cas = PayloadCas::new(&repository).unwrap();
-            seed_active_store(&mut store, &cas, "Old", b"old");
+    fn owner_manifest_null_payload_hash_does_not_require_an_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let owner_manifest = encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+            payload_hash: None,
+        }])
+        .unwrap();
+        let incoming = production_package_with_owner_manifest(
+            directory.path(),
+            "New",
+            b"new",
+            Some(owner_manifest.clone()),
+        );
+        let backup_path = directory.path().join("pre-replacement.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
 
-            let report = restore_lossless_package_v1(
-                &mut Cursor::new(incoming),
-                &staging,
-                &cas,
-                &mut store,
-                1,
-                &backup_path,
-                &NeverCancelled,
-            )
-            .unwrap();
+        let report = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap();
 
-            assert_eq!(report.revision, 2);
-            let head = store
-                .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+        assert_eq!(report.revision, 2);
+        let head = store
+            .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cas.read_object(head.value.manifest_hash.as_ref().unwrap())
                 .unwrap()
+                .unwrap(),
+            owner_manifest
+        );
+    }
+
+    #[test]
+    fn owner_manifest_missing_historical_payload_fails_before_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let owner_manifest = encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+            payload_hash: Some(Sha256::digest(b"ambient-only").into()),
+        }])
+        .unwrap();
+        let incoming = production_package_with_owner_manifest(
+            directory.path(),
+            "New",
+            b"new",
+            Some(owner_manifest),
+        );
+        let backup_path = directory.path().join("pre-replacement.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        cas.prepare_bytes(b"ambient-only").unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::MissingReference);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert!(!backup_path.exists());
+    }
+
+    #[test]
+    fn prebackup_deduplicates_zero_length_owner_payload_with_absent_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let backup_path = directory.path().join("pre-replacement.lossless");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(&repository).unwrap();
+        seed_active_store_with_owner_history(&mut store, &cas, "Old", b"old", b"");
+
+        let report = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(report.revision, 2);
+        let empty_hash = hex::encode(Sha256::digest([]));
+        let backup =
+            verify_lossless_package_v1(&mut File::open(&backup_path).unwrap(), &NeverCancelled)
                 .unwrap();
-            assert_eq!(
-                cas.read_object(head.value.manifest_hash.as_ref().unwrap())
-                    .unwrap()
-                    .unwrap(),
-                owner_manifest
-            );
-        }
+        assert_eq!(
+            backup
+                .manifest
+                .entries
+                .iter()
+                .filter(|entry| entry.sha256 == empty_hash)
+                .count(),
+            1
+        );
+        assert!(!backup.manifest.entries.iter().any(|entry| {
+            entry.kind == PayloadKind::OwnerPayload && entry.sha256 == empty_hash
+        }));
+
+        let isolated_repository = directory.path().join("isolated-zero-repository");
+        let isolated_staging = directory.path().join("isolated-zero-staging");
+        fs::create_dir(&isolated_repository).unwrap();
+        fs::create_dir(&isolated_staging).unwrap();
+        let isolated_cas = PayloadCas::new(&isolated_repository).unwrap();
+        let isolated = read_lossless_package_v1(
+            &mut File::open(&backup_path).unwrap(),
+            &isolated_staging,
+            &isolated_cas,
+            &NeverCancelled,
+        )
+        .unwrap();
+        assert_eq!(
+            isolated_cas.read_object(&empty_hash).unwrap().unwrap(),
+            Vec::<u8>::new()
+        );
+        drop(isolated);
     }
 
     #[test]
@@ -2794,7 +3101,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(backup.manifest.extensions["sourceRevision"], 1);
-                assert_eq!(backup.manifest.entries.len(), 6);
+                assert_eq!(backup.manifest.entries.len(), 7);
                 assert!(backup
                     .manifest
                     .entries
@@ -2834,7 +3141,7 @@ mod tests {
                     .unwrap();
                 let expected_owner_manifest = encode_owner_manifest(&[OwnerManifestEntry {
                     tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
-                    payload_hash: Some(Sha256::digest(b"old-asset").into()),
+                    payload_hash: Some(Sha256::digest(b"old-owner-history").into()),
                 }])
                 .unwrap();
                 assert_eq!(
@@ -2845,6 +3152,25 @@ mod tests {
                     backup_owner.byte_length,
                     expected_owner_manifest.len() as u64
                 );
+                let isolated_repository = directory.path().join("isolated-repository");
+                let isolated_staging = directory.path().join("isolated-staging");
+                fs::create_dir(&isolated_repository).unwrap();
+                fs::create_dir(&isolated_staging).unwrap();
+                let isolated_cas = PayloadCas::new(&isolated_repository).unwrap();
+                let isolated = read_lossless_package_v1(
+                    &mut File::open(&backup_path).unwrap(),
+                    &isolated_staging,
+                    &isolated_cas,
+                    &NeverCancelled,
+                )
+                .unwrap();
+                let historical_bytes = b"old-owner-history";
+                let historical_hash = hex::encode(Sha256::digest(historical_bytes));
+                assert_eq!(
+                    isolated_cas.read_object(&historical_hash).unwrap().unwrap(),
+                    historical_bytes
+                );
+                drop(isolated);
             }
         }
     }
@@ -3259,6 +3585,30 @@ mod tests {
             !active.exists(),
             "the successful report retains cleanup ownership"
         );
+    }
+
+    #[test]
+    fn staging_cleanup_does_not_follow_a_linked_owned_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let unrelated = root.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        let unrelated_file = unrelated.join(format!("{}.database", uuid::Uuid::new_v4()));
+        fs::write(&unrelated_file, b"unrelated").unwrap();
+        let staging = root.path().join("lossless-v1");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&unrelated, &staging).unwrap();
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&unrelated, &staging) {
+            if error.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create linked staging fixture: {error}");
+        }
+
+        let error = prepare_staging_directory(root.path()).unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::InvalidPath);
+        assert_eq!(fs::read(unrelated_file).unwrap(), b"unrelated");
     }
 
     #[test]
@@ -3917,6 +4267,17 @@ mod tests {
         username: &str,
         payload_prefix: &[u8],
     ) {
+        let owner_history = [payload_prefix, b"-owner-history"].concat();
+        seed_active_store_with_owner_history(store, cas, username, payload_prefix, &owner_history);
+    }
+
+    fn seed_active_store_with_owner_history(
+        store: &mut PersistentStore,
+        cas: &PayloadCas,
+        username: &str,
+        payload_prefix: &[u8],
+        owner_history: &[u8],
+    ) {
         let asset_bytes = [payload_prefix, b"-asset"].concat();
         let inlay_bytes = [payload_prefix, b"-inlay"].concat();
         let cold_bytes = cold_payload(&json!({
@@ -3925,9 +4286,15 @@ mod tests {
         let asset = cas.prepare_bytes(&asset_bytes).unwrap();
         let inlay = cas.prepare_bytes(&inlay_bytes).unwrap();
         let cold = cas.prepare_bytes(&cold_bytes).unwrap();
+        let historical = cas.prepare_bytes(owner_history).unwrap();
         let owner_manifest_bytes = encode_owner_manifest(&[OwnerManifestEntry {
             tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
-            payload_hash: Some(Sha256::digest(&asset_bytes).into()),
+            payload_hash: Some(
+                hex::decode(historical.content_hash)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
         }])
         .unwrap();
         let owner_manifest = cas.prepare_bytes(&owner_manifest_bytes).unwrap();
