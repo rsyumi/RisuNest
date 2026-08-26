@@ -30,9 +30,12 @@ export interface ConversationResidentInterval {
     messages: Message[]
 }
 
-export interface ConversationMissingRange {
-    startIndex: number
-    endIndex: number
+export interface ConversationMissingPersistentRange {
+    revision: DataRevision
+    currentStartIndex: number
+    currentEndIndex: number
+    persistentStartIndex: number
+    persistentEndIndex: number
 }
 
 export interface ConversationRangePin {
@@ -56,7 +59,7 @@ export interface RecordConversationReplaceRangeInput {
 
 export interface ConversationPersistenceAttempt {
     readonly sessionVersion: number
-    acknowledge(): void
+    acknowledge(revision: DataRevision): void
     release(): void
 }
 
@@ -85,6 +88,19 @@ interface StreamingOverlay {
     byteSize: number
     sessionVersion: number
 }
+
+interface PersistentSequenceSpan {
+    kind: 'persistent'
+    persistentStartIndex: number
+    length: number
+}
+
+interface LocalSequenceSpan {
+    kind: 'local'
+    length: number
+}
+
+type SequenceSpan = PersistentSequenceSpan | LocalSequenceSpan
 
 function validateIndex(value: number, name: string): void {
     if (!Number.isSafeInteger(value) || value < 0) {
@@ -125,8 +141,81 @@ function transformRange(
     range.endIndex = Math.max(nextStart, nextEnd)
 }
 
+function sequenceLength(spans: readonly SequenceSpan[]): number {
+    return spans.reduce((total, span) => total + span.length, 0)
+}
+
+function sliceSequenceSpan(
+    span: SequenceSpan,
+    startOffset: number,
+    endOffset: number,
+): SequenceSpan {
+    const length = endOffset - startOffset
+    if (span.kind === 'local') return { kind: 'local', length }
+    return {
+        kind: 'persistent',
+        persistentStartIndex: span.persistentStartIndex + startOffset,
+        length,
+    }
+}
+
+function splitSequenceSpans(
+    spans: readonly SequenceSpan[],
+    absoluteIndex: number,
+): [SequenceSpan[], SequenceSpan[]] {
+    const before: SequenceSpan[] = []
+    const after: SequenceSpan[] = []
+    let cursor = 0
+    for (const span of spans) {
+        const spanEnd = cursor + span.length
+        if (spanEnd <= absoluteIndex) before.push({ ...span })
+        else if (cursor >= absoluteIndex) after.push({ ...span })
+        else {
+            const splitOffset = absoluteIndex - cursor
+            before.push(sliceSequenceSpan(span, 0, splitOffset))
+            after.push(sliceSequenceSpan(span, splitOffset, span.length))
+        }
+        cursor = spanEnd
+    }
+    return [before, after]
+}
+
+function mergeSequenceSpans(spans: readonly SequenceSpan[]): SequenceSpan[] {
+    const merged: SequenceSpan[] = []
+    for (const span of spans) {
+        if (span.length === 0) continue
+        const previous = merged.at(-1)
+        if (previous?.kind === 'local' && span.kind === 'local') {
+            previous.length += span.length
+        } else if (
+            previous?.kind === 'persistent' &&
+            span.kind === 'persistent' &&
+            previous.persistentStartIndex + previous.length === span.persistentStartIndex
+        ) {
+            previous.length += span.length
+        } else {
+            merged.push({ ...span })
+        }
+    }
+    return merged
+}
+
+function replaceSequenceRange(
+    spans: readonly SequenceSpan[],
+    start: number,
+    deleteCount: number,
+    insertCount: number,
+): SequenceSpan[] {
+    const [before, fromStart] = splitSequenceSpans(spans, start)
+    const [, after] = splitSequenceSpans(fromStart, deleteCount)
+    return mergeSequenceSpans([
+        ...before,
+        ...(insertCount === 0 ? [] : [{ kind: 'local' as const, length: insertCount }]),
+        ...after,
+    ])
+}
+
 export class SegmentedConversationResidency {
-    readonly revision: DataRevision
     readonly maxResidentBytes: number
 
     private readonly entries = new Map<number, ResidentEntry>()
@@ -139,18 +228,33 @@ export class SegmentedConversationResidency {
     private currentSessionVersion = 0
     private acknowledgedVersion = 0
     private messageCount: number
+    private baseRevision: DataRevision
+    private baseMessageCount: number
+    private sequenceSpans: SequenceSpan[]
 
     constructor(options: SegmentedConversationResidencyOptions) {
         validateIndex(options.totalMessages, 'Conversation totalMessages')
         validateIndex(options.maxResidentBytes, 'Conversation resident byte budget')
-        this.revision = options.revision
+        this.baseRevision = options.revision
+        this.baseMessageCount = options.totalMessages
         this.messageCount = options.totalMessages
+        this.sequenceSpans = options.totalMessages === 0
+            ? []
+            : [{ kind: 'persistent', persistentStartIndex: 0, length: options.totalMessages }]
         this.maxResidentBytes = options.maxResidentBytes
         this.measureMessage = options.measureMessage
     }
 
     get totalMessages(): number {
         return this.messageCount
+    }
+
+    get revision(): DataRevision {
+        return this.baseRevision
+    }
+
+    get persistentTotalMessages(): number {
+        return this.baseMessageCount
     }
 
     get sessionVersion(): number {
@@ -215,29 +319,36 @@ export class SegmentedConversationResidency {
     }
 
     storeRange(input: SegmentedConversationRangeInput): void {
-        if (input.revision !== this.revision) {
+        if (input.revision !== this.baseRevision) {
             throw new Error(
-                `Conversation range revision ${input.revision} does not match ${this.revision}`,
+                `Conversation range revision ${input.revision} does not match ${this.baseRevision}`,
             )
         }
-        if (input.totalMessages !== this.messageCount) {
+        if (input.totalMessages !== this.baseMessageCount) {
             throw new Error(
-                `Conversation range total ${input.totalMessages} does not match ${this.messageCount}`,
+                `Conversation range total ${input.totalMessages} does not match ${this.baseMessageCount}`,
             )
         }
         validateIndex(input.startIndex, 'Conversation range startIndex')
-        if (input.startIndex + input.messages.length > this.messageCount) {
-            throw new RangeError('Conversation range exceeds the current message count')
+        if (input.startIndex + input.messages.length > this.baseMessageCount) {
+            throw new RangeError('Conversation range exceeds the persisted message count')
         }
-        for (let offset = 0; offset < input.messages.length; offset++) {
-            const absoluteIndex = input.startIndex + offset
-            if (this.isDirtyIndex(absoluteIndex) || this.streamingOverlay?.absoluteIndex === absoluteIndex) {
+        const prepared = input.messages.map((inputMessage) => {
+            const message = safeStructuredClone(inputMessage)
+            return { message, byteSize: this.measure(message) }
+        })
+        for (let offset = 0; offset < prepared.length; offset++) {
+            const persistentIndex = input.startIndex + offset
+            const absoluteIndex = this.currentIndexForPersistent(persistentIndex)
+            if (
+                absoluteIndex === undefined ||
+                this.isDirtyIndex(absoluteIndex) ||
+                this.streamingOverlay?.absoluteIndex === absoluteIndex
+            ) {
                 continue
             }
-            const message = safeStructuredClone(input.messages[offset])
             this.entries.set(absoluteIndex, {
-                message,
-                byteSize: this.measure(message),
+                ...prepared[offset],
                 lastAccess: this.tick(),
             })
         }
@@ -260,17 +371,39 @@ export class SegmentedConversationResidency {
         return messages
     }
 
-    missingRanges(startIndex: number, limit: number): ConversationMissingRange[] {
+    missingPersistentRanges(
+        startIndex: number,
+        limit: number,
+    ): ConversationMissingPersistentRange[] {
         validateIndex(startIndex, 'Conversation range startIndex')
         validateLimit(limit)
         const start = Math.min(startIndex, this.messageCount)
         const end = Math.min(this.messageCount, start + limit)
-        const missing: ConversationMissingRange[] = []
+        const missing: ConversationMissingPersistentRange[] = []
         for (let absoluteIndex = start; absoluteIndex < end; absoluteIndex++) {
             if (this.messageAt(absoluteIndex)) continue
+            const persistentIndex = this.persistentIndexAtCurrent(absoluteIndex)
+            if (persistentIndex === undefined) {
+                throw new Error(
+                    `Conversation local message ${absoluteIndex} is missing from residency`,
+                )
+            }
             const current = missing.at(-1)
-            if (current?.endIndex === absoluteIndex) current.endIndex += 1
-            else missing.push({ startIndex: absoluteIndex, endIndex: absoluteIndex + 1 })
+            if (
+                current?.currentEndIndex === absoluteIndex &&
+                current.persistentEndIndex === persistentIndex
+            ) {
+                current.currentEndIndex += 1
+                current.persistentEndIndex += 1
+            } else {
+                missing.push({
+                    revision: this.baseRevision,
+                    currentStartIndex: absoluteIndex,
+                    currentEndIndex: absoluteIndex + 1,
+                    persistentStartIndex: persistentIndex,
+                    persistentEndIndex: persistentIndex + 1,
+                })
+            }
         }
         return missing
     }
@@ -334,8 +467,15 @@ export class SegmentedConversationResidency {
         }
 
         const replacement = safeStructuredClone([...input.messages])
+        const replacementByteSizes = replacement.map((message) => this.measure(message))
         const removedEnd = input.start + input.deleteCount
         const delta = replacement.length - input.deleteCount
+        this.sequenceSpans = replaceSequenceRange(
+            this.sequenceSpans,
+            input.start,
+            input.deleteCount,
+            replacement.length,
+        )
         const nextEntries = new Map<number, ResidentEntry>()
         for (const [absoluteIndex, entry] of this.entries) {
             if (absoluteIndex < input.start) nextEntries.set(absoluteIndex, entry)
@@ -354,7 +494,6 @@ export class SegmentedConversationResidency {
 
         this.messageCount += delta
         this.currentSessionVersion = input.sessionVersion
-        const replacementByteSizes = replacement.map((message) => this.measure(message))
         const dirty: DirtyRecord = {
             start: input.start,
             deleteCount: input.deleteCount,
@@ -389,12 +528,15 @@ export class SegmentedConversationResidency {
         let released = false
         return {
             sessionVersion,
-            acknowledge: () => {
+            acknowledge: (revision) => {
                 if (released) return
-                this.acknowledgePersisted(sessionVersion)
-                released = true
-                this.pendingSaveAttempts.delete(attempt)
-                this.evictToBudget()
+                try {
+                    this.acknowledgePersisted(sessionVersion, revision)
+                } finally {
+                    released = true
+                    this.pendingSaveAttempts.delete(attempt)
+                    this.evictToBudget()
+                }
             },
             release: () => {
                 if (released) return
@@ -405,14 +547,46 @@ export class SegmentedConversationResidency {
         }
     }
 
-    acknowledgePersisted(sessionVersion: number): void {
+    acknowledgePersisted(sessionVersion: number, revision: DataRevision): boolean {
         validateIndex(sessionVersion, 'Conversation persisted session version')
-        if (sessionVersion < this.acknowledgedVersion) {
-            throw new RangeError('Conversation persisted version cannot move backwards')
-        }
+        validateIndex(revision, 'Conversation persisted data revision')
+        if (sessionVersion <= this.acknowledgedVersion) return false
         if (sessionVersion > this.currentSessionVersion) {
             throw new RangeError('Conversation persisted version exceeds the current session version')
         }
+        if (revision <= this.baseRevision) {
+            throw new RangeError('Conversation persisted data revision must advance')
+        }
+        let nextBaseMessageCount = this.baseMessageCount
+        for (const dirty of this.dirtyRecords) {
+            if (dirty.sessionVersion > sessionVersion) continue
+            nextBaseMessageCount += dirty.messages.length - dirty.deleteCount
+        }
+        const remainingDirty = this.dirtyRecords.filter(
+            (dirty) => dirty.sessionVersion > sessionVersion,
+        )
+        let nextSequence: SequenceSpan[] = nextBaseMessageCount === 0
+            ? []
+            : [{
+                kind: 'persistent',
+                persistentStartIndex: 0,
+                length: nextBaseMessageCount,
+            }]
+        for (const dirty of remainingDirty) {
+            nextSequence = replaceSequenceRange(
+                nextSequence,
+                dirty.start,
+                dirty.deleteCount,
+                dirty.messages.length,
+            )
+        }
+        if (sequenceLength(nextSequence) !== this.messageCount) {
+            throw new Error('Conversation persistence rebase does not match current message count')
+        }
+
+        this.baseRevision = revision
+        this.baseMessageCount = nextBaseMessageCount
+        this.sequenceSpans = nextSequence
         this.acknowledgedVersion = sessionVersion
         for (let index = this.dirtyRecords.length - 1; index >= 0; index--) {
             if (this.dirtyRecords[index].sessionVersion <= sessionVersion) {
@@ -420,6 +594,7 @@ export class SegmentedConversationResidency {
             }
         }
         this.evictToBudget()
+        return true
     }
 
     setStreamingOverlay(
@@ -436,11 +611,11 @@ export class SegmentedConversationResidency {
             throw new RangeError('Conversation streaming overlay is stale')
         }
         const cloned = safeStructuredClone(message)
-        this.entries.delete(absoluteIndex)
+        const byteSize = this.measure(cloned)
         this.streamingOverlay = {
             absoluteIndex,
             message: cloned,
-            byteSize: this.measure(cloned),
+            byteSize,
             sessionVersion,
         }
         this.evictToBudget()
@@ -502,6 +677,34 @@ export class SegmentedConversationResidency {
             return this.streamingOverlay.byteSize
         }
         return this.entries.get(absoluteIndex)?.byteSize ?? 0
+    }
+
+    private persistentIndexAtCurrent(absoluteIndex: number): number | undefined {
+        let currentStartIndex = 0
+        for (const span of this.sequenceSpans) {
+            const currentEndIndex = currentStartIndex + span.length
+            if (absoluteIndex < currentEndIndex) {
+                if (span.kind === 'local') return undefined
+                return span.persistentStartIndex + absoluteIndex - currentStartIndex
+            }
+            currentStartIndex = currentEndIndex
+        }
+        return undefined
+    }
+
+    private currentIndexForPersistent(persistentIndex: number): number | undefined {
+        let currentStartIndex = 0
+        for (const span of this.sequenceSpans) {
+            if (
+                span.kind === 'persistent' &&
+                persistentIndex >= span.persistentStartIndex &&
+                persistentIndex < span.persistentStartIndex + span.length
+            ) {
+                return currentStartIndex + persistentIndex - span.persistentStartIndex
+            }
+            currentStartIndex += span.length
+        }
+        return undefined
     }
 
     private measure(message: Message): number {
