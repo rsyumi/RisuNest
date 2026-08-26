@@ -53,7 +53,9 @@ function recordsEqual(
 ): boolean {
     if (left === undefined || right === undefined) return left === right
     if (left.state === 'tombstone' || right.state === 'tombstone') {
-        return left.state === 'tombstone' && right.state === 'tombstone'
+        return left.state === 'tombstone'
+            && right.state === 'tombstone'
+            && left.deletedGenerationSequence === right.deletedGenerationSequence
     }
     return left.objectHash === right.objectHash
         && left.dependencies.length === right.dependencies.length
@@ -121,6 +123,23 @@ function addCandidateHashes(
 ): void {
     candidates.add(record.objectHash)
     for (const dependency of record.dependencies) candidates.add(dependency)
+}
+
+function missingCandidateHashes(
+    candidates: Set<string>,
+    local: LogicalManifest,
+): string[] {
+    const sortedCandidates = [...candidates].sort()
+    let localIndex = 0
+    return sortedCandidates.filter((hash) => {
+        while (
+            localIndex < local.objects.length
+            && local.objects[localIndex].hash < hash
+        ) {
+            localIndex += 1
+        }
+        return local.objects[localIndex]?.hash !== hash
+    })
 }
 
 export async function planLogicalDeltaPull(input: {
@@ -229,7 +248,7 @@ export async function planLogicalDeltaPull(input: {
         expectedRemoteGeneration: remote.generation,
         apply,
         preserveLocalKeys,
-        candidateObjectHashes: [...candidateObjectHashes].sort(),
+        candidateObjectHashes: missingCandidateHashes(candidateObjectHashes, local),
         nextBaseManifestHash: remoteManifestHash,
     }
 }

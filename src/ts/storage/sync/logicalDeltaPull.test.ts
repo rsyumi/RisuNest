@@ -149,6 +149,48 @@ describe('logical delta pull planner', () => {
         }
     })
 
+    it('reports divergent tombstone generations as a conflict', async () => {
+        const base = manifest('generation-1', '1', [live(keys.preset, hashes.base)], 1)
+        const local = manifest('local-2', '2', [tombstone(keys.preset, '2')], 2)
+        const remote = manifest('generation-3', '3', [tombstone(keys.preset, '3')], 8)
+
+        await expect(plan({ base, local, remote })).resolves.toEqual({
+            kind: 'conflict',
+            expectedLocalRevision: 2,
+            expectedBaseManifestHash: await hashLogicalManifest(base),
+            conflicts: [{ key: keys.preset, type: 'delete-edit' }],
+        })
+    })
+
+    it('transfers only changed-record objects absent from the local manifest', async () => {
+        const sharedCharacter = live(keys.character, hashes.remote, [hashes.payloadA])
+        const base = manifest('generation-1', '1', [
+            live(keys.root, hashes.base),
+            sharedCharacter,
+        ], 1)
+        const local = manifest('local-2', '2', [
+            live(keys.root, hashes.base),
+            sharedCharacter,
+        ], 2)
+        const remote = manifest('generation-3', '3', [
+            live(keys.root, hashes.remote, [hashes.payloadA, hashes.payloadB].sort()),
+            sharedCharacter,
+        ], 8)
+
+        const result = await plan({ base, local, remote })
+
+        expect(result.kind).toBe('ready')
+        if (result.kind === 'ready') {
+            expect(result.apply).toEqual([{
+                type: 'put',
+                key: keys.root,
+                objectHash: hashes.remote,
+                dependencies: [hashes.payloadA, hashes.payloadB].sort(),
+            }])
+            expect(result.candidateObjectHashes).toEqual([hashes.payloadB])
+        }
+    })
+
     it('reports sorted live-live and delete-edit conflicts without a partial plan', async () => {
         const base = manifest('generation-1', '1', [
             live(keys.root, hashes.base),
