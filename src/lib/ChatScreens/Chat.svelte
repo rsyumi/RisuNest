@@ -13,7 +13,7 @@
     import { capitalize, getUserIcon, getUserName, sleep } from "src/ts/util"
     import { onDestroy, onMount, tick } from "svelte"
     import { type Unsubscriber } from "svelte/store"
-    import { v4 as uuidv4, v4 } from 'uuid'
+    import { v4 as uuidv4 } from 'uuid'
     import { language } from "../../lang"
     import { alertClear, alertConfirm, alertInput, alertNormal, alertRequestData, alertWait } from "../../ts/alert"
     import { ParseMarkdown, type CbsConditions, type simpleCharacterArgument } from "../../ts/parser/parser.svelte"
@@ -27,8 +27,9 @@
     import { getLLMCache, setLLMCache } from "../../ts/translator/translator"
     import { DeferredInlayMarkerRegistry, withResolvedDeferredInlaySources } from "src/ts/process/files/inlayRenderSource"
     import { copyImageSourceToDataUrl } from "src/ts/process/files/chatCopyInlays"
-    import { getActiveConversationSession } from "../../ts/storage/persistentDataRuntime.svelte"
+    import { getActiveConversationSession, getPersistentDataRuntime } from "../../ts/storage/persistentDataRuntime.svelte"
     import { removeChatMessage } from "../../ts/chatRemoval"
+    import { createCapturedConversationBranch } from "../../ts/chatBranchUi"
     import {
         captureChatMessageTarget,
         saveCapturedChatMessage,
@@ -950,35 +951,18 @@
     {/if}
 
     <button class="flex items-center hover:text-blue-500 transition-colors" onclick={async () => {
+        const target = captureCurrentMessage()
+        if (!target) return
         await sleep(1)
-        const currentChat = DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]
-        
-        if(DBState.db.createFolderOnBranch && !currentChat.folderId){
-            const folderId = v4()
-            DBState.db.characters[selIdState.selId].chatFolders ??= []
-            DBState.db.characters[selIdState.selId].chatFolders.unshift({
-                id: folderId,
-                name: `Branches of ${currentChat.name}`,
-                folded: false,
-            })
-            currentChat.folderId = folderId
-        }
-        
-        const currentMessage = currentChat.message[idx]
-        const newChat = $state.snapshot(currentChat)
-        newChat.name = createChatCopyName(newChat.name, 'Branch')
-        newChat.id = v4()
-        newChat.message = newChat.message.slice(0, idx + 1)
-        newChat.message.push({
-            role: 'char',
-            data: '{{specialcomment::branchedfrom::' + currentChat.id + '::' + currentChat.name + '::' + currentMessage.chatId + '::}}',
-            isComment: true,
-            disabled: true,
-            chatId: v4(),
+        await createCapturedConversationBranch({
+            target,
+            context: chatMessageContext,
+            runtime: getPersistentDataRuntime(),
+            createFolderOnBranch: DBState.db.createFolderOnBranch === true,
+            createId: uuidv4,
+            createBranchName: (sourceName) => createChatCopyName(sourceName, 'Branch'),
+            navigateToBranch: changeChatTo,
         })
-
-        DBState.db.characters[selIdState.selId].chats.unshift(newChat)
-        await changeChatTo(newChat.id)
     }}>
         <SplitIcon size={20}/>
         {#if showNames}
