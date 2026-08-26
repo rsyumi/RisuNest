@@ -223,6 +223,9 @@ internal fun openedFilesScript(paths: List<String>): String {
   return "window.tauriOpenedFiles=[$values];"
 }
 
+internal fun shouldUseNativeRisuSaveSpool(displayName: String): Boolean =
+  displayName.endsWith(".risudat", ignoreCase = true)
+
 internal class RestoredIntentConsumptionMarker(
   private val isConsumed: () -> Boolean,
   private val markConsumed: () -> Unit,
@@ -469,7 +472,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     if (BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS) {
       setIntent(intent)
       consumedOpenedFileFingerprint = null
-      lifecycleWebView?.let { injectOpenedFiles(it, intent) }
+      lifecycleWebView?.let { injectOpenedFiles(it, intent, includeLegacyFiles = false) }
     }
   }
 
@@ -671,6 +674,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     fun cancelSource(requestId: String) {
       safSourceCancellations[requestId]?.set(true)
     }
+
+    @JavascriptInterface
+    fun discardSource(token: String): Boolean = safSpoolStore().discardReady(token)
 
     @JavascriptInterface
     fun getActiveSourceRequestIds(): String = safSourceCancellations.keys
@@ -1146,9 +1152,20 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     else -> null
   }
 
-  private fun injectOpenedFiles(webView: WebView, openedIntent: Intent? = intent) {
+  private fun injectOpenedFiles(
+    webView: WebView,
+    openedIntent: Intent? = intent,
+    includeLegacyFiles: Boolean = true,
+  ) {
     val uris = claimOpenedFileUris(openedIntent)
     if (uris.isEmpty()) return
+    val (risuSaveUris, legacyUris) = uris.partition { uri ->
+      val displayName = runCatching { resolveLegacyDisplayName(uri) }
+        .getOrElse { sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") }
+      shouldUseNativeRisuSaveSpool(displayName)
+    }
+    if (includeLegacyFiles) injectLegacyOpenedFiles(webView, legacyUris)
+    if (risuSaveUris.isEmpty()) return
     val requestId = UUID.randomUUID().toString()
     val cancellation = AtomicBoolean(false)
     safSourceCancellations[requestId] = cancellation
@@ -1157,7 +1174,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         val store = safSpoolStore()
         val sources = withContext(Dispatchers.IO) {
           store.cleanupStale()
-          uris.map(::contentResolverSource)
+          risuSaveUris.map(::contentResolverSource)
         }
         val copyContext = currentCoroutineContext()
         val batch = spoolOpenedFilesOnIo(
@@ -1197,7 +1214,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       val ready = withContext(Dispatchers.IO) {
         val store = safSpoolStore()
         store.cleanupStale()
-        store.listReady().filter { deliveredSpoolTokens.add(it.token) }
+        store.listReady().filter {
+          shouldUseNativeRisuSaveSpool(it.displayName) && deliveredSpoolTokens.add(it.token)
+        }
       }
       if (ready.isEmpty() || lifecycleWebView !== webView) return@launch
       webView.evaluateJavascript(
@@ -1260,8 +1279,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private fun injectLegacyOpenedFiles(webView: WebView) {
-    val openedFiles = copyLegacyOpenedFiles(launchOpenedFileUris(intent))
+  private fun injectLegacyOpenedFiles(
+    webView: WebView,
+    uris: List<Uri> = launchOpenedFileUris(intent),
+  ) {
+    val openedFiles = copyLegacyOpenedFiles(uris)
     if (openedFiles.isEmpty()) return
     val script = openedFilesScript(openedFiles)
     if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {

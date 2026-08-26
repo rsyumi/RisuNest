@@ -23,15 +23,23 @@ export interface AndroidSpoolBatch {
 }
 
 export interface AndroidSpoolListenerDependencies {
-    initialBatch(): AndroidSpoolBatch | null | undefined
+    takePendingBatch(): AndroidSpoolBatch | null | undefined
+    clearPendingBatch(): void
     addEventListener(name: string, listener: (event: Event) => void): void
     removeEventListener(name: string, listener: (event: Event) => void): void
 }
 
 const productionSpoolListenerDependencies: AndroidSpoolListenerDependencies = {
-    initialBatch: () => (window as Window & {
-        tauriOpenedFileSpools?: AndroidSpoolBatch
-    }).tauriOpenedFileSpools,
+    takePendingBatch: () => {
+        const target = window as Window & { tauriOpenedFileSpools?: AndroidSpoolBatch }
+        const batch = target.tauriOpenedFileSpools
+        delete target.tauriOpenedFileSpools
+        return batch
+    },
+    clearPendingBatch: () => {
+        delete (window as Window & { tauriOpenedFileSpools?: AndroidSpoolBatch })
+            .tauriOpenedFileSpools
+    },
     addEventListener: (name, listener) => window.addEventListener(name, listener),
     removeEventListener: (name, listener) => window.removeEventListener(name, listener),
 }
@@ -42,10 +50,13 @@ export function listenAndroidSpoolBatches(
 ): () => void {
     const onReady = (event: Event) => {
         const batch = (event as CustomEvent<AndroidSpoolBatch>).detail
-        if (batch) listener(batch)
+        if (batch) {
+            dependencies.clearPendingBatch()
+            listener(batch)
+        }
     }
     dependencies.addEventListener(SPOOL_EVENT, onReady)
-    const initial = dependencies.initialBatch()
+    const initial = dependencies.takePendingBatch()
     if (initial) queueMicrotask(() => listener(initial))
     return () => dependencies.removeEventListener(SPOOL_EVENT, onReady)
 }
@@ -110,6 +121,7 @@ export interface AndroidSafJavascriptBridge {
     ): void
     cancelExport?(requestId: string): boolean | void
     cancelSource?(requestId: string): void
+    discardSource?(token: string): boolean
     getActiveSourceRequestIds?(): string
     getExportStatus?(): string | null
     acknowledgeExport?(requestId: string): boolean
@@ -163,6 +175,13 @@ export function cancelAndroidSafSource(
     bridge: AndroidSafJavascriptBridge = productionBridge(),
 ): void {
     bridge.cancelSource?.(requestId)
+}
+
+export function discardAndroidSafSource(
+    token: string,
+    bridge: AndroidSafJavascriptBridge = productionBridge(),
+): boolean {
+    return bridge.discardSource?.(token) === true
 }
 
 export function getActiveAndroidSafSourceRequestIds(

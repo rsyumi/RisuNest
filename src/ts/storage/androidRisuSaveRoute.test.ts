@@ -8,6 +8,7 @@ import {
 function dependencies(): AndroidRisuSaveSpoolRouteDependencies {
     return {
         confirmRestore: vi.fn(async () => true),
+        discard: vi.fn(),
         restore: vi.fn(async () => undefined),
         unsupported: vi.fn(),
         failed: vi.fn(),
@@ -68,7 +69,7 @@ describe('Android RisuSave spool route', () => {
         })
     })
 
-    it('deduplicates a replayed token and leaves a rejected restore unclaimed', async () => {
+    it('deduplicates a replayed token and discards a rejected restore', async () => {
         const deps = dependencies()
         vi.mocked(deps.confirmRestore).mockResolvedValueOnce(false)
         const route = createAndroidRisuSaveSpoolRoute(deps)
@@ -84,6 +85,8 @@ describe('Android RisuSave spool route', () => {
 
         expect(deps.confirmRestore).toHaveBeenCalledOnce()
         expect(deps.restore).not.toHaveBeenCalled()
+        expect(deps.discard).toHaveBeenCalledOnce()
+        expect(deps.discard).toHaveBeenCalledWith(source)
     })
 
     it('reports unsupported sources, spool failures, and restore errors without stopping the queue', async () => {
@@ -120,6 +123,9 @@ describe('Android RisuSave spool route', () => {
             code: 'source-open-failed',
         })
         expect(deps.unsupported).toHaveBeenCalledWith(expect.objectContaining({
+            displayName: 'card.charx',
+        }))
+        expect(deps.discard).toHaveBeenCalledWith(expect.objectContaining({
             displayName: 'card.charx',
         }))
         expect(deps.onError).toHaveBeenCalledWith(

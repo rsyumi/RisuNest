@@ -226,6 +226,26 @@ internal class SafSpoolStore(
     }.sortedBy(SafSpoolReady::token)
   }
 
+  fun discardReady(token: String): Boolean {
+    if (!isCanonicalUuidV4(token) || !root.isDirectory) return false
+    val canonicalRoot = runCatching { root.canonicalFile }.getOrNull() ?: return false
+    val ownedDirectory = root.resolve(token)
+    val canonicalOwned = runCatching { ownedDirectory.canonicalFile }.getOrNull() ?: return false
+    if (!ownedDirectory.isDirectory || canonicalOwned.parentFile != canonicalRoot) return false
+    val ownership = runCatching {
+      readSpoolOwnership(ownedDirectory.resolve("ownership.json"))
+    }.getOrNull() ?: return false
+    if (ownership.token != token || readReadySpool(ownedDirectory, token) == null) return false
+    val cleanupDirectory = root.resolve("$SPOOL_CLEANUP_PREFIX$token")
+    if (cleanupDirectory.exists()) return false
+    return try {
+      atomicPublisher.publish(ownedDirectory, cleanupDirectory)
+      deleteGeneratedDirectory(cleanupDirectory, token)
+    } catch (error: Exception) {
+      false
+    }
+  }
+
   private fun copySource(
     source: SafInputSource,
     target: File,
@@ -563,7 +583,11 @@ internal fun androidSpoolBatchScript(requestId: String, batch: SafSpoolBatch): S
     "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
   }
   val value = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]}"
-  return "window.tauriOpenedFileSpools=$value;" +
+  val pending = "{" +
+    "\"requestId\":${jsonString(requestId)}," +
+    "\"ready\":[...(window.tauriOpenedFileSpools?.ready??[]),...[$ready]]," +
+    "\"failures\":[...(window.tauriOpenedFileSpools?.failures??[]),...[$failures]]}"
+  return "window.tauriOpenedFileSpools=$pending;" +
     "window.dispatchEvent(new CustomEvent('risu-android-spool-ready',{detail:$value}));"
 }
 

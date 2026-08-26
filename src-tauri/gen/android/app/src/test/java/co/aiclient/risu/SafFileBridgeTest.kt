@@ -321,6 +321,28 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `ready spool can be discarded once without touching unrelated files`() {
+    val root = temporaryDirectory()
+    val token = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    val store = SafSpoolStore(
+      root = root,
+      atomicPublisher = testAtomicPublisher,
+      tokenFactory = { UUID.fromString(token) },
+    )
+    store.spool(listOf(TestSafSource("declined.risudat", 2) {
+      ByteArrayInputStream(byteArrayOf(1, 2))
+    }))
+    val unrelated = root.resolve("unrelated")
+    unrelated.writeText("preserve")
+
+    assertTrue(store.discardReady(token))
+    assertFalse(root.resolve(token).exists())
+    assertFalse(store.discardReady(token))
+    assertFalse(store.discardReady("../unrelated"))
+    assertEquals("preserve", unrelated.readText())
+  }
+
+  @Test
   fun `destination state survives store reconstruction with bounded identifiers only`() {
     val root = temporaryDirectory()
     val stateFile = root.resolve("android-saf-destination.json")

@@ -4,6 +4,7 @@ import { alertConfirm, alertError, alertNormal } from '../alert'
 import { isTauriAndroid } from '../platform'
 import { loadPluginsAfterAuthoritativeRestore } from '../plugins/plugins.svelte'
 import {
+    discardAndroidSafSource,
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
     type AndroidSpoolFailure,
@@ -48,6 +49,11 @@ export function registerAndroidRisuSaveRoute(): void {
         confirmRestore: async () =>
             await alertConfirm(language.risuSaveImportConfirm)
             && await alertConfirm(language.backupLoadConfirm2),
+        discard: (source) => {
+            if (!discardAndroidSafSource(source.token)) {
+                alertError(`${source.displayName}: discard-failed`)
+            }
+        },
         restore: async ({ source }) => {
             const result = await runSharedNativeFileOperation(
                 'import',

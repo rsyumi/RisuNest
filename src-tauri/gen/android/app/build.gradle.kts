@@ -15,7 +15,7 @@ val tauriProperties = Properties().apply {
 val enableExperimentalSafFileJobs = providers
     .gradleProperty("risuEnableExperimentalSafFileJobs")
     .map { it.equals("true", ignoreCase = true) }
-    .orElse(false)
+    .orElse(true)
 val enableExperimentalPeerCloneClient = providers
     .gradleProperty("risuEnableExperimentalPeerCloneClient")
     .map { it.equals("true", ignoreCase = true) }

@@ -7,8 +7,18 @@ import org.junit.Test
 
 class MainActivityBehaviorTest {
   @Test
-  fun `SAF file jobs stay disabled until physical lifecycle validation`() {
-    assertEquals(false, BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS)
+  fun `SAF RisuSave import is enabled by default`() {
+    assertEquals(true, BuildConfig.ENABLE_EXPERIMENTAL_SAF_FILE_JOBS)
+  }
+
+  @Test
+  fun `native SAF routing preserves legacy imports for other associated formats`() {
+    assertEquals(true, shouldUseNativeRisuSaveSpool("backup.risudat"))
+    assertEquals(true, shouldUseNativeRisuSaveSpool("BACKUP.RISUDAT"))
+    assertEquals(false, shouldUseNativeRisuSaveSpool("module.risum"))
+    assertEquals(false, shouldUseNativeRisuSaveSpool("preset.risup"))
+    assertEquals(false, shouldUseNativeRisuSaveSpool("character.charx"))
+    assertEquals(false, shouldUseNativeRisuSaveSpool("unknown"))
   }
 
   @Test
@@ -339,6 +349,8 @@ class MainActivityBehaviorTest {
     )
 
     assertEquals(true, script.contains("window.tauriOpenedFileSpools="))
+    assertEquals(true, script.contains("window.tauriOpenedFileSpools?.ready"))
+    assertEquals(true, script.contains("window.tauriOpenedFileSpools?.failures"))
     assertEquals(true, script.contains("\"requestId\":\"request-1\""))
     assertEquals(true, script.contains("11111111-1111-4111-8111-111111111111"))
     assertEquals(true, script.contains("a\\\"b\\\\c\\nd.risudat"))

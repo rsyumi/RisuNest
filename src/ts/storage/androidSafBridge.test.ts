@@ -4,6 +4,7 @@ import {
     cancelAndroidSafSource,
     consumeAndroidSpoolBatch,
     copyNativeExportToAndroidSaf,
+    discardAndroidSafSource,
     getActiveAndroidSafSourceRequestIds,
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
@@ -19,6 +20,7 @@ describe('Android SAF bridge', () => {
     it('subscribes before consuming the replayed ready batch and removes the listener', async () => {
         const listeners = new Set<(event: Event) => void>()
         const batches: unknown[] = []
+        let pendingClears = 0
         const initial = {
             requestId: 'initial-request',
             ready: [{
@@ -33,7 +35,8 @@ describe('Android SAF bridge', () => {
         const dispose = listenAndroidSpoolBatches(
             (batch) => batches.push(batch),
             {
-                initialBatch: () => initial,
+                takePendingBatch: () => initial,
+                clearPendingBatch: () => pendingClears += 1,
                 addEventListener: (_name, listener) => listeners.add(listener),
                 removeEventListener: (_name, listener) => listeners.delete(listener),
             },
@@ -49,8 +52,21 @@ describe('Android SAF bridge', () => {
         await Promise.resolve()
 
         expect(batches).toEqual([eventBatch, initial])
+        expect(pendingClears).toBe(1)
         dispose()
         expect(listeners.size).toBe(0)
+    })
+
+    it('discards a ready source through the token-only native bridge', () => {
+        const discardSource = vi.fn(() => true)
+
+        expect(discardAndroidSafSource(
+            '11111111-1111-4111-8111-111111111111',
+            { copyExport: vi.fn(), discardSource },
+        )).toBe(true)
+        expect(discardSource).toHaveBeenCalledWith(
+            '11111111-1111-4111-8111-111111111111',
+        )
     })
 
     it('passes ready spool tokens to native jobs without file reads or byte payloads', async () => {

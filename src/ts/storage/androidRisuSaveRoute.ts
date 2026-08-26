@@ -13,6 +13,7 @@ export interface AndroidRisuSaveRestoreInput {
 
 export interface AndroidRisuSaveSpoolRouteDependencies {
     confirmRestore(source: AndroidSpoolReady): Promise<boolean>
+    discard(source: AndroidSpoolReady): void
     restore(input: AndroidRisuSaveRestoreInput): Promise<void>
     unsupported(source: AndroidSpoolReady): void
     failed(failure: AndroidSpoolFailure): void
@@ -41,14 +42,21 @@ export function createAndroidRisuSaveSpoolRoute(
                     { ...batch, ready },
                     {
                         failed: dependencies.failed,
-                        unsupported: dependencies.unsupported,
+                        unsupported: (source) => {
+                            dependencies.discard(source)
+                            dependencies.unsupported(source)
+                        },
                         restore: async (input) => {
                             const token = input.source.type === 'androidSpool'
                                 ? input.source.token
                                 : null
                             if (!token) return
                             const source = ready.find((item) => item.token === token)
-                            if (!source || !await dependencies.confirmRestore(source)) return
+                            if (!source) return
+                            if (!await dependencies.confirmRestore(source)) {
+                                dependencies.discard(source)
+                                return
+                            }
                             try {
                                 await dependencies.restore(input)
                             }
