@@ -20,6 +20,7 @@ const CHILD_MODE_ENV: &str = "RISUNEST_P0_CLONE_CHILD_MODE";
 const CHILD_SESSION_URL_ENV: &str = "RISUNEST_P0_CLONE_SESSION_URL";
 const CHILD_STAGING_ROOT_ENV: &str = "RISUNEST_P0_CLONE_STAGING_ROOT";
 const CHILD_MARKER_ENV: &str = "RISUNEST_P0_CLONE_MARKER";
+const ANDROID_CHILD_JOB_ROOT_ENV: &str = "RISUNEST_P3_ANDROID_JOB_ROOT";
 
 #[test]
 #[ignore = "spawned by parent process tests"]
@@ -27,14 +28,17 @@ fn clone_process_child() {
     let Ok(mode) = std::env::var(CHILD_MODE_ENV) else {
         return;
     };
-    let session_url = std::env::var(CHILD_SESSION_URL_ENV).unwrap();
-    let staging_root = std::env::var(CHILD_STAGING_ROOT_ENV).unwrap();
-    let mut client = LoopbackCloneClient::new(staging_root, session_url).unwrap();
     match mode.as_str() {
         "proxy" => {
+            let session_url = std::env::var(CHILD_SESSION_URL_ENV).unwrap();
+            let staging_root = std::env::var(CHILD_STAGING_ROOT_ENV).unwrap();
+            let mut client = LoopbackCloneClient::new(staging_root, session_url).unwrap();
             client.download(&TransferCancellation::new()).unwrap();
         }
         "mid-chunk-kill" => {
+            let session_url = std::env::var(CHILD_SESSION_URL_ENV).unwrap();
+            let staging_root = std::env::var(CHILD_STAGING_ROOT_ENV).unwrap();
+            let mut client = LoopbackCloneClient::new(staging_root, session_url).unwrap();
             let marker = std::env::var(CHILD_MARKER_ENV).unwrap();
             client
                 .download_with_progress(&TransferCancellation::new(), |bytes| {
@@ -46,10 +50,25 @@ fn clone_process_child() {
             panic!("mid-chunk child completed before it was killed");
         }
         "cas-promotion-kill" => {
+            let session_url = std::env::var(CHILD_SESSION_URL_ENV).unwrap();
+            let staging_root = std::env::var(CHILD_STAGING_ROOT_ENV).unwrap();
+            let mut client = LoopbackCloneClient::new(staging_root, session_url).unwrap();
             let marker = std::env::var(CHILD_MARKER_ENV).unwrap();
             client.pause_after_cas_promotion_for_test(marker);
             client.download(&TransferCancellation::new()).unwrap();
             panic!("CAS-promotion child completed before it was killed");
+        }
+        "android-verified-chunk-kill" => {
+            let marker = std::env::var(CHILD_MARKER_ENV).unwrap();
+            let job_root = std::env::var(ANDROID_CHILD_JOB_ROOT_ENV).unwrap();
+            let mut job = AndroidResumableCloneJob::open(job_root).unwrap();
+            job.download_with_progress(&TransferCancellation::new(), |bytes| {
+                if bytes >= CLONE_CHUNK_SIZE + 64 * 1024 {
+                    write_durable_marker_and_wait(Path::new(&marker));
+                }
+            })
+            .unwrap();
+            panic!("Android clone child completed before it was killed");
         }
         _ => panic!("unknown clone child mode: {mode}"),
     }
@@ -85,6 +104,16 @@ fn spawn_clone_kill_child(
     marker: &Path,
 ) -> Child {
     clone_child_command(mode, session_url, staging_root)
+        .env(CHILD_MARKER_ENV, marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn spawn_android_clone_kill_child(job_root: &Path, marker: &Path) -> Child {
+    clone_child_command("android-verified-chunk-kill", "unused", job_root)
+        .env(ANDROID_CHILD_JOB_ROOT_ENV, job_root)
         .env(CHILD_MARKER_ENV, marker)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -794,6 +823,138 @@ fn persisted_lan_credential_is_owner_only_on_unix() {
             & 0o777,
         0o700
     );
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_job_resumes_from_a_verified_chunk_after_actual_process_kill() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let jobs_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[(CLONE_CHUNK_SIZE * 2 + 97) as usize]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let job_root = jobs_root
+        .path()
+        .join("99999999-9999-4999-8999-999999999999");
+    let job = AndroidResumableCloneJob::claim(
+        &job_root,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+    drop(job);
+    let marker = jobs_root.path().join("verified-chunk.kill-ready");
+    let mut child = spawn_android_clone_kill_child(&job_root, &marker);
+
+    wait_for_marker_and_kill(&mut child, &marker);
+
+    let mut completed = None;
+    for _ in 0..4 {
+        let mut reopened = AndroidResumableCloneJob::open(&job_root).unwrap();
+        match reopened.download(&TransferCancellation::new()) {
+            Ok(report) => {
+                completed = Some((reopened, report));
+                break;
+            }
+            Err(PeerSyncError::Transport(_)) => thread::sleep(Duration::from_millis(300)),
+            Err(error) => panic!("Android clone resume failed: {error}"),
+        }
+    }
+    let (reopened, report) = completed.expect("Android clone did not resume after LAN retry");
+    let total_bytes = host
+        .manifest()
+        .objects
+        .values()
+        .map(|object| object.size)
+        .sum::<u64>();
+    assert_eq!(
+        reopened.phase().unwrap(),
+        AndroidCloneJobPhase::VerifiedAwaitingActivation
+    );
+    assert_eq!(report.verified_objects, host.manifest().objects.len());
+    assert!(report.transferred_bytes <= total_bytes - CLONE_CHUNK_SIZE);
+    assert_eq!(report.maximum_buffer_bytes, 64 * 1024);
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_explicit_cancel_removes_only_the_owned_job_root() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let jobs_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(
+        source_root.path(),
+        &[64 * 1024, (CLONE_CHUNK_SIZE + 17) as usize],
+    );
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let job_root = jobs_root
+        .path()
+        .join("88888888-8888-4888-8888-888888888888");
+    let unrelated = jobs_root.path().join("keep.txt");
+    fs::write(&unrelated, b"keep").unwrap();
+    let cancellation = TransferCancellation::new();
+    let cancellation_for_progress = cancellation.clone();
+    let mut job = AndroidResumableCloneJob::claim(
+        &job_root,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+
+    let result = job.download_with_progress(&cancellation, move |bytes| {
+        if bytes >= 128 * 1024 {
+            cancellation_for_progress.cancel();
+        }
+    });
+
+    assert_eq!(result.unwrap_err(), PeerSyncError::Cancelled);
+    job.discard().unwrap();
+    assert!(!job_root.exists());
+    assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+    host.stop().unwrap();
+}
+
+#[test]
+fn android_clone_cancel_marker_survives_reopen_before_owned_cleanup() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let jobs_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let job_root = jobs_root
+        .path()
+        .join("77777777-7777-4777-8777-777777777777");
+    let unrelated = jobs_root.path().join("keep.txt");
+    fs::write(&unrelated, b"keep").unwrap();
+    let job = AndroidResumableCloneJob::claim(
+        &job_root,
+        &endpoint,
+        &pairing.session_id,
+        &pairing.manifest_id,
+        &pairing.claim,
+    )
+    .unwrap();
+
+    job.request_cancel().unwrap();
+    drop(job);
+    assert!(AndroidResumableCloneJob::open(&job_root)
+        .unwrap()
+        .cancel_requested()
+        .unwrap());
+
+    AndroidResumableCloneJob::discard_at(&job_root).unwrap();
+    assert!(!job_root.exists());
+    assert_eq!(fs::read(unrelated).unwrap(), b"keep");
     host.stop().unwrap();
 }
 

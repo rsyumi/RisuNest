@@ -1,3 +1,6 @@
+mod android_client;
+#[cfg(target_os = "android")]
+mod android_jni;
 mod client;
 pub(crate) mod commands;
 mod host;
@@ -12,6 +15,7 @@ mod tunnel;
 #[cfg(test)]
 mod tests;
 
+pub use android_client::{AndroidCloneJobPhase, AndroidResumableCloneJob};
 pub use client::{
     activate_downloaded_clone, CloneActivation, CloneTargetAdapter, CloneValidator, DownloadReport,
     LoopbackCloneClient, TransferCancellation,

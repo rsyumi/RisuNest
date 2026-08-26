@@ -4006,6 +4006,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "image",
+ "jni 0.21.1",
  "libc",
  "oauth2",
  "reqwest 0.11.27",
