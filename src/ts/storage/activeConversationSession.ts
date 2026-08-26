@@ -324,6 +324,13 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
     ) && typeof (value as PromiseLike<unknown>).then === 'function'
 }
 
+function restoreMessage(target: Message, snapshot: Message): void {
+    for (const key of Object.keys(target) as Array<keyof Message>) {
+        if (!(key in snapshot)) delete target[key]
+    }
+    Object.assign(target, safeStructuredClone(snapshot))
+}
+
 function createLocator(
     conversationId: string,
     messages: readonly Message[],
@@ -890,6 +897,12 @@ export class ActiveConversationSession {
             const completed = transaction[finishConversationTransaction]()
             if (completed.commands.length > 0) {
                 const previousMessages = this.conversation.message
+                const rollbackMessages = this.onMutation
+                    ? previousMessages.map((message) => ({
+                        message,
+                        snapshot: safeStructuredClone(message),
+                    }))
+                    : null
                 const previousLocatorRegistry = this.locatorRegistry
                 this.conversation.message = completed.messages
                 this.sessionVersion = completed.version
@@ -904,6 +917,14 @@ export class ActiveConversationSession {
                     })
                     previousLocatorRegistry.clear()
                 } catch (error) {
+                    if (rollbackMessages) {
+                        previousMessages.length = rollbackMessages.length
+                        for (let index = 0; index < rollbackMessages.length; index++) {
+                            const rollback = rollbackMessages[index]
+                            restoreMessage(rollback.message, rollback.snapshot)
+                            previousMessages[index] = rollback.message
+                        }
+                    }
                     this.conversation.message = previousMessages
                     this.sessionVersion = previousVersion
                     completed.locatorRegistry.clear()

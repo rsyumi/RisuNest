@@ -419,6 +419,30 @@ describe('ActiveConversationSession', () => {
         expect(after[2]).toBe(before[2])
     })
 
+    it('restores untouched nested state when the mutation observer throws', () => {
+        const edited = message('edited', 'zero')
+        edited.generationInfo = { stageTiming: { stage1: 1 } }
+        const untouched = message('untouched', 'one')
+        untouched.generationInfo = { stageTiming: { stage1: 2 } }
+        const originalMessages = [edited, untouched]
+        const conversation = chat(originalMessages)
+        const onMutation = vi.fn(() => {
+            conversation.message[1].generationInfo!.stageTiming!.stage1 = 99
+            throw new Error('observer failed')
+        })
+        const { session } = createSession(conversation, onMutation)
+
+        expect(() => session.edit(
+            session.locate(0),
+            message('edited', 'replacement'),
+        )).toThrow('observer failed')
+
+        expect(conversation.message).toBe(originalMessages)
+        expect(conversation.message[1]).toBe(untouched)
+        expect(conversation.message[1].generationInfo?.stageTiming?.stage1).toBe(2)
+        expect(session.version).toBe(0)
+    })
+
     it('isolates nested draft message state when a transaction throws', () => {
         const nested = message('nested', 'original')
         nested.generationInfo = {
