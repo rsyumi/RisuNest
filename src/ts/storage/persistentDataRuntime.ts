@@ -254,6 +254,7 @@ export interface PersistentDataRuntime {
     initializeActiveWorkingSet(database: Database): Promise<void>
     markPersistentDataDirty(estimatedBytes: number): void
     flushPendingData(reason: string): Promise<void>
+    acknowledgeGenerationCompletion(): Promise<void>
     commitCharacterAddition(request: CharacterAdditionRequest, reason: string): Promise<void>
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
@@ -502,6 +503,8 @@ export function createPersistentDataRuntime(
         markPersistentDataDirty: (estimatedBytes) =>
             coordinator.markPersistentDataDirty(estimatedBytes),
         flushPendingData: (reason) => coordinator.flushPendingData(reason),
+        acknowledgeGenerationCompletion: () =>
+            coordinator.flushPendingData('generation-completion'),
         commitCharacterAddition: (request, reason) =>
             coordinator.commitCharacterAddition(request, reason),
         activateCharacter,

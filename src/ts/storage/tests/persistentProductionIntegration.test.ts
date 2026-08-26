@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto'
 import { describe, expect, it, vi } from 'vitest'
 import type { Database } from '../database.svelte'
 import { IndexedDbPersistentDataStore } from '../indexedDbPersistentDataStore'
+import { RevisionConflictError } from '../persistentDataStore'
 import {
     capturePersistentRoot,
     capturePersistentPresets,
@@ -99,6 +100,11 @@ function makeAdapter(database: Database): PersistentDataRuntimeStateAdapter & {
 
 function makeStore(name: string) {
     return new IndexedDbPersistentDataStore(name, indexedDB, IDBKeyRange)
+}
+
+const rendererOwnedDebounceClock = {
+    setTimeout: () => Symbol('renderer-owned-debounce'),
+    clearTimeout: () => undefined,
 }
 
 async function concatenate(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
@@ -246,7 +252,7 @@ describe('persistent production runtime', () => {
         expect(legacyWriter).not.toHaveBeenCalled()
     })
 
-    it('recovers a completed generation when the renderer reloads before the debounce flush', async () => {
+    it('does not acknowledge completion until the generation survives renderer reload', async () => {
         const databaseName = `runtime-generation-reload-${crypto.randomUUID()}`
         const database = makeDatabase()
         const store = makeStore(databaseName)
@@ -256,10 +262,7 @@ describe('persistent production runtime', () => {
         const runtime = createPersistentDataRuntime({
             store,
             state: adapter,
-            clock: {
-                setTimeout: () => Symbol('renderer-owned-debounce'),
-                clearTimeout: () => undefined,
-            },
+            clock: rendererOwnedDebounceClock,
             prepareDatabase: async (candidate) => structuredClone(candidate),
         })
         await runtime.initializeActiveWorkingSet(database)
@@ -275,6 +278,7 @@ describe('persistent production runtime', () => {
         }
         adapter.current().characters[0].chats[0].message.push(completedGeneration)
         runtime.markPersistentDataDirty(64)
+        await runtime.acknowledgeGenerationCompletion()
 
         const reopened = makeStore(databaseName)
         await reopened.open()
@@ -283,6 +287,99 @@ describe('persistent production runtime', () => {
         expect(recovered.characters[0].chats[0].message).toContainEqual(
             completedGeneration,
         )
+    })
+
+    it('keeps a failed completion dirty so a retry makes it durable', async () => {
+        const databaseName = `runtime-generation-retry-${crypto.randomUUID()}`
+        const database = makeDatabase()
+        const store = makeStore(databaseName)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const commit = store.commit.bind(store)
+        let failNextCommit = true
+        store.commit = async (input) => {
+            if (failNextCommit) {
+                failNextCommit = false
+                throw new Error('synthetic generation commit failure')
+            }
+            return commit(input)
+        }
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            clock: rendererOwnedDebounceClock,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+        const completedGeneration = {
+            role: 'char' as const,
+            data: 'retryable completed response',
+            chatId: 'generation-retry',
+        }
+        adapter.current().characters[0].chats[0].message.push(completedGeneration)
+        runtime.markPersistentDataDirty(64)
+
+        await expect(runtime.acknowledgeGenerationCompletion()).rejects.toThrow(
+            'synthetic generation commit failure',
+        )
+        const beforeRetry = makeStore(databaseName)
+        await beforeRetry.open()
+        expect((await beforeRetry.materializeDatabase()).characters[0].chats[0].message).toEqual([])
+
+        await runtime.acknowledgeGenerationCompletion()
+
+        const reopened = makeStore(databaseName)
+        await reopened.open()
+        expect((await reopened.materializeDatabase()).characters[0].chats[0].message).toContainEqual(
+            completedGeneration,
+        )
+    })
+
+    it('rejects completion acknowledgement on revision conflict without exposing the generation', async () => {
+        const databaseName = `runtime-generation-conflict-${crypto.randomUUID()}`
+        const database = makeDatabase()
+        const store = makeStore(databaseName)
+        await store.open()
+        await store.replaceFromDatabase(database)
+        const adapter = makeAdapter(database)
+        const runtime = createPersistentDataRuntime({
+            store,
+            state: adapter,
+            clock: rendererOwnedDebounceClock,
+            prepareDatabase: async (candidate) => structuredClone(candidate),
+        })
+        await runtime.initializeActiveWorkingSet(database)
+
+        const competingStore = makeStore(databaseName)
+        await competingStore.open()
+        const competingRoot = await competingStore.readRoot()
+        await competingStore.commit({
+            expectedRevision: competingRoot.revision,
+            root: {
+                ...competingRoot.value,
+                username: 'Competing renderer',
+            },
+        })
+        adapter.current().characters[0].chats[0].message.push({
+            role: 'char',
+            data: 'conflicted completed response',
+            chatId: 'generation-conflict',
+        })
+        runtime.markPersistentDataDirty(64)
+
+        await expect(runtime.acknowledgeGenerationCompletion()).rejects.toBeInstanceOf(
+            RevisionConflictError,
+        )
+        await expect(runtime.acknowledgeGenerationCompletion()).rejects.toBeInstanceOf(
+            RevisionConflictError,
+        )
+
+        const reopened = makeStore(databaseName)
+        await reopened.open()
+        const persisted = await reopened.materializeDatabase()
+        expect(persisted.username).toBe('Competing renderer')
+        expect(persisted.characters[0].chats[0].message).toEqual([])
     })
 
     it('preserves inactive preset rows across scalable root flushes and active switches', async () => {

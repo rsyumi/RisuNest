@@ -39,6 +39,7 @@ import {
     consumeStreamingDisplayStream,
 } from './streamingDisplayStream'
 import {
+    acknowledgeGenerationCompletion,
     getActiveConversationSession,
     invalidateActiveConversationSession,
 } from '../storage/persistentDataRuntime.svelte'
@@ -1701,6 +1702,25 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     let result = ''
     let emoChanged = false
     let resendChat = false
+
+    async function completeGeneration(): Promise<true> {
+        await acknowledgeGenerationCompletion()
+        if(DBState.db.notification){
+            try {
+                const permission = await Notification.requestPermission()
+                if(permission === 'granted'){
+                    const noti = new Notification('Risuai', {
+                        body: result
+                    })
+                    noti.onclick = () => {
+                        window.focus()
+                    }
+                }
+            } catch {}
+        }
+        void peerSync()
+        return true
+    }
     
     if(abortSignal.aborted === true){
         return false
@@ -2065,6 +2085,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
     }
 
     if(needsAutoContinue){
+        await acknowledgeGenerationCompletion()
         doingChat.set(false)
         releaseOutputTarget()
         return await sendChat(chatProcessIndex, {
@@ -2120,31 +2141,14 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         }))) {
             return false
         }
-        
+
+        await acknowledgeGenerationCompletion()
         doingChat.set(false)
         releaseOutputTarget()
         return await sendChat(chatProcessIndex, {
             signal: abortSignal
         })
     }
-
-    if(DBState.db.notification){
-        try {
-            const permission = await Notification.requestPermission()
-            if(permission === 'granted'){
-                const noti = new Notification('Risuai', {
-                    body: result
-                })
-                noti.onclick = () => {
-                    window.focus()
-                }
-            }
-        } catch (error) {
-            
-        }
-    }
-
-    peerSync()
 
     if(req.special){
         if(req.special.emotion){
@@ -2231,7 +2235,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
                 
 
-                return true
+                return await completeGeneration()
             }
 
             function shuffleArray(array:string[]) {
@@ -2293,17 +2297,17 @@ export async function sendChat(chatProcessIndex = -1,arg:{
 
             if(rq.type === 'fail'){
                 if(abortSignal.aborted){
-                    return true
+                    return await completeGeneration()
                 }
                 throwError(rq.result)
-                return true
+                return await completeGeneration()
             }
             if(rq.type === 'streaming' || rq.type === 'multiline'){
                 if(abortSignal.aborted){
-                    return true
+                    return await completeGeneration()
                 }
                 throwError('Unexpected response type')
-                return true
+                return await completeGeneration()
             }
             else{
                 emotionList = currentEmotion.map((a) => {
@@ -2344,11 +2348,11 @@ export async function sendChat(chatProcessIndex = -1,arg:{
                     }
                 } catch (error) {
                     throwError(language.errors.httpError + `${error}`)
-                    return true
+                    return await completeGeneration()
                 }
             }
             
-            return true
+            return await completeGeneration()
 
 
         }
@@ -2394,7 +2398,7 @@ export async function sendChat(chatProcessIndex = -1,arg:{
         return false
     }
 
-    return true
+    return await completeGeneration()
     }
     finally {
         outputTarget?.release()
