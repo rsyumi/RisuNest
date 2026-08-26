@@ -36,7 +36,7 @@ tauri-plugin-process = "2.3.1"
 tauri-plugin-shell = "2.3.5"
 tauri-plugin-http = "2.5.9"
 oauth2 = "5.0.0"
-tokio = { version = "1.47.1", features = ["rt", "time"] }
+tokio = { version = "1.47.1", features = ["net", "rt", "time"] }
 tokio-util = { version = "0.7.19", features = ["io"], optional = true }
 libc = { version = "0.2", optional = true }
 hex = "0.4.3"
@@ -74,7 +74,7 @@ tauri-plugin-single-instance = { version = "2.4.3", features = ["deep-link"] }
 tauri-plugin-updater = "2.10.1"
 tiny_http = "0.12.0"
 getrandom = "0.2.15"
-reqwest = { version = "0.11.16", features = ["blocking", "json", "stream"] }
+reqwest = { version = "0.11.16", features = ["blocking", "json"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [target.'cfg(windows)'.dependencies]

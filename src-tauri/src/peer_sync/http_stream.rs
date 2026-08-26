@@ -3,7 +3,14 @@ use reqwest::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE},
     StatusCode, Url,
 };
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{sync_channel, RecvTimeoutError, SyncSender},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 const RANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -11,20 +18,19 @@ const RANGE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(super) struct HttpRangeStream {
-    client: reqwest::Client,
+    connect_timeout: Duration,
     no_progress_timeout: Duration,
+}
+
+enum RangeEvent {
+    Bytes(Vec<u8>),
+    Finished(Result<u64, PeerSyncError>),
 }
 
 impl HttpRangeStream {
     pub(super) fn new(connect_timeout: Duration) -> Result<Self, PeerSyncError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(connect_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(transport_error)?;
         Ok(Self {
-            client,
+            connect_timeout,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         })
     }
@@ -46,23 +52,62 @@ impl HttpRangeStream {
         is_cancelled: &dyn Fn() -> bool,
         on_bytes: &mut dyn FnMut(&[u8]) -> Result<(), PeerSyncError>,
     ) -> Result<u64, PeerSyncError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(transport_error)?;
-        runtime.block_on(self.read_async(
-            url,
-            bearer,
-            object,
-            start,
-            end,
-            total,
-            is_cancelled,
-            on_bytes,
-        ))
+        // Connection setup and gaps without headers or body bytes are bounded separately.
+        // A range that keeps making progress has no total elapsed-time deadline.
+        if is_cancelled() {
+            return Err(PeerSyncError::Cancelled);
+        }
+        let stopped = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let (events, receiver) = sync_channel(0);
+            let worker_stopped = &stopped;
+            let worker = scope.spawn(move || {
+                let result = self.read_on_worker(
+                    url,
+                    bearer,
+                    object,
+                    start,
+                    end,
+                    total,
+                    worker_stopped,
+                    &events,
+                );
+                let _ = events.send(RangeEvent::Finished(result));
+            });
+            let outcome = loop {
+                if is_cancelled() {
+                    break Err(PeerSyncError::Cancelled);
+                }
+                match receiver.recv_timeout(RANGE_POLL_INTERVAL) {
+                    Ok(RangeEvent::Bytes(bytes)) => {
+                        if is_cancelled() {
+                            break Err(PeerSyncError::Cancelled);
+                        }
+                        if let Err(error) = on_bytes(&bytes) {
+                            break Err(error);
+                        }
+                    }
+                    Ok(RangeEvent::Finished(result)) => break result,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break Err(PeerSyncError::Transport(
+                            "clone range worker disconnected".to_owned(),
+                        ))
+                    }
+                }
+            };
+            stopped.store(true, Ordering::SeqCst);
+            drop(receiver);
+            if worker.join().is_err() {
+                return Err(PeerSyncError::Transport(
+                    "clone range worker panicked".to_owned(),
+                ));
+            }
+            outcome
+        })
     }
 
-    async fn read_async(
+    fn read_on_worker(
         &self,
         url: Url,
         bearer: Option<&str>,
@@ -70,18 +115,44 @@ impl HttpRangeStream {
         start: u64,
         end: u64,
         total: Option<u64>,
-        is_cancelled: &dyn Fn() -> bool,
-        on_bytes: &mut dyn FnMut(&[u8]) -> Result<(), PeerSyncError>,
+        stopped: &AtomicBool,
+        events: &SyncSender<RangeEvent>,
     ) -> Result<u64, PeerSyncError> {
-        if is_cancelled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(transport_error)?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(transport_error)?;
+        runtime.block_on(self.read_async(
+            &client, url, bearer, object, start, end, total, stopped, events,
+        ))
+    }
+
+    async fn read_async(
+        &self,
+        client: &reqwest::Client,
+        url: Url,
+        bearer: Option<&str>,
+        object: &str,
+        start: u64,
+        end: u64,
+        total: Option<u64>,
+        stopped: &AtomicBool,
+        events: &SyncSender<RangeEvent>,
+    ) -> Result<u64, PeerSyncError> {
+        if stopped.load(Ordering::SeqCst) {
             return Err(PeerSyncError::Cancelled);
         }
         let expected_size = end
             .checked_sub(start)
             .and_then(|size| size.checked_add(1))
             .ok_or_else(|| PeerSyncError::Protocol("invalid clone range".to_owned()))?;
-        let request = self
-            .client
+        let request = client
             .get(url)
             .header(RANGE, format!("bytes={start}-{end}"));
         let request = match bearer {
@@ -93,7 +164,7 @@ impl HttpRangeStream {
         let mut response = loop {
             match tokio::time::timeout(RANGE_POLL_INTERVAL, &mut send).await {
                 Ok(result) => break result.map_err(transport_error)?,
-                Err(_) => self.check_wait(is_cancelled, last_progress)?,
+                Err(_) => self.check_wait(stopped, last_progress)?,
             }
         };
         validate_response(&response, object, start, end, total)?;
@@ -105,7 +176,7 @@ impl HttpRangeStream {
             let chunk = loop {
                 match tokio::time::timeout(RANGE_POLL_INTERVAL, &mut next).await {
                     Ok(result) => break result.map_err(transport_error)?,
-                    Err(_) => self.check_wait(is_cancelled, last_progress)?,
+                    Err(_) => self.check_wait(stopped, last_progress)?,
                 }
             };
             let Some(chunk) = chunk else {
@@ -124,9 +195,11 @@ impl HttpRangeStream {
                         "range response exceeded the requested clone chunk".to_owned(),
                     ));
                 }
-                on_bytes(bytes)?;
+                events
+                    .send(RangeEvent::Bytes(bytes.to_vec()))
+                    .map_err(|_| PeerSyncError::Cancelled)?;
             }
-            if is_cancelled() {
+            if stopped.load(Ordering::SeqCst) {
                 return Err(PeerSyncError::Cancelled);
             }
         }
@@ -140,10 +213,10 @@ impl HttpRangeStream {
 
     fn check_wait(
         &self,
-        is_cancelled: &dyn Fn() -> bool,
+        stopped: &AtomicBool,
         last_progress: Instant,
     ) -> Result<(), PeerSyncError> {
-        if is_cancelled() {
+        if stopped.load(Ordering::SeqCst) {
             return Err(PeerSyncError::Cancelled);
         }
         if last_progress.elapsed() >= self.no_progress_timeout {
@@ -215,7 +288,7 @@ mod tests {
         net::{TcpListener, TcpStream},
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            mpsc, Arc,
         },
         thread,
     };
@@ -253,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn progressing_slow_eight_megabyte_range_has_no_total_deadline() {
+    fn progressing_eight_megabyte_range_can_outlive_its_idle_deadline() {
         let size = 8 * 1024 * 1024_u64;
         let (url, server) = range_server(size, move |stream| {
             let bytes = [7_u8; RANGE_COPY_BUFFER_BYTES];
@@ -292,6 +365,34 @@ mod tests {
     }
 
     #[test]
+    fn stalled_response_headers_fail_on_the_no_progress_deadline() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_millis(500));
+        });
+        let stream = HttpRangeStream::new(Duration::from_secs(1))
+            .unwrap()
+            .with_no_progress_timeout(Duration::from_millis(150));
+        let url = Url::parse(&format!("http://{address}/objects/{OBJECT}")).unwrap();
+        let started = Instant::now();
+
+        let error = stream
+            .read(url, None, OBJECT, 0, 0, Some(1), &|| false, &mut |_| Ok(()))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(
+            matches!(error, PeerSyncError::Transport(message) if message.contains("no progress"))
+        );
+        assert!(elapsed < Duration::from_millis(400));
+    }
+
+    #[test]
     fn stalled_range_fails_on_the_no_progress_deadline() {
         let (url, server) = range_server(1, |stream| {
             thread::sleep(Duration::from_millis(500));
@@ -315,17 +416,49 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_interrupts_a_stalled_range_poll() {
-        let (url, server) = range_server(1, |stream| {
-            thread::sleep(Duration::from_millis(500));
-            let _ = stream.write_all(&[1]);
+    fn cancellation_interrupts_a_stalled_body_and_closes_the_socket() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (body_ready, wait_for_body) = mpsc::sync_channel(0);
+        let (socket_closed, wait_for_close) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/1\r\nETag: \"{OBJECT}\"\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            body_ready.send(()).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            let closed = match stream.read(&mut byte) {
+                Ok(0) => true,
+                Err(error) => !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ),
+                Ok(_) => false,
+            };
+            socket_closed.send(closed).unwrap();
         });
         let stream = HttpRangeStream::new(Duration::from_secs(1))
             .unwrap()
             .with_no_progress_timeout(Duration::from_secs(5));
+        let url = Url::parse(&format!("http://{address}/objects/{OBJECT}")).unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel = Arc::clone(&cancelled);
         let canceller = thread::spawn(move || {
+            wait_for_body.recv().unwrap();
             thread::sleep(Duration::from_millis(100));
             cancel.store(true, Ordering::SeqCst);
         });
@@ -345,9 +478,70 @@ mod tests {
             .unwrap_err();
         let elapsed = started.elapsed();
         canceller.join().unwrap();
+        assert!(wait_for_close
+            .recv_timeout(Duration::from_millis(400))
+            .unwrap());
         server.join().unwrap();
 
         assert!(matches!(error, PeerSyncError::Cancelled));
         assert!(elapsed < Duration::from_millis(400));
+    }
+
+    #[test]
+    fn cancellation_is_observed_before_the_next_64_kib_callback() {
+        let size = (RANGE_COPY_BUFFER_BYTES * 4) as u64;
+        let (url, server) = range_server(size, move |stream| {
+            stream.write_all(&vec![3_u8; size as usize]).unwrap();
+        });
+        let stream = HttpRangeStream::new(Duration::from_secs(1)).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut callbacks = 0;
+        let mut received = 0;
+
+        let error = stream
+            .read(
+                url,
+                None,
+                OBJECT,
+                0,
+                size - 1,
+                Some(size),
+                &|| cancelled.load(Ordering::SeqCst),
+                &mut |bytes| {
+                    callbacks += 1;
+                    received += bytes.len();
+                    cancelled.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, PeerSyncError::Cancelled));
+        assert_eq!(callbacks, 1);
+        assert!(received <= RANGE_COPY_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn blocking_range_read_is_safe_inside_an_entered_tokio_runtime() {
+        let (url, server) = range_server(1, |stream| stream.write_all(&[5]).unwrap());
+        let stream = HttpRangeStream::new(Duration::from_secs(1)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut received = Vec::new();
+
+        runtime
+            .block_on(async {
+                stream.read(url, None, OBJECT, 0, 0, Some(1), &|| false, &mut |bytes| {
+                    received.extend_from_slice(bytes);
+                    Ok(())
+                })
+            })
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(received, [5]);
     }
 }

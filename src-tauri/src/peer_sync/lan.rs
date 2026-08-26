@@ -99,7 +99,7 @@ impl LanCloneClient {
             .timeout(control_timeout)
             .send()
             .map_err(transport)?;
-        if !response.status().is_success() {
+        if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
                 response.status()
@@ -215,7 +215,7 @@ impl LanCloneClient {
             .control_request(self.client.get(format!("{}/manifest", self.session_url)))
             .send()
             .map_err(transport)?;
-        if !response.status().is_success() {
+        if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
                 response.status()
@@ -261,7 +261,7 @@ impl LanCloneClient {
             )
             .send()
             .map_err(transport)?;
-        if !response.status().is_success() {
+        if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
                 response.status()
@@ -275,6 +275,16 @@ impl LanCloneClient {
         {
             return Err(PeerSyncError::Protocol(
                 "LAN object ETag does not match its identity".to_owned(),
+            ));
+        }
+        if response
+            .headers()
+            .get(reqwest::header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok())
+            != Some("bytes")
+        {
+            return Err(PeerSyncError::Protocol(
+                "LAN object does not advertise byte ranges".to_owned(),
             ));
         }
         response
@@ -299,6 +309,7 @@ impl LanCloneClient {
             .and_then(|size| size.checked_add(1))
             .filter(|size| *size <= CLONE_CHUNK_SIZE)
             .ok_or_else(|| PeerSyncError::Protocol("invalid LAN range".to_owned()))?;
+        let total = self.head_object(object)?;
         let url = reqwest::Url::parse(&format!("{}/objects/{object}", self.session_url))
             .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
         let mut bytes = Vec::with_capacity(expected_size as usize);
@@ -308,7 +319,7 @@ impl LanCloneClient {
             object,
             start,
             end,
-            None,
+            Some(total),
             &|| false,
             &mut |chunk| {
                 bytes.extend_from_slice(chunk);
@@ -1400,6 +1411,42 @@ fn copy_exact_response(
 mod timeout_tests {
     use super::*;
 
+    const TEST_SESSION_ID: &str = "00000000-0000-4000-8000-000000000000";
+    const TEST_BEARER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn read_request_head(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn direct_client(address: SocketAddr) -> LanCloneClient {
+        let endpoint = format!("http://{address}");
+        let session_url = format!("{endpoint}/v1/sessions/{TEST_SESSION_ID}");
+        LanCloneClient {
+            client: reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(1))
+                .timeout(Duration::from_secs(1))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .unwrap(),
+            ranges: HttpRangeStream::new(Duration::from_secs(1)).unwrap(),
+            control_timeout: Duration::from_secs(1),
+            endpoint,
+            session_id: TEST_SESSION_ID.to_owned(),
+            session_url,
+            device_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            bearer: TEST_BEARER.to_owned(),
+            manifest_id: None,
+        }
+    }
+
     #[test]
     fn accepted_connection_keeps_short_read_polls_and_allows_slow_response_progress() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1443,5 +1490,106 @@ mod timeout_tests {
 
         assert!(matches!(error, PeerSyncError::Transport(_)));
         assert!(elapsed < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn manifest_requires_the_exact_ok_status() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = direct_client(listener.local_addr().unwrap());
+        let body = b"manifest";
+        let manifest_id = sha256_hex(body);
+        let response_etag = quoted(&manifest_id);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut stream).starts_with("GET "));
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+
+        let error = client.fetch_manifest(&manifest_id).unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, PeerSyncError::Transport(_)));
+    }
+
+    #[test]
+    fn object_head_requires_the_exact_ok_status() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = direct_client(listener.local_addr().unwrap());
+        let object = "a".repeat(64);
+        let response_etag = quoted(&object);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut stream).starts_with("HEAD "));
+            write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Length: 1\r\nAccept-Ranges: bytes\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let error = client.head_object(&object).unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, PeerSyncError::Transport(_)));
+    }
+
+    #[test]
+    fn object_head_requires_the_byte_range_contract() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = direct_client(listener.local_addr().unwrap());
+        let object = "a".repeat(64);
+        let response_etag = quoted(&object);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut stream).starts_with("HEAD "));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let error = client.head_object(&object).unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, PeerSyncError::Protocol(_)));
+    }
+
+    #[test]
+    fn direct_range_requires_the_total_from_object_head() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = direct_client(listener.local_addr().unwrap());
+        let object = "a".repeat(64);
+        let response_etag = quoted(&object);
+        let server = thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_request_head(&mut stream);
+            if request.starts_with("HEAD ") {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccept-Ranges: bytes\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                continue;
+            }
+            assert!(request.starts_with("GET "));
+            write!(
+                stream,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/3\r\nETag: {response_etag}\r\nConnection: close\r\n\r\nx"
+            )
+            .unwrap();
+            break;
+        });
+
+        let error = client.fetch_chunk(&object, 0, 0).unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, PeerSyncError::Protocol(_)));
     }
 }
