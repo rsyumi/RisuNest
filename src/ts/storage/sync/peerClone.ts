@@ -28,6 +28,14 @@ export interface PeerCloneSourceStatus {
     devices: readonly { deviceId: string; verifiedBytes: number; lastSeenAt: number }[]
 }
 
+export interface PeerCloneNativeCapabilities {
+    desktop: true
+    sourceReady: boolean
+    atomicActivationReady: boolean
+    largeFixturePassed: boolean
+    productionEnabled: boolean
+}
+
 export interface PeerCloneState {
     source: {
         phase: 'idle' | 'prepared' | 'running' | 'stopped'
@@ -112,31 +120,57 @@ export function reducePeerCloneState(state: PeerCloneState, event: PeerCloneEven
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const sha256Pattern = /^[0-9a-f]{64}$/
 const hostnamePattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/i
+const maximumPairingUriLength = 8192
+const maximumEndpointLength = 2048
+const maximumClaimLength = 512
 
 function invalidPairingUri(): never {
     throw new Error('Invalid peer clone pairing URI')
 }
 
-function isIpLiteral(hostname: string): boolean {
-    return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)
-        || /^\[[0-9a-f:.]+\]$/i.test(hostname)
+function parseIpv4(hostname: string): number[] | null {
+    if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return null
+    const octets = hostname.split('.').map(Number)
+    return octets.every((octet) => octet <= 255) ? octets : null
+}
+
+function hasExplicitValidPort(value: string): boolean {
+    const match = /^http:\/\/(?:\[[^\]]+\]|[^/:?#]+):(\d+)(?:[/?#]|$)/i.exec(value)
+    if (!match) return false
+    const port = Number(match[1])
+    return Number.isInteger(port) && port >= 1 && port <= 65535
+}
+
+function isUnsafeLanHost(hostname: string): boolean {
+    const ipv4 = parseIpv4(hostname)
+    if (ipv4) return ipv4[0] === 0 || ipv4[0] === 127 || (ipv4[0] >= 224 && ipv4[0] <= 239)
+    const normalized = hostname.toLowerCase()
+    return normalized === 'localhost' || normalized.endsWith('.localhost')
+        || normalized === '[::]' || normalized === '[::1]'
 }
 
 function endpointFor(sessionId: string, value: string): string {
+    if (value.length === 0 || value.length > maximumEndpointLength || !hasExplicitValidPort(value)) {
+        return invalidPairingUri()
+    }
     let endpoint: URL
     try {
         endpoint = new URL(value)
     } catch {
         return invalidPairingUri()
     }
+    const ipv4 = parseIpv4(endpoint.hostname)
+    const ipv4Shaped = /^\d+(?:\.\d+){3}$/.test(endpoint.hostname)
     if (
         endpoint.protocol !== 'http:'
-        || !endpoint.port
         || endpoint.username
         || endpoint.password
         || endpoint.hash
         || endpoint.search
-        || (!isIpLiteral(endpoint.hostname) && !hostnamePattern.test(endpoint.hostname))
+        || (ipv4Shaped && !ipv4)
+        || (!ipv4 && !/^\[[0-9a-f:.]+\]$/i.test(endpoint.hostname)
+            && !hostnamePattern.test(endpoint.hostname))
+        || isUnsafeLanHost(endpoint.hostname)
     ) return invalidPairingUri()
 
     const sessionPath = `/v1/sessions/${sessionId}`
@@ -145,6 +179,7 @@ function endpointFor(sessionId: string, value: string): string {
 }
 
 export function parsePeerCloneUri(value: string): PeerClonePairing {
+    if (value.length === 0 || value.length > maximumPairingUriLength) return invalidPairingUri()
     let uri: URL
     try {
         uri = new URL(value)
@@ -168,11 +203,18 @@ export function parsePeerCloneUri(value: string): PeerClonePairing {
     if (!uuidPattern.test(sessionId) || !sha256Pattern.test(manifestId) || !/^claim=[^&=\s]+$/.test(fragment)) {
         return invalidPairingUri()
     }
+    let claim: string
+    try {
+        claim = decodeURIComponent(fragment.slice('claim='.length))
+    } catch {
+        return invalidPairingUri()
+    }
+    if (claim.length === 0 || claim.length > maximumClaimLength) return invalidPairingUri()
     return {
         endpoint: endpointFor(sessionId, endpointValue),
         sessionId,
         manifestId,
-        claim: decodeURIComponent(fragment.slice('claim='.length)),
+        claim,
     }
 }
 
@@ -195,6 +237,22 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         const { endpoint, sessionId, manifestId } = state.target.pairing
         return { endpoint, sessionId, manifestId }
     }
+    const capabilities = async (): Promise<PeerCloneNativeCapabilities> => {
+        supported()
+        return nativeInvoke('peer_clone_capabilities')
+    }
+    const requireSourceReady = async () => {
+        const current = await capabilities()
+        if (!current.productionEnabled || !current.sourceReady || !current.largeFixturePassed) {
+            throw new Error('Peer clone source is not enabled by native production gates')
+        }
+    }
+    const requireTargetReady = async () => {
+        const current = await capabilities()
+        if (!current.productionEnabled || !current.atomicActivationReady || !current.largeFixturePassed) {
+            throw new Error('Peer clone target is not enabled by native production gates')
+        }
+    }
 
     return {
         status(): PeerCloneCapability {
@@ -203,6 +261,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
                 : { kind: 'unsupported', platform: options.platform }
         },
         getState: () => state,
+        capabilities,
         join(pairingUri: string): PeerCloneState {
             state = reducePeerCloneState(state, { type: 'target-joined', pairing: parsePeerCloneUri(pairingUri) })
             return state
@@ -220,6 +279,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         },
         async start(sessionId: string): Promise<void> {
             supported()
+            await requireSourceReady()
             await nativeInvoke('peer_clone_start', { sessionId })
             state = reducePeerCloneState(state, { type: 'source-started' })
         },
@@ -240,6 +300,7 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         async download(): Promise<void> {
             supported()
             const args = targetArgs()
+            await requireTargetReady()
             const pairing = state.target.pairing!
             await nativeInvoke('peer_clone_claim_client', {
                 endpoint: pairing.endpoint,
@@ -251,7 +312,9 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
         },
         async resume(): Promise<void> {
             supported()
-            await nativeInvoke('peer_clone_resume', targetArgs())
+            const args = targetArgs()
+            await requireTargetReady()
+            await nativeInvoke('peer_clone_resume', args)
             state = reducePeerCloneState(state, { type: 'target-resumed' })
         },
         async cancel(): Promise<void> {

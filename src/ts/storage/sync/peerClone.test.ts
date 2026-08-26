@@ -7,6 +7,7 @@ import {
     parsePeerCloneUri,
     reducePeerCloneState,
 } from './peerClone'
+import type { PeerCloneInvoke } from './peerClone'
 
 const pairingUri = 'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret'
 
@@ -31,15 +32,33 @@ describe('parsePeerCloneUri', () => {
         'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&endpoint=http%3A%2F%2F192.168.1.5%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret',
         'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&extra=x#claim=claim-secret',
         'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123%2Fv1%2Fsessions%2Fother&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret',
+        'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F999.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret',
+        'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F127.0.0.1%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret',
+        'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F224.0.0.1%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret',
+        'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2Flocalhost%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret',
+        'risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A0&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=claim-secret',
     ])('rejects malformed or unsafe pairing URI %s', (uri) => {
         expect(() => parsePeerCloneUri(uri)).toThrow()
+    })
+
+    it('rejects overlong values and malformed fragment encoding with the standard parser error', () => {
+        expect(() => parsePeerCloneUri(`${pairingUri}${'x'.repeat(8192)}`)).toThrow('Invalid peer clone pairing URI')
+        expect(() => parsePeerCloneUri(pairingUri.replace('claim-secret', '%E0%A4%A'))).toThrow('Invalid peer clone pairing URI')
     })
 })
 
 describe('PeerClone facade', () => {
     it('keeps the claim out of join and download, and sends it only in the claim command body', async () => {
-        const invoke = vi.fn(async (_command: string, ..._args: unknown[]) => undefined)
-        const facade = createPeerCloneFacade({ platform: 'desktop', invoke })
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string, ..._args: unknown[]): Promise<T> => (command === 'peer_clone_capabilities'
+            ? {
+                desktop: true,
+                sourceReady: true,
+                atomicActivationReady: true,
+                largeFixturePassed: true,
+                productionEnabled: true,
+            }
+            : undefined) as T)
+        const facade = createPeerCloneFacade({ platform: 'desktop', invoke: invoke as unknown as PeerCloneInvoke })
 
         facade.join(pairingUri)
         await expect(facade.download()).rejects.toThrow('confirmation')
@@ -58,6 +77,29 @@ describe('PeerClone facade', () => {
         })
         expect(JSON.stringify(invoke.mock.calls.filter(([command]) => command !== 'peer_clone_claim_client')))
             .not.toContain('claim-secret')
+    })
+
+    it('keeps public source and target operations closed until native production gates pass', async () => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(): Promise<T> => ({
+            desktop: true,
+            sourceReady: false,
+            atomicActivationReady: false,
+            largeFixturePassed: false,
+            productionEnabled: false,
+        } as T))
+        const facade = createPeerCloneFacade({ platform: 'desktop', invoke: invoke as unknown as PeerCloneInvoke })
+
+        facade.join(pairingUri)
+        facade.confirmDestructiveReplace()
+        await expect(facade.start('source-session')).rejects.toThrow('not enabled')
+        await expect(facade.download()).rejects.toThrow('not enabled')
+        await expect(facade.resume()).rejects.toThrow('not enabled')
+
+        expect(invoke.mock.calls).toEqual([
+            ['peer_clone_capabilities'],
+            ['peer_clone_capabilities'],
+            ['peer_clone_capabilities'],
+        ])
     })
 
     it('reports web and Android as explicitly unsupported without invoking native commands', async () => {
