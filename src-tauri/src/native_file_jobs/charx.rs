@@ -309,16 +309,6 @@ where
     };
 
     cancellation.check()?;
-    if archive.len() > limits.max_entries {
-        return Err(CharXParseError::new(
-            CharXParseErrorCode::TooManyEntries,
-            format!(
-                "CharX has {} entries, limit is {}",
-                archive.len(),
-                limits.max_entries
-            ),
-        ));
-    }
     let archive_offset = archive.offset();
     let has_card_entry = archive_has_card_entry(&mut archive, &cancellation)?;
     if jpeg_name && (!has_card_entry || archive_offset == 0) {
@@ -351,6 +341,17 @@ where
         return Err(CharXParseError::new(
             CharXParseErrorCode::MissingCardMetadata,
             "CharX archive has no root card.json entry",
+        ));
+    }
+
+    if archive.len() > limits.max_entries {
+        return Err(CharXParseError::new(
+            CharXParseErrorCode::TooManyEntries,
+            format!(
+                "CharX has {} entries, limit is {}",
+                archive.len(),
+                limits.max_entries
+            ),
         ));
     }
 

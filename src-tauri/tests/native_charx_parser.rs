@@ -166,6 +166,28 @@ fn detects_appended_charx_jpeg_but_keeps_an_ordinary_jpeg_as_an_asset() {
 }
 
 #[test]
+fn jpeg_with_a_non_card_trailing_zip_remains_an_asset_before_card_limits_apply() {
+    let archive = zip_bytes(
+        &[
+            ("one.bin", b"one", CompressionMethod::Stored),
+            ("two.bin", b"two", CompressionMethod::Stored),
+        ],
+        false,
+    );
+    let mut bytes = b"\xff\xd8\xff\xe0ordinary\xff\xd9".to_vec();
+    bytes.extend_from_slice(&archive);
+    let limits = CharXLimits {
+        max_entries: 1,
+        ..CharXLimits::default()
+    };
+
+    let (_directory, inspection) =
+        parse_card("ordinary-with-zip.jpg", &bytes, limits).expect("classify JPEG asset");
+
+    assert!(matches!(inspection, CharXInspection::OrdinaryJpegAsset(_)));
+}
+
+#[test]
 fn rejects_unsafe_duplicate_and_sanitized_collision_paths() {
     for path in [
         "/absolute.png",
