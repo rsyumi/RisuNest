@@ -317,6 +317,8 @@ export const getActiveConversationSession = (): ActiveConversationSession | null
     getPersistentDataRuntime().getActiveConversationSession()
 export const invalidateActiveConversationSession = (): void =>
     getPersistentDataRuntime().invalidateActiveConversationSession()
+export const peekActiveConversationSession = (): ActiveConversationSession | null =>
+    productionRuntime?.getActiveConversationSession() ?? null
 export const deactivateActiveWorkingSet = (): Promise<boolean> =>
     getPersistentDataRuntime().deactivateActiveWorkingSet()
 export const reconcilePersistentActiveCharacterIds = (

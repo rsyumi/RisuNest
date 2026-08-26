@@ -1,5 +1,5 @@
 import { parseChatML } from "../parser/chatML";
-import { risuChatParser } from "../parser/parser.svelte";
+import { risuChatParser as risuChatParserGlobal } from "../parser/parser.svelte";
 import { getCurrentCharacter, getCurrentChat, getDatabase, setCurrentCharacter, setDatabase, type Chat, type character } from "../storage/database.svelte";
 import { tokenize } from "../tokenizer";
 import { getModuleTriggers } from "./modules";
@@ -15,6 +15,11 @@ import { generateAIImage } from "./stableDiff";
 import { writeInlayImage } from "./files/inlays";
 import { runScripted } from "./scriptings";
 import { calcString } from "./infunctions";
+import {
+    createConversationOperationContext,
+    type ConversationOperationContext,
+} from "./conversationOperationContext";
+import { peekActiveConversationSession } from "../storage/persistentDataRuntime.svelte";
 
 
 export interface triggerscript{
@@ -1065,6 +1070,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     displayMode?: boolean
     displayData?: string
     tempVars?: Record<string, string>
+    conversationOperation?: ConversationOperationContext
 }){
     arg.recursiveCount ??= 0
     char = arg.displayMode ? char : safeStructuredClone(char)
@@ -1098,6 +1104,33 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         }
         return null
     }
+
+    let ownedConversationOperation: ConversationOperationContext | null = null
+    if (!arg.displayMode && !arg.conversationOperation) {
+        const activeSession = peekActiveConversationSession()
+        if (
+            activeSession?.isActive &&
+            activeSession.materializeCompatibilityArray() === arg.chat.message
+        ) {
+            ownedConversationOperation = createConversationOperationContext(
+                activeSession,
+                arg.chat,
+            )
+        }
+    }
+    const conversationOperation = arg.conversationOperation ?? ownedConversationOperation
+    if (conversationOperation) chat = conversationOperation.chat
+    const operationDatabase = conversationOperation?.createDatabaseView(db) ?? db
+    const risuChatParser = (
+        value: string,
+        parserArgument: Parameters<typeof risuChatParserGlobal>[1] = {},
+    ) => risuChatParserGlobal(value, {
+        ...parserArgument,
+        db: parserArgument.db ?? operationDatabase,
+    })
+    let conversationOperationCommitted = false
+
+    try {
 
     let tempVars:Record<string, string> = arg.tempVars ?? {}
     
@@ -1410,7 +1443,8 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             recursiveCount: arg.recursiveCount,
                             additonalSysPrompt,
                             stopSending,
-                            manualName: effect.value
+                            manualName: effect.value,
+                            conversationOperation,
                         })
                         if(r){
                             additonalSysPrompt = r.additonalSysPrompt
@@ -1564,6 +1598,7 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                         getVar: getVar,
                         char: char,
                         chat: chat,
+                        operationContext: conversationOperation,
                     })
 
                     if(triggerCodeResult.stopSending){
@@ -1808,7 +1843,8 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                             recursiveCount: arg.recursiveCount,
                             additonalSysPrompt,
                             stopSending,
-                            manualName: effect.target
+                            manualName: effect.target,
+                            conversationOperation,
                         })
                         if(r){
                             additonalSysPrompt = r.additonalSysPrompt
@@ -2828,7 +2864,21 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     if (shouldSetTriggerId && mode !== 'manual') {
         CurrentTriggerIdStore.set(previousTriggerId)
     }
+
+    if (ownedConversationOperation) {
+        const activeSession = peekActiveConversationSession()
+        ownedConversationOperation.commit(activeSession)
+        conversationOperationCommitted = true
+        const committedMessages = activeSession?.materializeCompatibilityArray()
+        Object.assign(arg.chat, chat)
+        if (committedMessages) arg.chat.message = committedMessages
+        chat = arg.chat
+    }
     
     return {additonalSysPrompt, chat, tokens:caculatedTokens, stopSending, sendAIprompt, displayData: arg.displayData, tempVars: arg.tempVars}
-
+    } finally {
+        if (ownedConversationOperation && !conversationOperationCommitted) {
+            ownedConversationOperation.release()
+        }
+    }
 }

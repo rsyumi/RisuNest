@@ -112,6 +112,11 @@ export class ConversationOperationContext {
         }
     }
 
+    hasPendingMutations(): boolean {
+        this.assertOpen()
+        return !valuesEqual(this.originalMessages, this.chat.message)
+    }
+
     collectMutationBatch(): ConversationMutationBatch {
         this.assertOpen()
         if (this.session.version !== this.baseVersion) {

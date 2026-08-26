@@ -37,6 +37,9 @@ vi.mock('src/ts/storage/database.svelte', () => ({
     getCurrentCharacter: vi.fn(),
     getCurrentChat: vi.fn(),
 }))
+vi.mock('src/ts/storage/persistentDataRuntime.svelte', () => ({
+    peekActiveConversationSession: () => null,
+}))
 vi.mock('src/ts/globalApi.svelte', () => ({ downloadFile: vi.fn() }))
 vi.mock('src/ts/alert', () => ({ alertError: vi.fn(), alertNormal: vi.fn() }))
 vi.mock('src/lang', () => ({ language: {} }))

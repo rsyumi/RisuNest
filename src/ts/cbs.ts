@@ -126,8 +126,8 @@ export type CBSRegisterArg = {
 
 export function registerCBS(arg:CBSRegisterArg) {
     const { 
-        registerFunction, 
-        getDatabase, 
+        registerFunction: registerFunctionRaw,
+        getDatabase: getDefaultDatabase,
         getUserName, 
         getPersonaPrompt, 
         risuChatParser, 
@@ -156,6 +156,26 @@ export function registerCBS(arg:CBSRegisterArg) {
     const projectedHistoryIndex = (matcherArg: matcherArg, absoluteIndex: number) => (
         absoluteIndex - (matcherArg.historyOffset ?? 0)
     )
+    let currentMatcherDatabase: Database | null = null
+    const getDatabase = (): Database => currentMatcherDatabase ?? getDefaultDatabase()
+    const registerFunction: CBSRegisterArg['registerFunction'] = (definition) => {
+        if (definition.callback === 'doc_only') {
+            return registerFunctionRaw(definition)
+        }
+        const callback = definition.callback
+        return registerFunctionRaw({
+            ...definition,
+            callback: (str, matcherArg, args, vars) => {
+                const previousDatabase = currentMatcherDatabase
+                currentMatcherDatabase = matcherArg.db
+                try {
+                    return callback(str, matcherArg, args, vars)
+                } finally {
+                    currentMatcherDatabase = previousDatabase
+                }
+            },
+        })
+    }
 
     // Basic character/user variables
     registerFunction({

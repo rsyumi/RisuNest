@@ -22,6 +22,11 @@ import { isTauriMobile } from '../platform';
 import { getRuntimePerformanceBudgets, subscribeRuntimePerformanceProfile } from '../runtimePerformanceProfile';
 import { createLuaFactory } from './luaRuntime';
 import { withObjectUrl } from '../objectUrl';
+import {
+    createConversationOperationContext,
+    type ConversationOperationContext,
+} from './conversationOperationContext';
+import { peekActiveConversationSession } from '../storage/persistentDataRuntime.svelte';
 let luaFactory:LuaFactory
 let ScriptingSafeIds = new Set<string>()
 let ScriptingEditDisplayIds = new Set<string>()
@@ -38,6 +43,8 @@ interface BasicScriptingEngineState {
     chat?: Chat;
     setVar?: (key:string, value:string) => boolean|void,
     getVar?: (key:string) => string,
+    operationDatabase?: ReturnType<ConversationOperationContext['createDatabaseView']>
+    operationCharacter?: character|groupChat|simpleCharacterArgument
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -70,6 +77,7 @@ export async function runScripted(code:string, arg:{
     meta?: object,
     mode?: string,
     type?: 'lua'|'py'
+    operationContext?: ConversationOperationContext
 }){
     const type: 'lua'|'py' = arg.type ?? 'lua'
     if (type === 'py' && isTauriMobile) {
@@ -82,7 +90,7 @@ export async function runScripted(code:string, arg:{
     const meta = arg.meta ?? {}
     const mode = arg.mode ?? 'manual'
 
-    let chat = arg.chat ?? getCurrentChat()
+    let chat = arg.operationContext?.chat ?? arg.chat ?? getCurrentChat()
     let stopSending = false
     let lowLevelAccess = arg.lowLevelAccess ?? false
 
@@ -99,6 +107,8 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.chat = chat
         ScriptingEngineState.setVar = setVar
         ScriptingEngineState.getVar = getVar
+        ScriptingEngineState.operationCharacter = char
+        ScriptingEngineState.operationDatabase = arg.operationContext?.createDatabaseView(getDatabase())
         if (code !== ScriptingEngineState.code) {
             try {
             let declareAPI:(name: string, func:Function) => void
@@ -290,7 +300,13 @@ export async function runScripted(code:string, arg:{
             })
 
             declareAPI('cbs', (value) => {
-                return risuChatParser(value, { chara: getCurrentCharacter() })
+                const operationCharacter = ScriptingEngineState.operationCharacter
+                return risuChatParser(value, {
+                    chara: operationCharacter?.type === 'simple'
+                        ? getCurrentCharacter()
+                        : operationCharacter ?? getCurrentCharacter(),
+                    db: ScriptingEngineState.operationDatabase,
+                })
             })
             
             declareAPI('setFullChatMain', (id:string, value:string) => {
@@ -1482,7 +1498,27 @@ ${code}
 `
 }
 
-export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:character|groupChat|simpleCharacterArgument, mode:string, content:T, meta?:object):Promise<T>{
+function createCurrentConversationOperation(): {
+    context: ConversationOperationContext
+    sourceChat: Chat
+} | null {
+    const session = peekActiveConversationSession()
+    if (!session?.isActive) return null
+    const sourceChat = getCurrentChat()
+    if (session.materializeCompatibilityArray() !== sourceChat.message) return null
+    return {
+        context: createConversationOperationContext(session, sourceChat),
+        sourceChat,
+    }
+}
+
+export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(
+    char: character|groupChat|simpleCharacterArgument,
+    mode: string,
+    content: T,
+    meta?: object,
+    conversationOperation?: ConversationOperationContext,
+): Promise<T>{
     switch(mode){
         case 'editinput':
             mode = 'editInput'
@@ -1497,6 +1533,8 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
             return content
     }
 
+    let ownedOperation: ReturnType<typeof createCurrentConversationOperation> = null
+    let operationContext = conversationOperation
     try {
         let data = content
 
@@ -1504,6 +1542,13 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
             v.lowLevelAccess = false
             return v
         }).concat(getModuleTriggers()))
+        if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
+            return content
+        }
+        if (!operationContext) {
+            ownedOperation = createCurrentConversationOperation()
+            operationContext = ownedOperation?.context
+        }
     
         for(let trigger of triggers){
             if(trigger?.effect?.[0]?.type === 'triggerlua'){
@@ -1513,6 +1558,7 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
                     mode: mode,
                     data,
                     meta,
+                    operationContext,
                 })
                 data = runResult.res ?? data
             }
@@ -1522,16 +1568,33 @@ export async function runLuaEditTrigger<T extends string|OpenAIChat[]>(char:char
         return data   
     } catch (error) {
         return content
+    } finally {
+        if (ownedOperation) {
+            ownedOperation.context.commit(peekActiveConversationSession())
+        }
     }
 }
 
-export async function runLuaButtonTrigger(char:character|groupChat|simpleCharacterArgument, data:string):Promise<any>{
+export async function runLuaButtonTrigger(
+    char: character|groupChat|simpleCharacterArgument,
+    data: string,
+    conversationOperation?: ConversationOperationContext,
+): Promise<any>{
     let runResult
+    let ownedOperation: ReturnType<typeof createCurrentConversationOperation> = null
+    let operationContext = conversationOperation
     try {
         const triggers = char.type === 'group' ? getModuleTriggers() : char.triggerscript.map<triggerscript>((v) => ({
             ...v,
             lowLevelAccess: char.type !== 'simple' ? char.lowLevelAccess ?? false : false
         })).concat(getModuleTriggers())
+        if (!triggers.some((trigger) => trigger?.effect?.[0]?.type === 'triggerlua')) {
+            return undefined
+        }
+        if (!operationContext) {
+            ownedOperation = createCurrentConversationOperation()
+            operationContext = ownedOperation?.context
+        }
 
         for(let trigger of triggers){
             if(trigger?.effect?.[0]?.type === 'triggerlua'){
@@ -1539,12 +1602,18 @@ export async function runLuaButtonTrigger(char:character|groupChat|simpleCharact
                     char: char,
                     lowLevelAccess: trigger.lowLevelAccess,
                     mode: 'onButtonClick',
-                    data: data
+                    data: data,
+                    operationContext,
                 })
             }
         }
     } catch (error) {
         throw(error)
+    } finally {
+        if (ownedOperation) {
+            ownedOperation.context.commit(peekActiveConversationSession())
+            if (runResult) runResult.chat = ownedOperation.sourceChat
+        }
     }
     return runResult   
 }

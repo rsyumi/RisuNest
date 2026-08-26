@@ -9,6 +9,9 @@ import { readImage } from '../globalApi.svelte'
 import { getDatabase } from '../storage/database.svelte'
 import { asBuffer } from '../util'
 import { writeInlayImage } from './files/inlays'
+import { ActiveConversationSession } from '../storage/activeConversationSession'
+import { createConversationOperationContext } from './conversationOperationContext'
+import type { Chat } from '../storage/database.svelte'
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -586,6 +589,94 @@ test('records explicit false stop and ordered chat mutations', async () => {
     res: false,
     stopSending: true,
   })
+})
+
+test('runs ordered Lua chat mutations inside one versioned conversation operation', async () => {
+  const conversation = {
+    id: 'lua-operation-chat',
+    message: [
+      { role: 'user', data: 'original', chatId: 'message-0' },
+      { role: 'char', data: 'remove-me', chatId: 'message-1' },
+      { role: 'user', data: 'keep-me', chatId: 'message-2' },
+    ],
+  } as Chat
+  const session = new ActiveConversationSession({
+    characterId: 'lua-operation-character',
+    conversationId: 'lua-operation-chat',
+    conversation,
+    storeRevision: 11,
+  })
+  const operationContext = createConversationOperationContext(session, conversation)
+
+  const result = await runScripted(`
+    listenEdit('editInput', function(id, value, meta)
+      setChat(id, 0, 'edited')
+      insertChat(id, 1, 'char', 'inserted')
+      removeChat(id, 2)
+      addChat(id, 'user', 'tail')
+      return false
+    end)
+  `, {
+    char: { chaId: 'lua-operation-character' } as never,
+    mode: 'editInput',
+    operationContext,
+  })
+
+  expect(result.stopSending).toBe(true)
+  expect(conversation.message.map((entry) => entry.data)).toEqual([
+    'original',
+    'remove-me',
+    'keep-me',
+  ])
+  expect(operationContext.chat.message.map((entry) => entry.data)).toEqual([
+    'edited',
+    'inserted',
+    'keep-me',
+    'tail',
+  ])
+
+  operationContext.commit(session)
+  expect(conversation.message.map((entry) => entry.data)).toEqual([
+    'edited',
+    'inserted',
+    'keep-me',
+    'tail',
+  ])
+})
+
+test('keeps the eager Lua mutation in the operation batch after a handler error', async () => {
+  const conversation = {
+    id: 'lua-partial-chat',
+    message: [{ role: 'user', data: 'before-error', chatId: 'message-0' }],
+  } as Chat
+  const session = new ActiveConversationSession({
+    characterId: 'lua-partial-character',
+    conversationId: 'lua-partial-chat',
+    conversation,
+    storeRevision: 12,
+  })
+  const operationContext = createConversationOperationContext(session, conversation)
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+  try {
+    const result = await runScripted(`
+      listenEdit('editInput', function(id, value, meta)
+        setChat(id, 0, 'mutated-before-error')
+        error('synthetic operation failure')
+      end)
+    `, {
+      char: { chaId: 'lua-partial-character' } as never,
+      mode: 'editInput',
+      operationContext,
+    })
+
+    expect(result.res).toBeUndefined()
+    operationContext.commit(session)
+    expect(conversation.message[0].data).toBe('mutated-before-error')
+  }
+  finally {
+    consoleError.mockRestore()
+  }
 })
 
 test('records absolute and negative chat reads plus recent and length semantics', async () => {
