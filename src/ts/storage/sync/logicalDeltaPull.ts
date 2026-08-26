@@ -175,6 +175,12 @@ export async function planLogicalDeltaPull(input: {
     }
     const remoteManifestHash = await hashLogicalManifest(remote)
     if (
+        remote.generation === base.generation
+        && remoteManifestHash !== actualBaseManifestHash
+    ) {
+        throw new TypeError('Logical delta remote generation ID reuses different content')
+    }
+    if (
         remote.generationSequence === base.generationSequence
         && (
             remote.generation !== base.generation
@@ -191,7 +197,13 @@ export async function planLogicalDeltaPull(input: {
     const candidateObjectHashes = new Set<string>()
 
     for (const records of recordUnion(base.records, local.records, remote.records)) {
-        if (records.base?.state === 'live') {
+        if (records.base?.state === 'tombstone') {
+            if (records.local === undefined || records.remote === undefined) {
+                throw new TypeError(
+                    `Logical delta descendant must retain tombstone ${records.key}`,
+                )
+            }
+        } else if (records.base?.state === 'live') {
             if (records.local === undefined || records.remote === undefined) {
                 throw new TypeError(
                     `Logical delta descendant must tombstone deleted base record ${records.key}`,

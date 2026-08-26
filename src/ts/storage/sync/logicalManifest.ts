@@ -86,6 +86,11 @@ export function validateGenerationSequence(value: unknown, description: string):
     return value
 }
 
+function compareGenerationSequences(left: string, right: string): number {
+    if (left.length !== right.length) return left.length < right.length ? -1 : 1
+    return left < right ? -1 : left > right ? 1 : 0
+}
+
 function sha256(value: unknown, description: string): string {
     if (typeof value !== 'string' || !SHA256_PATTERN.test(value)) {
         throw new TypeError(`${description} must be a lowercase SHA-256`)
@@ -184,6 +189,10 @@ export function validateLogicalManifest(value: unknown): LogicalManifest {
     if (!Array.isArray(value.objects) || value.objects.length > MAX_LOGICAL_MANIFEST_OBJECTS) {
         throw new TypeError('Logical manifest objects exceed the count limit')
     }
+    const generationSequence = validateGenerationSequence(
+        value.generationSequence,
+        'Logical manifest generationSequence',
+    )
 
     const records: LogicalManifestRecord[] = []
     let previousRecordKey: string | undefined
@@ -192,6 +201,16 @@ export function validateLogicalManifest(value: unknown): LogicalManifest {
         sortedAfter(previousRecordKey, record.key, 'Logical manifest records')
         records.push(record)
         previousRecordKey = record.key
+    }
+    for (const record of records) {
+        if (
+            record.state === 'tombstone'
+            && compareGenerationSequences(record.deletedGenerationSequence, generationSequence) > 0
+        ) {
+            throw new TypeError(
+                'Tombstone deletedGenerationSequence cannot exceed manifest generationSequence',
+            )
+        }
     }
 
     const objects: LogicalManifestObject[] = []
@@ -226,10 +245,7 @@ export function validateLogicalManifest(value: unknown): LogicalManifest {
         schema: LOGICAL_MANIFEST_SCHEMA,
         libraryId: boundedString(value.libraryId, 'Logical manifest libraryId'),
         generation: boundedString(value.generation, 'Logical manifest generation'),
-        generationSequence: validateGenerationSequence(
-            value.generationSequence,
-            'Logical manifest generationSequence',
-        ),
+        generationSequence,
         parentGeneration: value.parentGeneration === null
             ? null
             : boundedString(value.parentGeneration, 'Logical manifest parentGeneration'),

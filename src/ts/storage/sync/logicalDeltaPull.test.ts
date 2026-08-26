@@ -11,6 +11,7 @@ import {
 } from './logicalManifest'
 
 const hashes = {
+    empty: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     base: '1'.repeat(64),
     local: '2'.repeat(64),
     remote: '3'.repeat(64),
@@ -160,6 +161,47 @@ describe('logical delta pull planner', () => {
             expectedBaseManifestHash: await hashLogicalManifest(base),
             conflicts: [{ key: keys.preset, type: 'delete-edit' }],
         })
+    })
+
+    it.each(['local', 'remote'] as const)(
+        'rejects omission of a common-base tombstone from the %s descendant',
+        async (side) => {
+            const base = manifest('generation-1', '1', [tombstone(keys.preset, '1')], 1)
+            const local = manifest('local-2', '2', [tombstone(keys.preset, '1')], 2)
+            const remote = manifest('generation-2', '2', [tombstone(keys.preset, '1')], 8)
+            if (side === 'local') local.records = []
+            else remote.records = []
+
+            await expect(plan({ base, local, remote })).rejects.toThrow('retain tombstone')
+        },
+    )
+
+    it('rejects a reused remote generation ID with different content', async () => {
+        const base = manifest('shared-generation', '1', [live(keys.root, hashes.base)], 1)
+        const local = manifest('local-2', '2', [live(keys.root, hashes.base)], 2)
+        const remote = manifest('shared-generation', '2', [live(keys.root, hashes.remote)], 8)
+
+        await expect(plan({ base, local, remote })).rejects.toThrow('generation ID')
+    })
+
+    it('transfers an absent zero-byte object instead of classifying it as a no-op', async () => {
+        const base = manifest('generation-1', '1', [], 1)
+        const local = manifest('local-2', '2', [], 2)
+        const remote = manifest('generation-2', '2', [live(keys.root, hashes.empty)], 8)
+        remote.objects[0].size = 0
+
+        const result = await plan({ base, local, remote })
+
+        expect(result.kind).toBe('ready')
+        if (result.kind === 'ready') {
+            expect(result.apply).toEqual([{
+                type: 'put',
+                key: keys.root,
+                objectHash: hashes.empty,
+                dependencies: [],
+            }])
+            expect(result.candidateObjectHashes).toEqual([hashes.empty])
+        }
     })
 
     it('transfers only changed-record objects absent from the local manifest', async () => {

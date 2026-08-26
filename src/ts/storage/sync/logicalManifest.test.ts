@@ -60,6 +60,15 @@ describe('logical manifest codec', () => {
 
     it.each([
         ['noncanonical generation sequence', (value: any) => { value.generationSequence = '02' }],
+        ['future tombstone sequence', (value: any) => {
+            value.generationSequence = '2'
+            value.records = [{
+                key: 'r1:character:WyJjaGFyYWN0ZXItMSJd',
+                state: 'tombstone',
+                deletedGenerationSequence: '3',
+            }]
+            value.objects = []
+        }],
         ['invalid logical key', (value: any) => { value.records[0].key = 'root' }],
         ['uppercase object hash', (value: any) => { value.records[0].objectHash = 'A'.repeat(64) }],
         ['unsorted dependencies', (value: any) => {
