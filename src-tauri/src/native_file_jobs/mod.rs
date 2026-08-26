@@ -2599,6 +2599,112 @@ mod tests {
     }
 
     #[test]
+    fn content_cancel_during_preparation_finishes_cancelled_and_cleans_staging() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("large-card.json");
+        let description = "x".repeat(7 * 1024 * 1024);
+        fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "spec": "chara_card_v3",
+                "data": {
+                    "name": "Cancelled",
+                    "description": description,
+                    "assets": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = state
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::DesktopPath {
+                    path: source.to_string_lossy().into_owned(),
+                },
+                display_name: "large-card.json".to_owned(),
+            })
+            .expect("start content preparation");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.status(&started.job_id).unwrap().state == JobState::Queued {
+            assert!(
+                Instant::now() < deadline,
+                "content preparation did not start"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            state.cancel(&started.job_id).unwrap(),
+            CancelOutcome::Requested
+        );
+        loop {
+            let status = state.status(&started.job_id).unwrap();
+            if status.state.is_terminal() {
+                assert_eq!(status.state, JobState::Cancelled);
+                assert!(status.prepared_content.is_none());
+                break;
+            }
+            assert!(Instant::now() < deadline, "content cancellation timed out");
+            thread::yield_now();
+        }
+        assert!(!directory
+            .path()
+            .join("native-file-jobs/jobs")
+            .join(&started.job_id)
+            .exists());
+    }
+
+    #[test]
+    fn accepted_content_cancel_overrides_preparation_error_after_cleanup() {
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::PrepareContentImport).unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
+
+        job.finish_content_job(
+            Err(NativeJobError::new(
+                "store-error",
+                "progress raced with cancellation",
+            )),
+            Ok(()),
+        )
+        .unwrap();
+
+        let status = job.status();
+        assert_eq!(status.state, JobState::Cancelled);
+        assert!(status.error.is_none());
+    }
+
+    #[test]
+    fn cancel_request_coordinates_with_content_wait_mutex() {
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::PrepareContentImport).unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let wait_guard = job.restore_finalized.lock().unwrap();
+        let started = Arc::new(Barrier::new(2));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cancelled = Arc::clone(&job);
+        let cancel_started = Arc::clone(&started);
+        let handle = thread::spawn(move || {
+            cancel_started.wait();
+            sender.send(cancelled.request_cancel()).unwrap();
+        });
+
+        started.wait();
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(wait_guard);
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            CancelOutcome::Requested
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn export_request_is_an_explicit_path_only_job_contract() {
         let request: NativeFileJobStartRequest = serde_json::from_value(serde_json::json!({
             "kind": "export-block-risu-save",
