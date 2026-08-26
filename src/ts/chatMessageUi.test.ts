@@ -112,30 +112,28 @@ describe('chat message UI targets', () => {
         ])
     })
 
-    it('returns canonical display data when a full or partial draft cannot save', () => {
-        const target = fixture([
-            { role: 'user', data: 'zero' },
-            { role: 'char', data: 'one' },
-            { role: 'user', data: 'two' },
-        ])
+    it('keeps the current canonical display after stale full and partial saves', () => {
+        const target = fixture([{ role: 'user', data: 'old', chatId: 'target-id' }])
         const fullEdit = capture(target, 0)
-        const partialEdit = capture(target, 2)
-        target.conversation.message.splice(1, 0, { role: 'char', data: 'inserted' })
+        const partialEdit = capture(target, 0)
+        target.session.edit(target.session.locate(0), {
+            role: 'user',
+            data: 'new canonical',
+            chatId: 'target-id',
+        })
+        let fullDisplay = target.conversation.message[0].data
+        let partialDisplay = target.conversation.message[0].data
 
-        expect(saveCapturedChatMessage(fullEdit, target, 'full draft')).toEqual({
-            saved: true,
-            displayData: 'full draft',
-        })
-        expect(saveCapturedChatMessage(partialEdit, target, 'partial draft')).toEqual({
-            saved: false,
-            displayData: 'two',
-        })
-        expect(target.conversation.message.map((message) => message.data)).toEqual([
-            'full draft',
-            'inserted',
-            'one',
-            'two',
-        ])
+        const fullResult = saveCapturedChatMessage(fullEdit, target, 'full draft')
+        if (fullResult.saved) fullDisplay = fullResult.displayData
+        const partialResult = saveCapturedChatMessage(partialEdit, target, 'partial draft')
+        if (partialResult.saved) partialDisplay = partialResult.displayData
+
+        expect(fullResult).toEqual({ saved: false })
+        expect(partialResult).toEqual({ saved: false })
+        expect(fullDisplay).toBe('new canonical')
+        expect(partialDisplay).toBe('new canonical')
+        expect(target.conversation.message[0].data).toBe('new canonical')
     })
 
     it('preserves missing and duplicate IDs when bookmarks use the current last-match policy', async () => {

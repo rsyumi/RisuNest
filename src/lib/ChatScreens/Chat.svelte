@@ -97,6 +97,7 @@
         rawStreamingText = message,
     }: Props = $props();
 
+    let editDraft = $state(message)
     let msgDisplay = $state('')
     let translated = $state(false)
     let partialEditEnabled = $state(true)
@@ -143,6 +144,7 @@
 
     function beginEdit() {
         editTarget = captureCurrentMessage()
+        editDraft = message
         editMode = editTarget !== null
     }
 
@@ -162,9 +164,13 @@
 
     function edit(){
         const target = editTarget ?? captureCurrentMessage()
+        editTarget = null
         if (!target) return false
-        const result = saveCapturedChatMessage(target, chatMessageContext, message)
-        if (result.saved) editTarget = null
+        const result = saveCapturedChatMessage(target, chatMessageContext, editDraft)
+        if (result.saved) {
+            message = result.displayData
+            displaya(result.displayData)
+        }
         return result.saved
     }
 
@@ -178,8 +184,10 @@
                 chatMessageContext,
                 e.detail.newData,
             )
-            message = result.displayData
-            displaya(result.displayData)
+            if (result.saved) {
+                message = result.displayData
+                displaya(result.displayData)
+            }
         }
     }
 
@@ -405,7 +413,8 @@
             saveTranslationEdit()
         }} />
     {:else if editMode}
-        <AutoresizeArea bind:value={message} handleLongPress={() => {
+        <AutoresizeArea bind:value={editDraft} handleLongPress={() => {
+            editTarget = null
             editMode = false
         }} />
     {:else if isComment}
@@ -806,7 +815,8 @@
                 beginEdit()
             }
             else{
-                if(edit()) editMode = false
+                edit()
+                editMode = false
             }
         }}>
             <PencilIcon size={20}/>
@@ -1134,7 +1144,7 @@
 
                         </div>
                         {#if editMode}
-                            <textarea class="grow h-138 sm:h-96 overflow-y-auto bg-transparent text-black p-2 mb-2 resize-none message-edit-area" bind:value={message}></textarea>
+                            <textarea class="grow h-138 sm:h-96 overflow-y-auto bg-transparent text-black p-2 mb-2 resize-none message-edit-area" bind:value={editDraft}></textarea>
                         {:else}
                             <div class="grow h-138 sm:h-96 overflow-y-auto p-2 mb-2 sm:mb-0">
                                 {@render textBox()}

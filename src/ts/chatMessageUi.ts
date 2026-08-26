@@ -35,10 +35,9 @@ export interface ToggleBookmarkOptions {
     defaultName(message: Message): string
 }
 
-export interface CapturedChatMessageSaveResult {
-    saved: boolean
-    displayData: string
-}
+export type CapturedChatMessageSaveResult =
+    | { saved: true; displayData: string }
+    | { saved: false }
 
 export class LatestChatScrollRequestGuard {
     private generation = 0
@@ -137,10 +136,7 @@ export function saveCapturedChatMessage(
     data: string,
 ): CapturedChatMessageSaveResult {
     const saved = editCapturedChatMessage(target, context, data)
-    return {
-        saved,
-        displayData: saved ? data : target.message.data,
-    }
+    return saved ? { saved: true, displayData: data } : { saved: false }
 }
 
 export function toggleCapturedMessageRole(
