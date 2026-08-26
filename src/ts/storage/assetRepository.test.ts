@@ -150,6 +150,10 @@ describe('AssetRepository BlobStore facade', () => {
                 }
             }),
             readObject: vi.fn(async (hash: string) => objects.get(hash)?.slice() ?? null),
+            readObjectRange: vi.fn(async (
+                hash: string,
+                range: { start: number; endExclusive: number },
+            ) => objects.get(hash)?.slice(range.start, range.endExclusive) ?? null),
             statObject: vi.fn(async (hash: string) => objects.get(hash)?.byteLength ?? null),
         } as ImmutablePayloadCas
         const legacy = {
@@ -245,6 +249,10 @@ describe('AssetRepository BlobStore facade', () => {
         ])
         const cas = {
             readObject: vi.fn(async (hash: string) => casBytes.get(hash)?.slice() ?? null),
+            readObjectRange: vi.fn(async (
+                hash: string,
+                range: { start: number; endExclusive: number },
+            ) => casBytes.get(hash)?.slice(range.start, range.endExclusive) ?? null),
             statObject: vi.fn(async (hash: string) => casBytes.get(hash)?.byteLength ?? null),
         } as unknown as ImmutablePayloadCas
         const legacy = {
@@ -295,6 +303,60 @@ describe('AssetRepository BlobStore facade', () => {
         await expect(current.stat('assets/no-alias.bin')).resolves.toBeNull()
         expect(legacy.read).not.toHaveBeenCalled()
         expect(legacy.stat).not.toHaveBeenCalled()
+    })
+
+    it('keeps a CAS range read bounded to the requested bytes', async () => {
+        const key = 'assets/large.bin'
+        const alias: AssetAlias = {
+            key,
+            objectHash: 'dd'.repeat(32),
+            kind: 'asset',
+            size: 6,
+            mime: 'application/octet-stream',
+            name: 'Large',
+            ext: 'bin',
+        }
+        const reader = {
+            readAssetAlias: vi.fn(async () => ({ revision: 12, value: alias })),
+        } as unknown as PersistentDataStore
+        const cas = {
+            readObject: vi.fn(async () => {
+                throw new Error('complete CAS object read is forbidden')
+            }),
+            readObjectRange: vi.fn(async () => new Uint8Array([2, 3, 4])),
+            statObject: vi.fn(async () => 6),
+        } as unknown as ImmutablePayloadCas
+        const legacy = {
+            read: vi.fn(async () => {
+                throw new Error('legacy fallback is forbidden')
+            }),
+            stat: vi.fn(async () => null),
+        } as unknown as BlobStore
+        const repository = createAssetRepository({
+            reader,
+            cas,
+            legacy,
+            legacyFallback: false,
+        })
+
+        await expect(repository.read(key, {
+            start: 2,
+            endExclusive: 5,
+        })).resolves.toEqual({
+            revision: 12,
+            value: {
+                alias,
+                data: new Uint8Array([2, 3, 4]),
+                source: 'cas',
+            },
+        })
+        expect(cas.statObject).toHaveBeenCalledWith(alias.objectHash)
+        expect(cas.readObjectRange).toHaveBeenCalledWith(alias.objectHash, {
+            start: 2,
+            endExclusive: 5,
+        })
+        expect(cas.readObject).not.toHaveBeenCalled()
+        expect(legacy.read).not.toHaveBeenCalled()
     })
 
     it('uses only explicit verified legacy fallback and preserves missing-alias semantics', async () => {

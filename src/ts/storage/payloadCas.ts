@@ -1,8 +1,14 @@
-import type { BlobKeyValueBackend, BlobStore } from './blobStore'
+import {
+    validateBlobReadRange,
+    type BlobKeyValueBackend,
+    type BlobReadRange,
+    type BlobStore,
+} from './blobStore'
 
 export interface ImmutablePayloadBackend {
     putIfAbsent(key: string, data: Uint8Array): Promise<boolean>
     read(key: string): Promise<Uint8Array | null>
+    readRange?(key: string, range: BlobReadRange): Promise<Uint8Array | null>
     stat(key: string): Promise<number | null>
 }
 
@@ -22,6 +28,10 @@ export interface PreparedImmutablePayload {
 export interface ImmutablePayloadCas {
     prepare(data: Uint8Array): Promise<PreparedImmutablePayload>
     readObject(contentHash: string): Promise<Uint8Array | null>
+    readObjectRange(
+        contentHash: string,
+        range: BlobReadRange,
+    ): Promise<Uint8Array | null>
     statObject(contentHash: string): Promise<number | null>
 }
 
@@ -75,6 +85,13 @@ export function createImmutablePayloadCas(backend: ImmutablePayloadBackend): Imm
         async readObject(contentHash) {
             return backend.read(objectPhysicalKey(contentHash))
         },
+        async readObjectRange(contentHash, range) {
+            validateBlobReadRange(range)
+            const physicalKey = objectPhysicalKey(contentHash)
+            if (backend.readRange) return backend.readRange(physicalKey, range)
+            const data = await backend.read(physicalKey)
+            return data?.slice(range.start, range.endExclusive) ?? null
+        },
         async statObject(contentHash) {
             return backend.stat(objectPhysicalKey(contentHash))
         },
@@ -98,6 +115,11 @@ export function createBlobKeyValuePayloadBackend(
             })
         },
         read: (key) => backend.read(key),
+        async readRange(key, range) {
+            if (backend.readRange) return backend.readRange(key, range)
+            const data = await backend.read(key)
+            return data?.slice(range.start, range.endExclusive) ?? null
+        },
         async stat(key) {
             if (backend.size) return backend.size(key)
             return (await backend.read(key))?.byteLength ?? null

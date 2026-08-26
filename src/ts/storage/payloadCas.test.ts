@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import {
     createBlobKeyValuePayloadBackend,
     createImmutablePayloadCas,
@@ -19,6 +19,13 @@ class MemoryImmutablePayloadBackend implements ImmutablePayloadBackend {
 
     async read(key: string): Promise<Uint8Array | null> {
         return this.values.get(key)?.slice() ?? null
+    }
+
+    async readRange(
+        key: string,
+        range: { start: number; endExclusive: number },
+    ): Promise<Uint8Array | null> {
+        return this.values.get(key)?.slice(range.start, range.endExclusive) ?? null
     }
 
     async stat(key: string): Promise<number | null> {
@@ -187,6 +194,25 @@ describe('immutable payload CAS', () => {
         await expect(cas.statObject('../objects')).rejects.toThrow(
             '64 lowercase hexadecimal',
         )
+    })
+
+    test('reads a validated object range without materializing the complete payload', async () => {
+        const backend = new MemoryImmutablePayloadBackend()
+        const cas = createImmutablePayloadCas(backend)
+        const prepared = await cas.prepare(new Uint8Array([0, 1, 2, 3, 4, 5]))
+        const fullRead = vi.spyOn(backend, 'read').mockRejectedValue(
+            new Error('complete payload read is forbidden'),
+        )
+
+        await expect(cas.readObjectRange(prepared.contentHash, {
+            start: 2,
+            endExclusive: 5,
+        })).resolves.toEqual(new Uint8Array([2, 3, 4]))
+        expect(fullRead).not.toHaveBeenCalled()
+        await expect(cas.readObjectRange(prepared.contentHash, {
+            start: 5,
+            endExclusive: 4,
+        })).rejects.toThrow('ascending order')
     })
 
     test('BlobStore backends publish immutable keys without enumerating their tree', async () => {

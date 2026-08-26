@@ -84,14 +84,38 @@ export function createAssetRepository(options: AssetRepositoryOptions): AssetRep
             const alias = versioned.value
             validateAssetAlias(alias)
             if (alias.objectHash !== null) {
-                const data = await cas.readObject(alias.objectHash)
-                if (data !== null) {
-                    if (data.byteLength !== alias.size) {
-                        throw new Error(`Asset alias size mismatch for ${key}`)
+                if (range) {
+                    const objectSize = await cas.statObject(alias.objectHash)
+                    if (objectSize !== null) {
+                        if (objectSize !== alias.size) {
+                            throw new Error(`Asset alias size mismatch for ${key}`)
+                        }
+                        const data = await cas.readObjectRange(alias.objectHash, range)
+                        if (data !== null) {
+                            const expectedSize = Math.max(
+                                0,
+                                Math.min(range.endExclusive, alias.size)
+                                - Math.min(range.start, alias.size),
+                            )
+                            if (data.byteLength !== expectedSize) {
+                                throw new Error(`Asset alias range size mismatch for ${key}`)
+                            }
+                            return {
+                                revision: versioned.revision,
+                                value: { alias, data, source: 'cas' },
+                            }
+                        }
                     }
-                    return {
-                        revision: versioned.revision,
-                        value: { alias, data: blobRange(data, range), source: 'cas' },
+                } else {
+                    const data = await cas.readObject(alias.objectHash)
+                    if (data !== null) {
+                        if (data.byteLength !== alias.size) {
+                            throw new Error(`Asset alias size mismatch for ${key}`)
+                        }
+                        return {
+                            revision: versioned.revision,
+                            value: { alias, data, source: 'cas' },
+                        }
                     }
                 }
             }
