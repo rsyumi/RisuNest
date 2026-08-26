@@ -51,7 +51,7 @@ vi.mock('./plugins/plugins.svelte', () => ({
     pluginV2: { providerOptions: new Map() },
 }))
 
-import { ChatTokenizer, strongBan } from './tokenizer'
+import { ChatTokenizer, encode, strongBan } from './tokenizer'
 
 describe('chat tokenizer native count batching', () => {
     beforeEach(() => {
@@ -97,6 +97,73 @@ describe('chat tokenizer native count batching', () => {
 
         expect(result).toBe(300)
         expect(harness.nativeCountBatch).not.toHaveBeenCalled()
+    })
+
+    it.each(['name', 'noName'] as const)(
+        'preserves mixed chat adjustments in %s mode',
+        async (useName) => {
+            const chats = Array.from({ length: 100 }, (_, index) => ({
+                role: index % 2 === 0 ? 'user' as const : 'assistant' as const,
+                content: `mixed-content-${index}`,
+                name: index % 3 === 0 ? `speaker-${index}` : undefined,
+                thoughts: index === 0 ? ['hidden thought', 'another hidden thought'] : undefined,
+                multimodals: index === 1
+                    ? [
+                        { type: 'image' as const, base64: 'image-a' },
+                        { type: 'audio' as const, base64: 'audio-b' },
+                    ]
+                    : undefined,
+            }))
+            const tokenizer = new ChatTokenizer(3, useName)
+            harness.nativeCountBatch.mockResolvedValueOnce(null)
+            const expected = await tokenizer.tokenizeChats(chats)
+            harness.nativeCountBatch.mockImplementationOnce(async (candidate) => {
+                const texts = candidate.buildTexts()
+                expect(candidate.itemCount).toBe(texts.length)
+                expect(texts.some((text: string) => text.includes('hidden thought'))).toBe(false)
+                if(useName === 'noName'){
+                    expect(texts.some((text: string) => text.startsWith('speaker-'))).toBe(false)
+                }
+                return await Promise.all(texts.map(async (text: string) => (await encode(text)).length))
+            })
+
+            await expect(tokenizer.tokenizeChats(chats)).resolves.toBe(expected)
+        },
+    )
+
+    it.each([
+        ['null result', null],
+        ['rejected invocation', new Error('native count failed')],
+    ] as const)('preserves the JavaScript result after a %s', async (_name, nativeResult) => {
+        const chats = Array.from({ length: 100 }, (_, index) => ({
+            role: 'user' as const,
+            content: `fallback-content-${index}`,
+            name: index % 4 === 0 ? `fallback-name-${index}` : undefined,
+        }))
+        const tokenizer = new ChatTokenizer(3, 'name')
+        harness.nativeCountBatch.mockResolvedValueOnce(null)
+        const expected = await tokenizer.tokenizeChats(chats)
+        if(nativeResult instanceof Error){
+            harness.nativeCountBatch.mockRejectedValueOnce(nativeResult)
+        }
+        else {
+            harness.nativeCountBatch.mockResolvedValueOnce(nativeResult)
+        }
+
+        await expect(tokenizer.tokenizeChats(chats)).resolves.toBe(expected)
+    })
+
+    it('preserves the JavaScript special-token result after native rejection', async () => {
+        const chats = Array.from({ length: 100 }, (_, index) => ({
+            role: 'user' as const,
+            content: index === 0 ? '<|ENDOFTEXT|>' : `safe-content-${index}`,
+        }))
+        const tokenizer = new ChatTokenizer(3, 'name')
+        harness.nativeCountBatch.mockResolvedValueOnce(null)
+        const expected = await tokenizer.tokenizeChats(chats)
+        harness.nativeCountBatch.mockRejectedValueOnce(new Error('native count failed'))
+
+        await expect(tokenizer.tokenizeChats(chats)).resolves.toBe(expected)
     })
 })
 
