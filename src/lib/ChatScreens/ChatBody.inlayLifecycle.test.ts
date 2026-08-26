@@ -191,6 +191,55 @@ describe('ChatBody deferred inlay lifecycle', () => {
         expect(inlayMocks.getInlayAssetBlob).not.toHaveBeenCalledWith('first')
     })
 
+    test('reports only the latest parse generation as capture settled', async () => {
+        const firstParse = deferred<string>()
+        parserMocks.ParseMarkdown.mockImplementation(async (message: string) => {
+            if (message === 'first') return firstParse.promise
+            return `<span>${message}</span>`
+        })
+        const onCaptureSettled = vi.fn()
+        mounted = mount(ChatBodyInlayHarness, { target, props: { onCaptureSettled } })
+        await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalled())
+
+        ;(mounted as { setMessage(value: string): void }).setMessage('second')
+        await tick()
+        await vi.waitFor(() => expect(onCaptureSettled).toHaveBeenCalledOnce())
+        const activeGeneration = onCaptureSettled.mock.calls[0][0]
+
+        firstParse.resolve('<span>first</span>')
+        await Promise.resolve(); await Promise.resolve(); await tick()
+
+        expect(onCaptureSettled).toHaveBeenCalledOnce()
+        expect(activeGeneration).toBeGreaterThan(1)
+    })
+
+    test('reports capture settled after its deferred object URLs are mounted', async () => {
+        inlayMocks.getInlayAssetBlob.mockResolvedValue({
+            data: new Blob(['first']), type: 'image', name: 'first.png',
+        })
+        const onCaptureSettled = vi.fn(() => {
+            expect(target.querySelector('img')?.getAttribute('src')).toBe('blob:first')
+        })
+
+        mounted = mount(ChatBodyInlayHarness, { target, props: { onCaptureSettled } })
+        await vi.waitFor(() => expect(onCaptureSettled).toHaveBeenCalledOnce())
+    })
+
+    test('does not report capture settled after a pending body is destroyed', async () => {
+        const pendingParse = deferred<string>()
+        parserMocks.ParseMarkdown.mockReturnValue(pendingParse.promise)
+        const onCaptureSettled = vi.fn()
+        mounted = mount(ChatBodyInlayHarness, { target, props: { onCaptureSettled } })
+        await vi.waitFor(() => expect(parserMocks.ParseMarkdown).toHaveBeenCalled())
+
+        await unmount(mounted)
+        mounted = undefined
+        pendingParse.resolve('<span>late</span>')
+        await Promise.resolve(); await Promise.resolve(); await tick()
+
+        expect(onCaptureSettled).not.toHaveBeenCalled()
+    })
+
     test('does not let translated markup reuse an observed slot for another asset', async () => {
         chatState.db = {
             autoTranslate: true,

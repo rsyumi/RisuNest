@@ -3,9 +3,13 @@
 
     interface Props {
         initialTranslated?: boolean
+        onCaptureSettled?: (generation: number) => void
     }
 
-    let { initialTranslated: translated = $bindable(false) }: Props = $props()
+    let {
+        initialTranslated: translated = $bindable(false),
+        onCaptureSettled,
+    }: Props = $props()
     let message = $state('first')
     let raw = $state(false)
 
@@ -27,4 +31,5 @@
     modelShortName=""
     renderRawStreaming={raw}
     rawStreamingText="streaming"
+    {onCaptureSettled}
 />

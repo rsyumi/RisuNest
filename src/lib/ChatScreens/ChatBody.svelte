@@ -8,7 +8,7 @@
     import { getModuleAssets } from "src/ts/process/modules";
     import { getCurrentCharacter } from "src/ts/storage/database.svelte";
     import { getFileSrc } from "src/ts/globalApi.svelte";
-    import { DeferredInlayMarkerRegistry, mountDeferredInlaySources } from "src/ts/process/files/inlayRenderSource";
+    import { DeferredInlayMarkerRegistry, mountDeferredInlaySources, resolveDeferredInlaySources } from "src/ts/process/files/inlayRenderSource";
     import { onDestroy, tick } from 'svelte'
 
     interface Props {
@@ -25,6 +25,7 @@
         modelShortName: string
         renderRawStreaming?: boolean
         rawStreamingText?: string
+        onCaptureSettled?: (generation: number) => void
     }
 
     let {
@@ -40,6 +41,7 @@
         modelShortName = '',
         renderRawStreaming = false,
         rawStreamingText = '',
+        onCaptureSettled,
     }: Props =  $props()
 
     // svelte-ignore non_reactive_update
@@ -54,9 +56,12 @@
         promise: Promise<string>
         deferredInlays: DeferredInlayMarkerRegistry
         disposed: boolean
+        generation: number
+        settledNotified: boolean
     }
 
     let activeParseJob: ChatBodyParseJob|null = null
+    let parseGeneration = 0
 
     function getCbsCondition(){
         try{
@@ -188,7 +193,7 @@
         }
     }
 
-    const checkImg = () => {
+    const checkImg = async (job: ChatBodyParseJob) => {
         if(!DBState.db.newImageHandlingBeta || !bodyRoot){
             return
         }
@@ -206,7 +211,7 @@
             })
             const exactAssets = new Map(normalizedAssets.map((asset) => [asset.name, asset.path]))
 
-            imgs.forEach(async (img) => {
+            await Promise.all(Array.from(imgs).map(async (img) => {
                 const name = img.getAttribute('src')?.toLocaleLowerCase() || ''
                 console.log(name)
 
@@ -223,7 +228,9 @@
                 if(foundAsset){
                     img.classList.add('root-loaded-image')
                     img.classList.add('root-loaded-image-' + styl)
-                    img.src = await getFileSrc(foundAsset)
+                    const source = await getFileSrc(foundAsset)
+                    if (destroyed || job.disposed || job !== activeParseJob) return
+                    img.src = source
                     return
                 }
 
@@ -247,6 +254,7 @@
                 }
                 if(currentFound){
                     const got = await getFileSrc(currentFound)
+                    if (destroyed || job.disposed || job !== activeParseJob) return
                     const name2 = img.getAttribute('src')?.toLocaleLowerCase() || ''
                     if(name === name2){
                         img.setAttribute('src', got)
@@ -261,7 +269,7 @@
                 else{
                     img.setAttribute('noimage', 'true')
                 }
-            })
+            }))
         }
     }
 
@@ -270,6 +278,8 @@
             promise: Promise.resolve(''),
             deferredInlays: new DeferredInlayMarkerRegistry(),
             disposed: false,
+            generation: ++parseGeneration,
+            settledNotified: false,
         }
         job.promise = markParsing(msgDisplay, character, idx, job)
         return job
@@ -296,8 +306,22 @@
                 return
             }
             releaseObjectUrls()
-            if (renderRoot) releaseObjectUrls = mountDeferredInlaySources(renderRoot, job.deferredInlays)
+            if (renderRoot) {
+                releaseObjectUrls = onCaptureSettled
+                    ? await resolveDeferredInlaySources(renderRoot, job.deferredInlays)
+                    : mountDeferredInlaySources(renderRoot, job.deferredInlays)
+            }
             else disposeParseJob(job)
+            if (destroyed || job.disposed || job !== activeParseJob) {
+                releaseObjectUrls()
+                releaseObjectUrls = () => {}
+                return
+            }
+            await checkImg(job)
+            await tick()
+            if (destroyed || job.disposed || job !== activeParseJob || job.settledNotified) return
+            job.settledNotified = true
+            onCaptureSettled?.(job.generation)
         }
         catch {
             // markParsing handles its own failures
@@ -322,8 +346,6 @@
             return
         }
         if (!result) return
-        checkImg()
-        result.promise.then(checkImg)
         void syncObjectUrls(result)
     })
 </script>
