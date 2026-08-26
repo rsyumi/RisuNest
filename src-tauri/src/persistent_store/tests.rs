@@ -3,7 +3,9 @@ use super::{
     ConversationMutation, ConversationPage, ConversationQuery, ConversationWindowQuery,
     PersistentStore, PluginStorageMutation, QueryOrder, StoreError, WorkingSetCommit,
 };
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
@@ -3032,6 +3034,295 @@ fn ordinary_commit_during_a_lease_does_not_copy_any_generation_family() {
     store.release_revision(&lease.lease).expect("release lease");
 }
 
+fn leased_family_canonical(store: &PersistentStore, lease: &str) -> Vec<u8> {
+    let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
+    serde_json::to_vec(&json!({
+        "root": store.read_root(Some(lease)).expect("read leased root"),
+        "presetCatalog": store.query_presets(Some(lease)).expect("query leased presets"),
+        "preset": store.read_preset("0", Some(lease)).expect("read leased preset"),
+        "liveCharacters": store.query_characters(
+            &CharacterQuery {
+                search: None,
+                order: QueryOrder::Configured,
+                trash: false,
+                limit: 100,
+                cursor: None,
+            },
+            Some(lease),
+        ).expect("query leased live characters"),
+        "trashedCharacters": store.query_characters(
+            &CharacterQuery {
+                search: None,
+                order: QueryOrder::Configured,
+                trash: true,
+                limit: 100,
+                cursor: None,
+            },
+            Some(lease),
+        ).expect("query leased trashed characters"),
+        "character": store.read_character("char-a", Some(lease))
+            .expect("read leased character"),
+        "conversationCatalog": store.query_conversations(
+            &ConversationQuery {
+                character_id: "char-a".to_owned(),
+                order: QueryOrder::Configured,
+                limit: 100,
+                cursor: None,
+            },
+            Some(lease),
+        ).expect("query leased conversations"),
+        "conversation": store.read_conversation("char-a", "conv-short", Some(lease))
+            .expect("read leased conversation"),
+        "messageWindow": store.read_conversation_window(
+            &ConversationWindowQuery {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-short".to_owned(),
+                start_index: None,
+                limit: None,
+                anchor_message_id: None,
+                before: None,
+                after: None,
+            },
+            Some(lease),
+        ).expect("read leased message window"),
+        "pluginCatalog": store.query_plugin_storage(Some(lease))
+            .expect("query leased plugin storage"),
+        "plugin": store.read_plugin_storage("lease-key", Some(lease))
+            .expect("read leased plugin value"),
+        "assetAliases": store.list_asset_aliases(Some(lease))
+            .expect("list leased asset aliases"),
+        "assetAlias": store.read_asset_alias("asset", "assets/lease.bin", Some(lease))
+            .expect("read leased asset alias"),
+        "assetOwnerHeads": store.list_asset_owner_heads(Some(lease))
+            .expect("list leased asset owner heads"),
+        "assetOwnerHead": store.read_asset_owner_head(&owner, Some(lease))
+            .expect("read leased asset owner head"),
+        "coldAliases": store.list_cold_aliases(Some(lease))
+            .expect("list leased cold aliases"),
+        "coldAlias": store.read_cold_alias("cold/lease", Some(lease))
+            .expect("read leased cold alias"),
+        "materialized": store.materialize_lease(lease).expect("materialize leased revision"),
+    }))
+    .expect("serialize leased record families")
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+#[test]
+fn wal_lease_keeps_every_final_record_family_and_native_export_canonical() {
+    let (_directory, mut store, database) = open_fixture();
+    let alias = AssetAlias {
+        key: "assets/lease.bin".to_owned(),
+        object_hash: Some("11".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 7,
+        mime: "application/octet-stream".to_owned(),
+        name: "lease.bin".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({ "fixture": "lease" }),
+    };
+    let owner = AssetOwnerHead::present(
+        AssetOwnerLocator::RootModuleAssets { index: 0 },
+        "22".repeat(32),
+        1,
+    );
+    let cold = ColdAlias {
+        key: "cold/lease".to_owned(),
+        object_hash: Some("33".repeat(32)),
+        size: 9,
+        metadata: json!({ "codec": "fixture" }),
+    };
+    let mut final_root = staged_root(&database);
+    final_root["modules"] = json!([{
+        "id": "lease-module",
+        "assets": [["lease", "assets/lease.bin", "BIN"]]
+    }]);
+    let staging = store.replace_begin().expect("begin final-family staging");
+    store
+        .replace_put_root(&staging.staging_id, &final_root)
+        .expect("stage final-family root");
+    store
+        .replace_put_presets(
+            &staging.staging_id,
+            database["botPresets"].as_array().expect("fixture presets"),
+        )
+        .expect("stage final-family presets");
+    store
+        .replace_add_characters(
+            &staging.staging_id,
+            database["characters"]
+                .as_array()
+                .expect("fixture characters"),
+        )
+        .expect("stage final-family characters");
+    store
+        .replace_put_asset_aliases(&staging.staging_id, std::slice::from_ref(&alias))
+        .expect("stage final-family asset alias");
+    store
+        .replace_put_asset_owner_heads(&staging.staging_id, std::slice::from_ref(&owner))
+        .expect("stage final-family owner head");
+    store
+        .replace_put_cold_aliases(&staging.staging_id, std::slice::from_ref(&cold))
+        .expect("stage final-family cold alias");
+    let seeded = store
+        .replace_commit(&staging.staging_id, Some(1))
+        .expect("activate final-family staging");
+    let seeded = store
+        .commit(&WorkingSetCommit {
+            expected_revision: seeded.revision,
+            root: None,
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            asset_owner_heads: None,
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "lease-key".to_owned(),
+                value: json!({ "nested": [0, false, ""] }),
+            }]),
+        })
+        .expect("seed plugin family before lease");
+    let lease = store
+        .acquire_revision(seeded.revision)
+        .expect("acquire canonical lease");
+    let canonical_before = leased_family_canonical(&store, &lease.lease);
+    let export_before = store
+        .export_risu_save(&lease.lease, false)
+        .expect("export canonical lease before writes");
+    let export_before_bytes = fs::read(&export_before.path).expect("read first native export");
+
+    let mut changed_character = database["characters"][1].clone();
+    changed_character["name"] = json!("Writer Alpha");
+    let changed = store
+        .commit(&WorkingSetCommit {
+            expected_revision: seeded.revision,
+            root: Some(json!({
+                "username": "Writer root",
+                "modules": [{ "id": "writer-module" }]
+            })),
+            replace_presets: Some(vec![json!({ "name": "Writer preset" })]),
+            character: Some(changed_character),
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: Some(vec![ConversationMutation::ReplaceRange {
+                character_id: "char-a".to_owned(),
+                conversation_id: "conv-short".to_owned(),
+                start: 2,
+                delete_count: 0,
+                messages: vec![message("writer-message")],
+                conversation: None,
+                configured_index: None,
+            }]),
+            delete_character_id: Some("char-b".to_owned()),
+            asset_owner_heads: Some(vec![AssetOwnerHead::absent(
+                AssetOwnerLocator::RootModuleAssets { index: 0 },
+            )]),
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "lease-key".to_owned(),
+                value: json!("writer plugin"),
+            }]),
+        })
+        .expect("mutate writer record families");
+    let replacement_alias = AssetAlias {
+        object_hash: Some("44".repeat(32)),
+        metadata: json!({ "fixture": "writer" }),
+        ..alias.clone()
+    };
+    let changed = store
+        .commit_asset_alias(&replacement_alias, changed.revision)
+        .expect("mutate writer asset alias");
+    let replacement = store
+        .replace_begin()
+        .expect("begin replacement during canonical lease");
+    store
+        .replace_put_root(
+            &replacement.staging_id,
+            &json!({ "username": "Replacement" }),
+        )
+        .expect("stage replacement during canonical lease");
+    store
+        .replace_commit(&replacement.staging_id, Some(changed.revision))
+        .expect("activate replacement during canonical lease");
+
+    let canonical_after = leased_family_canonical(&store, &lease.lease);
+    let export_after = store
+        .export_risu_save(&lease.lease, false)
+        .expect("export canonical lease after writes");
+    let export_after_bytes = fs::read(&export_after.path).expect("read second native export");
+    assert_eq!(sha256(&canonical_after), sha256(&canonical_before));
+    assert_eq!(sha256(&export_after_bytes), sha256(&export_before_bytes));
+
+    store
+        .cleanup_risu_save_export(Path::new(&export_before.path))
+        .expect("clean first native export");
+    store
+        .cleanup_risu_save_export(Path::new(&export_after.path))
+        .expect("clean second native export");
+    store
+        .release_revision(&lease.lease)
+        .expect("release canonical lease");
+}
+
+#[test]
+fn two_revision_leases_remain_independent_until_each_is_released() {
+    let (_directory, mut store, _) = open_fixture();
+    let first = store.acquire_revision(1).expect("acquire first lease");
+    let second = store.acquire_revision(1).expect("acquire second lease");
+    assert_eq!(store.lease_diagnostics().active_count, 2);
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Writer revision" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            asset_owner_heads: None,
+            plugin_storage: None,
+        })
+        .expect("commit writer revision");
+
+    store
+        .release_revision(&first.lease)
+        .expect("release first lease");
+    assert_eq!(store.lease_diagnostics().active_count, 1);
+    assert!(matches!(
+        store.read_root(Some(&first.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
+    assert_eq!(
+        store
+            .read_root(Some(&second.lease))
+            .expect("second lease remains pinned")
+            .value["username"],
+        "Fixture User"
+    );
+    assert!(matches!(
+        store.checkpoint(CheckpointMode::Truncate),
+        Err(StoreError::Store { .. })
+    ));
+
+    store
+        .release_revision(&second.lease)
+        .expect("release second lease");
+    assert_eq!(store.lease_diagnostics().active_count, 0);
+    store
+        .release_revision(&second.lease)
+        .expect("repeat released lease cleanup");
+}
+
 #[test]
 fn revision_lease_survives_append_delete_root_change_and_staged_replace() {
     let (_directory, mut store, database) = open_fixture();
@@ -3884,6 +4175,173 @@ fn reopen_invalidates_runtime_and_legacy_leases_then_reclaims_inactive_generatio
             .expect("read active root after sweep")
             .value["username"],
         "Active after lease"
+    );
+}
+
+#[test]
+fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_commit() {
+    let (directory, mut store, _) = open_fixture();
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Pilot-mutated root" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            asset_owner_heads: None,
+            plugin_storage: Some(vec![PluginStorageMutation::Set {
+                key: "rollback-compatible".to_owned(),
+                value: json!({ "pilot": true }),
+            }]),
+        })
+        .expect("mutate fixture through WAL pilot");
+    let database_path = directory.path().join("persistent/persistent.db");
+    drop(store);
+
+    let mut compatibility = Connection::open(&database_path).expect("open database for COW path");
+    super::schema::initialize(&mut compatibility).expect("initialize compatible schema");
+    assert_eq!(
+        compatibility
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read schema version"),
+        8
+    );
+    assert_eq!(
+        super::current_revision(&compatibility).expect("read pilot revision through COW path"),
+        2
+    );
+    let source =
+        super::active_generation(&compatibility).expect("read pilot generation through COW path");
+    let source_root: String = compatibility
+        .query_row(
+            "SELECT value FROM root WHERE generation = ?1",
+            [&source],
+            |row| row.get(0),
+        )
+        .expect("read pilot root through COW path");
+    assert_eq!(
+        serde_json::from_str::<Value>(&source_root).expect("parse pilot root")["username"],
+        "Pilot-mutated root"
+    );
+
+    let legacy_lease = "snapshot-rollback-compatible";
+    compatibility
+        .execute(
+            "INSERT INTO snapshot_leases (lease, generation, revision, created_at)
+             VALUES (?1, ?2, 2, 4102444800000)",
+            params![legacy_lease, source],
+        )
+        .expect("acquire generation COW lease");
+    let target = "revision-3";
+    let transaction = compatibility
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("begin generation COW commit");
+    for (table, columns) in super::GENERATION_TABLES {
+        transaction
+            .execute(
+                &format!(
+                    "INSERT INTO {table} (generation, {columns})
+                     SELECT ?1, {columns} FROM {table} WHERE generation = ?2"
+                ),
+                params![target, source],
+            )
+            .unwrap_or_else(|error| panic!("copy {table} through generation COW path: {error}"));
+        let source_rows: i64 = transaction
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE generation = ?1"),
+                [&source],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|error| panic!("count source {table}: {error}"));
+        let target_rows: i64 = transaction
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE generation = ?1"),
+                [target],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|error| panic!("count target {table}: {error}"));
+        assert_eq!(target_rows, source_rows, "generation COW copied {table}");
+    }
+    transaction
+        .execute(
+            "UPDATE root SET value = ?2 WHERE generation = ?1",
+            params![
+                target,
+                serde_json::to_string(&json!({ "username": "Generation COW writer" }))
+                    .expect("serialize COW root")
+            ],
+        )
+        .expect("write generation COW root");
+    transaction
+        .execute(
+            "UPDATE meta SET value = '3' WHERE key = 'currentRevision'",
+            [],
+        )
+        .expect("advance generation COW revision");
+    transaction
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'activeGeneration'",
+            [serde_json::to_string(target).expect("serialize COW generation")],
+        )
+        .expect("activate generation COW target");
+    transaction.commit().expect("commit generation COW write");
+
+    let (leased_generation, leased_revision): (String, i64) = compatibility
+        .query_row(
+            "SELECT generation, revision FROM snapshot_leases WHERE lease = ?1",
+            [legacy_lease],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("resolve generation COW lease");
+    let leased_root: String = compatibility
+        .query_row(
+            "SELECT value FROM root WHERE generation = ?1",
+            [&leased_generation],
+            |row| row.get(0),
+        )
+        .expect("read generation COW lease");
+    assert_eq!(leased_revision, 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(&leased_root).expect("parse leased COW root")["username"],
+        "Pilot-mutated root"
+    );
+    assert_eq!(
+        super::current_revision(&compatibility).expect("read generation COW revision"),
+        3
+    );
+    assert_eq!(
+        super::active_generation(&compatibility).expect("read generation COW target"),
+        target
+    );
+    drop(compatibility);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen generation COW database");
+    assert_eq!(reopened.revision().expect("read reopened COW revision"), 3);
+    assert_eq!(
+        reopened
+            .read_root(None)
+            .expect("read reopened COW root")
+            .value["username"],
+        "Generation COW writer"
+    );
+    assert_eq!(
+        reopened
+            .read_plugin_storage("rollback-compatible", None)
+            .expect("read COW-copied plugin value")
+            .expect("COW-copied plugin value exists")
+            .value,
+        json!({ "pilot": true })
+    );
+    assert_eq!(
+        reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .expect("check COW database integrity"),
+        "ok"
     );
 }
 
@@ -5590,6 +6048,49 @@ fn byte_rotation_uses_four_times_current_logical_database_size() {
     assert!(!sparse[0].exists());
     assert!(sparse[1..].iter().all(|path| path.is_file()));
     assert!(Path::new(&created.path).is_file());
+}
+
+#[test]
+fn pending_restore_reopens_cleanly_after_the_store_drops_an_active_lease() {
+    let (directory, mut store, database) = open_fixture();
+    let lease = store
+        .acquire_revision(1)
+        .expect("acquire pre-restore lease");
+    let snapshot = store
+        .snapshot_create("lease-restore")
+        .expect("create snapshot while lease is active");
+    store
+        .commit(&WorkingSetCommit {
+            expected_revision: 1,
+            root: Some(json!({ "username": "Writer after restore snapshot" })),
+            replace_presets: None,
+            character: None,
+            character_details: None,
+            replace_character: None,
+            add_character: None,
+            conversations: None,
+            delete_character_id: None,
+            asset_owner_heads: None,
+            plugin_storage: None,
+        })
+        .expect("commit after restore snapshot");
+    store
+        .snapshot_restore_request(Path::new(&snapshot.path))
+        .expect("prepare restore while lease is active");
+    drop(store);
+
+    let restored = PersistentStore::open(directory.path()).expect("apply pending restore");
+    assert_eq!(restored.revision().expect("read restored revision"), 1);
+    assert_eq!(
+        restored
+            .materialize(None)
+            .expect("materialize restored data"),
+        database
+    );
+    assert!(matches!(
+        restored.read_root(Some(&lease.lease)),
+        Err(StoreError::SnapshotReleased)
+    ));
 }
 
 #[test]
