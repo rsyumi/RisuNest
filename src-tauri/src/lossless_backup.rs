@@ -1,5 +1,8 @@
 use crate::{
-    asset_repository::{PayloadCas, PreparedPayload},
+    asset_repository::{
+        owner_manifest_codec::{decode_owner_manifest, OwnerManifestEntry},
+        PayloadCas, PreparedPayload,
+    },
     local_backup::CancellationProbe,
     lossless_f0::{
         rebuild_f0_v1, validate_f0_v1, F0Error, F0ErrorCode, F0ExpectedMissing,
@@ -10,15 +13,15 @@ use crate::{
         JobPhase, JobProgress,
     },
     persistent_store::{
-        AssetAlias, AssetOwnerHead, AssetOwnerLocator, ColdAlias, PersistentStore, RevisionResult,
-        StagingResult, StoreError, StoreResult,
+        materialized_asset_owner_entries, AssetAlias, AssetOwnerHead, AssetOwnerLocator, ColdAlias,
+        PersistentStore, RevisionResult, StagingResult, StoreError, StoreResult,
     },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -29,12 +32,14 @@ const MAGIC: &[u8; 17] = b"RISUNESTLOSSLESS\0";
 const FORMAT_VERSION: u32 = 1;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_OWNER_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000_000;
 const MAX_REFERENCES: usize = 4_000_000;
 const MAX_WARNINGS: usize = 65_536;
 const MAX_PATH_BYTES: usize = 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 512;
 const DATABASE_PATH: &str = "database.risudat";
+const ALIAS_METADATA_FIELD: &str = "risuNestAliasMetadata";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -227,6 +232,15 @@ pub(crate) fn project_payload_aliases(
             } else {
                 ("asset".to_owned(), None, None, None)
             };
+            let alias_metadata = match metadata.get(ALIAS_METADATA_FIELD) {
+                Some(value) if value.is_object() => value.clone(),
+                Some(_) => {
+                    return Err(invalid_manifest(
+                        "lossless package preserved alias metadata must be an object",
+                    ));
+                }
+                None => entry.metadata.clone(),
+            };
             Ok(AssetAlias {
                 key: logical_key,
                 object_hash,
@@ -238,7 +252,7 @@ pub(crate) fn project_payload_aliases(
                 inlay_type,
                 width,
                 height,
-                metadata: entry.metadata.clone(),
+                metadata: alias_metadata,
             })
         })
         .collect()
@@ -800,8 +814,20 @@ pub(crate) fn restore_lossless_package_v1(
         }
     };
     check_cancelled(cancellation).or_else(|error| abort_restore(store, &staging_id, error))?;
+    let prepared = match store
+        .prepare_replace_commit(&staging_id, Some(expected_revision))
+        .map_err(store_error)
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return abort_restore(store, &staging_id, error),
+    };
+    let authorized = match prepared.create_snapshot().map_err(store_error) {
+        Ok(authorized) => authorized,
+        Err(error) => return abort_restore(store, &staging_id, error),
+    };
+    check_cancelled(cancellation).or_else(|error| abort_restore(store, &staging_id, error))?;
     let revision = match store
-        .replace_commit(&staging_id, Some(expected_revision))
+        .finish_prepared_replace(authorized)
         .map_err(store_error)
     {
         Ok(revision) => revision.revision,
@@ -853,6 +879,7 @@ fn validate_staged_f0(
     database: &Value,
     cas: &PayloadCas,
 ) -> Result<F0Validation, LosslessError> {
+    validate_staged_owner_manifests(entries, database, cas)?;
     let payloads = staged_f0_payloads(entries, cas)?;
     let expected_missing = manifest
         .references
@@ -884,6 +911,92 @@ fn validate_staged_f0(
         ));
     }
     Ok(validation)
+}
+
+fn validate_staged_owner_manifests(
+    entries: &[StagedLosslessEntry],
+    database: &Value,
+    cas: &PayloadCas,
+) -> Result<(), LosslessError> {
+    let asset_hashes = entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::Asset)
+        .filter_map(|entry| {
+            entry
+                .logical_key
+                .as_deref()
+                .map(|key| (key, entry.sha256.as_str()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
+    {
+        let head = parse_owner_head_entry(entry)?;
+        if !head.present {
+            continue;
+        }
+        let hash = head
+            .manifest_hash
+            .as_deref()
+            .expect("validated present owner head has a manifest hash");
+        let canonical = cas
+            .read_object(hash)
+            .map_err(LosslessError::io)?
+            .ok_or_else(|| {
+                LosslessError::new(
+                    LosslessErrorCode::MissingReference,
+                    "lossless owner manifest object is missing after staging",
+                )
+            })?;
+        let decoded = decode_owner_manifest(&canonical).map_err(|error| {
+            invalid_manifest(format!("invalid lossless owner manifest payload: {error}"))
+        })?;
+        let parent = materialized_asset_owner_entries(database, &head.owner)
+            .map_err(store_error)?
+            .ok_or_else(|| {
+                invalid_manifest("present lossless owner head requires a staged parent property")
+            })?;
+        if decoded.len() != head.entry_count as usize || !owner_tuples_match(parent, &decoded) {
+            return Err(invalid_manifest(
+                "lossless owner manifest tuples differ from the staged parent",
+            ));
+        }
+        for owner_entry in decoded {
+            let packaged_hash = asset_hashes.get(owner_entry.tuple[1].as_str());
+            match (owner_entry.payload_hash, packaged_hash) {
+                (Some(payload_hash), Some(expected)) if hex::encode(payload_hash) == **expected => {
+                }
+                (Some(_), None) => {
+                    return Err(LosslessError::new(
+                        LosslessErrorCode::MissingReference,
+                        "lossless owner manifest payload hash has no packaged asset alias",
+                    ));
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(LosslessError::new(
+                        LosslessErrorCode::HashMismatch,
+                        "lossless owner manifest payload hash differs from its packaged asset",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn owner_tuples_match(parent: &[Value], decoded: &[OwnerManifestEntry]) -> bool {
+    parent.len() == decoded.len()
+        && parent.iter().zip(decoded).all(|(value, entry)| {
+            value.as_array().is_some_and(|tuple| {
+                tuple.len() == 3
+                    && tuple
+                        .iter()
+                        .zip(&entry.tuple)
+                        .all(|(value, expected)| value.as_str() == Some(expected))
+            })
+        })
 }
 
 fn staged_f0_payloads(
@@ -1221,6 +1334,17 @@ fn lossless_asset_metadata(alias: &AssetAlias) -> Result<Value, LosslessError> {
             ),
         )
     })?;
+    for field in [
+        "name",
+        "ext",
+        "mime",
+        "inlayType",
+        "width",
+        "height",
+        ALIAS_METADATA_FIELD,
+    ] {
+        metadata.remove(field);
+    }
     metadata.insert("name".to_owned(), Value::String(alias.name.clone()));
     metadata.insert("ext".to_owned(), Value::String(alias.ext.clone()));
     metadata.insert("mime".to_owned(), Value::String(alias.mime.clone()));
@@ -1242,6 +1366,7 @@ fn lossless_asset_metadata(alias: &AssetAlias) -> Result<Value, LosslessError> {
             metadata.insert("height".to_owned(), Value::from(height));
         }
     }
+    metadata.insert(ALIAS_METADATA_FIELD.to_owned(), alias.metadata.clone());
     Ok(Value::Object(metadata))
 }
 
@@ -1306,13 +1431,22 @@ fn validate_payload_manifest(
     let package_payloads = manifest
         .entries
         .iter()
-        .filter(|entry| {
+        .filter_map(|entry| {
             matches!(
                 entry.kind,
                 PayloadKind::Asset | PayloadKind::Inlay | PayloadKind::Cold
             )
+            .then(|| {
+                (
+                    (
+                        entry.kind,
+                        entry.logical_key.as_deref().expect("validated payload key"),
+                    ),
+                    entry,
+                )
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<HashMap<_, _>>();
     if package_payloads.len() != payloads.len() {
         return Err(LosslessError::new(
             LosslessErrorCode::BackupIncomplete,
@@ -1326,10 +1460,7 @@ fn validate_payload_manifest(
             F0PayloadKind::Cold => PayloadKind::Cold,
         };
         let entry = package_payloads
-            .iter()
-            .find(|entry| {
-                entry.kind == kind && entry.logical_key.as_deref() == Some(payload.key.as_str())
-            })
+            .get(&(kind, payload.key.as_str()))
             .ok_or_else(|| {
                 LosslessError::new(
                     LosslessErrorCode::BackupIncomplete,
@@ -1638,6 +1769,12 @@ fn validate_manifest(manifest: &LosslessManifest) -> Result<(), LosslessError> {
                 "lossless package v1 entry exceeds the u32 payload limit",
             ));
         }
+        if entry.kind == PayloadKind::OwnerManifest && entry.byte_length > MAX_OWNER_MANIFEST_BYTES
+        {
+            return Err(invalid_manifest(
+                "lossless owner manifest decode limit exceeded",
+            ));
+        }
         if entry.kind == PayloadKind::Database {
             database_count += 1;
             if entry.logical_path != DATABASE_PATH || entry.logical_key.is_some() {
@@ -1749,6 +1886,15 @@ fn validate_payload_metadata(entry: &LosslessManifestEntry) -> Result<(), Lossle
         }
     }
     let inlay_type = metadata.get("inlayType").and_then(Value::as_str);
+    if matches!(entry.kind, PayloadKind::Asset | PayloadKind::Inlay)
+        && metadata
+            .get(ALIAS_METADATA_FIELD)
+            .is_some_and(|value| !value.is_object())
+    {
+        return Err(invalid_manifest(
+            "lossless package preserved alias metadata must be an object",
+        ));
+    }
     if entry.kind == PayloadKind::Inlay {
         if !matches!(inlay_type, Some("image" | "audio" | "video" | "signature")) {
             return Err(invalid_manifest(
@@ -2157,14 +2303,48 @@ impl Drop for JobOwnedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asset_repository::owner_manifest_codec::encode_owner_manifest;
     use crate::local_backup::NeverCancelled;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use std::{
         fs,
         io::Cursor,
-        sync::{atomic::AtomicBool, Arc},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
     };
+
+    struct CancelAfterBytes<R> {
+        inner: R,
+        bytes_read: usize,
+        cancel_after: usize,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl<R: Read> Read for CancelAfterBytes<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            self.bytes_read += read;
+            if self.bytes_read >= self.cancel_after {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
+    }
+
+    struct CheckCountingCancellation {
+        calls: AtomicUsize,
+        cancel_at: Option<usize>,
+    }
+
+    impl CancellationProbe for CheckCountingCancellation {
+        fn is_cancelled(&self) -> bool {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.cancel_at.is_some_and(|cancel_at| call >= cancel_at)
+        }
+    }
 
     #[test]
     fn versioned_package_round_trips_every_payload_kind_and_ordered_references_exactly() {
@@ -2420,6 +2600,70 @@ mod tests {
     }
 
     #[test]
+    fn owner_manifest_must_be_canonical_and_match_staged_parent_before_activation() {
+        let mismatched = encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: [
+                "different".to_owned(),
+                "shared".to_owned(),
+                "BIN".to_owned(),
+            ],
+            payload_hash: Some(Sha256::digest(b"new-asset").into()),
+        }])
+        .unwrap();
+        let wrong_payload_hash = encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+            payload_hash: Some([0x77; 32]),
+        }])
+        .unwrap();
+        let missing_payload_hash = encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+            payload_hash: None,
+        }])
+        .unwrap();
+        for (owner_manifest, expected_code) in [
+            (
+                b"not-a-romf-manifest".to_vec(),
+                LosslessErrorCode::InvalidManifest,
+            ),
+            (mismatched, LosslessErrorCode::InvalidManifest),
+            (wrong_payload_hash, LosslessErrorCode::HashMismatch),
+            (missing_payload_hash, LosslessErrorCode::HashMismatch),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let staging = directory.path().join("job-staging");
+            let repository = directory.path().join("repository");
+            fs::create_dir(&staging).unwrap();
+            fs::create_dir(&repository).unwrap();
+            let incoming = production_package_with_owner_manifest(
+                directory.path(),
+                "New",
+                b"new",
+                Some(owner_manifest),
+            );
+            let backup_path = directory.path().join("pre-replacement.lossless");
+            let mut store = PersistentStore::open(directory.path()).unwrap();
+            let cas = PayloadCas::new(&repository).unwrap();
+            seed_active_store(&mut store, &cas, "Old", b"old");
+
+            let error = restore_lossless_package_v1(
+                &mut Cursor::new(incoming),
+                &staging,
+                &cas,
+                &mut store,
+                1,
+                &backup_path,
+                &NeverCancelled,
+            )
+            .unwrap_err();
+
+            assert_eq!(error.code, expected_code);
+            assert_eq!(store.revision().unwrap(), 1);
+            assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+            assert!(!backup_path.exists());
+        }
+    }
+
+    #[test]
     fn sqlite_reopen_observes_complete_old_or_database_and_typed_payload_generation() {
         for fail_before_commit in [true, false] {
             let directory = tempfile::tempdir().unwrap();
@@ -2472,17 +2716,23 @@ mod tests {
                 assert_eq!(asset.value.metadata["nested"]["label"], "New-asset");
                 assert_eq!(inlay.value.metadata["nested"]["label"], "New-inlay");
                 assert_eq!(cold.value.metadata["nested"]["label"], "New-cold");
+                assert_eq!(cold.value.metadata[ALIAS_METADATA_FIELD], "user collision");
                 let owner = reopened
                     .read_asset_owner_head(&AssetOwnerLocator::RootModuleAssets { index: 0 }, None)
                     .unwrap()
                     .unwrap();
                 assert!(owner.value.present);
                 assert_eq!(owner.value.entry_count, 1);
+                let owner_manifest = cas
+                    .read_object(owner.value.manifest_hash.as_ref().unwrap())
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(
-                    cas.read_object(owner.value.manifest_hash.as_ref().unwrap())
-                        .unwrap()
-                        .unwrap(),
-                    b"New-owner-manifest"
+                    decode_owner_manifest(&owner_manifest).unwrap(),
+                    vec![OwnerManifestEntry {
+                        tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+                        payload_hash: Some(Sha256::digest(b"new-asset").into()),
+                    }]
                 );
                 assert_eq!(
                     reopened
@@ -2534,6 +2784,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(backup_cold.metadata["source"], "legacy-cold");
                 assert_eq!(backup_cold.metadata["ordinal"], 7);
+                assert_eq!(backup_cold.metadata[ALIAS_METADATA_FIELD], "user collision");
                 assert!(backup_cold.metadata.get("name").is_none());
                 assert_eq!(
                     backup
@@ -2553,11 +2804,19 @@ mod tests {
                             && entry.metadata["present"] == true
                     })
                     .unwrap();
+                let expected_owner_manifest = encode_owner_manifest(&[OwnerManifestEntry {
+                    tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+                    payload_hash: Some(Sha256::digest(b"old-asset").into()),
+                }])
+                .unwrap();
                 assert_eq!(
                     backup_owner.sha256,
-                    hex::encode(Sha256::digest(b"Old-owner-manifest"))
+                    hex::encode(Sha256::digest(&expected_owner_manifest))
                 );
-                assert_eq!(backup_owner.byte_length, b"Old-owner-manifest".len() as u64);
+                assert_eq!(
+                    backup_owner.byte_length,
+                    expected_owner_manifest.len() as u64
+                );
             }
         }
     }
@@ -3003,6 +3262,47 @@ mod tests {
     }
 
     #[test]
+    fn owner_manifest_decode_limit_rejects_oversize_before_payload_allocation() {
+        let head = AssetOwnerHead::present(
+            AssetOwnerLocator::RootModuleAssets { index: 0 },
+            "11".repeat(32),
+            1,
+        );
+        let mut manifest = LosslessManifest {
+            version: FORMAT_VERSION,
+            compatibility: compatibility(),
+            entries: vec![
+                LosslessManifestEntry {
+                    logical_path: DATABASE_PATH.to_owned(),
+                    logical_key: None,
+                    kind: PayloadKind::Database,
+                    byte_length: 0,
+                    sha256: hex::encode(Sha256::digest([])),
+                    metadata: json!({}),
+                },
+                LosslessManifestEntry {
+                    logical_path: "owner-manifests/bounded".to_owned(),
+                    logical_key: Some(owner_head_logical_key(&head.owner)),
+                    kind: PayloadKind::OwnerManifest,
+                    byte_length: MAX_OWNER_MANIFEST_BYTES,
+                    sha256: head.manifest_hash.clone().unwrap(),
+                    metadata: serde_json::to_value(&head).unwrap(),
+                },
+            ],
+            references: vec![],
+            warnings: vec![],
+            extensions: json!({}),
+        };
+
+        validate_manifest(&manifest).expect("accepted M5 manifest range remains representable");
+        manifest.entries[1].byte_length = MAX_OWNER_MANIFEST_BYTES + 1;
+        let error = validate_manifest(&manifest).unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::InvalidManifest);
+        assert!(error.message.contains("owner manifest decode limit"));
+    }
+
+    #[test]
     fn cancellation_and_incomplete_pinned_inventory_abort_without_activation_or_backup() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("staging");
@@ -3053,6 +3353,115 @@ mod tests {
         assert_eq!(error.code, LosslessErrorCode::BackupIncomplete);
         assert_eq!(store.revision().unwrap(), 1);
         assert!(!backup_path.exists());
+    }
+
+    #[test]
+    fn cancellation_during_copy_cleans_partial_staging_and_preserves_active_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let large_prefix = vec![0x5a; 2 * 1024 * 1024];
+        let incoming = production_package(directory.path(), "New", &large_prefix);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut source = CancelAfterBytes {
+            inner: Cursor::new(incoming.clone()),
+            bytes_read: 0,
+            cancel_after: incoming.len() / 2,
+            cancelled: cancelled.clone(),
+        };
+        let cas = PayloadCas::new(&repository).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let backup_path = directory.path().join("mid-copy.lossless");
+
+        let error = restore_lossless_package_v1(
+            &mut source,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &crate::local_backup::AtomicCancellation::new(cancelled),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::Cancelled);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+        assert!(!backup_path.exists());
+        assert!(fs::read_dir(staging.join("lossless-v1"))
+            .unwrap()
+            .next()
+            .is_none());
+        assert!(fs::read_dir(repository.join("assets-v2").join("staging"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn final_cancellation_check_runs_after_snapshot_before_activation() {
+        let baseline_directory = tempfile::tempdir().unwrap();
+        let baseline_staging = baseline_directory.path().join("staging");
+        let baseline_repository = baseline_directory.path().join("repository");
+        fs::create_dir(&baseline_staging).unwrap();
+        fs::create_dir(&baseline_repository).unwrap();
+        let baseline_incoming = production_package(baseline_directory.path(), "New", b"new");
+        let baseline_cas = PayloadCas::new(&baseline_repository).unwrap();
+        let mut baseline_store = PersistentStore::open(baseline_directory.path()).unwrap();
+        seed_active_store(&mut baseline_store, &baseline_cas, "Old", b"old");
+        let baseline_probe = CheckCountingCancellation {
+            calls: AtomicUsize::new(0),
+            cancel_at: None,
+        };
+        restore_lossless_package_v1(
+            &mut Cursor::new(baseline_incoming),
+            &baseline_staging,
+            &baseline_cas,
+            &mut baseline_store,
+            1,
+            &baseline_directory.path().join("baseline.lossless"),
+            &baseline_probe,
+        )
+        .unwrap();
+        let final_check = baseline_probe.calls.load(Ordering::SeqCst);
+        assert!(final_check > 0);
+
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("staging");
+        let repository = directory.path().join("repository");
+        fs::create_dir(&staging).unwrap();
+        fs::create_dir(&repository).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let cas = PayloadCas::new(&repository).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let backup_path = directory.path().join("boundary.lossless");
+        let cancellation = CheckCountingCancellation {
+            calls: AtomicUsize::new(0),
+            cancel_at: Some(final_check),
+        };
+
+        let error = restore_lossless_package_v1(
+            &mut Cursor::new(incoming),
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &backup_path,
+            &cancellation,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::Cancelled);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+        assert!(backup_path.is_file());
+        verify_lossless_package_v1(&mut File::open(&backup_path).unwrap(), &NeverCancelled)
+            .unwrap();
+        assert_eq!(store.snapshot_list().unwrap().len(), 1);
     }
 
     #[test]
@@ -3150,7 +3559,16 @@ mod tests {
             inlay_type: None,
             width: None,
             height: None,
-            metadata: json!({ "nested": { "preserved": true } }),
+            metadata: json!({
+                "nested": { "preserved": true },
+                "name": 17,
+                "ext": null,
+                "mime": false,
+                "inlayType": "image",
+                "width": "legacy",
+                "height": 99,
+                "risuNestAliasMetadata": "user collision"
+            }),
         };
         let inlay = AssetAlias {
             key: "shared".to_owned(),
@@ -3161,31 +3579,66 @@ mod tests {
             name: "original.png".to_owned(),
             ext: "png".to_owned(),
             inlay_type: Some("image".to_owned()),
-            width: Some(11),
+            width: None,
             height: Some(13),
-            metadata: json!({ "nested": { "preserved": true } }),
+            metadata: json!({
+                "nested": { "preserved": true },
+                "inlayType": "audio",
+                "width": "legacy",
+                "height": "legacy"
+            }),
         };
 
+        let asset_metadata = lossless_asset_metadata(&asset).unwrap();
+        let inlay_metadata = lossless_asset_metadata(&inlay).unwrap();
         assert_eq!(
-            lossless_asset_metadata(&asset).unwrap(),
+            asset_metadata,
             json!({
                 "nested": { "preserved": true },
                 "name": "shared.bin",
                 "ext": "bin",
-                "mime": "application/octet-stream"
+                "mime": "application/octet-stream",
+                "risuNestAliasMetadata": asset.metadata
             })
         );
         assert_eq!(
-            lossless_asset_metadata(&inlay).unwrap(),
+            inlay_metadata,
             json!({
                 "nested": { "preserved": true },
                 "name": "original.png",
                 "ext": "png",
                 "mime": "image/png",
                 "inlayType": "image",
-                "width": 11,
-                "height": 13
+                "height": 13,
+                "risuNestAliasMetadata": inlay.metadata
             })
+        );
+
+        let staged = [
+            StagedLosslessEntry {
+                logical_path: "assets/shared".to_owned(),
+                logical_key: Some(asset.key.clone()),
+                kind: PayloadKind::Asset,
+                byte_length: asset.size as u64,
+                sha256: asset.object_hash.clone().unwrap(),
+                metadata: asset_metadata,
+                staged_path: None,
+                immutable_object: None,
+            },
+            StagedLosslessEntry {
+                logical_path: "inlays/shared".to_owned(),
+                logical_key: Some(inlay.key.clone()),
+                kind: PayloadKind::Inlay,
+                byte_length: inlay.size as u64,
+                sha256: inlay.object_hash.clone().unwrap(),
+                metadata: inlay_metadata,
+                staged_path: None,
+                immutable_object: None,
+            },
+        ];
+        assert_eq!(
+            project_payload_aliases(&staged).unwrap(),
+            vec![asset, inlay]
         );
     }
 
@@ -3241,7 +3694,59 @@ mod tests {
         assert_eq!(verified.manifest.references[49_999].occurrence, 49_999);
     }
 
+    #[test]
+    fn fifty_thousand_payload_inventory_entries_validate_by_identity() {
+        let metadata = json!({
+            "name": "asset.bin",
+            "ext": "bin",
+            "mime": "application/octet-stream"
+        });
+        let entries = (0..50_000)
+            .map(|index| {
+                let key = format!("asset-{index:05}");
+                LosslessManifestEntry {
+                    logical_path: format!("assets/{key}"),
+                    logical_key: Some(key),
+                    kind: PayloadKind::Asset,
+                    byte_length: 0,
+                    sha256: "11".repeat(32),
+                    metadata: metadata.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let payloads = (0..50_000)
+            .rev()
+            .map(|index| F0PayloadDescriptor {
+                kind: F0PayloadKind::Asset,
+                key: format!("asset-{index:05}"),
+                sha256: "11".repeat(32),
+                byte_length: 0,
+                metadata: metadata.clone(),
+                cold_source: None,
+            })
+            .collect::<Vec<_>>();
+        let manifest = LosslessManifest {
+            version: FORMAT_VERSION,
+            compatibility: compatibility(),
+            entries,
+            references: vec![],
+            warnings: vec![],
+            extensions: json!({}),
+        };
+
+        validate_payload_manifest(&manifest, &payloads).unwrap();
+    }
+
     fn production_package(root: &Path, username: &str, payload_prefix: &[u8]) -> Vec<u8> {
+        production_package_with_owner_manifest(root, username, payload_prefix, None)
+    }
+
+    fn production_package_with_owner_manifest(
+        root: &Path,
+        username: &str,
+        payload_prefix: &[u8],
+        owner_manifest_override: Option<Vec<u8>>,
+    ) -> Vec<u8> {
         let database_root = root.join(format!("package-database-{username}"));
         fs::create_dir(&database_root).unwrap();
         let mut source_store = PersistentStore::open(&database_root).unwrap();
@@ -3259,7 +3764,13 @@ mod tests {
         let asset_path = root.join(format!("package-asset-{username}"));
         let inlay_path = root.join(format!("package-inlay-{username}"));
         let cold_path = root.join(format!("package-cold-{username}"));
-        let owner_manifest_bytes = format!("{username}-owner-manifest").into_bytes();
+        let owner_manifest_bytes = owner_manifest_override.unwrap_or_else(|| {
+            encode_owner_manifest(&[OwnerManifestEntry {
+                tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+                payload_hash: Some(Sha256::digest(&asset_bytes).into()),
+            }])
+            .unwrap()
+        });
         let owner_manifest_path = root.join(format!("package-owner-manifest-{username}"));
         let absent_owner_path = root.join(format!("package-absent-owner-{username}"));
         fs::write(&asset_path, &asset_bytes).unwrap();
@@ -3376,7 +3887,11 @@ mod tests {
         let asset = cas.prepare_bytes(&asset_bytes).unwrap();
         let inlay = cas.prepare_bytes(&inlay_bytes).unwrap();
         let cold = cas.prepare_bytes(&cold_bytes).unwrap();
-        let owner_manifest_bytes = format!("{username}-owner-manifest").into_bytes();
+        let owner_manifest_bytes = encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+            payload_hash: Some(Sha256::digest(&asset_bytes).into()),
+        }])
+        .unwrap();
         let owner_manifest = cas.prepare_bytes(&owner_manifest_bytes).unwrap();
         let metadata = payload_metadata(username);
         let staging = store.replace_begin().unwrap().staging_id;
@@ -3424,6 +3939,7 @@ mod tests {
                     metadata: json!({
                         "source": "legacy-cold",
                         "ordinal": 7,
+                        "risuNestAliasMetadata": "user collision",
                         "nested": { "label": format!("{username}-cold") }
                     }),
                 }],
@@ -3523,6 +4039,7 @@ mod tests {
                 "name": "shared.json.zlib",
                 "ext": "zlib",
                 "mime": "application/octet-stream",
+                "risuNestAliasMetadata": "user collision",
                 "nested": { "label": format!("{username}-cold") }
             }),
         )

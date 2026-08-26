@@ -611,6 +611,13 @@ pub(crate) struct StagingResult {
     pub(crate) staging_id: String,
 }
 
+pub(crate) fn materialized_asset_owner_entries<'a>(
+    database: &'a Value,
+    owner: &AssetOwnerLocator,
+) -> StoreResult<Option<&'a Vec<Value>>> {
+    commit::staged_owner_entries(database, owner)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SnapshotInfo {

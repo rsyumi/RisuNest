@@ -371,7 +371,7 @@ fn validate_staged_owner_heads(database: &Value, heads: &[AssetOwnerHead]) -> St
     Ok(())
 }
 
-fn staged_owner_entries<'a>(
+pub(super) fn staged_owner_entries<'a>(
     database: &'a Value,
     owner: &AssetOwnerLocator,
 ) -> StoreResult<Option<&'a Vec<Value>>> {
