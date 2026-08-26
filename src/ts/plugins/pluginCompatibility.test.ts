@@ -7,6 +7,8 @@ import {
     createPluginLoadOrchestrator,
     createPluginLoadReentrancyGuard,
     getManualPluginInstallVersion,
+    preparePluginFullObjectCallbackRegistration,
+    runPluginFullObjectReplacement,
     runPluginUnloadCallbacks,
     runAwaitablePluginLoader,
     selectPluginCompatibilityProfile,
@@ -47,6 +49,45 @@ describe('plugin compatibility profiles', () => {
             'maximum-compatibility',
             'getCharacter',
         )).not.toThrow()
+    })
+
+    it('invalidates the active conversation after a full-object replacement', () => {
+        const events: string[] = []
+
+        const result = runPluginFullObjectReplacement(
+            'maximum-compatibility',
+            'setCharacter',
+            true,
+            () => {
+                events.push('replace')
+                return 'replaced'
+            },
+            () => events.push('invalidate'),
+        )
+
+        expect(result).toBe('replaced')
+        expect(events).toEqual(['replace', 'invalidate'])
+    })
+
+    it('rechecks plugin lifetime and profile after an asynchronous permission wait', () => {
+        const controller = new AbortController()
+        controller.abort()
+
+        expect(preparePluginFullObjectCallbackRegistration(
+            'scalable-v3',
+            'addRisuChatListener',
+            controller.signal,
+        )).toBe(false)
+        expect(() => preparePluginFullObjectCallbackRegistration(
+            'scalable-v3',
+            'addRisuChatListener',
+            new AbortController().signal,
+        )).toThrow(/maximum-compatibility/i)
+        expect(preparePluginFullObjectCallbackRegistration(
+            'maximum-compatibility',
+            'addRisuChatListener',
+            new AbortController().signal,
+        )).toBe(true)
     })
 
     it('selects scalable mode unless an enabled API v2.1 plugin exists', () => {

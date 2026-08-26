@@ -38,11 +38,16 @@ import {
     flushPendingData,
     getActiveConversationSession,
     getPersistentNavigationGeneration,
+    invalidateActiveConversationSession,
     materializePersistentDatabaseSnapshotWithRevision,
     replacePersistentDatabase,
 } from "src/ts/storage/persistentDataRuntime.svelte";
 import { appendCurrentConversationMessage } from "src/ts/conversationMutations";
-import { assertPluginFullObjectCompatibility } from "../pluginCompatibility";
+import {
+    assertPluginFullObjectCompatibility,
+    preparePluginFullObjectCallbackRegistration,
+    runPluginFullObjectReplacement,
+} from "../pluginCompatibility";
 import {
     createProductionPluginDatabaseAccess,
     linkPluginQueryAbortSignals,
@@ -695,8 +700,13 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
         return oldApis.getChar()
     }
     const setCompleteCurrentCharacter = (character: unknown) => {
-        requireFullObjectAccess('setCharacter')
-        return oldApis.setChar(character)
+        return runPluginFullObjectReplacement(
+            pluginCompatibility.profile,
+            'setCharacter',
+            true,
+            () => oldApis.setChar(character),
+            invalidateActiveConversationSession,
+        )
     }
     const pluginLifetime = new AbortController()
     addPluginUnloadCallback(plugin.name, () => pluginLifetime.abort())
@@ -796,6 +806,11 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             if(!conf){
                 return;
             }
+            if (!preparePluginFullObjectCallbackRegistration(
+                pluginCompatibility.profile,
+                'addRisuChatListener',
+                pluginLifetime.signal,
+            )) return
             oldApis.addRisuChatListener(mode, func as any);
             addPluginUnloadCallback(plugin.name, () => oldApis.removeRisuChatListener(mode, func as any));
         },
@@ -947,13 +962,19 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return null;
         },
         setCharacterToIndex: (index:number, char:any) => {
-            requireFullObjectAccess('setCharacterToIndex')
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[index];
-            if(charId){
-                DBState.db.characters[charId] = char
-            }
+            const target = charId ? db.characters[charId] : undefined
+            return runPluginFullObjectReplacement(
+                pluginCompatibility.profile,
+                'setCharacterToIndex',
+                target !== undefined && target === db.characters[get(selectedCharID)],
+                () => {
+                    if(charId) DBState.db.characters[charId] = char
+                },
+                invalidateActiveConversationSession,
+            )
         },
         getChatFromIndex: (characterIndex:number, chatIndex:number) => {
             requireFullObjectAccess('getChatFromIndex')
@@ -969,16 +990,24 @@ const makeRisuaiAPIV3 = (iframe:HTMLIFrameElement,plugin:RisuPlugin) => {
             return null;
         },
         setChatToIndex: (characterIndex:number, chatIndex:number, chat:any) => {
-            requireFullObjectAccess('setChatToIndex')
             const db = DBState.db
             const charIds = Object.keys(db.characters);
             const charId = charIds[characterIndex];
-            if(charId){
-                const chats = db.characters[charId].chats;
-                if(chats && chats[chatIndex]){
-                    DBState.db.characters[charId].chats[chatIndex] = chat
-                }
-            }
+            const target = charId ? db.characters[charId] : undefined
+            return runPluginFullObjectReplacement(
+                pluginCompatibility.profile,
+                'setChatToIndex',
+                target !== undefined &&
+                    target === db.characters[get(selectedCharID)] &&
+                    target.chatPage === chatIndex,
+                () => {
+                    const chats = target?.chats
+                    if(chats && chats[chatIndex]){
+                        chats[chatIndex] = chat
+                    }
+                },
+                invalidateActiveConversationSession,
+            )
         },
         getCurrentCharacterIndex: () => {
             return get(selectedCharID)

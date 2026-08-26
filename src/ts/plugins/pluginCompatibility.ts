@@ -16,6 +16,29 @@ export function assertPluginFullObjectCompatibility(
     )
 }
 
+export function runPluginFullObjectReplacement<T>(
+    profile: PluginCompatibilityProfile,
+    operation: string,
+    affectsActiveConversation: boolean,
+    replace: () => T,
+    invalidateActiveConversation: () => void,
+): T {
+    assertPluginFullObjectCompatibility(profile, operation)
+    const result = replace()
+    if (affectsActiveConversation) invalidateActiveConversation()
+    return result
+}
+
+export function preparePluginFullObjectCallbackRegistration(
+    profile: PluginCompatibilityProfile,
+    operation: string,
+    lifetimeSignal: AbortSignal,
+): boolean {
+    if (lifetimeSignal.aborted) return false
+    assertPluginFullObjectCompatibility(profile, operation)
+    return true
+}
+
 export function getManualPluginInstallVersion(
     apiVersion: string,
 ): '2.1' | '3.0' | null {
