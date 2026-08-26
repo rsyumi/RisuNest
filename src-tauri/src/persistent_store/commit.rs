@@ -152,11 +152,8 @@ pub(super) fn commit(
     }
     let mut conversation_changes = Vec::new();
     for mutation in input.conversations.as_deref().unwrap_or_default() {
-        conversation_changes.push(apply_conversation_mutation(
-            &transaction,
-            &generation,
-            mutation,
-        )?);
+        let change = apply_conversation_mutation(&transaction, &generation, mutation)?;
+        super::logical_index::push_conversation_change(&mut conversation_changes, change)?;
     }
     for mutation in input.plugin_storage.as_deref().unwrap_or_default() {
         apply_plugin_storage_mutation(&transaction, &generation, mutation)?;
@@ -1279,8 +1276,8 @@ fn apply_conversation_mutation(
                     start: 0,
                     old_count: 0,
                     new_count: messages.len() as u64,
-                    replaced_count: 0,
-                    inserted_count: messages.len() as u64,
+                    affected_end: messages.len() as u64,
+                    force_tail: !messages.is_empty(),
                     was_new: true,
                 });
             };
@@ -1358,8 +1355,9 @@ fn apply_conversation_mutation(
                 start: start as u64,
                 old_count: old_count as u64,
                 new_count: (old_count + delta) as u64,
-                replaced_count: delete_count as u64,
-                inserted_count: messages.len() as u64,
+                affected_end: (start as u64)
+                    .saturating_add((delete_count as u64).max(messages.len() as u64)),
+                force_tail: delta != 0,
                 was_new: false,
             })
         }
