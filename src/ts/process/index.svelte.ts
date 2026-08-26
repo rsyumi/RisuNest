@@ -136,6 +136,17 @@ function beginPromptHistoryOperation(
     })
 }
 
+function hasMismatchedActiveConversationSession(): boolean {
+    const activeSession = getActiveConversationSession()
+    if (!activeSession) return false
+
+    const selectedCharacter = DBState.db.characters[get(selectedCharID)]
+    const selectedConversation = selectedCharacter?.chats[selectedCharacter.chatPage]
+    return !selectedCharacter
+        || !selectedConversation
+        || !activeSession.matchesConversation(selectedCharacter.chaId, selectedConversation)
+}
+
 interface GenerationCompletionLifecycle {
     responseApplied: boolean
     acknowledgementAttempted: boolean
@@ -285,6 +296,8 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             return false
         }
     }
+    if (hasMismatchedActiveConversationSession()) return false
+
     await activatePresetChainForRequest(
         chatProcessIndex === -1 ? DBState.db : { botPresets: [] },
         changeToPreset,
@@ -305,6 +318,8 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
         await peerSync()
         chatProcessStage.set(0)
     }
+
+    if (hasMismatchedActiveConversationSession()) return false
 
     DBState.db.statics.messages += 1
     selectedChar = get(selectedCharID)

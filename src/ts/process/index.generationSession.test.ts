@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
     modelResponse: null as any,
     modelRequestCount: 0,
     modelRequests: [] as any[],
+    presetActivationCount: 0,
     outputTrigger: null as null | ((chat: any) => Promise<any> | any),
     tokenizeResult: null as Promise<number> | null,
     inlay: null as null | ((data: string) => { text: string, promise?: Promise<string> }),
@@ -149,7 +150,11 @@ vi.mock('../globalApi.svelte', () => ({ readImage: vi.fn() }))
 vi.mock('../plugins/plugins.svelte', () => ({
     pluginV2: { chatOutput: mocks.listeners },
 }))
-vi.mock('./presetChain', () => ({ activatePresetChainForRequest: vi.fn(async () => undefined) }))
+vi.mock('./presetChain', () => ({
+    activatePresetChainForRequest: vi.fn(async () => {
+        mocks.presetActivationCount += 1
+    }),
+}))
 vi.mock('../storage/persistentDataRuntime.svelte', () => ({
     acknowledgeGenerationCompletion: vi.fn(async () => undefined),
     getActiveConversationSession: () => mocks.session,
@@ -303,6 +308,7 @@ describe('sendChat generation session integration', () => {
         mocks.modelResponse = streamingResponse('answer')
         mocks.modelRequestCount = 0
         mocks.modelRequests.length = 0
+        mocks.presetActivationCount = 0
         mocks.outputTrigger = null
         mocks.tokenizeResult = null
         mocks.inlay = null
@@ -329,6 +335,7 @@ describe('sendChat generation session integration', () => {
     it('fails closed before assigning IDs when the active session owns another chat', async () => {
         const source = makeChat([{ role: 'user', data: 'must remain unchanged' }])
         const { currentCharacter } = installDatabase(source)
+        currentCharacter.lastInteraction = 123
         const otherChat = makeChat([{ role: 'user', data: 'other', chatId: 'other' }])
         otherChat.id = 'chat-b'
         mocks.session = new ActiveConversationSession({
@@ -341,7 +348,10 @@ describe('sendChat generation session integration', () => {
         await expect(sendChat()).resolves.toBe(false)
 
         expect(source.message).toEqual([{ role: 'user', data: 'must remain unchanged' }])
+        expect(mocks.presetActivationCount).toBe(0)
         expect(mocks.modelRequestCount).toBe(0)
+        expect(DBState.db.statics.messages).toBe(0)
+        expect(currentCharacter.lastInteraction).toBe(123)
     })
 
     it('publishes a trigger clone through a fresh fallback and preserves final action order', async () => {
