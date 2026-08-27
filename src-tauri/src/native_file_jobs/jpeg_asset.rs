@@ -132,6 +132,25 @@ fn validate_ordinary_jpeg(
     Ok(())
 }
 
+fn character_image_extension(uri: &str) -> &'static str {
+    let path = uri
+        .split(|character| matches!(character, '?' | '#'))
+        .next()
+        .unwrap_or(uri);
+    let extension = path
+        .rsplit_once('.')
+        .map_or("", |(_, extension)| extension)
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => "png",
+        "webp" => "webp",
+        "gif" => "gif",
+        "jpg" => "jpg",
+        "jpeg" => "jpeg",
+        _ => "png",
+    }
+}
+
 fn update_character_image(
     mut character: Value,
     character_id: &str,
@@ -152,6 +171,7 @@ fn update_character_image(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
     {
+        let extension = character_image_extension(&previous);
         let assets = object
             .entry("ccAssets")
             .or_insert_with(|| Value::Array(Vec::new()))
@@ -166,7 +186,7 @@ fn update_character_image(
             "type": "icon",
             "name": "iconx",
             "uri": previous,
-            "ext": "png",
+            "ext": extension,
         }));
     }
     object.insert("image".to_owned(), Value::String(logical_id.to_owned()));
@@ -552,6 +572,76 @@ mod tests {
                 owner_head
             );
         }
+    }
+
+    #[test]
+    fn replacing_a_native_jpeg_preserves_its_extension_in_previous_portraits() {
+        let (directory, store, character_id, _owner_head) = open_fixture();
+        let first_bytes = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9];
+        let first_path = directory.path().join("first.JPEG");
+        fs::write(&first_path, first_bytes).expect("write first JPEG source");
+        let first = import_jpeg_asset(
+            opened_source(&first_path, first_bytes.len() as u64),
+            "first.JPEG",
+            JpegAssetDestination::CurrentCharacterImage {
+                character_id: character_id.clone(),
+            },
+            2,
+            directory.path(),
+            store,
+            &job(),
+        )
+        .expect("import first JPEG asset");
+        let first_logical_id = format!("assets/{}.jpeg", first.source_sha256);
+
+        let second_bytes = [0xff, 0xd8, 0xff, 0xe1, 4, 5, 6, 0xff, 0xd9];
+        let second_path = directory.path().join("second.jpg");
+        fs::write(&second_path, second_bytes).expect("write second JPEG source");
+        import_jpeg_asset(
+            opened_source(&second_path, second_bytes.len() as u64),
+            "second.jpg",
+            JpegAssetDestination::CurrentCharacterImage {
+                character_id: character_id.clone(),
+            },
+            3,
+            directory.path(),
+            PersistentStore::open(directory.path()).expect("reopen store for second JPEG"),
+            &job(),
+        )
+        .expect("replace first JPEG asset");
+
+        let reopened = PersistentStore::open(directory.path()).expect("reopen replaced character");
+        let character = reopened
+            .read_character(&character_id, None)
+            .expect("read character")
+            .expect("character");
+        assert_eq!(
+            character.value["ccAssets"]
+                .as_array()
+                .expect("previous portraits")
+                .last(),
+            Some(&json!({
+                "type": "icon",
+                "name": "iconx",
+                "uri": first_logical_id,
+                "ext": "jpeg",
+            }))
+        );
+    }
+
+    #[test]
+    fn previous_portrait_extension_ignores_query_and_fragment() {
+        let updated = update_character_image(
+            json!({
+                "chaId": "character-1",
+                "image": "assets/portrait.JpG?download=1#preview",
+            }),
+            "character-1",
+            "assets/replacement.png",
+        )
+        .expect("update character image");
+
+        assert_eq!(updated["ccAssets"][0]["ext"], "jpg");
     }
 
     #[test]
