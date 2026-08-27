@@ -818,7 +818,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         val store = safSpoolStore()
         val source = withContext(Dispatchers.IO) {
           store.cleanupStale()
-          contentResolverSource(uri)
+          val (displayName, totalBytes) = resolveSourceMetadata(uri)
+          contentResolverSource(uri, displayName, totalBytes)
         }
         if (!source.displayName.endsWith(".risulossless", ignoreCase = true)) {
           SafSpoolBatch(
