@@ -1,4 +1,8 @@
-import type { Database } from './storage/database.svelte'
+import {
+    cloneConversationMetadata,
+    type ActiveConversationSession,
+} from './storage/activeConversationSession'
+import type { Chat, Database } from './storage/database.svelte'
 
 type ConversationOwner = Database['characters'][number]
 
@@ -9,10 +13,21 @@ export function readConversationSuggestions(
 }
 
 export function writeConversationSuggestions(
-    owner: ConversationOwner | undefined,
-    chatPage: number,
-    suggestions: string[],
+    conversation: Chat,
+    session: ActiveConversationSession | null,
+    suggestions: readonly string[],
 ): void {
-    const conversation = owner?.chats[chatPage]
-    if (conversation) conversation.suggestMessages = suggestions
+    if (!session) {
+        conversation.suggestMessages = [...suggestions]
+        return
+    }
+    const expectedMetadata = cloneConversationMetadata(conversation)
+    session.applyOperation({
+        expectedVersion: session.version,
+        expectedMetadata,
+        metadata: {
+            ...expectedMetadata,
+            suggestMessages: [...suggestions],
+        },
+    })
 }

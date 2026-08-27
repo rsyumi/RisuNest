@@ -115,18 +115,17 @@ function harness(messages: Message[]) {
     } as unknown as PersistentDataStore
     let activeSession: ActiveConversationSession | null = session
     let navigationGeneration = 1
-    const target = {
-        characterId: owner.chaId,
-        conversationId: conversation.id!,
-        navigationGeneration,
-        storeRevision: session.storeRevision,
-    } as SelectedConversationTarget
     const dependencies = {
         store,
         flushPendingData: vi.fn(async () => undefined),
         getNavigationGeneration: () => navigationGeneration,
         getActiveConversationSession: () => activeSession,
-        captureSelectedConversationTarget: () => activeSession ? target : null,
+        captureSelectedConversationTarget: () => activeSession ? {
+            characterId: owner.chaId,
+            conversationId: conversation.id!,
+            navigationGeneration,
+            storeRevision: activeSession.storeRevision,
+        } as SelectedConversationTarget : null,
         captureSelectedConversationAuthority: () => null,
     }
     return {
@@ -315,6 +314,66 @@ describe('chat screenshot source lease', () => {
         expect(source.session.storeRevision).toBe(7)
         expect(lease.snapshot.revision).toBe(8)
         expect((await lease.createJob(1, 1)).messages[0].data).toBe('same conversation')
+        expect(source.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('recaptures the committed revision after flushing a pending edit', async () => {
+        const source = harness([
+            { role: 'user', data: 'before flush', chatId: 'one' },
+        ])
+        source.session.edit(source.session.locate(0), {
+            role: 'user',
+            data: 'after flush',
+            chatId: 'one',
+        })
+        const revisionEightLease = {
+            ...source.lease,
+            revision: 8,
+            readConversationWindow: vi.fn(async ({ startIndex = 0, limit = 1 }) => {
+                const page = source.conversation.message.slice(startIndex, startIndex + limit)
+                return {
+                    revision: 8,
+                    value: {
+                        characterId: source.owner.chaId,
+                        conversationId: source.conversation.id!,
+                        messages: structuredClone(page),
+                        startIndex,
+                        endIndex: startIndex + page.length,
+                        totalMessages: source.conversation.message.length,
+                        hasMoreBefore: startIndex > 0,
+                        hasMoreAfter: startIndex + page.length < source.conversation.message.length,
+                    },
+                }
+            }),
+        } as unknown as PersistentRevisionLease
+        const originalReadRoot = source.dependencies.store.readRoot.bind(
+            source.dependencies.store,
+        )
+        source.dependencies.flushPendingData.mockImplementation(async () => {
+            source.session.acknowledgePersisted(
+                source.session.sessionToken,
+                source.session.version,
+                8,
+            )
+            source.dependencies.store.readRoot = vi.fn(async () => ({
+                ...await originalReadRoot(),
+                revision: 8,
+            }))
+            source.dependencies.store.acquireRevision = vi.fn(async () => revisionEightLease)
+        })
+
+        const screenshot = await openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)
+
+        expect(screenshot.snapshot).toMatchObject({
+            revision: 8,
+            sessionVersion: 1,
+            totalTurns: 1,
+        })
+        expect((await screenshot.createJob(1, 1)).messages[0].data).toBe('after flush')
         expect(source.release).toHaveBeenCalledTimes(1)
     })
 

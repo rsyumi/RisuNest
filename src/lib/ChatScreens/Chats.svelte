@@ -113,6 +113,8 @@
         readonly totalMessages: number
         readonly renderSignature: ChatRenderSignature
         projection: LiveChatParserProjection | null
+        needsRemount: boolean
+        preserveMountedRuntime: boolean
         failed: boolean
         retryTimer: ReturnType<typeof setTimeout> | null
     }
@@ -746,23 +748,32 @@
             })
             const previousSignature = renderSignatures.get(key)
             let parserProjection: BoundedLiveChatParserProjection | undefined
+            let parserProjectionState: RowParserProjectionState | undefined
             if (sourceSnapshot && viewportRow && activeViewportSource && parserProjectionResolver) {
-                const projectionState = ensureRowParserProjection(
+                parserProjectionState = ensureRowParserProjection(
                     key,
                     viewportRow,
                     totalMessages,
                     renderSignature,
                     sourceSnapshot,
                 )
-                if (!projectionState.projection) {
+                if (!parserProjectionState.projection) {
                     orderedElements.push(element)
                     continue
                 }
-                if (projectionState.projection.kind === 'bounded') {
-                    parserProjection = projectionState.projection
+                if (parserProjectionState.projection.kind === 'bounded') {
+                    parserProjection = parserProjectionState.projection
                 }
             }
-            if (!areChatRenderSignaturesEqual(previousSignature, renderSignature)) {
+            const requiresRemount = parserProjectionState?.needsRemount === true
+                || !areChatRenderSignaturesEqual(previousSignature, renderSignature)
+            const preserveMountedRuntime = parserProjectionState?.preserveMountedRuntime === true
+                && mountInstances.has(key) && (
+                activeStreamingMessage
+                || pinReasons.get(key)?.has('editor') === true
+                || pinReasons.get(key)?.has('playing-media') === true
+            )
+            if (requiresRemount && !preserveMountedRuntime) {
                 const source = activeViewportSource
                 releaseRowRuntimeState(key, true)
                 unmountInstance(key)
@@ -800,6 +811,7 @@
                 })
                 mountInstances.set(key, instance)
                 renderSignatures.set(key, renderSignature)
+                if (parserProjectionState) parserProjectionState.needsRemount = false
             } else {
                 mountInstances.get(key)?.updateStreamingDisplay?.({
                     isOptimizedStreamingMessage: activeStreamingMessage,
@@ -957,9 +969,15 @@
             && areChatRenderSignaturesEqual(existing.renderSignature, renderSignature)
         ) return existing
 
-        releaseRowRuntimeState(key)
-        unmountInstance(key)
-        renderSignatures.delete(key)
+        const preserveMountedRuntime = existing?.source === source && (
+            existing.sourceToken !== sourceSnapshot.sourceToken
+            || existing.sourceVersion !== sourceSnapshot.version
+            || existing.row.key !== row.key
+            || existing.row.absoluteIndex !== row.absoluteIndex
+            || existing.row.sourceVersion !== row.sourceVersion
+            || existing.totalMessages !== totalMessages
+        )
+        releaseRowParserProjection(key)
         const controller = new AbortController()
         const state: RowParserProjectionState = {
             controller,
@@ -971,6 +989,8 @@
             totalMessages,
             renderSignature,
             projection: null,
+            needsRemount: mountInstances.has(key),
+            preserveMountedRuntime,
             failed: false,
             retryTimer: null,
         }

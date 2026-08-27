@@ -347,6 +347,26 @@ describe('live chat parser history projection', () => {
         expect(reads).toEqual([{ startIndex: 19, limit: 1 }])
     })
 
+    it('acquires complete history when the current CBS recursively expands to history', async () => {
+        const messages = makeMessages(20)
+        messages[19].data = '{{personality}}'
+        const complete = vi.fn(async () => makeCompleteLease(messages))
+        const { input } = makeInput(messages, 19, {
+            parserIndirections: {
+                personality: '{{history}}',
+            },
+            acquireCompleteProjection: complete,
+        })
+
+        const result = await createChatParserHistoryProjection(input)
+
+        expect(result).toMatchObject({
+            kind: 'complete',
+            reasons: ['full-history-cbs'],
+        })
+        expect(complete).toHaveBeenCalledOnce()
+    })
+
     it.each(['lua', 'plugin-v2', 'display-trigger', 'inject'] as const)(
         'acquires one validated complete projection for unsafe %s processing',
         async (dependency) => {

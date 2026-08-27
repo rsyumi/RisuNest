@@ -303,6 +303,7 @@ describe('conversation reroll mutations', () => {
         let history = createConversationRerollHistory(
             oldTarget,
             captureConversationRerollTail(oldTarget, 1),
+            4,
         )
         firstSession.reroll(firstSession.positionAt(1), [{ role: 'char', data: 'current' }])
         const currentTarget = captureConversationMutationTarget(
@@ -333,7 +334,7 @@ describe('conversation reroll mutations', () => {
             returnedSession,
         )
 
-        expect(isConversationRerollHistoryCurrent(history, returnedTarget)).toBe(true)
+        expect(isConversationRerollHistoryCurrent(history, returnedTarget, 4)).toBe(true)
         const rebound = refreshConversationRerollHistory(history, returnedTarget)
         const moved = moveConversationRerollHistory(
             rebound!,
@@ -349,6 +350,55 @@ describe('conversation reroll mutations', () => {
         expect(conversation.message.map((message) => message.data)).toEqual([
             'user',
             'current',
+        ])
+    })
+
+    it('invalidates history after leaving and returning to the same conversation', () => {
+        const conversationA = createConversation(messages('a-user', 'a-old'))
+        const conversationB = createConversation(messages('b-user', 'b-current'))
+        conversationB.id = 'conversation-b'
+        const character = createCharacter(conversationA)
+        character.chats.push(conversationB)
+        const firstSession = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: conversationA.id,
+            conversation: conversationA,
+            storeRevision: 1,
+        })
+        const oldTarget = captureConversationMutationTarget(
+            character,
+            conversationA,
+            firstSession,
+        )
+        const history = createConversationRerollHistory(
+            oldTarget,
+            captureConversationRerollTail(oldTarget, 1),
+            1,
+        )
+
+        character.chatPage = 1
+        firstSession.invalidate()
+        character.chatPage = 0
+        const returnedConversation = createConversation(
+            structuredClone(conversationA.message),
+        )
+        character.chats[0] = returnedConversation
+        const returnedSession = new ActiveConversationSession({
+            characterId: character.chaId,
+            conversationId: returnedConversation.id,
+            conversation: returnedConversation,
+            storeRevision: 1,
+        })
+        const returnedTarget = captureConversationMutationTarget(
+            character,
+            returnedConversation,
+            returnedSession,
+        )
+
+        expect(isConversationRerollHistoryCurrent(history, returnedTarget, 3)).toBe(false)
+        expect(returnedConversation.message.map((message) => message.data)).toEqual([
+            'a-user',
+            'a-old',
         ])
     })
 

@@ -21,6 +21,18 @@ describe('chat parser history classification', () => {
         })
     })
 
+    it('follows recursive CBS indirection before choosing a bounded projection', () => {
+        const result = classifyChatParserHistory({
+            source: '{{personality}}',
+            indirections: {
+                personality: '{{history}}',
+            },
+        })
+
+        expect(result.requiresFullHistory).toBe(true)
+        expect(result.reasons).toContain('full-history-cbs')
+    })
+
     it('extends a bounded projection for literal previous-chat-log indices', () => {
         const classification = classifyChatParserHistory({
             source: '{{previous-chat-log :: 10}} {{previous_chat_log::95}}',

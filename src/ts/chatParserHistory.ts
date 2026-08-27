@@ -19,6 +19,7 @@ export interface ChatParserHistoryClassification {
 export interface ChatParserHistoryClassificationInput {
     readonly source: unknown
     readonly unsafeDependencies?: readonly ChatParserUnsafeHistoryDependency[]
+    readonly indirections?: Readonly<Record<string, unknown>>
 }
 
 const FULL_HISTORY_CBS_NAMES = new Set([
@@ -46,9 +47,23 @@ export function classifyChatParserHistory(
     const reasons = new Set<ChatParserHistoryReason>(input.unsafeDependencies ?? [])
     const absoluteMessageIndices = new Set<number>()
     const texts = collectParserInputText(input.source)
+    const indirections = new Map(
+        Object.entries(input.indirections ?? {}).map(([name, value]) => [
+            normalizeCbsName(name),
+            value,
+        ]),
+    )
+    const followedIndirections = new Set<string>()
 
     for (const text of texts) {
-        classifyText(text, reasons, absoluteMessageIndices, true)
+        classifyText(
+            text,
+            reasons,
+            absoluteMessageIndices,
+            true,
+            indirections,
+            followedIndirections,
+        )
     }
 
     return {
@@ -81,6 +96,8 @@ function classifyText(
     reasons: Set<ChatParserHistoryReason>,
     absoluteMessageIndices: Set<number>,
     decodeStyles: boolean,
+    indirections: ReadonlyMap<string, unknown>,
+    followedIndirections: Set<string>,
 ): void {
     for (const expression of extractCbsExpressions(text)) {
         const parsed = parseCbsExpression(expression)
@@ -88,13 +105,28 @@ function classifyText(
             reasons.add('full-history-cbs')
             continue
         }
-        if (parsed.name !== PREVIOUS_CHAT_LOG_CBS_NAME) continue
-
-        if (!parsed.firstArgument || !/^\d+$/.test(parsed.firstArgument)) {
-            reasons.add('dynamic-previous-chat-log')
-            continue
+        if (parsed.name === PREVIOUS_CHAT_LOG_CBS_NAME) {
+            if (!parsed.firstArgument || !/^\d+$/.test(parsed.firstArgument)) {
+                reasons.add('dynamic-previous-chat-log')
+            } else {
+                absoluteMessageIndices.add(Number(parsed.firstArgument))
+            }
         }
-        absoluteMessageIndices.add(Number(parsed.firstArgument))
+        if (
+            !indirections.has(parsed.name) ||
+            followedIndirections.has(parsed.name)
+        ) continue
+        followedIndirections.add(parsed.name)
+        for (const indirectText of collectParserInputText(indirections.get(parsed.name))) {
+            classifyText(
+                indirectText,
+                reasons,
+                absoluteMessageIndices,
+                true,
+                indirections,
+                followedIndirections,
+            )
+        }
     }
 
     if (!decodeStyles || !text.toLocaleLowerCase().includes('<risu-style')) return
@@ -106,7 +138,14 @@ function classifyText(
         if (decoded === null) {
             reasons.add('ambiguous-risu-style')
         } else {
-            classifyText(decoded, reasons, absoluteMessageIndices, false)
+            classifyText(
+                decoded,
+                reasons,
+                absoluteMessageIndices,
+                false,
+                indirections,
+                followedIndirections,
+            )
         }
     }
     textWithoutMatchedStyles = textWithoutMatchedStyles.replace(stylePattern, '')
@@ -137,7 +176,7 @@ function parseCbsExpression(expression: string): Readonly<{
 }> {
     const colonIndex = expression.indexOf(':')
     const rawName = colonIndex === -1 ? expression : expression.slice(0, colonIndex)
-    const name = rawName.toLocaleLowerCase().replace(/[\s_-]/g, '')
+    const name = normalizeCbsName(rawName)
     if (colonIndex === -1) return { name, firstArgument: null }
 
     const doubleColon = expression[colonIndex + 1] === ':'
@@ -151,6 +190,10 @@ function parseCbsExpression(expression: string): Readonly<{
             : argumentText.slice(0, nextSeparator)
         ).trim(),
     }
+}
+
+function normalizeCbsName(name: string): string {
+    return name.toLocaleLowerCase().replace(/[\s_-]/g, '')
 }
 
 function decodeHexUtf8(value: string): string | null {

@@ -53,6 +53,7 @@ export interface ChatParserHistoryProjectionInput {
     currentAbsoluteIndex: number
     maxProjectionMessages: number
     parserSource: unknown
+    parserIndirections?: Readonly<Record<string, unknown>>
     unsafeDependencies?: readonly ChatParserUnsafeHistoryDependency[]
     contextSeed: ProcessScriptCaptureContext
     reader: ChatParserHistoryProjectionReader
@@ -122,6 +123,7 @@ export async function createChatParserHistoryProjection(
     const currentMessage = cloneProjectionData(readCurrentMessage)
     const classification = classifyChatParserHistory({
         source: [input.parserSource, currentMessage],
+        indirections: input.parserIndirections,
         unsafeDependencies: input.unsafeDependencies,
     })
     let initialStart = input.currentAbsoluteIndex

@@ -15,16 +15,16 @@
     import {defaultAutoSuggestPrompt} from "../../ts/storage/defaultPrompts.js";
     import {
         readConversationSuggestions,
-        writeConversationSuggestions,
     } from "../../ts/autoSuggestionMetadata";
 
     interface Props {
         send: () => any;
         messageInput: (string:string) => any;
         readLatestMessages: (signal?: AbortSignal) => Promise<Message[]>;
+        writeSuggestions: (suggestions: readonly string[]) => Promise<boolean>;
     }
 
-    let { send, messageInput, readLatestMessages }: Props = $props();
+    let { send, messageInput, readLatestMessages, writeSuggestions }: Props = $props();
     let suggestMessages:string[] = $state(
         readConversationSuggestions(DBState.db.characters[$selectedCharID]),
     )
@@ -111,15 +111,11 @@
                 currentChar : currentChar as character
             }, 'submodel', requestController?.signal ?? null)
             const stillCurrentRequest = suggestionRequestId === requestId && $selectedCharID === requestCharId && DBState.db.characters[requestCharId]?.chatPage === requestChatPage
-            const currentTargetChat = DBState.db.characters[requestCharId]?.chats[requestChatPage]
-            if(rq2.type !== 'fail' && rq2.type !== 'streaming' && rq2.type !== 'multiline' && progress && stillCurrentRequest && currentTargetChat){
+            if(rq2.type !== 'fail' && rq2.type !== 'streaming' && rq2.type !== 'multiline' && progress && stillCurrentRequest){
                 var suggestMessagesNew = rq2.result.split('\n').filter(msg => msg.startsWith('-')).map(msg => msg.replace('-','').trim())
-                writeConversationSuggestions(
-                    DBState.db.characters[requestCharId],
-                    requestChatPage,
-                    suggestMessagesNew,
-                )
-                suggestMessages = suggestMessagesNew
+                if (await writeSuggestions(suggestMessagesNew)) {
+                    suggestMessages = suggestMessagesNew
+                }
             }
         } catch(error) {
             if(!requestController?.signal.aborted && suggestionRequestId === requestId){

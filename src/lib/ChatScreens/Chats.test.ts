@@ -589,6 +589,67 @@ describe('Chats imperative mount lifecycle', () => {
         expect(session.pinCount('streaming')).toBe(0)
     })
 
+    test('preserves focused editors and playing media while source parser projections refresh', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        const resolver: LiveChatParserProjectionResolver = {
+            resolve: vi.fn(async ({ row }) => boundedProjection(
+                currentCharacter,
+                row.absoluteIndex,
+            )),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+                parserProjectionResolver: resolver,
+            },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+        const editorRow = probeElements(target).find(
+            (element) => element.dataset.message === 'message-0',
+        )!
+        const mediaRow = probeElements(target).find(
+            (element) => element.dataset.message === 'message-1',
+        )!
+        const editorInstance = Number(editorRow.dataset.chatProbe)
+        const mediaInstance = Number(mediaRow.dataset.chatProbe)
+        const editor = document.createElement('textarea')
+        editor.value = 'unsaved editor draft'
+        editorRow.append(editor)
+        editor.focus()
+        editor.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+        const media = document.createElement('audio')
+        mediaRow.append(media)
+        media.dispatchEvent(new Event('play'))
+        expect(session.pinCount('editor')).toBe(1)
+        expect(session.pinCount('playing-media')).toBe(1)
+
+        session.append(makeMessage(8))
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(9))
+        expect(probeIdForMessage(target, 'message-0')).toBe(editorInstance)
+        expect(probeIdForMessage(target, 'message-1')).toBe(mediaInstance)
+        expect(editor.isConnected).toBe(true)
+        expect(editor.value).toBe('unsaved editor draft')
+        expect(media.isConnected).toBe(true)
+        expect(session.pinCount('editor')).toBe(1)
+        expect(session.pinCount('playing-media')).toBe(1)
+
+        editor.blur()
+        media.dispatchEvent(new Event('pause'))
+        await vi.waitFor(() => expect(session.pinCount('editor')).toBe(0))
+        expect(session.pinCount('playing-media')).toBe(0)
+        await vi.waitFor(() => {
+            expect(probeIdForMessage(target, 'message-0')).not.toBe(editorInstance)
+            expect(probeIdForMessage(target, 'message-1')).not.toBe(mediaInstance)
+        })
+    })
+
     test('renders source rows and conversation count without reading a metadata-only shell body', async () => {
         const messages = [makeMessage(0), makeMessage(1), makeMessage(2)]
         const source = makePersistentViewportSource(messages)

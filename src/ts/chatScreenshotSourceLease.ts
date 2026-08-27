@@ -81,6 +81,20 @@ function requireOpeningTarget(
     return target
 }
 
+function requireOpeningIdentity(
+    input: OpenChatScreenshotSourceInput,
+    dependencies: ChatScreenshotSourceDependencies,
+    captured: SelectedConversationTarget,
+): SelectedConversationTarget {
+    const target = requireOpeningTarget(input, dependencies)
+    if (
+        target.characterId !== captured.characterId
+        || target.conversationId !== captured.conversationId
+        || target.navigationGeneration !== captured.navigationGeneration
+    ) throw new PersistentConversationReadStaleError()
+    return target
+}
+
 function requireWindowedAuthority(
     dependencies: ChatScreenshotSourceDependencies,
     target: SelectedConversationTarget,
@@ -146,12 +160,14 @@ export async function openChatScreenshotSourceLease(
     }
     await dependencies.flushPendingData('screenshot-dialog-open')
     assertNotAborted(signal)
+    let committedTarget: SelectedConversationTarget
+    let committedAuthority: WindowedConversationPersistenceAuthority | null = null
     try {
-        requireOpeningTarget(input, dependencies, openingTarget)
+        committedTarget = requireOpeningIdentity(input, dependencies, openingTarget)
         if (session) {
             assertOpeningSession(input, dependencies, session, sessionVersion, navigationGeneration)
         } else {
-            requireWindowedAuthority(dependencies, openingTarget)
+            committedAuthority = requireWindowedAuthority(dependencies, committedTarget)
         }
     } catch {
         throw new Error('Screenshot conversation changed while opening')
@@ -167,12 +183,12 @@ export async function openChatScreenshotSourceLease(
             navigationGeneration,
             signal,
         )
-        : await dependencies.store.acquireRevision(openingTarget.storeRevision)
+        : await dependencies.store.acquireRevision(committedTarget.storeRevision)
     let keepLease = false
     try {
         assertNotAborted(signal)
         try {
-            requireOpeningTarget(input, dependencies, openingTarget)
+            requireOpeningTarget(input, dependencies, committedTarget)
             if (session) {
                 assertOpeningSession(
                     input,
@@ -182,8 +198,8 @@ export async function openChatScreenshotSourceLease(
                     navigationGeneration,
                 )
             } else {
-                requireWindowedAuthority(dependencies, openingTarget)
-                if (lease.revision !== openingTarget.storeRevision) {
+                requireWindowedAuthority(dependencies, committedTarget)
+                if (lease.revision !== committedTarget.storeRevision) {
                     throw new PersistentConversationReadStaleError()
                 }
             }
@@ -197,7 +213,7 @@ export async function openChatScreenshotSourceLease(
         )
         assertNotAborted(signal)
         try {
-            requireOpeningTarget(input, dependencies, openingTarget)
+            requireOpeningTarget(input, dependencies, committedTarget)
             if (session) {
                 assertOpeningSession(
                     input,
@@ -207,14 +223,14 @@ export async function openChatScreenshotSourceLease(
                     navigationGeneration,
                 )
             } else {
-                requireWindowedAuthority(dependencies, openingTarget)
+                requireWindowedAuthority(dependencies, committedTarget)
             }
         } catch {
             throw new Error('Screenshot conversation changed while opening')
         }
         if (
             (session && session.persistedVersion !== sessionVersion)
-            || (session ? session.totalMessages : openingAuthority!.totalMessages) !==
+            || (session ? session.totalMessages : committedAuthority!.totalMessages) !==
                 evidence.totalMessages
         ) {
             throw new Error('Screenshot conversation changed while opening')

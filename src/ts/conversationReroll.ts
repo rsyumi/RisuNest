@@ -30,6 +30,7 @@ export interface ConversationRerollTransition {
 export interface ConversationRerollHistory {
     characterId: string
     conversationId: string
+    navigationGeneration: number
     totalMessages: number
     evidenceStartIndex: number
     evidence: readonly Message[]
@@ -100,11 +101,13 @@ export function applyConversationRerollTail(
 export function createConversationRerollHistory(
     target: ConversationMutationTarget,
     tail: readonly Message[],
+    navigationGeneration = 0,
 ): ConversationRerollHistory {
     return bindConversationRerollHistory(
         [safeStructuredClone([...tail])],
         0,
         target,
+        navigationGeneration,
     )
 }
 
@@ -125,7 +128,12 @@ export function appendConversationRerollHistory(
         throw new ConversationRerollHistoryStaleError()
     }
     const entries = [...history.entries, safeStructuredClone([...tail])]
-    return bindConversationRerollHistory(entries, entries.length - 1, target)
+    return bindConversationRerollHistory(
+        entries,
+        entries.length - 1,
+        target,
+        history.navigationGeneration,
+    )
 }
 
 export function refreshConversationRerollHistory(
@@ -141,14 +149,23 @@ export function refreshConversationRerollHistory(
             previousTarget === target,
         )
     ) return null
-    return bindConversationRerollHistory(history.entries, history.index, target)
+    return bindConversationRerollHistory(
+        history.entries,
+        history.index,
+        target,
+        history.navigationGeneration,
+    )
 }
 
 export function isConversationRerollHistoryCurrent(
     history: ConversationRerollHistory,
     target: ConversationMutationTarget,
+    navigationGeneration = history.navigationGeneration,
 ): boolean {
-    if (!isConversationRerollHistoryOwner(history, target)) return false
+    if (
+        history.navigationGeneration !== navigationGeneration
+        || !isConversationRerollHistoryOwner(history, target)
+    ) return false
     try {
         assertConversationMutationTargetCurrent(target)
     } catch {
@@ -178,7 +195,12 @@ export function moveConversationRerollHistory(
             target.conversation,
             target.session,
         )
-        return bindConversationRerollHistory(history.entries, nextIndex, refreshedTarget)
+        return bindConversationRerollHistory(
+            history.entries,
+            nextIndex,
+            refreshedTarget,
+            history.navigationGeneration,
+        )
     } catch (error) {
         if (isStaleRerollError(error)) return null
         throw error
@@ -255,6 +277,7 @@ function bindConversationRerollHistory(
     entries: readonly Message[][],
     index: number,
     target: ConversationMutationTarget,
+    navigationGeneration: number,
 ): ConversationRerollHistory {
     assertConversationMutationTargetCurrent(target)
     const evidenceLength = Math.max(1, ...entries.map((entry) => entry.length))
@@ -262,6 +285,7 @@ function bindConversationRerollHistory(
     return {
         characterId: target.character.chaId,
         conversationId: target.conversation.id,
+        navigationGeneration,
         totalMessages: target.messageCount,
         evidenceStartIndex: evidence.startIndex,
         evidence: evidence.messages,

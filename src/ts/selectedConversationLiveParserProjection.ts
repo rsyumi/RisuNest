@@ -83,6 +83,7 @@ export interface SelectedConversationLiveParserProjectionDependencies {
     createBoundedContextSeed(current: CurrentChatMessageTarget): ProcessScriptCaptureContext
     createCompleteContext(current: CurrentChatMessageTarget): ProcessScriptCaptureContext
     parserSource(current: CurrentChatMessageTarget): unknown
+    parserIndirections?(current: CurrentChatMessageTarget): Readonly<Record<string, unknown>>
     unsafeDependencies(
         current: CurrentChatMessageTarget,
     ): readonly ChatParserUnsafeHistoryDependency[]
@@ -137,6 +138,7 @@ export function createSelectedConversationLiveParserProjectionResolver(
                 currentAbsoluteIndex: input.row.absoluteIndex,
                 maxProjectionMessages: dependencies.maxProjectionMessages,
                 parserSource: dependencies.parserSource(current),
+                parserIndirections: dependencies.parserIndirections?.(current),
                 unsafeDependencies: dependencies.unsafeDependencies(current),
                 contextSeed: dependencies.createBoundedContextSeed(current),
                 reader: {

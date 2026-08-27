@@ -99,6 +99,7 @@
         requireCurrent(): ConversationOperationAuthority
     }
     import { readSelectedConversationLatestTail } from '../../ts/selectedConversationTail';
+    import { writeConversationSuggestions } from '../../ts/autoSuggestionMetadata';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -249,7 +250,11 @@
         target: ConversationMutationTarget,
     ): ConversationRerollHistory | null {
         if (!rerollHistory) return null
-        if (!isConversationRerollHistoryCurrent(rerollHistory, target)) {
+        if (!isConversationRerollHistoryCurrent(
+            rerollHistory,
+            target,
+            persistentRuntime.getNavigationGeneration(),
+        )) {
             rerollHistory = null
             return null
         }
@@ -478,7 +483,11 @@
             const tail = messages.length > 0
                 ? captureConversationRerollTail(mutationTarget, messages.length - 1)
                 : [undefined as Message]
-            history = createConversationRerollHistory(mutationTarget, tail)
+            history = createConversationRerollHistory(
+                mutationTarget,
+                tail,
+                persistentRuntime.getNavigationGeneration(),
+            )
             rerollHistory = history
         }
         if (!truncateConversationForReroll(mutationTarget)) return
@@ -530,6 +539,25 @@
         if (result.type === 'history') rerollHistory = result.history
     }
 
+    async function writeSelectedConversationSuggestions(
+        suggestions: readonly string[],
+    ): Promise<boolean> {
+        const result = await runSelectedConversationOperation(
+            'write-auto-suggestions',
+            (context) => {
+                const authority = context.requireCurrent()
+                writeConversationSuggestions(
+                    authority.conversation,
+                    authority.session,
+                    suggestions,
+                )
+                context.requireCurrent()
+                return true
+            },
+        )
+        return result === true
+    }
+
     let abortController:null|AbortController = null
 
     async function sendChatMain(continued:boolean = false) {
@@ -568,7 +596,11 @@
                     : null
                 rerollHistory = refreshedHistory
                     ? appendConversationRerollHistory(refreshedHistory, refreshedTarget, tail)
-                    : createConversationRerollHistory(refreshedTarget, tail)
+                    : createConversationRerollHistory(
+                        refreshedTarget,
+                        tail,
+                        persistentRuntime.getNavigationGeneration(),
+                    )
             } else if (refreshedTarget) {
                 refreshRerollHistoryAfterOwnedMutation(mutationTarget, refreshedTarget)
             }
@@ -947,6 +979,39 @@
         )
     }
 
+    function liveParserIndirections(
+        current: CurrentChatMessageTarget,
+    ): Readonly<Record<string, unknown>> {
+        const character = current.character.type === 'group' ? null : current.character
+        let authorNote = current.conversation.note ?? ''
+        if (!authorNote) {
+            for (const item of DBState.db.promptTemplate ?? []) {
+                if (item.type !== 'authornote' || !item.defaultText) continue
+                authorNote = item.defaultText
+                break
+            }
+        }
+        return {
+            personality: character?.personality ?? '',
+            charpersona: character?.personality ?? '',
+            description: character?.desc ?? '',
+            chardesc: character?.desc ?? '',
+            scenario: character?.scenario ?? '',
+            exampledialogue: character?.exampleMessage ?? '',
+            examplemessage: character?.exampleMessage ?? '',
+            persona: getPersonaPrompt(),
+            userpersona: getPersonaPrompt(),
+            mainprompt: DBState.db.mainPrompt ?? '',
+            systemprompt: DBState.db.mainPrompt ?? '',
+            jb: DBState.db.jailbreak ?? '',
+            jailbreak: DBState.db.jailbreak ?? '',
+            globalnote: DBState.db.globalNote ?? '',
+            systemnote: DBState.db.globalNote ?? '',
+            ujb: DBState.db.globalNote ?? '',
+            authornote: authorNote,
+        }
+    }
+
     const liveParserProjectionResolver = createSelectedConversationLiveParserProjectionResolver({
         runtime: persistentRuntime,
         maxProjectionMessages: 256,
@@ -959,6 +1024,7 @@
             characterRegex: current.character.customscript ?? [],
             moduleRegex: getModuleRegexScripts(),
         }),
+        parserIndirections: liveParserIndirections,
         unsafeDependencies: (current) => {
             const moduleTriggers = getModuleTriggers()
             const triggers = current.character.type === 'group'
@@ -1343,7 +1409,7 @@
                     : msg
                 )} {send} readLatestMessages={(signal) =>
                     readSelectedConversationLatestTail(persistentRuntime, 10, signal)
-                }/>
+                } writeSuggestions={writeSelectedConversationSuggestions}/>
             {/if}
 
             {#if chatPanelStore.length > 0}
