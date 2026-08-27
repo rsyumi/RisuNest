@@ -7,6 +7,9 @@ use super::{
     NativeJobError, OpenedJobSource, PreparedContent, PreparedContentAsset, PreparedContentFormat,
     PreparedContentModule,
 };
+use crate::asset_repository::job_pins::{
+    CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob,
+};
 use crate::asset_repository::{PayloadCas, PreparedPayload};
 use crate::import_export_jobs::{
     classify_content, parse_json_card, parse_risum, ContentKind, FormatError, FormatErrorKind,
@@ -17,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_MODULE_OVERLAY_ITEMS: usize = 256;
@@ -181,54 +185,82 @@ pub(super) fn prepare_content(
         job.is_cancel_requested()
     })
     .map_err(native_format_error)?;
+    let supported = matches!(
+        kind,
+        ContentKind::JsonCard | ContentKind::CharxCard | ContentKind::AppendedCharxJpeg
+    );
+    if !supported {
+        return match kind {
+            ContentKind::JpegAsset => Err(NativeJobError::new(
+                "unsupported-without-destination",
+                "ordinary JPEG import requires an asset destination",
+            )),
+            ContentKind::RisuModule | ContentKind::Unknown => Err(NativeJobError::new(
+                "invalid-input",
+                "content preparation accepts Character Card v3 JSON and CharX cards only",
+            )),
+            _ => unreachable!("supported content kinds were handled above"),
+        };
+    }
+    let mut cas_session = begin_content_cas_session(repository_root, job)?;
+    let cas = match open_payload_cas(repository_root) {
+        Ok(cas) => cas,
+        Err(error) => return Err(abort_failed_content_session(cas_session, error)),
+    };
     let prepared = match kind {
         ContentKind::JsonCard => prepare_json_content(
             &mut source,
             owned_directory,
-            repository_root,
             &content_import_limits(),
+            &cas,
+            &mut cas_session,
             job,
-        )?,
+        ),
         ContentKind::CharxCard | ContentKind::AppendedCharxJpeg => {
             let spool_path = owned_directory.join("source.charx");
-            spool_charx_source(&mut source, &spool_path, &|| job.is_cancel_requested())?;
-            prepare_charx_content(
-                &spool_path,
-                display_name,
-                owned_directory,
-                repository_root,
-                job,
-            )?
+            spool_charx_source(&mut source, &spool_path, &|| job.is_cancel_requested()).and_then(
+                |()| {
+                    prepare_charx_content(
+                        &spool_path,
+                        display_name,
+                        owned_directory,
+                        &cas,
+                        &mut cas_session,
+                        job,
+                    )
+                },
+            )
         }
-        ContentKind::JpegAsset => {
-            return Err(NativeJobError::new(
-                "unsupported-without-destination",
-                "ordinary JPEG import requires an asset destination",
-            ));
-        }
-        ContentKind::RisuModule | ContentKind::Unknown => {
-            return Err(NativeJobError::new(
-                "invalid-input",
-                "content preparation accepts Character Card v3 JSON and CharX cards only",
-            ));
-        }
+        _ => unreachable!("unsupported content kinds returned before opening a CAS session"),
+    };
+    let mut prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => return Err(abort_failed_content_session(cas_session, error)),
     };
     let item_count = prepared.assets.len() as u64;
-    job.set_progress(JobProgress {
+    if let Err(error) = job.set_progress(JobProgress {
         completed_bytes: source.total_bytes,
         total_bytes: Some(source.total_bytes),
         completed_items: item_count,
         total_items: Some(item_count),
-    })
-    .map_err(|error| NativeJobError::new("store-error", error))?;
+    }) {
+        let error = if job.is_cancel_requested() {
+            content_cancelled()
+        } else {
+            NativeJobError::new("store-error", error)
+        };
+        return Err(abort_failed_content_session(cas_session, error));
+    }
+    prepared.cas_session_id = job.id();
     Ok(prepared)
 }
 
 fn prepare_json_content(
     source: &mut OpenedJobSource,
     owned_directory: &Path,
-    repository_root: &Path,
     limits: &ImportLimits,
+    cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<PreparedContent, NativeJobError> {
     source
@@ -241,12 +273,12 @@ fn prepare_json_content(
     })
     .map_err(native_format_error)?;
     let ParsedJsonCard { metadata, payloads } = parsed;
-    let cas = open_payload_cas(repository_root)?;
-    let assets = promote_json_assets(&metadata, payloads, owned_directory, &cas, job)?;
+    let assets = promote_json_assets(&metadata, payloads, owned_directory, cas, cas_session, job)?;
     Ok(PreparedContent {
         format: PreparedContentFormat::JsonCard,
         metadata,
         assets,
+        cas_session_id: String::new(),
         portrait_logical_id: None,
         module: None,
     })
@@ -256,7 +288,8 @@ fn prepare_charx_content(
     spool_path: &Path,
     display_name: &str,
     owned_directory: &Path,
-    repository_root: &Path,
+    cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<PreparedContent, NativeJobError> {
     let inspection = inspect_charx_file(
@@ -299,19 +332,20 @@ fn prepare_charx_content(
     )
     .map_err(native_format_error)?;
     let ParsedJsonCard { metadata, payloads } = parsed;
-    let cas = open_payload_cas(repository_root)?;
-    let mut assets = promote_archive_asset_occurrences(&descriptor, &cas, job)?;
+    let mut assets = promote_archive_asset_occurrences(&descriptor, cas, cas_session, job)?;
     assets.extend(promote_json_assets(
         &metadata,
         payloads,
         owned_directory,
-        &cas,
+        cas,
+        cas_session,
         job,
     )?);
     let portrait_logical_id = match descriptor.container_kind {
         CharXContainerKind::CharX => None,
         CharXContainerKind::AppendedCharXJpeg => {
-            let portrait = promote_jpeg_prefix(spool_path, descriptor.archive_offset, &cas, job)?;
+            let portrait =
+                promote_jpeg_prefix(spool_path, descriptor.archive_offset, cas, cas_session, job)?;
             let logical_id = portrait.logical_id.clone();
             assets.push(portrait);
             Some(logical_id)
@@ -325,6 +359,7 @@ fn prepare_charx_content(
         format,
         metadata,
         assets,
+        cas_session_id: String::new(),
         portrait_logical_id,
         module,
     })
@@ -333,6 +368,7 @@ fn prepare_charx_content(
 fn promote_archive_asset_occurrences(
     descriptor: &ParsedCharXDescriptor,
     cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<Vec<PreparedContentAsset>, NativeJobError> {
     let payloads = descriptor
@@ -357,7 +393,7 @@ fn promote_archive_asset_occurrences(
         let promoted_payload = match promoted.get(&reference.normalized_name) {
             Some(promoted_payload) => promoted_payload.clone(),
             None => {
-                let promoted_payload = promote_staged_payload(cas, payload, job)?;
+                let promoted_payload = promote_staged_payload(cas, cas_session, payload, job)?;
                 promoted.insert(reference.normalized_name.clone(), promoted_payload.clone());
                 promoted_payload
             }
@@ -412,6 +448,7 @@ fn promote_json_assets(
     payloads: Vec<JsonCardPayload>,
     staging_root: &Path,
     cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<Vec<PreparedContentAsset>, NativeJobError> {
     let mut assets = Vec::with_capacity(payloads.len());
@@ -441,7 +478,7 @@ fn promote_json_assets(
             staged_path,
             card_asset_types: Vec::new(),
         };
-        let promoted = promote_staged_payload(cas, &staged, job)?;
+        let promoted = promote_staged_payload(cas, cas_session, &staged, job)?;
         let name_pointer = json_pointer
             .strip_suffix("/uri")
             .map(|pointer| format!("{pointer}/name"));
@@ -468,6 +505,7 @@ fn promote_json_assets(
 
 fn promote_staged_payload(
     cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
     payload: &StagedPayloadDescriptor,
     job: &JobControl,
 ) -> Result<PromotedPayload, NativeJobError> {
@@ -475,7 +513,7 @@ fn promote_staged_payload(
         return Err(content_cancelled());
     }
     let staged = open_regular_file_no_follow(&payload.staged_path)?.file;
-    let promoted = prepare_cancellable_payload(cas, staged, job)?;
+    let promoted = prepare_cancellable_payload(cas, cas_session, staged, job)?;
     if promoted.content_hash != payload.sha256 || promoted.byte_size != payload.decoded_size {
         return Err(NativeJobError::new(
             "store-error",
@@ -547,6 +585,7 @@ fn promote_jpeg_prefix(
     spool_path: &Path,
     archive_offset: u64,
     cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
     job: &JobControl,
 ) -> Result<PreparedContentAsset, NativeJobError> {
     if archive_offset == 0 {
@@ -559,7 +598,8 @@ fn promote_jpeg_prefix(
         return Err(content_cancelled());
     }
     let source = open_regular_file_no_follow(spool_path)?;
-    let promoted = prepare_cancellable_payload(cas, source.file.take(archive_offset), job)?;
+    let promoted =
+        prepare_cancellable_payload(cas, cas_session, source.file.take(archive_offset), job)?;
     if promoted.byte_size != archive_offset {
         return Err(NativeJobError::new(
             "invalid-source",
@@ -590,17 +630,56 @@ fn open_payload_cas(repository_root: &Path) -> Result<PayloadCas, NativeJobError
 
 fn prepare_cancellable_payload<R: Read>(
     cas: &PayloadCas,
+    cas_session: &mut DurableCasJob,
     reader: R,
     job: &JobControl,
 ) -> Result<PreparedPayload, NativeJobError> {
     let mut reader = CancellableReader { inner: reader, job };
-    cas.prepare_reader(&mut reader).map_err(|error| {
-        if job.is_cancel_requested() {
-            content_cancelled()
-        } else {
-            NativeJobError::new("store-error", error.to_string())
-        }
-    })
+    cas_session
+        .prepare_reader(cas, &mut reader, CasObjectRole::DirectObject)
+        .map_err(|error| {
+            if job.is_cancel_requested() {
+                content_cancelled()
+            } else {
+                NativeJobError::new("store-error", error.to_string())
+            }
+        })
+}
+
+fn begin_content_cas_session(
+    repository_root: &Path,
+    job: &JobControl,
+) -> Result<DurableCasJob, NativeJobError> {
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| NativeJobError::new("store-error", error.to_string()))?
+        .as_millis();
+    let created_at_ms = i64::try_from(created_at_ms).map_err(|_| {
+        NativeJobError::new(
+            "store-error",
+            "system time exceeds the supported millisecond range",
+        )
+    })?;
+    DurableCasJob::begin(
+        repository_root,
+        &job.id(),
+        CasJobKind::CardOrModuleContentImport,
+        created_at_ms,
+    )
+    .map_err(|error| NativeJobError::new("store-error", error.to_string()))
+}
+
+fn abort_failed_content_session(
+    mut cas_session: DurableCasJob,
+    error: NativeJobError,
+) -> NativeJobError {
+    match cas_session.release(CasReleaseOutcome::Aborted) {
+        Ok(()) => error,
+        Err(abort_error) => NativeJobError::new(
+            "cleanup-failed",
+            format!("{}; CAS session abort failed: {abort_error}", error.message),
+        ),
+    }
 }
 
 fn content_import_limits() -> ImportLimits {

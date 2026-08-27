@@ -177,6 +177,7 @@ pub(crate) struct PreparedContent {
     pub(crate) format: PreparedContentFormat,
     pub(crate) metadata: Value,
     pub(crate) assets: Vec<PreparedContentAsset>,
+    pub(crate) cas_session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) portrait_logical_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1077,7 +1078,7 @@ impl NativeFileJobState {
             let cleanup =
                 cleanup_one_owned_directory(&root.join("jobs"), &owned_directory, &job.id());
             drop(worker_permit);
-            let _ = job.finish_content_job(outcome, cleanup);
+            let _ = job.finish_content_job_with_cas(outcome, cleanup, &repository_root);
             let _ = registry.prune();
         });
         Ok(NativeFileJobStarted {
@@ -1362,6 +1363,46 @@ fn is_bounded_content_display_name(name: &str) -> bool {
 
 fn content_cancelled() -> NativeJobError {
     NativeJobError::new("cancelled", "content preparation was cancelled")
+}
+
+fn finish_content_cas_session(
+    repository_root: &Path,
+    expected_job_id: &str,
+    cancel_requested: bool,
+    outcome: &Result<PreparedContent, NativeJobError>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    let Ok(prepared) = outcome else {
+        return cleanup;
+    };
+    if cleanup.is_ok() && !cancel_requested {
+        return cleanup;
+    }
+    if prepared.cas_session_id != expected_job_id {
+        return combine_cleanup_errors(
+            cleanup,
+            "prepared content CAS session does not match its native job".to_owned(),
+        );
+    }
+    let abort = crate::asset_repository::job_pins::DurableCasJob::open(
+        repository_root,
+        &prepared.cas_session_id,
+    )
+    .and_then(|mut session| {
+        session.release(crate::asset_repository::job_pins::CasReleaseOutcome::Aborted)
+    })
+    .map_err(|error| format!("content CAS session abort failed: {error}"));
+    match abort {
+        Ok(()) => cleanup,
+        Err(abort) => combine_cleanup_errors(cleanup, abort),
+    }
+}
+
+fn combine_cleanup_errors(cleanup: Result<(), String>, additional: String) -> Result<(), String> {
+    match cleanup {
+        Ok(()) => Err(additional),
+        Err(cleanup) => Err(format!("{cleanup}; {additional}")),
+    }
 }
 
 enum RestoreJobSink {
@@ -2172,6 +2213,24 @@ impl JobControl {
         outcome: Result<PreparedContent, NativeJobError>,
         cleanup: Result<(), String>,
     ) -> Result<(), String> {
+        self.finish_content_job_inner(outcome, cleanup, None)
+    }
+
+    fn finish_content_job_with_cas(
+        &self,
+        outcome: Result<PreparedContent, NativeJobError>,
+        cleanup: Result<(), String>,
+        repository_root: &Path,
+    ) -> Result<(), String> {
+        self.finish_content_job_inner(outcome, cleanup, Some(repository_root))
+    }
+
+    fn finish_content_job_inner(
+        &self,
+        outcome: Result<PreparedContent, NativeJobError>,
+        cleanup: Result<(), String>,
+        repository_root: Option<&Path>,
+    ) -> Result<(), String> {
         let mut status = self
             .status
             .lock()
@@ -2179,6 +2238,16 @@ impl JobControl {
         if status.kind != JobKind::PrepareContentImport || status.state.is_terminal() {
             return Err("native content job cannot finish from its current state".to_owned());
         }
+        let cleanup = match repository_root {
+            Some(repository_root) => finish_content_cas_session(
+                repository_root,
+                &status.job_id,
+                self.is_cancel_requested(),
+                &outcome,
+                cleanup,
+            ),
+            None => cleanup,
+        };
         let (state, failure, prepared_content) = match (outcome, cleanup) {
             (Err(error), Err(cleanup)) => (
                 JobState::Failed,
@@ -3006,6 +3075,15 @@ mod tests {
             .as_ref()
             .expect("prepared content metadata");
         assert_eq!(content.format, PreparedContentFormat::JsonCard);
+        assert_eq!(content.cas_session_id, started.job_id);
+        assert_eq!(content.cas_session_id.len(), 36);
+        assert_eq!(
+            serde_json::to_value(content)
+                .unwrap()
+                .pointer("/casSessionId")
+                .and_then(Value::as_str),
+            Some(started.job_id.as_str())
+        );
         assert_eq!(content.assets.len(), 1);
         assert_eq!(content.assets[0].byte_size, 4);
         assert_eq!(content.assets[0].reference_key, "native-data-0");
@@ -3043,6 +3121,18 @@ mod tests {
             cas.read_object(&content.assets[0].object_hash).unwrap(),
             Some(vec![1, 2, 3, 4])
         );
+        let session = crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .expect("prepared content keeps its durable CAS session for TypeScript activation");
+        assert_eq!(
+            session.kind(),
+            crate::asset_repository::job_pins::CasJobKind::CardOrModuleContentImport
+        );
+        assert_eq!(session.pin_count(), 1);
+        assert!(!session.is_sealed());
+        assert!(!session.is_released());
 
         assert_eq!(
             state.cancel(&started.job_id).unwrap(),
@@ -3067,6 +3157,7 @@ mod tests {
             .prepared_content
             .as_ref()
             .expect("prepared CharX content");
+        assert_eq!(content.cas_session_id, started.job_id);
         let serialized = serde_json::to_value(content).unwrap();
         assert_eq!(
             serialized.pointer("/format").and_then(Value::as_str),
@@ -3173,6 +3264,14 @@ mod tests {
         use sha2::{Digest as _, Sha256};
         let unused_hash = hex::encode(Sha256::digest(b"unreferenced payload"));
         assert_eq!(cas.stat_object(&unused_hash).unwrap(), None);
+        let session = crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .expect("prepared CharX keeps its durable CAS session");
+        assert_eq!(session.pin_count(), 3);
+        assert!(!session.is_sealed());
+        assert!(!session.is_released());
         assert!(!directory
             .path()
             .join("native-file-jobs/jobs")
@@ -3196,6 +3295,7 @@ mod tests {
             .prepared_content
             .as_ref()
             .expect("prepared appended CharX JPEG content");
+        assert_eq!(content.cas_session_id, started.job_id);
         let serialized = serde_json::to_value(content).unwrap();
         assert_eq!(
             serialized.pointer("/format").and_then(Value::as_str),
@@ -3223,6 +3323,14 @@ mod tests {
             cas.read_object(&portrait.object_hash).unwrap(),
             Some(prefix.to_vec())
         );
+        let session = crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .expect("appended CharX keeps its durable CAS session");
+        assert_eq!(session.pin_count(), 4);
+        assert!(!session.is_sealed());
+        assert!(!session.is_released());
     }
 
     #[test]
@@ -3242,6 +3350,133 @@ mod tests {
         );
         assert!(prepared.prepared_content.is_none());
         assert!(!directory.path().join("assets-v2").exists());
+    }
+
+    #[test]
+    fn content_parse_failure_aborts_and_releases_its_durable_cas_session() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("invalid-card.json");
+        fs::write(
+            &source,
+            br#"{"spec":"chara_card_v3","data":{"name":"Invalid","assets":[{"type":"icon","uri":"data:image/png;base64,%%%","name":"broken","ext":"png"}]}}"#,
+        )
+        .unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "invalid-card.json");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Failed);
+        assert!(prepared.prepared_content.is_none());
+        assert!(directory.path().join("assets-v2/job-pins").is_dir());
+        assert!(crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn content_promotion_failure_aborts_and_releases_its_durable_cas_session() {
+        let directory = TempDir::new().unwrap();
+        let object_hash = "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a";
+        fs::create_dir_all(
+            directory
+                .path()
+                .join("assets-v2/objects")
+                .join(&object_hash[..2])
+                .join(&object_hash[2..]),
+        )
+        .unwrap();
+        let source = directory.path().join("card.json");
+        fs::write(
+            &source,
+            br#"{"spec":"chara_card_v3","data":{"name":"Promotion failure","assets":[{"type":"icon","uri":"data:image/png;base64,AQIDBA==","name":"main","ext":"png"}]}}"#,
+        )
+        .unwrap();
+        let state = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let started = start_test_content_job(&state, &source, "card.json");
+
+        let prepared = wait_for_content_job(&state, &started.job_id);
+
+        assert_eq!(prepared.state, JobState::Failed);
+        assert!(prepared.prepared_content.is_none());
+        assert!(crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .is_err());
+    }
+
+    fn prepared_content_with_durable_session(
+        repository_root: &Path,
+        job: &JobControl,
+    ) -> PreparedContent {
+        use crate::asset_repository::job_pins::{CasJobKind, CasObjectRole, DurableCasJob};
+        let cas = crate::asset_repository::PayloadCas::new(repository_root).unwrap();
+        let mut session = DurableCasJob::begin(
+            repository_root,
+            &job.id(),
+            CasJobKind::CardOrModuleContentImport,
+            1,
+        )
+        .unwrap();
+        session
+            .prepare_bytes(&cas, b"prepared", CasObjectRole::DirectObject)
+            .unwrap();
+        PreparedContent {
+            format: PreparedContentFormat::JsonCard,
+            metadata: serde_json::json!({"spec":"chara_card_v3","data":{"name":"Prepared"}}),
+            assets: Vec::new(),
+            cas_session_id: job.id(),
+            portrait_logical_id: None,
+            module: None,
+        }
+    }
+
+    #[test]
+    fn accepted_cancel_after_content_prepare_aborts_its_durable_cas_session() {
+        let directory = TempDir::new().unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::PrepareContentImport).unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let prepared = prepared_content_with_durable_session(directory.path(), &job);
+        assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
+        job.finish_content_job_with_cas(Ok(prepared), Ok(()), directory.path())
+            .unwrap();
+
+        assert_eq!(job.status().state, JobState::Cancelled);
+        assert!(crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &job.id(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn final_staging_cleanup_failure_aborts_the_prepared_durable_cas_session() {
+        let directory = TempDir::new().unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::PrepareContentImport).unwrap();
+        job.start(JobPhase::ReadingSource).unwrap();
+        let prepared = prepared_content_with_durable_session(directory.path(), &job);
+        job.finish_content_job_with_cas(
+            Ok(prepared),
+            Err("injected staging cleanup failure".to_owned()),
+            directory.path(),
+        )
+        .unwrap();
+
+        assert_eq!(job.status().state, JobState::Failed);
+        assert_eq!(
+            job.status().error.as_ref().map(|error| error.code.as_str()),
+            Some("cleanup-failed")
+        );
+        assert!(crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &job.id(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -3303,6 +3538,11 @@ mod tests {
             .join("native-file-jobs/jobs")
             .join(&started.job_id)
             .exists());
+        assert!(crate::asset_repository::job_pins::DurableCasJob::open(
+            directory.path(),
+            &started.job_id,
+        )
+        .is_err());
         assert_eq!(
             fs::read(active_database).unwrap(),
             b"unchanged-active-database"
@@ -3503,6 +3743,7 @@ mod tests {
                     format: PreparedContentFormat::JsonCard,
                     metadata: serde_json::json!({"spec": "chara_card_v3"}),
                     assets: Vec::new(),
+                    cas_session_id: content_id.clone(),
                     portrait_logical_id: None,
                     module: None,
                 }),
