@@ -335,6 +335,65 @@ describe('sendChat generation session integration', () => {
         })
     })
 
+    it.each([
+        {
+            name: 'edits the existing character tail',
+            messages: [{ role: 'char', data: 'partial', chatId: 'response-1' }] as Message[],
+            command: 'edit',
+            start: 0,
+            deleteCount: 1,
+            expectedData: 'partial\n```risuerror\nrequest failed\n```',
+        },
+        {
+            name: 'appends after a user tail',
+            messages: [{ role: 'user', data: 'prompt', chatId: 'user-1' }] as Message[],
+            command: 'append',
+            start: 1,
+            deleteCount: 0,
+            expectedData: '```risuerror\nrequest failed\n```',
+        },
+    ])('$name through the active session when an inlay error is produced', async ({
+        messages,
+        command,
+        start,
+        deleteCount,
+        expectedData,
+    }) => {
+        const onMutation = vi.fn()
+        const { chat, session } = installDatabase(makeChat(messages), [], onMutation)
+        DBState.db.inlayErrorResponse = true
+        mocks.modelResponse = { type: 'fail', result: 'request failed' }
+
+        await expect(sendChat()).resolves.toBe(false)
+
+        expect(chat.message.at(-1)?.data).toBe(expectedData)
+        expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
+            previousVersion: 0,
+            sessionVersion: 1,
+            commands: [command],
+            mutations: [expect.objectContaining({ start, deleteCount })],
+        }))
+        expect(session.pinCount('transaction')).toBe(0)
+    })
+
+    it('retains the direct error response fallback when no active session exists', async () => {
+        const { chat } = installDatabase(makeChat([{
+            role: 'user',
+            data: 'prompt',
+            chatId: 'user-1',
+        }]))
+        mocks.session = null
+        DBState.db.inlayErrorResponse = true
+        mocks.modelResponse = { type: 'fail', result: 'request failed' }
+
+        await expect(sendChat()).resolves.toBe(false)
+
+        expect(chat.message.at(-1)).toMatchObject({
+            role: 'char',
+            data: '```risuerror\nrequest failed\n```',
+        })
+    })
+
     it('fails closed before assigning IDs when the active session owns another chat', async () => {
         const source = makeChat([{ role: 'user', data: 'must remain unchanged' }])
         const { currentCharacter } = installDatabase(source)

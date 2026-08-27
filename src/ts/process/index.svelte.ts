@@ -66,6 +66,7 @@ import {
     type PromptHistoryCompatibilitySnapshot,
 } from './promptHistory'
 import { runCurrentChatParserPass } from './currentChatParserPass'
+import { applyGenerationErrorResponse } from './generationErrorResponse'
 
 export { doingChat } from './generationState'
 
@@ -264,15 +265,7 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
                 return
             }
 
-            const messages = chatRoom.message
-            const last = messages[messages.length - 1]
             const suffix = `\n\`\`\`risuerror\n${error}\n\`\`\``
-
-            if(last?.role === 'char'){
-                last.data += suffix
-                return
-            }
-
             const m:Message = {
                 role: 'char',
                 data: `\`\`\`risuerror\n${error}\n\`\`\``,
@@ -284,7 +277,23 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
             if(generationInfo){
                 m.generationInfo = generationInfo
             }
-            messages.push(m)
+            const session = getActiveConversationSession()
+            const applied = applyGenerationErrorResponse({
+                session,
+                getCurrentSession: getActiveConversationSession,
+                characterId: charRoom.chaId,
+                chat: chatRoom,
+                getCurrentChat: () => {
+                    const currentOwner = DBState.db.characters?.[sc]
+                    return currentOwner === charRoom && currentOwner.chatPage === st
+                        ? currentOwner.chats?.[st]
+                        : null
+                },
+                isOwnerCurrent: () => get(selectedCharID) === sc,
+                suffix,
+                appendMessage: m,
+            })
+            if (!applied) alertError(error)
             return
         }
         catch(e){
