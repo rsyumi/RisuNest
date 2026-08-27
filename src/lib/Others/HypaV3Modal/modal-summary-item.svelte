@@ -36,6 +36,8 @@
     alertConfirmTwice,
     handleDualAction,
     getFirstMessage,
+    captureCurrentHypaMessageById,
+    captureCurrentHypaMessagesByIds,
     processRegexScript,
     getCategoryName,
   } from "./utils";
@@ -144,20 +146,16 @@
   }
 
   function isOrphan(): boolean {
-    const char = DBState.db.characters[$selectedCharID];
-    const chat = char.chats[DBState.db.characters[$selectedCharID].chatPage];
-
+    const messageIds: string[] = [];
     for (const chatMemo of summary.chatMemos) {
       if (chatMemo == null) {
         // Check first message exists
         if (!getFirstMessage()) return true;
       } else {
-        if (chat.message.findIndex((m) => m.chatId === chatMemo) === -1)
-          return true;
+        messageIds.push(chatMemo);
       }
     }
-
-    return false;
+    return captureCurrentHypaMessagesByIds(messageIds).length !== messageIds.length;
   }
 
   async function toggleReroll(): Promise<void> {
@@ -194,8 +192,6 @@
   async function getMessageFromChatMemo(
     chatMemo: string | null
   ): Promise<Message | null> {
-    const char = DBState.db.characters[$selectedCharID];
-    const chat = char.chats[DBState.db.characters[$selectedCharID].chatPage];
     const shouldProcess = getCurrentHypaV3Preset().settings.processRegexScript;
 
     let msg = null;
@@ -207,9 +203,10 @@
       if (!firstMessage) return null;
       msg = { role: "char", data: firstMessage };
     } else {
-      msgIndex = chat.message.findIndex((m) => m.chatId === chatMemo);
-      if (msgIndex === -1) return null;
-      msg = chat.message[msgIndex];
+      const target = captureCurrentHypaMessageById(chatMemo);
+      if (!target) return null;
+      msgIndex = target.absoluteIndex;
+      msg = target.message;
     }
 
     return shouldProcess ? await processRegexScript(msg, msgIndex) : msg;

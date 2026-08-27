@@ -514,7 +514,7 @@ export async function processScriptFull(char:character|groupChat|simpleCharacter
         readPin = conversationAccess === 'read-only' && !conversationOperation &&
             !compatibilityPin && !promptOperationScope?.usesPluginCompatibility &&
             conversationOwner?.session
-            ? conversationOwner.session.acquirePin('transaction')
+            ? conversationOwner.session.acquirePin('compatibility')
             : null
         if (
             !promptOperationScope && !conversationOperation && needsConversationOperation &&

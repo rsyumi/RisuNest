@@ -5,6 +5,7 @@ import type { Chat, Database, Message } from './storage/database.svelte'
 import {
     captureChatMessageTarget,
     captureChatMessageTargetById,
+    captureChatMessageTargetsByIds,
     editCapturedChatMessage,
     LatestChatScrollRequestGuard,
     navigateCapturedChatMessage,
@@ -167,6 +168,79 @@ describe('chat message UI targets', () => {
         expect(target.conversation.message[1].chatId).toBe('assigned')
         expect(target.conversation.bookmarks).toEqual(['assigned'])
         expect(target.conversation.bookmarkNames).toEqual({ assigned: 'Default name' })
+    })
+
+    it('uses the same empty message ID lookup semantics with and without an active session', () => {
+        const messages = [
+            { role: 'user', data: 'empty ID', chatId: '' },
+            { role: 'char', data: 'named ID', chatId: 'named' },
+        ] as Message[]
+        const sessionTarget = fixture(structuredClone(messages))
+        const legacyTarget = fixture(structuredClone(messages), false)
+
+        expect(captureChatMessageTargetById(sessionTarget, '')?.absoluteIndex).toBe(0)
+        expect(captureChatMessageTargetById(legacyTarget, '')?.absoluteIndex).toBe(0)
+    })
+
+    it('resolves bookmark targets through bounded session pages without retaining full history', () => {
+        const messages = Array.from({ length: 300 }, (_, index) => ({
+            role: index % 2 === 0 ? 'user' : 'char',
+            data: `message-${index}`,
+            chatId: `id-${index}`,
+        } as Message))
+        messages[10].chatId = 'duplicate'
+        messages[280].chatId = 'duplicate'
+        const target = fixture(messages)
+        const sharedLocator = target.session.locate(1)
+        const findTargets = vi.spyOn(target.session, 'findMessageTargetsByIds')
+
+        const captured = captureChatMessageTargetsByIds(
+            target,
+            ['id-129', 'missing', 'duplicate', 'id-0'],
+            'last',
+        )
+
+        expect(captured.map((entry) => ({
+            id: entry.message.chatId,
+            index: entry.absoluteIndex,
+            data: entry.message.data,
+        }))).toEqual([
+            { id: 'id-129', index: 129, data: 'message-129' },
+            { id: 'duplicate', index: 280, data: 'message-280' },
+            { id: 'id-0', index: 0, data: 'message-0' },
+        ])
+        expect(findTargets).toHaveBeenCalledWith(
+            ['id-129', 'missing', 'duplicate', 'id-0'],
+            'last',
+        )
+        expect(target.session.ownsMessageLocator(sharedLocator)).toBe(true)
+        expect(captured.every(
+            (entry) => entry.locator && target.session.ownsMessageLocator(entry.locator),
+        )).toBe(true)
+        expect(captured.every((entry) => !('messages' in entry))).toBe(true)
+    })
+
+    it('refreshes a session target after a compatibility path mutates the live message in place', () => {
+        const target = fixture([{
+            role: 'char',
+            data: 'captured',
+            chatId: 'message-id',
+            name: 'old name',
+        }])
+        const captured = capture(target, 0)
+        target.conversation.message[0].data = 'latest'
+        target.conversation.message[0].name = 'new name'
+
+        const resolved = resolveChatMessageTarget(captured, target)
+
+        expect(resolved?.message).toMatchObject({
+            data: 'latest',
+            name: 'new name',
+        })
+        expect(captured.message).toMatchObject({
+            data: 'captured',
+            name: 'old name',
+        })
     })
 
     it('keeps the direct-array fallback narrow and identity-safe across a bookmark prompt', async () => {

@@ -62,6 +62,12 @@ export interface ActiveConversationWindow {
     sessionVersion: number
 }
 
+export interface ActiveConversationMessageTarget {
+    absoluteIndex: number
+    message: Message
+    locator: MessageLocator
+}
+
 export interface ActiveConversationBranchSource {
     characterId: string
     conversationId: string
@@ -1205,10 +1211,44 @@ export class ActiveConversationSession {
 
     findMessageLocatorById(messageId: string): MessageLocator | null {
         this.assertActive()
-        const absoluteIndex = this.conversation.message.findIndex(
-            (message) => message.chatId === messageId,
-        )
-        return absoluteIndex === -1 ? null : this.locate(absoluteIndex)
+        return this.findMessageTargetsByIds([messageId], 'first')[0]?.locator ?? null
+    }
+
+    findMessageTargetsByIds(
+        messageIds: readonly string[],
+        occurrence: 'first' | 'last' = 'first',
+    ): ActiveConversationMessageTarget[] {
+        this.assertActive()
+        if (messageIds.length === 0) return []
+        const requested = new Set(messageIds)
+        const matches = new Map<string, number>()
+        const messages = this.conversation.message
+        const pageSize = 128
+        for (let startIndex = 0; startIndex < messages.length; startIndex += pageSize) {
+            const page = messages.slice(
+                startIndex,
+                Math.min(messages.length, startIndex + pageSize),
+            )
+            for (let offset = 0; offset < page.length; offset++) {
+                const messageId = page[offset].chatId
+                if (
+                    messageId === undefined ||
+                    !requested.has(messageId) ||
+                    (occurrence === 'first' && matches.has(messageId))
+                ) continue
+                matches.set(messageId, startIndex + offset)
+            }
+            if (occurrence === 'first' && matches.size === requested.size) break
+        }
+        return messageIds.flatMap((messageId) => {
+            const absoluteIndex = matches.get(messageId)
+            if (absoluteIndex === undefined) return []
+            return [{
+                absoluteIndex,
+                message: safeStructuredClone(messages[absoluteIndex]),
+                locator: this.locate(absoluteIndex),
+            }]
+        })
     }
 
     readMessage(locator: MessageLocator): Message {

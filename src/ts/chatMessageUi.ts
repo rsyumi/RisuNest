@@ -20,15 +20,29 @@ export interface CaptureChatMessageTargetOptions extends ChatMessageUiContext {
     absoluteIndex: number
 }
 
-export interface CapturedChatMessageTarget {
+interface CapturedChatMessageTargetBase {
     absoluteIndex: number
     character: Database['characters'][number]
     conversation: Chat
-    messages: Message[]
     message: Message
-    session: ActiveConversationSession | null
-    locator: MessageLocator | null
 }
+
+interface CapturedSessionChatMessageTarget extends CapturedChatMessageTargetBase {
+    kind: 'session'
+    session: ActiveConversationSession
+    locator: MessageLocator
+}
+
+interface CapturedLegacyChatMessageTarget extends CapturedChatMessageTargetBase {
+    kind: 'legacy'
+    session: null
+    locator: null
+    legacyMessages: Message[]
+}
+
+export type CapturedChatMessageTarget =
+    | CapturedSessionChatMessageTarget
+    | CapturedLegacyChatMessageTarget
 
 export interface ToggleBookmarkOptions {
     requestName(currentName: string): Promise<string>
@@ -82,13 +96,25 @@ export function captureChatMessageTarget(
     const message = current?.conversation.message[options.absoluteIndex]
     if (!current || !message) return null
     const session = matchingSession(current, options.getCurrentSession())
+    if (session) {
+        const locator = session.locate(options.absoluteIndex)
+        return {
+            kind: 'session',
+            absoluteIndex: options.absoluteIndex,
+            ...current,
+            message: session.readMessage(locator),
+            session,
+            locator,
+        }
+    }
     return {
+        kind: 'legacy',
         absoluteIndex: options.absoluteIndex,
         ...current,
-        messages: current.conversation.message,
+        legacyMessages: current.conversation.message,
         message,
-        session,
-        locator: session?.locate(options.absoluteIndex) ?? null,
+        session: null,
+        locator: null,
     }
 }
 
@@ -97,14 +123,43 @@ export function captureChatMessageTargetById(
     messageId: string,
     occurrence: 'first' | 'last' = 'first',
 ): CapturedChatMessageTarget | null {
+    return captureChatMessageTargetsByIds(context, [messageId], occurrence)[0] ?? null
+}
+
+export function captureChatMessageTargetsByIds(
+    context: ChatMessageUiContext,
+    messageIds: readonly string[],
+    occurrence: 'first' | 'last' = 'first',
+): CapturedChatMessageTarget[] {
     const current = context.captureCurrent()
-    if (!current) return null
+    if (!current || messageIds.length === 0) return []
+    const session = matchingSession(current, context.getCurrentSession())
+    if (session) {
+        return session.findMessageTargetsByIds(messageIds, occurrence).map((target) => ({
+            kind: 'session' as const,
+            ...current,
+            ...target,
+            session,
+        }))
+    }
+
+    const requested = new Set(messageIds)
+    const captured = new Map<string, CapturedLegacyChatMessageTarget>()
     const messages = current.conversation.message
-    const absoluteIndex = occurrence === 'first'
-        ? messages.findIndex((message) => message.chatId === messageId)
-        : messages.findLastIndex((message) => message.chatId === messageId)
-    if (absoluteIndex < 0) return null
-    return captureChatMessageTarget({ ...context, absoluteIndex })
+    for (let absoluteIndex = 0; absoluteIndex < messages.length; absoluteIndex++) {
+        const messageId = messages[absoluteIndex].chatId
+        if (
+            messageId === undefined ||
+            !requested.has(messageId) ||
+            (occurrence === 'first' && captured.has(messageId))
+        ) continue
+        const target = captureChatMessageTarget({ ...context, absoluteIndex })
+        if (target?.kind === 'legacy') captured.set(messageId, target)
+    }
+    return messageIds.flatMap((messageId) => {
+        const target = captured.get(messageId)
+        return target ? [target] : []
+    })
 }
 
 export function resolveChatMessageTarget(
@@ -112,23 +167,23 @@ export function resolveChatMessageTarget(
     context: ChatMessageUiContext,
 ): CapturedChatMessageTarget | null {
     const current = context.captureCurrent()
-    if (target.session && target.locator) {
+    if (target.kind === 'session') {
         if (!current) return null
         const currentSession = matchingSession(current, context.getCurrentSession())
         if (currentSession !== target.session) return null
         try {
-            requireCurrentConversationSession(target.session, currentSession)
-                .resolveLocator(target.locator)
+            const message = requireCurrentConversationSession(target.session, currentSession)
+                .readMessage(target.locator)
+            return { ...target, message }
         } catch {
             return null
         }
-        return target
     }
 
     if (
         current?.character !== target.character ||
         current.conversation !== target.conversation ||
-        current.conversation.message !== target.messages ||
+        current.conversation.message !== target.legacyMessages ||
         current.conversation.message[target.absoluteIndex] !== target.message ||
         matchingSession(current, context.getCurrentSession()) !== null
     ) return null
@@ -223,7 +278,7 @@ export async function renameCapturedBookmark(
         current.message.chatId !== messageId ||
         !current.conversation.bookmarks?.includes(messageId)
     ) return false
-    if (current.session && current.locator) {
+    if (current.session) {
         current.session.renameBookmark(current.locator, newName)
     } else {
         current.conversation.bookmarkNames ??= {}
@@ -247,7 +302,7 @@ function editCapturedMessage(
     const current = resolveChatMessageTarget(target, context)
     if (!current) return false
     const updated = update(current.message)
-    if (current.session && current.locator) {
+    if (current.session) {
         current.session.edit(current.locator, updated)
     } else {
         Object.assign(current.message, updated)
@@ -264,7 +319,7 @@ function setCapturedBookmark(
 ): boolean {
     const current = resolveChatMessageTarget(target, context)
     if (!current) return false
-    if (current.session && current.locator) {
+    if (current.session) {
         current.session.setBookmark(current.locator, {
             bookmarked,
             messageId,
@@ -298,16 +353,7 @@ function matchingSession(
     current: CurrentChatMessageTarget,
     session: ActiveConversationSession | null,
 ): ActiveConversationSession | null {
-    if (
-        !session?.isActive ||
-        session.characterId !== current.character.chaId ||
-        session.conversationId !== current.conversation.id
-    ) return null
-    try {
-        return session.materializeCompatibilityArray() === current.conversation.message
-            ? session
-            : null
-    } catch {
-        return null
-    }
+    return session?.matchesConversation(current.character.chaId, current.conversation) === true
+        ? session
+        : null
 }

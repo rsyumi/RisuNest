@@ -582,6 +582,7 @@ describe('history-sensitive regex conversation operations', () => {
             mocks.database.characters = [char] as never
             mocks.state.currentChat = chat
             mocks.state.session = session
+            const acquirePin = vi.spyOn(session, 'acquirePin')
             const structuredCloneSpy = vi.spyOn(globalThis, 'structuredClone')
 
             try {
@@ -595,6 +596,7 @@ describe('history-sensitive regex conversation operations', () => {
                 )
 
                 expect(structuredCloneSpy).not.toHaveBeenCalled()
+                expect(acquirePin).toHaveBeenCalledWith('compatibility')
                 expect(session.activePinReasons).toEqual([])
             } finally {
                 structuredCloneSpy.mockRestore()

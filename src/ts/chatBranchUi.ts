@@ -94,7 +94,7 @@ export async function createCapturedConversationBranch(
     }
 
     const source = current.conversation
-    const sourceMessage = source.message[current.absoluteIndex]
+    const sourceMessage = current.message
     if (!sourceMessage) return false
 
     const nextCharacter = characterDetail(current.character)

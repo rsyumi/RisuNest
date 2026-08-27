@@ -4,6 +4,13 @@ import { type Message } from "src/ts/storage/database.svelte";
 import { alertConfirm } from "src/ts/alert";
 import { DBState, selectedCharID } from "src/ts/stores.svelte";
 import { language } from "src/lang";
+import {
+  captureChatMessageTarget,
+  captureChatMessageTargetById,
+  captureChatMessageTargetsByIds,
+  type CapturedChatMessageTarget,
+} from "src/ts/chatMessageUi";
+import { peekActiveConversationSession } from "src/ts/storage/persistentDataRuntime.svelte";
 
 export async function alertConfirmTwice(
   firstMessage: string,
@@ -93,6 +100,44 @@ export function getFirstMessage(): string | null {
     : char.alternateGreetings?.[chat.fmIndex]
     ? char.alternateGreetings[chat.fmIndex]
     : null;
+}
+
+const currentHypaMessageContext = {
+  captureCurrent: () => {
+    const character = DBState.db.characters[get(selectedCharID)];
+    const conversation = character?.chats[character.chatPage];
+    return character && conversation ? { character, conversation } : null;
+  },
+  getCurrentSession: peekActiveConversationSession,
+};
+
+export function captureCurrentHypaMessageAt(
+  absoluteIndex: number
+): CapturedChatMessageTarget | null {
+  return captureChatMessageTarget({
+    ...currentHypaMessageContext,
+    absoluteIndex,
+  });
+}
+
+export function captureCurrentHypaMessageById(
+  messageId: string
+): CapturedChatMessageTarget | null {
+  return captureChatMessageTargetById(
+    currentHypaMessageContext,
+    messageId,
+    "first"
+  );
+}
+
+export function captureCurrentHypaMessagesByIds(
+  messageIds: readonly string[]
+): CapturedChatMessageTarget[] {
+  return captureChatMessageTargetsByIds(
+    currentHypaMessageContext,
+    messageIds,
+    "first"
+  );
 }
 
 export async function processRegexScript(

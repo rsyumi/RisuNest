@@ -71,6 +71,40 @@ describe('ActiveConversationSession', () => {
         expect(session.findMessageLocatorById('missing')).toBeNull()
     })
 
+    it('finds only requested message targets in bounded pages without invalidating shared locators', () => {
+        const source = Array.from({ length: 300 }, (_, index) =>
+            message(`message-${index}`, `message-${index}`),
+        )
+        source[0].chatId = 'first-target'
+        source[280].chatId = 'last-target'
+        let numericReads = 0
+        const messages = new Proxy(source, {
+            get(target, property, receiver) {
+                if (typeof property === 'string' && /^\d+$/.test(property)) numericReads += 1
+                return Reflect.get(target, property, receiver)
+            },
+        })
+        const { session } = createSession(chat(messages))
+        const shared = session.locate(1)
+        numericReads = 0
+
+        const first = session.findMessageTargetsByIds(['first-target'], 'first')
+
+        expect(first).toMatchObject([{
+            absoluteIndex: 0,
+            message: { chatId: 'first-target', data: 'message-0' },
+        }])
+        expect(numericReads).toBeLessThanOrEqual(130)
+        expect(session.ownsMessageLocator(shared)).toBe(true)
+
+        const last = session.findMessageTargetsByIds(['last-target'], 'last')
+        expect(last).toMatchObject([{
+            absoluteIndex: 280,
+            message: { chatId: 'last-target', data: 'message-280' },
+        }])
+        expect(session.ownsMessageLocator(shared)).toBe(true)
+    })
+
     it('appends and edits without cloning the full backing array or untouched messages', () => {
         const first = message('first', 'first')
         const second = message('second', 'second')

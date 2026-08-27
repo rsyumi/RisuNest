@@ -9,7 +9,7 @@
     import { alertInput } from "src/ts/alert";
     import { getActiveConversationSession } from "src/ts/storage/persistentDataRuntime.svelte";
     import {
-        captureChatMessageTarget,
+        captureChatMessageTargetsByIds,
         removeCapturedBookmark,
         renameCapturedBookmark,
         type CapturedChatMessageTarget,
@@ -30,48 +30,32 @@
         getCurrentSession: getActiveConversationSession,
     };
 
-    const messageMap = $derived.by(() => {
-        if (!chara) return new Map();
-
-        const chat = chara.chats[chara.chatPage];
-        const allMessages = chat.message;
-        const map = new Map();
-        
-        allMessages.forEach((m, index) => {
-            map.set(m.chatId, {
-                ...m,
-                originalIndex: index,
-                saying: m.saying ?? '',
-                target: captureChatMessageTarget({
-                    ...chatMessageContext,
-                    absoluteIndex: index,
-                }),
-            });
-        });
-
-        return map;
-    });
-
     const bookmarkedMessages = $derived.by(() => {
         if (!chara) return [];
 
         const chat = chara.chats[chara.chatPage];
         const bookmarkIds = chat.bookmarks ?? [];
-        const map = messageMap; 
+        const targets = captureChatMessageTargetsByIds(
+            chatMessageContext,
+            bookmarkIds,
+            'last',
+        );
 
-        const messages = bookmarkIds
-            .map(id => {
-                const message = map.get(id); 
-                if (!message) return null;
-
+        const messages = targets.map(target => {
+                const message = target.message;
                 let speaker = null;
                 if (chara.type === 'group' && message.saying) {
                     speaker = findCharacterbyId(message.saying);
                 }
                 
-                return { ...message, speaker };
-            })
-            .filter(Boolean);
+                return {
+                    ...message,
+                    originalIndex: target.absoluteIndex,
+                    saying: message.saying ?? '',
+                    speaker,
+                    target,
+                };
+            });
 
         return messages;
     });

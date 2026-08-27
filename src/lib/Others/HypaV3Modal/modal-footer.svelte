@@ -4,9 +4,13 @@
     getCurrentHypaV3Preset,
   } from "src/ts/process/memory/hypav3";
   import { type Message } from "src/ts/storage/database.svelte";
-  import { DBState, selectedCharID } from "src/ts/stores.svelte";
   import { language } from "src/lang";
-  import { getFirstMessage, processRegexScript } from "./utils";
+  import {
+    captureCurrentHypaMessageAt,
+    captureCurrentHypaMessageById,
+    getFirstMessage,
+    processRegexScript,
+  } from "./utils";
 
   interface Props {
     hypaV3Data: SerializableHypaV3Data;
@@ -15,22 +19,22 @@
   let { hypaV3Data }: Props = $props();
 
   async function getNextSummarizationTarget(): Promise<Message | null> {
-    const char = DBState.db.characters[$selectedCharID];
-    const chat = char.chats[DBState.db.characters[$selectedCharID].chatPage];
     const shouldProcess = getCurrentHypaV3Preset().settings.processRegexScript;
 
     // Summaries exist
     if (hypaV3Data.summaries.length > 0) {
       const lastSummary = hypaV3Data.summaries.at(-1);
-      const lastMessageIndex = chat.message.findIndex(
-        (m) => m.chatId === lastSummary.chatMemos.at(-1)
-      );
+      const lastMessageId = lastSummary.chatMemos.at(-1);
+      const lastMessage = lastMessageId == null
+        ? null
+        : captureCurrentHypaMessageById(lastMessageId);
 
-      if (lastMessageIndex !== -1) {
-        const next = chat.message[lastMessageIndex + 1] ?? null;
+      if (lastMessage) {
+        const nextTarget = captureCurrentHypaMessageAt(lastMessage.absoluteIndex + 1);
+        const next = nextTarget?.message ?? null;
 
         return next && shouldProcess
-          ? await processRegexScript(next, lastMessageIndex + 1)
+          ? await processRegexScript(next, lastMessage.absoluteIndex + 1)
           : next;
       }
     }
@@ -40,7 +44,7 @@
     const firstMessage = getFirstMessage();
 
     if (!firstMessage) {
-      const next = chat.message[0] ?? null;
+      const next = captureCurrentHypaMessageAt(0)?.message ?? null;
 
       return next && shouldProcess ? await processRegexScript(next, 0) : next;
     }
