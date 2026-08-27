@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -946,6 +946,14 @@ fn scan_cold_payloads(
 }
 
 fn decode_cold_payload(source: &Path, payload: &F0PayloadDescriptor) -> Result<Value, F0Error> {
+    decode_cold_payload_with_limit(source, payload, MAX_COLD_DECODED_BYTES)
+}
+
+fn decode_cold_payload_with_limit(
+    source: &Path,
+    payload: &F0PayloadDescriptor,
+    decoded_limit: usize,
+) -> Result<Value, F0Error> {
     let mut source_file = File::open(source).map_err(|error| cold_error(payload, error))?;
     let actual_length = source_file
         .metadata()
@@ -981,8 +989,142 @@ fn decode_cold_payload(source: &Path, payload: &F0PayloadDescriptor) -> Result<V
     source_file
         .seek(SeekFrom::Start(0))
         .map_err(|error| cold_error(payload, error))?;
-    let decoder = flate2::read::ZlibDecoder::new(source_file);
-    let mut limited = DecodedLimitReader::new(decoder, MAX_COLD_DECODED_BYTES);
+    let mut source_file = BufReader::with_capacity(COLD_COPY_BUFFER_BYTES, source_file);
+    let codec = detect_cold_payload_codec(
+        source_file
+            .fill_buf()
+            .map_err(|error| cold_error(payload, error))?,
+    );
+    match codec {
+        ColdPayloadCodec::Gzip => decode_cold_payload_stream(
+            flate2::bufread::GzDecoder::new(source_file),
+            flate2::bufread::GzDecoder::into_inner,
+            payload,
+            decoded_limit,
+        ),
+        ColdPayloadCodec::Zlib => decode_cold_payload_stream(
+            ColdDeflateDecoder::new(source_file, true),
+            ColdDeflateDecoder::into_inner,
+            payload,
+            decoded_limit,
+        ),
+        ColdPayloadCodec::RawDeflate => decode_cold_payload_stream(
+            ColdDeflateDecoder::new(source_file, false),
+            ColdDeflateDecoder::into_inner,
+            payload,
+            decoded_limit,
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ColdPayloadCodec {
+    Gzip,
+    Zlib,
+    RawDeflate,
+}
+
+fn detect_cold_payload_codec(header: &[u8]) -> ColdPayloadCodec {
+    if header.starts_with(&[0x1f, 0x8b, 0x08]) {
+        return ColdPayloadCodec::Gzip;
+    }
+    if header.len() >= 2 {
+        let compression_method = header[0] & 0x0f;
+        let window_size = header[0] >> 4;
+        let checksum = u16::from_be_bytes([header[0], header[1]]);
+        if compression_method == 8 && window_size <= 7 && checksum % 31 == 0 {
+            return ColdPayloadCodec::Zlib;
+        }
+    }
+    ColdPayloadCodec::RawDeflate
+}
+
+struct ColdDeflateDecoder<R> {
+    source: R,
+    decoder: flate2::Decompress,
+    finished: bool,
+}
+
+impl<R> ColdDeflateDecoder<R> {
+    fn new(source: R, zlib_header: bool) -> Self {
+        Self {
+            source,
+            decoder: flate2::Decompress::new(zlib_header),
+            finished: false,
+        }
+    }
+
+    fn into_inner(self) -> R {
+        self.source
+    }
+}
+
+impl<R: BufRead> Read for ColdDeflateDecoder<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || self.finished {
+            return Ok(0);
+        }
+        loop {
+            let input = self.source.fill_buf()?;
+            let input_finished = input.is_empty();
+            let before_input = self.decoder.total_in();
+            let before_output = self.decoder.total_out();
+            let status = self
+                .decoder
+                .decompress(
+                    input,
+                    output,
+                    if input_finished {
+                        flate2::FlushDecompress::Finish
+                    } else {
+                        flate2::FlushDecompress::None
+                    },
+                )
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("corrupt cold payload deflate stream: {error}"),
+                    )
+                })?;
+            let consumed = (self.decoder.total_in() - before_input) as usize;
+            let produced = (self.decoder.total_out() - before_output) as usize;
+            self.source.consume(consumed);
+
+            if status == flate2::Status::StreamEnd {
+                self.finished = true;
+                return Ok(produced);
+            }
+            if produced != 0 {
+                return Ok(produced);
+            }
+            if input_finished {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unfinished cold payload deflate stream",
+                ));
+            }
+            if consumed == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cold payload deflate decoder made no progress",
+                ));
+            }
+        }
+    }
+}
+
+fn decode_cold_payload_stream<R, D, F>(
+    decoder: D,
+    into_inner: F,
+    payload: &F0PayloadDescriptor,
+    decoded_limit: usize,
+) -> Result<Value, F0Error>
+where
+    R: BufRead,
+    D: Read,
+    F: FnOnce(D) -> R,
+{
+    let mut limited = DecodedLimitReader::new(decoder, decoded_limit);
     let value: Value = serde_json::from_reader(&mut limited).map_err(|error| F0Error {
         code: F0ErrorCode::ColdPayload,
         message: if limited.exceeded {
@@ -991,6 +1133,21 @@ fn decode_cold_payload(source: &Path, payload: &F0PayloadDescriptor) -> Result<V
             format!("invalid F0 cold payload JSON for {}: {error}", payload.key)
         },
     })?;
+    let decoder = limited.into_inner();
+    let mut source = into_inner(decoder);
+    if !source
+        .fill_buf()
+        .map_err(|error| cold_error(payload, error))?
+        .is_empty()
+    {
+        return Err(F0Error {
+            code: F0ErrorCode::ColdPayload,
+            message: format!(
+                "F0 cold payload contains trailing compressed bytes: {}",
+                payload.key
+            ),
+        });
+    }
     if !matches!(&value, Value::Array(_))
         && !value
             .as_object()
@@ -1017,6 +1174,10 @@ impl<R> DecodedLimitReader<R> {
             remaining: limit,
             exceeded: false,
         }
+    }
+
+    fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -1531,7 +1692,10 @@ fn canonical_too_large() -> F0Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::{write::ZlibEncoder, Compression};
+    use flate2::{
+        write::{DeflateEncoder, GzEncoder, ZlibEncoder},
+        Compression,
+    };
     use serde_json::json;
     use std::{fs, io::Write};
 
@@ -1732,6 +1896,195 @@ mod tests {
         fs::write(&cold_path, changed_bytes).unwrap();
         let changed = rebuild_f0_v1(&database, &payloads, &[]).unwrap_err();
         assert_eq!(changed.code, F0ErrorCode::InvalidInventory);
+    }
+
+    #[test]
+    fn cold_payload_decoder_matches_fflate_gzip_zlib_and_raw_deflate() {
+        let directory = tempfile::tempdir().unwrap();
+        let cold_value = json!({
+            "character": {
+                "image": "asset-key",
+                "roadmap14Unknown": "{{inlay::inlay-key}}"
+            }
+        });
+        let fflate_payloads = [
+            (
+                "gzip",
+                "1f8b08004edf8f6a0003ab564ace482c4a4c2e492d52b2aa56cacc4d4c4f55b2524a2c2e4e2dd1cd4ead54d2512aca4f4cc94d2c303409cdcbcecb2fcf034a575767e6e524565a59812990bada5aa5da5a009cf2bb114d000000",
+            ),
+            (
+                "zlib",
+                "789cab564ace482c4a4c2e492d52b2aa56cacc4d4c4f55b2524a2c2e4e2dd1cd4ead54d2512aca4f4cc94d2c303409cdcbcecb2fcf034a575767e6e524565a59812990bada5aa5da5a001f211bb2",
+            ),
+            (
+                "raw-deflate",
+                "ab564ace482c4a4c2e492d52b2aa56cacc4d4c4f55b2524a2c2e4e2dd1cd4ead54d2512aca4f4cc94d2c303409cdcbcecb2fcf034a575767e6e524565a59812990bada5aa5da5a00",
+            ),
+        ];
+        let mut decoded = Vec::new();
+
+        for (codec, encoded_hex) in fflate_payloads {
+            let encoded = hex::decode(encoded_hex).unwrap();
+            let path = directory.path().join(format!("cold-{codec}.bin"));
+            fs::write(&path, &encoded).unwrap();
+            let payload = cold_payload(&path, &encoded);
+            decoded.push(decode_cold_payload(&path, &payload).unwrap());
+        }
+
+        assert_eq!(decoded, vec![cold_value.clone(); 3]);
+
+        let database = json!({
+            "characters": [],
+            "botPresets": [{ "name": "preset" }],
+            "botPresetsId": 0,
+            "personas": [{ "id": "persona" }],
+            "selectedPersona": 0
+        });
+        let mut validations = Vec::new();
+        for (codec, encoded_hex) in fflate_payloads {
+            let encoded = hex::decode(encoded_hex).unwrap();
+            let path = directory.path().join(format!("cold-{codec}.bin"));
+            validations.push(
+                rebuild_f0_v1(
+                    &database,
+                    &[
+                        cold_payload(&path, &encoded),
+                        payload(F0PayloadKind::Asset, "asset-key"),
+                        payload(F0PayloadKind::Inlay, "inlay-key"),
+                    ],
+                    &[],
+                )
+                .unwrap(),
+            );
+        }
+        assert!(validations.windows(2).all(|pair| {
+            pair[0].canonical_database_sha256 == pair[1].canonical_database_sha256
+                && pair[0].reference_graph_sha256 == pair[1].reference_graph_sha256
+                && pair[0].references == pair[1].references
+        }));
+    }
+
+    #[test]
+    fn cold_payload_decoder_rejects_trailing_corrupt_and_unfinished_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = serde_json::to_vec(&json!({ "message": [] })).unwrap();
+        let codecs = [
+            ("gzip", encode_gzip(&source)),
+            ("zlib", encode_zlib(&source)),
+            ("raw-deflate", encode_raw_deflate(&source)),
+        ];
+
+        for (codec, encoded) in codecs {
+            let mut trailing = encoded.clone();
+            trailing.push(0);
+            let trailing_path = directory.path().join(format!("{codec}-trailing.bin"));
+            fs::write(&trailing_path, &trailing).unwrap();
+            let trailing_error =
+                decode_cold_payload(&trailing_path, &cold_payload(&trailing_path, &trailing))
+                    .unwrap_err();
+            assert_eq!(trailing_error.code, F0ErrorCode::ColdPayload);
+            assert!(trailing_error.message.contains("trailing compressed bytes"));
+
+            let mut corrupt = encoded;
+            if codec == "raw-deflate" {
+                corrupt[0] = (corrupt[0] & !0b111) | 0b111;
+            } else {
+                let last = corrupt.last_mut().unwrap();
+                *last ^= 1;
+            }
+            let corrupt_path = directory.path().join(format!("{codec}-corrupt.bin"));
+            fs::write(&corrupt_path, &corrupt).unwrap();
+            let corrupt_error =
+                decode_cold_payload(&corrupt_path, &cold_payload(&corrupt_path, &corrupt))
+                    .expect_err(&format!("{codec} corrupt payload was accepted"));
+            assert_eq!(corrupt_error.code, F0ErrorCode::ColdPayload);
+        }
+
+        let mut truncated_gzip = encode_gzip(&source);
+        truncated_gzip.truncate(truncated_gzip.len() - 1);
+        let mut truncated_zlib = encode_zlib(&source);
+        truncated_zlib.truncate(truncated_zlib.len() - 4);
+        let unfinished_raw = encode_unfinished_raw_deflate(&source);
+        for (codec, encoded) in [
+            ("gzip", truncated_gzip),
+            ("zlib", truncated_zlib),
+            ("raw-deflate", unfinished_raw),
+        ] {
+            let path = directory.path().join(format!("{codec}-unfinished.bin"));
+            fs::write(&path, &encoded).unwrap();
+            let error = decode_cold_payload(&path, &cold_payload(&path, &encoded))
+                .expect_err(&format!("{codec} unfinished payload was accepted"));
+            assert_eq!(error.code, F0ErrorCode::ColdPayload);
+        }
+    }
+
+    #[test]
+    fn cold_payload_decoder_enforces_the_decoded_limit_for_every_codec() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = serde_json::to_vec(&json!({ "message": ["0123456789"] })).unwrap();
+        let codecs = [
+            ("gzip", encode_gzip(&source)),
+            ("zlib", encode_zlib(&source)),
+            ("raw-deflate", encode_raw_deflate(&source)),
+        ];
+
+        for (codec, encoded) in codecs {
+            let path = directory.path().join(format!("{codec}-bomb.bin"));
+            fs::write(&path, &encoded).unwrap();
+            assert_eq!(
+                decode_cold_payload_with_limit(
+                    &path,
+                    &cold_payload(&path, &encoded),
+                    source.len(),
+                )
+                .unwrap(),
+                json!({ "message": ["0123456789"] })
+            );
+            let error = decode_cold_payload_with_limit(
+                &path,
+                &cold_payload(&path, &encoded),
+                source.len() - 1,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, F0ErrorCode::ColdPayload);
+            assert!(error.message.contains("exceeds the decoded limit"));
+        }
+    }
+
+    fn cold_payload(path: &Path, encoded: &[u8]) -> F0PayloadDescriptor {
+        let mut payload = payload(F0PayloadKind::Cold, "cold-key");
+        payload.sha256 = hex::encode(Sha256::digest(encoded));
+        payload.byte_length = encoded.len() as u64;
+        payload.metadata = json!({ "source": "legacy-cold", "ordinal": 0 });
+        payload.cold_source = Some(path.to_owned());
+        payload
+    }
+
+    fn encode_gzip(source: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(source).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn encode_zlib(source: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(source).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn encode_raw_deflate(source: &[u8]) -> Vec<u8> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(source).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn encode_unfinished_raw_deflate(source: &[u8]) -> Vec<u8> {
+        let length = u16::try_from(source.len()).unwrap();
+        let mut encoded = vec![0, length as u8, (length >> 8) as u8];
+        let complement = !length;
+        encoded.extend_from_slice(&[complement as u8, (complement >> 8) as u8]);
+        encoded.extend_from_slice(source);
+        encoded
     }
 
     #[test]
