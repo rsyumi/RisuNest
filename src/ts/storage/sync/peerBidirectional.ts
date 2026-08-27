@@ -89,6 +89,11 @@ export type PeerBidirectionalSyncResult =
           phase: 'localCommitted'
           committedRevision: number
       }
+    | {
+          kind: 'sourceUnavailable'
+          operationId: string
+          committedRevision: number
+      }
 
 export type PeerBidirectionalDurableOperation =
     | {
@@ -188,6 +193,16 @@ function completed(
     return result.kind === 'noChanges' || result.kind === 'updated'
 }
 
+export class PeerBidirectionalRefreshError extends Error {
+    readonly result: PeerBidirectionalCompletedResult
+
+    constructor(result: PeerBidirectionalCompletedResult, cause: unknown) {
+        super(cause instanceof Error ? cause.message : String(cause))
+        this.name = 'PeerBidirectionalRefreshError'
+        this.result = result
+    }
+}
+
 export function createPeerBidirectionalFacade(options: {
     platform: PeerClonePlatform
     invoke?: PeerBidirectionalInvoke
@@ -213,10 +228,14 @@ export function createPeerBidirectionalFacade(options: {
         if (!runtime) throw new Error('Peer sync mutation runtime is unavailable')
         if (pendingRefresh) {
             if (pendingRefresh.key !== key) {
-                throw new Error('Another peer sync operation is awaiting renderer refresh')
+                throw new Error('A different peer sync retry is awaiting renderer refresh')
             }
             const pending = pendingRefresh
-            await pending.fence.refreshCommittedWorkingSet(pending.result.revision)
+            try {
+                await pending.fence.refreshCommittedWorkingSet(pending.result.revision)
+            } catch (cause) {
+                throw new PeerBidirectionalRefreshError(pending.result, cause)
+            }
             pendingRefresh = undefined
             pending.fence.release()
             return pending.result
@@ -231,7 +250,11 @@ export function createPeerBidirectionalFacade(options: {
             })
             if (completed(result)) {
                 pendingRefresh = { key, result, fence }
-                await fence.refreshCommittedWorkingSet(result.revision)
+                try {
+                    await fence.refreshCommittedWorkingSet(result.revision)
+                } catch (cause) {
+                    throw new PeerBidirectionalRefreshError(result, cause)
+                }
                 pendingRefresh = undefined
             }
             return result
@@ -277,7 +300,7 @@ export function createPeerBidirectionalFacade(options: {
         resolve(operationId, winner) {
             return runMutation(
                 'peer-bidirectional-resolve',
-                `operation:${operationId}`,
+                `operation:${operationId}:resolve:${winner}`,
                 'peer_bidirectional_resolve',
                 { operationId, winner },
             )
@@ -285,7 +308,7 @@ export function createPeerBidirectionalFacade(options: {
         resume(operationId) {
             return runMutation(
                 'peer-bidirectional-resume',
-                `operation:${operationId}`,
+                `operation:${operationId}:resume`,
                 'peer_bidirectional_resume',
                 { operationId },
             )

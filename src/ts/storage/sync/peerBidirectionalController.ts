@@ -1,5 +1,6 @@
 import {
     createPeerBidirectionalFacade,
+    PeerBidirectionalRefreshError,
     type PeerBidirectionalCapabilities,
     type PeerBidirectionalDurableOperation,
     type PeerBidirectionalFacade,
@@ -13,6 +14,8 @@ export type PeerBidirectionalOperationPhase =
     | 'running'
     | 'awaitingConflict'
     | 'localCommitted'
+    | 'sourceUnavailable'
+    | 'refreshPending'
     | 'completed'
     | 'stale'
     | 'failed'
@@ -24,7 +27,9 @@ export interface PeerBidirectionalControllerSnapshot {
     operationPhase: PeerBidirectionalOperationPhase
     operationResult?: PeerBidirectionalSyncResult
     operationId?: string
-    error: string
+    operationRetained: boolean
+    sourceError: string
+    operationError: string
 }
 
 function operationSnapshot(
@@ -54,6 +59,7 @@ function resultPhase(result: PeerBidirectionalSyncResult): PeerBidirectionalOper
     switch (result.kind) {
         case 'conflict': return 'awaitingConflict'
         case 'resumeRequired': return result.phase
+        case 'sourceUnavailable': return 'sourceUnavailable'
         case 'stale': return 'stale'
         default: return 'completed'
     }
@@ -68,13 +74,28 @@ export function createPeerBidirectionalController(options: {
         sourceStatus: { phase: 'idle', devices: [] },
         sourcePairingUri: '',
         operationPhase: 'idle',
-        error: '',
+        operationRetained: false,
+        sourceError: '',
+        operationError: '',
     }
     let initialized = false
     let initialization: Promise<void> | undefined
     let sourceTimer: ReturnType<typeof setInterval> | undefined
     let sourcePolling = false
     let activeOperation: { key: string; promise: Promise<PeerBidirectionalSyncResult> } | undefined
+    let refreshRetry: {
+        key: string
+        operation: () => Promise<PeerBidirectionalSyncResult>
+    } | undefined
+
+    const retainedPhase = (phase: PeerBidirectionalOperationPhase): boolean => [
+        'running',
+        'awaitingConflict',
+        'localCommitted',
+        'sourceUnavailable',
+        'refreshPending',
+        'completed',
+    ].includes(phase)
 
     const publish = (): void => {
         snapshot = { ...snapshot }
@@ -82,6 +103,7 @@ export function createPeerBidirectionalController(options: {
     }
     const update = (next: Partial<PeerBidirectionalControllerSnapshot>): void => {
         snapshot = { ...snapshot, ...next }
+        snapshot.operationRetained = retainedPhase(snapshot.operationPhase)
         publish()
     }
     const stopSourcePolling = (): void => {
@@ -98,11 +120,11 @@ export function createPeerBidirectionalController(options: {
                 sourcePairingUri: status.source.phase === 'running'
                     ? status.source.pairingUri ?? snapshot.sourcePairingUri
                     : '',
-                error: '',
+                sourceError: '',
             })
             if (status.source.phase !== 'running') stopSourcePolling()
         } catch (cause) {
-            update({ error: cause instanceof Error ? cause.message : String(cause) })
+            update({ sourceError: cause instanceof Error ? cause.message : String(cause) })
         } finally {
             sourcePolling = false
         }
@@ -116,12 +138,15 @@ export function createPeerBidirectionalController(options: {
         }
     }
     const runSource = async <T>(operation: () => Promise<T>): Promise<T> => {
+        if (snapshot.operationRetained) {
+            throw new Error('A retained peer sync operation must be resolved first')
+        }
         try {
             const result = await operation()
-            update({ error: '' })
+            update({ sourceError: '' })
             return result
         } catch (cause) {
-            update({ error: cause instanceof Error ? cause.message : String(cause) })
+            update({ sourceError: cause instanceof Error ? cause.message : String(cause) })
             throw cause
         }
     }
@@ -131,24 +156,38 @@ export function createPeerBidirectionalController(options: {
     ): Promise<PeerBidirectionalSyncResult> => {
         if (activeOperation) {
             if (activeOperation.key !== key) {
-                return Promise.reject(new Error('A peer sync operation for a different pairing is already running'))
+                const differentPairing = activeOperation.key.startsWith('pairing:') && key.startsWith('pairing:')
+                return Promise.reject(new Error(differentPairing
+                    ? 'A peer sync operation for a different pairing is already running'
+                    : 'A different peer sync operation is already running'))
             }
             return activeOperation.promise
         }
-        update({ operationPhase: 'running', error: '' })
+        update({ operationPhase: 'running', operationError: '' })
         const promise = operation().then((result) => {
+            refreshRetry = undefined
             update({
                 operationPhase: resultPhase(result),
                 operationResult: result,
                 operationId: result.operationId,
-                error: '',
+                operationError: '',
             })
             return result
         }).catch((cause) => {
-            update({
-                operationPhase: 'failed',
-                error: cause instanceof Error ? cause.message : String(cause),
-            })
+            if (cause instanceof PeerBidirectionalRefreshError) {
+                refreshRetry = { key, operation }
+                update({
+                    operationPhase: 'refreshPending',
+                    operationResult: cause.result,
+                    operationId: cause.result.operationId,
+                    operationError: cause.message,
+                })
+            } else {
+                update({
+                    operationPhase: 'failed',
+                    operationError: cause instanceof Error ? cause.message : String(cause),
+                })
+            }
             throw cause
         }).finally(() => {
             activeOperation = undefined
@@ -178,13 +217,14 @@ export function createPeerBidirectionalController(options: {
                         ? status.source.pairingUri ?? ''
                         : '',
                     ...operationSnapshot(status.operation),
-                    error: '',
+                    sourceError: '',
+                    operationError: '',
                 })
                 if (status.source.phase === 'running') beginSourcePolling()
             }).catch((cause) => {
                 initialized = false
                 initialization = undefined
-                update({ error: cause instanceof Error ? cause.message : String(cause) })
+                update({ sourceError: cause instanceof Error ? cause.message : String(cause) })
             })
             return initialization
         },
@@ -211,32 +251,55 @@ export function createPeerBidirectionalController(options: {
             update({ sourceStatus: status.source })
         }),
         sync(pairingUri: string) {
-            return runOperation(`pairing:${pairingUri}`, () => options.facade.sync(pairingUri))
+            const key = `pairing:${pairingUri}`
+            if (activeOperation) {
+                return runOperation(key, () => options.facade.sync(pairingUri))
+            }
+            if (snapshot.operationRetained) {
+                return Promise.reject(new Error('A retained peer sync operation must be resolved first'))
+            }
+            return runOperation(key, () => options.facade.sync(pairingUri))
         },
         resolve(winner: 'local' | 'remote') {
             const operationId = snapshot.operationId
+            const key = `operation:${operationId ?? ''}:resolve:${winner}`
+            if (activeOperation) {
+                return runOperation(key, () => options.facade.resolve(operationId ?? '', winner))
+            }
             if (!operationId || snapshot.operationPhase !== 'awaitingConflict') {
                 return Promise.reject(new Error('No peer sync conflict is awaiting a choice'))
             }
             return runOperation(
-                `operation:${operationId}`,
+                key,
                 () => options.facade.resolve(operationId, winner),
             )
         },
         resume() {
             const operationId = snapshot.operationId
-            if (!operationId || snapshot.operationPhase !== 'localCommitted') {
+            if (snapshot.operationPhase === 'refreshPending' && refreshRetry) {
+                return runOperation(refreshRetry.key, refreshRetry.operation)
+            }
+            const key = `operation:${operationId ?? ''}:resume`
+            if (activeOperation) {
+                return runOperation(key, () => options.facade.resume(operationId ?? ''))
+            }
+            if (!operationId || !['localCommitted', 'sourceUnavailable'].includes(snapshot.operationPhase)) {
                 return Promise.reject(new Error('No peer sync operation can be resumed'))
             }
             return runOperation(
-                `operation:${operationId}`,
+                key,
                 () => options.facade.resume(operationId),
             )
         },
         async acknowledge(): Promise<void> {
             if (!snapshot.operationId || snapshot.operationPhase !== 'completed') return
             await options.facade.acknowledge(snapshot.operationId)
-            update({ operationPhase: 'idle', operationResult: undefined, operationId: undefined })
+            update({
+                operationPhase: 'idle',
+                operationResult: undefined,
+                operationId: undefined,
+                operationError: '',
+            })
         },
     }
 }

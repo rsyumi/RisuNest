@@ -30,5 +30,23 @@ describe('peer bidirectional settings surface', () => {
         expect(languageKorean.peerBidirectional?.backupCreated).toContain('무손실 백업')
         expect(languageKorean.peerBidirectional?.resume).toContain('재개')
     })
-})
 
+    it('locks overlapping controls for retained operations and can dismiss a terminal result', () => {
+        expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained')
+        expect(peerCloneSettingsSource).toContain('disabled={!bidirectionalEnabled || bidirectionalBusy || bidirectionalOperationRetained}')
+        expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained || !bidirectionalPairingInput')
+        expect(peerCloneSettingsSource).toContain('bidirectionalOperationRetained || device.revoked')
+        expect(peerCloneSettingsSource).toContain('bidirectionalController.acknowledge()')
+        expect(peerCloneSettingsSource).toContain('language.peerBidirectional.acknowledge')
+        expect(peerCloneSettingsSource).toContain("bidirectionalOperationPhase === 'sourceUnavailable'")
+        expect(languageEnglish.peerBidirectional.sourceUnavailable).toContain('other device')
+        expect(languageKorean.peerBidirectional?.sourceUnavailable).toContain('다른 기기')
+    })
+
+    it('localizes the losing backup side', () => {
+        expect(peerCloneSettingsSource).toContain('language.peerBidirectional.backupLocal')
+        expect(peerCloneSettingsSource).toContain('language.peerBidirectional.backupRemote')
+        expect(languageEnglish.peerBidirectional.backupLocal).toContain('this device')
+        expect(languageEnglish.peerBidirectional.backupRemote).toContain('other device')
+    })
+})

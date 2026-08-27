@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
     createPeerBidirectionalFacade,
     parsePeerBidirectionalUri,
+    PeerBidirectionalRefreshError,
     type PeerBidirectionalInvoke,
     type PeerBidirectionalMutationRuntime,
 } from './peerBidirectional'
@@ -112,6 +113,24 @@ describe('peer bidirectional facade', () => {
             operationId: 'operation-2',
         })
         expect(events).not.toContain('refresh:7')
+        expect(events.filter((event) => event.startsWith('refresh:'))).toHaveLength(0)
+        expect(events.at(-1)).toBe('release')
+    })
+
+    it('does not refresh the renderer for a stale generation result', async () => {
+        const events: string[] = []
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime(events),
+            invoke: (async () => ({
+                kind: 'stale',
+                operationId: 'operation-stale',
+                reason: 'remoteGeneration',
+            })) as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.sync(pairingUri)).resolves.toMatchObject({ kind: 'stale' })
+        expect(events.filter((event) => event.startsWith('refresh:'))).toHaveLength(0)
         expect(events.at(-1)).toBe('release')
     })
 
@@ -178,5 +197,46 @@ describe('peer bidirectional facade', () => {
         await facade.resolve('operation-4', 'local')
         expect(events).toContain('invoke:peer_bidirectional_resolve:operation-4:local')
         expect(events).toContain('refresh:9')
+    })
+
+    it('retains the exact resolve result and fence when renderer refresh fails', async () => {
+        const events: string[] = []
+        let failRefresh = true
+        const base = runtime(events)
+        const invoke = vi.fn(async () => ({
+            kind: 'updated' as const,
+            operationId: 'operation-refresh',
+            revision: 9,
+            remoteRevision: 6,
+            transferredObjects: 1,
+            transferredBytes: 8,
+            backups: [],
+        }))
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: {
+                ...base,
+                async acquirePersistentMutationFence(token) {
+                    const fence = await base.acquirePersistentMutationFence(token)
+                    return {
+                        ...fence,
+                        async refreshCommittedWorkingSet(revision) {
+                            events.push(`refresh:${revision}`)
+                            if (failRefresh) {
+                                failRefresh = false
+                                throw new Error('renderer refresh failed')
+                            }
+                        },
+                    }
+                },
+            },
+        })
+
+        await expect(facade.resolve('operation-refresh', 'local')).rejects.toBeInstanceOf(PeerBidirectionalRefreshError)
+        await expect(facade.resolve('operation-refresh', 'remote')).rejects.toThrow('different peer sync retry')
+        await expect(facade.resolve('operation-refresh', 'local')).resolves.toMatchObject({ kind: 'updated' })
+        expect(invoke).toHaveBeenCalledTimes(1)
+        expect(events.filter((event) => event === 'release')).toHaveLength(1)
     })
 })
