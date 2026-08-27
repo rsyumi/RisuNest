@@ -1,10 +1,10 @@
-#[cfg(desktop)]
-use super::PreparedCloneSession;
 use super::{
     http_stream::HttpRangeStream,
     protocol::{sha256_hex, CLONE_CHUNK_SIZE, MAX_MANIFEST_BYTES},
     PeerSyncError,
 };
+#[cfg(desktop)]
+use super::{LogicalDeltaObject, LogicalDeltaObjectSource, PreparedCloneSession};
 #[cfg(desktop)]
 use crate::asset_repository::PayloadCas;
 use serde::{Deserialize, Serialize};
@@ -550,11 +550,121 @@ pub(crate) struct TunnelOriginProbe {
 
 #[cfg(desktop)]
 struct LanShared {
-    session: PreparedCloneSession,
+    session: LanSession,
     manifest_bytes: Arc<[u8]>,
     claim: Mutex<Option<ClaimState>>,
     tunnel_probe: Mutex<Option<TunnelProbeState>>,
     devices: Mutex<BTreeMap<String, DeviceState>>,
+}
+
+#[cfg(desktop)]
+pub struct PreparedLogicalLanSession {
+    session_id: String,
+    source_device_id: String,
+    manifest_id: String,
+    manifest_bytes: Arc<[u8]>,
+    objects: BTreeMap<String, u64>,
+    source: Mutex<Box<dyn LogicalDeltaObjectSource + Send>>,
+}
+
+#[cfg(desktop)]
+impl PreparedLogicalLanSession {
+    pub fn new(
+        session_id: &str,
+        source_device_id: &str,
+        manifest_id: String,
+        manifest_bytes: impl Into<Arc<[u8]>>,
+        objects: Vec<LogicalDeltaObject>,
+        source: Box<dyn LogicalDeltaObjectSource + Send>,
+    ) -> Result<Self, PeerSyncError> {
+        if !is_canonical_uuid(session_id)
+            || !is_canonical_uuid(source_device_id)
+            || !is_lower_hex_256(&manifest_id)
+        {
+            return Err(PeerSyncError::Validation(
+                "logical LAN session identity is invalid".to_owned(),
+            ));
+        }
+        let manifest_bytes = manifest_bytes.into();
+        if manifest_bytes.len() > MAX_MANIFEST_BYTES || sha256_hex(&manifest_bytes) != manifest_id {
+            return Err(PeerSyncError::Validation(
+                "logical LAN manifest identity is invalid".to_owned(),
+            ));
+        }
+        let mut object_sizes = BTreeMap::new();
+        for object in objects {
+            validate_object_hash(&object.hash)?;
+            if object_sizes.insert(object.hash, object.size).is_some() {
+                return Err(PeerSyncError::Validation(
+                    "logical LAN manifest contains duplicate objects".to_owned(),
+                ));
+            }
+        }
+        let manifest = super::logical_delta::decode_logical_manifest(&manifest_bytes)
+            .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+        let manifest_objects = manifest
+            .objects
+            .into_iter()
+            .map(|object| (object.hash, object.size))
+            .collect::<BTreeMap<_, _>>();
+        if object_sizes != manifest_objects {
+            return Err(PeerSyncError::Validation(
+                "logical LAN objects differ from the canonical manifest".to_owned(),
+            ));
+        }
+        Ok(Self {
+            session_id: session_id.to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            manifest_id,
+            manifest_bytes,
+            objects: object_sizes,
+            source: Mutex::new(source),
+        })
+    }
+}
+
+#[cfg(desktop)]
+enum LanSession {
+    Clone(PreparedCloneSession),
+    Logical(PreparedLogicalLanSession),
+}
+
+#[cfg(desktop)]
+impl LanSession {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Clone(session) => &session.manifest().session_id,
+            Self::Logical(session) => &session.session_id,
+        }
+    }
+
+    fn manifest_id(&self) -> &str {
+        match self {
+            Self::Clone(session) => session.manifest_id(),
+            Self::Logical(session) => &session.manifest_id,
+        }
+    }
+
+    fn permission(&self) -> &'static str {
+        match self {
+            Self::Clone(_) => "clone-read",
+            Self::Logical(_) => "logical-read",
+        }
+    }
+
+    fn source_device_id(&self) -> Option<&str> {
+        match self {
+            Self::Clone(_) => None,
+            Self::Logical(session) => Some(&session.source_device_id),
+        }
+    }
+
+    fn object_size(&self, hash: &str) -> Option<u64> {
+        match self {
+            Self::Clone(session) => session.manifest().objects.get(hash).map(|value| value.size),
+            Self::Logical(session) => session.objects.get(hash).copied(),
+        }
+    }
 }
 
 #[cfg(desktop)]
@@ -609,10 +719,27 @@ pub struct LanCloneHost {
 #[cfg(desktop)]
 impl LanCloneHost {
     pub fn prepare(session: PreparedCloneSession) -> Self {
+        let manifest_bytes = Arc::from(session.manifest_bytes());
         Self {
             shared: Arc::new(LanShared {
-                manifest_bytes: Arc::from(session.manifest_bytes()),
-                session,
+                manifest_bytes,
+                session: LanSession::Clone(session),
+                claim: Mutex::new(None),
+                tunnel_probe: Mutex::new(None),
+                devices: Mutex::new(BTreeMap::new()),
+            }),
+            address: None,
+            stopped: None,
+            active_connection: None,
+            thread: None,
+        }
+    }
+
+    pub fn prepare_logical(session: PreparedLogicalLanSession) -> Self {
+        Self {
+            shared: Arc::new(LanShared {
+                manifest_bytes: Arc::clone(&session.manifest_bytes),
+                session: LanSession::Logical(session),
                 claim: Mutex::new(None),
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
@@ -677,7 +804,7 @@ impl LanCloneHost {
         self.stopped = Some(stopped);
         self.active_connection = Some(active_connection);
         Ok(LanPairing {
-            session_id: self.shared.session.manifest().session_id.clone(),
+            session_id: self.shared.session.session_id().to_owned(),
             manifest_id: self.shared.session.manifest_id().to_owned(),
             claim: hex::encode(claim),
         })
@@ -688,7 +815,10 @@ impl LanCloneHost {
     }
 
     pub fn manifest(&self) -> &super::CloneManifest {
-        self.shared.session.manifest()
+        match &self.shared.session {
+            LanSession::Clone(session) => session.manifest(),
+            LanSession::Logical(_) => panic!("logical LAN session has no clone manifest"),
+        }
     }
 
     pub(crate) fn control(&self) -> LanCloneHostControl {
@@ -716,7 +846,7 @@ impl LanCloneHost {
         });
         let path_prefix = format!(
             "/v1/sessions/{}/tunnel-check",
-            self.shared.session.manifest().session_id
+            self.shared.session.session_id()
         );
         let path = format!("{path_prefix}/{}", hex::encode(secret));
         Ok(TunnelOriginProbe {
@@ -1040,7 +1170,7 @@ fn handle_request(
     shared: &LanShared,
     stopped: &AtomicBool,
 ) -> Result<(), PeerSyncError> {
-    let prefix = format!("/v1/sessions/{}", shared.session.manifest().session_id);
+    let prefix = format!("/v1/sessions/{}", shared.session.session_id());
     let tunnel_probe_prefix = format!("{prefix}/tunnel-check/");
     if let Some(candidate) = request
         .url
@@ -1080,12 +1210,19 @@ fn handle_request(
     let Some(object) = request.url.strip_prefix(&object_prefix).map(str::to_owned) else {
         return respond_empty(stream, 404);
     };
-    if object.contains('/') || !shared.session.manifest().objects.contains_key(&object) {
+    if object.contains('/') || shared.session.object_size(&object).is_none() {
         return respond_empty(stream, 404);
     }
-    match request.method.as_str() {
-        "HEAD" => head(stream, shared, &object),
-        "GET" => range(stream, &request, shared, &object, stopped),
+    match (&shared.session, request.method.as_str()) {
+        (LanSession::Clone(_), "HEAD") => head(stream, shared, &object),
+        (LanSession::Clone(_), "GET") => range(stream, &request, shared, &object, stopped),
+        (LanSession::Logical(_), "HEAD") => head(stream, shared, &object),
+        (LanSession::Logical(_), "GET") => {
+            if request.range_count != 0 || request.range.is_some() || !request.body.is_empty() {
+                return respond_empty(stream, 400);
+            }
+            logical_object(stream, shared, &object, stopped)
+        }
         _ => respond_empty(stream, 405),
     }
 }
@@ -1166,7 +1303,8 @@ fn claim(
     let response = ClaimResponse {
         device_id: device_id.clone(),
         bearer: hex::encode(bearer),
-        permission: "clone-read",
+        permission: shared.session.permission(),
+        source_device_id: shared.session.source_device_id(),
     };
     shared.devices.lock().unwrap().insert(
         device_id,
@@ -1220,7 +1358,7 @@ fn progress(
     if progress
         .current_object
         .as_deref()
-        .is_some_and(|object| !shared.session.manifest().objects.contains_key(object))
+        .is_some_and(|object| shared.session.object_size(object).is_none())
     {
         return respond_empty(stream, 400);
     }
@@ -1234,13 +1372,20 @@ fn progress(
 
 #[cfg(desktop)]
 fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
-    let descriptor = &shared.session.manifest().objects[object];
-    write_response_head(
-        stream,
-        200,
-        &[("Accept-Ranges", "bytes"), ("ETag", &quoted(object))],
-        descriptor.size,
-    )
+    let size = shared
+        .session
+        .object_size(object)
+        .ok_or_else(|| PeerSyncError::Storage("session object descriptor is missing".to_owned()))?;
+    let range_header = match &shared.session {
+        LanSession::Clone(_) => Some(("Accept-Ranges", "bytes")),
+        LanSession::Logical(_) => None,
+    };
+    let etag = quoted(object);
+    let mut headers = vec![("ETag", etag.as_str())];
+    if let Some(header) = range_header {
+        headers.insert(0, header);
+    }
+    write_response_head(stream, 200, &headers, size)
 }
 
 #[cfg(desktop)]
@@ -1257,7 +1402,10 @@ fn range(
     let Some((start, end)) = request.range.as_deref().and_then(parse_range) else {
         return respond_empty(stream, 416);
     };
-    let descriptor = &shared.session.manifest().objects[object];
+    let LanSession::Clone(session) = &shared.session else {
+        return respond_empty(stream, 405);
+    };
+    let descriptor = &session.manifest().objects[object];
     let Some(chunk) = descriptor
         .chunks
         .iter()
@@ -1265,11 +1413,10 @@ fn range(
     else {
         return respond_empty(stream, 416);
     };
-    let physical = shared
-        .session
+    let physical = session
         .physical_hash(object)
         .ok_or_else(|| PeerSyncError::Storage("session object mapping is missing".to_owned()))?;
-    let cas = PayloadCas::new(shared.session.root())?;
+    let cas = PayloadCas::new(session.root())?;
     let mut file = cas
         .open_object(physical)?
         .ok_or_else(|| PeerSyncError::Storage("session object file is missing".to_owned()))?;
@@ -1290,6 +1437,30 @@ fn range(
     copy_exact_response(stream, &mut file, chunk.size, stopped)
 }
 
+#[cfg(desktop)]
+fn logical_object(
+    stream: &mut TcpStream,
+    shared: &LanShared,
+    object: &str,
+    stopped: &AtomicBool,
+) -> Result<(), PeerSyncError> {
+    let LanSession::Logical(session) = &shared.session else {
+        return respond_empty(stream, 405);
+    };
+    let size = *session.objects.get(object).ok_or_else(|| {
+        PeerSyncError::Storage("logical session object descriptor is missing".to_owned())
+    })?;
+    let mut source = session.source.lock().map_err(|error| {
+        PeerSyncError::Storage(format!("logical source mutex poisoned: {error}"))
+    })?;
+    let mut reader = source.open_object(&LogicalDeltaObject {
+        hash: object.to_owned(),
+        size,
+    })?;
+    write_response_head(stream, 200, &[("ETag", &quoted(object))], size)?;
+    copy_exact_response(stream, reader.as_mut(), size, stopped)
+}
+
 #[derive(Serialize, Deserialize)]
 struct ClaimRequest {
     claim: String,
@@ -1297,10 +1468,12 @@ struct ClaimRequest {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg(desktop)]
-struct ClaimResponse {
+struct ClaimResponse<'a> {
     device_id: String,
     bearer: String,
     permission: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_device_id: Option<&'a str>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1308,6 +1481,7 @@ struct ClaimResponseOwned {
     device_id: String,
     bearer: String,
     permission: String,
+    source_device_id: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1728,6 +1902,15 @@ fn copy_exact_response(
 #[cfg(all(test, desktop))]
 mod timeout_tests {
     use super::*;
+    use crate::peer_sync::{
+        logical_delta::{
+            build_logical_manifest, LogicalManifestBuilderInput, LogicalRecordEnvelope,
+            LogicalRecordLocator, ProjectedLogicalRecord,
+        },
+        LogicalDeltaObject, LogicalDeltaObjectSource,
+    };
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
 
     const TEST_SESSION_ID: &str = "00000000-0000-4000-8000-000000000000";
     const TEST_BEARER: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -1921,5 +2104,279 @@ mod timeout_tests {
         server.join().unwrap();
 
         assert!(matches!(error, PeerSyncError::Protocol(_)), "{error:?}");
+    }
+
+    struct LogicalFixtureSource(BTreeMap<String, Vec<u8>>);
+
+    impl LogicalDeltaObjectSource for LogicalFixtureSource {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            let bytes = self.0.get(&object.hash).ok_or_else(|| {
+                PeerSyncError::Storage("logical fixture object is absent".to_owned())
+            })?;
+            Ok(Box::new(Cursor::new(bytes.clone())))
+        }
+    }
+
+    #[test]
+    fn logical_session_reuses_claim_bearer_revoke_and_bounded_object_routes() {
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Plugin {
+                    storage_key: "plugin-key".to_owned(),
+                },
+                LogicalRecordEnvelope::Plugin {
+                    ordinal: 0,
+                    value: serde_json::json!({"value":"remote"}),
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        let record_hash = built.record_objects[0].object.hash.clone();
+        let record_bytes = built.record_objects[0].object.bytes.clone();
+        let session_id = "00000000-0000-4000-8000-000000000042";
+        let source_device_id = "00000000-0000-4000-8000-000000000043";
+        let logical = PreparedLogicalLanSession::new(
+            session_id,
+            source_device_id,
+            built.manifest_hash.clone(),
+            built.manifest_bytes.clone(),
+            built
+                .manifest
+                .objects
+                .iter()
+                .map(|object| LogicalDeltaObject {
+                    hash: object.hash.clone(),
+                    size: object.size,
+                })
+                .collect(),
+            Box::new(LogicalFixtureSource(BTreeMap::from([(
+                record_hash.clone(),
+                record_bytes.clone(),
+            )]))),
+        )
+        .unwrap();
+        let mut host = LanCloneHost::prepare_logical(logical);
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let mut client = LanLogicalDeltaClient::claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+
+        assert_eq!(client.source_device_id(), source_device_id);
+        assert_eq!(client.fetch_manifest().unwrap(), built.manifest_bytes);
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: record_hash,
+                size: record_bytes.len() as u64,
+            })
+            .unwrap();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert_eq!(received, record_bytes);
+
+        assert!(host.revoke(&client.device_id));
+        assert!(matches!(
+            client.fetch_manifest(),
+            Err(PeerSyncError::Transport(_))
+        ));
+        host.stop().unwrap();
+    }
+}
+
+#[cfg(desktop)]
+pub struct LanLogicalDeltaClient {
+    client: reqwest::blocking::Client,
+    control_timeout: Duration,
+    session_url: String,
+    pub device_id: String,
+    bearer: String,
+    source_device_id: String,
+    manifest_id: String,
+}
+
+#[cfg(desktop)]
+impl LanLogicalDeltaClient {
+    pub fn claim(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+    ) -> Result<Self, PeerSyncError> {
+        if endpoint.len() > MAX_URL_BYTES
+            || !is_canonical_uuid(session_id)
+            || !is_lower_hex_256(manifest_id)
+            || !is_lower_hex_256(claim)
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid logical delta pairing data".to_owned(),
+            ));
+        }
+        let endpoint = validate_lan_endpoint(endpoint)?;
+        let session_url = format!("{endpoint}/v1/sessions/{session_id}");
+        if session_url.len() > MAX_URL_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "logical delta session URL is too long".to_owned(),
+            ));
+        }
+        let control_timeout = CONTROL_REQUEST_TIMEOUT;
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(control_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(transport)?;
+        let response = client
+            .post(format!("{session_url}/claim"))
+            .json(&ClaimRequest {
+                claim: claim.to_owned(),
+            })
+            .timeout(control_timeout)
+            .send()
+            .map_err(transport)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(PeerSyncError::Transport(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        let mut body = Vec::new();
+        response
+            .take(MAX_CLAIM_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(transport)?;
+        if body.len() > MAX_CLAIM_RESPONSE_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "logical delta claim response is too large".to_owned(),
+            ));
+        }
+        let response: ClaimResponseOwned = serde_json::from_slice(&body)
+            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+        let source_device_id = response.source_device_id.ok_or_else(|| {
+            PeerSyncError::Protocol("logical delta source device identity is missing".to_owned())
+        })?;
+        if !is_canonical_uuid(&response.device_id)
+            || !is_canonical_uuid(&source_device_id)
+            || !is_lower_hex_256(&response.bearer)
+            || response.permission != "logical-read"
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid logical delta claim response".to_owned(),
+            ));
+        }
+        Ok(Self {
+            client,
+            control_timeout,
+            session_url,
+            device_id: response.device_id,
+            bearer: response.bearer,
+            source_device_id,
+            manifest_id: manifest_id.to_owned(),
+        })
+    }
+
+    pub fn source_device_id(&self) -> &str {
+        &self.source_device_id
+    }
+
+    pub fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
+        let response = self
+            .authorized(self.client.get(format!("{}/manifest", self.session_url)))
+            .send()
+            .map_err(transport)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(PeerSyncError::Transport(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        if response.content_length().unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES as u64 {
+            return Err(PeerSyncError::Protocol(
+                "logical delta manifest is too large".to_owned(),
+            ));
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                PeerSyncError::Protocol("logical delta manifest ETag is missing".to_owned())
+            })?;
+        let mut bytes = Vec::new();
+        response
+            .take(MAX_MANIFEST_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(transport)?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "logical delta manifest is too large".to_owned(),
+            ));
+        }
+        let received = sha256_hex(&bytes);
+        if received != self.manifest_id || etag != quoted(&self.manifest_id) {
+            return Err(PeerSyncError::StaleManifest {
+                expected: self.manifest_id.clone(),
+                received,
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn authorized(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        request
+            .bearer_auth(&self.bearer)
+            .timeout(self.control_timeout)
+    }
+}
+
+#[cfg(desktop)]
+impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
+    fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
+        validate_object_hash(&object.hash)?;
+        let response = self
+            .authorized(
+                self.client
+                    .get(format!("{}/objects/{}", self.session_url, object.hash)),
+            )
+            .send()
+            .map_err(transport)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(PeerSyncError::Transport(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        let content_length = response.content_length().ok_or_else(|| {
+            PeerSyncError::Protocol("logical delta object size header is missing".to_owned())
+        })?;
+        if content_length != object.size
+            || response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                != Some(quoted(&object.hash).as_str())
+        {
+            return Err(PeerSyncError::Protocol(
+                "logical delta object response identity is invalid".to_owned(),
+            ));
+        }
+        Ok(Box::new(response))
     }
 }

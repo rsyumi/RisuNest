@@ -220,7 +220,7 @@ function isAllowedPublicHttpsHost(hostname: string): boolean {
         && hostname.toLowerCase() !== 'localhost'
 }
 
-function endpointFor(sessionId: string, value: string): string {
+export function parsePeerCloneEndpoint(value: string): string {
     if (value.length === 0 || value.length > maximumEndpointLength) {
         return invalidPairingUri()
     }
@@ -281,7 +281,7 @@ export function parsePeerCloneUri(value: string): PeerClonePairing {
     }
     if (claim.length > maximumClaimLength || !claimPattern.test(claim)) return invalidPairingUri()
     return {
-        endpoint: endpointFor(sessionId, endpointValue),
+        endpoint: parsePeerCloneEndpoint(endpointValue),
         sessionId,
         manifestId,
         claim,

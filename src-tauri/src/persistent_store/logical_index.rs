@@ -69,6 +69,8 @@ pub(crate) struct LogicalIndexBuildRequest {
     pub(crate) lease: Option<String>,
 }
 
+pub(crate) const PRODUCT_LOGICAL_LIBRARY_ID: &str = "risunest-default-library-v1";
+
 #[derive(Clone, Debug)]
 struct PageSource {
     page_index: u64,
@@ -316,6 +318,25 @@ pub(super) fn cleanup_abandoned_logical_staging(connection: &mut Connection) -> 
 }
 
 impl PersistentStore {
+    pub(crate) fn seal_or_initialize_active_logical_generation(
+        &mut self,
+        cas: &PayloadCas,
+    ) -> StoreResult<BuiltIndexedLogicalManifest> {
+        if logical_index_is_active(&self.connection)? {
+            return self.seal_active_logical_generation(cas);
+        }
+        self.rebuild_logical_index(
+            cas,
+            LogicalIndexBuildRequest {
+                library_id: PRODUCT_LOGICAL_LIBRARY_ID.to_owned(),
+                generation_id: format!("local-{}", uuid::Uuid::new_v4()),
+                generation_sequence: "0".to_owned(),
+                parent_generation_id: None,
+                lease: None,
+            },
+        )
+    }
+
     pub(crate) fn rebuild_logical_index(
         &mut self,
         cas: &PayloadCas,

@@ -8,6 +8,8 @@ mod client;
 #[cfg(desktop)]
 pub(crate) mod commands;
 #[cfg(desktop)]
+pub(crate) mod delta_commands;
+#[cfg(desktop)]
 mod host;
 mod http_stream;
 mod lan;

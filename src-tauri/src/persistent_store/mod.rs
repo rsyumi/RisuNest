@@ -8,9 +8,12 @@ pub(crate) mod kei;
 pub(crate) mod logical_delta_source;
 mod logical_delta_target;
 #[allow(unused_imports)]
-pub(crate) use logical_delta_target::establish_logical_common_base;
+pub(crate) use logical_delta_target::{
+    establish_logical_common_base, PersistentLogicalDeltaTarget,
+};
 #[allow(dead_code)]
 mod logical_index;
+pub(crate) use logical_index::PRODUCT_LOGICAL_LIBRARY_ID;
 #[allow(dead_code)]
 mod logical_schema;
 mod owner_projection;

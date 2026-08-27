@@ -487,6 +487,8 @@ pub fn run() {
                     app_data_dir.clone(),
                 ),
             );
+            #[cfg(desktop)]
+            app.manage(peer_sync::delta_commands::PeerDeltaCommandState::default());
             #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
@@ -574,6 +576,20 @@ pub fn run() {
             peer_sync::android_commands::peer_clone_android_finalize,
             #[cfg(target_os = "android")]
             peer_sync::android_commands::peer_clone_android_release,
+            #[cfg(desktop)]
+            peer_sync::delta_commands::peer_delta_capabilities,
+            #[cfg(desktop)]
+            peer_sync::delta_commands::peer_delta_prepare,
+            #[cfg(desktop)]
+            peer_sync::delta_commands::peer_delta_start,
+            #[cfg(desktop)]
+            peer_sync::delta_commands::peer_delta_status,
+            #[cfg(desktop)]
+            peer_sync::delta_commands::peer_delta_stop,
+            #[cfg(desktop)]
+            peer_sync::delta_commands::peer_delta_revoke,
+            #[cfg(desktop)]
+            peer_sync::delta_commands::peer_delta_pull,
             oauth_login,
             native_tokenizer::tokenize_batch,
             native_media::native_media_write_inlay_image,

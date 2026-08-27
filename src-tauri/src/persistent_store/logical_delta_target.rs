@@ -4,8 +4,9 @@ use super::{
 };
 use crate::{
     asset_repository::{
+        job_pins::{CasObjectRole, DurableCasJob},
         owner_manifest_codec::{decode_owner_manifest, encode_owner_manifest},
-        PayloadCas,
+        PayloadCas, PreparedPayload,
     },
     peer_sync::{
         logical_delta::{
@@ -23,6 +24,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{Read, Write},
@@ -73,6 +75,7 @@ pub(crate) struct PersistentLogicalDeltaTarget<'a> {
     remote_manifest: LogicalManifest,
     remote_manifest_hash: String,
     staging_root: PathBuf,
+    durable_job: Option<&'a RefCell<DurableCasJob>>,
 }
 
 pub(crate) enum PersistentLogicalDeltaStage {
@@ -97,7 +100,7 @@ pub(crate) enum PersistentLogicalDeltaStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct PeerBase {
+pub(crate) struct PeerBase {
     generation_id: String,
     manifest_hash: String,
     generation_sequence: String,
@@ -271,6 +274,52 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         remote_manifest_bytes: &[u8],
         staging_root: &Path,
     ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_durable_job(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        durable_job: &'a RefCell<DurableCasJob>,
+    ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            Some(durable_job),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_inner(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        durable_job: Option<&'a RefCell<DurableCasJob>>,
+    ) -> Result<Self, PeerSyncError> {
         if peer_id.is_empty() || library_id.is_empty() || local_generation_id.is_empty() {
             return validation("logical delta target identities must be nonempty");
         }
@@ -281,7 +330,14 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         }
         let remote_manifest_hash = hash_logical_manifest(&remote_manifest)
             .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
-        let prepared = cas.prepare_bytes(remote_manifest_bytes)?;
+        let prepared = match durable_job {
+            Some(job) => job.borrow_mut().prepare_bytes(
+                cas,
+                remote_manifest_bytes,
+                CasObjectRole::DirectObject,
+            )?,
+            None => cas.prepare_bytes(remote_manifest_bytes)?,
+        };
         if prepared.content_hash != remote_manifest_hash
             || prepared.byte_size != remote_manifest_bytes.len() as u64
         {
@@ -296,7 +352,37 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             remote_manifest,
             remote_manifest_hash,
             staging_root: staging_root.to_path_buf(),
+            durable_job,
         })
+    }
+
+    fn prepare_bytes(&self, bytes: &[u8]) -> Result<PreparedPayload, PeerSyncError> {
+        match self.durable_job {
+            Some(job) => {
+                Ok(job
+                    .borrow_mut()
+                    .prepare_bytes(self.cas, bytes, CasObjectRole::DirectObject)?)
+            }
+            None => Ok(self.cas.prepare_bytes(bytes)?),
+        }
+    }
+
+    fn prepare_reader(&self, reader: &mut impl Read) -> Result<PreparedPayload, PeerSyncError> {
+        match self.durable_job {
+            Some(job) => Ok(job.borrow_mut().prepare_reader(
+                self.cas,
+                reader,
+                CasObjectRole::DirectObject,
+            )?),
+            None => Ok(self.cas.prepare_reader(reader)?),
+        }
+    }
+
+    fn seal_durable_job(&mut self) -> Result<(), PeerSyncError> {
+        if let Some(job) = self.durable_job {
+            job.borrow_mut().seal(self.store, unix_millis()?)?;
+        }
+        Ok(())
     }
 
     fn validate_plan_identity(&self, plan: &ReadyLogicalDeltaPlan) -> Result<(), PeerSyncError> {
@@ -366,6 +452,44 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             )
             .optional()
             .map_err(sql_error)
+    }
+
+    pub(crate) fn has_common_base(&self) -> Result<bool, PeerSyncError> {
+        Ok(self.common_base()?.is_some())
+    }
+
+    pub(crate) fn build_ready_plan(
+        &self,
+        expected_local_revision: i64,
+    ) -> Result<ReadyLogicalDeltaPlan, PeerSyncError> {
+        if expected_local_revision < 0 {
+            return validation("logical delta expected local revision must be nonnegative");
+        }
+        let base = self.common_base()?.ok_or_else(|| {
+            PeerSyncError::Validation(
+                "logical delta target has no durable common base for this peer".to_owned(),
+            )
+        })?;
+        let base_manifest = self.load_common_base_manifest(&base)?;
+        let local_manifest =
+            self.load_local_manifest(&self.local_generation_id, expected_local_revision, true)?;
+        validate_manifest_object_size_parity([
+            &base_manifest,
+            &local_manifest,
+            &self.remote_manifest,
+        ])?;
+        let (apply, preserve_local_keys, candidate_object_hashes) =
+            derive_exact_three_way_plan(&base_manifest, &local_manifest, &self.remote_manifest)?;
+        Ok(ReadyLogicalDeltaPlan {
+            expected_local_revision,
+            expected_base_manifest_hash: base.manifest_hash,
+            expected_remote_generation: self.remote_manifest.generation.clone(),
+            apply,
+            preserve_local_keys,
+            candidate_object_hashes,
+            next_base_manifest_hash: self.remote_manifest_hash.clone(),
+            next_base_generation_sequence: self.remote_manifest.generation_sequence.clone(),
+        })
     }
 
     fn remote_base(&self) -> PeerBase {
@@ -614,7 +738,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
     fn promote_exact(&self, hash: &str, bytes: &[u8]) -> Result<(), PeerSyncError> {
         let expected_size = self.object_size(hash)?;
         verify_bytes(bytes, hash, expected_size)?;
-        let prepared = self.cas.prepare_bytes(bytes)?;
+        let prepared = self.prepare_bytes(bytes)?;
         if prepared.content_hash != hash || prepared.byte_size != expected_size {
             return validation("logical delta CAS promotion changed object identity");
         }
@@ -629,7 +753,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         let expected_size = self.object_size(hash)?;
         if let Some(path) = staged_objects.get(hash) {
             let mut file = fs::File::open(path)?;
-            let prepared = self.cas.prepare_reader(&mut file)?;
+            let prepared = self.prepare_reader(&mut file)?;
             if prepared.content_hash != hash || prepared.byte_size != expected_size {
                 return validation("logical delta streamed CAS promotion changed object identity");
             }
@@ -1221,6 +1345,8 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                     }
                 }
 
+                let cas = self.cas;
+                let durable_job = self.durable_job;
                 let transaction = self
                     .store
                     .connection
@@ -1235,7 +1361,14 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                     false,
                 )
                 .map_err(storage_error)?;
-                let prepared = self.cas.prepare_bytes(&built.manifest_bytes)?;
+                let prepared = match durable_job {
+                    Some(job) => job.borrow_mut().prepare_bytes(
+                        cas,
+                        &built.manifest_bytes,
+                        CasObjectRole::DirectObject,
+                    )?,
+                    None => cas.prepare_bytes(&built.manifest_bytes)?,
+                };
                 if prepared.content_hash != built.manifest_hash
                     || prepared.byte_size != built.manifest_bytes.len() as u64
                 {
@@ -1291,6 +1424,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
         {
             return validation("logical delta activation differs from its verified remote base");
         }
+        self.seal_durable_job()?;
         match stage {
             PersistentLogicalDeltaStage::AlreadyActive { revision, changed } => {
                 let original_revision = if *changed {
@@ -4317,6 +4451,12 @@ mod tests {
             &staging_root,
         )
         .expect("open staged target");
+        assert_eq!(
+            target
+                .build_ready_plan(0)
+                .expect("derive authoritative no-op plan"),
+            plan
+        );
         let mut missing_preserve = plan.clone();
         missing_preserve.preserve_local_keys =
             vec![encode_logical_record_key(&LogicalRecordLocator::Plugin {
