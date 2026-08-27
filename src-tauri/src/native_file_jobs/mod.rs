@@ -972,11 +972,8 @@ impl NativeFileJobState {
                     store,
                 }
             }
-            NativeFileJobStartRequest::PrepareContentImport { .. } => {
-                return Err(NativeJobError::new(
-                    "capability-unavailable",
-                    "native content import is not active",
-                ));
+            request @ NativeFileJobStartRequest::PrepareContentImport { .. } => {
+                return self.start_content(request);
             }
             NativeFileJobStartRequest::KeiBackupUpload {
                 lease,

@@ -144,6 +144,7 @@ import {
     importCharacter,
     importCharacterCardSpec,
     importCharacterProcess,
+    isNativeCharacterContentImportEnabled,
     mapPreparedNativeCharacterCard,
     type CharacterCardV2Risu,
 } from './characterCards'
@@ -164,6 +165,10 @@ describe('character card additions', () => {
             mocks.database.characters.push(character)
             return character.chaId
         })
+    })
+
+    it('enables the verified native character content route', () => {
+        expect(isNativeCharacterContentImportEnabled()).toBe(true)
     })
 
     it('commits a complete detached legacy card before returning its stable index', async () => {

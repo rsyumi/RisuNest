@@ -34,7 +34,7 @@ export const hubURL = isNodeServer
     ? NIGHTLY_HUB_URL 
     : EXTERNAL_HUB_URL;
 
-const nativeCharacterContentImportEnabled = false
+const nativeCharacterContentImportEnabled = true
 
 export function isNativeCharacterContentImportEnabled(): boolean {
     return nativeCharacterContentImportEnabled
