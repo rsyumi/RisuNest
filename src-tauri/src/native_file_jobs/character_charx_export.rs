@@ -340,6 +340,7 @@ fn export_character_charx_with_reader(
         warning_codes: Vec::new(),
         handoff_path,
         recovery_path: None,
+        publication: None,
     })
 }
 
