@@ -16,7 +16,7 @@ use crate::{
     lossless_backup::create_and_verify_lossless_backup_v1_report,
     persistent_store::{
         LogicalDeltaConflictKind, LogicalDeltaConflictPolicy, LogicalDeltaPlanResolution,
-        PersistentLogicalDeltaTarget, PersistentStore, SyncGenerationIdentity,
+        PersistentLogicalDeltaTarget, PersistentStore, StoreError, SyncGenerationIdentity,
         PRODUCT_LOGICAL_LIBRARY_ID,
     },
 };
@@ -1087,6 +1087,38 @@ where
             reason: PeerBidirectionalStaleReason::LocalRevision,
         });
     }
+    let common_base = store
+        .sync_device_common_base_identity(&context.library_id, &context.credential.source_device_id)
+        .map_err(store_error)?;
+    if common_base.as_ref() != Some(&context.previous_shared) {
+        journal.abandon(operation_id)?;
+        return Ok(ResumeLocalCommittedOutcome::Stale {
+            operation_id: operation_id.to_owned(),
+            reason: PeerBidirectionalStaleReason::CommonBase,
+        });
+    }
+    let acknowledgement = match store
+        .sync_device_ack_state(&context.library_id, &context.credential.source_device_id)
+    {
+        Ok(acknowledgement) => acknowledgement,
+        Err(StoreError::Validation { .. }) => {
+            journal.abandon(operation_id)?;
+            return Ok(ResumeLocalCommittedOutcome::Stale {
+                operation_id: operation_id.to_owned(),
+                reason: PeerBidirectionalStaleReason::DeviceAcknowledgement,
+            });
+        }
+        Err(error) => return Err(store_error(error)),
+    };
+    if acknowledgement.shared_identity != context.previous_shared
+        || acknowledgement.local_identity != context.previous_local
+    {
+        journal.abandon(operation_id)?;
+        return Ok(ResumeLocalCommittedOutcome::Stale {
+            operation_id: operation_id.to_owned(),
+            reason: PeerBidirectionalStaleReason::DeviceAcknowledgement,
+        });
+    }
     let active = store
         .seal_or_initialize_active_logical_generation(cas)
         .map_err(store_error)?;
@@ -1112,6 +1144,13 @@ where
             return Ok(ResumeLocalCommittedOutcome::SourceUnavailable {
                 operation_id: operation_id.to_owned(),
                 committed_revision,
+            });
+        }
+        Err(PeerSyncError::ActivationConflict { .. } | PeerSyncError::StaleManifest { .. }) => {
+            journal.abandon(operation_id)?;
+            return Ok(ResumeLocalCommittedOutcome::Stale {
+                operation_id: operation_id.to_owned(),
+                reason: PeerBidirectionalStaleReason::RemoteGeneration,
             });
         }
         Err(error) => return Err(error),
@@ -1575,6 +1614,7 @@ mod tests {
             .unwrap();
         let operation_id = "123e4567-e89b-42d3-a456-426614174013";
         let mut retained_context = context(operation_id);
+        retained_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
         retained_context.credential.source_device_id = peer_id.to_owned();
         retained_context.previous_shared = shared.clone();
         retained_context.previous_local = shared.clone();
@@ -1623,6 +1663,147 @@ mod tests {
                 local_identity: shared,
             }
         );
+
+        let outcome = resume_bidirectional_local_committed_with_remote(
+            &mut reopened,
+            &cas,
+            directory.path(),
+            operation_id,
+            |_context, _revision, _shared, _manifest| {
+                Err(PeerSyncError::ActivationConflict {
+                    expected: Some("before".to_owned()),
+                    actual: Some("after".to_owned()),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ResumeLocalCommittedOutcome::Stale {
+                operation_id: operation_id.to_owned(),
+                reason: PeerBidirectionalStaleReason::RemoteGeneration,
+            }
+        );
+        assert!(journal.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn resume_checks_the_exact_common_base_and_device_ack_before_remote_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let shared = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        let peer_id = "123e4567-e89b-42d3-a456-426614174022";
+        establish_logical_common_base(
+            &mut store,
+            &cas,
+            peer_id,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &base.manifest.generation,
+            0,
+            &base.manifest_bytes,
+        )
+        .unwrap();
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    PRODUCT_LOGICAL_LIBRARY_ID,
+                    peer_id,
+                    shared.clone(),
+                    0,
+                )
+                .unwrap(),
+                0,
+            )
+            .unwrap();
+        let journal = PeerBidirectionalOperationJournal::new(directory.path());
+
+        let common_base_operation_id = "123e4567-e89b-42d3-a456-426614174023";
+        let mut common_base_context = context(common_base_operation_id);
+        common_base_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        common_base_context.credential.source_device_id = peer_id.to_owned();
+        common_base_context.previous_shared = generation("stale-base", "0", 'a');
+        common_base_context.previous_local = shared.clone();
+        journal
+            .store(&PeerBidirectionalDurableOperation::LocalCommitted {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: common_base_context,
+                committed_revision: 0,
+                shared_generation: shared.clone(),
+                changed: false,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backups: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            resume_bidirectional_local_committed_with_remote(
+                &mut store,
+                &cas,
+                directory.path(),
+                common_base_operation_id,
+                |_context, _revision, _shared, _manifest| {
+                    panic!("stale common base must not contact the remote source")
+                },
+            )
+            .unwrap(),
+            ResumeLocalCommittedOutcome::Stale {
+                operation_id: common_base_operation_id.to_owned(),
+                reason: PeerBidirectionalStaleReason::CommonBase,
+            }
+        );
+
+        let device_ack_operation_id = "123e4567-e89b-42d3-a456-426614174024";
+        assert_eq!(
+            store
+                .sync_device_common_base_identity(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+                .unwrap(),
+            Some(shared.clone())
+        );
+        store
+            .revoke_sync_device(PRODUCT_LOGICAL_LIBRARY_ID, peer_id, &shared)
+            .unwrap();
+        let mut device_ack_context = context(device_ack_operation_id);
+        device_ack_context.library_id = PRODUCT_LOGICAL_LIBRARY_ID.to_owned();
+        device_ack_context.credential.source_device_id = peer_id.to_owned();
+        device_ack_context.previous_shared = shared.clone();
+        device_ack_context.previous_local = shared.clone();
+        journal
+            .store(&PeerBidirectionalDurableOperation::LocalCommitted {
+                schema: OPERATION_SCHEMA.to_owned(),
+                context: device_ack_context,
+                committed_revision: 0,
+                shared_generation: shared,
+                changed: false,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backups: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            resume_bidirectional_local_committed_with_remote(
+                &mut store,
+                &cas,
+                directory.path(),
+                device_ack_operation_id,
+                |_context, _revision, _shared, _manifest| {
+                    panic!("stale device acknowledgement must not contact the remote source")
+                },
+            )
+            .unwrap(),
+            ResumeLocalCommittedOutcome::Stale {
+                operation_id: device_ack_operation_id.to_owned(),
+                reason: PeerBidirectionalStaleReason::DeviceAcknowledgement,
+            }
+        );
+        assert!(journal.load().unwrap().is_none());
     }
 
     #[test]

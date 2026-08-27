@@ -1524,7 +1524,10 @@ fn bidirectional_remote_apply(
         .expect("checked bidirectional session");
     match control.remote_apply(session, request) {
         Ok(receipt) if receipt.is_valid() => respond_json(stream, 200, &receipt),
-        Ok(_) | Err(_) => respond_empty(stream, 409),
+        Err(PeerSyncError::ActivationConflict { .. } | PeerSyncError::StaleManifest { .. }) => {
+            respond_empty(stream, 409)
+        }
+        Ok(_) | Err(_) => respond_empty(stream, 500),
     }
 }
 
@@ -2590,6 +2593,7 @@ mod timeout_tests {
     #[derive(Default)]
     struct BidirectionalControlFixture {
         registrations: Mutex<Vec<LanBidirectionalSession>>,
+        remote_apply_error: Mutex<Option<PeerSyncError>>,
     }
 
     impl LanBidirectionalControl for BidirectionalControlFixture {
@@ -2607,6 +2611,9 @@ mod timeout_tests {
             _session: LanBidirectionalSession,
             request: LanBidirectionalRemoteApplyRequest,
         ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+            if let Some(error) = self.remote_apply_error.lock().unwrap().take() {
+                return Err(error);
+            }
             Ok(LanBidirectionalRemoteApplyReceipt {
                 committed_revision: request.expected_source_revision,
                 committed_generation: request.expected_source_generation,
@@ -2732,6 +2739,42 @@ mod timeout_tests {
             })
             .unwrap();
         assert_eq!(accepted.committed_generation, generation);
+
+        *control.remote_apply_error.lock().unwrap() = Some(PeerSyncError::ActivationConflict {
+            expected: Some("before".to_owned()),
+            actual: Some("after".to_owned()),
+        });
+        assert!(matches!(
+            client.request_remote_apply(LanBidirectionalRemoteApplyRequest {
+                operation_id: "00000000-0000-4000-8000-000000000076".to_owned(),
+                source_endpoint: endpoint.clone(),
+                source_session_id: pairing.session_id.clone(),
+                source_manifest_id: pairing.manifest_id.clone(),
+                source_claim: pairing.claim.clone(),
+                expected_source_revision: 0,
+                expected_source_generation: generation.clone(),
+                expected_common_base_manifest_hash: pairing.manifest_id.clone(),
+                backup_losing_side: false,
+            }),
+            Err(PeerSyncError::ActivationConflict { .. })
+        ));
+
+        *control.remote_apply_error.lock().unwrap() =
+            Some(PeerSyncError::Storage("fixture failure".to_owned()));
+        assert!(matches!(
+            client.request_remote_apply(LanBidirectionalRemoteApplyRequest {
+                operation_id: "00000000-0000-4000-8000-000000000077".to_owned(),
+                source_endpoint: endpoint.clone(),
+                source_session_id: pairing.session_id.clone(),
+                source_manifest_id: pairing.manifest_id.clone(),
+                source_claim: pairing.claim.clone(),
+                expected_source_revision: 0,
+                expected_source_generation: generation.clone(),
+                expected_common_base_manifest_hash: pairing.manifest_id.clone(),
+                backup_losing_side: false,
+            }),
+            Err(PeerSyncError::Transport(message)) if message.contains("500")
+        ));
 
         let resumed = LanBidirectionalLogicalClient::resume(client.credential()).unwrap();
         assert_eq!(resumed.device_id(), target_device_id);
@@ -3519,6 +3562,12 @@ impl LanBidirectionalLogicalClient {
             )
             .send()
             .map_err(transport)?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(PeerSyncError::ActivationConflict {
+                expected: None,
+                actual: None,
+            });
+        }
         if response.status() != reqwest::StatusCode::OK {
             return Err(PeerSyncError::Transport(format!(
                 "HTTP {}",
