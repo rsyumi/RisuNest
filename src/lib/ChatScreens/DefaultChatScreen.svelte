@@ -538,7 +538,12 @@
     }
 
     async function openScreenshotDialog() {
-        if (screenshotOpening || screenshotRunning) return
+        if (
+            screenshotOpening
+            || screenshotRunning
+            || screenshotDialogOpen
+            || screenshotSourceLease
+        ) return
         screenshotError = ''
         screenshotCompletedTurns = 0
         const source = currentCharacter

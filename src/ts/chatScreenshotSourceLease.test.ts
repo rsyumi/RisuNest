@@ -171,6 +171,47 @@ describe('chat screenshot source lease', () => {
         expect(source.release).toHaveBeenCalledTimes(1)
     })
 
+    it('pins the current root when unrelated data advances after the flush', async () => {
+        const source = harness([
+            { role: 'user', data: 'same conversation', chatId: 'one' },
+        ])
+        const originalRead = source.lease.readConversationWindow.bind(source.lease)
+        const originalReadRoot = source.dependencies.store.readRoot.bind(
+            source.dependencies.store,
+        )
+        const revisionEightLease = {
+            ...source.lease,
+            revision: 8,
+            readConversationWindow: vi.fn(async (input) => {
+                const result = await originalRead(input)
+                return result ? { ...result, revision: 8 } : null
+            }),
+        } as unknown as PersistentRevisionLease
+        source.dependencies.flushPendingData.mockImplementation(async () => {
+            source.dependencies.store.readRoot = vi.fn(async () => ({
+                ...await originalReadRoot(),
+                revision: 8,
+            }))
+            source.dependencies.store.acquireRevision = vi.fn(
+                async (revision) => {
+                    expect(revision).toBe(8)
+                    return revisionEightLease
+                },
+            )
+        })
+
+        const lease = await openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)
+
+        expect(source.session.storeRevision).toBe(7)
+        expect(lease.snapshot.revision).toBe(8)
+        expect((await lease.createJob(1, 1)).messages[0].data).toBe('same conversation')
+        expect(source.release).toHaveBeenCalledTimes(1)
+    })
+
     it('does not retarget the capture after navigation replaces the active session', async () => {
         const source = harness([
             { role: 'user', data: 'pinned conversation', chatId: 'one' },
