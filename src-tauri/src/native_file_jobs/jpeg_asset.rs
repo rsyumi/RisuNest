@@ -17,7 +17,7 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
     rename_all = "kebab-case",
     rename_all_fields = "camelCase"
 )]
-pub(super) enum JpegAssetDestination {
+pub(crate) enum JpegAssetDestination {
     CurrentCharacterImage { character_id: String },
 }
 
@@ -358,10 +358,11 @@ mod tests {
     fn open_fixture() -> (tempfile::TempDir, PersistentStore, String, AssetOwnerHead) {
         let directory = tempfile::tempdir().expect("create temp directory");
         let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
-        let mut database = fixture();
-        let characters = database["characters"]
-            .as_array_mut()
-            .expect("fixture characters");
+        let database = fixture();
+        let mut characters = database["characters"]
+            .as_array()
+            .expect("fixture characters")
+            .clone();
         let character_id = characters[0]["chaId"]
             .as_str()
             .expect("fixture character ID")
@@ -384,7 +385,7 @@ mod tests {
             )
             .expect("stage presets");
         store
-            .replace_add_characters(&staging.staging_id, characters)
+            .replace_add_characters(&staging.staging_id, &characters)
             .expect("stage characters");
         store
             .replace_commit(&staging.staging_id, Some(0))
