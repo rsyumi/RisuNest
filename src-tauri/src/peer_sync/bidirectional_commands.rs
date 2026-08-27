@@ -1,6 +1,9 @@
 use super::{
     execute_logical_delta_pull,
-    lan::{LanBidirectionalGeneration, LanBidirectionalLogicalCredential},
+    lan::{
+        LanBidirectionalGeneration, LanBidirectionalLogicalCredential,
+        LanBidirectionalRemoteApplyReceipt,
+    },
     logical_delta::{decode_logical_manifest, hash_logical_manifest},
     LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource, PeerSyncError,
 };
@@ -495,6 +498,159 @@ fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    operation_id: &str,
+    peer_id: &str,
+    expected_revision: i64,
+    expected_common_base_manifest_hash: &str,
+    expected_shared_generation: LanBidirectionalGeneration,
+    shared_manifest_bytes: &[u8],
+    shared_source: &mut S,
+    backup_losing_side: bool,
+) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+    if uuid::Uuid::parse_str(operation_id)
+        .map(|value| value.to_string() != operation_id)
+        .unwrap_or(true)
+    {
+        return Err(PeerSyncError::Validation(
+            "bidirectional remote operation ID is invalid".to_owned(),
+        ));
+    }
+    if backup_losing_side {
+        return Err(PeerSyncError::Protocol(
+            "bidirectional remote conflict backup is not implemented".to_owned(),
+        ));
+    }
+    let shared_manifest = decode_logical_manifest(shared_manifest_bytes)
+        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+    let shared_manifest_hash = hash_logical_manifest(&shared_manifest)
+        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+    if shared_manifest.library_id != PRODUCT_LOGICAL_LIBRARY_ID
+        || shared_manifest.generation != expected_shared_generation.generation_id
+        || shared_manifest_hash != expected_shared_generation.manifest_hash
+        || shared_manifest.generation_sequence != expected_shared_generation.generation_sequence
+    {
+        return Err(PeerSyncError::Validation(
+            "bidirectional shared generation differs from its verified manifest".to_owned(),
+        ));
+    }
+    let previous = store
+        .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+        .map_err(store_error)?;
+    if previous.shared_identity.manifest_hash != expected_common_base_manifest_hash {
+        return Err(PeerSyncError::ActivationConflict {
+            expected: Some(expected_common_base_manifest_hash.to_owned()),
+            actual: Some(previous.shared_identity.manifest_hash),
+        });
+    }
+    let local = store
+        .seal_or_initialize_active_logical_generation(cas)
+        .map_err(store_error)?;
+    let durable_job_id = uuid::Uuid::new_v4().to_string();
+    let job = RefCell::new(DurableCasJob::begin(
+        app_root,
+        &durable_job_id,
+        CasJobKind::LogicalDeltaTarget,
+        now_millis()?,
+    )?);
+    let mut target = match PersistentLogicalDeltaTarget::new_p5_remote_shared_ack_with_durable_job(
+        store,
+        cas,
+        peer_id,
+        PRODUCT_LOGICAL_LIBRARY_ID,
+        &local.manifest.generation,
+        shared_manifest_bytes,
+        &app_root.join("peer-bidirectional").join("staging"),
+        &job,
+        LogicalDeltaConflictPolicy::PreferRemote,
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(error);
+        }
+    };
+    let plan = match target.resolve_authoritative_plan(expected_revision) {
+        Ok(LogicalDeltaPlanResolution::Ready { plan, .. }) => plan,
+        Ok(LogicalDeltaPlanResolution::Conflict { .. }) => {
+            drop(target);
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(PeerSyncError::Protocol(
+                "bidirectional remote winner did not resolve its conflicts".to_owned(),
+            ));
+        }
+        Err(error) => {
+            drop(target);
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(error);
+        }
+    };
+    let local_hashes = local
+        .manifest
+        .objects
+        .iter()
+        .map(|object| object.hash.clone())
+        .collect::<BTreeSet<_>>();
+    let shared_sizes = shared_manifest
+        .objects
+        .iter()
+        .map(|object| (object.hash.clone(), object.size))
+        .collect::<BTreeMap<_, _>>();
+    let mut measured_source = MeasuredLogicalDeltaSource::new(shared_source);
+    let activation = execute_logical_delta_pull(
+        &plan,
+        &local_hashes,
+        cas,
+        &shared_sizes,
+        &mut measured_source,
+        &mut target,
+    );
+    let (transferred_objects, transferred_bytes) = measured_source.totals();
+    drop(target);
+    let committed_revision = match activation {
+        Ok(LogicalDeltaActivation::Activated { revision })
+        | Ok(LogicalDeltaActivation::AlreadyActive { revision }) => revision,
+        Ok(LogicalDeltaActivation::Conflict {
+            actual_revision, ..
+        }) => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(PeerSyncError::ActivationConflict {
+                expected: Some(expected_revision.to_string()),
+                actual: Some(actual_revision.to_string()),
+            });
+        }
+        Err(error) => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(error);
+        }
+    };
+    let acknowledged = store
+        .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, peer_id)
+        .map_err(store_error)?;
+    let expected_shared = SyncGenerationIdentity {
+        generation_id: expected_shared_generation.generation_id.clone(),
+        manifest_hash: expected_shared_generation.manifest_hash.clone(),
+        generation_sequence: expected_shared_generation.generation_sequence.clone(),
+    };
+    if acknowledged.shared_identity != expected_shared {
+        return Err(PeerSyncError::Storage(
+            "bidirectional remote acknowledgement differs from shared generation".to_owned(),
+        ));
+    }
+    job.borrow_mut().release(CasReleaseOutcome::Committed)?;
+    Ok(LanBidirectionalRemoteApplyReceipt {
+        committed_revision,
+        committed_generation: expected_shared_generation,
+        transferred_objects,
+        transferred_bytes,
+        backup: None,
+    })
+}
+
 fn now_millis() -> Result<i64, PeerSyncError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -654,8 +810,9 @@ mod tests {
             LogicalRecordLocator, ProjectedLogicalRecord,
         },
         persistent_store::{
-            establish_logical_common_base, PersistentStore, VerifiedSyncDeviceRegistration,
-            WorkingSetCommit, PRODUCT_LOGICAL_LIBRARY_ID,
+            establish_logical_common_base, logical_delta_source::LogicalDeltaSourceSession,
+            PersistentStore, VerifiedSyncDeviceRegistration, WorkingSetCommit,
+            PRODUCT_LOGICAL_LIBRARY_ID,
         },
     };
     use serde_json::json;
@@ -785,6 +942,19 @@ mod tests {
                 .map(|record| (record.object.hash.clone(), record.object.bytes.clone()))
                 .collect(),
             reads: 0,
+        }
+    }
+
+    fn copy_tree(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
         }
     }
 
@@ -1173,5 +1343,189 @@ mod tests {
             }
             other => panic!("unexpected retained operation: {other:?}"),
         }
+    }
+
+    #[test]
+    fn remote_apply_reports_shared_a_and_advances_only_after_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let bootstrap_root = directory.path().join("bootstrap");
+        fs::create_dir(&bootstrap_root).unwrap();
+        let bootstrap_cas = PayloadCas::new(&bootstrap_root).unwrap();
+        let mut bootstrap_store = PersistentStore::open(&bootstrap_root).unwrap();
+        let base = bootstrap_store
+            .seal_or_initialize_active_logical_generation(&bootstrap_cas)
+            .unwrap();
+        drop(bootstrap_store);
+        let local_root = directory.path().join("local");
+        let remote_root = directory.path().join("remote");
+        copy_tree(&bootstrap_root, &local_root);
+        copy_tree(&bootstrap_root, &remote_root);
+
+        let local_cas = PayloadCas::new(&local_root).unwrap();
+        let remote_cas = PayloadCas::new(&remote_root).unwrap();
+        let mut local_store = PersistentStore::open(&local_root).unwrap();
+        let mut remote_store = PersistentStore::open(&remote_root).unwrap();
+        let local_device = "123e4567-e89b-42d3-a456-426614174021";
+        let remote_device = "123e4567-e89b-42d3-a456-426614174022";
+        let common = SyncGenerationIdentity {
+            generation_id: base.manifest.generation.clone(),
+            manifest_hash: base.manifest_hash.clone(),
+            generation_sequence: base.manifest.generation_sequence.clone(),
+        };
+        for (store, cas, peer_id) in [
+            (&mut local_store, &local_cas, remote_device),
+            (&mut remote_store, &remote_cas, local_device),
+        ] {
+            establish_logical_common_base(
+                store,
+                cas,
+                peer_id,
+                PRODUCT_LOGICAL_LIBRARY_ID,
+                &base.manifest.generation,
+                0,
+                &base.manifest_bytes,
+            )
+            .unwrap();
+            store
+                .attach_verified_sync_device_at_common_base(
+                    VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                        PRODUCT_LOGICAL_LIBRARY_ID,
+                        peer_id,
+                        common.clone(),
+                        0,
+                    )
+                    .unwrap(),
+                    0,
+                )
+                .unwrap();
+        }
+        local_store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"side": "local"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        remote_store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: None,
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: Some(vec![crate::persistent_store::PluginStorageMutation::Set {
+                    key: "remote-key".to_owned(),
+                    value: json!({"side": "remote"}),
+                }]),
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let remote_generation = remote_store
+            .seal_or_initialize_active_logical_generation(&remote_cas)
+            .unwrap();
+        let mut remote_source = LogicalDeltaSourceSession::open(
+            &remote_root,
+            &remote_root,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &remote_generation.manifest.generation,
+        )
+        .unwrap();
+        let credential = LanBidirectionalLogicalCredential {
+            endpoint: "http://192.168.1.2:32146".to_owned(),
+            session_id: "123e4567-e89b-42d3-a456-426614174020".to_owned(),
+            manifest_id: remote_generation.manifest_hash.clone(),
+            device_id: local_device.to_owned(),
+            source_device_id: remote_device.to_owned(),
+            bearer: "e".repeat(64),
+        };
+        assert_eq!(
+            begin_bidirectional_local_merge(
+                &mut local_store,
+                &local_cas,
+                &local_root,
+                credential,
+                1,
+                &remote_generation.manifest_bytes,
+                &mut remote_source,
+            )
+            .unwrap(),
+            LocalMergeOutcome::LocalCommitted
+        );
+        let shared = local_store
+            .seal_or_initialize_active_logical_generation(&local_cas)
+            .unwrap();
+        let shared_identity = SyncGenerationIdentity {
+            generation_id: shared.manifest.generation.clone(),
+            manifest_hash: shared.manifest_hash.clone(),
+            generation_sequence: shared.manifest.generation_sequence.clone(),
+        };
+        let mut shared_source = LogicalDeltaSourceSession::open(
+            &local_root,
+            &local_root,
+            PRODUCT_LOGICAL_LIBRARY_ID,
+            &shared.manifest.generation,
+        )
+        .unwrap();
+
+        let receipt = apply_bidirectional_remote_shared(
+            &mut remote_store,
+            &remote_cas,
+            &remote_root,
+            "123e4567-e89b-42d3-a456-426614174023",
+            local_device,
+            1,
+            &common.manifest_hash,
+            LanBidirectionalGeneration {
+                generation_id: shared_identity.generation_id.clone(),
+                manifest_hash: shared_identity.manifest_hash.clone(),
+                generation_sequence: shared_identity.generation_sequence.clone(),
+            },
+            &shared.manifest_bytes,
+            &mut shared_source,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(receipt.committed_revision, 2);
+        assert_eq!(
+            receipt.committed_generation,
+            LanBidirectionalGeneration {
+                generation_id: shared_identity.generation_id.clone(),
+                manifest_hash: shared_identity.manifest_hash.clone(),
+                generation_sequence: shared_identity.generation_sequence.clone(),
+            }
+        );
+        assert_eq!(receipt.transferred_objects, 1);
+        assert!(receipt.transferred_bytes > 0);
+        assert!(receipt.backup.is_none());
+        assert_eq!(
+            remote_store.read_root(None).unwrap().value,
+            json!({"side": "local"})
+        );
+        assert_eq!(
+            remote_store
+                .read_plugin_storage("remote-key", None)
+                .unwrap()
+                .unwrap()
+                .value,
+            json!({"side": "remote"})
+        );
+        let remote_ack = remote_store
+            .sync_device_ack_state(PRODUCT_LOGICAL_LIBRARY_ID, local_device)
+            .unwrap();
+        assert_eq!(remote_ack.shared_identity, shared_identity);
+        assert_ne!(remote_ack.local_identity, remote_ack.shared_identity);
     }
 }
