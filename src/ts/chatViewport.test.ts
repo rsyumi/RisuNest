@@ -6,6 +6,44 @@ function keys(count: number): string[] {
 }
 
 describe('buildChatViewport', () => {
+    it('uses a bounded key source and indexed height corrections without scanning omitted rows', () => {
+        let keyReads = 0
+        let indexLookups = 0
+        const viewport = buildChatViewport({
+            keySource: {
+                length: 10_000,
+                keyAt(index) {
+                    keyReads += 1
+                    return `message-${index}`
+                },
+                indexOf(key) {
+                    indexLookups += 1
+                    return Number(key.slice('message-'.length))
+                },
+            },
+            budget: 64,
+            overscan: 8,
+            estimatedMessageHeight: 100,
+            measuredHeightsByIndex: new Map([
+                [0, 150],
+                [5_000, 80],
+            ]),
+            anchor: { key: 'message-5000', indexHint: 5_000, relativeOffset: 17 },
+            pins: [{ key: 'message-5000', reason: 'editor', indexHint: 5_000 }],
+        })
+
+        expect(viewport.messageRows).toHaveLength(64)
+        expect(viewport.messageRows.some((row) => row.index === 5_000)).toBe(true)
+        expect(viewport.rows[0]).toEqual({
+            kind: 'gap',
+            startIndex: 0,
+            endIndex: 4_992,
+            height: 499_250,
+        })
+        expect(keyReads).toBeLessThanOrEqual(66)
+        expect(indexLookups).toBe(0)
+    })
+
     it('starts at the newest tail and counts overscan inside the mounted budget', () => {
         const normal = buildChatViewport({
             keys: keys(100),

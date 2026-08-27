@@ -18,6 +18,7 @@
         buildChatViewport,
         type ChatViewportAnchor,
         type ChatViewportJumpOptions,
+        type ChatViewportKeySource,
         type ChatViewportPin,
         type ChatViewportPinReason,
         type ChatViewportResult,
@@ -57,6 +58,7 @@
 
     const ESTIMATED_MESSAGE_HEIGHT = 256
     const VIEWPORT_OVERSCAN = 8
+    const MEASURED_HEIGHT_CACHE_LIMIT = 256
 
     type ChatInstance = {
         updateStreamingDisplay?: (state: {
@@ -72,6 +74,11 @@
     let mountedElements = new Map<string, HTMLElement>()
     let renderSignatures = new Map<string, ChatRenderSignature>()
     let measuredHeights = new Map<string, number>()
+    let measuredHeightIndices = new Map<number, number>()
+    let measuredHeightIndexByKey = new Map<string, number>()
+    let measuredHeightRecency = new Map<string, number>()
+    let measuredHeightClock = 0
+    let keyLookupScans = 0
     let pinReasons = new Map<string, Set<ChatViewportPinReason>>()
     let playingMedia = new Map<string, Set<EventTarget>>()
     let viewportAnchor: ChatViewportAnchor | null = null
@@ -168,10 +175,22 @@
         return `${scope.length}:${scope}|conversation-start`
     }
 
-    function viewportKeys(scope: string): string[] {
-        return hasConversationStart()
-            ? [conversationStartKey(scope), ...messageRenderKeys]
-            : messageRenderKeys
+    function viewportKeySource(scope: string): ChatViewportKeySource {
+        const startOffset = hasConversationStart() ? 1 : 0
+        const startKey = startOffset === 1 ? conversationStartKey(scope) : null
+        return {
+            length: messageRenderKeys.length + startOffset,
+            keyAt(index) {
+                if (startKey !== null && index === 0) return startKey
+                return messageRenderKeys[index - startOffset]
+            },
+            indexOf(key) {
+                if (startKey !== null && key === startKey) return 0
+                keyLookupScans += 1
+                const index = messageRenderKeys.indexOf(key)
+                return index < 0 ? -1 : index + startOffset
+            },
+        }
     }
 
     function resetViewport(scope: string): void {
@@ -179,6 +198,11 @@
         clearScheduledWork()
         clearMountedRows()
         measuredHeights = new Map()
+        measuredHeightIndices = new Map()
+        measuredHeightIndexByKey = new Map()
+        measuredHeightRecency = new Map()
+        measuredHeightClock = 0
+        keyLookupScans = 0
         pinReasons = new Map()
         playingMedia = new Map()
         viewportAnchor = null
@@ -210,10 +234,8 @@
             messageRenderKeys = identitySequence.toArray()
         }
         if (needsStructuralRegistration) {
-            const retainedKeys = new Set(viewportKeys(scope))
-            for (const key of measuredHeights.keys()) {
-                if (!retainedKeys.has(key)) measuredHeights.delete(key)
-            }
+            const source = viewportKeySource(scope)
+            rebuildMeasuredHeightIndices(source)
         }
         registeredScope = scope
         registeredMessages = messages
@@ -224,10 +246,16 @@
     function currentPins(currentChat: character['chats'][number] | groupChat['chats'][number] | undefined): ChatViewportPin[] {
         const pins: ChatViewportPin[] = []
         for (const [key, reasons] of pinReasons) {
-            for (const reason of reasons) pins.push({ key, reason })
+            const indexHintText = mountedElements.get(key)?.dataset.chatViewportIndex
+            const indexHint = indexHintText === undefined ? undefined : Number(indexHintText)
+            for (const reason of reasons) pins.push({ key, reason, indexHint })
         }
         if (currentChat?.isStreaming && messageRenderKeys.length > 0) {
-            pins.push({ key: messageRenderKeys.at(-1)!, reason: 'streaming' })
+            pins.push({
+                key: messageRenderKeys.at(-1)!,
+                reason: 'streaming',
+                indexHint: messageRenderKeys.length - 1 + (hasConversationStart() ? 1 : 0),
+            })
         }
         return pins
     }
@@ -278,18 +306,18 @@
         if (activeScope !== scope) resetViewport(scope)
         const reloadPointerMap = get(ReloadChatPointer)
         syncIdentityRegistration(scope, reloadPointerMap)
-        const keys = viewportKeys(scope)
+        const keySource = viewportKeySource(scope)
         const preservedAnchor = options.anchor !== undefined
             ? options.anchor
             : options.preserveAnchor === false ? viewportAnchor : captureDomAnchor()
         const currentChat = currentCharacter.chats?.[currentCharacter.chatPage]
         const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
         const result = buildChatViewport({
-            keys,
+            keySource,
             budget,
             overscan: Math.min(VIEWPORT_OVERSCAN, budget - 1),
             estimatedMessageHeight: ESTIMATED_MESSAGE_HEIGHT,
-            measuredHeights,
+            measuredHeightsByIndex: measuredHeightIndices,
             anchor: preservedAnchor,
             jumpTarget: options.jumpTarget,
             pins: currentPins(currentChat),
@@ -298,6 +326,8 @@
         viewportResult = result
         renderViewportRows(scope, result, currentChat, reloadPointerMap)
         chatBody.dataset.chatPinOverflow = String(result.pinOverflow?.count ?? 0)
+        chatBody.dataset.chatMeasuredHeightCount = String(measuredHeights.size)
+        chatBody.dataset.chatKeyLookupScans = String(keyLookupScans)
         correctDomAnchor(preservedAnchor)
         hasRenderedChat = true
         return result
@@ -608,6 +638,51 @@
         autoScrollTimer = null
     }
 
+    function rebuildMeasuredHeightIndices(source = viewportKeySource(currentChatScope())): void {
+        const remainingKeys = new Set(measuredHeights.keys())
+        const nextByIndex = new Map<number, number>()
+        const nextIndexByKey = new Map<string, number>()
+        for (let index = 0; index < source.length && remainingKeys.size > 0; index++) {
+            const key = source.keyAt(index)
+            if (key === undefined || !remainingKeys.delete(key)) continue
+            nextByIndex.set(index, measuredHeights.get(key)!)
+            nextIndexByKey.set(key, index)
+        }
+        for (const key of remainingKeys) {
+            measuredHeights.delete(key)
+            measuredHeightRecency.delete(key)
+        }
+        measuredHeightIndices = nextByIndex
+        measuredHeightIndexByKey = nextIndexByKey
+    }
+
+    function pruneMeasuredHeights(): void {
+        if (measuredHeights.size <= MEASURED_HEIGHT_CACHE_LIMIT) {
+            chatBody.dataset.chatMeasuredHeightCount = String(measuredHeights.size)
+            return
+        }
+        const retained = new Set([
+            ...renderKeys,
+            ...pinReasons.keys(),
+            ...(viewportAnchor ? [viewportAnchor.key] : []),
+        ])
+        const candidates = [...measuredHeights.keys()]
+            .filter((key) => !retained.has(key))
+            .sort((left, right) => (
+                (measuredHeightRecency.get(left) ?? 0) -
+                (measuredHeightRecency.get(right) ?? 0)
+            ))
+        for (const key of candidates) {
+            if (measuredHeights.size <= MEASURED_HEIGHT_CACHE_LIMIT) break
+            measuredHeights.delete(key)
+            measuredHeightRecency.delete(key)
+            const index = measuredHeightIndexByKey.get(key)
+            if (index !== undefined) measuredHeightIndices.delete(index)
+            measuredHeightIndexByKey.delete(key)
+        }
+        chatBody.dataset.chatMeasuredHeightCount = String(measuredHeights.size)
+    }
+
     function handleResize(entries: ResizeObserverEntry[]): void {
         const anchor = captureDomAnchor()
         let changed = false
@@ -616,11 +691,21 @@
             const key = element.dataset.chatRenderKey
             const height = element.getBoundingClientRect().height || entry.contentRect.height
             if (!key || !Number.isFinite(height) || height <= 0) continue
+            const index = Number(element.dataset.chatViewportIndex)
+            if (!Number.isInteger(index) || index < 0) continue
             if (Math.abs((measuredHeights.get(key) ?? 0) - height) < 0.5) continue
+            const previousIndex = measuredHeightIndexByKey.get(key)
+            if (previousIndex !== undefined && previousIndex !== index) {
+                measuredHeightIndices.delete(previousIndex)
+            }
             measuredHeights.set(key, height)
+            measuredHeightRecency.set(key, ++measuredHeightClock)
+            measuredHeightIndices.set(index, height)
+            measuredHeightIndexByKey.set(key, index)
             changed = true
         }
         if (!changed) return
+        pruneMeasuredHeights()
         viewportAnchor = anchor
         if (scheduledReconcileFrame !== null) return
         scheduledReconcileFrame = scheduleFrame(() => {
@@ -646,10 +731,12 @@
         const start = Number(visibleGap.dataset.chatGapStart)
         const end = Number(visibleGap.dataset.chatGapEnd)
         const target = movingOlder ? end - 1 : start
-        const keys = viewportKeys(currentChatScope())
-        if (!Number.isInteger(target) || target < 0 || target >= keys.length) return
+        const keySource = viewportKeySource(currentChatScope())
+        if (!Number.isInteger(target) || target < 0 || target >= keySource.length) return
+        const key = keySource.keyAt(target)
+        if (key === undefined) return
         viewportAnchor = {
-            key: keys[target],
+            key,
             indexHint: target,
             relativeOffset: viewportAnchor?.relativeOffset ?? 0,
         }
@@ -792,6 +879,9 @@
         clearMountedRows()
         renderSignatures.clear()
         measuredHeights.clear()
+        measuredHeightIndices.clear()
+        measuredHeightIndexByKey.clear()
+        measuredHeightRecency.clear()
         pinReasons.clear()
         playingMedia.clear()
         imageResolutionGeneration += 1

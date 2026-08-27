@@ -416,6 +416,28 @@ describe('Chats imperative mount lifecycle', () => {
         expect(chatMountProbe.mounts.length - chatMountProbe.unmounts.length).toBeLessThanOrEqual(65)
     })
 
+    test('bounds retained height corrections while visiting a long conversation', async () => {
+        const messages = Array.from({ length: 2_000 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: { initialMessages: messages, initialCharacter: makeCharacter(messages) },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+
+        const observer = TestResizeObserver.instances.at(-1)!
+        for (const index of [0, 300, 600, 900, 1_200, 1_500, 1_800]) {
+            await (mounted as HarnessInstance).jumpTo(index)
+            for (const row of target.querySelectorAll<HTMLElement>('[data-chat-render-key]')) {
+                observer.emit(row, 200 + (Number(row.dataset.chatViewportIndex) % 7))
+            }
+            await tick()
+        }
+
+        const chatBody = target.querySelector<HTMLElement>('[data-chat-measured-height-count]')!
+        expect(Number(chatBody.dataset.chatMeasuredHeightCount)).toBeLessThanOrEqual(256)
+        expect(Number(chatBody.dataset.chatKeyLookupScans)).toBe(0)
+    })
+
     test('replaces bounded rows while reverse-flex scrolling crosses measured gaps', async () => {
         const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
         mounted = mount(ChatsHarness, {
