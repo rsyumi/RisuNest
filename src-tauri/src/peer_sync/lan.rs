@@ -124,6 +124,7 @@ impl LanCloneClient {
             .post(format!("{session_url}/claim"))
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
+                device_id: None,
             })
             .timeout(control_timeout)
             .send()
@@ -570,6 +571,38 @@ pub struct PreparedLogicalLanSession {
 }
 
 #[cfg(desktop)]
+pub(crate) struct PreparedBidirectionalLogicalLanSession {
+    logical: PreparedLogicalLanSession,
+    control: Arc<dyn LanBidirectionalControl>,
+}
+
+#[cfg(desktop)]
+impl PreparedBidirectionalLogicalLanSession {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        session_id: &str,
+        source_device_id: &str,
+        manifest_id: String,
+        manifest_bytes: impl Into<Arc<[u8]>>,
+        objects: Vec<LogicalDeltaObject>,
+        source: Box<dyn LogicalDeltaObjectSource + Send>,
+        control: Arc<dyn LanBidirectionalControl>,
+    ) -> Result<Self, PeerSyncError> {
+        Ok(Self {
+            logical: PreparedLogicalLanSession::new(
+                session_id,
+                source_device_id,
+                manifest_id,
+                manifest_bytes,
+                objects,
+                source,
+            )?,
+            control,
+        })
+    }
+}
+
+#[cfg(desktop)]
 impl PreparedLogicalLanSession {
     pub fn new(
         session_id: &str,
@@ -629,6 +662,7 @@ impl PreparedLogicalLanSession {
 enum LanSession {
     Clone(PreparedCloneSession),
     Logical(PreparedLogicalLanSession),
+    BidirectionalLogical(PreparedBidirectionalLogicalLanSession),
 }
 
 #[cfg(desktop)]
@@ -637,6 +671,7 @@ impl LanSession {
         match self {
             Self::Clone(session) => &session.manifest().session_id,
             Self::Logical(session) => &session.session_id,
+            Self::BidirectionalLogical(session) => &session.logical.session_id,
         }
     }
 
@@ -644,6 +679,7 @@ impl LanSession {
         match self {
             Self::Clone(session) => session.manifest_id(),
             Self::Logical(session) => &session.manifest_id,
+            Self::BidirectionalLogical(session) => &session.logical.manifest_id,
         }
     }
 
@@ -651,6 +687,7 @@ impl LanSession {
         match self {
             Self::Clone(_) => "clone-read",
             Self::Logical(_) => "logical-read",
+            Self::BidirectionalLogical(_) => "logical-bidirectional",
         }
     }
 
@@ -658,6 +695,7 @@ impl LanSession {
         match self {
             Self::Clone(_) => None,
             Self::Logical(session) => Some(&session.source_device_id),
+            Self::BidirectionalLogical(session) => Some(&session.logical.source_device_id),
         }
     }
 
@@ -665,6 +703,14 @@ impl LanSession {
         match self {
             Self::Clone(session) => session.manifest().objects.get(hash).map(|value| value.size),
             Self::Logical(session) => session.objects.get(hash).copied(),
+            Self::BidirectionalLogical(session) => session.logical.objects.get(hash).copied(),
+        }
+    }
+
+    fn bidirectional_control(&self) -> Option<&Arc<dyn LanBidirectionalControl>> {
+        match self {
+            Self::BidirectionalLogical(session) => Some(&session.control),
+            Self::Clone(_) | Self::Logical(_) => None,
         }
     }
 }
@@ -742,6 +788,24 @@ impl LanCloneHost {
             shared: Arc::new(LanShared {
                 manifest_bytes: Arc::clone(&session.manifest_bytes),
                 session: LanSession::Logical(session),
+                claim: Mutex::new(None),
+                tunnel_probe: Mutex::new(None),
+                devices: Mutex::new(BTreeMap::new()),
+            }),
+            address: None,
+            stopped: None,
+            active_connection: None,
+            thread: None,
+        }
+    }
+
+    pub(crate) fn prepare_bidirectional_logical(
+        session: PreparedBidirectionalLogicalLanSession,
+    ) -> Self {
+        Self {
+            shared: Arc::new(LanShared {
+                manifest_bytes: Arc::clone(&session.logical.manifest_bytes),
+                session: LanSession::BidirectionalLogical(session),
                 claim: Mutex::new(None),
                 tunnel_probe: Mutex::new(None),
                 devices: Mutex::new(BTreeMap::new()),
@@ -1208,6 +1272,12 @@ fn handle_request(
         }
         return progress(stream, request, shared, &device);
     }
+    if request.url == format!("{prefix}/registration") {
+        return bidirectional_registration(stream, request, shared, &device);
+    }
+    if request.url == format!("{prefix}/remote-apply") {
+        return bidirectional_remote_apply(stream, request, shared, &device);
+    }
     let object_prefix = format!("{prefix}/objects/");
     let Some(object) = request.url.strip_prefix(&object_prefix).map(str::to_owned) else {
         return respond_empty(stream, 404);
@@ -1218,8 +1288,10 @@ fn handle_request(
     match (&shared.session, request.method.as_str()) {
         (LanSession::Clone(_), "HEAD") => head(stream, shared, &object),
         (LanSession::Clone(_), "GET") => range(stream, &request, shared, &object, stopped),
-        (LanSession::Logical(_), "HEAD") => head(stream, shared, &object),
-        (LanSession::Logical(_), "GET") => {
+        (LanSession::Logical(_) | LanSession::BidirectionalLogical(_), "HEAD") => {
+            head(stream, shared, &object)
+        }
+        (LanSession::Logical(_) | LanSession::BidirectionalLogical(_), "GET") => {
             if request.range_count != 0 || request.range.is_some() || !request.body.is_empty() {
                 return respond_empty(stream, 400);
             }
@@ -1289,6 +1361,13 @@ fn claim(
     if secret.len() != 32 {
         return respond_empty(stream, 403);
     }
+    let device_id = match &shared.session {
+        LanSession::BidirectionalLogical(_) => match request_body.device_id.as_deref() {
+            Some(device_id) if is_canonical_uuid(device_id) => device_id.to_owned(),
+            _ => return respond_empty(stream, 400),
+        },
+        LanSession::Clone(_) | LanSession::Logical(_) => uuid::Uuid::new_v4().to_string(),
+    };
     let mut claim = shared.claim.lock().unwrap();
     let Some(claim) = claim.as_mut() else {
         return respond_empty(stream, 410);
@@ -1301,7 +1380,6 @@ fn claim(
     }
     claim.consumed = true;
     let bearer = random_secret()?;
-    let device_id = uuid::Uuid::new_v4().to_string();
     let response = ClaimResponse {
         device_id: device_id.clone(),
         bearer: hex::encode(bearer),
@@ -1373,6 +1451,82 @@ fn progress(
 }
 
 #[cfg(desktop)]
+fn authenticated_bidirectional_session(
+    shared: &LanShared,
+    target_device_id: &str,
+) -> Option<LanBidirectionalSession> {
+    shared
+        .session
+        .bidirectional_control()
+        .and_then(|_| shared.session.source_device_id())
+        .map(|source_device_id| LanBidirectionalSession {
+            session_id: shared.session.session_id().to_owned(),
+            source_device_id: source_device_id.to_owned(),
+            target_device_id: target_device_id.to_owned(),
+        })
+}
+
+#[cfg(desktop)]
+fn bidirectional_registration(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+    device_id: &str,
+) -> Result<(), PeerSyncError> {
+    if request.method != "POST" {
+        return respond_empty(stream, 405);
+    }
+    let Some(session) = authenticated_bidirectional_session(shared, device_id) else {
+        return respond_empty(stream, 404);
+    };
+    let Ok(request) = serde_json::from_slice::<LanBidirectionalRegistrationRequest>(&request.body)
+    else {
+        return respond_empty(stream, 400);
+    };
+    if !request.is_valid() {
+        return respond_empty(stream, 400);
+    }
+    let control = shared
+        .session
+        .bidirectional_control()
+        .expect("checked bidirectional session");
+    match control.register(session, request) {
+        Ok(()) => respond_empty(stream, 204),
+        Err(_) => respond_empty(stream, 409),
+    }
+}
+
+#[cfg(desktop)]
+fn bidirectional_remote_apply(
+    stream: &mut TcpStream,
+    request: HttpRequest,
+    shared: &LanShared,
+    device_id: &str,
+) -> Result<(), PeerSyncError> {
+    if request.method != "POST" {
+        return respond_empty(stream, 405);
+    }
+    let Some(session) = authenticated_bidirectional_session(shared, device_id) else {
+        return respond_empty(stream, 404);
+    };
+    let Ok(request) = serde_json::from_slice::<LanBidirectionalRemoteApplyRequest>(&request.body)
+    else {
+        return respond_empty(stream, 400);
+    };
+    if !request.is_valid() {
+        return respond_empty(stream, 400);
+    }
+    let control = shared
+        .session
+        .bidirectional_control()
+        .expect("checked bidirectional session");
+    match control.remote_apply(session, request) {
+        Ok(receipt) if receipt.is_valid() => respond_json(stream, 200, &receipt),
+        Ok(_) | Err(_) => respond_empty(stream, 409),
+    }
+}
+
+#[cfg(desktop)]
 fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), PeerSyncError> {
     let size = shared
         .session
@@ -1380,7 +1534,7 @@ fn head(stream: &mut TcpStream, shared: &LanShared, object: &str) -> Result<(), 
         .ok_or_else(|| PeerSyncError::Storage("session object descriptor is missing".to_owned()))?;
     let range_header = match &shared.session {
         LanSession::Clone(_) => Some(("Accept-Ranges", "bytes")),
-        LanSession::Logical(_) => None,
+        LanSession::Logical(_) | LanSession::BidirectionalLogical(_) => None,
     };
     let etag = quoted(object);
     let mut headers = vec![("ETag", etag.as_str())];
@@ -1447,8 +1601,10 @@ fn logical_object(
     object: &str,
     stopped: &AtomicBool,
 ) -> Result<(), PeerSyncError> {
-    let LanSession::Logical(session) = &shared.session else {
-        return respond_empty(stream, 405);
+    let session = match &shared.session {
+        LanSession::Logical(session) => session,
+        LanSession::BidirectionalLogical(session) => &session.logical,
+        LanSession::Clone(_) => return respond_empty(stream, 405),
     };
     let size = *session.objects.get(object).ok_or_else(|| {
         PeerSyncError::Storage("logical session object descriptor is missing".to_owned())
@@ -1476,8 +1632,142 @@ fn set_current_object(shared: &LanShared, device_id: &str, object: Option<&str>)
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ClaimRequest {
     claim: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_id: Option<String>,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LanBidirectionalSession {
+    pub(crate) session_id: String,
+    pub(crate) source_device_id: String,
+    pub(crate) target_device_id: String,
+}
+
+#[cfg(desktop)]
+pub(crate) trait LanBidirectionalControl: Send + Sync {
+    fn register(
+        &self,
+        session: LanBidirectionalSession,
+        request: LanBidirectionalRegistrationRequest,
+    ) -> Result<(), PeerSyncError>;
+
+    fn remote_apply(
+        &self,
+        session: LanBidirectionalSession,
+        request: LanBidirectionalRemoteApplyRequest,
+    ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError>;
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LanBidirectionalGeneration {
+    pub(crate) generation_id: String,
+    pub(crate) manifest_hash: String,
+    pub(crate) generation_sequence: String,
+}
+
+#[cfg(desktop)]
+impl LanBidirectionalGeneration {
+    fn is_valid(&self) -> bool {
+        !self.generation_id.is_empty()
+            && self.generation_id.len() <= MAX_BODY_BYTES
+            && is_lower_hex_256(&self.manifest_hash)
+            && is_canonical_decimal(&self.generation_sequence)
+    }
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LanBidirectionalRegistrationRequest {
+    pub(crate) library_id: String,
+    pub(crate) generation: LanBidirectionalGeneration,
+    pub(crate) expected_revision: i64,
+}
+
+#[cfg(desktop)]
+impl LanBidirectionalRegistrationRequest {
+    fn is_valid(&self) -> bool {
+        !self.library_id.is_empty()
+            && self.library_id.len() <= MAX_BODY_BYTES
+            && self.expected_revision >= 0
+            && self.generation.is_valid()
+    }
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LanBidirectionalRemoteApplyRequest {
+    pub(crate) operation_id: String,
+    pub(crate) source_endpoint: String,
+    pub(crate) source_session_id: String,
+    pub(crate) source_manifest_id: String,
+    pub(crate) source_claim: String,
+    pub(crate) expected_source_revision: i64,
+    pub(crate) expected_source_generation: LanBidirectionalGeneration,
+    pub(crate) expected_common_base_manifest_hash: String,
+    pub(crate) backup_losing_side: bool,
+}
+
+#[cfg(desktop)]
+impl LanBidirectionalRemoteApplyRequest {
+    fn is_valid(&self) -> bool {
+        is_canonical_uuid(&self.operation_id)
+            && validate_lan_endpoint(&self.source_endpoint).is_ok()
+            && is_canonical_uuid(&self.source_session_id)
+            && is_lower_hex_256(&self.source_manifest_id)
+            && is_lower_hex_256(&self.source_claim)
+            && self.expected_source_revision >= 0
+            && self.expected_source_generation.is_valid()
+            && is_lower_hex_256(&self.expected_common_base_manifest_hash)
+    }
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LanBidirectionalBackupReceipt {
+    pub(crate) package_id: String,
+    pub(crate) path: String,
+}
+
+#[cfg(desktop)]
+impl LanBidirectionalBackupReceipt {
+    fn is_valid(&self) -> bool {
+        !self.package_id.is_empty()
+            && self.package_id.len() <= MAX_BODY_BYTES
+            && !self.path.is_empty()
+            && self.path.len() <= MAX_BODY_BYTES
+    }
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LanBidirectionalRemoteApplyReceipt {
+    pub(crate) committed_revision: i64,
+    pub(crate) committed_generation: LanBidirectionalGeneration,
+    pub(crate) transferred_objects: u64,
+    pub(crate) transferred_bytes: u64,
+    pub(crate) backup: Option<LanBidirectionalBackupReceipt>,
+}
+
+#[cfg(desktop)]
+impl LanBidirectionalRemoteApplyReceipt {
+    fn is_valid(&self) -> bool {
+        self.committed_revision >= 0
+            && self.committed_generation.is_valid()
+            && match &self.backup {
+                Some(backup) => backup.is_valid(),
+                None => true,
+            }
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1645,6 +1935,13 @@ fn is_canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value)
         .map(|parsed| parsed.to_string() == value)
         .unwrap_or(false)
+}
+
+fn is_canonical_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
 }
 
 fn ensure_credential_parent(path: &Path) -> Result<(), PeerSyncError> {
@@ -2288,6 +2585,216 @@ mod timeout_tests {
         }
     }
 
+    #[derive(Default)]
+    struct BidirectionalControlFixture {
+        registrations: Mutex<Vec<LanBidirectionalSession>>,
+    }
+
+    impl LanBidirectionalControl for BidirectionalControlFixture {
+        fn register(
+            &self,
+            session: LanBidirectionalSession,
+            _request: LanBidirectionalRegistrationRequest,
+        ) -> Result<(), PeerSyncError> {
+            self.registrations.lock().unwrap().push(session);
+            Ok(())
+        }
+
+        fn remote_apply(
+            &self,
+            _session: LanBidirectionalSession,
+            request: LanBidirectionalRemoteApplyRequest,
+        ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+            Ok(LanBidirectionalRemoteApplyReceipt {
+                committed_revision: request.expected_source_revision,
+                committed_generation: request.expected_source_generation,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                backup: None,
+            })
+        }
+    }
+
+    fn prepared_bidirectional_logical_session(
+        session_id: &str,
+        source_device_id: &str,
+        control: Arc<BidirectionalControlFixture>,
+    ) -> PreparedBidirectionalLogicalLanSession {
+        let built = build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: "library".to_owned(),
+            generation: "generation-1".to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some("generation-0".to_owned()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Root,
+                LogicalRecordEnvelope::Root {
+                    value: serde_json::json!({}),
+                    owner_heads: vec![],
+                },
+                vec![],
+            )],
+        })
+        .unwrap();
+        PreparedBidirectionalLogicalLanSession::new(
+            session_id,
+            source_device_id,
+            built.manifest_hash,
+            built.manifest_bytes,
+            built
+                .manifest
+                .objects
+                .iter()
+                .map(|object| LogicalDeltaObject {
+                    hash: object.hash.clone(),
+                    size: object.size,
+                })
+                .collect(),
+            Box::new(LogicalFixtureSource(BTreeMap::new())),
+            control,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn p5_claim_binds_the_stable_target_and_authenticates_control_callbacks() {
+        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        let session_id = "00000000-0000-4000-8000-000000000070";
+        let source_device_id = "00000000-0000-4000-8000-000000000071";
+        let target_device_id = "00000000-0000-4000-8000-000000000072";
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                session_id,
+                source_device_id,
+                Arc::clone(&control),
+            ));
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        assert_eq!(
+            reqwest::blocking::Client::new()
+                .post(format!(
+                    "{endpoint}/v1/sessions/{}/registration",
+                    pairing.session_id
+                ))
+                .body("{}")
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let client = LanBidirectionalLogicalClient::claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+            target_device_id,
+        )
+        .unwrap();
+        let generation = LanBidirectionalGeneration {
+            generation_id: "generation-1".to_owned(),
+            manifest_hash: pairing.manifest_id.clone(),
+            generation_sequence: "1".to_owned(),
+        };
+
+        assert_eq!(client.device_id(), target_device_id);
+        assert_eq!(client.source_device_id(), source_device_id);
+        assert_eq!(host.devices()[0].device_id, target_device_id);
+
+        client
+            .register(LanBidirectionalRegistrationRequest {
+                library_id: "library".to_owned(),
+                generation: generation.clone(),
+                expected_revision: 0,
+            })
+            .unwrap();
+        assert_eq!(control.registrations.lock().unwrap().len(), 1);
+        assert_eq!(
+            control.registrations.lock().unwrap()[0]
+                .target_device_id
+                .as_str(),
+            target_device_id
+        );
+
+        let accepted = client
+            .request_remote_apply(LanBidirectionalRemoteApplyRequest {
+                operation_id: "00000000-0000-4000-8000-000000000075".to_owned(),
+                source_endpoint: endpoint.clone(),
+                source_session_id: pairing.session_id.clone(),
+                source_manifest_id: pairing.manifest_id.clone(),
+                source_claim: pairing.claim.clone(),
+                expected_source_revision: 0,
+                expected_source_generation: generation.clone(),
+                expected_common_base_manifest_hash: pairing.manifest_id.clone(),
+                backup_losing_side: false,
+            })
+            .unwrap();
+        assert_eq!(accepted.committed_generation, generation);
+
+        let resumed = LanBidirectionalLogicalClient::resume(client.credential()).unwrap();
+        assert_eq!(resumed.device_id(), target_device_id);
+        assert_eq!(resumed.source_device_id(), source_device_id);
+
+        assert!(host.revoke(target_device_id));
+        assert!(matches!(
+            client.register(LanBidirectionalRegistrationRequest {
+                library_id: "library".to_owned(),
+                generation: LanBidirectionalGeneration {
+                    generation_id: "generation-1".to_owned(),
+                    manifest_hash: pairing.manifest_id,
+                    generation_sequence: "1".to_owned(),
+                },
+                expected_revision: 0,
+            }),
+            Err(PeerSyncError::Transport(_))
+        ));
+        host.stop().unwrap();
+    }
+
+    #[test]
+    fn p5_rejects_malformed_claimants_and_wrong_logical_permissions() {
+        let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
+        let control = Arc::new(BidirectionalControlFixture::default());
+        let mut host =
+            LanCloneHost::prepare_bidirectional_logical(prepared_bidirectional_logical_session(
+                "00000000-0000-4000-8000-000000000073",
+                "00000000-0000-4000-8000-000000000074",
+                control,
+            ));
+        let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
+        let endpoint = format!("http://{}", host.address().unwrap());
+        let session_url = format!("{endpoint}/v1/sessions/{}", pairing.session_id);
+        let raw_client = reqwest::blocking::Client::new();
+
+        assert_eq!(
+            raw_client
+                .post(format!("{session_url}/claim"))
+                .json(
+                    &serde_json::json!({"claim": pairing.claim.clone(), "deviceId": "not-a-uuid"})
+                )
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        assert!(matches!(
+            LanLogicalDeltaClient::claim_with_timeouts_and_device(
+                &endpoint,
+                &pairing.session_id,
+                &pairing.manifest_id,
+                &pairing.claim,
+                Some("00000000-0000-4000-8000-000000000076"),
+                "logical-read",
+                LogicalClientTimeouts {
+                    control_request: CONTROL_REQUEST_TIMEOUT,
+                    object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+                },
+            ),
+            Err(PeerSyncError::Protocol(_))
+        ));
+        host.stop().unwrap();
+    }
+
     #[test]
     fn logical_session_reuses_claim_bearer_revoke_and_bounded_object_routes() {
         let _guard = LOGICAL_LAN_TEST_LOCK.lock().unwrap();
@@ -2639,10 +3146,31 @@ impl LanLogicalDeltaClient {
         claim: &str,
         timeouts: LogicalClientTimeouts,
     ) -> Result<Self, PeerSyncError> {
+        Self::claim_with_timeouts_and_device(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            None,
+            "logical-read",
+            timeouts,
+        )
+    }
+
+    fn claim_with_timeouts_and_device(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        device_id: Option<&str>,
+        permission: &str,
+        timeouts: LogicalClientTimeouts,
+    ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
             || !is_lower_hex_256(manifest_id)
             || !is_lower_hex_256(claim)
+            || device_id.is_some_and(|value| !is_canonical_uuid(value))
         {
             return Err(PeerSyncError::Protocol(
                 "invalid logical delta pairing data".to_owned(),
@@ -2662,6 +3190,7 @@ impl LanLogicalDeltaClient {
             .post(format!("{session_url}/claim"))
             .json(&ClaimRequest {
                 claim: claim.to_owned(),
+                device_id: device_id.map(str::to_owned),
             })
             .timeout(control_timeout)
             .send()
@@ -2688,9 +3217,10 @@ impl LanLogicalDeltaClient {
             PeerSyncError::Protocol("logical delta source device identity is missing".to_owned())
         })?;
         if !is_canonical_uuid(&response.device_id)
+            || device_id.is_some_and(|expected| response.device_id.as_str() != expected)
             || !is_canonical_uuid(&source_device_id)
             || !is_lower_hex_256(&response.bearer)
-            || response.permission != "logical-read"
+            || response.permission != permission
         {
             return Err(PeerSyncError::Protocol(
                 "invalid logical delta claim response".to_owned(),
@@ -2819,6 +3349,210 @@ impl LogicalDeltaObjectSource for LanLogicalDeltaClient {
             hasher: Sha256::new(),
             completed: false,
         }))
+    }
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LanBidirectionalLogicalCredential {
+    pub(crate) endpoint: String,
+    pub(crate) session_id: String,
+    pub(crate) manifest_id: String,
+    pub(crate) device_id: String,
+    pub(crate) source_device_id: String,
+    pub(crate) bearer: String,
+}
+
+#[cfg(desktop)]
+impl LanBidirectionalLogicalCredential {
+    fn validate(&self) -> Result<String, PeerSyncError> {
+        if !is_canonical_uuid(&self.session_id)
+            || !is_lower_hex_256(&self.manifest_id)
+            || !is_canonical_uuid(&self.device_id)
+            || !is_canonical_uuid(&self.source_device_id)
+            || !is_lower_hex_256(&self.bearer)
+        {
+            return Err(PeerSyncError::Protocol(
+                "invalid bidirectional logical credential".to_owned(),
+            ));
+        }
+        validate_lan_endpoint(&self.endpoint)
+    }
+}
+
+#[cfg(desktop)]
+pub(crate) struct LanBidirectionalLogicalClient {
+    inner: LanLogicalDeltaClient,
+    endpoint: String,
+    session_id: String,
+}
+
+#[cfg(desktop)]
+impl LanBidirectionalLogicalClient {
+    pub(crate) fn claim(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        device_id: &str,
+    ) -> Result<Self, PeerSyncError> {
+        let inner = LanLogicalDeltaClient::claim_with_timeouts_and_device(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            Some(device_id),
+            "logical-bidirectional",
+            LogicalClientTimeouts {
+                control_request: CONTROL_REQUEST_TIMEOUT,
+                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+            },
+        )?;
+        Ok(Self {
+            endpoint: validate_lan_endpoint(endpoint)?,
+            session_id: session_id.to_owned(),
+            inner,
+        })
+    }
+
+    pub(crate) fn resume(
+        credential: LanBidirectionalLogicalCredential,
+    ) -> Result<Self, PeerSyncError> {
+        let endpoint = credential.validate()?;
+        let session_url = format!("{endpoint}/v1/sessions/{}", credential.session_id);
+        if session_url.len() > MAX_URL_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "bidirectional logical session URL is too long".to_owned(),
+            ));
+        }
+        let timeouts = LogicalClientTimeouts {
+            control_request: CONTROL_REQUEST_TIMEOUT,
+            object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+        };
+        Ok(Self {
+            inner: LanLogicalDeltaClient {
+                control_client: build_logical_http_client(LogicalRequestKind::Control, timeouts)?,
+                object_client: build_logical_http_client(LogicalRequestKind::Object, timeouts)?,
+                control_timeout: timeouts.control_request,
+                session_url,
+                device_id: credential.device_id,
+                bearer: credential.bearer,
+                source_device_id: credential.source_device_id,
+                manifest_id: credential.manifest_id,
+                verified_bytes: Arc::new(Mutex::new(0)),
+            },
+            endpoint,
+            session_id: credential.session_id,
+        })
+    }
+
+    pub(crate) fn credential(&self) -> LanBidirectionalLogicalCredential {
+        LanBidirectionalLogicalCredential {
+            endpoint: self.endpoint.clone(),
+            session_id: self.session_id.clone(),
+            manifest_id: self.inner.manifest_id.clone(),
+            device_id: self.inner.device_id.clone(),
+            source_device_id: self.inner.source_device_id.clone(),
+            bearer: self.inner.bearer.clone(),
+        }
+    }
+
+    pub(crate) fn device_id(&self) -> &str {
+        &self.inner.device_id
+    }
+
+    pub(crate) fn source_device_id(&self) -> &str {
+        self.inner.source_device_id()
+    }
+
+    pub(crate) fn fetch_manifest(&self) -> Result<Vec<u8>, PeerSyncError> {
+        self.inner.fetch_manifest()
+    }
+
+    pub(crate) fn register(
+        &self,
+        request: LanBidirectionalRegistrationRequest,
+    ) -> Result<(), PeerSyncError> {
+        if !request.is_valid() {
+            return Err(PeerSyncError::Protocol(
+                "invalid bidirectional registration request".to_owned(),
+            ));
+        }
+        let response = self
+            .inner
+            .authorized_control(
+                self.inner
+                    .control_client
+                    .post(format!("{}/registration", self.inner.session_url))
+                    .json(&request),
+            )
+            .send()
+            .map_err(transport)?;
+        if response.status().as_u16() != 204 {
+            return Err(PeerSyncError::Transport(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_remote_apply(
+        &self,
+        request: LanBidirectionalRemoteApplyRequest,
+    ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError> {
+        if !request.is_valid() {
+            return Err(PeerSyncError::Protocol(
+                "invalid bidirectional remote apply request".to_owned(),
+            ));
+        }
+        let response = self
+            .inner
+            .authorized_control(
+                self.inner
+                    .control_client
+                    .post(format!("{}/remote-apply", self.inner.session_url))
+                    .json(&request),
+            )
+            .send()
+            .map_err(transport)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(PeerSyncError::Transport(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
+        if response.content_length().unwrap_or(u64::MAX) > MAX_BODY_BYTES as u64 {
+            return Err(PeerSyncError::Protocol(
+                "bidirectional remote apply response is too large".to_owned(),
+            ));
+        }
+        let mut body = Vec::new();
+        response
+            .take(MAX_BODY_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(transport)?;
+        if body.len() > MAX_BODY_BYTES {
+            return Err(PeerSyncError::Protocol(
+                "bidirectional remote apply response is too large".to_owned(),
+            ));
+        }
+        let receipt = serde_json::from_slice::<LanBidirectionalRemoteApplyReceipt>(&body)
+            .map_err(|error| PeerSyncError::Protocol(error.to_string()))?;
+        if !receipt.is_valid() {
+            return Err(PeerSyncError::Protocol(
+                "invalid bidirectional remote apply response".to_owned(),
+            ));
+        }
+        Ok(receipt)
+    }
+}
+
+#[cfg(desktop)]
+impl LogicalDeltaObjectSource for LanBidirectionalLogicalClient {
+    fn open_object(&mut self, object: &LogicalDeltaObject) -> Result<Box<dyn Read>, PeerSyncError> {
+        self.inner.open_object(object)
     }
 }
 
