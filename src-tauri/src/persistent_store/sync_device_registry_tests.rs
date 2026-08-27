@@ -865,6 +865,40 @@ fn authenticated_p5_registration_attaches_to_an_exact_p4_common_base_idempotentl
 }
 
 #[test]
+fn p5_registration_reads_the_exact_existing_p4_common_base_identity() {
+    let directory = tempfile::tempdir().expect("create P5 common-base fixture");
+    let store = PersistentStore::open(directory.path()).expect("open store");
+    seed_complete_generation(&store, "library", "generation-1", "7", HASH_A);
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_peer_common_bases (
+                peer_id, library_id, generation_id, manifest_hash,
+                generation_sequence, updated_at
+             ) VALUES ('device-a', 'library', 'generation-1', ?1, '7', 10)",
+            [HASH_A],
+        )
+        .expect("seed existing P4 common base");
+
+    assert_eq!(
+        store
+            .sync_device_common_base_identity("library", "device-a")
+            .expect("read exact P4 common base"),
+        Some(SyncGenerationIdentity {
+            generation_id: "generation-1".to_owned(),
+            manifest_hash: HASH_A.to_owned(),
+            generation_sequence: "7".to_owned(),
+        })
+    );
+    assert_eq!(
+        store
+            .sync_device_common_base_identity("library", "device-b")
+            .expect("read absent P4 common base"),
+        None
+    );
+}
+
+#[test]
 fn authenticated_p5_registration_rejects_mismatched_common_base_without_mutation() {
     let directory = tempfile::tempdir().expect("create mismatched attachment fixture");
     let mut store = PersistentStore::open(directory.path()).expect("open store");

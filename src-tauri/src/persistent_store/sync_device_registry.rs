@@ -130,6 +130,16 @@ struct TombstoneCursor {
 }
 
 impl PersistentStore {
+    pub(crate) fn sync_device_common_base_identity(
+        &self,
+        library_id: &str,
+        device_id: &str,
+    ) -> StoreResult<Option<SyncGenerationIdentity>> {
+        validate_library_id(library_id)?;
+        validate_device_id(device_id)?;
+        load_common_base(&self.connection, library_id, device_id)
+    }
+
     pub(crate) fn sync_device_ack_state(
         &self,
         library_id: &str,
