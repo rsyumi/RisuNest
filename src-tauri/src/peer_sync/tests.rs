@@ -579,8 +579,12 @@ fn named_tunnel_origin_uses_the_documented_fixed_loopback_port() {
     ))
     .unwrap();
 
+    let error = match host.start_named_tunnel_origin() {
+        Ok(_) => panic!("named tunnel origin started on an occupied port"),
+        Err(error) => error,
+    };
     assert_eq!(
-        host.start_named_tunnel_origin().unwrap_err().to_string(),
+        error.to_string(),
         format!(
             "Transport(\"{}\")",
             super::lan::NAMED_TUNNEL_ORIGIN_UNAVAILABLE
