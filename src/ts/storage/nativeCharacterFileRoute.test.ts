@@ -25,7 +25,7 @@ function dependencies(
 }
 
 describe('native character file route', () => {
-    it('keeps PNG on the selected-path legacy route without starting native preparation', async () => {
+    it('routes a selected PNG card through native preparation without reading its bytes', async () => {
         const deps = dependencies()
 
         await expect(importDesktopNativeCharacterPath(
@@ -33,12 +33,36 @@ describe('native character file route', () => {
             deps,
         )).resolves.toEqual({
             kind: 'imported',
+            mode: 'native',
+            value: 'native-card',
+        })
+
+        expect(deps.nativeImport).toHaveBeenCalledWith({
+            source: { type: 'desktopPath', path: 'C:\\chosen\\card.PNG' },
+            displayName: 'card.PNG',
+        })
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
+
+    it('falls back to the existing PNG importer when the native parser reaches its bounded limit', async () => {
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => {
+                throw new NativeFileJobError('native-limit', 'PNG metadata is too large')
+            }),
+        })
+
+        await expect(importDesktopNativeCharacterPath(
+            'C:\\chosen\\large.png',
+            deps,
+        )).resolves.toEqual({
+            kind: 'imported',
             mode: 'legacy',
             value: 'legacy-card',
         })
 
-        expect(deps.nativeImport).not.toHaveBeenCalled()
-        expect(deps.readDesktopPath).toHaveBeenCalledWith('C:\\chosen\\card.PNG')
+        expect(deps.nativeImport).toHaveBeenCalledOnce()
+        expect(deps.readDesktopPath).toHaveBeenCalledWith('C:\\chosen\\large.png')
     })
 
     it('uses one desktop picker and the selected path for a pre-activation compatibility fallback', async () => {

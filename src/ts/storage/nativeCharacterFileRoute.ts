@@ -41,6 +41,7 @@ function fileNameFromPath(path: string): string {
 function isNativeCharacterCandidate(displayName: string): boolean {
     const extension = displayName.split('.').at(-1)?.toLocaleLowerCase('en-US')
     return extension === 'json'
+        || extension === 'png'
         || extension === 'charx'
         || extension === 'jpg'
         || extension === 'jpeg'
