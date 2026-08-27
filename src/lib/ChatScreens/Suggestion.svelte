@@ -13,14 +13,21 @@
     import { onDestroy } from 'svelte';
     import DeferredMarkdown from "src/lib/UI/DeferredMarkdown.svelte";
     import {defaultAutoSuggestPrompt} from "../../ts/storage/defaultPrompts.js";
+    import {
+        readConversationSuggestions,
+        writeConversationSuggestions,
+    } from "../../ts/autoSuggestionMetadata";
 
     interface Props {
         send: () => any;
         messageInput: (string:string) => any;
+        readLatestMessages: (signal?: AbortSignal) => Promise<Message[]>;
     }
 
-    let { send, messageInput }: Props = $props();
-    let suggestMessages:string[] = $state(DBState.db.characters[$selectedCharID]?.chats[DBState.db.characters[$selectedCharID].chatPage]?.suggestMessages)
+    let { send, messageInput, readLatestMessages }: Props = $props();
+    let suggestMessages:string[] = $state(
+        readConversationSuggestions(DBState.db.characters[$selectedCharID]),
+    )
     let suggestMessagesTranslated:string[] = $state()
     let toggleTranslate:boolean = $state(DBState.db.autoTranslate)
     let progress:boolean = $state();
@@ -42,11 +49,11 @@
                 cancelSuggestionRequest()
             }
             let currentChar = DBState.db.characters[$selectedCharID];
-            suggestMessages = currentChar?.chats[currentChar.chatPage].suggestMessages
+            suggestMessages = currentChar ? readConversationSuggestions(currentChar) : undefined
         }
     }
 
-    const requestSuggestions = () => {
+    const requestSuggestions = async () => {
         if($doingChat || $selectedCharID <= -1 || (suggestMessages && suggestMessages.length > 0) || progress){
             return
         }
@@ -57,39 +64,8 @@
             return
         }
         const requestChatPage = currentChar.chatPage
-        const currentChat = currentChar.chats[requestChatPage]
-        if(!currentChat){
+        if(!currentChar.chats[requestChatPage]){
             return
-        }
-        let messages:Message[] = []
-        
-        messages = [...messages, ...currentChat.message];
-        let lastMessages:Message[] = messages.slice(Math.max(messages.length - 10, 0));
-        if(lastMessages.length === 0)
-            return
-        const prompt = DBState.db.autoSuggestPrompt && DBState.db.autoSuggestPrompt.length > 0 ? DBState.db.autoSuggestPrompt : defaultAutoSuggestPrompt
-        let promptbody:OpenAIChat[] = [
-            {
-                role:'system',
-                content: replacePlaceholders(prompt, currentChar.name)
-            },
-            {
-                role: 'user', 
-                content: lastMessages.map(b=>(b.role==='char'? currentChar.name : getUserName())+":"+b.data).reduce((a,b)=>a+','+b)
-            }
-        ]
-
-        if(DBState.db.subModel === "textgen_webui" || DBState.db.subModel === 'mancer' || DBState.db.subModel.startsWith('local_')){
-            promptbody = [
-                {
-                    role: 'system',
-                    content: replacePlaceholders(DBState.db.autoSuggestPrompt, currentChar.name)
-                },
-                ...lastMessages.map(({ role, data }) => ({
-                    role: role === "user" ? "user" as const : "assistant" as const,
-                    content: data,
-                })),
-            ]
         }
 
         const requestId = suggestionRequestId + 1
@@ -98,29 +74,63 @@
         abortController = requestController
         progress = true
         progressChatPage = requestChatPage
+        try {
+            const lastMessages = await readLatestMessages(requestController?.signal)
+            const stillCurrentTail = suggestionRequestId === requestId &&
+                $selectedCharID === requestCharId &&
+                DBState.db.characters[requestCharId]?.chatPage === requestChatPage
+            if (!stillCurrentTail || lastMessages.length === 0) return
+            const prompt = DBState.db.autoSuggestPrompt && DBState.db.autoSuggestPrompt.length > 0 ? DBState.db.autoSuggestPrompt : defaultAutoSuggestPrompt
+            let promptbody:OpenAIChat[] = [
+                {
+                    role:'system',
+                    content: replacePlaceholders(prompt, currentChar.name)
+                },
+                {
+                    role: 'user',
+                    content: lastMessages.map(b=>(b.role==='char'? currentChar.name : getUserName())+":"+b.data).reduce((a,b)=>a+','+b)
+                }
+            ]
 
-        requestChatData({
-            formated: promptbody,
-            bias: {},
-            currentChar : currentChar as character
-        }, 'submodel', requestController?.signal ?? null).then(rq2=>{
+            if(DBState.db.subModel === "textgen_webui" || DBState.db.subModel === 'mancer' || DBState.db.subModel.startsWith('local_')){
+                promptbody = [
+                    {
+                        role: 'system',
+                        content: replacePlaceholders(DBState.db.autoSuggestPrompt, currentChar.name)
+                    },
+                    ...lastMessages.map(({ role, data }) => ({
+                        role: role === "user" ? "user" as const : "assistant" as const,
+                        content: data,
+                    })),
+                ]
+            }
+
+            const rq2 = await requestChatData({
+                formated: promptbody,
+                bias: {},
+                currentChar : currentChar as character
+            }, 'submodel', requestController?.signal ?? null)
             const stillCurrentRequest = suggestionRequestId === requestId && $selectedCharID === requestCharId && DBState.db.characters[requestCharId]?.chatPage === requestChatPage
             const currentTargetChat = DBState.db.characters[requestCharId]?.chats[requestChatPage]
             if(rq2.type !== 'fail' && rq2.type !== 'streaming' && rq2.type !== 'multiline' && progress && stillCurrentRequest && currentTargetChat){
                 var suggestMessagesNew = rq2.result.split('\n').filter(msg => msg.startsWith('-')).map(msg => msg.replace('-','').trim())
-                currentTargetChat.suggestMessages = suggestMessagesNew
+                writeConversationSuggestions(
+                    DBState.db.characters[requestCharId],
+                    requestChatPage,
+                    suggestMessagesNew,
+                )
                 suggestMessages = suggestMessagesNew
             }
-        }).catch(error => {
+        } catch(error) {
             if(!requestController?.signal.aborted && suggestionRequestId === requestId){
                 console.error(error)
             }
-        }).finally(() => {
+        } finally {
             if(suggestionRequestId === requestId){
                 progress = false
                 abortController = undefined
             }
-        })
+        }
     }
 
     const unsub = doingChat.subscribe(async (v) => {
@@ -129,7 +139,7 @@
             suggestMessages = []
             return
         }
-        requestSuggestions()
+        void requestSuggestions()
     })
 
     const translateSuggest = async (toggle, messages)=>{
@@ -184,7 +194,7 @@
                         if(result) {
                             suggestMessages = []
                             cancelSuggestionRequest()
-                            requestSuggestions()
+                            void requestSuggestions()
                         }
                     })
                 }}

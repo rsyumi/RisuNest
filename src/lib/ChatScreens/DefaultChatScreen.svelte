@@ -98,6 +98,7 @@
     interface ConversationOperationContext {
         requireCurrent(): ConversationOperationAuthority
     }
+    import { readSelectedConversationLatestTail } from '../../ts/selectedConversationTail';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -1317,7 +1318,9 @@
                     (DBState.db.subModel === "textgen_webui" || DBState.db.subModel === "mancer" || DBState.db.subModel.startsWith('local_')) && DBState.db.autoSuggestClean
                     ? msg.replace(/ +\(.+?\) *$| - [^"'*]*?$/, '')
                     : msg
-                )} {send}/>
+                )} {send} readLatestMessages={(signal) =>
+                    readSelectedConversationLatestTail(persistentRuntime, 10, signal)
+                }/>
             {/if}
 
             {#if chatPanelStore.length > 0}

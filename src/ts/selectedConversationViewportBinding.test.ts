@@ -39,6 +39,7 @@ class TestViewportSource implements ConversationViewportSource {
         return {
             sourceToken: this.sourceToken,
             version: this.version,
+            storeRevision: 1,
             totalMessages: this.messages.length,
             keyAt: (index) => this.keyAt(index),
             indexOfKey: (key) => Number(String(key).split(':').at(-1)),

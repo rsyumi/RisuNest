@@ -33,6 +33,7 @@ export interface ConversationViewportRow {
 export interface ConversationViewportSnapshot {
     readonly sourceToken: string
     readonly version: number
+    readonly storeRevision: DataRevision
     readonly totalMessages: number
     keyAt(absoluteIndex: number): ConversationViewportKey | undefined
     indexOfKey(key: ConversationViewportKey): number
@@ -132,6 +133,7 @@ implements ConversationViewportSource {
         return {
             sourceToken: this.sourceToken,
             version: this.currentVersion,
+            storeRevision: this.session.storeRevision,
             totalMessages: keys.length,
             keyAt: (absoluteIndex) => keys[absoluteIndex],
             indexOfKey: (key) => keyIndices.get(key) ?? -1,
@@ -375,6 +377,7 @@ implements ConversationViewportSource {
         return {
             sourceToken: this.sourceToken,
             version: epoch,
+            storeRevision: this.currentRevision,
             totalMessages,
             keyAt: (absoluteIndex) => this.keyAt(epoch, totalMessages, absoluteIndex),
             indexOfKey: (key) => this.indexOfKey(epoch, totalMessages, key),
