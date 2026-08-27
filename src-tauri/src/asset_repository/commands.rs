@@ -309,6 +309,17 @@ fn finalize_content_job(
             }
         }
     }
+    for entry in &decoded {
+        let Some(payload_hash) = entry.payload_hash else {
+            continue;
+        };
+        let payload_hash = hex::encode(payload_hash);
+        if !complete.contains_key(&payload_hash) {
+            return invalid_content_finalization(
+                "owner manifest references an unlisted content object",
+            );
+        }
+    }
     if let Some((byte_size, _)) = complete.get(&owner_hash) {
         if *byte_size != owner_size {
             return invalid_content_finalization(
@@ -373,7 +384,7 @@ pub(crate) async fn asset_cas_job_finalize_content(
     app: AppHandle,
     session_id: String,
     owner_manifest: Vec<u8>,
-    direct_objects: Vec<ContentDirectObject>,
+    content_assets: Vec<ContentDirectObject>,
 ) -> Result<PreparedPayload, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let root = repository_root(&app)?;
@@ -397,7 +408,7 @@ pub(crate) async fn asset_cas_job_finalize_content(
                 &cas,
                 store,
                 &owner_manifest,
-                &direct_objects,
+                &content_assets,
                 now_ms().map_err(|message| StoreError::Store { message })?,
             )
             .map_err(StoreError::from)
@@ -428,6 +439,19 @@ mod tests {
                 "icon".to_owned(),
             ],
             payload_hash: None,
+        }])
+        .unwrap()
+    }
+
+    fn owner_manifest_with_payload(payload_hash: &str) -> Vec<u8> {
+        let payload_hash: [u8; 32] = hex::decode(payload_hash).unwrap().try_into().unwrap();
+        encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: [
+                "character".to_owned(),
+                "card-1".to_owned(),
+                "icon".to_owned(),
+            ],
+            payload_hash: Some(payload_hash),
         }])
         .unwrap()
     }
@@ -567,12 +591,33 @@ mod tests {
     }
 
     #[test]
+    fn content_finalizer_rejects_an_unlisted_manifest_payload_before_owner_prepare() {
+        let directory = TempDir::new().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let unlisted = cas
+            .prepare_bytes(b"present in CAS but omitted from receipt")
+            .unwrap();
+        let manifest = owner_manifest_with_payload(&unlisted.content_hash);
+        let manifest_hash = hex::encode(Sha256::digest(&manifest));
+        let mut job = begin_content_job(directory.path(), "content-unlisted-payload");
+
+        let error =
+            finalize_content_job(&mut job, &cas, &mut store, &manifest, &[], 2).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(job.pin_count(), 0);
+        assert!(!job.is_sealed());
+        assert_eq!(cas.stat_object(&manifest_hash).unwrap(), None);
+    }
+
+    #[test]
     fn content_finalizer_seals_manifest_and_direct_pins_into_catalog_and_gc_roots() {
         let directory = TempDir::new().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let direct = cas.prepare_bytes(b"direct object").unwrap();
-        let manifest = owner_manifest();
+        let manifest = owner_manifest_with_payload(&direct.content_hash);
         let mut job = begin_content_job(directory.path(), "content-finalized");
 
         let prepared = finalize_content_job(
