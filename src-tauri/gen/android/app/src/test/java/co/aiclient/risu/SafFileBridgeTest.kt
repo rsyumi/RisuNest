@@ -725,6 +725,7 @@ class SafFileBridgeTest {
     assertEquals("backup_file.risudat", safeSafDestinationName("backup file"))
     assertEquals("opened-file.risudat", safeSafDestinationName("///"))
     assertEquals("chat.zip", safeSafDestinationName("folder/chat.zip"))
+    assertEquals("Leased.charx", safeSafDestinationName("Leased.charx"))
   }
 
   @Test

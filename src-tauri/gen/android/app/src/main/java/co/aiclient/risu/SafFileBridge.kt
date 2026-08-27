@@ -643,6 +643,7 @@ internal fun safeSafDestinationName(name: String): String {
   return if (
     safe.endsWith(".risudat", ignoreCase = true)
     || safe.endsWith(".zip", ignoreCase = true)
+    || safe.endsWith(".charx", ignoreCase = true)
   ) safe else "$safe.risudat"
 }
 
