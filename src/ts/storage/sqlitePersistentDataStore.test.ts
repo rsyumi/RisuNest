@@ -155,6 +155,28 @@ describe('SqlitePersistentDataStore', () => {
         ])
     })
 
+    it('forwards each current and leased asset alias batch with one native call', async () => {
+        mocks.invoke.mockResolvedValueOnce({ lease: 'lease-alias-batch' }).mockResolvedValue({
+            revision: 9,
+            value: [],
+        })
+        const store = new SqlitePersistentDataStore()
+        const lease = await store.acquireRevision(9)
+        const keys = ['assets/first.bin', 'assets/second.bin']
+
+        await store.readAssetAliasesByKeys('asset', keys)
+        await lease.readAssetAliasesByKeys('inlay', keys)
+
+        expect(mocks.invoke.mock.calls).toEqual([
+            ['pds_acquire_revision', { revision: 9 }],
+            ['pds_read_asset_aliases_by_keys', { kind: 'asset', keys }],
+            [
+                'pds_read_asset_aliases_by_keys',
+                { kind: 'inlay', keys, lease: 'lease-alias-batch' },
+            ],
+        ])
+    })
+
     it('restores native revision-conflict errors', async () => {
         mocks.invoke.mockRejectedValue({ code: 'revision-conflict', expected: 12, actual: 13 })
         const store = new SqlitePersistentDataStore()

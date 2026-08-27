@@ -2,6 +2,7 @@ import type { Chat, Database, Message, botPreset } from './database.svelte'
 import type {
     AssetAlias,
     AssetAliasIdentity,
+    AssetAliasKind,
     AssetAliasListQuery,
     AssetAliasPage,
     AssetOwnerHead,
@@ -37,6 +38,7 @@ import {
     SnapshotReleasedError,
     validateColdAlias,
     validateAssetAlias,
+    validateAssetAliasKeyBatch,
     validateAssetAliasIdentity,
     assetOwnerLocatorKey,
     validateConversationWindowQuery,
@@ -525,6 +527,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         const transaction = this.requireDatabase().transaction(['meta', 'assetAliases'], 'readonly')
         const { revision, generation } = await this.readActive(transaction)
         return this.readAssetAliasFromTransaction(transaction, revision, generation, identity)
+    }
+
+    async readAssetAliasesByKeys(
+        kind: AssetAliasKind,
+        keys: string[],
+    ): Promise<Versioned<AssetAlias[]>> {
+        validateAssetAliasKeyBatch(kind, keys)
+        const transaction = this.requireDatabase().transaction(['meta', 'assetAliases'], 'readonly')
+        const { revision, generation } = await this.readActive(transaction)
+        return this.readAssetAliasesByKeysFromTransaction(
+            transaction,
+            revision,
+            generation,
+            kind,
+            keys,
+        )
     }
 
     async listAssetAliases(input: AssetAliasListQuery): Promise<AssetAliasPage> {
@@ -1224,6 +1242,22 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
                     identity,
                 )
             },
+            readAssetAliasesByKeys: async (kind, keys) => {
+                assertActive()
+                validateAssetAliasKeyBatch(kind, keys)
+                const transaction = this.requireDatabase().transaction(
+                    ['meta', 'assetAliases'],
+                    'readonly',
+                )
+                return this.readAssetAliasesByKeysFromTransaction(
+                    transaction,
+                    revision,
+                    generation,
+                    kind,
+                    keys,
+                    lease,
+                )
+            },
             listAssetAliases: async (input) => {
                 assertActive()
                 const transaction = this.requireDatabase().transaction(
@@ -1374,6 +1408,51 @@ export class IndexedDbPersistentDataStore implements PersistentDataStore {
         }
         validateAssetAlias(record.value)
         return { revision, value: structuredClone(record.value) }
+    }
+
+    private async readAssetAliasesByKeysFromTransaction(
+        transaction: IDBTransaction,
+        revision: DataRevision,
+        generation: string,
+        kind: AssetAliasKind,
+        keys: string[],
+        lease?: string,
+    ): Promise<Versioned<AssetAlias[]>> {
+        const leaseRequest = lease === undefined
+            ? undefined
+            : transaction.objectStore('meta').get(this.snapshotLeaseKey(lease))
+        const objectStore = transaction.objectStore('assetAliases')
+        const requests = keys.map((key) => objectStore.get(this.assetAliasKey(generation, kind, key)))
+        const done = transactionDone(transaction)
+        const leaseRecord = leaseRequest === undefined
+            ? undefined
+            : await requestResult(leaseRequest) as SnapshotLeaseRecord | undefined
+        const records = await Promise.all(requests.map(async (request) =>
+            await requestResult(request) as StoredRecord<AssetAlias> | undefined))
+        await done
+        if (lease !== undefined) {
+            const target = leaseRecord ? this.snapshotLeaseTarget(leaseRecord) : undefined
+            if (!target || target.generation !== generation || target.revision !== revision) {
+                throw new SnapshotReleasedError()
+            }
+        }
+        const values: AssetAlias[] = []
+        for (let index = 0; index < records.length; index++) {
+            const record = records[index]
+            if (!record) continue
+            if (record.generation !== generation) {
+                throw new TypeError('Asset alias stored generation does not match its lookup key')
+            }
+            if (record.value.kind !== kind) {
+                throw new TypeError('Asset alias stored kind does not match its lookup key')
+            }
+            if (record.value.key !== keys[index]) {
+                throw new TypeError('Asset alias stored logical key does not match its lookup key')
+            }
+            validateAssetAlias(record.value)
+            values.push(structuredClone(record.value))
+        }
+        return { revision, value: values }
     }
 
     private async listAssetAliasesFromTransaction(

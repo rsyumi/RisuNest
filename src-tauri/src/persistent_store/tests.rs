@@ -1500,6 +1500,121 @@ fn asset_alias_overwrite_isolated_by_revision_lease() {
 }
 
 #[test]
+fn asset_alias_batch_lookup_preserves_kind_and_exact_revision_lease() {
+    let (_directory, mut store, _) = open_fixture();
+    let asset = AssetAlias {
+        key: "assets/batch-shared.bin".to_owned(),
+        object_hash: Some("31".repeat(32)),
+        kind: "asset".to_owned(),
+        size: 3,
+        mime: "application/octet-stream".to_owned(),
+        name: "Batch asset".to_owned(),
+        ext: "bin".to_owned(),
+        inlay_type: None,
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let inlay = AssetAlias {
+        key: asset.key.clone(),
+        object_hash: Some("32".repeat(32)),
+        kind: "inlay".to_owned(),
+        size: 4,
+        mime: "image/webp".to_owned(),
+        name: "Batch inlay".to_owned(),
+        ext: "webp".to_owned(),
+        inlay_type: Some("image".to_owned()),
+        width: None,
+        height: None,
+        metadata: json!({}),
+    };
+    let first = store
+        .commit_asset_alias(&asset, 1)
+        .expect("commit batch asset");
+    let second = store
+        .commit_asset_alias(&inlay, first.revision)
+        .expect("commit batch inlay");
+    let lease = store
+        .acquire_revision(second.revision)
+        .expect("acquire batch revision");
+    let replacement = AssetAlias {
+        object_hash: Some("33".repeat(32)),
+        size: 5,
+        ..asset.clone()
+    };
+    let third = store
+        .commit_asset_alias(&replacement, second.revision)
+        .expect("commit batch replacement");
+    let keys = vec![asset.key.clone(), "assets/missing.bin".to_owned()];
+
+    assert_eq!(
+        store
+            .read_asset_aliases_by_keys("asset", &keys, None)
+            .expect("read current batch"),
+        super::Versioned {
+            revision: third.revision,
+            value: vec![replacement],
+        }
+    );
+    assert_eq!(
+        store
+            .read_asset_aliases_by_keys("inlay", &[asset.key.clone()], None)
+            .expect("read sibling kind batch"),
+        super::Versioned {
+            revision: third.revision,
+            value: vec![inlay],
+        }
+    );
+    assert_eq!(
+        store
+            .read_asset_aliases_by_keys("asset", &keys, Some(&lease.lease))
+            .expect("read leased batch"),
+        super::Versioned {
+            revision: second.revision,
+            value: vec![asset],
+        }
+    );
+}
+
+#[test]
+fn asset_alias_batch_lookup_accepts_512_unique_keys_and_rejects_invalid_batches() {
+    let (_directory, store, _) = open_fixture();
+    let keys = (0..512)
+        .map(|index| format!("assets/batch-{index}.bin"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        store
+            .read_asset_aliases_by_keys("asset", &keys, None)
+            .expect("accept 512 batch keys")
+            .value,
+        Vec::<AssetAlias>::new()
+    );
+    assert!(matches!(
+        store.read_asset_aliases_by_keys("asset", &[], None),
+        Err(StoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        store.read_asset_aliases_by_keys(
+            "asset",
+            &["duplicate".to_owned(), "duplicate".to_owned()],
+            None,
+        ),
+        Err(StoreError::Validation { .. })
+    ));
+    let mut too_many = keys;
+    too_many.push("assets/batch-512.bin".to_owned());
+    assert!(matches!(
+        store.read_asset_aliases_by_keys("asset", &too_many, None),
+        Err(StoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        store.read_asset_aliases_by_keys("invalid", &["assets/valid.bin".to_owned()], None),
+        Err(StoreError::Validation { .. })
+    ));
+}
+
+#[test]
 fn staged_asset_aliases_activate_with_zero_and_missing_payloads() {
     let directory = tempfile::tempdir().expect("create temporary directory");
     let mut store = PersistentStore::open(directory.path()).expect("open persistent store");
@@ -1973,6 +2088,10 @@ fn corrupt_persisted_asset_alias_fails_direct_lookup_and_integrity_check() {
 
     assert!(matches!(
         store.read_asset_alias("asset", "assets/corrupt.bin", None),
+        Err(StoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        store.read_asset_aliases_by_keys("asset", &["assets/corrupt.bin".to_owned()], None,),
         Err(StoreError::Validation { .. })
     ));
     let integrity: String = store

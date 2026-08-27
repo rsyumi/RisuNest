@@ -318,6 +318,90 @@ export function persistentDataStoreContract(createHarness: () => Promise<Persist
             await lease.release()
         })
 
+        it('reads found asset aliases by unique keys at the exact current and leased revisions', async () => {
+            const { store } = await createHarness()
+            const sharedKey = 'assets/batch-shared.bin'
+            const asset: AssetAlias = {
+                key: sharedKey,
+                objectHash: '13'.repeat(32),
+                kind: 'asset',
+                size: 3,
+                mime: 'application/octet-stream',
+                name: 'Batch asset',
+                ext: 'bin',
+            }
+            const inlay: AssetAlias = {
+                key: sharedKey,
+                objectHash: '14'.repeat(32),
+                kind: 'inlay',
+                size: 4,
+                mime: 'image/webp',
+                name: 'Batch inlay',
+                ext: 'webp',
+                inlayType: 'image',
+            }
+            const imported = await store.replaceFromDatabase(
+                structuredClone(fixtureDatabase),
+                undefined,
+                [asset, inlay],
+            )
+            const lease = await store.acquireRevision(imported.revision)
+            const replacement = { ...asset, objectHash: '15'.repeat(32), size: 5 }
+            const committed = await store.commitAssetAlias(replacement, imported.revision)
+
+            expect(await store.readAssetAliasesByKeys('asset', [sharedKey, 'assets/missing.bin']))
+                .toEqual({ revision: committed.revision, value: [replacement] })
+            expect(await store.readAssetAliasesByKeys('inlay', [sharedKey]))
+                .toEqual({ revision: committed.revision, value: [inlay] })
+            expect(await lease.readAssetAliasesByKeys('asset', [sharedKey, 'assets/missing.bin']))
+                .toEqual({ revision: imported.revision, value: [asset] })
+            await lease.release()
+        })
+
+        it('accepts exactly 512 asset alias keys', async () => {
+            const { store } = await createHarness()
+            const aliases: AssetAlias[] = Array.from({ length: 512 }, (_, index) => ({
+                key: `assets/batch-${index}.bin`,
+                objectHash: index.toString(16).padStart(64, '0'),
+                kind: 'asset',
+                size: index,
+                mime: 'application/octet-stream',
+                name: `Batch ${index}`,
+                ext: 'bin',
+            }))
+            const imported = await store.replaceFromDatabase(
+                structuredClone(fixtureDatabase),
+                undefined,
+                aliases,
+            )
+
+            const result = await store.readAssetAliasesByKeys(
+                'asset',
+                aliases.map((alias) => alias.key),
+            )
+
+            expect(result.revision).toBe(imported.revision)
+            expect(new Map(result.value.map((alias) => [alias.key, alias]))).toEqual(
+                new Map(aliases.map((alias) => [alias.key, alias])),
+            )
+        })
+
+        it('rejects invalid asset alias key batches', async () => {
+            const { store } = await createHarness()
+            const keys = Array.from({ length: 513 }, (_, index) => `assets/${index}.bin`)
+
+            await expect(store.readAssetAliasesByKeys('asset', [])).rejects.toThrow('between 1 and 512')
+            await expect(store.readAssetAliasesByKeys('asset', ['duplicate', 'duplicate']))
+                .rejects.toThrow('unique')
+            await expect(store.readAssetAliasesByKeys('asset', keys)).rejects.toThrow('between 1 and 512')
+            await expect(store.readAssetAliasesByKeys('invalid' as 'asset', ['assets/valid.bin']))
+                .rejects.toThrow('kind')
+            await expect(store.readAssetAliasesByKeys(
+                'asset',
+                ['assets/valid.bin', null] as unknown as string[],
+            )).rejects.toThrow('string')
+        })
+
         it('commits imported character and module aliases in one revision', async () => {
             const { store } = await createHarness()
             const imported = await store.replaceFromDatabase(structuredClone(fixtureDatabase))

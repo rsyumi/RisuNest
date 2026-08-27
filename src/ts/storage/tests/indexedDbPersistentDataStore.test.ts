@@ -951,6 +951,29 @@ describe('IndexedDbPersistentDataStore I/O shape', () => {
         })).rejects.toThrow('objectHash')
     })
 
+    it('rejects a corrupt persisted asset alias during batch lookup', async () => {
+        const indexedDB = new IDBFactory()
+        const databaseName = `asset-alias-batch-integrity-${databaseSequence++}`
+        const store = new IndexedDbPersistentDataStore(databaseName, indexedDB, IDBKeyRange)
+        await store.open()
+        await writeRawRecords(indexedDB, databaseName, 'assetAliases', [{
+            key: 'revision-0:asset-alias:asset:assets/corrupt-batch.bin',
+            generation: 'revision-0',
+            value: {
+                key: 'assets/corrupt-batch.bin',
+                objectHash: 'CORRUPT',
+                kind: 'asset',
+                size: 1,
+                mime: 'application/octet-stream',
+                name: 'Corrupt batch',
+                ext: 'bin',
+            },
+        }])
+
+        await expect(store.readAssetAliasesByKeys('asset', ['assets/corrupt-batch.bin']))
+            .rejects.toThrow('objectHash')
+    })
+
     it('fails closed when a persisted alias row identity does not match its lookup key', async () => {
         const indexedDB = new IDBFactory()
         const databaseName = `asset-alias-identity-${databaseSequence++}`

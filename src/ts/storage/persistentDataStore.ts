@@ -258,6 +258,25 @@ export function validateAssetAliasIdentity(identity: AssetAliasIdentity): void {
     }
 }
 
+export function validateAssetAliasKeyBatch(kind: AssetAliasKind, keys: string[]): void {
+    if (kind !== 'asset' && kind !== 'inlay') {
+        throw new TypeError('Asset alias identity kind must be asset or inlay')
+    }
+    if (!Array.isArray(keys) || keys.length < 1 || keys.length > 512) {
+        throw new TypeError('Asset alias key batch size must be between 1 and 512')
+    }
+    const uniqueKeys = new Set<string>()
+    for (const key of keys) {
+        if (typeof key !== 'string') {
+            throw new TypeError('Asset alias identity key must be a string')
+        }
+        if (uniqueKeys.has(key)) {
+            throw new TypeError('Asset alias key batch must contain unique keys')
+        }
+        uniqueKeys.add(key)
+    }
+}
+
 export type PluginStorageMutation =
     | { type: 'set'; key: string; value: unknown }
     | { type: 'delete'; key: string }
@@ -438,6 +457,7 @@ export interface PersistentRevisionReader {
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
+    readAssetAliasesByKeys(kind: AssetAliasKind, keys: string[]): Promise<Versioned<AssetAlias[]>>
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
     readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>
@@ -465,6 +485,7 @@ export interface PersistentDataStore {
     queryPluginStorage(): Promise<PluginStorageCatalog>
     readPluginStorage(key: string): Promise<Versioned<unknown> | null>
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null>
+    readAssetAliasesByKeys(kind: AssetAliasKind, keys: string[]): Promise<Versioned<AssetAlias[]>>
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage>
     readAssetRepositoryAuthority(): Promise<Versioned<AssetRepositoryAuthorityState>>
     readAssetOwnerHead(owner: AssetOwnerLocator): Promise<Versioned<AssetOwnerHead> | null>

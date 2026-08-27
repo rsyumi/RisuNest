@@ -1283,6 +1283,16 @@ impl PersistentStore {
         query::read_asset_alias(connection, kind, key, &target)
     }
 
+    pub(crate) fn read_asset_aliases_by_keys(
+        &self,
+        kind: &str,
+        keys: &[String],
+        lease: Option<&str>,
+    ) -> StoreResult<Versioned<Vec<AssetAlias>>> {
+        let (connection, target) = self.read_view(lease)?;
+        query::read_asset_aliases_by_keys(connection, kind, keys, &target)
+    }
+
     pub(crate) fn list_asset_alias_page(
         &self,
         query_input: &AssetAliasListQuery,

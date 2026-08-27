@@ -9,6 +9,7 @@ use super::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 pub(super) fn read_root(
     connection: &Connection,
@@ -150,6 +151,48 @@ pub(super) fn read_asset_alias(
             })
         })
         .transpose()
+}
+
+pub(super) fn read_asset_aliases_by_keys(
+    connection: &Connection,
+    kind: &str,
+    keys: &[String],
+    target: &ReadTarget,
+) -> StoreResult<Versioned<Vec<AssetAlias>>> {
+    validate_asset_kind(kind)?;
+    if !(1..=512).contains(&keys.len()) {
+        return Err(StoreError::Validation {
+            message: "Asset alias key batch size must be between 1 and 512".to_owned(),
+        });
+    }
+    let mut unique_keys = HashSet::with_capacity(keys.len());
+    for key in keys {
+        if !unique_keys.insert(key.as_str()) {
+            return Err(StoreError::Validation {
+                message: "Asset alias key batch must contain unique keys".to_owned(),
+            });
+        }
+    }
+    let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT logical_key, object_hash, kind, size, mime, name, ext, inlay_type, width, height, metadata
+         FROM asset_aliases
+         WHERE generation = ? AND kind = ? AND logical_key IN ({placeholders})"
+    );
+    let parameters = std::iter::once(target.generation.as_str())
+        .chain(std::iter::once(kind))
+        .chain(keys.iter().map(String::as_str));
+    let mut statement = connection.prepare(&sql)?;
+    let values = statement
+        .query_map(rusqlite::params_from_iter(parameters), asset_alias_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for value in &values {
+        value.validate()?;
+    }
+    Ok(Versioned {
+        revision: target.revision,
+        value: values,
+    })
 }
 
 pub(super) fn list_asset_alias_page(

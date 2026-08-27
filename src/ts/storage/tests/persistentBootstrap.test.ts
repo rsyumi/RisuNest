@@ -47,6 +47,7 @@ function createStore(input?: {
         queryPluginStorage: vi.fn(async () => ({ revision, items: [] })),
         readPluginStorage: vi.fn(async () => null),
         readAssetAlias: vi.fn(async () => null),
+        readAssetAliasesByKeys: vi.fn(async () => ({ revision, value: [] })),
         listAssetAliases: vi.fn(async () => ({ revision, items: [] })),
         readAssetRepositoryAuthority: vi.fn(async () => ({
             revision,

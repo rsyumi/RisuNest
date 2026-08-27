@@ -222,6 +222,18 @@ pub(crate) fn pds_read_asset_alias(
 }
 
 #[tauri::command(async)]
+pub(crate) fn pds_read_asset_aliases_by_keys(
+    state: State<'_, PersistentStoreState>,
+    kind: String,
+    keys: Vec<String>,
+    lease: Option<String>,
+) -> Result<Versioned<Vec<AssetAlias>>, StoreError> {
+    with_store(state, |store| {
+        store.read_asset_aliases_by_keys(&kind, &keys, lease.as_deref())
+    })
+}
+
+#[tauri::command(async)]
 pub(crate) fn pds_list_asset_aliases(
     state: State<'_, PersistentStoreState>,
     query: AssetAliasListQuery,

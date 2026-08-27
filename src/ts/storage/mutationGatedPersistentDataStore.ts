@@ -2,6 +2,7 @@ import type { Database } from './database.svelte'
 import type {
     AssetAlias,
     AssetAliasIdentity,
+    AssetAliasKind,
     AssetAliasListQuery,
     AssetRepositoryMigrationInput,
     AssetOwnerLocator,
@@ -45,6 +46,8 @@ export function createMutationGatedPersistentDataStore(
         queryPluginStorage: () => store.queryPluginStorage(),
         readPluginStorage: (key: string) => store.readPluginStorage(key),
         readAssetAlias: (identity: AssetAliasIdentity) => store.readAssetAlias(identity),
+        readAssetAliasesByKeys: (kind: AssetAliasKind, keys: string[]) =>
+            store.readAssetAliasesByKeys(kind, keys),
         listAssetAliases: (input: AssetAliasListQuery) => store.listAssetAliases(input),
         readAssetRepositoryAuthority: () => store.readAssetRepositoryAuthority(),
         readAssetOwnerHead: (owner: AssetOwnerLocator) => store.readAssetOwnerHead(owner),

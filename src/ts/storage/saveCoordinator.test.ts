@@ -187,7 +187,7 @@ describe('SaveCoordinator', () => {
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead,
-                readAssetAlias: vi.fn(async () => null),
+                readAssetAliasesByKeys: vi.fn(async () => ({ revision: 7, value: [] })),
                 release,
             })),
         } as unknown as PersistentDataStore
@@ -522,8 +522,8 @@ describe('SaveCoordinator', () => {
     it('preserves cancellation during an alias read and never starts commit', async () => {
         const database = makeDatabase()
         database.modules = []
-        const aliasRead = deferred<null>()
-        const readAssetAlias = vi.fn(() => aliasRead.promise)
+        const aliasRead = deferred<{ revision: number; value: [] }>()
+        const readAssetAliasesByKeys = vi.fn(() => aliasRead.promise)
         const release = vi.fn(async () => undefined)
         const commit = vi.fn()
         const store = {
@@ -532,7 +532,7 @@ describe('SaveCoordinator', () => {
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
-                readAssetAlias,
+                readAssetAliasesByKeys,
                 release,
             })),
         } as unknown as PersistentDataStore
@@ -559,9 +559,9 @@ describe('SaveCoordinator', () => {
             }],
             ownerHead: { present: true, manifestHash: 'b'.repeat(64), entryCount: 1 },
         }, controller.signal)
-        await vi.waitFor(() => expect(readAssetAlias).toHaveBeenCalledOnce())
+        await vi.waitFor(() => expect(readAssetAliasesByKeys).toHaveBeenCalledOnce())
         controller.abort(reason)
-        aliasRead.resolve(null)
+        aliasRead.resolve({ revision: 7, value: [] })
 
         await expect(append).rejects.toBe(reason)
         expect(commit).not.toHaveBeenCalled()
@@ -621,14 +621,14 @@ describe('SaveCoordinator', () => {
             ext: 'future-extension-metadata',
         }
         const commit = vi.fn(async (_input: WorkingSetCommit) => ({ revision: 8 }))
-        const readAssetAlias = vi.fn(async () => ({ revision: 7, value: existing }))
+        const readAssetAliasesByKeys = vi.fn(async () => ({ revision: 7, value: [existing] }))
         const store = {
             commit,
             acquireRevision: vi.fn(async () => ({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
-                readAssetAlias,
+                readAssetAliasesByKeys,
                 release: vi.fn(async () => undefined),
             })),
         } as unknown as PersistentDataStore
@@ -647,7 +647,7 @@ describe('SaveCoordinator', () => {
             ownerHead: { present: false, manifestHash: null, entryCount: 0 },
         })
 
-        expect(readAssetAlias).toHaveBeenCalledOnce()
+        expect(readAssetAliasesByKeys).toHaveBeenCalledOnce()
         expect(commit.mock.calls[0][0].assetAliases).toEqual([])
 
         const conflictingCoordinator = new SaveCoordinator({
@@ -657,9 +657,9 @@ describe('SaveCoordinator', () => {
                     revision: 7,
                     readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                     readAssetOwnerHead: vi.fn(async () => null),
-                    readAssetAlias: vi.fn(async () => ({
+                    readAssetAliasesByKeys: vi.fn(async () => ({
                         revision: 7,
-                        value: { ...existing, objectHash: 'b'.repeat(64) },
+                        value: [{ ...existing, objectHash: 'b'.repeat(64) }],
                     })),
                     release: vi.fn(async () => undefined),
                 })),
@@ -675,6 +675,61 @@ describe('SaveCoordinator', () => {
             assetAliases: [incoming],
             ownerHead: { present: false, manifestHash: null, entryCount: 0 },
         })).rejects.toThrow(/alias conflicts/i)
+    })
+
+    it('looks up 513 unique aliases in stable batches and commits only missing aliases', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const aliases = Array.from({ length: 513 }, (_, index) => ({
+            kind: 'asset' as const,
+            key: `assets/${index.toString(16).padStart(64, '0')}.bin`,
+            objectHash: index.toString(16).padStart(64, '0'),
+            size: index,
+            mime: '',
+            name: '',
+            ext: 'bin',
+        }))
+        const existing = {
+            ...aliases[0],
+            mime: 'application/octet-stream',
+            name: 'retained.bin',
+            ext: 'future-extension-metadata',
+        }
+        const commit = vi.fn(async (_input: WorkingSetCommit) => ({ revision: 8 }))
+        const readAssetAliasesByKeys = vi.fn(async (_kind: 'asset', keys: string[]) => ({
+            revision: 7,
+            value: keys.includes(existing.key) ? [existing] : [],
+        }))
+        const store = {
+            commit,
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAliasesByKeys,
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7, database)
+
+        await coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'batched', name: 'Batched', description: '' },
+            assetAliases: [...aliases, aliases[0]],
+            ownerHead: { present: true, manifestHash: 'f'.repeat(64), entryCount: 514 },
+        })
+
+        expect(readAssetAliasesByKeys.mock.calls.map(([, keys]) => keys)).toEqual([
+            aliases.slice(0, 512).map((alias) => alias.key),
+            [aliases[512].key],
+        ])
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0].assetAliases).toEqual(aliases.slice(1))
     })
 
     it('adopts a successful storage-only revision without changing dirty state or baselines', async () => {

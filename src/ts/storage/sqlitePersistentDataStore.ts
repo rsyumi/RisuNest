@@ -11,6 +11,7 @@ import {
     validateConversationWindowQuery,
     type AssetAlias,
     type AssetAliasIdentity,
+    type AssetAliasKind,
     type AssetAliasListQuery,
     type AssetAliasPage,
     type AssetOwnerHead,
@@ -169,6 +170,13 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
 
     readAssetAlias(identity: AssetAliasIdentity): Promise<Versioned<AssetAlias> | null> {
         return invokeStore('pds_read_asset_alias', { ...identity })
+    }
+
+    readAssetAliasesByKeys(
+        kind: AssetAliasKind,
+        keys: string[],
+    ): Promise<Versioned<AssetAlias[]>> {
+        return invokeStore('pds_read_asset_aliases_by_keys', { kind, keys })
     }
 
     listAssetAliases(query: AssetAliasListQuery): Promise<AssetAliasPage> {
@@ -413,6 +421,10 @@ export class SqlitePersistentDataStore implements PersistentDataStore {
             readAssetAlias: async (identity) => {
                 assertActive()
                 return invokeStore('pds_read_asset_alias', { ...identity, lease })
+            },
+            readAssetAliasesByKeys: async (kind, keys) => {
+                assertActive()
+                return invokeStore('pds_read_asset_aliases_by_keys', { kind, keys, lease })
             },
             listAssetAliases: async (query) => {
                 assertActive()

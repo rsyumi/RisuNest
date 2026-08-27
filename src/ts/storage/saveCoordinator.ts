@@ -1246,18 +1246,28 @@ export class SaveCoordinator {
                     }
                     if (!previous) uniqueAliases.set(alias.key, canonicalClone(alias))
                 }
-                for (const alias of uniqueAliases.values()) {
+                const uniqueAliasValues = [...uniqueAliases.values()]
+                const existingAliases = new Map<string, AssetAlias>()
+                for (let index = 0; index < uniqueAliasValues.length; index += 512) {
                     signal?.throwIfAborted()
-                    const existing = await reader.readAssetAlias({ kind: 'asset', key: alias.key })
+                    const keys = uniqueAliasValues
+                        .slice(index, index + 512)
+                        .map((alias) => alias.key)
+                    const existing = await reader.readAssetAliasesByKeys('asset', keys)
                     signal?.throwIfAborted()
+                    this.assertReadRevision(revision, existing.revision)
+                    for (const alias of existing.value) existingAliases.set(alias.key, alias)
+                }
+                for (const alias of uniqueAliasValues) {
+                    signal?.throwIfAborted()
+                    const existing = existingAliases.get(alias.key)
                     if (!existing) {
                         aliases.push(alias)
                         continue
                     }
-                    this.assertReadRevision(revision, existing.revision)
                     if (
-                        existing.value.objectHash !== alias.objectHash
-                        || existing.value.size !== alias.size
+                        existing.objectHash !== alias.objectHash
+                        || existing.size !== alias.size
                     ) {
                         throw new PersistentRootModuleAppendRejectedError(
                             `Imported module alias conflicts with existing ${alias.key}`,

@@ -632,6 +632,7 @@ pub fn run() {
             persistent_store::commands::pds_query_plugin_storage,
             persistent_store::commands::pds_read_plugin_storage,
             persistent_store::commands::pds_read_asset_alias,
+            persistent_store::commands::pds_read_asset_aliases_by_keys,
             persistent_store::commands::pds_list_asset_aliases,
             persistent_store::commands::pds_read_asset_repository_authority,
             persistent_store::commands::pds_read_asset_owner_head,
