@@ -494,6 +494,7 @@ pub fn run() {
                 responder.respond(response);
             });
         })
+        .manage(asset_repository::commands::DurableCasJobState::default())
         .manage(persistent_store::PersistentStoreState::default())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -558,6 +559,11 @@ pub fn run() {
             asset_repository::commands::asset_cas_read_object,
             asset_repository::commands::asset_cas_read_object_range,
             asset_repository::commands::asset_cas_stat_object,
+            asset_repository::commands::asset_cas_job_begin,
+            asset_repository::commands::asset_cas_job_prepare,
+            asset_repository::commands::asset_cas_job_pin_existing,
+            asset_repository::commands::asset_cas_job_seal,
+            asset_repository::commands::asset_cas_job_release,
             native_file_jobs::native_file_job_start,
             native_file_jobs::native_file_job_status,
             native_file_jobs::native_file_job_list,

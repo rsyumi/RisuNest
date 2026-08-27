@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import {
+    beginCasJob,
     createNativeImmutablePayloadCas,
     createNativeNewInlayImageEncoder,
+    pinExistingCasObject,
+    prepareCasObject,
+    releaseCasJob,
+    sealCasJob,
 } from './nativeAssetRepository'
 
 describe('native asset repository adapters', () => {
@@ -70,5 +75,39 @@ describe('native asset repository adapters', () => {
             },
         })
         expect(invoke).toHaveBeenCalledOnce()
+    })
+
+    it('exposes a native-only durable CAS pin session without catalog enumeration', async () => {
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'asset_cas_job_begin') return 'session-1'
+            if (command === 'asset_cas_job_prepare') return {
+                contentHash: '44'.repeat(32),
+                byteSize: 3,
+                physicalKey: `assets-v2/objects/44/${'44'.repeat(32).slice(2)}`,
+                deduplicated: false,
+                directoryEntriesSynced: false,
+            }
+            return null
+        })
+
+        await expect(beginCasJob('lossless-import', invoke)).resolves.toBe('session-1')
+        await expect(prepareCasObject(
+            'session-1',
+            Uint8Array.of(1, 2, 3),
+            'direct-object',
+            invoke,
+        )).resolves.toMatchObject({ byteSize: 3 })
+        await pinExistingCasObject('session-1', '55'.repeat(32), 7, 'owner-manifest', invoke)
+        await sealCasJob('session-1', invoke)
+        await releaseCasJob('session-1', 'committed', invoke)
+
+        expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+            'asset_cas_job_begin',
+            'asset_cas_job_prepare',
+            'asset_cas_job_pin_existing',
+            'asset_cas_job_seal',
+            'asset_cas_job_release',
+        ])
+        expect(invoke).not.toHaveBeenCalledWith(expect.stringContaining('catalog'), expect.anything())
     })
 })
