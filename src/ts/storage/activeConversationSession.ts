@@ -12,6 +12,7 @@ import {
 export type ActiveConversationPinReason =
     | 'viewport'
     | 'editor'
+    | 'playing-media'
     | 'dirty'
     | 'pending-save'
     | 'streaming'
@@ -1068,6 +1069,9 @@ export class ActiveConversationSession {
     private readonly residentReadsEnabled: boolean
     private readonly pins = new Map<ActiveConversationPinReason, number>()
     private readonly residencyRangePins = new Map<ActiveConversationPinReason, number>()
+    private readonly subscribers = new Set<(
+        event: ActiveConversationMutationEvent | null,
+    ) => void>()
     private locatorRegistry = new ConversationLocatorRegistry()
     private sessionVersion = 0
     private persistedSessionVersion = 0
@@ -1149,6 +1153,19 @@ export class ActiveConversationSession {
 
     get activePinReasons(): ActiveConversationPinReason[] {
         return [...this.pins.keys()]
+    }
+
+    subscribe(
+        listener: (event: ActiveConversationMutationEvent | null) => void,
+    ): () => void {
+        this.assertActive()
+        this.subscribers.add(listener)
+        let subscribed = true
+        return () => {
+            if (!subscribed) return
+            subscribed = false
+            this.subscribers.delete(listener)
+        }
     }
 
     matchesConversation(characterId: string, conversation: Chat): boolean {
@@ -1953,6 +1970,8 @@ export class ActiveConversationSession {
     invalidate(): void {
         if (!this.active) return
         this.active = false
+        this.notifySubscribers(null)
+        this.subscribers.clear()
         this.pins.clear()
         this.residencyRangePins.clear()
         this.locatorRegistry.clear()
@@ -2043,6 +2062,17 @@ export class ActiveConversationSession {
                 }
             } catch {
                 this.activateCompatibilityFallback(this.conversation.message.length)
+            }
+        }
+        this.notifySubscribers(event)
+    }
+
+    private notifySubscribers(event: ActiveConversationMutationEvent | null): void {
+        for (const subscriber of [...this.subscribers]) {
+            try {
+                subscriber(event)
+            } catch (error) {
+                console.error('Active conversation subscriber failed', error)
             }
         }
     }
