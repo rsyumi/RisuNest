@@ -814,7 +814,7 @@ fn content_import_limits() -> ImportLimits {
     }
 }
 
-fn content_classification_limits() -> ImportLimits {
+pub(super) fn content_classification_limits() -> ImportLimits {
     let charx_limits = CharXLimits::default();
     let mut limits = content_import_limits();
     limits.max_container_entries = charx_limits.max_entries;
@@ -837,7 +837,7 @@ fn storage_suffix(extension: Option<&str>) -> String {
     }
 }
 
-fn native_format_error(error: FormatError) -> NativeJobError {
+pub(super) fn native_format_error(error: FormatError) -> NativeJobError {
     let code = match error.kind {
         FormatErrorKind::Cancelled => "cancelled",
         FormatErrorKind::InvalidFormat | FormatErrorKind::LimitExceeded => "invalid-input",

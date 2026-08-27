@@ -142,6 +142,7 @@ export interface NativeFileJobStatus {
         | 'restore-legacy-local-backup'
         | 'export-legacy-local-backup'
         | 'prepare-content-import'
+        | 'import-jpeg-asset'
         | 'kei-backup-upload'
         | 'restore-official-account-snapshot'
         | 'official-publication-upload'

@@ -1,5 +1,6 @@
 pub mod charx;
 mod content;
+mod jpeg_asset;
 pub mod screenshot_output;
 
 mod legacy_backup;
@@ -212,6 +213,12 @@ pub(crate) enum NativeFileJobStartRequest {
     PrepareContentImport {
         source: JobSource,
         display_name: String,
+    },
+    ImportJpegAsset {
+        source: JobSource,
+        display_name: String,
+        destination: jpeg_asset::JpegAssetDestination,
+        expected_revision: i64,
     },
     KeiBackupUpload {
         lease: String,
@@ -1151,6 +1158,39 @@ impl NativeFileJobState {
             request @ NativeFileJobStartRequest::PrepareContentImport { .. } => {
                 return self.start_content(request);
             }
+            NativeFileJobStartRequest::ImportJpegAsset {
+                source,
+                display_name,
+                destination,
+                expected_revision,
+            } => {
+                if !is_bounded_content_display_name(&display_name) {
+                    return Err(NativeJobError::new(
+                        "invalid-input",
+                        "JPEG asset display name is invalid",
+                    ));
+                }
+                let opened_source = match &source {
+                    JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
+                    JobSource::AndroidSpool { token } => {
+                        parse_android_spool_token(token)?;
+                        None
+                    }
+                };
+                let store =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.open_native_job_store()
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::ImportJpegAsset {
+                    opened_source,
+                    source,
+                    display_name,
+                    destination,
+                    expected_revision,
+                    store,
+                }
+            }
             NativeFileJobStartRequest::KeiBackupUpload {
                 lease,
                 expected_revision,
@@ -1414,7 +1454,7 @@ impl NativeFileJobState {
             }
         };
         let source_preparation = (|| -> Result<(), NativeJobError> {
-            let (opened_source, source) = match &mut task {
+            let (opened_source, source, expected_display_name) = match &mut task {
                 NativeFileJobTask::Restore {
                     opened_source,
                     source,
@@ -1429,13 +1469,24 @@ impl NativeFileJobState {
                     opened_source,
                     source,
                     ..
-                } => (opened_source, source),
+                } => (opened_source, source, None),
+                NativeFileJobTask::ImportJpegAsset {
+                    opened_source,
+                    source,
+                    display_name,
+                    ..
+                } => (opened_source, source, Some(display_name.as_str())),
                 _ => return Ok(()),
             };
             match source {
                 JobSource::DesktopPath { .. } if opened_source.is_some() => Ok(()),
                 JobSource::AndroidSpool { token } if opened_source.is_none() => {
-                    let path = claim_spool_source(&self.root, token, &owned_directory)?;
+                    let path = claim_spool_source_with_display_name(
+                        &self.root,
+                        token,
+                        &owned_directory,
+                        expected_display_name,
+                    )?;
                     *opened_source = Some(open_regular_file_no_follow(&path)?);
                     Ok(())
                 }
@@ -1576,6 +1627,31 @@ impl NativeFileJobState {
                     store,
                     &job,
                 ),
+                NativeFileJobTask::ImportJpegAsset {
+                    opened_source,
+                    display_name,
+                    destination,
+                    expected_revision,
+                    store,
+                    ..
+                } => match opened_source {
+                    Some(opened_source) => {
+                        let repository_root = store.repository_root().to_path_buf();
+                        jpeg_asset::import_jpeg_asset(
+                            opened_source,
+                            &display_name,
+                            destination,
+                            expected_revision,
+                            &repository_root,
+                            store,
+                            &job,
+                        )
+                    }
+                    None => Err(NativeJobError::new(
+                        "store-error",
+                        "native JPEG asset source was not prepared",
+                    )),
+                },
                 #[cfg(feature = "native-kei-upload-pilot")]
                 NativeFileJobTask::KeiBackup { prepared } => {
                     crate::persistent_store::kei::run_job(prepared, Arc::clone(&job))
@@ -1877,6 +1953,14 @@ enum NativeFileJobTask {
         expected_revision: i64,
         store: crate::persistent_store::PersistentStore,
     },
+    ImportJpegAsset {
+        opened_source: Option<OpenedJobSource>,
+        source: JobSource,
+        display_name: String,
+        destination: jpeg_asset::JpegAssetDestination,
+        expected_revision: i64,
+        store: crate::persistent_store::PersistentStore,
+    },
     #[cfg(feature = "native-kei-upload-pilot")]
     KeiBackup {
         prepared: crate::persistent_store::kei::PreparedKeiUpload,
@@ -1898,6 +1982,7 @@ impl NativeFileJobTask {
             Self::ExportLossless { .. } => JobKind::ExportLosslessBackup,
             Self::RestoreLegacyLocalBackup { .. } => JobKind::RestoreLegacyLocalBackup,
             Self::ExportLegacyLocalBackup { .. } => JobKind::ExportLegacyLocalBackup,
+            Self::ImportJpegAsset { .. } => JobKind::ImportJpegAsset,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
             #[cfg(feature = "native-official-publication")]
@@ -1926,6 +2011,9 @@ impl NativeFileJobTask {
                 expected_revision, ..
             }
             | Self::ExportLegacyLocalBackup {
+                expected_revision, ..
+            }
+            | Self::ImportJpegAsset {
                 expected_revision, ..
             } => *expected_revision,
             #[cfg(feature = "native-kei-upload-pilot")]
@@ -2184,6 +2272,7 @@ pub(crate) enum JobKind {
     ExportLosslessBackup,
     ExportLegacyLocalBackup,
     PrepareContentImport,
+    ImportJpegAsset,
     KeiBackupUpload,
     OfficialPublicationUpload,
 }
@@ -2786,6 +2875,7 @@ impl JobControl {
             JobKind::ExportLosslessBackup => JobPhase::WritingExport,
             JobKind::ExportLegacyLocalBackup => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,
+            JobKind::ImportJpegAsset => JobPhase::ReadingSource,
             JobKind::KeiBackupUpload => JobPhase::WritingExport,
             JobKind::OfficialPublicationUpload => JobPhase::WritingExport,
         };
@@ -2836,7 +2926,12 @@ impl JobControl {
         if status.state != JobState::Running {
             return Err("native job phase requires a running job".to_owned());
         }
-        if phase == JobPhase::Complete || phase.rank() != status.phase.rank() + 1 {
+        let direct_jpeg_activation = status.kind == JobKind::ImportJpegAsset
+            && status.phase == JobPhase::ReadingSource
+            && phase == JobPhase::ActivatingDatabase;
+        if phase == JobPhase::Complete
+            || (!direct_jpeg_activation && phase.rank() != status.phase.rank() + 1)
+        {
             return Err("native job phase transition is invalid".to_owned());
         }
         status.phase = phase;
@@ -3250,6 +3345,40 @@ mod tests {
             handoff_path: None,
             recovery_path: None,
             publication: None,
+        }
+    }
+
+    #[test]
+    fn jpeg_asset_job_request_keeps_source_and_explicit_destination_descriptor_only() {
+        let request: NativeFileJobStartRequest = serde_json::from_value(json!({
+            "kind": "import-jpeg-asset",
+            "source": {
+                "type": "androidSpool",
+                "token": "spool-token"
+            },
+            "displayName": "portrait.jpeg",
+            "destination": {
+                "kind": "current-character-image",
+                "characterId": "character-1"
+            },
+            "expectedRevision": 7
+        }))
+        .expect("decode JPEG asset request");
+
+        match request {
+            NativeFileJobStartRequest::ImportJpegAsset {
+                source: JobSource::AndroidSpool { token },
+                display_name,
+                destination:
+                    jpeg_asset::JpegAssetDestination::CurrentCharacterImage { character_id },
+                expected_revision,
+            } => {
+                assert_eq!(token, "spool-token");
+                assert_eq!(display_name, "portrait.jpeg");
+                assert_eq!(character_id, "character-1");
+                assert_eq!(expected_revision, 7);
+            }
+            _ => panic!("unexpected JPEG asset request"),
         }
     }
 
@@ -4740,6 +4869,45 @@ mod tests {
             .join("native-file-jobs/sources")
             .join(token)
             .exists());
+    }
+
+    #[test]
+    fn jpeg_asset_job_rejects_and_cleans_a_spool_with_a_different_display_name() {
+        let directory = TempDir::new().unwrap();
+        let job_root = directory.path().join("native-file-jobs");
+        let state = NativeFileJobState::initialize(job_root.clone());
+        let token = Uuid::new_v4().to_string();
+        write_literal_spool(
+            &job_root,
+            &token,
+            &format!(
+                "{{\"token\":\"{token}\",\"state\":\"ready\",\"displayName\":\"portrait.jpg\",\"bytes\":9,\"totalBytes\":null}}"
+            ),
+            1,
+        );
+
+        let error = state
+            .spawn(
+                NativeFileJobTask::ImportJpegAsset {
+                    opened_source: None,
+                    source: JobSource::AndroidSpool {
+                        token: token.clone(),
+                    },
+                    display_name: "portrait.jpeg".to_owned(),
+                    destination: jpeg_asset::JpegAssetDestination::CurrentCharacterImage {
+                        character_id: "character-1".to_owned(),
+                    },
+                    expected_revision: 0,
+                    store: crate::persistent_store::PersistentStore::open(directory.path())
+                        .unwrap(),
+                },
+                false,
+            )
+            .expect_err("reject mismatched JPEG spool display name");
+
+        assert_eq!(error.code, "invalid-source");
+        assert!(!job_root.join("sources").join(token).exists());
+        assert_eq!(fs::read_dir(job_root.join("jobs")).unwrap().count(), 0);
     }
 
     #[test]

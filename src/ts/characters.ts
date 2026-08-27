@@ -31,6 +31,11 @@ import { removeCharacterIdFromOrder } from './storage/characterOrderMutation'
 import { restoreColdPersistentCharacter } from './process/coldCharacterRestore'
 import { safeStructuredClone } from './polyfill'
 import { isConversationSummaryStub } from './storage/conversationResidency'
+import { open } from '@tauri-apps/plugin-dialog'
+import { readFile } from '@tauri-apps/plugin-fs'
+import { isTauriDesktop } from './platform'
+import { selectCharacterImageFile } from './storage/characterImageFileRoute'
+import { importNativeJpegAsset } from './storage/nativeJpegAssetImport'
 
 export async function commitDetachedCharacter(
     character: character | groupChat,
@@ -117,49 +122,61 @@ export async function getCharImage(loc:string, type:'plain'|'css'|'contain'|'lgc
 }
 
 export async function selectCharImg(charIndex:number) {
-    const selected = await selectSingleFile(['png', 'webp', 'gif', 'jpg', 'jpeg'])
-    if(!selected){
-        return
-    }
-    const img = selected.data
-    let db = DBState.db
-
-    const type = getImageType(img)
-
-    try {
-        if(type === 'PNG' && db.characters[charIndex].type === 'character'){
-            const gen = PngChunk.readGenerator(img)
-            const allowedChunk = [
-                'parameters', 'Comment', 'Title', 'Description', 'Author', 'Software', 'Source', 'Disclaimer', 'Warning', 'Copyright',
-            ]
-            for await (const chunk of gen){
-                if(chunk instanceof AppendableBuffer){
-                    continue
+    const characterId = DBState.db.characters[charIndex]?.chaId
+    if (!characterId) return
+    await selectCharacterImageFile(characterId, {
+        isTauriDesktop,
+        chooseDesktopPath: async () => {
+            const selected = await open({
+                multiple: false,
+                directory: false,
+                filters: [{
+                    name: 'png, webp, gif, jpg, jpeg',
+                    extensions: ['png', 'webp', 'gif', 'jpg', 'jpeg'],
+                }],
+            })
+            return typeof selected === 'string' ? selected : null
+        },
+        readDesktopPath: readFile,
+        chooseLegacyFile: async () => selectSingleFile(['png', 'webp', 'gif', 'jpg', 'jpeg']),
+        nativeImport: importNativeJpegAsset,
+        legacyImport: async (img) => {
+            const db = DBState.db
+            const type = getImageType(img)
+            try {
+                if(type === 'PNG' && db.characters[charIndex].type === 'character'){
+                    const gen = PngChunk.readGenerator(img)
+                    const allowedChunk = [
+                        'parameters', 'Comment', 'Title', 'Description', 'Author', 'Software', 'Source', 'Disclaimer', 'Warning', 'Copyright',
+                    ]
+                    for await (const chunk of gen){
+                        if(chunk instanceof AppendableBuffer){
+                            continue
+                        }
+                        if(!chunk){
+                            continue
+                        }
+                        if(chunk.value.length > 20_000){
+                            continue
+                        }
+                        if(allowedChunk.includes(chunk.key)){
+                            console.log(chunk.key, chunk.value)
+                            db.characters[charIndex].extentions ??= {}
+                            db.characters[charIndex].extentions.pngExif ??= {}
+                            db.characters[charIndex].extentions.pngExif[chunk.key] = chunk.value
+                        }
+                    }
+                    console.log(db.characters[charIndex].extentions)
                 }
-                if(!chunk){
-                    continue
-                }
-                if(chunk.value.length > 20_000){
-                    continue
-                }
-                if(allowedChunk.includes(chunk.key)){
-                    console.log(chunk.key, chunk.value)
-                    db.characters[charIndex].extentions ??= {}
-                    db.characters[charIndex].extentions.pngExif ??= {}
-                    db.characters[charIndex].extentions.pngExif[chunk.key] = chunk.value
-                }
+            } catch (error) {
+                console.error(error)
             }
-            console.log(db.characters[charIndex].extentions)
-        }   
-    } catch (error) {
-        console.error(error)
-    }
-
-
-
-    const imgp = await saveImage(img)
-    dumpCharImage(charIndex)
-    DBState.db.characters[charIndex].image = imgp
+            const imgp = await saveImage(img)
+            dumpCharImage(charIndex)
+            DBState.db.characters[charIndex].image = imgp
+            return imgp
+        },
+    })
 }
 
 export function dumpCharImage(charIndex:number) {
