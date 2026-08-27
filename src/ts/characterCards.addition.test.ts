@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
         mocks.database.characters.push(character)
         return character.chaId
     }),
+    alertCardExport: vi.fn(),
     alertConfirm: vi.fn(),
     readImage: vi.fn(async (_key: string) => new Uint8Array([1, 2, 3, 4])),
     saveAsset: vi.fn(),
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => ({
     importDesktopNativeCharacterPath: vi.fn(),
     desktopPickerPaths: [] as string[],
     openDesktopPicker: vi.fn(async () => mocks.desktopPickerPaths),
+    exportNativeCharacterCharxFromPicker: vi.fn(),
     nextId: 0,
 }))
 
@@ -36,7 +38,7 @@ vi.mock('./storage/database.svelte', () => ({
     getDatabase: () => mocks.database,
 }))
 vi.mock('./alert', () => ({
-    alertCardExport: vi.fn(),
+    alertCardExport: mocks.alertCardExport,
     alertConfirm: mocks.alertConfirm,
     alertError: vi.fn(),
     alertInput: vi.fn(),
@@ -81,6 +83,9 @@ vi.mock('src/ts/platform', () => ({
 vi.mock('./storage/nativeCharacterFileRoute', () => ({
     importDesktopNativeCharacterFromPicker: mocks.importDesktopNativeCharacterFromPicker,
     importDesktopNativeCharacterPath: mocks.importDesktopNativeCharacterPath,
+}))
+vi.mock('./storage/nativeCharacterCharxExportRoute', () => ({
+    exportNativeCharacterCharxFromPicker: mocks.exportNativeCharacterCharxFromPicker,
 }))
 vi.mock('@tauri-apps/plugin-dialog', () => ({
     open: mocks.openDesktopPicker,
@@ -141,6 +146,7 @@ vi.mock('./media', () => ({
 
 import {
     exportCharacterCard,
+    exportChar,
     importCharacter,
     importCharacterCardSpec,
     importCharacterProcess,
@@ -161,6 +167,8 @@ describe('character card additions', () => {
         mocks.desktopPickerPaths = []
         vi.clearAllMocks()
         mocks.alertConfirm.mockResolvedValue(true)
+        mocks.alertCardExport.mockResolvedValue({ type: 'cancelled' })
+        mocks.exportNativeCharacterCharxFromPicker.mockResolvedValue({ characterCount: 1 })
         mocks.commitDetachedCharacter.mockImplementation(async (character, _reason) => {
             mocks.database.characters.push(character)
             return character.chaId
@@ -533,6 +541,57 @@ describe('character card additions', () => {
         const payload = mocks.charxWrites.find((entry) => entry.key.endsWith('/exact.bin'))
         expect(Array.from(payload?.data ?? [])).toEqual([1, 2, 3, 4])
         expect(mocks.compressImage).not.toHaveBeenCalled()
+    })
+
+    it('routes the selected desktop CCv3 CharX through the native leased exporter', async () => {
+        const character = {
+            type: 'character',
+            name: 'Native card',
+            image: 'assets/avatar.png',
+            firstMessage: 'Hello',
+            desc: '',
+            chats: [],
+            chatFolders: [],
+            chatPage: 0,
+            viewScreen: 'none',
+            bias: [],
+            emotionImages: [],
+            globalLore: [],
+            chaId: 'native-card',
+            customscript: [{ comment: 'regex' }],
+            triggerscript: [{ comment: 'trigger' }],
+            alternateGreetings: [],
+            tags: [],
+            additionalAssets: [],
+            ccAssets: [],
+            extentions: {},
+        } as any
+        mocks.database.characters = [character]
+        mocks.alertCardExport.mockResolvedValue({
+            type: '',
+            type2: 'charx',
+        } as any)
+
+        await exportChar(0)
+
+        expect(mocks.exportNativeCharacterCharxFromPicker).toHaveBeenCalledOnce()
+        const input = mocks.exportNativeCharacterCharxFromPicker.mock.calls[0][0]
+        expect(input.characterId).toBe('native-card')
+        expect(input.suggestedName).toBe('Native card.charx')
+        expect(input.card).toMatchObject({
+            spec: 'chara_card_v3',
+            data: { extensions: { risuai: {} } },
+        })
+        expect(input.card.data.extensions.risuai).not.toHaveProperty('triggerscript')
+        expect(input.card.data.extensions.risuai).not.toHaveProperty('customScripts')
+        expect(input.module).toMatchObject({
+            name: 'Native card Module',
+            trigger: character.triggerscript,
+            regex: character.customscript,
+            lorebook: character.globalLore,
+        })
+        expect(mocks.readImage).not.toHaveBeenCalled()
+        expect(mocks.charxWrites).toEqual([])
     })
 
     it('keeps ordinary asset bytes exact in the JavaScript JSON export fallback', async () => {
