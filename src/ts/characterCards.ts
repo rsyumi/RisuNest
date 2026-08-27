@@ -6,7 +6,7 @@ import { language } from "src/lang"
 import { v4 as uuidv4, v4 } from 'uuid';
 import { changeChar, characterFormatUpdate, commitDetachedCharacter } from "./characters"
 import { AppendableBuffer, BlankWriter, checkCharOrder, downloadFile, loadAsset, LocalWriter, openURL, readImage, saveAsset, VirtualWriter } from "./globalApi.svelte"
-import { isTauri, isNodeServer } from "src/ts/platform"
+import { isTauri, isNodeServer, isTauriDesktop } from "src/ts/platform"
 import { getImageType } from "./media"
 import { DBState, SettingsMenuIndex, ShowRealmFrameStore, selectedCharID, settingsOpen } from "./stores.svelte"
 import { hasher } from "./parser/parser.svelte"
@@ -17,10 +17,12 @@ import type { OnnxModelFiles } from "./process/transformers"
 import { CharXImporter, CharXWriter } from "./process/processzip"
 import { exportModuleLegacy, readModule, type RisuModule } from "./process/modules"
 import { readFile } from "@tauri-apps/plugin-fs"
+import { open } from "@tauri-apps/plugin-dialog"
 import { getCurrent, onOpenUrl } from '@tauri-apps/plugin-deep-link';
 import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
 import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
 import { publishPeerCloneUri } from "./storage/sync/peerCloneDeepLink"
+import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -31,9 +33,58 @@ export const hubURL = isNodeServer
     ? NIGHTLY_HUB_URL 
     : EXTERNAL_HUB_URL;
 
+const nativeCharacterContentImportEnabled = false
+
+async function importPreparedNativeCharacterContent(input: {
+    source: { type: 'desktopPath'; path: string }
+    displayName: string
+}): Promise<{ kind: 'declined' } | { kind: 'imported'; value: string }> {
+    const [{ runNativePreparedContentRoute }, { activatePreparedNativeCharacterContent }] = await Promise.all([
+        import('./storage/nativePreparedContentRoute'),
+        import('./storage/nativeCharacterContentActivation'),
+    ])
+    const result = await runNativePreparedContentRoute(
+        input.source,
+        input.displayName,
+        {
+            map: async (content) => content,
+            activate: activatePreparedNativeCharacterContent,
+        },
+    )
+    return result ? { kind: 'imported', value: result.characterId } : { kind: 'declined' }
+}
+
 export async function importCharacter() {
     let lastImportedCharacterId: string | null = null
     try {
+        if(isTauriDesktop){
+            const selected = await open({ multiple: true, directory: false })
+            const paths = typeof selected === 'string'
+                ? [selected]
+                : selected ?? []
+            for(const path of paths){
+                const result = await importDesktopNativeCharacterPath(path, {
+                    readDesktopPath: readFile,
+                    nativeEnabled: () => nativeCharacterContentImportEnabled,
+                    nativeImport: importPreparedNativeCharacterContent,
+                    legacyImport: async ({ name, data }) => {
+                        const importedIndex = await importCharacterProcess({ name, data })
+                        return typeof importedIndex === 'number'
+                            ? getDatabase().characters[importedIndex]?.chaId ?? null
+                            : null
+                    },
+                })
+                if(result.kind === 'imported'){
+                    checkCharOrder()
+                    lastImportedCharacterId = result.value
+                }
+                if(result.kind === 'destination-required'){
+                    alertError('This JPEG is not a character card. Choose an asset destination to import it.')
+                }
+            }
+            return lastImportedCharacterId
+        }
+
         const files = await selectFileByDom(["*"], 'multiple')
         if(!files){
             return

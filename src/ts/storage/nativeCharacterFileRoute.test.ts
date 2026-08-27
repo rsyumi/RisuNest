@@ -1,0 +1,153 @@
+import { describe, expect, it, vi } from 'vitest'
+
+import {
+    importAndroidNativeCharacterSpool,
+    importDesktopNativeCharacterPath,
+    importDesktopNativeCharacterFromPicker,
+    type NativeCharacterFileRouteDependencies,
+} from './nativeCharacterFileRoute'
+import { NativeFileJobError } from './nativeFileJobs'
+
+function dependencies(
+    overrides: Partial<NativeCharacterFileRouteDependencies<string>> = {},
+): NativeCharacterFileRouteDependencies<string> {
+    return {
+        chooseDesktopPath: vi.fn(async () => 'C:\\chosen\\card.charx'),
+        readDesktopPath: vi.fn(async () => Uint8Array.from([1, 2, 3])),
+        nativeEnabled: () => true,
+        nativeImport: vi.fn(async () => ({
+            kind: 'imported' as const,
+            value: 'native-card',
+        })),
+        legacyImport: vi.fn(async () => 'legacy-card'),
+        ...overrides,
+    }
+}
+
+describe('native character file route', () => {
+    it('keeps PNG on the selected-path legacy route without starting native preparation', async () => {
+        const deps = dependencies()
+
+        await expect(importDesktopNativeCharacterPath(
+            'C:\\chosen\\card.PNG',
+            deps,
+        )).resolves.toEqual({
+            kind: 'imported',
+            mode: 'legacy',
+            value: 'legacy-card',
+        })
+
+        expect(deps.nativeImport).not.toHaveBeenCalled()
+        expect(deps.readDesktopPath).toHaveBeenCalledWith('C:\\chosen\\card.PNG')
+    })
+
+    it('uses one desktop picker and the selected path for a pre-activation compatibility fallback', async () => {
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => {
+                throw new NativeFileJobError('capability-unavailable', 'Native content import is unavailable')
+            }),
+        })
+
+        await expect(importDesktopNativeCharacterFromPicker(deps)).resolves.toEqual({
+            kind: 'imported',
+            mode: 'legacy',
+            value: 'legacy-card',
+        })
+
+        expect(deps.chooseDesktopPath).toHaveBeenCalledOnce()
+        expect(deps.nativeImport).toHaveBeenCalledWith({
+            source: { type: 'desktopPath', path: 'C:\\chosen\\card.charx' },
+            displayName: 'card.charx',
+        })
+        expect(deps.readDesktopPath).toHaveBeenCalledWith('C:\\chosen\\card.charx')
+        expect(deps.legacyImport).toHaveBeenCalledWith({
+            name: 'card.charx',
+            data: Uint8Array.from([1, 2, 3]),
+        })
+    })
+
+    it('does not fall back after native mapping or persistence has begun', async () => {
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => { throw new Error('revision conflict') }),
+        })
+
+        await expect(importDesktopNativeCharacterFromPicker(deps)).rejects.toThrow('revision conflict')
+
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
+
+    it('uses legacy compatibility for an off-spec native character card result', async () => {
+        const error = Object.assign(new TypeError('Unsupported card'), {
+            name: 'UnsupportedPreparedNativeCharacterCardError',
+            code: 'unsupported-character-card',
+        })
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => {
+                throw error
+            }),
+        })
+
+        await expect(importDesktopNativeCharacterFromPicker(deps)).resolves.toEqual({
+            kind: 'imported',
+            mode: 'legacy',
+            value: 'legacy-card',
+        })
+
+        expect(deps.readDesktopPath).toHaveBeenCalledWith('C:\\chosen\\card.charx')
+    })
+
+    it('does not treat a matching arbitrary error code as a pre-activation fallback', async () => {
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => { throw { code: 'unsupported-format' } }),
+        })
+
+        await expect(importDesktopNativeCharacterFromPicker(deps)).rejects.toEqual({
+            code: 'unsupported-format',
+        })
+
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+    })
+
+    it('treats a low-level decline as a handled non-import', async () => {
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => ({ kind: 'declined' as const })),
+        })
+
+        await expect(importDesktopNativeCharacterFromPicker(deps)).resolves.toEqual({ kind: 'declined' })
+
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
+
+    it('returns the stable destination-required result for an ordinary JPEG without activation or fallback', async () => {
+        const deps = dependencies({
+            chooseDesktopPath: vi.fn(async () => 'C:\\chosen\\portrait.jpeg'),
+            nativeImport: vi.fn(async () => {
+                throw new NativeFileJobError('destination-required', 'JPEG is not a character card')
+            }),
+        })
+
+        await expect(importDesktopNativeCharacterFromPicker(deps)).resolves.toEqual({
+            kind: 'destination-required',
+        })
+
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
+
+    it('passes an Android spool source to the same native seam without reading bytes', async () => {
+        const deps = dependencies()
+
+        await expect(importAndroidNativeCharacterSpool({
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'card.json',
+        }, deps)).resolves.toEqual({ kind: 'imported', value: 'native-card' })
+
+        expect(deps.nativeImport).toHaveBeenCalledWith({
+            source: { type: 'androidSpool', token: '11111111-1111-4111-8111-111111111111' },
+            displayName: 'card.json',
+        })
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+    })
+})

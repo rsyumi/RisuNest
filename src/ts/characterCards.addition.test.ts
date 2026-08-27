@@ -17,6 +17,11 @@ const mocks = vi.hoisted(() => ({
     charxWrites: [] as Array<{ key: string; data: Uint8Array }>,
     pngWrites: [] as Array<{ key: string; data: Uint8Array }>,
     downloads: [] as Array<{ name: string; data: Uint8Array }>,
+    nativeDesktopResult: { kind: 'cancelled' } as unknown,
+    importDesktopNativeCharacterFromPicker: vi.fn(),
+    importDesktopNativeCharacterPath: vi.fn(),
+    desktopPickerPaths: [] as string[],
+    openDesktopPicker: vi.fn(async () => mocks.desktopPickerPaths),
     nextId: 0,
 }))
 
@@ -68,7 +73,18 @@ vi.mock('./globalApi.svelte', () => ({
     saveAsset: mocks.saveAsset,
     VirtualWriter: class {},
 }))
-vi.mock('src/ts/platform', () => ({ isTauri: false, isNodeServer: false }))
+vi.mock('src/ts/platform', () => ({
+    isTauri: false,
+    isTauriDesktop: true,
+    isNodeServer: false,
+}))
+vi.mock('./storage/nativeCharacterFileRoute', () => ({
+    importDesktopNativeCharacterFromPicker: mocks.importDesktopNativeCharacterFromPicker,
+    importDesktopNativeCharacterPath: mocks.importDesktopNativeCharacterPath,
+}))
+vi.mock('@tauri-apps/plugin-dialog', () => ({
+    open: mocks.openDesktopPicker,
+}))
 vi.mock('./stores.svelte', () => ({
     DBState: { db: mocks.database },
     SettingsMenuIndex: { set: vi.fn() },
@@ -125,6 +141,7 @@ vi.mock('./media', () => ({
 
 import {
     exportCharacterCard,
+    importCharacter,
     importCharacterCardSpec,
     importCharacterProcess,
     mapPreparedNativeCharacterCard,
@@ -139,6 +156,8 @@ describe('character card additions', () => {
         mocks.charxWrites = []
         mocks.pngWrites = []
         mocks.downloads = []
+        mocks.nativeDesktopResult = { kind: 'cancelled' }
+        mocks.desktopPickerPaths = []
         vi.clearAllMocks()
         mocks.alertConfirm.mockResolvedValue(true)
         mocks.commitDetachedCharacter.mockImplementation(async (character, _reason) => {
@@ -166,6 +185,51 @@ describe('character card additions', () => {
         expect(character.chats).toHaveLength(1)
         expect(character.chats[0].id).toBeTruthy()
         expect(index).toBe(0)
+    })
+
+    it('uses the native desktop character path route once and returns its imported character ID', async () => {
+        mocks.desktopPickerPaths = ['C:\\chosen\\card.charx']
+        mocks.nativeDesktopResult = {
+            kind: 'imported',
+            mode: 'native',
+            value: 'native-character-id',
+        }
+        mocks.importDesktopNativeCharacterPath.mockResolvedValue(mocks.nativeDesktopResult)
+
+        const imported = await importCharacter()
+
+        expect(imported).toBe('native-character-id')
+        expect(mocks.importDesktopNativeCharacterPath).toHaveBeenCalledOnce()
+    })
+
+    it('processes every selected desktop path through the native character route', async () => {
+        mocks.desktopPickerPaths = [
+            'C:\\chosen\\card.png',
+            'C:\\chosen\\card.charx',
+        ]
+        mocks.importDesktopNativeCharacterPath
+            .mockResolvedValueOnce({ kind: 'imported', mode: 'legacy', value: 'png-card' })
+            .mockResolvedValueOnce({ kind: 'imported', mode: 'native', value: 'charx-card' })
+
+        const imported = await importCharacter()
+
+        expect(imported).toBe('charx-card')
+        expect(mocks.openDesktopPicker).toHaveBeenCalledOnce()
+        expect(mocks.openDesktopPicker).toHaveBeenCalledWith({
+            multiple: true,
+            directory: false,
+        })
+        expect(mocks.importDesktopNativeCharacterPath).toHaveBeenCalledTimes(2)
+        expect(mocks.importDesktopNativeCharacterPath).toHaveBeenNthCalledWith(
+            1,
+            'C:\\chosen\\card.png',
+            expect.any(Object),
+        )
+        expect(mocks.importDesktopNativeCharacterPath).toHaveBeenNthCalledWith(
+            2,
+            'C:\\chosen\\card.charx',
+            expect.any(Object),
+        )
     })
 
     it('keeps the JavaScript card fallback for mixed-case JSON filenames', async () => {
