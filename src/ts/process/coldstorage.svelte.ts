@@ -1,6 +1,6 @@
 import { forageStorage } from "../globalApi.svelte"
 import { isNodeServer } from "src/ts/platform"
-import { DBState } from "../stores.svelte"
+import { DBState, selectedCharID } from "../stores.svelte"
 import { compress as fflateCompress, decompress as fflateDecompress } from "fflate"
 import { fetchProtectedResource } from "../sionyw"
 import { alertClear, alertConfirm, alertError, alertWait } from "../alert"
@@ -8,10 +8,15 @@ import { language } from "src/lang"
 import type { Database } from "../storage/database.svelte"
 import { coldStorageHeader, getColdStorageAffectedCharacters, getColdStorageBackupName, isColdStorageBackupData, listColdDataKeysFromDb } from "./coldstorageData"
 import { compactColdStorageDatabase } from "../storage/coldStorageCompaction"
-import { replacePersistentDatabase } from "../storage/persistentDataRuntime.svelte"
+import {
+    getActiveConversationSession,
+    getPersistentNavigationGeneration,
+    replacePersistentDatabase,
+} from "../storage/persistentDataRuntime.svelte"
 import type { LocalColdStorageRuntime } from "../storage/localColdStorageRuntime"
 import { hasIncompletePersistentWorkingSet } from '../storage/workingSetCatalog'
 import { workingSetResidency } from '../storage/workingSetResidency'
+import { get } from 'svelte/store'
 
 export {
     coldStorageHeader,
@@ -332,41 +337,84 @@ export async function makeColdData():Promise<boolean>{
 }
 
 export async function preLoadChat(characterIndex:number, chatIndex:number){
-    const chat = DBState.db?.characters?.[characterIndex]?.chats?.[chatIndex]   
+    const character = DBState.db?.characters?.[characterIndex]
+    const chat = character?.chats?.[chatIndex]
 
-    if(!chat){
+    if(!chat || get(selectedCharID) !== characterIndex || character.chatPage !== chatIndex){
         return
     }
 
     if(chat.message?.[0]?.data?.startsWith(coldStorageHeader)){
+        const navigationGeneration = getPersistentNavigationGeneration()
+        const session = getActiveConversationSession()
+        if (session && !session.matchesConversation(character.chaId, chat)) return
+        const sessionVersion = session?.version
+        const sessionToken = session?.positionAt(0).sessionToken
+        const expectedMessages = chat.message
+        const expectedPlaceholder = chat.message[0]
+        const characterId = character.chaId
+        const conversationId = chat.id
         //bring back from cold storage
         const coldDataKey = chat.message[0].data.slice(coldStorageHeader.length)
         const coldData = await getColdStorageItem(coldDataKey)
+        const replacement = { ...chat }
         if(coldData && Array.isArray(coldData)){
-            chat.message = coldData
-            chat.lastDate = Date.now()
+            replacement.message = coldData
+            replacement.lastDate = Date.now()
         }
         else if(coldData?.message){
-            chat.message = coldData.message
-            chat.hypaV2Data = coldData.hypaV2Data
-            chat.hypaV3Data = coldData.hypaV3Data
-            chat.scriptstate = coldData.scriptstate
-            chat.localLore = coldData.localLore
-            chat.lastDate = Date.now()
+            replacement.message = coldData.message
+            replacement.hypaV2Data = coldData.hypaV2Data
+            replacement.hypaV3Data = coldData.hypaV3Data
+            replacement.scriptstate = coldData.scriptstate
+            replacement.localLore = coldData.localLore
+            replacement.lastDate = Date.now()
         }
         else{
             // Cold storage data is missing or corrupted.
             // Replace with an error message so the user knows what happened
             // instead of silently showing a broken pointer.
             console.error(`Cold storage data not found for key: ${coldDataKey}`)
-            chat.message = [{
+            replacement.message = [{
                 time: Date.now(),
                 data: `[Cold storage data could not be loaded. Key: ${coldDataKey}]`,
                 role: 'char'
             }]
-            chat.lastDate = Date.now()
+            replacement.lastDate = Date.now()
+        }
+        const currentCharacter = DBState.db?.characters?.[characterIndex]
+        const currentChat = currentCharacter?.chats?.[chatIndex]
+        if (
+            getPersistentNavigationGeneration() !== navigationGeneration ||
+            get(selectedCharID) !== characterIndex ||
+            currentCharacter !== character ||
+            currentCharacter.chaId !== characterId ||
+            currentCharacter.chatPage !== chatIndex ||
+            currentChat !== chat ||
+            currentChat.id !== conversationId ||
+            currentChat.message !== expectedMessages ||
+            currentChat.message[0] !== expectedPlaceholder ||
+            currentChat.message[0]?.data !== `${coldStorageHeader}${coldDataKey}`
+        ) return
+        const currentSession = getActiveConversationSession()
+        if (
+            session &&
+            sessionVersion !== undefined &&
+            sessionToken !== undefined &&
+            currentSession === session &&
+            session.version === sessionVersion &&
+            session.ownsSessionToken(sessionToken) &&
+            session.matchesConversation(characterId, chat)
+        ) {
+            session.adoptConversationReplacement(
+                sessionVersion,
+                expectedMessages,
+                replacement,
+            )
             return
         }
+        if (session || currentSession) return
+        Object.assign(chat, replacement)
     }
 
 }
