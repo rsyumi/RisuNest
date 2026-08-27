@@ -13,8 +13,11 @@ import { ActiveConversationSession } from '../storage/activeConversationSession'
 import { createConversationOperationContext } from './conversationOperationContext'
 import type { Chat, character } from '../storage/database.svelte'
 import { DBState } from '../stores.svelte'
+import { risuChatParser } from '../parser/parser.svelte'
+import type { LuaEngine } from 'wasmoon'
 
 const scriptingSelectionState = vi.hoisted(() => ({ index: 0 }))
+const createdLuaEngines = vi.hoisted(() => [] as LuaEngine[])
 
 vi.mock('../parser/parser.svelte', () => ({
   hasher: vi.fn(),
@@ -68,6 +71,22 @@ vi.mock('./lorebook.svelte', () => ({ loadLoreBookV3PromptFromCompatibilitySnaps
 vi.mock('./memory/hypamemory', () => ({ HypaProcesser: vi.fn() }))
 vi.mock('./request/request', () => ({ requestChatData: vi.fn() }))
 vi.mock('./stableDiff', () => ({ generateAIImage: vi.fn() }))
+vi.mock('./luaRuntime', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./luaRuntime')>()
+  return {
+    ...actual,
+    async createLuaFactory() {
+      const factory = await actual.createLuaFactory()
+      const createEngine = factory.createEngine.bind(factory)
+      factory.createEngine = async (options) => {
+        const engine = await createEngine(options)
+        createdLuaEngines.push(engine)
+        return engine
+      }
+      return factory
+    },
+  }
+})
 
 let runScripted: typeof import('./scriptings').runScripted
 let jsonLuaSource = ''
@@ -549,6 +568,79 @@ test('records Lua global persistence with owner and mode isolation', async () =>
   await expect(invoke('k3-owner-a', 'editInput')).resolves.toMatchObject({ res: 2 })
   await expect(invoke('k3-owner-a', 'editOutput')).resolves.toMatchObject({ res: 1 })
   await expect(invoke('k3-owner-b', 'editInput')).resolves.toMatchObject({ res: 1 })
+})
+
+test('releases cached invocation state while preserving Lua globals', async () => {
+  const fixture = operationCharacterFixture('cached-invocation-release')
+  installOperationCharacterFixture(fixture)
+  const operationContext = createConversationOperationContext(
+    fixture.session,
+    fixture.chat,
+  )
+  const code = `
+    retained_counter = retained_counter or 0
+    listenEdit('editInput', function(id, value)
+      retained_counter = retained_counter + 1
+      if value == 'error' then
+        error('synthetic cached invocation failure')
+      end
+      if value == 'cancel' then
+        stopChat(id)
+      end
+      return retained_counter
+    end)
+  `
+
+  const first = await runScripted(code, {
+    char: fixture.char,
+    data: 'success',
+    mode: 'editInput',
+    operationContext,
+  })
+  const engine = createdLuaEngines.at(-1)!
+  const getFullChat = engine.global.get('getFullChatMain') as (id: string) => string
+  const getChatVar = engine.global.get('getChatVar') as (id: string, key: string) => string
+  const parseCbs = engine.global.get('cbs') as (value: string) => string
+  const emptyDatabase = { characters: [] }
+  DBState.db = emptyDatabase as never
+  vi.mocked(getDatabase).mockReturnValue(emptyDatabase as never)
+  vi.mocked(risuChatParser).mockClear()
+
+  expect(first.res).toBe(1)
+  expect(() => getFullChat('inactive')).toThrow(/Cannot read properties of undefined/)
+  expect(() => getChatVar('inactive', 'key')).toThrow(/is not a function/)
+  parseCbs('after invocation')
+  expect(risuChatParser).toHaveBeenLastCalledWith('after invocation', {
+    chara: undefined,
+    db: undefined,
+    selectedCharacterId: undefined,
+    getChatVar: undefined,
+    setChatVar: undefined,
+  })
+
+  const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  const failed = await runScripted(code, {
+    char: fixture.char,
+    data: 'error',
+    mode: 'editInput',
+    operationContext,
+  })
+  consoleError.mockRestore()
+
+  expect(failed.res).toBeUndefined()
+  expect(() => getFullChat('inactive')).toThrow(/Cannot read properties of undefined/)
+
+  const second = await runScripted(code, {
+    char: { chaId: fixture.char.chaId } as never,
+    chat: { message: [] } as never,
+    data: 'cancel',
+    mode: 'editInput',
+  })
+
+  expect(second.res).toBe(3)
+  expect(second.stopSending).toBe(true)
+  expect(createdLuaEngines.at(-1)).toBe(engine)
+  expect(() => getFullChat('inactive')).toThrow(/Cannot read properties of undefined/)
 })
 
 test('records nil, null, false, arrays, and JSON round trips', async () => {

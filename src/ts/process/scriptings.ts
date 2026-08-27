@@ -61,6 +61,7 @@ interface BasicScriptingEngineState {
     operationCharacter?: character|groupChat|simpleCharacterArgument
     selectedCharacterId?: string
     capturedCharacterOwner?: CapturedCharacterOwner
+    stopSending?: boolean
 }
 
 interface LuaScriptingEngineState extends BasicScriptingEngineState {
@@ -74,6 +75,17 @@ interface PythonScriptingEngineState extends BasicScriptingEngineState {
 }
 
 type ScriptingEngineState = LuaScriptingEngineState | PythonScriptingEngineState;
+
+function clearScriptingEngineInvocationState(state: ScriptingEngineState) {
+    state.chat = undefined
+    state.setVar = undefined
+    state.getVar = undefined
+    state.operationDatabase = undefined
+    state.operationCharacter = undefined
+    state.selectedCharacterId = undefined
+    state.capturedCharacterOwner = undefined
+    state.stopSending = undefined
+}
 
 let ScriptingEngines = new Map<string, ScriptingEngineState>()
 let luaFactoryPromise: Promise<void> | null = null;
@@ -142,7 +154,6 @@ export async function runScripted(code:string, arg:{
     const mode = arg.mode ?? 'manual'
 
     let chat = arg.operationContext?.chat ?? arg.chat ?? getCurrentChat()
-    let stopSending = false
     let lowLevelAccess = arg.lowLevelAccess ?? false
 
     if(type === 'lua'){
@@ -155,6 +166,7 @@ export async function runScripted(code:string, arg:{
     
     try {
     return await ScriptingEngineState.mutex.runExclusive(async () => {
+        try {
         ScriptingEngineState.chat = chat
         ScriptingEngineState.setVar = setVar
         ScriptingEngineState.getVar = getVar
@@ -162,6 +174,7 @@ export async function runScripted(code:string, arg:{
         ScriptingEngineState.operationDatabase = operationDatabase
         ScriptingEngineState.selectedCharacterId = selectedCharacterId
         ScriptingEngineState.capturedCharacterOwner = capturedCharacterOwner
+        ScriptingEngineState.stopSending = false
         if (code !== ScriptingEngineState.code) {
             try {
             let declareAPI:(name: string, func:Function) => void
@@ -256,7 +269,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                stopSending = true
+                ScriptingEngineState.stopSending = true
             })
             declareAPI('alertError', (id:string, value:string) => {
                 if(!ScriptingSafeIds.has(id)){
@@ -533,7 +546,12 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingLowLevelIds.has(id)){
                     return
                 }
-                const gen = await generateAIImage(value, char as character, negValue, 'inlay')
+                const gen = await generateAIImage(
+                    value,
+                    ScriptingEngineState.operationCharacter as character,
+                    negValue,
+                    'inlay',
+                )
                 if(!gen){
                     return 'Error: Image generation failed'
                 }
@@ -827,7 +845,7 @@ export async function runScripted(code:string, arg:{
                 if(!ScriptingSafeIds.has(id)){
                     return
                 }
-                if(typeof data !== 'string'){
+                if(typeof desc !== 'string'){
                     throw('Invalid data type')
                 }
                 if(ScriptingEngineState.capturedCharacterOwner?.character.type === 'group'){
@@ -927,7 +945,7 @@ export async function runScripted(code:string, arg:{
                     return
                 }
 
-                if (char.type !== 'character') {
+                if (ScriptingEngineState.operationCharacter?.type !== 'character') {
                     return
                 }
 
@@ -1266,7 +1284,7 @@ export async function runScripted(code:string, arg:{
                     }
                 }   
                 if(res === false){
-                    stopSending = true
+                    ScriptingEngineState.stopSending = true
                 }
             } catch (error) {
                 console.error(error)
@@ -1307,7 +1325,7 @@ export async function runScripted(code:string, arg:{
         chat = ScriptingEngineState.chat
 
         return {
-            stopSending, chat, res
+            stopSending: ScriptingEngineState.stopSending ?? false, chat, res
         }
         } finally {
             ScriptingSafeIds.delete(accessKey)
@@ -1315,6 +1333,9 @@ export async function runScripted(code:string, arg:{
             ScriptingEditDisplayIds.delete(accessKey)
             invocationFinished = true
             finishScriptingEngineUse(ScriptingEngineState)
+        }
+        } finally {
+            clearScriptingEngineInvocationState(ScriptingEngineState)
         }
     })
     } finally {
