@@ -14,7 +14,9 @@ use crate::{
     },
     local_backup::NeverCancelled,
     lossless_backup::{
-        create_and_verify_lossless_backup_v1_report, verify_lossless_package_v1_for_production,
+        create_and_verify_lossless_backup_v1_report,
+        create_and_verify_peer_bidirectional_backup_v1_report,
+        verify_lossless_package_v1_for_production, LosslessPeerSourceBinding,
     },
     persistent_store::{
         LogicalDeltaConflictKind, LogicalDeltaConflictPolicy, LogicalDeltaPlanResolution,
@@ -250,10 +252,30 @@ fn valid_backups(backups: &[PeerBidirectionalBackupReceipt]) -> bool {
         .all(|backup| !backup.package_id.is_empty() && !backup.path.is_empty())
 }
 
+fn lossless_source_binding(
+    operation_id: &str,
+    side: PeerBidirectionalBackupSide,
+    source: &SyncGenerationIdentity,
+) -> LosslessPeerSourceBinding {
+    LosslessPeerSourceBinding::new(
+        operation_id,
+        match side {
+            PeerBidirectionalBackupSide::Local => "local",
+            PeerBidirectionalBackupSide::Remote => "remote",
+        },
+        &source.generation_id,
+        &source.manifest_hash,
+        &source.generation_sequence,
+    )
+}
+
 fn verify_bidirectional_backup_receipt(
     path: &Path,
+    operation_id: &str,
     expected_revision: i64,
     side: PeerBidirectionalBackupSide,
+    expected_source: &SyncGenerationIdentity,
+    expected_package_id: Option<&str>,
 ) -> Result<PeerBidirectionalBackupReceipt, PeerSyncError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -273,6 +295,18 @@ fn verify_bidirectional_backup_receipt(
     {
         return Err(PeerSyncError::Storage(
             "bidirectional backup belongs to another source revision".to_owned(),
+        ));
+    }
+    if verified.manifest.extensions.get("peerBidirectionalSource")
+        != Some(&lossless_source_binding(operation_id, side, expected_source).extension())
+    {
+        return Err(PeerSyncError::Storage(
+            "bidirectional backup belongs to another source generation".to_owned(),
+        ));
+    }
+    if expected_package_id.is_some_and(|package_id| package_id != verified.archive_sha256) {
+        return Err(PeerSyncError::Storage(
+            "bidirectional backup package differs from its receipt".to_owned(),
         ));
     }
     Ok(PeerBidirectionalBackupReceipt {
@@ -304,6 +338,7 @@ fn ensure_bidirectional_backup_receipt(
     operation_id: &str,
     expected_revision: i64,
     side: PeerBidirectionalBackupSide,
+    expected_source: &SyncGenerationIdentity,
 ) -> Result<PeerBidirectionalBackupReceipt, PeerSyncError> {
     let side_name = match side {
         PeerBidirectionalBackupSide::Local => "local",
@@ -316,7 +351,14 @@ fn ensure_bidirectional_backup_receipt(
     fs::create_dir_all(&backup_root)?;
     match fs::symlink_metadata(&backup_path) {
         Ok(_) => {
-            return verify_bidirectional_backup_receipt(&backup_path, expected_revision, side);
+            return verify_bidirectional_backup_receipt(
+                &backup_path,
+                operation_id,
+                expected_revision,
+                side,
+                expected_source,
+                None,
+            );
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -326,12 +368,14 @@ fn ensure_bidirectional_backup_receipt(
         .join("backup-staging")
         .join(format!("{operation_id}-{side_name}"));
     fs::create_dir_all(&backup_staging)?;
-    match create_and_verify_lossless_backup_v1_report(
+    let source_binding = lossless_source_binding(operation_id, side, expected_source);
+    match create_and_verify_peer_bidirectional_backup_v1_report(
         &backup_path,
         &backup_staging,
         cas,
         store,
         expected_revision,
+        &source_binding,
         &NeverCancelled,
     ) {
         Ok(report) => Ok(PeerBidirectionalBackupReceipt {
@@ -340,7 +384,14 @@ fn ensure_bidirectional_backup_receipt(
             path: backup_path.to_string_lossy().into_owned(),
         }),
         Err(_) if fs::symlink_metadata(&backup_path).is_ok() => {
-            verify_bidirectional_backup_receipt(&backup_path, expected_revision, side)
+            verify_bidirectional_backup_receipt(
+                &backup_path,
+                operation_id,
+                expected_revision,
+                side,
+                expected_source,
+                None,
+            )
         }
         Err(error) => Err(PeerSyncError::Storage(error.to_string())),
     }
@@ -760,6 +811,7 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
             operation_id,
             context.expected_local_revision,
             PeerBidirectionalBackupSide::Local,
+            &local_generation,
         )?);
         journal.store(&PeerBidirectionalDurableOperation::AwaitingConflict {
             schema: OPERATION_SCHEMA.to_owned(),
@@ -852,6 +904,7 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
     peer_id: &str,
     expected_revision: i64,
     expected_common_base_manifest_hash: &str,
+    expected_losing_generation: &SyncGenerationIdentity,
     expected_shared_generation: LanBidirectionalGeneration,
     shared_manifest_bytes: &[u8],
     shared_source: &mut S,
@@ -922,8 +975,11 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
                             operation_id,
                             PeerBidirectionalBackupSide::Remote,
                         ),
+                        operation_id,
                         expected_revision,
                         PeerBidirectionalBackupSide::Remote,
+                        expected_losing_generation,
+                        None,
                     )?;
                     Some(LanBidirectionalBackupReceipt {
                         package_id: receipt.package_id,
@@ -955,6 +1011,20 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
             actual: Some(previous.shared_identity.manifest_hash),
         });
     }
+    let local = store
+        .seal_or_initialize_active_logical_generation(cas)
+        .map_err(store_error)?;
+    let local_identity = SyncGenerationIdentity {
+        generation_id: local.manifest.generation.clone(),
+        manifest_hash: local.manifest_hash.clone(),
+        generation_sequence: local.manifest.generation_sequence.clone(),
+    };
+    if local_identity != *expected_losing_generation {
+        return Err(PeerSyncError::StaleManifest {
+            expected: expected_losing_generation.manifest_hash.clone(),
+            received: local_identity.manifest_hash,
+        });
+    }
     let backup = if backup_losing_side {
         let receipt = ensure_bidirectional_backup_receipt(
             store,
@@ -963,6 +1033,7 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
             operation_id,
             expected_revision,
             PeerBidirectionalBackupSide::Remote,
+            expected_losing_generation,
         )?;
         Some(LanBidirectionalBackupReceipt {
             package_id: receipt.package_id,
@@ -971,9 +1042,6 @@ fn apply_bidirectional_remote_shared<S: LogicalDeltaObjectSource + ?Sized>(
     } else {
         None
     };
-    let local = store
-        .seal_or_initialize_active_logical_generation(cas)
-        .map_err(store_error)?;
     let durable_job_id = uuid::Uuid::new_v4().to_string();
     let job = RefCell::new(DurableCasJob::begin(
         app_root,
@@ -2586,13 +2654,16 @@ mod tests {
             .load()
             .unwrap()
             .unwrap();
-        let durable_job_id = match retained {
+        let (durable_job_id, local_generation) = match retained {
             PeerBidirectionalDurableOperation::AwaitingConflict {
-                context, conflicts, ..
+                context,
+                conflicts,
+                local_generation,
+                ..
             } => {
                 assert_eq!(context.operation_id, conflict.operation_id);
                 assert_eq!(conflicts.len(), 1);
-                context.durable_job_id
+                (context.durable_job_id, local_generation)
             }
             other => panic!("unexpected retained operation: {other:?}"),
         };
@@ -2611,14 +2682,42 @@ mod tests {
         let wrong_source_cas = PayloadCas::new(wrong_source_directory.path()).unwrap();
         let mut wrong_source_store = PersistentStore::open(wrong_source_directory.path()).unwrap();
         seed_lossless_backup_fixture(&mut wrong_source_store, &wrong_source_cas);
+        wrong_source_store
+            .commit(&WorkingSetCommit {
+                expected_revision: 1,
+                root: Some(lossless_root("Wrong source at the same revision")),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let wrong_generation = wrong_source_store
+            .seal_or_initialize_active_logical_generation(&wrong_source_cas)
+            .unwrap();
+        let wrong_source_identity = SyncGenerationIdentity {
+            generation_id: wrong_generation.manifest.generation,
+            manifest_hash: wrong_generation.manifest_hash,
+            generation_sequence: wrong_generation.manifest.generation_sequence,
+        };
         let wrong_source_staging = wrong_source_directory.path().join("backup-staging");
         fs::create_dir_all(&wrong_source_staging).unwrap();
-        create_and_verify_lossless_backup_v1_report(
+        create_and_verify_peer_bidirectional_backup_v1_report(
             &backup_path,
             &wrong_source_staging,
             &wrong_source_cas,
             &mut wrong_source_store,
-            1,
+            2,
+            &lossless_source_binding(
+                &conflict.operation_id,
+                PeerBidirectionalBackupSide::Local,
+                &wrong_source_identity,
+            ),
             &NeverCancelled,
         )
         .unwrap();
@@ -2688,12 +2787,17 @@ mod tests {
         fs::remove_file(&backup_path).unwrap();
         let complete_staging = directory.path().join("complete-backup-staging");
         fs::create_dir_all(&complete_staging).unwrap();
-        let completed_backup = create_and_verify_lossless_backup_v1_report(
+        let completed_backup = create_and_verify_peer_bidirectional_backup_v1_report(
             &backup_path,
             &complete_staging,
             &cas,
             &mut store,
             2,
+            &lossless_source_binding(
+                &conflict.operation_id,
+                PeerBidirectionalBackupSide::Local,
+                &local_generation,
+            ),
             &NeverCancelled,
         )
         .unwrap();
@@ -2939,6 +3043,11 @@ mod tests {
             manifest_hash: shared.manifest_hash.clone(),
             generation_sequence: shared.manifest.generation_sequence.clone(),
         };
+        let remote_identity = SyncGenerationIdentity {
+            generation_id: remote.manifest.generation.clone(),
+            manifest_hash: remote.manifest_hash.clone(),
+            generation_sequence: remote.manifest.generation_sequence.clone(),
+        };
         let mut shared_source = LogicalDeltaSourceSession::open(
             &local_root,
             &local_root,
@@ -2954,6 +3063,7 @@ mod tests {
             local_device,
             2,
             &common.manifest_hash,
+            &remote_identity,
             LanBidirectionalGeneration {
                 generation_id: shared_identity.generation_id.clone(),
                 manifest_hash: shared_identity.manifest_hash.clone(),
@@ -2989,6 +3099,7 @@ mod tests {
             local_device,
             2,
             &common.manifest_hash,
+            &remote_identity,
             LanBidirectionalGeneration {
                 generation_id: shared_identity.generation_id.clone(),
                 manifest_hash: shared_identity.manifest_hash.clone(),
@@ -3295,6 +3406,11 @@ mod tests {
             manifest_hash: shared.manifest_hash.clone(),
             generation_sequence: shared.manifest.generation_sequence.clone(),
         };
+        let remote_identity = SyncGenerationIdentity {
+            generation_id: remote_generation.manifest.generation.clone(),
+            manifest_hash: remote_generation.manifest_hash.clone(),
+            generation_sequence: remote_generation.manifest.generation_sequence.clone(),
+        };
         let mut shared_source = LogicalDeltaSourceSession::open(
             &local_root,
             &local_root,
@@ -3311,6 +3427,7 @@ mod tests {
             local_device,
             1,
             &common.manifest_hash,
+            &remote_identity,
             LanBidirectionalGeneration {
                 generation_id: shared_identity.generation_id.clone(),
                 manifest_hash: shared_identity.manifest_hash.clone(),
@@ -3370,6 +3487,7 @@ mod tests {
             local_device,
             1,
             &common.manifest_hash,
+            &remote_identity,
             LanBidirectionalGeneration {
                 generation_id: shared_identity.generation_id.clone(),
                 manifest_hash: shared_identity.manifest_hash.clone(),
@@ -3443,6 +3561,7 @@ mod tests {
                 local_device,
                 1,
                 &common.manifest_hash,
+                &remote_identity,
                 LanBidirectionalGeneration {
                     generation_id: shared_identity.generation_id.clone(),
                     manifest_hash: shared_identity.manifest_hash.clone(),

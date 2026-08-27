@@ -179,6 +179,43 @@ pub(crate) struct CreatedLosslessBackup {
     pub(crate) preset_count: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LosslessPeerSourceBinding {
+    operation_id: String,
+    side: String,
+    generation_id: String,
+    manifest_hash: String,
+    generation_sequence: String,
+}
+
+impl LosslessPeerSourceBinding {
+    pub(crate) fn new(
+        operation_id: &str,
+        side: &str,
+        generation_id: &str,
+        manifest_hash: &str,
+        generation_sequence: &str,
+    ) -> Self {
+        Self {
+            operation_id: operation_id.to_owned(),
+            side: side.to_owned(),
+            generation_id: generation_id.to_owned(),
+            manifest_hash: manifest_hash.to_owned(),
+            generation_sequence: generation_sequence.to_owned(),
+        }
+    }
+
+    pub(crate) fn extension(&self) -> Value {
+        serde_json::json!({
+            "operationId": self.operation_id,
+            "side": self.side,
+            "generationId": self.generation_id,
+            "manifestHash": self.manifest_hash,
+            "generationSequence": self.generation_sequence,
+        })
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct LosslessRestoreReport {
     pub(crate) revision: i64,
@@ -1227,6 +1264,7 @@ fn restore_lossless_package_v1_inner(
             durable_job.as_deref_mut(),
             job_owner_manifest_hashes.as_ref(),
             require_v2,
+            None,
             cancellation,
         )?;
         Ok((backup, character_count, preset_count))
@@ -1664,6 +1702,7 @@ fn create_and_verify_pre_replacement_backup(
     mut durable_job: Option<&mut DurableCasJob>,
     job_owner_manifest_hashes: Option<&HashSet<String>>,
     require_v2: bool,
+    peer_source: Option<&LosslessPeerSourceBinding>,
     cancellation: &dyn CancellationProbe,
 ) -> Result<CreatedLosslessBackup, LosslessError> {
     check_cancelled(cancellation)?;
@@ -1740,6 +1779,20 @@ fn create_and_verify_pre_replacement_backup(
             .iter()
             .map(lossless_reference)
             .collect::<Vec<_>>();
+        let mut extensions = serde_json::json!({
+            "sourceRevision": expected_revision,
+            "assetRepositoryAuthority": asset_repository_authority.value,
+            "coldPayloadAuthority": cold_payload_authority.value,
+        });
+        if let Some(peer_source) = peer_source {
+            extensions
+                .as_object_mut()
+                .expect("lossless extensions are an object")
+                .insert(
+                    "peerBidirectionalSource".to_owned(),
+                    peer_source.extension(),
+                );
+        }
         let mut output_guard = IncompleteBackupFile::create(output_path)?;
         let written = write_lossless_package_v1(
             output_guard.file_mut(),
@@ -1747,11 +1800,7 @@ fn create_and_verify_pre_replacement_backup(
             compatibility,
             references,
             Vec::new(),
-            serde_json::json!({
-                "sourceRevision": expected_revision,
-                "assetRepositoryAuthority": asset_repository_authority.value,
-                "coldPayloadAuthority": cold_payload_authority.value,
-            }),
+            extensions,
             cancellation,
         )?;
         output_guard.sync()?;
@@ -1838,6 +1887,42 @@ pub(crate) fn create_and_verify_lossless_backup_v1_report(
         None,
         None,
         false,
+        None,
+        cancellation,
+    );
+    let released = store.release_revision(&lease).map_err(store_error);
+    match (exported, released) {
+        (Ok(bytes), Ok(())) => Ok(bytes),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(cleanup_error(error, "revision lease release", cleanup)),
+    }
+}
+
+pub(crate) fn create_and_verify_peer_bidirectional_backup_v1_report(
+    output_path: &Path,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    store: &mut PersistentStore,
+    expected_revision: i64,
+    peer_source: &LosslessPeerSourceBinding,
+    cancellation: &dyn CancellationProbe,
+) -> Result<CreatedLosslessBackup, LosslessError> {
+    let lease = store
+        .acquire_revision(expected_revision)
+        .map_err(store_error)?
+        .lease;
+    let exported = create_and_verify_pre_replacement_backup(
+        output_path,
+        job_staging_root,
+        cas,
+        store,
+        &lease,
+        expected_revision,
+        None,
+        None,
+        false,
+        Some(peer_source),
         cancellation,
     );
     let released = store.release_revision(&lease).map_err(store_error);
@@ -1873,6 +1958,7 @@ pub(crate) fn create_and_verify_lossless_backup_v1_durable_report(
         Some(durable_job),
         None,
         true,
+        None,
         cancellation,
     );
     let released = store.release_revision(&lease).map_err(store_error);
