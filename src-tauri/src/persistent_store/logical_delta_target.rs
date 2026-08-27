@@ -5171,7 +5171,16 @@ mod tests {
             objects: source_objects,
             content_gets: 0,
         };
-        let mut target = PersistentLogicalDeltaTarget::new(
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                "logical-changed-payloads",
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .expect("begin durable changed logical target job"),
+        );
+        let mut target = PersistentLogicalDeltaTarget::new_with_durable_job(
             &mut store,
             &cas,
             "peer",
@@ -5179,6 +5188,7 @@ mod tests {
             "local-0",
             &remote.manifest_bytes,
             &staging_root,
+            &job,
         )
         .unwrap();
 
@@ -5237,22 +5247,36 @@ mod tests {
         );
         let activated_logical_head = store
             .connection
-            .query_row::<(String, String, i64, String), _, _>(
+            .query_row::<(String, String, i64, String, String), _, _>(
                 "SELECT generation.generation_id, generation.pds_generation,
-                        generation.source_revision, generation.state
+                        generation.source_revision, generation.state,
+                        generation.manifest_hash
                  FROM logical_library_head AS head
                  JOIN logical_sync_generations AS generation
                    ON generation.library_id = head.library_id
                   AND generation.generation_id = head.generation_id
                  WHERE head.singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_ne!(activated_logical_head.0, "local-0");
         assert_eq!(activated_logical_head.1, "revision-1");
         assert_eq!(activated_logical_head.2, 1);
         assert_eq!(activated_logical_head.3, "complete");
+        let durable_roots = job.borrow().root_set().expect("read sealed job roots");
+        assert!(durable_roots.object_hashes.contains(&asset_hash));
+        assert!(durable_roots
+            .object_hashes
+            .contains(&activated_logical_head.4));
         assert!(source.content_gets > 0);
         let root = store.read_root(None).unwrap().value;
         assert_eq!(root["theme"], "remote");

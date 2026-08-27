@@ -1596,6 +1596,7 @@ export const languageKorean = {
         fullCloneRequired: "정확한 공통 기반이 없습니다. 위의 전체 복제를 한 번 실행한 뒤 증분 업데이트를 사용하세요.",
         conflictLocalRemote: "두 기기에서 같은 논리 레코드를 변경했습니다. 데이터는 변경되지 않았습니다. 차이를 해결한 뒤 다시 시도하세요.",
         conflictStaleRevision: "업데이트 시작 중 로컬 데이터가 변경되었습니다. 데이터는 변경되지 않았습니다. 다시 시도하세요.",
+        invalidLink: "증분 업데이트 링크가 잘못되었습니다.",
     },
     localToggles: "로컬 토글",
 } satisfies DeepPartial<typeof import('./en').languageEnglish>

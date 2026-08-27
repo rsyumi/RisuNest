@@ -15,6 +15,7 @@
         type PeerDeltaCapabilities,
         type PeerDeltaPullResult,
         type PeerDeltaSourceStatus,
+        parsePeerDeltaUri,
     } from 'src/ts/storage/sync/peerDelta'
     import { getDesktopPeerDeltaController } from 'src/ts/storage/sync/peerDeltaController'
     import {
@@ -87,6 +88,7 @@
         && deltaCapabilities.atomicActivationReady
         && deltaCapabilities.authenticatedTransportReady
     ))
+    const deltaOperationRunning = $derived(deltaBusy || deltaPullPhase === 'running')
 
     function reportError(cause: unknown): void {
         error = cause instanceof Error ? cause.message : String(cause)
@@ -258,6 +260,12 @@
 
     async function pullDelta(): Promise<void> {
         if (!deltaPairingInput) return
+        try {
+            parsePeerDeltaUri(deltaPairingInput)
+        } catch {
+            deltaError = language.peerDelta.invalidLink
+            return
+        }
         await withDeltaBusy(async () => {
             await deltaController.pull(deltaPairingInput)
         })
@@ -453,16 +461,16 @@
             {deltaSourcePhaseText()}
         </p>
         <div class="mt-2 flex flex-wrap gap-2">
-            <Button disabled={!deltaSourceEnabled || deltaBusy} onclick={prepareDeltaSource}>
+            <Button disabled={!deltaSourceEnabled || deltaOperationRunning} onclick={prepareDeltaSource}>
                 {language.peerDelta.prepare}
             </Button>
             <Button
-                disabled={!deltaSourceEnabled || deltaBusy || deltaSourceStatus.phase !== 'prepared'}
+                disabled={!deltaSourceEnabled || deltaOperationRunning || deltaSourceStatus.phase !== 'prepared'}
                 onclick={startDeltaSource}
             >{language.peerDelta.start}</Button>
             <Button
                 styled="danger"
-                disabled={deltaBusy || !['prepared', 'running'].includes(deltaSourceStatus.phase)}
+                disabled={deltaOperationRunning || !['prepared', 'running'].includes(deltaSourceStatus.phase)}
                 onclick={stopDeltaSource}
             >{language.peerDelta.stop}</Button>
         </div>
@@ -476,7 +484,7 @@
                 class="mt-1 w-full rounded-md border border-darkborderc bg-bgcolor p-2 text-sm"
                 value={deltaSourcePairingUri}
             ></textarea>
-            <Button className="mt-2" onclick={() => navigator.clipboard.writeText(deltaSourcePairingUri)}>
+            <Button className="mt-2" disabled={deltaOperationRunning} onclick={() => navigator.clipboard.writeText(deltaSourcePairingUri)}>
                 {language.peerDelta.copyLink}
             </Button>
         {/if}
@@ -490,7 +498,7 @@
                         <Button
                             size="sm"
                             styled="danger"
-                            disabled={deltaBusy || device.revoked}
+                            disabled={deltaOperationRunning || device.revoked}
                             onclick={() => revokeDeltaDevice(device.deviceId)}
                         >{language.peerDelta.revoke}</Button>
                     </li>
@@ -514,7 +522,7 @@
         ></textarea>
         <Button
             className="mt-2"
-            disabled={!deltaTargetEnabled || deltaBusy || !deltaPairingInput}
+            disabled={!deltaTargetEnabled || deltaOperationRunning || !deltaPairingInput}
             onclick={pullDelta}
         >{language.peerDelta.pull}</Button>
 

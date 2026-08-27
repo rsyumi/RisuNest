@@ -62,6 +62,8 @@ const RESPONSE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PERSISTED_CREDENTIAL_BYTES: u64 = 4096;
 const PERSISTED_CREDENTIAL_SCHEMA: &str = "risunest.peer-clone-credential/v1";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(desktop)]
+const LOGICAL_OBJECT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(desktop)]
 pub struct LanPairing {
@@ -1962,6 +1964,30 @@ mod timeout_tests {
         }
     }
 
+    fn direct_logical_client(
+        address: SocketAddr,
+        control_timeout: Duration,
+        object_idle_timeout: Duration,
+    ) -> LanLogicalDeltaClient {
+        let session_url = format!("http://{address}/v1/sessions/{TEST_SESSION_ID}");
+        let timeouts = LogicalClientTimeouts {
+            control_request: control_timeout,
+            object_idle: object_idle_timeout,
+        };
+        LanLogicalDeltaClient {
+            control_client: build_logical_http_client(LogicalRequestKind::Control, timeouts)
+                .unwrap(),
+            object_client: build_logical_http_client(LogicalRequestKind::Object, timeouts).unwrap(),
+            control_timeout,
+            session_url,
+            device_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            bearer: TEST_BEARER.to_owned(),
+            source_device_id: "00000000-0000-4000-8000-000000000002".to_owned(),
+            manifest_id: "a".repeat(64),
+            verified_bytes: Arc::new(Mutex::new(0)),
+        }
+    }
+
     fn finish_response(stream: &mut TcpStream) {
         let _ = stream.shutdown(Shutdown::Write);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
@@ -2012,6 +2038,97 @@ mod timeout_tests {
 
         assert!(matches!(error, PeerSyncError::Transport(_)));
         assert!(elapsed < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn logical_object_body_stall_uses_a_bounded_idle_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let bytes = b"stalled logical object".to_vec();
+        let object_hash = sha256_hex(&bytes);
+        let object_size = bytes.len() as u64;
+        let response_etag = quoted(&object_hash);
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut stream).starts_with("GET "));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(1_000));
+            let _ = stream.write_all(&bytes);
+        });
+        let mut client = direct_logical_client(
+            address,
+            Duration::from_millis(100),
+            Duration::from_millis(120),
+        );
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: object_hash,
+                size: object_size,
+            })
+            .unwrap();
+        let started = Instant::now();
+        let error = reader.read_to_end(&mut Vec::new()).unwrap_err();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::Other
+        ));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "stall lasted {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn logical_object_can_progress_longer_than_the_control_timeout() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let bytes = b"logical object with paced progress".to_vec();
+        let object_hash = sha256_hex(&bytes);
+        let response_etag = quoted(&object_hash);
+        let server_bytes = bytes.clone();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request_head(&mut stream).starts_with("GET "));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: {response_etag}\r\nConnection: close\r\n\r\n",
+                server_bytes.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            for chunk in server_bytes.chunks(8) {
+                thread::sleep(Duration::from_millis(80));
+                stream.write_all(chunk).unwrap();
+                stream.flush().unwrap();
+            }
+            finish_response(&mut stream);
+        });
+        let control_timeout = Duration::from_millis(100);
+        let mut client =
+            direct_logical_client(address, control_timeout, Duration::from_millis(200));
+        let mut reader = client
+            .open_object(&LogicalDeltaObject {
+                hash: object_hash,
+                size: bytes.len() as u64,
+            })
+            .unwrap();
+        let started = Instant::now();
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+
+        assert_eq!(received, bytes);
+        assert!(elapsed > control_timeout);
     }
 
     #[test]
@@ -2372,15 +2489,18 @@ mod timeout_tests {
         let mut host = LanCloneHost::prepare_logical(logical);
         let pairing = host.start_on(Ipv4Addr::LOCALHOST, 0).unwrap();
         let endpoint = format!("http://{}", host.address().unwrap());
-        let mut client = LanLogicalDeltaClient::claim(
+        let control_timeout = Duration::from_millis(400);
+        let mut client = LanLogicalDeltaClient::claim_with_timeouts(
             &endpoint,
             &pairing.session_id,
             &pairing.manifest_id,
             &pairing.claim,
+            LogicalClientTimeouts {
+                control_request: control_timeout,
+                object_idle: Duration::from_secs(2),
+            },
         )
         .unwrap();
-        let control_timeout = Duration::from_millis(400);
-        client.control_timeout = control_timeout;
 
         let started = Instant::now();
         let mut reader = client
@@ -2428,13 +2548,17 @@ mod timeout_tests {
 
     #[test]
     fn logical_object_stream_is_not_bound_by_the_short_control_timeout() {
+        let timeouts = LogicalClientTimeouts {
+            control_request: Duration::from_secs(5),
+            object_idle: Duration::from_secs(30),
+        };
         assert_eq!(
-            logical_request_timeout(LogicalRequestKind::Control, Duration::from_secs(5)),
-            Some(Duration::from_secs(5)),
+            logical_request_timeout(LogicalRequestKind::Control, timeouts),
+            Duration::from_secs(5),
         );
         assert_eq!(
-            logical_request_timeout(LogicalRequestKind::Object, Duration::from_secs(5)),
-            None,
+            logical_request_timeout(LogicalRequestKind::Object, timeouts),
+            Duration::from_secs(30),
         );
     }
 }
@@ -2460,30 +2584,32 @@ enum LogicalRequestKind {
 }
 
 #[cfg(desktop)]
-fn logical_request_timeout(
-    kind: LogicalRequestKind,
-    control_timeout: Duration,
-) -> Option<Duration> {
+#[derive(Clone, Copy)]
+struct LogicalClientTimeouts {
+    control_request: Duration,
+    object_idle: Duration,
+}
+
+#[cfg(desktop)]
+fn logical_request_timeout(kind: LogicalRequestKind, timeouts: LogicalClientTimeouts) -> Duration {
     match kind {
-        LogicalRequestKind::Control => Some(control_timeout),
-        LogicalRequestKind::Object => None,
+        LogicalRequestKind::Control => timeouts.control_request,
+        LogicalRequestKind::Object => timeouts.object_idle,
     }
 }
 
 #[cfg(desktop)]
 fn build_logical_http_client(
     kind: LogicalRequestKind,
-    control_timeout: Duration,
+    timeouts: LogicalClientTimeouts,
 ) -> Result<reqwest::blocking::Client, PeerSyncError> {
-    let builder = reqwest::blocking::Client::builder()
+    reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
+        .timeout(logical_request_timeout(kind, timeouts))
         .redirect(reqwest::redirect::Policy::none())
-        .no_proxy();
-    let builder = match logical_request_timeout(kind, control_timeout) {
-        Some(timeout) => builder.timeout(timeout),
-        None => builder,
-    };
-    builder.build().map_err(transport)
+        .no_proxy()
+        .build()
+        .map_err(transport)
 }
 
 #[cfg(desktop)]
@@ -2493,6 +2619,25 @@ impl LanLogicalDeltaClient {
         session_id: &str,
         manifest_id: &str,
         claim: &str,
+    ) -> Result<Self, PeerSyncError> {
+        Self::claim_with_timeouts(
+            endpoint,
+            session_id,
+            manifest_id,
+            claim,
+            LogicalClientTimeouts {
+                control_request: CONTROL_REQUEST_TIMEOUT,
+                object_idle: LOGICAL_OBJECT_IDLE_TIMEOUT,
+            },
+        )
+    }
+
+    fn claim_with_timeouts(
+        endpoint: &str,
+        session_id: &str,
+        manifest_id: &str,
+        claim: &str,
+        timeouts: LogicalClientTimeouts,
     ) -> Result<Self, PeerSyncError> {
         if endpoint.len() > MAX_URL_BYTES
             || !is_canonical_uuid(session_id)
@@ -2510,10 +2655,9 @@ impl LanLogicalDeltaClient {
                 "logical delta session URL is too long".to_owned(),
             ));
         }
-        let control_timeout = CONTROL_REQUEST_TIMEOUT;
-        let control_client =
-            build_logical_http_client(LogicalRequestKind::Control, control_timeout)?;
-        let object_client = build_logical_http_client(LogicalRequestKind::Object, control_timeout)?;
+        let control_timeout = timeouts.control_request;
+        let control_client = build_logical_http_client(LogicalRequestKind::Control, timeouts)?;
+        let object_client = build_logical_http_client(LogicalRequestKind::Object, timeouts)?;
         let response = control_client
             .post(format!("{session_url}/claim"))
             .json(&ClaimRequest {

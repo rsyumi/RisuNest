@@ -23,4 +23,18 @@ describe('peer delta settings surface', () => {
         expect(languageKorean.peerDelta?.fullCloneRequired).toContain('전체 복제')
         expect(languageKorean.peerDelta?.divergenceHelp).toContain('교체하지')
     })
+
+    it('keeps delta actions disabled while a remounted controller reports a running pull', () => {
+        expect(peerCloneSettingsSource).toContain(
+            "const deltaOperationRunning = $derived(deltaBusy || deltaPullPhase === 'running')",
+        )
+        expect(peerCloneSettingsSource).toContain('disabled={!deltaTargetEnabled || deltaOperationRunning || !deltaPairingInput}')
+        expect(peerCloneSettingsSource).toContain('disabled={!deltaSourceEnabled || deltaOperationRunning}')
+    })
+
+    it('uses translated invalid-link feedback for delta pairing input', () => {
+        expect(peerCloneSettingsSource).toContain('deltaError = language.peerDelta.invalidLink')
+        expect(languageEnglish.peerDelta.invalidLink).toContain('invalid')
+        expect(languageKorean.peerDelta?.invalidLink).toContain('잘못')
+    })
 })

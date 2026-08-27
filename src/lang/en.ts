@@ -1816,6 +1816,7 @@ export const languageEnglish = {
         fullCloneRequired: "No exact common base exists. Use the full clone above once, then use incremental updates afterward.",
         conflictLocalRemote: "Both devices changed the same logical records. No data was changed. Resolve the divergence before retrying.",
         conflictStaleRevision: "Local data changed while the update was starting. No data was changed. Retry the update.",
+        invalidLink: "The incremental update link is invalid.",
     },
     localToggles: "Local Toggles",
 } satisfies I18nTranslation;

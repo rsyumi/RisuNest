@@ -32,9 +32,12 @@ export function createPeerDeltaController(options: {
     let initialization: Promise<void> | undefined
     let sourceTimer: ReturnType<typeof setInterval> | undefined
     let sourcePolling = false
-    let activePull: Promise<PeerDeltaPullResult> | undefined
+    let sourceError = ''
+    let pullError = ''
+    let activePull: { pairingUri: string, promise: Promise<PeerDeltaPullResult> } | undefined
 
     const publish = (): void => {
+        snapshot = { ...snapshot, error: pullError || sourceError }
         for (const listener of listeners) listener(snapshot)
     }
     const update = (next: Partial<PeerDeltaControllerSnapshot>): void => {
@@ -50,16 +53,17 @@ export function createPeerDeltaController(options: {
         sourcePolling = true
         try {
             const sourceStatus = await options.facade.status()
+            sourceError = ''
             update({
                 sourceStatus,
                 sourcePairingUri: sourceStatus.phase === 'running'
                     ? sourceStatus.pairingUri ?? snapshot.sourcePairingUri
                     : '',
-                error: '',
             })
             if (sourceStatus.phase !== 'running') stopSourcePolling()
         } catch (cause) {
-            update({ error: cause instanceof Error ? cause.message : String(cause) })
+            sourceError = cause instanceof Error ? cause.message : String(cause)
+            publish()
         } finally {
             sourcePolling = false
         }
@@ -75,10 +79,12 @@ export function createPeerDeltaController(options: {
     const run = async <T>(operation: () => Promise<T>): Promise<T> => {
         try {
             const result = await operation()
-            update({ error: '' })
+            sourceError = ''
+            publish()
             return result
         } catch (cause) {
-            update({ error: cause instanceof Error ? cause.message : String(cause) })
+            sourceError = cause instanceof Error ? cause.message : String(cause)
+            publish()
             throw cause
         }
     }
@@ -97,17 +103,20 @@ export function createPeerDeltaController(options: {
                 options.facade.capabilities(),
                 options.facade.status(),
             ]).then(([capabilities, sourceStatus]) => {
+                sourceError = ''
                 update({
                     capabilities,
                     sourceStatus,
                     sourcePairingUri: sourceStatus.phase === 'running'
                         ? sourceStatus.pairingUri ?? ''
                         : '',
-                    error: '',
                 })
                 if (sourceStatus.phase === 'running') beginSourcePolling()
             }).catch((cause) => {
-                update({ error: cause instanceof Error ? cause.message : String(cause) })
+                sourceError = cause instanceof Error ? cause.message : String(cause)
+                initialized = false
+                initialization = undefined
+                publish()
             })
             return initialization
         },
@@ -136,27 +145,34 @@ export function createPeerDeltaController(options: {
             update({ sourceStatus: await options.facade.status() })
         }),
         pull(pairingUri: string): Promise<PeerDeltaPullResult> {
-            if (activePull) return activePull
-            update({ pullPhase: 'running', pullResult: undefined, error: '' })
-            activePull = options.facade.pull(pairingUri).then((pullResult) => {
+            if (activePull) {
+                if (activePull.pairingUri !== pairingUri) {
+                    return Promise.reject(new Error('A peer delta pull for a different pairing is already running'))
+                }
+                return activePull.promise
+            }
+            pullError = ''
+            update({ pullPhase: 'running', pullResult: undefined })
+            const promise = options.facade.pull(pairingUri).then((pullResult) => {
+                pullError = ''
                 update({
                     pullResult,
                     pullPhase: pullResult.kind === 'fullCloneRequired'
                         ? 'fullCloneRequired'
                         : pullResult.kind === 'conflict' ? 'conflict' : 'completed',
-                    error: '',
                 })
                 return pullResult
             }).catch((cause) => {
+                pullError = cause instanceof Error ? cause.message : String(cause)
                 update({
                     pullPhase: 'failed',
-                    error: cause instanceof Error ? cause.message : String(cause),
                 })
                 throw cause
             }).finally(() => {
                 activePull = undefined
             })
-            return activePull
+            activePull = { pairingUri, promise }
+            return promise
         },
     }
 }

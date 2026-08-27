@@ -1,13 +1,13 @@
 use super::{
     execute_logical_delta_pull,
     lan::{LanCloneHostControl, LanLogicalDeltaClient, PreparedLogicalLanSession},
-    logical_delta::{decode_logical_manifest, hash_logical_manifest},
+    logical_delta::decode_logical_manifest,
     LanCloneHost, LogicalDeltaActivation, LogicalDeltaObject, LogicalDeltaObjectSource,
-    PeerSyncError,
+    PeerSyncError, ReadyLogicalDeltaPlan,
 };
 use crate::{
     asset_repository::{
-        job_pins::{CasJobKind, CasObjectRole, CasReleaseOutcome, DurableCasJob},
+        job_pins::{CasJobKind, CasReleaseOutcome, DurableCasJob},
         PayloadCas,
     },
     persistent_store::{
@@ -406,17 +406,6 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
         now_millis()?,
     )?);
     let _abort_unsealed = AbortUnsealedJobOnDrop(&job);
-    let prepared_manifest =
-        job.borrow_mut()
-            .prepare_bytes(cas, remote_manifest_bytes, CasObjectRole::DirectObject)?;
-    let remote_manifest_hash = hash_logical_manifest(&remote_manifest)
-        .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
-    if prepared_manifest.content_hash != remote_manifest_hash {
-        let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
-        return Err(PeerSyncError::Validation(
-            "logical delta remote manifest hash is inconsistent".to_owned(),
-        ));
-    }
 
     let staging_root = app_root.join("peer-delta").join("staging");
     let mut target = PersistentLogicalDeltaTarget::new_with_durable_job(
@@ -471,7 +460,7 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
         Ok(plan) => plan,
         Err(error) => {
             drop(target);
-            return classify_plan_error(error);
+            return classify_plan_error(error, expected_revision);
         }
     };
     let local_hashes = local
@@ -521,27 +510,83 @@ fn pull_logical_delta<S: LogicalDeltaObjectSource + ?Sized>(
                 transferred_bytes: 0,
             })
         }
-        Ok(LogicalDeltaActivation::Conflict { .. }) => {
+        Ok(LogicalDeltaActivation::Conflict {
+            actual_revision,
+            actual_base_manifest_hash,
+        }) => {
             let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
-            Ok(PeerDeltaPullResult::Conflict {
-                reason: "localAndRemoteChanged",
-            })
+            Ok(classify_activation_conflict(
+                &plan,
+                actual_revision,
+                &actual_base_manifest_hash,
+            ))
         }
         Err(error) => {
             if !job.borrow().is_sealed() {
                 let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
             }
-            Err(error)
+            classify_plan_error(error, plan.expected_local_revision)
         }
     }
 }
 
-fn classify_plan_error(error: PeerSyncError) -> Result<PeerDeltaPullResult, PeerSyncError> {
+fn pull_logical_delta_from_app_root<S: LogicalDeltaObjectSource + ?Sized>(
+    app_root: &Path,
+    source_device_id: &str,
+    expected_revision: i64,
+    remote_manifest_bytes: &[u8],
+    remote_source: &mut S,
+) -> Result<PeerDeltaPullResult, PeerSyncError> {
+    let cas = PayloadCas::new(app_root)?;
+    let mut store = PersistentStore::open(app_root).map_err(store_error)?;
+    pull_logical_delta(
+        &mut store,
+        &cas,
+        app_root,
+        source_device_id,
+        expected_revision,
+        remote_manifest_bytes,
+        remote_source,
+    )
+}
+
+fn classify_plan_error(
+    error: PeerSyncError,
+    expected_local_revision: i64,
+) -> Result<PeerDeltaPullResult, PeerSyncError> {
     match error {
         PeerSyncError::LogicalMergeConflict { .. } => Ok(PeerDeltaPullResult::Conflict {
             reason: "localAndRemoteChanged",
         }),
+        PeerSyncError::ActivationConflict { expected, .. } => {
+            let expected_revision = expected_local_revision.to_string();
+            Ok(PeerDeltaPullResult::Conflict {
+                reason: if expected.as_deref() == Some(expected_revision.as_str()) {
+                    "staleRevision"
+                } else {
+                    "localAndRemoteChanged"
+                },
+            })
+        }
         error => Err(error),
+    }
+}
+
+fn classify_activation_conflict(
+    plan: &ReadyLogicalDeltaPlan,
+    actual_revision: i64,
+    actual_base_manifest_hash: &str,
+) -> PeerDeltaPullResult {
+    PeerDeltaPullResult::Conflict {
+        reason: if actual_revision != plan.expected_local_revision {
+            "staleRevision"
+        } else if actual_base_manifest_hash != plan.expected_base_manifest_hash {
+            "localAndRemoteChanged"
+        } else {
+            // The target can also reject an otherwise identical revision/base when
+            // the active logical head no longer matches the prepared stage.
+            "staleRevision"
+        },
     }
 }
 
@@ -611,12 +656,14 @@ pub fn peer_delta_status(
 }
 
 #[tauri::command]
-pub fn peer_delta_stop(
+pub async fn peer_delta_stop(
     state: State<'_, PeerDeltaCommandState>,
     session_id: String,
 ) -> Result<(), String> {
-    state
-        .stop_source(&session_id)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || state.stop_source(&session_id))
+        .await
+        .map_err(|error| format!("peer delta source stop worker failed: {error}"))?
         .map_err(|error| error.to_string())
 }
 
@@ -650,19 +697,13 @@ pub async fn peer_delta_pull(
             .map_err(|error| error.to_string())?;
         let manifest = client.fetch_manifest().map_err(|error| error.to_string())?;
         let source_device_id = client.source_device_id().to_owned();
-        let cas = PayloadCas::new(&app_root).map_err(|error| error.to_string())?;
-        persistent_store::commands::with_store_mut(app.state(), |store| {
-            pull_logical_delta(
-                store,
-                &cas,
-                &app_root,
-                &source_device_id,
-                expected_revision,
-                &manifest,
-                &mut client,
-            )
-            .map_err(as_store_error)
-        })
+        pull_logical_delta_from_app_root(
+            &app_root,
+            &source_device_id,
+            expected_revision,
+            &manifest,
+            &mut client,
+        )
         .map_err(|error| error.to_string())
     })
     .await
@@ -764,12 +805,6 @@ fn store_error(error: StoreError) -> PeerSyncError {
     PeerSyncError::Storage(error.to_string())
 }
 
-fn as_store_error(error: PeerSyncError) -> StoreError {
-    StoreError::Store {
-        message: error.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,11 +820,39 @@ mod tests {
         persistent_store::WorkingSetCommit,
     };
     use serde_json::json;
-    use std::io::{Cursor, Read};
+    use std::{
+        io::{Cursor, Read},
+        sync::mpsc,
+        thread,
+    };
 
     struct FixtureSource {
         objects: BTreeMap<String, Vec<u8>>,
         reads: usize,
+    }
+
+    struct BlockingFixtureSource {
+        objects: BTreeMap<String, Vec<u8>>,
+        opened: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl LogicalDeltaObjectSource for BlockingFixtureSource {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            self.opened
+                .send(())
+                .map_err(|error| PeerSyncError::Transport(error.to_string()))?;
+            self.release
+                .recv()
+                .map_err(|error| PeerSyncError::Transport(error.to_string()))?;
+            let bytes = self.objects.get(&object.hash).ok_or_else(|| {
+                PeerSyncError::Transport(format!("fixture object {} is absent", object.hash))
+            })?;
+            Ok(Box::new(Cursor::new(bytes.clone())))
+        }
     }
 
     impl LogicalDeltaObjectSource for FixtureSource {
@@ -877,12 +940,102 @@ mod tests {
     #[test]
     fn typed_merge_conflict_projects_to_the_product_conflict_result() {
         assert_eq!(
-            classify_plan_error(PeerSyncError::LogicalMergeConflict {
-                record: "plugin:shared".to_owned(),
-            })
+            classify_plan_error(
+                PeerSyncError::LogicalMergeConflict {
+                    record: "plugin:shared".to_owned(),
+                },
+                7
+            )
             .unwrap(),
             PeerDeltaPullResult::Conflict {
                 reason: "localAndRemoteChanged",
+            }
+        );
+    }
+
+    #[test]
+    fn planning_revision_cas_conflict_projects_as_stale_revision() {
+        assert_eq!(
+            classify_plan_error(
+                PeerSyncError::ActivationConflict {
+                    expected: Some("7".to_owned()),
+                    actual: Some("8".to_owned()),
+                },
+                7,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "staleRevision",
+            }
+        );
+    }
+
+    #[test]
+    fn planning_base_cas_conflict_projects_as_local_and_remote_changed() {
+        assert_eq!(
+            classify_plan_error(
+                PeerSyncError::ActivationConflict {
+                    expected: Some("a".repeat(64)),
+                    actual: Some("c".repeat(64)),
+                },
+                7,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "localAndRemoteChanged",
+            }
+        );
+    }
+
+    fn activation_conflict_plan() -> ReadyLogicalDeltaPlan {
+        ReadyLogicalDeltaPlan {
+            expected_local_revision: 7,
+            expected_base_manifest_hash: "a".repeat(64),
+            expected_remote_generation: "remote".to_owned(),
+            apply: vec![],
+            preserve_local_keys: vec![],
+            candidate_object_hashes: vec![],
+            next_base_manifest_hash: "b".repeat(64),
+            next_base_generation_sequence: "8".to_owned(),
+        }
+    }
+
+    #[test]
+    fn coordinator_projects_revision_cas_conflict_as_stale_revision() {
+        let plan = activation_conflict_plan();
+
+        assert_eq!(
+            classify_activation_conflict(&plan, 8, &plan.expected_base_manifest_hash),
+            PeerDeltaPullResult::Conflict {
+                reason: "staleRevision",
+            }
+        );
+    }
+
+    #[test]
+    fn coordinator_projects_base_cas_conflict_as_local_and_remote_changed() {
+        let plan = activation_conflict_plan();
+
+        assert_eq!(
+            classify_activation_conflict(&plan, 7, &"c".repeat(64)),
+            PeerDeltaPullResult::Conflict {
+                reason: "localAndRemoteChanged",
+            }
+        );
+    }
+
+    #[test]
+    fn coordinator_projects_matching_revision_and_base_conflict_as_stale_revision() {
+        let plan = activation_conflict_plan();
+
+        assert_eq!(
+            classify_activation_conflict(
+                &plan,
+                plan.expected_local_revision,
+                &plan.expected_base_manifest_hash,
+            ),
+            PeerDeltaPullResult::Conflict {
+                reason: "staleRevision",
             }
         );
     }
@@ -1043,6 +1196,68 @@ mod tests {
         assert_eq!(
             store.read_root(None).unwrap().value,
             json!({"side":"remote"})
+        );
+    }
+
+    #[test]
+    fn dedicated_pull_connection_does_not_hold_the_managed_store_during_object_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut setup = PersistentStore::open(directory.path()).unwrap();
+        let local = setup
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer = "00000000-0000-4000-8000-000000000013";
+        pull_logical_delta(
+            &mut setup,
+            &cas,
+            directory.path(),
+            peer,
+            0,
+            &local.manifest_bytes,
+            &mut empty_source(),
+        )
+        .unwrap();
+        let remote = remote_root_manifest(&local.manifest, "remote-slow", json!({"side":"remote"}));
+        drop(setup);
+
+        let managed_store = Arc::new(Mutex::new(PersistentStore::open(directory.path()).unwrap()));
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let root = directory.path().to_path_buf();
+        let remote_bytes = remote.manifest_bytes.clone();
+        let source = BlockingFixtureSource {
+            objects: remote
+                .record_objects
+                .iter()
+                .map(|record| (record.object.hash.clone(), record.object.bytes.clone()))
+                .collect(),
+            opened: opened_tx,
+            release: release_rx,
+        };
+        let pull = thread::spawn(move || {
+            let mut source = source;
+            pull_logical_delta_from_app_root(&root, peer, 0, &remote_bytes, &mut source)
+        });
+        opened_rx.recv().unwrap();
+
+        assert_eq!(
+            managed_store
+                .try_lock()
+                .unwrap()
+                .read_root(None)
+                .unwrap()
+                .value,
+            json!({})
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            pull.join().unwrap().unwrap(),
+            PeerDeltaPullResult::Updated {
+                revision: 1,
+                transferred_objects: 1,
+                transferred_bytes: remote.record_objects[0].object.size,
+            }
         );
     }
 
