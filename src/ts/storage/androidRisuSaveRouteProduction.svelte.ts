@@ -22,7 +22,6 @@ import {
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 
 let disposeSpoolListener: (() => void) | undefined
-let androidOpenedSpoolTail: Promise<void> = Promise.resolve()
 
 export interface AndroidOpenedSpoolDispatchDependencies {
     enqueueRestore(batch: AndroidSpoolBatch): Promise<void>
@@ -42,6 +41,7 @@ function isAndroidNativeCharacterSpool(source: AndroidSpoolReady): boolean {
 export async function dispatchAndroidOpenedSpoolBatch(
     batch: AndroidSpoolBatch,
     dependencies: AndroidOpenedSpoolDispatchDependencies,
+    handledCharacterTokens?: Set<string>,
 ): Promise<void> {
     const characterSources = batch.ready.filter(isAndroidNativeCharacterSpool)
     await dependencies.enqueueRestore({
@@ -49,6 +49,8 @@ export async function dispatchAndroidOpenedSpoolBatch(
         ready: batch.ready.filter((source) => !isAndroidNativeCharacterSpool(source)),
     })
     for (const source of characterSources) {
+        if (handledCharacterTokens?.has(source.token)) continue
+        handledCharacterTokens?.add(source.token)
         try {
             const result = await dependencies.importCharacter(source)
             if (result.kind === 'destination-required') {
@@ -61,18 +63,27 @@ export async function dispatchAndroidOpenedSpoolBatch(
     }
 }
 
-function enqueueAndroidOpenedSpoolBatch(
-    batch: AndroidSpoolBatch,
+export function createAndroidOpenedSpoolDispatcher(
     dependencies: AndroidOpenedSpoolDispatchDependencies,
-): Promise<void> {
-    const queued = androidOpenedSpoolTail.then(async () => {
-        await dispatchAndroidOpenedSpoolBatch(batch, dependencies)
-    })
-    androidOpenedSpoolTail = queued.then(
-        () => undefined,
-        () => undefined,
-    )
-    return queued
+): { enqueue(batch: AndroidSpoolBatch): Promise<void> } {
+    const handledCharacterTokens = new Set<string>()
+    let tail: Promise<void> = Promise.resolve()
+    return {
+        enqueue(batch) {
+            const queued = tail.then(async () => {
+                await dispatchAndroidOpenedSpoolBatch(
+                    batch,
+                    dependencies,
+                    handledCharacterTokens,
+                )
+            })
+            tail = queued.then(
+                () => undefined,
+                () => undefined,
+            )
+            return queued
+        },
+    }
 }
 
 async function importAndroidCharacterSpool(
@@ -166,12 +177,13 @@ export function registerAndroidRisuSaveRoute(): void {
         failed: showSpoolFailure,
         onError: (_source, error) => showRestoreError(error),
     })
+    const dispatcher = createAndroidOpenedSpoolDispatcher({
+        enqueueRestore: route.enqueue,
+        importCharacter: importAndroidCharacterSpool,
+        reportCharacterError: (_source, error) => showRestoreError(error),
+        reportDestinationRequired: showDestinationRequired,
+    })
     disposeSpoolListener = listenAndroidSpoolBatches((batch) => {
-        void enqueueAndroidOpenedSpoolBatch(batch, {
-            enqueueRestore: route.enqueue,
-            importCharacter: importAndroidCharacterSpool,
-            reportCharacterError: (_source, error) => showRestoreError(error),
-            reportDestinationRequired: showDestinationRequired,
-        })
+        void dispatcher.enqueue(batch)
     })
 }

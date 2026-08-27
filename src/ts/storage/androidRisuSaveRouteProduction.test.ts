@@ -15,6 +15,7 @@ vi.mock('./persistentDataRuntime.svelte', () => ({
 }))
 
 import {
+    createAndroidOpenedSpoolDispatcher,
     dispatchAndroidOpenedSpoolBatch,
     type AndroidOpenedSpoolDispatchDependencies,
 } from './androidRisuSaveRouteProduction.svelte'
@@ -99,5 +100,94 @@ describe('Android opened spool production route', () => {
             ready: [],
             failures: [],
         })
+    })
+
+    it('reports the explicit destination result for an ordinary Android JPEG', async () => {
+        const dependencies: AndroidOpenedSpoolDispatchDependencies = {
+            enqueueRestore: vi.fn(async () => undefined),
+            importCharacter: vi.fn(async () => ({ kind: 'destination-required' as const })),
+            reportCharacterError: vi.fn(),
+            reportDestinationRequired: vi.fn(),
+        }
+        const source = {
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'portrait.jpeg',
+            bytes: 10,
+        }
+
+        await dispatchAndroidOpenedSpoolBatch({
+            requestId: 'opened-jpeg',
+            ready: [source],
+            failures: [],
+        }, dependencies)
+
+        expect(dependencies.reportDestinationRequired).toHaveBeenCalledExactlyOnceWith(source)
+        expect(dependencies.reportCharacterError).not.toHaveBeenCalled()
+    })
+
+    it('deduplicates a replayed character token for one dispatcher lifetime', async () => {
+        const dependencies: AndroidOpenedSpoolDispatchDependencies = {
+            enqueueRestore: vi.fn(async () => undefined),
+            importCharacter: vi.fn(async () => ({ kind: 'declined' as const })),
+            reportCharacterError: vi.fn(),
+            reportDestinationRequired: vi.fn(),
+        }
+        const dispatcher = createAndroidOpenedSpoolDispatcher(dependencies)
+        const source = {
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'card.charx',
+            bytes: 10,
+        }
+
+        await dispatcher.enqueue({ requestId: 'opened-1', ready: [source], failures: [] })
+        await dispatcher.enqueue({ requestId: 'replayed-1', ready: [source], failures: [] })
+
+        expect(dependencies.importCharacter).toHaveBeenCalledExactlyOnceWith(source)
+    })
+
+    it('keeps distinct character tokens with the same name in FIFO order', async () => {
+        let releaseFirst!: () => void
+        const calls: string[] = []
+        const dependencies: AndroidOpenedSpoolDispatchDependencies = {
+            enqueueRestore: vi.fn(async () => undefined),
+            importCharacter: vi.fn(async (source) => {
+                calls.push(source.token)
+                if (calls.length === 1) {
+                    await new Promise<void>((resolve) => releaseFirst = resolve)
+                }
+                return { kind: 'declined' as const }
+            }),
+            reportCharacterError: vi.fn(),
+            reportDestinationRequired: vi.fn(),
+        }
+        const dispatcher = createAndroidOpenedSpoolDispatcher(dependencies)
+        const first = {
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'card.charx',
+            bytes: 10,
+        }
+        const second = {
+            token: '22222222-2222-4222-8222-222222222222',
+            displayName: 'card.charx',
+            bytes: 10,
+        }
+
+        const firstBatch = dispatcher.enqueue({
+            requestId: 'opened-1',
+            ready: [first],
+            failures: [],
+        })
+        await vi.waitFor(() => expect(calls).toEqual([first.token]))
+        const secondBatch = dispatcher.enqueue({
+            requestId: 'opened-2',
+            ready: [second],
+            failures: [],
+        })
+        await Promise.resolve()
+        expect(calls).toEqual([first.token])
+
+        releaseFirst()
+        await Promise.all([firstBatch, secondBatch])
+        expect(calls).toEqual([first.token, second.token])
     })
 })

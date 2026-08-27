@@ -182,4 +182,23 @@ describe('native character file route', () => {
         expect(deps.readDesktopPath).not.toHaveBeenCalled()
         expect(deps.legacyImport).not.toHaveBeenCalled()
     })
+
+    it('maps the stable ordinary JPEG native error to the Android destination result', async () => {
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => {
+                throw new NativeFileJobError(
+                    'unsupported-without-destination',
+                    'ordinary JPEG import requires an asset destination',
+                )
+            }),
+        })
+
+        await expect(importAndroidNativeCharacterSpool({
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'portrait.jpeg',
+        }, deps)).resolves.toEqual({ kind: 'destination-required' })
+
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
 })

@@ -73,7 +73,10 @@ function mayUseLegacyFallback(error: unknown): boolean {
 
 function isDestinationRequired(error: unknown): boolean {
     return error instanceof NativeFileJobError
-        && nativeErrorCode(error) === 'destination-required'
+        && (
+            nativeErrorCode(error) === 'destination-required'
+            || nativeErrorCode(error) === 'unsupported-without-destination'
+        )
 }
 
 function isCapabilityUnavailable(error: unknown): boolean {
