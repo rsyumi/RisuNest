@@ -1,10 +1,15 @@
 use super::{
     PersistentStore, RegisteredSyncDeviceStatus, SyncGenerationIdentity,
-    VerifiedSyncDeviceRegistration,
+    VerifiedSharedAckLocalProof, VerifiedSyncDeviceRegistration,
+};
+use crate::peer_sync::logical_delta::{
+    hash_logical_manifest, LogicalManifest, LogicalManifestLiveRecord, LogicalManifestObject,
+    LogicalManifestRecord, LogicalManifestTombstoneRecord,
 };
 use rusqlite::params;
 
 const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const EMPTY_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn seed_complete_generation(
     store: &PersistentStore,
@@ -31,7 +36,7 @@ fn seed_complete_generation(
 }
 
 #[test]
-fn schema_v13_creates_generation_independent_device_registry() {
+fn schema_v14_creates_shared_ack_local_proof_registry() {
     let directory = tempfile::tempdir().expect("create schema fixture");
     let store = PersistentStore::open(directory.path()).expect("open fresh store");
 
@@ -40,7 +45,7 @@ fn schema_v13_creates_generation_independent_device_registry() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        13
+        14
     );
     assert_eq!(
         store
@@ -51,9 +56,657 @@ fn schema_v13_creates_generation_independent_device_registry() {
             .expect("query device registry"),
         0
     );
-    assert!(super::GENERATION_TABLES
-        .iter()
-        .all(|(table, _)| *table != "logical_sync_devices"));
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_sync_device_ack_proofs",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("query empty acknowledgement proofs"),
+        0
+    );
+    assert!(super::GENERATION_TABLES.iter().all(|(table, _)| !matches!(
+        *table,
+        "logical_sync_devices" | "logical_sync_device_ack_proofs"
+    )));
+}
+
+fn proof_manifest(
+    generation: &str,
+    generation_sequence: &str,
+    parent_generation: Option<&str>,
+    source_revision: u64,
+    live_object_hash: &str,
+    tombstone_sequence: &str,
+) -> LogicalManifest {
+    let live_size = if live_object_hash == EMPTY_HASH { 0 } else { 1 };
+    LogicalManifest {
+        schema: "risunest.logical-manifest/v1".to_owned(),
+        library_id: "library".to_owned(),
+        generation: generation.to_owned(),
+        generation_sequence: generation_sequence.to_owned(),
+        parent_generation: parent_generation.map(str::to_owned),
+        source_revision,
+        records: vec![
+            LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key: "r1:asset:WyJsaXZlIl0".to_owned(),
+                state: "live".to_owned(),
+                object_hash: live_object_hash.to_owned(),
+                dependencies: Vec::new(),
+            }),
+            LogicalManifestRecord::Tombstone(LogicalManifestTombstoneRecord {
+                key: "r1:asset:WyJvbGQiXQ".to_owned(),
+                state: "tombstone".to_owned(),
+                deleted_generation_sequence: tombstone_sequence.to_owned(),
+            }),
+        ],
+        objects: vec![LogicalManifestObject {
+            hash: live_object_hash.to_owned(),
+            size: live_size,
+        }],
+    }
+}
+
+fn seed_indexed_manifest(
+    store: &PersistentStore,
+    manifest: &LogicalManifest,
+) -> SyncGenerationIdentity {
+    let manifest_hash = hash_logical_manifest(manifest).expect("hash logical manifest");
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_sync_generations (
+                library_id, generation_id, generation_sequence, parent_generation_id,
+                pds_generation, source_revision, state, manifest_hash, created_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?2, ?5, 'complete', ?6, 1, 1)",
+            params![
+                manifest.library_id,
+                manifest.generation,
+                manifest.generation_sequence,
+                manifest.parent_generation,
+                i64::try_from(manifest.source_revision).expect("safe source revision"),
+                manifest_hash,
+            ],
+        )
+        .expect("seed indexed generation");
+    for record in &manifest.records {
+        match record {
+            LogicalManifestRecord::Live(record) => {
+                let size = manifest
+                    .objects
+                    .iter()
+                    .find(|object| object.hash == record.object_hash)
+                    .expect("live object descriptor")
+                    .size;
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO logical_record_heads (
+                            library_id, generation_id, record_key, record_kind, state,
+                            object_hash, object_size, deleted_generation_sequence
+                         ) VALUES (?1, ?2, ?3, 'asset', 'live', ?4, ?5, NULL)",
+                        params![
+                            manifest.library_id,
+                            manifest.generation,
+                            record.key,
+                            record.object_hash,
+                            i64::try_from(size).expect("safe object size"),
+                        ],
+                    )
+                    .expect("seed live logical record");
+            }
+            LogicalManifestRecord::Tombstone(record) => {
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO logical_record_heads (
+                            library_id, generation_id, record_key, record_kind, state,
+                            object_hash, object_size, deleted_generation_sequence
+                         ) VALUES (?1, ?2, ?3, 'asset', 'tombstone', NULL, 0, ?4)",
+                        params![
+                            manifest.library_id,
+                            manifest.generation,
+                            record.key,
+                            record.deleted_generation_sequence,
+                        ],
+                    )
+                    .expect("seed tombstone logical record");
+            }
+        }
+    }
+    SyncGenerationIdentity {
+        generation_id: manifest.generation.clone(),
+        manifest_hash,
+        generation_sequence: manifest.generation_sequence.clone(),
+    }
+}
+
+#[test]
+fn shared_ack_proof_accepts_equal_content_with_device_local_manifest_metadata() {
+    let directory = tempfile::tempdir().expect("create shared proof fixture");
+    let store = PersistentStore::open(directory.path()).expect("open store");
+    let shared = proof_manifest("shared-a", "3", Some("shared-c"), 50, EMPTY_HASH, "1");
+    let local = proof_manifest("local-b", "42", Some("local-c"), 99, EMPTY_HASH, "1");
+    let shared_identity = SyncGenerationIdentity {
+        generation_id: shared.generation.clone(),
+        manifest_hash: hash_logical_manifest(&shared).expect("hash shared manifest"),
+        generation_sequence: shared.generation_sequence.clone(),
+    };
+    let local_identity = seed_indexed_manifest(&store, &local);
+
+    let _: VerifiedSharedAckLocalProof = store
+        .verify_shared_ack_local_proof(&shared_identity, &shared, &local_identity)
+        .expect("verify equal shared and local content");
+}
+
+#[test]
+fn shared_ack_proof_rejects_record_object_and_tombstone_differences() {
+    for name in ["record", "object", "tombstone deletion sequence"] {
+        let directory = tempfile::tempdir().expect("create unequal proof fixture");
+        let store = PersistentStore::open(directory.path()).expect("open store");
+        let shared = proof_manifest("shared-a", "3", None, 50, HASH_A, "1");
+        let mut local = proof_manifest("local-b", "42", None, 99, HASH_A, "1");
+        match name {
+            "record" => match &mut local.records[0] {
+                LogicalManifestRecord::Live(record) => {
+                    record.key = "r1:asset:WyJhIl0".to_owned();
+                }
+                LogicalManifestRecord::Tombstone(_) => unreachable!(),
+            },
+            "object" => local.objects[0].size = 2,
+            "tombstone deletion sequence" => match &mut local.records[1] {
+                LogicalManifestRecord::Tombstone(record) => {
+                    record.deleted_generation_sequence = "2".to_owned();
+                }
+                LogicalManifestRecord::Live(_) => unreachable!(),
+            },
+            _ => unreachable!(),
+        }
+        let shared_identity = SyncGenerationIdentity {
+            generation_id: shared.generation.clone(),
+            manifest_hash: hash_logical_manifest(&shared).expect("hash shared manifest"),
+            generation_sequence: shared.generation_sequence.clone(),
+        };
+        let local_identity = seed_indexed_manifest(&store, &local);
+
+        assert!(
+            store
+                .verify_shared_ack_local_proof(&shared_identity, &shared, &local_identity)
+                .is_err(),
+            "{name} mismatch must be rejected"
+        );
+    }
+}
+
+#[test]
+fn shared_ack_advance_cas_updates_common_base_device_and_local_proof_atomically() {
+    let directory = tempfile::tempdir().expect("create shared advance fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let common_identity = seed_indexed_manifest(&store, &common);
+    store
+        .register_verified_sync_device(
+            VerifiedSyncDeviceRegistration::for_test(
+                "library",
+                "device-a",
+                common_identity.clone(),
+                10,
+            ),
+            0,
+        )
+        .expect("register device at common base");
+
+    let shared = proof_manifest("shared-a", "3", Some("shared-c"), 50, EMPTY_HASH, "1");
+    let local = proof_manifest("local-b", "42", Some("local-c"), 99, EMPTY_HASH, "1");
+    let shared_identity = SyncGenerationIdentity {
+        generation_id: shared.generation.clone(),
+        manifest_hash: hash_logical_manifest(&shared).expect("hash shared manifest"),
+        generation_sequence: shared.generation_sequence.clone(),
+    };
+    let local_identity = seed_indexed_manifest(&store, &local);
+    let proof = store
+        .verify_shared_ack_local_proof(&shared_identity, &shared, &local_identity)
+        .expect("verify next local proof");
+    let retry_proof = proof.clone();
+
+    store
+        .advance_sync_device_shared_ack(
+            "library",
+            "device-a",
+            &common_identity,
+            &common_identity,
+            &shared_identity,
+            proof,
+        )
+        .expect("advance shared ACK with local proof");
+    store
+        .advance_sync_device_shared_ack(
+            "library",
+            "device-a",
+            &common_identity,
+            &common_identity,
+            &shared_identity,
+            retry_proof,
+        )
+        .expect("retry shared ACK after response loss");
+
+    let row: (String, String, String, String) = store
+        .connection
+        .query_row(
+            "SELECT device.acknowledged_generation_id, common_base.generation_id,
+                    proof.shared_generation_id, proof.local_generation_id
+             FROM logical_sync_devices AS device
+             JOIN logical_peer_common_bases AS common_base
+               ON common_base.library_id = device.library_id
+              AND common_base.peer_id = device.device_id
+             JOIN logical_sync_device_ack_proofs AS proof
+               ON proof.library_id = device.library_id
+              AND proof.device_id = device.device_id
+             WHERE device.library_id = 'library' AND device.device_id = 'device-a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("read atomic shared ACK state");
+    assert_eq!(
+        row,
+        (
+            "shared-a".to_owned(),
+            "shared-a".to_owned(),
+            "shared-a".to_owned(),
+            "local-b".to_owned(),
+        )
+    );
+}
+
+#[test]
+fn stale_shared_ack_or_local_proof_cas_mutates_nothing() {
+    let directory = tempfile::tempdir().expect("create stale proof fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let common_identity = seed_indexed_manifest(&store, &common);
+    store
+        .register_verified_sync_device(
+            VerifiedSyncDeviceRegistration::for_test(
+                "library",
+                "device-a",
+                common_identity.clone(),
+                10,
+            ),
+            0,
+        )
+        .expect("register device");
+    let shared = proof_manifest("shared-a", "3", None, 50, EMPTY_HASH, "1");
+    let local = proof_manifest("local-b", "42", None, 99, EMPTY_HASH, "1");
+    let shared_identity = SyncGenerationIdentity {
+        generation_id: shared.generation.clone(),
+        manifest_hash: hash_logical_manifest(&shared).expect("hash shared manifest"),
+        generation_sequence: shared.generation_sequence.clone(),
+    };
+    let local_identity = seed_indexed_manifest(&store, &local);
+    let proof = store
+        .verify_shared_ack_local_proof(&shared_identity, &shared, &local_identity)
+        .expect("verify next proof");
+    let wrong_local = SyncGenerationIdentity {
+        generation_id: "wrong-local".to_owned(),
+        ..common_identity.clone()
+    };
+
+    assert!(store
+        .advance_sync_device_shared_ack(
+            "library",
+            "device-a",
+            &common_identity,
+            &wrong_local,
+            &shared_identity,
+            proof,
+        )
+        .is_err());
+    let unchanged: (String, String, String) = store
+        .connection
+        .query_row(
+            "SELECT device.acknowledged_generation_id, common_base.generation_id,
+                    proof.local_generation_id
+             FROM logical_sync_devices AS device
+             JOIN logical_peer_common_bases AS common_base
+               ON common_base.library_id = device.library_id
+              AND common_base.peer_id = device.device_id
+             JOIN logical_sync_device_ack_proofs AS proof
+               ON proof.library_id = device.library_id
+              AND proof.device_id = device.device_id
+             WHERE device.library_id = 'library' AND device.device_id = 'device-a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read unchanged proof state");
+    assert_eq!(
+        unchanged,
+        (
+            "common-c".to_owned(),
+            "common-c".to_owned(),
+            "common-c".to_owned(),
+        )
+    );
+}
+
+#[test]
+fn schema_v13_migration_backfills_active_and_revoked_proofs_only() {
+    let directory = tempfile::tempdir().expect("create v13 proof migration fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open current store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let identity = seed_indexed_manifest(&store, &common);
+    for device_id in ["active", "revoked", "forgotten"] {
+        store
+            .register_verified_sync_device(
+                VerifiedSyncDeviceRegistration::for_test(
+                    "library",
+                    device_id,
+                    identity.clone(),
+                    10,
+                ),
+                0,
+            )
+            .expect("register migration device");
+    }
+    store
+        .revoke_sync_device("library", "revoked", &identity)
+        .expect("revoke migration device");
+    store
+        .forget_sync_device("library", "forgotten", &identity)
+        .expect("forget migration device");
+    store
+        .connection
+        .execute_batch(
+            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+             DROP TABLE logical_sync_device_ack_proofs;
+             PRAGMA user_version = 13;",
+        )
+        .expect("downgrade proof schema to v13");
+    drop(store);
+
+    let migrated = PersistentStore::open(directory.path()).expect("migrate v13 proof schema");
+    assert_eq!(
+        migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read migrated schema version"),
+        14
+    );
+    let proofs = migrated
+        .connection
+        .prepare(
+            "SELECT device_id, shared_generation_id, local_generation_id
+             FROM logical_sync_device_ack_proofs
+             ORDER BY device_id",
+        )
+        .expect("prepare migrated proofs")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("query migrated proofs")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collect migrated proofs");
+    assert_eq!(
+        proofs,
+        [
+            (
+                "active".to_owned(),
+                "common-c".to_owned(),
+                "common-c".to_owned(),
+            ),
+            (
+                "revoked".to_owned(),
+                "common-c".to_owned(),
+                "common-c".to_owned(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn v13_snapshot_restore_migrates_shared_ack_proofs_before_activation() {
+    let directory = tempfile::tempdir().expect("create v13 snapshot fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open current store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let identity = seed_indexed_manifest(&store, &common);
+    store
+        .register_verified_sync_device(
+            VerifiedSyncDeviceRegistration::for_test("library", "device-a", identity, 10),
+            0,
+        )
+        .expect("register snapshot device");
+    let snapshot = store
+        .snapshot_create("v13-proof-migration")
+        .expect("create proof snapshot");
+    let snapshot_connection =
+        rusqlite::Connection::open(&snapshot.path).expect("open proof snapshot for v13 fixture");
+    snapshot_connection
+        .execute_batch(
+            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+             DROP TABLE logical_sync_device_ack_proofs;
+             PRAGMA user_version = 13;",
+        )
+        .expect("downgrade proof snapshot to v13");
+    drop(snapshot_connection);
+    store
+        .snapshot_restore_request(std::path::Path::new(&snapshot.path))
+        .expect("request v13 proof restore");
+    drop(store);
+
+    let restored = PersistentStore::open(directory.path()).expect("restore and migrate v13 proof");
+    assert_eq!(
+        restored
+            .connection
+            .query_row(
+                "SELECT local_generation_id
+                 FROM logical_sync_device_ack_proofs
+                 WHERE library_id = 'library' AND device_id = 'device-a'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read restored proof"),
+        "common-c"
+    );
+}
+
+#[test]
+fn proof_local_generation_cannot_be_pruned() {
+    let directory = tempfile::tempdir().expect("create proof prune fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let common_identity = seed_indexed_manifest(&store, &common);
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_library_head (singleton, library_id, generation_id)
+             VALUES (1, 'library', 'common-c')",
+            [],
+        )
+        .expect("seed common head");
+    store
+        .register_verified_sync_device(
+            VerifiedSyncDeviceRegistration::for_test(
+                "library",
+                "device-a",
+                common_identity.clone(),
+                10,
+            ),
+            0,
+        )
+        .expect("register prune device");
+    let shared = proof_manifest("shared-a", "3", None, 50, EMPTY_HASH, "1");
+    let local = proof_manifest("local-b", "42", None, 99, EMPTY_HASH, "1");
+    let shared_identity = SyncGenerationIdentity {
+        generation_id: shared.generation.clone(),
+        manifest_hash: hash_logical_manifest(&shared).expect("hash shared manifest"),
+        generation_sequence: shared.generation_sequence.clone(),
+    };
+    let local_identity = seed_indexed_manifest(&store, &local);
+    let proof = store
+        .verify_shared_ack_local_proof(&shared_identity, &shared, &local_identity)
+        .expect("verify prune proof");
+    store
+        .advance_sync_device_shared_ack(
+            "library",
+            "device-a",
+            &common_identity,
+            &common_identity,
+            &shared_identity,
+            proof,
+        )
+        .expect("advance prune proof");
+
+    assert!(store
+        .prune_logical_generation("library", "local-b")
+        .is_err());
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_sync_generations
+                 WHERE library_id = 'library' AND generation_id = 'local-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count retained proof generation"),
+        1
+    );
+
+    store
+        .connection
+        .execute(
+            "UPDATE logical_sync_generations
+             SET pds_generation = 'staging-logical-proof'
+             WHERE library_id = 'library' AND generation_id = 'local-b'",
+            [],
+        )
+        .expect("mark proof witness as staging-shaped");
+    drop(store);
+
+    let reopened = PersistentStore::open(directory.path()).expect("reopen proof prune fixture");
+    assert_eq!(
+        reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_sync_generations
+                 WHERE library_id = 'library' AND generation_id = 'local-b'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count proof witness after abandoned staging cleanup"),
+        1
+    );
+}
+
+#[test]
+fn tombstone_planning_fails_closed_on_missing_or_corrupt_ack_proof() {
+    let directory = tempfile::tempdir().expect("create proof tombstone fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let identity = seed_indexed_manifest(&store, &common);
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_library_head (singleton, library_id, generation_id)
+             VALUES (1, 'library', 'common-c')",
+            [],
+        )
+        .expect("seed tombstone proof head");
+    store
+        .register_verified_sync_device(
+            VerifiedSyncDeviceRegistration::for_test("library", "device-a", identity.clone(), 10),
+            0,
+        )
+        .expect("register tombstone proof device");
+    store
+        .connection
+        .execute(
+            "DELETE FROM logical_sync_device_ack_proofs
+             WHERE library_id = 'library' AND device_id = 'device-a'",
+            [],
+        )
+        .expect("remove proof row");
+    assert!(store.plan_tombstone_collection(&identity, None, 1).is_err());
+
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_sync_device_ack_proofs (
+                library_id, device_id,
+                shared_generation_id, shared_manifest_hash, shared_generation_sequence,
+                local_generation_id, local_manifest_hash, local_generation_sequence,
+                verified_at
+             ) VALUES (
+                'library', 'device-a', 'common-c', ?1, '1',
+                'missing-local', ?1, '1', 10
+             )",
+            [identity.manifest_hash.as_str()],
+        )
+        .expect("inject corrupt local proof");
+    assert!(store.plan_tombstone_collection(&identity, None, 1).is_err());
+}
+
+#[test]
+fn tombstone_planning_uses_the_proven_local_generation_sequence() {
+    let directory = tempfile::tempdir().expect("create local proof tombstone fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let common_identity = seed_indexed_manifest(&store, &common);
+    store
+        .register_verified_sync_device(
+            VerifiedSyncDeviceRegistration::for_test(
+                "library",
+                "device-a",
+                common_identity.clone(),
+                10,
+            ),
+            0,
+        )
+        .expect("register tombstone device");
+
+    let shared = proof_manifest("shared-a", "100", None, 50, EMPTY_HASH, "1");
+    let local = proof_manifest("local-b", "2", None, 99, EMPTY_HASH, "1");
+    let shared_identity = SyncGenerationIdentity {
+        generation_id: shared.generation.clone(),
+        manifest_hash: hash_logical_manifest(&shared).expect("hash shared manifest"),
+        generation_sequence: shared.generation_sequence.clone(),
+    };
+    let local_identity = seed_indexed_manifest(&store, &local);
+    let proof = store
+        .verify_shared_ack_local_proof(&shared_identity, &shared, &local_identity)
+        .expect("verify local tombstone proof");
+    store
+        .advance_sync_device_shared_ack(
+            "library",
+            "device-a",
+            &common_identity,
+            &common_identity,
+            &shared_identity,
+            proof,
+        )
+        .expect("advance shared tombstone ACK");
+
+    let active = proof_manifest("active-d", "3", Some("local-b"), 100, EMPTY_HASH, "3");
+    let active_identity = seed_indexed_manifest(&store, &active);
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_library_head (singleton, library_id, generation_id)
+             VALUES (1, 'library', 'active-d')",
+            [],
+        )
+        .expect("seed active tombstone head");
+
+    let page = store
+        .plan_tombstone_collection(&active_identity, None, 1)
+        .expect("plan using local proof sequence");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].blocking_device_ids, ["device-a"]);
 }
 
 #[test]
@@ -394,7 +1047,9 @@ fn schema_v12_common_bases_migrate_to_revoked_exact_audit_rows() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX logical_sync_devices_status;
+            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+             DROP TABLE logical_sync_device_ack_proofs;
+             DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
              PRAGMA user_version = 12;",
         )
@@ -434,7 +1089,9 @@ fn invalid_v12_common_base_rolls_back_the_entire_v13_migration() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX logical_sync_devices_status;
+            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+             DROP TABLE logical_sync_device_ack_proofs;
+             DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
              PRAGMA user_version = 12;",
         )
@@ -489,6 +1146,8 @@ fn invalid_v12_common_base_hash_sequence_and_timestamp_each_roll_back_v13() {
                 "PRAGMA ignore_check_constraints = ON;
                  {corruption};
                  PRAGMA ignore_check_constraints = OFF;
+                 DROP INDEX logical_sync_device_ack_proofs_local_generation;
+                 DROP TABLE logical_sync_device_ack_proofs;
                  DROP INDEX logical_sync_devices_status;
                  DROP TABLE logical_sync_devices;
                  PRAGMA user_version = 12;"
@@ -510,7 +1169,7 @@ fn invalid_v12_common_base_hash_sequence_and_timestamp_each_roll_back_v13() {
 }
 
 #[test]
-fn v13_reopen_rejects_changed_table_constraints_and_index_definition() {
+fn v14_reopen_rejects_changed_table_constraints_and_index_definition() {
     let table_directory = tempfile::tempdir().expect("create table corruption fixture");
     let table_store = PersistentStore::open(table_directory.path()).expect("open current store");
     table_store
@@ -574,7 +1233,9 @@ fn v12_snapshot_restore_migrates_common_base_to_revoked_device() {
         rusqlite::Connection::open(&snapshot.path).expect("open snapshot candidate");
     snapshot_connection
         .execute_batch(
-            "DROP INDEX logical_sync_devices_status;
+            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+             DROP TABLE logical_sync_device_ack_proofs;
+             DROP INDEX logical_sync_devices_status;
              DROP TABLE logical_sync_devices;
              PRAGMA user_version = 12;",
         )

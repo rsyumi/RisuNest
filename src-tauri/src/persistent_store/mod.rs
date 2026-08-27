@@ -31,7 +31,8 @@ pub(crate) use snapshot::RevisionReadLease;
 #[allow(unused_imports)]
 pub(crate) use sync_device_registry::{
     RegisteredSyncDevice, RegisteredSyncDeviceStatus, SyncGenerationIdentity,
-    TombstoneCollectionItem, TombstoneCollectionPage, VerifiedSyncDeviceRegistration,
+    TombstoneCollectionItem, TombstoneCollectionPage, VerifiedSharedAckLocalProof,
+    VerifiedSyncDeviceRegistration,
 };
 
 use rusqlite::{params, Connection, OptionalExtension};

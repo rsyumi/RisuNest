@@ -283,6 +283,11 @@ pub(super) fn cleanup_abandoned_logical_staging(connection: &mut Connection) -> 
                    SELECT 1 FROM logical_generation_session_pins AS pin
                    WHERE pin.library_id = generation.library_id
                      AND pin.generation_id = generation.generation_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM logical_sync_device_ack_proofs AS proof
+                   WHERE proof.library_id = generation.library_id
+                     AND proof.local_generation_id = generation.generation_id
                )",
         )?;
         let rows = statement
@@ -655,6 +660,17 @@ impl PersistentStore {
         )?;
         if is_head {
             return validation("logical library head cannot be pruned");
+        }
+        let acknowledgement_proof: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM logical_sync_device_ack_proofs
+                WHERE library_id = ?1 AND local_generation_id = ?2
+             )",
+            params![library_id, generation_id],
+            |row| row.get(0),
+        )?;
+        if acknowledgement_proof {
+            return validation("sync acknowledgement proof generation cannot be pruned");
         }
         let session_pinned: bool = transaction.query_row(
             "SELECT EXISTS(

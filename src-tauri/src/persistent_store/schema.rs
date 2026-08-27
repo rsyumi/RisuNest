@@ -2,7 +2,7 @@ use super::{logical_schema, StoreError, StoreResult};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 13;
+pub(super) const SCHEMA_VERSION: u32 = 14;
 
 const SYNC_DEVICE_TABLE_SQL: &str = r#"
 CREATE TABLE logical_sync_devices (
@@ -53,6 +53,46 @@ CREATE INDEX logical_sync_devices_status
     ON logical_sync_devices (library_id, status, device_id)
 "#;
 
+const SYNC_DEVICE_ACK_PROOF_TABLE_SQL: &str = r#"
+CREATE TABLE logical_sync_device_ack_proofs (
+    library_id TEXT NOT NULL CHECK (length(library_id) > 0),
+    device_id TEXT NOT NULL CHECK (length(device_id) BETWEEN 1 AND 1024),
+    shared_generation_id TEXT NOT NULL CHECK (length(shared_generation_id) > 0),
+    shared_manifest_hash TEXT NOT NULL CHECK (
+        length(shared_manifest_hash) = 64
+        AND shared_manifest_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    shared_generation_sequence TEXT NOT NULL CHECK (
+        length(shared_generation_sequence) BETWEEN 1 AND 64
+        AND shared_generation_sequence NOT GLOB '*[^0-9]*'
+        AND (
+            shared_generation_sequence = '0'
+            OR substr(shared_generation_sequence, 1, 1) != '0'
+        )
+    ),
+    local_generation_id TEXT NOT NULL CHECK (length(local_generation_id) > 0),
+    local_manifest_hash TEXT NOT NULL CHECK (
+        length(local_manifest_hash) = 64
+        AND local_manifest_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    local_generation_sequence TEXT NOT NULL CHECK (
+        length(local_generation_sequence) BETWEEN 1 AND 64
+        AND local_generation_sequence NOT GLOB '*[^0-9]*'
+        AND (
+            local_generation_sequence = '0'
+            OR substr(local_generation_sequence, 1, 1) != '0'
+        )
+    ),
+    verified_at INTEGER NOT NULL CHECK (verified_at >= 0),
+    PRIMARY KEY (library_id, device_id)
+)
+"#;
+
+const SYNC_DEVICE_ACK_PROOF_INDEX_SQL: &str = r#"
+CREATE INDEX logical_sync_device_ack_proofs_local_generation
+    ON logical_sync_device_ack_proofs (library_id, local_generation_id)
+"#;
+
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
         "
@@ -81,10 +121,15 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
         10 => {}
         11 => {
             migrate_v11_to_v12(connection)?;
-            return migrate_v12_to_v13(connection);
+            migrate_v12_to_v13(connection)?;
+            return migrate_v13_to_v14(connection);
         }
-        12 => return migrate_v12_to_v13(connection),
-        SCHEMA_VERSION => return validate_v13_schema(connection),
+        12 => {
+            migrate_v12_to_v13(connection)?;
+            return migrate_v13_to_v14(connection);
+        }
+        13 => return migrate_v13_to_v14(connection),
+        SCHEMA_VERSION => return validate_v14_schema(connection),
         _ => {
             return Err(StoreError::Store {
                 message: format!("unsupported persistent schema version {version}"),
@@ -93,7 +138,8 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     }
     migrate_v10_to_v11(connection)?;
     migrate_v11_to_v12(connection)?;
-    migrate_v12_to_v13(connection)
+    migrate_v12_to_v13(connection)?;
+    migrate_v13_to_v14(connection)
 }
 
 fn create_v10(connection: &mut Connection) -> StoreResult<()> {
@@ -355,6 +401,73 @@ fn migrate_v12_to_v13(connection: &mut Connection) -> StoreResult<()> {
         ",
     )?;
     validate_v13_schema(&transaction)?;
+    transaction.pragma_update(None, "user_version", 13)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v13_to_v14(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_v13_schema(&transaction)?;
+    let invalid_count: i64 = transaction.query_row(
+        "SELECT (
+         SELECT COUNT(*)
+         FROM logical_sync_devices AS device
+         LEFT JOIN logical_peer_common_bases AS common_base
+           ON common_base.library_id = device.library_id
+          AND common_base.peer_id = device.device_id
+         LEFT JOIN logical_sync_generations AS generation
+           ON generation.library_id = device.library_id
+          AND generation.generation_id = device.acknowledged_generation_id
+          AND generation.manifest_hash = device.acknowledged_manifest_hash
+          AND generation.generation_sequence = device.acknowledged_generation_sequence
+          AND generation.state = 'complete'
+          AND generation.completed_at IS NOT NULL
+         WHERE (
+            device.status != 'forgotten'
+            AND (
+                common_base.peer_id IS NULL
+                OR common_base.generation_id != device.acknowledged_generation_id
+                OR common_base.manifest_hash != device.acknowledged_manifest_hash
+                OR common_base.generation_sequence != device.acknowledged_generation_sequence
+                OR generation.generation_id IS NULL
+            )
+         ) OR (
+            device.status = 'forgotten' AND common_base.peer_id IS NOT NULL
+         )) + (
+         SELECT COUNT(*)
+         FROM logical_peer_common_bases AS common_base
+         LEFT JOIN logical_sync_devices AS device
+           ON device.library_id = common_base.library_id
+          AND device.device_id = common_base.peer_id
+         WHERE device.device_id IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_count != 0 {
+        return Err(StoreError::Validation {
+            message: "v13 sync device registry cannot be proven locally".to_owned(),
+        });
+    }
+    transaction.execute_batch(SYNC_DEVICE_ACK_PROOF_TABLE_SQL)?;
+    transaction.execute_batch(SYNC_DEVICE_ACK_PROOF_INDEX_SQL)?;
+    transaction.execute_batch(
+        "INSERT INTO logical_sync_device_ack_proofs (
+            library_id, device_id,
+            shared_generation_id, shared_manifest_hash, shared_generation_sequence,
+            local_generation_id, local_manifest_hash, local_generation_sequence,
+            verified_at
+         )
+         SELECT library_id, device_id,
+                acknowledged_generation_id, acknowledged_manifest_hash,
+                acknowledged_generation_sequence,
+                acknowledged_generation_id, acknowledged_manifest_hash,
+                acknowledged_generation_sequence, acknowledged_at
+         FROM logical_sync_devices
+         WHERE status != 'forgotten';",
+    )?;
+    validate_v14_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -389,6 +502,42 @@ fn validate_v13_schema(connection: &Connection) -> StoreResult<()> {
     {
         return Err(StoreError::Validation {
             message: "sync device registry status index definition is invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_v14_schema(connection: &Connection) -> StoreResult<()> {
+    validate_v13_schema(connection)?;
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'logical_sync_device_ack_proofs'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(SYNC_DEVICE_ACK_PROOF_TABLE_SQL))
+    {
+        return Err(StoreError::Validation {
+            message: "sync device acknowledgement proof table definition is invalid".to_owned(),
+        });
+    }
+    let index_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'logical_sync_device_ack_proofs_local_generation'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(SYNC_DEVICE_ACK_PROOF_INDEX_SQL))
+    {
+        return Err(StoreError::Validation {
+            message: "sync device acknowledgement proof index definition is invalid".to_owned(),
         });
     }
     Ok(())
