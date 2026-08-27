@@ -297,6 +297,62 @@ describe('Chat frozen capture presentation', () => {
         expect(target.querySelector('.border-amber-500')).not.toBeNull()
     })
 
+    test('uses the mounted viewport row for live presentation without recapturing its array index', async () => {
+        const timestamp = Date.UTC(2024, 5, 6, 7, 8, 9)
+        const message = {
+            role: 'char' as const,
+            data: 'Viewport body',
+            chatId: 'viewport-message',
+            time: timestamp,
+        }
+        const indexReads = vi.fn(() => {
+            throw new Error('live message index was recaptured')
+        })
+        const messages = new Proxy([] as typeof message[], {
+            get(target, property, receiver) {
+                if (property === '3') return indexReads()
+                return Reflect.get(target, property, receiver)
+            },
+        })
+        live.db = {
+            ...live.db,
+            theme: 'mobilechat',
+            characters: [{
+                type: 'character',
+                name: 'Live Character',
+                chaId: 'live-character',
+                chatPage: 0,
+                chats: [{ id: 'live-chat', message: messages, bookmarks: [] }],
+                ttsMode: 'none',
+            }],
+        }
+
+        mounted = mount(Chat, {
+            target,
+            props: {
+                message: message.data,
+                name: 'Live Character',
+                role: 'char',
+                idx: 3,
+                totalLength: 10,
+                isLastMemory: false,
+                viewportRow: {
+                    key: 'viewport-key' as any,
+                    absoluteIndex: 3,
+                    message,
+                    sourceVersion: 1,
+                },
+                captureViewportTarget: () => null,
+                bookmarked: false,
+            },
+        })
+
+        await vi.waitFor(() => expect(target.querySelector('[data-chat-body-probe]')?.textContent).toBe('Viewport body'))
+        expect(target.querySelector('[data-chat-id="viewport-message"]')).not.toBeNull()
+        expect(target.querySelector('.text-xs')?.textContent?.trim()).not.toBe('')
+        expect(indexReads).not.toHaveBeenCalled()
+    })
+
     test('renders each frozen group turn with the same names as the normal Chat presentation', async () => {
         const memberA = { ...context().parserContext.character, name: 'Member A', chaId: 'member-a' }
         const memberB = { ...context().parserContext.character, name: 'Member B', chaId: 'member-b' }

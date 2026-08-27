@@ -3,6 +3,9 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { mount, tick, unmount } from 'svelte'
 import type { character, Message } from 'src/ts/storage/database.svelte'
+import { ActiveConversationSession } from 'src/ts/storage/activeConversationSession'
+import { SynchronousSessionConversationViewportSource } from 'src/ts/conversationViewportSource'
+import type { ConversationViewportSource } from 'src/ts/conversationViewportSource'
 
 const imageMocks = vi.hoisted(() => ({
     mode: 'normal',
@@ -83,7 +86,7 @@ vi.mock('src/ts/stores.svelte', async () => {
 vi.mock('./Chat.svelte', async () => ({ default: (await import('./ChatMountProbe.test.svelte')).default }))
 vi.mock('./CreatorQuote.svelte', async () => ({ default: (await import('./ChatMountProbe.test.svelte')).default }))
 
-import { ReloadGUIPointer } from 'src/ts/stores.svelte'
+import { DBState, ReloadGUIPointer } from 'src/ts/stores.svelte'
 import { setRuntimePerformanceProfile } from 'src/ts/runtimePerformanceProfile'
 import ChatsHarness from './ChatsHarness.test.svelte'
 import { chatMountProbe, resetChatMountProbe } from './chatMountProbe'
@@ -99,6 +102,9 @@ interface HarnessInstance {
     switchCharacter(character: character, messages: Message[]): void
     jumpTo(index: number, options?: { align?: 'start' | 'center'; highlight?: boolean }): Promise<boolean>
     jumpToLatestMessage(): Promise<void>
+    setViewportSource(source: ConversationViewportSource | null): void
+    hasUnreadMessage(): boolean
+    getCurrentCharacter(): character
 }
 
 function makeMessage(index: number, overrides: Partial<Message> = {}): Message {
@@ -134,6 +140,23 @@ function makeCharacter(messages: Message[], isStreaming = false): character {
     } as unknown as character
 }
 
+function makeViewportSource(currentCharacter: character) {
+    const conversation = currentCharacter.chats[currentCharacter.chatPage]
+    const session = new ActiveConversationSession({
+        characterId: currentCharacter.chaId,
+        conversationId: conversation.id!,
+        conversation,
+        storeRevision: 1,
+        maxResidentBytes: 1_024,
+        measureMessage: () => 1,
+    })
+    const source = new SynchronousSessionConversationViewportSource({
+        session,
+        captureCurrent: () => ({ character: currentCharacter, conversation }),
+    })
+    return { session, source }
+}
+
 function probeElements(target: HTMLElement): HTMLElement[] {
     return [...target.querySelectorAll<HTMLElement>('[data-chat-probe]')]
         .filter((element) => element.dataset.index !== '-1')
@@ -159,6 +182,8 @@ describe('Chats imperative mount lifecycle', () => {
         imageMocks.staleReject = undefined
         imageMocks.pendingResolve = undefined
         imageMocks.getCharImage.mockClear()
+        DBState.db.autoScrollToNewMessage = false
+        DBState.db.alwaysScrollToNewMessage = false
         setRuntimePerformanceProfile('normal')
         TestResizeObserver.instances = []
         vi.stubGlobal('ResizeObserver', TestResizeObserver)
@@ -414,6 +439,223 @@ describe('Chats imperative mount lifecycle', () => {
         }
 
         expect(chatMountProbe.mounts.length - chatMountProbe.unmounts.length).toBeLessThanOrEqual(65)
+    })
+
+    test('renders absolute session rows and mirrors UI pin lifetimes through the viewport source', async () => {
+        const messages = Array.from({ length: 200 }, (_, index) => makeMessage(index))
+        messages.at(-1)!.role = 'char'
+        const currentCharacter = makeCharacter(messages, true)
+        const { session, source } = makeViewportSource(currentCharacter)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+            },
+        })
+
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(64))
+        expect(source.snapshot().rowAt(199)?.message.data).toBe('message-199')
+        expect(source.snapshot().rowAt(0)).toBeUndefined()
+        expect(session.pinCount('viewport')).toBeGreaterThan(0)
+        expect(session.pinCount('streaming')).toBe(1)
+        await expect((mounted as HarnessInstance).jumpTo(0)).resolves.toBe(true)
+        expect(source.snapshot().rowAt(0)?.message.data).toBe('message-0')
+
+        const oldest = probeElements(target).find(
+            (element) => element.dataset.message === 'message-0',
+        )!
+        const editor = document.createElement('textarea')
+        oldest.append(editor)
+        editor.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+        expect(session.pinCount('editor')).toBe(1)
+
+        const media = document.createElement('audio')
+        oldest.append(media)
+        media.dispatchEvent(new Event('play'))
+        expect(session.pinCount('playing-media')).toBe(1)
+
+        editor.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+        media.dispatchEvent(new Event('pause'))
+        await vi.waitFor(() => expect(session.pinCount('editor')).toBe(0))
+        expect(session.pinCount('playing-media')).toBe(0)
+
+        await unmount(mounted)
+        mounted = undefined
+        expect(session.pinCount('viewport')).toBe(0)
+        expect(session.pinCount('streaming')).toBe(0)
+    })
+
+    test('refreshes mounted bookmark presentation after a source metadata mutation', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: makeCharacter(messages),
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+        const currentCharacter = (mounted as HarnessInstance).getCurrentCharacter()
+        const { session, source } = makeViewportSource(currentCharacter)
+        ;(mounted as HarnessInstance).setViewportSource(source)
+        await vi.waitFor(() => expect(
+            probeElements(target).find(
+                (element) => element.dataset.message === 'message-7',
+            )?.dataset.bookmarked,
+        ).toBe('false'))
+
+        session.setBookmark(session.locate(7), {
+            bookmarked: true,
+            messageId: 'message-id-7',
+            name: 'Newest',
+        })
+
+        await vi.waitFor(() => expect(
+            chatMountProbe.mounts.filter((entry) => entry.message === 'message-7').at(-1)?.bookmarked,
+        ).toBe(true))
+        expect(probeElements(target).find(
+            (element) => element.dataset.message === 'message-7',
+        )?.dataset.bookmarked).toBe('true')
+    })
+
+    test('keeps the source-key wrapper when an insertion shifts its absolute index', async () => {
+        const messages = Array.from({ length: 100 }, (_, index) => makeMessage(index))
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: source,
+            },
+        })
+
+        await vi.waitFor(() => expect(
+            probeElements(target).some((element) => element.dataset.message === 'message-90'),
+        ).toBe(true))
+        const before = probeElements(target)
+            .find((element) => element.dataset.message === 'message-90')!
+            .closest<HTMLElement>('[data-chat-render-key]')
+        expect(before).not.toBeNull()
+
+        session.replaceRange(session.positionAt(0), 0, [makeMessage(-1)])
+
+        await vi.waitFor(() => {
+            const shifted = probeElements(target)
+                .find((element) => element.dataset.message === 'message-90')
+            expect(shifted?.dataset.index).toBe('91')
+            expect(shifted?.closest('[data-chat-render-key]')).toBe(before)
+        })
+    })
+
+    test('preserves the prior tail bottom state while a source append row is loading', async () => {
+        const messages = Array.from({ length: 8 }, (_, index) => makeMessage(index))
+        messages.at(-1)!.role = 'char'
+        const currentCharacter = makeCharacter(messages)
+        const { session, source } = makeViewportSource(currentCharacter)
+        let blockLoads = false
+        let releaseLoads!: () => void
+        const loadBarrier = new Promise<void>((resolve) => {
+            releaseLoads = resolve
+        })
+        const delayedSource: ConversationViewportSource = {
+            snapshot: () => source.snapshot(),
+            ensureRange: async (request) => {
+                if (blockLoads) await loadBarrier
+                if (!request.signal?.aborted) await source.ensureRange(request)
+            },
+            acquireRangePin: (...args) => source.acquireRangePin(...args),
+            subscribe: (listener) => source.subscribe(listener),
+            captureMessageTarget: (key) => source.captureMessageTarget(key),
+            dispose: () => source.dispose(),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: messages,
+                initialCharacter: currentCharacter,
+                initialViewportSource: delayedSource,
+            },
+        })
+        await vi.waitFor(() => expect(probeElements(target)).toHaveLength(8))
+
+        const scrollParent = target.querySelector<HTMLElement>('.scroll-parent')!
+        scrollParent.getBoundingClientRect = () => ({
+            top: 0,
+            bottom: 500,
+            height: 500,
+        } as DOMRect)
+        const oldTail = probeElements(target)
+            .find((element) => element.dataset.message === 'message-7')!
+            .closest<HTMLElement>('[data-chat-render-key]')!
+        oldTail.getBoundingClientRect = () => ({
+            top: 450,
+            bottom: 500,
+            height: 50,
+        } as DOMRect)
+        DBState.db.autoScrollToNewMessage = true
+        blockLoads = true
+
+        session.append(makeMessage(8, { role: 'char' }))
+        await tick()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+
+        expect((mounted as HarnessInstance).hasUnreadMessage()).toBe(false)
+        releaseLoads()
+    })
+
+    test('aborts pending source loads and renders only the replacement source', async () => {
+        const firstMessages = Array.from({ length: 100 }, (_, index) => makeMessage(index))
+        const firstCharacter = makeCharacter(firstMessages)
+        const { source: firstSource } = makeViewportSource(firstCharacter)
+        const pendingSignals: AbortSignal[] = []
+        let releaseLoads!: () => void
+        const loadBarrier = new Promise<void>((resolve) => {
+            releaseLoads = resolve
+        })
+        const delayedSource: ConversationViewportSource = {
+            snapshot: () => firstSource.snapshot(),
+            ensureRange: async (request) => {
+                if (request.signal) pendingSignals.push(request.signal)
+                await loadBarrier
+                if (!request.signal?.aborted) await firstSource.ensureRange(request)
+            },
+            acquireRangePin: (...args) => firstSource.acquireRangePin(...args),
+            subscribe: (listener) => firstSource.subscribe(listener),
+            captureMessageTarget: (key) => firstSource.captureMessageTarget(key),
+            dispose: () => firstSource.dispose(),
+        }
+        mounted = mount(ChatsHarness, {
+            target,
+            props: {
+                initialMessages: firstMessages,
+                initialCharacter: firstCharacter,
+                initialViewportSource: delayedSource,
+            },
+        })
+        await vi.waitFor(() => expect(pendingSignals.length).toBeGreaterThan(0))
+
+        const replacementMessages = Array.from(
+            { length: 8 },
+            (_, index) => makeMessage(index, { data: `replacement-${index}` }),
+        )
+        const replacementCharacter = makeCharacter(replacementMessages)
+        replacementCharacter.chaId = 'replacement-character'
+        replacementCharacter.chats[0].id = 'replacement-chat'
+        const { source: replacementSource } = makeViewportSource(replacementCharacter)
+        ;(mounted as HarnessInstance).switchCharacter(replacementCharacter, replacementMessages)
+        ;(mounted as HarnessInstance).setViewportSource(replacementSource)
+        await tick()
+
+        expect(pendingSignals.every((signal) => signal.aborted)).toBe(true)
+        releaseLoads()
+        await vi.waitFor(() => expect(
+            probeElements(target).map((element) => element.dataset.message),
+        ).toContain('replacement-7'))
+        expect(target.textContent).not.toContain('message-99')
     })
 
     test('bounds retained height corrections while visiting a long conversation', async () => {

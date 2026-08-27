@@ -1,9 +1,13 @@
 import {
     requireCurrentConversationSession,
     type ActiveConversationSession,
-    type MessageLocator,
 } from './storage/activeConversationSession'
-import type { Chat, Database, Message } from './storage/database.svelte'
+import type { Chat, Database } from './storage/database.svelte'
+import {
+    captureChatMessageTarget,
+    resolveChatMessageTarget,
+    type CapturedChatMessageTarget,
+} from './chatMessageUi'
 
 export interface CurrentChatRemovalTarget {
     character: Database['characters'][number]
@@ -12,6 +16,7 @@ export interface CurrentChatRemovalTarget {
 
 export interface RemoveChatMessageOptions {
     absoluteIndex: number
+    captureTarget?: () => CapturedChatMessageTarget | null
     shiftKey: boolean
     recursive: boolean
     askRemoval: boolean
@@ -22,25 +27,15 @@ export interface RemoveChatMessageOptions {
     confirmInstantRemoval(): Promise<boolean>
 }
 
-interface CapturedChatRemovalTarget extends CurrentChatRemovalTarget {
-    messages: Message[]
-    message: Message
-    session: ActiveConversationSession | null
-    locator: MessageLocator | null
-}
-
 export async function removeChatMessage(options: RemoveChatMessageOptions): Promise<boolean> {
-    const current = options.captureCurrent()
-    const message = current?.conversation.message[options.absoluteIndex]
-    if (!current || !message) return false
-    const session = options.getCurrentSession()
-    const target: CapturedChatRemovalTarget = {
-        ...current,
-        messages: current.conversation.message,
-        message,
-        session,
-        locator: session?.locate(options.absoluteIndex) ?? null,
-    }
+    const target = options.captureTarget
+        ? options.captureTarget()
+        : captureChatMessageTarget({
+            absoluteIndex: options.absoluteIndex,
+            captureCurrent: options.captureCurrent,
+            getCurrentSession: options.getCurrentSession,
+        })
+    if (!target) return false
 
     if (options.shiftKey) return mutateCapturedTarget(options, target, 'truncate')
 
@@ -61,40 +56,34 @@ export async function removeChatMessage(options: RemoveChatMessageOptions): Prom
 
 function isCurrentTarget(
     options: RemoveChatMessageOptions,
-    target: CapturedChatRemovalTarget,
+    target: CapturedChatMessageTarget,
 ): boolean {
-    const current = options.captureCurrent()
-    return (
-        current?.character === target.character &&
-        current.conversation === target.conversation &&
-        current.conversation.message === target.messages &&
-        current.conversation.message[options.absoluteIndex] === target.message &&
-        options.getCurrentSession() === target.session
-    )
+    return resolveChatMessageTarget(target, options) !== null
 }
 
 function mutateCapturedTarget(
     options: RemoveChatMessageOptions,
-    target: CapturedChatRemovalTarget,
+    target: CapturedChatMessageTarget,
     mutation: 'delete' | 'truncate',
 ): boolean {
-    if (!isCurrentTarget(options, target)) return false
-    if (target.session && target.locator) {
+    const current = resolveChatMessageTarget(target, options)
+    if (!current) return false
+    if (current.kind === 'session') {
         const session = requireCurrentConversationSession(
-            target.session,
+            current.session,
             options.getCurrentSession(),
         )
-        if (mutation === 'delete') session.delete(target.locator)
-        else session.truncate(target.locator)
+        if (mutation === 'delete') session.delete(current.locator)
+        else session.truncate(current.locator)
         return true
     }
     if (mutation === 'delete') {
-        target.conversation.message.splice(options.absoluteIndex, 1)
-        target.conversation.message = target.conversation.message
+        current.conversation.message.splice(current.absoluteIndex, 1)
+        current.conversation.message = current.conversation.message
     } else {
-        target.conversation.message = target.conversation.message.slice(
+        current.conversation.message = current.conversation.message.slice(
             0,
-            options.absoluteIndex,
+            current.absoluteIndex,
         )
     }
     return true

@@ -304,7 +304,13 @@ describe('SynchronousSessionConversationViewportSource', () => {
             session,
         })
 
-        session.delete(session.locate(1))
+        session.replaceRange(session.positionAt(0), 0, [message('inserted', 'inserted')])
+        expect(source.captureMessageTarget(key)).toMatchObject({
+            absoluteIndex: 2,
+            message: { chatId: 'second', data: 'second' },
+        })
+
+        session.delete(session.locate(2))
         expect(source.captureMessageTarget(key)).toBeNull()
     })
 })

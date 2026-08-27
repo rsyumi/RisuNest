@@ -40,6 +40,7 @@
     } from "../../ts/chatMessageUi"
     import type { DeepReadonly, FrozenChatScreenshotRenderContext } from 'src/ts/chatScreenshotRange'
     import { safeStructuredClone } from 'src/ts/polyfill'
+    import type { ConversationViewportRow } from 'src/ts/conversationViewportSource'
 
     let translating = $state(false)
     let editMode = $state(false)
@@ -78,6 +79,9 @@
         captureContext?: FrozenChatScreenshotRenderContext;
         captureMessage?: DeepReadonly<Message>;
         captureParserIndex?: number;
+        viewportRow?: ConversationViewportRow;
+        captureViewportTarget?: () => CapturedChatMessageTarget | null;
+        bookmarked?: boolean;
     }
 
     let {
@@ -108,6 +112,9 @@
         captureContext,
         captureMessage,
         captureParserIndex = idx,
+        viewportRow,
+        captureViewportTarget,
+        bookmarked,
     }: Props = $props();
 
     let editDraft = $state(message)
@@ -119,6 +126,7 @@
     let captureZoomSize = $derived(captureSettings?.zoomSize ?? DBState.db.zoomsize)
     let captureLineHeight = $derived(captureSettings?.lineHeight ?? DBState.db.lineHeight ?? 1.25)
     let hideCaptureIcon = $derived(captureSettings?.hideIcons ?? $HideIconStore)
+    let presentedMessage = $derived(captureMessage ?? viewportRow?.message)
 
     function captureParserChara() {
         const character = captureContext?.parserContext.character
@@ -165,10 +173,8 @@
         const currentCharacter = DBState.db.characters[selIdState.selId]
         const currentChat = currentCharacter?.chats[currentCharacter.chatPage]
         const session = getActiveConversationSession()
-        return session?.isActive &&
-            session.characterId === currentCharacter?.chaId &&
-            session.conversationId === currentChat?.id &&
-            session.materializeCompatibilityArray() === currentChat.message
+        return currentCharacter && currentChat &&
+            session?.matchesConversation(currentCharacter.chaId, currentChat)
             ? session
             : null
     }
@@ -185,6 +191,7 @@
     }
 
     function captureCurrentMessage() {
+        if (captureViewportTarget) return captureViewportTarget()
         return captureChatMessageTarget({
             ...chatMessageContext,
             absoluteIndex: idx,
@@ -200,6 +207,7 @@
     async function rm(e:MouseEvent, rec?:boolean){
         await removeChatMessage({
             absoluteIndex: idx,
+            captureTarget: captureViewportTarget,
             shiftKey: e.shiftKey,
             recursive: rec ?? false,
             askRemoval: DBState.db.askRemoval ?? false,
@@ -244,7 +252,7 @@
         try{
             const cbsConditions:CbsConditions = {
                 firstmsg: firstMessage ?? false,
-                chatRole: captureMessage?.role ?? (
+                chatRole: presentedMessage?.role ?? (
                     captureContext
                         ? role
                         : DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage]?.message?.[idx]?.role ?? null
@@ -390,9 +398,11 @@
 
     let isBookmarked = $derived(captureContext
         ? captureChat?.bookmarks?.includes(captureMessage?.chatId ?? '') ?? false
-        : DBState.db.characters[selIdState.selId]
-            ?.chats[DBState.db.characters[selIdState.selId].chatPage]
-            ?.bookmarks?.includes(DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]?.chatId) ?? false
+        : bookmarked ?? (
+            DBState.db.characters[selIdState.selId]
+                ?.chats[DBState.db.characters[selIdState.selId].chatPage]
+                ?.bookmarks?.includes(DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx]?.chatId) ?? false
+        )
     );
 
     let staticCaptureSettled = false
@@ -440,7 +450,7 @@
             <button class="text-sm p-1 text-textcolor2 border-darkborderc float-end mr-2 my-1
                     hover:ring-darkbutton hover:ring-3 rounded-md hover:text-textcolor transition-all flex justify-center items-center" 
                     onclick={() => {
-                        const currentMessage = captureMessage ?? (
+                        const currentMessage = presentedMessage ?? (
                             idx >= 0
                                 ? DBState.db.characters[$selectedCharID]
                                     ?.chats[DBState.db.characters[$selectedCharID].chatPage]
@@ -1180,7 +1190,9 @@
      data-chat-index={idx}
      data-chat-id={captureContext
         ? captureMessage?.chatId ?? ''
-        : DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.chatId ?? ''}
+        : presentedMessage?.chatId
+            ?? DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.chatId
+            ?? ''}
      style={isLastMemory ? `border-top:${captureSettings?.memoryLimitThickness ?? DBState.db.memoryLimitThickness}px solid rgba(98, 114, 164, 0.7);` : ''}
      onclickcapture={handleButtonTriggerWithin}>
     <div class="text-textcolor mt-1 ml-4 mr-4 mb-1 p-2 bg-transparent grow border-t-gray-900 border-opacity/30 border-transparent flexium items-start max-w-full" >
@@ -1195,9 +1207,11 @@
                     class:rounded-tr-none={role === 'user'}
                 >
                     <p class="text-gray-800">{@render textBox()}</p>
-                    {#if captureContext
-                        ? captureMessage?.time
-                        : DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.time}
+                    {#if presentedMessage?.time ?? (
+                        captureContext
+                            ? captureMessage?.time
+                            : DBState.db.characters?.[selIdState.selId]?.chats?.[DBState.db.characters?.[selIdState.selId]?.chatPage]?.message?.[idx]?.time
+                    )}
                         <span class="text-xs text-textcolor2 mt-1 block">
                             {new Intl.DateTimeFormat(undefined, {
                                 hour: '2-digit',
@@ -1206,9 +1220,11 @@
                                 month: '2-digit',
                                 day: '2-digit',
                                 hour12: false
-                            }).format(captureContext
-                                ? captureMessage?.time
-                                : DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].time)}
+                            }).format(presentedMessage?.time ?? (
+                                captureContext
+                                    ? captureMessage?.time
+                                    : DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].time
+                            ))}
                         </span>
                     {/if}
                 </div>
@@ -1246,9 +1262,9 @@
             {@render senderIcon({rounded: captureSettings?.roundIcons ?? DBState.db.roundIcons})}
             <span class="flex flex-col ml-4 w-full max-w-full min-w-0 text-black">
                 <div class="flexium items-center chat-width">
-                    {#if (captureCharacter?.chaId ?? DBState.db.characters[selIdState.selId]?.chaId) === "§playground" && !blankMessage && (captureMessage ?? DBState.db.characters[selIdState.selId]?.chats?.[DBState.db.characters[selIdState.selId]?.chatPage]?.message?.[idx])}
+                    {#if (captureCharacter?.chaId ?? DBState.db.characters[selIdState.selId]?.chaId) === "§playground" && !blankMessage && (presentedMessage ?? DBState.db.characters[selIdState.selId]?.chats?.[DBState.db.characters[selIdState.selId]?.chatPage]?.message?.[idx])}
                         <span class="chat-width text-xl border-darkborderc flex items-center text-textcolor">
-                            <span>{(captureMessage?.role ?? DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role) === 'char' ? 'Assistant' : 'User'}</span>
+                            <span>{(presentedMessage?.role ?? DBState.db.characters[selIdState.selId].chats[DBState.db.characters[selIdState.selId].chatPage].message[idx].role) === 'char' ? 'Assistant' : 'User'}</span>
                             <button class="ml-2 text-textcolor2 hover:text-textcolor" onclick={() => {
                                 const target = captureCurrentMessage()
                                 if (!target || !toggleCapturedMessageRole(target, chatMessageContext)) return

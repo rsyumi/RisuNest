@@ -4,6 +4,7 @@ export interface ChatProbeMount {
     index: number
     image: string
     character: unknown
+    bookmarked?: boolean
 }
 
 export interface ChatProbeStreamingUpdate {

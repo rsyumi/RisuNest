@@ -27,6 +27,12 @@
         getRuntimePerformanceBudgets,
         subscribeRuntimePerformanceProfile,
     } from 'src/ts/runtimePerformanceProfile'
+    import type {
+        ConversationViewportPin as ConversationSourcePin,
+        ConversationViewportKey,
+        ConversationViewportSnapshot,
+        ConversationViewportSource,
+    } from 'src/ts/conversationViewportSource'
 
     let {
         messages,
@@ -40,6 +46,7 @@
         currentUsername,
         userIcon,
         userIconPortrait,
+        viewportSource = null,
         hasNewUnreadMessage = $bindable(false),
     }: {
         messages: Message[]
@@ -53,6 +60,7 @@
         currentUsername: string
         userIcon: string
         userIconPortrait?: boolean
+        viewportSource?: ConversationViewportSource | null
         hasNewUnreadMessage?: boolean
     } = $props()
 
@@ -81,6 +89,13 @@
     let keyLookupScans = 0
     let pinReasons = new Map<string, Set<ChatViewportPinReason>>()
     let playingMedia = new Map<string, Set<EventTarget>>()
+    let sourcePins = new Map<string, ConversationSourcePin>()
+    let sourceLoads = new Map<string, AbortController>()
+    let sourceUnsubscribe: (() => void) | null = null
+    let activeViewportSource: ConversationViewportSource | null = null
+    let sourceUpdateRevision = $state(0)
+    let lastMountedSourceTailKey: string | null = null
+    let pendingSourceWasAtBottom: boolean | null = null
     let viewportAnchor: ChatViewportAnchor | null = null
     let viewportResult: ChatViewportResult | null = null
     let identitySequence: ChatRenderIdentitySequence | null = null
@@ -156,6 +171,7 @@
             String(ownerSessionId),
             conversationId,
             String(conversationSessionId),
+            activeViewportSource?.snapshot().sourceToken ?? 'compatibility-array',
         ].map((part) => `${part.length}:${part}`).join('|')
     }
 
@@ -175,9 +191,26 @@
         return `${scope.length}:${scope}|conversation-start`
     }
 
-    function viewportKeySource(scope: string): ChatViewportKeySource {
+    function viewportKeySource(
+        scope: string,
+        sourceSnapshot: ConversationViewportSnapshot | null = currentSourceSnapshot(),
+    ): ChatViewportKeySource {
         const startOffset = hasConversationStart() ? 1 : 0
         const startKey = startOffset === 1 ? conversationStartKey(scope) : null
+        if (sourceSnapshot) {
+            return {
+                length: sourceSnapshot.totalMessages + startOffset,
+                keyAt(index) {
+                    if (startKey !== null && index === 0) return startKey
+                    return sourceSnapshot.keyAt(index - startOffset)
+                },
+                indexOf(key) {
+                    if (startKey !== null && key === startKey) return 0
+                    const index = sourceSnapshot.indexOfKey(key as ConversationViewportKey)
+                    return index < 0 ? -1 : index + startOffset
+                },
+            }
+        }
         return {
             length: messageRenderKeys.length + startOffset,
             keyAt(index) {
@@ -191,6 +224,22 @@
                 return index < 0 ? -1 : index + startOffset
             },
         }
+    }
+
+    function currentSourceSnapshot(): ConversationViewportSnapshot | null {
+        void sourceUpdateRevision
+        return activeViewportSource?.snapshot() ?? null
+    }
+
+    function currentMessageCount(snapshot = currentSourceSnapshot()): number {
+        return snapshot?.totalMessages ?? messages.length
+    }
+
+    function currentMessageKey(
+        absoluteIndex: number,
+        snapshot = currentSourceSnapshot(),
+    ): string | undefined {
+        return snapshot?.keyAt(absoluteIndex) ?? messageRenderKeys[absoluteIndex]
     }
 
     function resetViewport(scope: string): void {
@@ -214,9 +263,11 @@
         registeredLength = 0
         previousReloadPointer = null
         activeScope = scope
+        releaseSourcePins()
     }
 
     function syncIdentityRegistration(scope: string, reloadPointer: unknown): void {
+        if (activeViewportSource) return
         const needsStructuralRegistration = (
             registeredScope !== scope
             || registeredMessages !== messages
@@ -243,22 +294,185 @@
         previousReloadPointer = reloadPointer
     }
 
-    function currentPins(currentChat: character['chats'][number] | groupChat['chats'][number] | undefined): ChatViewportPin[] {
+    function currentPins(
+        currentChat: character['chats'][number] | groupChat['chats'][number] | undefined,
+        sourceSnapshot: ConversationViewportSnapshot | null,
+    ): ChatViewportPin[] {
         const pins: ChatViewportPin[] = []
         for (const [key, reasons] of pinReasons) {
             const indexHintText = mountedElements.get(key)?.dataset.chatViewportIndex
             const indexHint = indexHintText === undefined ? undefined : Number(indexHintText)
             for (const reason of reasons) pins.push({ key, reason, indexHint })
         }
-        if (currentChat?.isStreaming && messageRenderKeys.length > 0) {
+        const totalMessages = currentMessageCount(sourceSnapshot)
+        const streamingKey = totalMessages > 0
+            ? currentMessageKey(totalMessages - 1, sourceSnapshot)
+            : undefined
+        if (currentChat?.isStreaming && streamingKey !== undefined) {
             pins.push({
-                key: messageRenderKeys.at(-1)!,
+                key: streamingKey,
                 reason: 'streaming',
-                indexHint: messageRenderKeys.length - 1 + (hasConversationStart() ? 1 : 0),
+                indexHint: totalMessages - 1 + (hasConversationStart() ? 1 : 0),
             })
         }
         return pins
     }
+
+    function contiguousRanges(indices: readonly number[]): Array<[number, number]> {
+        const ranges: Array<[number, number]> = []
+        for (const index of [...new Set(indices)].sort((left, right) => left - right)) {
+            const current = ranges.at(-1)
+            if (current && current[1] === index) current[1] = index + 1
+            else ranges.push([index, index + 1])
+        }
+        return ranges
+    }
+
+    function syncSourcePins(
+        result: ChatViewportResult,
+        currentChat: character['chats'][number] | groupChat['chats'][number] | undefined,
+        sourceSnapshot: ConversationViewportSnapshot | null,
+    ): void {
+        const source = activeViewportSource
+        if (!source || !sourceSnapshot) {
+            releaseSourcePins()
+            return
+        }
+        const startOffset = hasConversationStart() ? 1 : 0
+        const desired = new Map<string, {
+            startIndex: number
+            endIndex: number
+            reason: 'viewport' | 'editor' | 'playing-media' | 'streaming'
+        }>()
+        const viewportIndices = result.rows.flatMap((row) => (
+            row.kind === 'message' && row.index >= startOffset
+                ? [row.index - startOffset]
+                : []
+        ))
+        for (const [startIndex, endIndex] of contiguousRanges(viewportIndices)) {
+            desired.set(`viewport:${startIndex}:${endIndex}`, {
+                startIndex,
+                endIndex,
+                reason: 'viewport',
+            })
+        }
+        for (const [key, reasons] of pinReasons) {
+            const absoluteIndex = sourceSnapshot.indexOfKey(key as ConversationViewportKey)
+            if (absoluteIndex < 0) continue
+            for (const reason of reasons) {
+                if (reason !== 'editor' && reason !== 'playing-media') continue
+                desired.set(`${reason}:${absoluteIndex}:${absoluteIndex + 1}`, {
+                    startIndex: absoluteIndex,
+                    endIndex: absoluteIndex + 1,
+                    reason,
+                })
+            }
+        }
+        if (currentChat?.isStreaming && sourceSnapshot.totalMessages > 0) {
+            const absoluteIndex = sourceSnapshot.totalMessages - 1
+            desired.set(`streaming:${absoluteIndex}:${absoluteIndex + 1}`, {
+                startIndex: absoluteIndex,
+                endIndex: absoluteIndex + 1,
+                reason: 'streaming',
+            })
+        }
+
+        const acquired = new Map(sourcePins)
+        try {
+            for (const [key, pin] of desired) {
+                if (acquired.has(key)) continue
+                acquired.set(key, source.acquireRangePin(
+                    pin.startIndex,
+                    pin.endIndex,
+                    pin.reason,
+                ))
+            }
+        } catch {
+            for (const [key, pin] of acquired) {
+                if (!sourcePins.has(key)) pin.release()
+            }
+            return
+        }
+        for (const [key, pin] of sourcePins) {
+            if (!desired.has(key)) pin.release()
+        }
+        sourcePins = new Map([...acquired].filter(([key]) => desired.has(key)))
+    }
+
+    function releaseSourcePins(): void {
+        for (const pin of sourcePins.values()) pin.release()
+        sourcePins.clear()
+    }
+
+    function requestMissingSourceRows(
+        result: ChatViewportResult,
+        sourceSnapshot: ConversationViewportSnapshot | null,
+    ): void {
+        const source = activeViewportSource
+        if (!source || !sourceSnapshot) return
+        const startOffset = hasConversationStart() ? 1 : 0
+        const missing = result.rows.flatMap((row) => {
+            if (row.kind !== 'message' || row.index < startOffset) return []
+            const absoluteIndex = row.index - startOffset
+            return sourceSnapshot.rowAt(absoluteIndex) ? [] : [absoluteIndex]
+        })
+        for (const [startIndex, endIndex] of contiguousRanges(missing)) {
+            const loadKey = [
+                sourceSnapshot.sourceToken,
+                sourceSnapshot.version,
+                startIndex,
+                endIndex,
+            ].join(':')
+            if (sourceLoads.has(loadKey)) continue
+            const controller = new AbortController()
+            sourceLoads.set(loadKey, controller)
+            void source.ensureRange({
+                startIndex,
+                limit: endIndex - startIndex,
+                reason: 'viewport',
+                signal: controller.signal,
+            }).catch(() => undefined).finally(() => {
+                if (sourceLoads.get(loadKey) === controller) sourceLoads.delete(loadKey)
+            })
+        }
+    }
+
+    function abortSourceLoads(): void {
+        for (const controller of sourceLoads.values()) controller.abort()
+        sourceLoads.clear()
+    }
+
+    function activateViewportSource(source: ConversationViewportSource | null): void {
+        if (source === activeViewportSource) return
+        navigationGeneration += 1
+        abortSourceLoads()
+        releaseSourcePins()
+        sourceUnsubscribe?.()
+        sourceUnsubscribe = null
+        activeViewportSource = source
+        sourceUpdateRevision += 1
+        lastMountedSourceTailKey = null
+        pendingSourceWasAtBottom = null
+        activeScope = null
+        if (source) {
+            sourceUnsubscribe = source.subscribe(() => {
+                if (source !== activeViewportSource || !chatBody) return
+                if (lastMountedSourceTailKey !== null) {
+                    pendingSourceWasAtBottom = (
+                        pendingSourceWasAtBottom === true ||
+                        isMountedKeyAtBottom(lastMountedSourceTailKey)
+                    )
+                }
+                sourceUpdateRevision += 1
+                reconcileViewport()
+            })
+        }
+        if (chatBody) reconcileViewport()
+    }
+
+    $effect.pre(() => {
+        activateViewportSource(viewportSource)
+    })
 
     function captureDomAnchor(): ChatViewportAnchor | null {
         if (!scrollContainer) return viewportAnchor
@@ -305,8 +519,9 @@
         const scope = currentChatScope()
         if (activeScope !== scope) resetViewport(scope)
         const reloadPointerMap = get(ReloadChatPointer)
+        const sourceSnapshot = currentSourceSnapshot()
         syncIdentityRegistration(scope, reloadPointerMap)
-        const keySource = viewportKeySource(scope)
+        const keySource = viewportKeySource(scope, sourceSnapshot)
         const preservedAnchor = options.anchor !== undefined
             ? options.anchor
             : options.preserveAnchor === false ? viewportAnchor : captureDomAnchor()
@@ -320,11 +535,13 @@
             measuredHeightsByIndex: measuredHeightIndices,
             anchor: preservedAnchor,
             jumpTarget: options.jumpTarget,
-            pins: currentPins(currentChat),
+            pins: currentPins(currentChat, sourceSnapshot),
         })
         viewportAnchor = result.anchor
         viewportResult = result
-        renderViewportRows(scope, result, currentChat, reloadPointerMap)
+        syncSourcePins(result, currentChat, sourceSnapshot)
+        requestMissingSourceRows(result, sourceSnapshot)
+        renderViewportRows(scope, result, currentChat, reloadPointerMap, sourceSnapshot)
         chatBody.dataset.chatPinOverflow = String(result.pinOverflow?.count ?? 0)
         chatBody.dataset.chatMeasuredHeightCount = String(measuredHeights.size)
         chatBody.dataset.chatKeyLookupScans = String(keyLookupScans)
@@ -338,6 +555,7 @@
         result: ChatViewportResult,
         currentChat: character['chats'][number] | groupChat['chats'][number] | undefined,
         reloadPointerMap: Record<number, number>,
+        sourceSnapshot: ConversationViewportSnapshot | null,
     ): void {
         const currentRenderKeys = new Set<string>()
         const orderedElements: HTMLElement[] = []
@@ -345,8 +563,9 @@
         const performanceMode = currentChat?.isStreaming
             ? currentChat.activeStreamingDisplayOptimizationMode ?? configuredPerformanceMode
             : configuredPerformanceMode
+        const totalMessages = currentMessageCount(sourceSnapshot)
         const activeStreamingIndex = performanceMode !== 'off' && currentChat?.isStreaming
-            ? messages.length - 1
+            ? totalMessages - 1
             : -1
         const globalReloadPointer = get(ReloadGUIPointer)
         const startOffset = hasConversationStart() ? 1 : 0
@@ -376,9 +595,19 @@
             }
 
             const index = row.index - startOffset
-            const message = messages[index]
+            const viewportRow = sourceSnapshot?.rowAt(index)
+            const message = (viewportRow?.message ?? (
+                sourceSnapshot ? undefined : messages[index]
+            )) as Message | undefined
             const key = row.key
-            if (!message) continue
+            if (!message) {
+                const retainedElement = mountedElements.get(key)
+                if (retainedElement) {
+                    currentRenderKeys.add(key)
+                    orderedElements.push(retainedElement)
+                }
+                continue
+            }
             const element = ensureElement(key, row.index)
             element.dataset.chatIndex = String(index)
             currentRenderKeys.add(key)
@@ -386,14 +615,16 @@
                 ? (userIconPortrait ?? false)
                 : ((currentCharacter as character).largePortrait ?? false)
             const activeStreamingMessage = index === activeStreamingIndex && message.role === 'char'
+            const bookmarked = currentChat?.bookmarks?.includes(message.chatId ?? '') ?? false
             const renderSignature = createChatRenderSignature({
                 message,
                 index,
-                totalLength: messages.length,
+                totalLength: totalMessages,
                 largePortrait: messageLargePortrait,
                 reloadPointer: reloadPointerMap[index] ?? 0,
                 globalReloadPointer,
                 activeStreamingMessage,
+                bookmarked,
                 resolvedImage: message.role === 'user' ? resolvedUserImage : resolvedCharacterImage,
                 displayName: message.role === 'user' ? currentUsername : currentCharacter.name,
                 parserCharacter,
@@ -401,6 +632,7 @@
             })
             const previousSignature = renderSignatures.get(key)
             if (!areChatRenderSignaturesEqual(previousSignature, renderSignature)) {
+                const source = activeViewportSource
                 releaseRowRuntimeState(key)
                 unmountInstance(key)
                 element.replaceChildren()
@@ -408,9 +640,14 @@
                     target: element,
                     props: {
                         message: message.data,
+                        viewportRow,
+                        captureViewportTarget: viewportRow && source
+                            ? () => source.captureMessageTarget(viewportRow.key)
+                            : undefined,
+                        bookmarked,
                         isLastMemory: false,
                         idx: index,
-                        totalLength: messages.length,
+                        totalLength: totalMessages,
                         img: (message.role === 'user' ? resolvedUserImage : resolvedCharacterImage) ?? '',
                         onReroll,
                         unReroll,
@@ -436,7 +673,7 @@
                     rawStreamingText: message.data,
                 })
             }
-            const latest = index === messages.length - 1
+            const latest = index === totalMessages - 1
             element.classList.toggle('is-latest-chat-row', latest)
             element.classList.toggle(
                 'is-settled-history',
@@ -447,6 +684,17 @@
 
         for (const key of renderKeys) {
             if (!currentRenderKeys.has(key)) removeMountedRow(key)
+        }
+        if (sourceSnapshot && totalMessages > 0) {
+            const tailIndex = totalMessages - 1
+            const tailKey = sourceSnapshot.keyAt(tailIndex)
+            if (
+                tailKey !== undefined &&
+                sourceSnapshot.rowAt(tailIndex) !== undefined &&
+                mountedElements.has(tailKey)
+            ) lastMountedSourceTailKey = tailKey
+        } else if (!sourceSnapshot) {
+            lastMountedSourceTailKey = null
         }
         reconcileChatBodyChildren(orderedElements)
         renderKeys = currentRenderKeys
@@ -743,11 +991,20 @@
         reconcileViewport({ jumpTarget: target })
     }
 
+    function isMountedKeyAtBottom(key: string): boolean {
+        if (!scrollContainer) return true
+        const element = mountedElements.get(key)
+        if (!element) return false
+        return element.getBoundingClientRect().top <= scrollContainer.getBoundingClientRect().bottom + 100
+    }
+
     function checkIfAtBottom(): boolean {
-        if (!scrollContainer || messageRenderKeys.length === 0) return true
-        const latest = mountedElements.get(messageRenderKeys.at(-1)!)
-        if (!latest) return false
-        return latest.getBoundingClientRect().top <= scrollContainer.getBoundingClientRect().bottom + 100
+        const sourceSnapshot = currentSourceSnapshot()
+        const totalMessages = currentMessageCount(sourceSnapshot)
+        if (!scrollContainer || totalMessages === 0) return true
+        const latestKey = currentMessageKey(totalMessages - 1, sourceSnapshot)
+        if (latestKey === undefined) return false
+        return isMountedKeyAtBottom(latestKey)
     }
 
     async function waitForLayout(): Promise<void> {
@@ -768,13 +1025,44 @@
     }
 
     export async function jumpTo(index: number, options: ChatViewportJumpOptions = {}): Promise<boolean> {
-        if (!Number.isInteger(index) || index < 0 || index >= messages.length) return false
+        const source = activeViewportSource
+        const sourceSnapshot = currentSourceSnapshot()
+        const totalMessages = currentMessageCount(sourceSnapshot)
+        if (!Number.isInteger(index) || index < 0 || index >= totalMessages) return false
         const generation = ++navigationGeneration
         const scope = currentChatScope()
+        if (source && sourceSnapshot) {
+            const budget = getRuntimePerformanceBudgets().chatMountedMessageBudget
+            const startIndex = Math.max(0, index - Math.min(VIEWPORT_OVERSCAN, budget - 1))
+            const controller = new AbortController()
+            const loadKey = `jump:${generation}`
+            sourceLoads.set(loadKey, controller)
+            try {
+                await source.ensureRange({
+                    startIndex,
+                    limit: Math.min(budget, totalMessages - startIndex),
+                    reason: 'jump',
+                    signal: controller.signal,
+                })
+            } catch {
+                return false
+            } finally {
+                if (sourceLoads.get(loadKey) === controller) sourceLoads.delete(loadKey)
+            }
+            const currentSnapshot = currentSourceSnapshot()
+            if (
+                controller.signal.aborted ||
+                generation !== navigationGeneration ||
+                source !== activeViewportSource ||
+                currentSnapshot?.sourceToken !== sourceSnapshot.sourceToken ||
+                currentSnapshot.version !== sourceSnapshot.version
+            ) return false
+        }
         const startOffset = hasConversationStart() ? 1 : 0
         const result = reconcileViewport({ jumpTarget: index + startOffset, preserveAnchor: false })
         if (!result?.jumpAccepted) return false
-        const key = messageRenderKeys[index]
+        const key = currentMessageKey(index)
+        if (key === undefined) return false
         await waitForLayout()
         if (generation !== navigationGeneration || scope !== currentChatScope()) return false
         const element = mountedElements.get(key)
@@ -802,8 +1090,9 @@
 
     export async function jumpToLatestMessage(): Promise<void> {
         hasNewUnreadMessage = false
-        if (messages.length > 0) {
-            await jumpTo(messages.length - 1)
+        const totalMessages = currentMessageCount()
+        if (totalMessages > 0) {
+            await jumpTo(totalMessages - 1)
             return
         }
         const scope = currentChatScope()
@@ -823,12 +1112,15 @@
     $effect(() => {
         void $ReloadChatPointer
         if (!imagesReady && !hasRenderedChat) return
-        const wasAtBottom = checkIfAtBottom()
+        const wasAtBottom = pendingSourceWasAtBottom ?? checkIfAtBottom()
+        pendingSourceWasAtBottom = null
         reconcileViewport()
         const conversationScope = currentChatScope()
         const isSameChat = conversationScope === previousConversationScope
-        if (isSameChat && messages.length > previousLength) {
-            const lastMessage = messages.at(-1)
+        const totalMessages = currentMessageCount()
+        if (isSameChat && totalMessages > previousLength) {
+            const lastMessage = currentSourceSnapshot()?.rowAt(totalMessages - 1)?.message
+                ?? messages.at(-1)
             if (lastMessage?.role === 'char' && DBState.db.autoScrollToNewMessage) {
                 if (wasAtBottom || DBState.db.alwaysScrollToNewMessage) {
                     if (autoScrollTimer) clearTimeout(autoScrollTimer)
@@ -841,7 +1133,7 @@
                 }
             }
         }
-        previousLength = messages.length
+        previousLength = totalMessages
         previousConversationScope = conversationScope
     })
 
@@ -875,6 +1167,11 @@
 
     onDestroy(() => {
         navigationGeneration += 1
+        abortSourceLoads()
+        releaseSourcePins()
+        sourceUnsubscribe?.()
+        sourceUnsubscribe = null
+        activeViewportSource = null
         clearScheduledWork()
         clearMountedRows()
         renderSignatures.clear()

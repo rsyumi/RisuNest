@@ -283,6 +283,7 @@ describe('createChatRenderSignature', () => {
         expect(sameSignature(signatureFor({ ...original, generationInfo: { generationId: 'reroll-2' } }), base)).toBe(false)
         expect(sameSignature(signatureFor(original, { index: 2 }), base)).toBe(false)
         expect(sameSignature(signatureFor(original, { reloadPointer: 1 }), base)).toBe(false)
+        expect(sameSignature(signatureFor(original, { bookmarked: true }), base)).toBe(false)
         expect(sameSignature(signatureFor(original, { resolvedImage: 'changed.png' }), base)).toBe(false)
     })
 

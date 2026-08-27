@@ -74,6 +74,11 @@
     import { getModuleAssets, getModuleLorebooks, getModuleRegexScripts, getModules } from 'src/ts/process/modules';
     import { ColorSchemeTypeStore } from 'src/ts/gui/colorscheme';
     import { HideIconStore } from 'src/ts/stores.svelte';
+    import {
+        SynchronousSessionConversationViewportSource,
+        type ConversationViewportSource,
+    } from '../../ts/conversationViewportSource';
+    import type { ActiveConversationSession } from '../../ts/storage/activeConversationSession';
 
     const loadPlaygroundMenu = () => import('../Playground/PlaygroundMenu.svelte').then(m => m.default);
     
@@ -97,7 +102,81 @@
     let { openModuleList = $bindable(false), openChatList = $bindable(false), customStyle = '' }: Props = $props();
     let currentCharacter = $derived(DBState.db.characters[$selectedCharID])
     let currentChat = $derived(currentCharacter?.chats[currentCharacter.chatPage]?.message ?? [])
+    let conversationViewportSource = $state<ConversationViewportSource | null>(null)
+    let viewportSourceOwner: Database['characters'][number] | null = null
+    let viewportSourceConversation: ChatRecord | null = null
+    let viewportSourceSession: ActiveConversationSession | null = null
+    let viewportSourceLifetimeUnsubscribe: (() => void) | null = null
     const scrollRequestGuard = new LatestChatScrollRequestGuard()
+
+    function replaceConversationViewportSource(
+        character: Database['characters'][number] | undefined,
+        conversation: ChatRecord | undefined,
+        session: ActiveConversationSession | null,
+    ): void {
+        const shouldHaveSource = character !== undefined && conversation !== undefined &&
+            session?.matchesConversation(character.chaId, conversation) === true
+        const hasExpectedSource = shouldHaveSource
+            ? conversationViewportSource !== null
+            : conversationViewportSource === null
+        if (
+            character === viewportSourceOwner &&
+            conversation === viewportSourceConversation &&
+            session === viewportSourceSession &&
+            hasExpectedSource
+        ) return
+
+        viewportSourceLifetimeUnsubscribe?.()
+        viewportSourceLifetimeUnsubscribe = null
+        conversationViewportSource?.dispose()
+        conversationViewportSource = null
+        viewportSourceOwner = character ?? null
+        viewportSourceConversation = conversation ?? null
+        viewportSourceSession = session
+        if (!character || !conversation || !session || !shouldHaveSource) {
+            return
+        }
+
+        const capturedCharacter = character
+        const capturedConversation = conversation
+        const capturedSession = session
+        const source = new SynchronousSessionConversationViewportSource({
+            session,
+            captureCurrent: () => {
+                const selectedCharacter = DBState.db.characters[$selectedCharID]
+                const selectedConversation = selectedCharacter?.chats[selectedCharacter.chatPage]
+                return selectedCharacter === capturedCharacter &&
+                    selectedConversation === capturedConversation &&
+                    getActiveConversationSession() === capturedSession &&
+                    capturedSession.matchesConversation(capturedCharacter.chaId, capturedConversation)
+                    ? { character: selectedCharacter, conversation: selectedConversation }
+                    : null
+            },
+        })
+        conversationViewportSource = source
+        viewportSourceLifetimeUnsubscribe = source.subscribe(() => {
+            if (capturedSession.isActive) return
+            queueMicrotask(() => {
+                if (conversationViewportSource !== source) return
+                const selectedCharacter = DBState.db.characters[$selectedCharID]
+                replaceConversationViewportSource(
+                    selectedCharacter,
+                    selectedCharacter?.chats[selectedCharacter.chatPage],
+                    getActiveConversationSession(),
+                )
+            })
+        })
+    }
+
+    $effect.pre(() => {
+        const character = currentCharacter
+        const conversation = character?.chats[character.chatPage]
+        replaceConversationViewportSource(
+            character,
+            conversation,
+            getActiveConversationSession(),
+        )
+    })
 
     function captureCurrentConversationTarget(): ConversationMutationTarget | null {
         const character = DBState.db.characters[$selectedCharID]
@@ -817,6 +896,10 @@
     }
 
     onDestroy(() => {
+        viewportSourceLifetimeUnsubscribe?.()
+        viewportSourceLifetimeUnsubscribe = null
+        conversationViewportSource?.dispose()
+        conversationViewportSource = null
         screenshotOpenGeneration += 1
         cancelScreenshot()
         releaseScreenshotSource()
@@ -1139,6 +1222,7 @@
             <Chats
                 bind:this={chatsInstance}
                 messages={currentChat}
+                viewportSource={conversationViewportSource}
                 onReroll={reroll}
                 unReroll={unReroll}
                 onFirstMessageReroll={() => {

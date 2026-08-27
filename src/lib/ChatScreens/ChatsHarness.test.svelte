@@ -2,21 +2,27 @@
     import type { character, Message } from 'src/ts/storage/database.svelte'
     import Chats from './Chats.svelte'
     import type { ChatViewportHandle, ChatViewportJumpOptions } from 'src/ts/chatViewport'
+    import type { ConversationViewportSource } from 'src/ts/conversationViewportSource'
 
     let {
         initialMessages,
         initialCharacter,
+        initialViewportSource = null,
     }: {
         initialMessages: Message[]
         initialCharacter: character
+        initialViewportSource?: ConversationViewportSource | null
     } = $props()
 
     let messages = $state<Message[]>([])
     let currentCharacter = $state<character>(null as unknown as character)
     let chats = $state<ChatViewportHandle>()
+    let viewportSource = $state<ConversationViewportSource | null>(null)
+    let hasNewUnreadMessage = $state(false)
     const initialize = () => {
         messages = initialMessages
         currentCharacter = initialCharacter
+        viewportSource = initialViewportSource
     }
     initialize()
 
@@ -49,6 +55,10 @@
         currentCharacter.image = image
     }
 
+    export function setViewportSource(nextSource: ConversationViewportSource | null) {
+        viewportSource = nextSource
+    }
+
     export function switchCharacter(character: character, nextMessages: Message[]) {
         currentCharacter = character
         messages = nextMessages
@@ -61,16 +71,26 @@
     export function jumpToLatestMessage() {
         return chats?.jumpToLatestMessage() ?? Promise.resolve()
     }
+
+    export function hasUnreadMessage() {
+        return hasNewUnreadMessage
+    }
+
+    export function getCurrentCharacter() {
+        return currentCharacter
+    }
 </script>
 
 <div class="scroll-parent">
     <Chats
         bind:this={chats}
         {messages}
+        {viewportSource}
         {currentCharacter}
         onReroll={() => {}}
         unReroll={() => {}}
         currentUsername="User"
         userIcon="user.png"
+        bind:hasNewUnreadMessage
     />
 </div>

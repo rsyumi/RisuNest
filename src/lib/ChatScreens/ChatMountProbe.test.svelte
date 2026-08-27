@@ -9,12 +9,14 @@
         img,
         character,
         rawStreamingText,
+        bookmarked = false,
     }: {
         message: string
         idx: number
         img: string
         character: unknown
         rawStreamingText: string
+        bookmarked?: boolean
     } = $props()
 
     const instanceId = chatMountProbe.nextInstanceId++
@@ -35,7 +37,7 @@
 
     onMount(() => {
         displayedStreamingText = rawStreamingText
-        chatMountProbe.mounts.push({ instanceId, message, index: idx, image: img, character })
+        chatMountProbe.mounts.push({ instanceId, message, index: idx, image: img, character, bookmarked })
     })
 
     onDestroy(() => {
@@ -49,4 +51,5 @@
     data-index={idx}
     data-image={img}
     data-streaming-text={displayedStreamingText}
+    data-bookmarked={bookmarked}
 ></div>

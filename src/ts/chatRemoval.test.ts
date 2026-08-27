@@ -30,6 +30,25 @@ function currentTarget(id: string) {
 }
 
 describe('removeChatMessage', () => {
+    it('does not fall back to the absolute index when a viewport target is unavailable', async () => {
+        const current = currentTarget('current')
+
+        await expect(removeChatMessage({
+            absoluteIndex: 0,
+            captureTarget: () => null,
+            shiftKey: false,
+            recursive: false,
+            askRemoval: false,
+            instantRemove: false,
+            captureCurrent: () => current,
+            getCurrentSession: () => null,
+            confirmRemoval: vi.fn(async () => true),
+            confirmInstantRemoval: vi.fn(async () => true),
+        })).resolves.toBe(false)
+
+        expect(current.conversation.message).toHaveLength(2)
+    })
+
     it('aborts a no-session delete when navigation changes during the first confirmation', async () => {
         const original = currentTarget('original')
         const replacement = currentTarget('replacement')

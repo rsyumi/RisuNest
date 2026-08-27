@@ -206,6 +206,7 @@ export interface ChatRenderSignatureInput {
     reloadPointer: number
     globalReloadPointer: number
     activeStreamingMessage: boolean
+    bookmarked?: boolean
     resolvedImage: string | null
     displayName: string
     parserCharacter: ChatParserCharacterDependencies | null
@@ -217,6 +218,7 @@ export interface ChatRenderSignature {
     role: Message['role']
     isComment: boolean
     disabled: Message['disabled']
+    bookmarked: boolean
     generationModel: string | null
     generationId: string | null
     inputTokens: number | null
@@ -295,6 +297,7 @@ export function createChatRenderSignature(input: ChatRenderSignatureInput): Chat
         role: input.message.role,
         isComment: input.message.isComment ?? false,
         disabled: input.message.disabled ?? false,
+        bookmarked: input.bookmarked ?? false,
         generationModel: generation?.model ?? null,
         generationId: generation?.generationId ?? null,
         inputTokens: generation?.inputTokens ?? null,
@@ -341,6 +344,7 @@ export function areChatRenderSignaturesEqual(
         && left.role === right.role
         && left.isComment === right.isComment
         && left.disabled === right.disabled
+        && left.bookmarked === right.bookmarked
         && left.generationModel === right.generationModel
         && left.generationId === right.generationId
         && left.inputTokens === right.inputTokens
