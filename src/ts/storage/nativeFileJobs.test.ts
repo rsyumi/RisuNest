@@ -205,6 +205,60 @@ describe('native file jobs', () => {
         ])
     })
 
+    it('retains a successful Android CharX job when native source cleanup fails', async () => {
+        const commands: string[] = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174005.charx'
+        const terminal: NativeFileJobStatus = {
+            jobId: 'character-export',
+            kind: 'export-character-charx',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 4096, completedItems: 3 },
+            result: {
+                revision: 31,
+                sourceBytes: 4096,
+                sourceSha256: 'c'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+
+        const result = await runNativeCharacterCharxExport(
+            {
+                characterId: 'character-id',
+                destination: { type: 'androidSaf', suggestedName: 'Leased.charx' },
+                expectedRevision: 31,
+                card: { spec: 'chara_card_v3' },
+                module: {},
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'native_character_charx_handoff_cleanup') {
+                        throw new Error('handoff is still in use')
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 4096, warningCodes: [] }),
+            },
+        )
+
+        expect(result.warningCodes).toEqual(['cleanup-failed'])
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_character_charx_handoff_cleanup',
+        ])
+    })
+
     it('rejects a short Android CharX handoff and still cleans both native receipts', async () => {
         const commands: string[] = []
         const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174003.charx'

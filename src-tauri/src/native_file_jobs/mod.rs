@@ -2693,6 +2693,7 @@ impl JobControl {
         Ok((status.kind == JobKind::PrepareContentImport
             && status.state == JobState::Succeeded
             && status.prepared_content.is_some())
+            || (status.kind == JobKind::ExportCharacterCharx && status.state.is_terminal())
             || (status.kind == JobKind::OfficialPublicationUpload && status.state.is_terminal()))
     }
 
@@ -5501,6 +5502,22 @@ mod tests {
         job.start(JobPhase::ReadingSource).unwrap();
         job.finish_success(result(1)).unwrap();
         assert!(expiring.status(&id).is_err());
+    }
+
+    #[test]
+    fn terminal_character_charx_receipt_is_retained_until_explicit_forget() {
+        let registry = JobRegistry::with_retention(0, Duration::ZERO);
+        let charx = registry.create(JobKind::ExportCharacterCharx).unwrap();
+        let charx_id = charx.id();
+        charx.start(JobPhase::WritingExport).unwrap();
+        charx.finish_success(result(1)).unwrap();
+
+        assert_eq!(
+            registry.status(&charx_id).unwrap().state,
+            JobState::Succeeded
+        );
+        assert!(registry.forget(&charx_id).unwrap());
+        assert!(registry.status(&charx_id).is_err());
     }
 
     #[test]

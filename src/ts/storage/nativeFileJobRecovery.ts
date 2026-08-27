@@ -97,9 +97,11 @@ async function reconcileExportInBackground(
                 retainNativeJob = true
                 return
             }
+            retainNativeJob = true
             await dependencies.invoke('native_character_charx_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
+            retainNativeJob = false
         }
     }
     finally {

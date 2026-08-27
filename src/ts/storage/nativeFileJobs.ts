@@ -956,6 +956,7 @@ export async function runNativeCharacterCharxExport(
     let outcomeFailed = false
     let result: NativeFileJobResult | undefined
     let managedSource: string | undefined
+    let handoffCleanupFailed = false
     try {
         if (terminal.state === 'cancelled') throw abortError()
         if (terminal.state !== 'succeeded') {
@@ -1019,6 +1020,7 @@ export async function runNativeCharacterCharxExport(
                 })
             }
             catch {
+                handoffCleanupFailed = true
                 if (result && !outcomeFailed) {
                     result.warningCodes = [
                         ...result.warningCodes
@@ -1029,17 +1031,19 @@ export async function runNativeCharacterCharxExport(
                 }
             }
         }
-        try {
-            await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
-        }
-        catch (error) {
-            if (result) {
-                result.warningCodes = [
-                    ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
-                    'cleanup-failed',
-                ]
+        if (!handoffCleanupFailed) {
+            try {
+                await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
             }
-            else if (!outcomeFailed) throw error
+            catch (error) {
+                if (result) {
+                    result.warningCodes = [
+                        ...result.warningCodes.filter((code) => code !== 'cleanup-failed').slice(0, 15),
+                        'cleanup-failed',
+                    ]
+                }
+                else if (!outcomeFailed) throw error
+            }
         }
     }
 }
