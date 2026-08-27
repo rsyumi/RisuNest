@@ -185,6 +185,7 @@ pub(crate) fn restore_lossless_backup(
         ),
         handoff_path: None,
         recovery_path: Some(recovery_destination.to_string_lossy().into_owned()),
+        publication: None,
     });
     let outcome =
         remove_uncommitted_recovery(outcome, &recovery_destination, activation_attempted.get());
@@ -288,6 +289,7 @@ pub(crate) fn export_lossless_backup(
             warning_codes: Vec::new(),
             handoff_path,
             recovery_path: None,
+            publication: None,
         })
     });
     finish_durable_job(outcome, &mut durable)
