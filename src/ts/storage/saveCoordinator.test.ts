@@ -454,6 +454,39 @@ describe('SaveCoordinator', () => {
         expect(database.modules).toEqual([])
     })
 
+    it('retains a post-commit callback revision conflict as the exact ambiguous error', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const callbackError = new RevisionConflictError(7, 8)
+        const store = {
+            commit: vi.fn(async () => ({ revision: 8 })),
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias: vi.fn(async () => null),
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishRootWorkingSet: () => { throw callbackError },
+        })
+        coordinator.initialize(7, database)
+
+        await expect(coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })).rejects.toBe(callbackError)
+
+        expect(store.commit).toHaveBeenCalledOnce()
+        expect(coordinator.revision).toBe(8)
+    })
+
     it('retains the exact ambiguous error when commit invocation rejects generically', async () => {
         const database = makeDatabase()
         database.modules = []
@@ -491,6 +524,7 @@ describe('SaveCoordinator', () => {
         database.modules = []
         const aliasRead = deferred<null>()
         const readAssetAlias = vi.fn(() => aliasRead.promise)
+        const release = vi.fn(async () => undefined)
         const commit = vi.fn()
         const store = {
             commit,
@@ -499,7 +533,7 @@ describe('SaveCoordinator', () => {
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead: vi.fn(async () => null),
                 readAssetAlias,
-                release: vi.fn(async () => undefined),
+                release,
             })),
         } as unknown as PersistentDataStore
         const coordinator = new SaveCoordinator({
@@ -531,8 +565,47 @@ describe('SaveCoordinator', () => {
 
         await expect(append).rejects.toBe(reason)
         expect(commit).not.toHaveBeenCalled()
+        expect(release).toHaveBeenCalledOnce()
         expect(coordinator.revision).toBe(7)
         expect(database.modules).toEqual([])
+    })
+
+    it('preserves an existing dirty-save debounce when cancellation is queued', async () => {
+        vi.useFakeTimers()
+        try {
+            const database = makeDatabase()
+            database.modules = []
+            const commit = vi.fn(async ({ expectedRevision }: WorkingSetCommit) => ({
+                revision: expectedRevision + 1,
+            }))
+            const store = makeStore(commit)
+            const coordinator = new SaveCoordinator({
+                store,
+                captureRoot: () => captureRoot(database),
+                captureSelectedCharacter: () => database.characters[0],
+                replaceDatabase: () => undefined,
+            })
+            coordinator.initialize(7, database)
+            database.username = 'Pending dirty edit'
+            coordinator.markPersistentDataDirty(1)
+            const controller = new AbortController()
+            const reason = new RevisionConflictError(7, 8)
+            controller.abort(reason)
+
+            await expect(coordinator.appendPersistentRootModule('native-risum-import', {
+                module: { id: 'new-id', name: 'Imported', description: '' },
+                assetAliases: [],
+                ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+            }, controller.signal)).rejects.toBe(reason)
+
+            await vi.advanceTimersByTimeAsync(500)
+            expect(commit).toHaveBeenCalledWith(expect.objectContaining({
+                expectedRevision: 7,
+                root: { username: 'Pending dirty edit', modules: [] },
+            }))
+        } finally {
+            vi.useRealTimers()
+        }
     })
 
     it('omits matching aliases to retain metadata and rejects conflicting identities', async () => {

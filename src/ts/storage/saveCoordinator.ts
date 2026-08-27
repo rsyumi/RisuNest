@@ -1210,7 +1210,6 @@ export class SaveCoordinator {
         try {
             this.assertInitialized()
             this.assertPersistentMutationAllowed()
-            this.cancelDebounce()
         }
         catch (error) {
             throw persistentRootModuleAppendRejected(error)
@@ -1218,6 +1217,7 @@ export class SaveCoordinator {
         let commitStarted = false
         return this.enqueue(async () => {
             signal?.throwIfAborted()
+            this.cancelDebounce()
             await this.flushIterations(reason, true)
             signal?.throwIfAborted()
             const revision = this.revision
@@ -1309,12 +1309,21 @@ export class SaveCoordinator {
             const liveBeforeCommit = this.capture()
             signal?.throwIfAborted()
             commitStarted = true
-            const committed = await this.dependencies.store.commit({
-                expectedRevision: revision,
-                root: snapshot.root,
-                assetAliases: snapshot.aliases,
-                assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
-            })
+            let committed: { revision: DataRevision }
+            try {
+                committed = await this.dependencies.store.commit({
+                    expectedRevision: revision,
+                    root: snapshot.root,
+                    assetAliases: snapshot.aliases,
+                    assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
+                })
+            }
+            catch (error) {
+                if (error instanceof RevisionConflictError) {
+                    throw persistentRootModuleAppendRejected(error)
+                }
+                throw error
+            }
             const liveAfterCommit = this.capture()
             const publishedRoot = rebaseRootMutation(
                 liveBeforeCommit.root,
@@ -1333,9 +1342,6 @@ export class SaveCoordinator {
                 this.armOfficialPublishRetry(this.officialPublishDelayMs())
             }
         }).catch((error) => {
-            if (error instanceof RevisionConflictError) {
-                throw persistentRootModuleAppendRejected(error)
-            }
             if (commitStarted) throw error
             if (signal?.aborted && error === signal.reason) throw error
             throw persistentRootModuleAppendRejected(error)

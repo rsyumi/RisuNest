@@ -86,7 +86,10 @@ export async function activatePreparedNativeModuleContent(
     signal?.throwIfAborted()
     await lifecycle.sealPreparedContent()
     if (signal?.aborted) {
-        await lifecycle.abortPreparedContent?.()
+        try {
+            await lifecycle.abortPreparedContent?.()
+        }
+        catch {}
         signal.throwIfAborted()
     }
     try {
@@ -97,7 +100,10 @@ export async function activatePreparedNativeModuleContent(
             error instanceof PersistentRootModuleAppendRejectedError
             || (signal?.aborted && error === signal.reason)
         ) {
-            await lifecycle.abortPreparedContent?.()
+            try {
+                await lifecycle.abortPreparedContent?.()
+            }
+            catch {}
         }
         throw error
     }

@@ -184,11 +184,13 @@ describe('native RISUM module activation', () => {
 
     it('releases sealed roots and does not append when cancellation arrives during sealing', async () => {
         const controller = new AbortController()
+        const reason = new DOMException('cancelled during sealing', 'AbortError')
+        const cleanupError = new Error('native cleanup unavailable')
         const append = vi.fn()
         const lifecycle: PreparedNativeContentActivationLifecycle = {
             prepareOwnerManifestAndSeal: vi.fn(),
-            sealPreparedContent: vi.fn(async () => controller.abort()),
-            abortPreparedContent: vi.fn(async () => undefined),
+            sealPreparedContent: vi.fn(async () => controller.abort(reason)),
+            abortPreparedContent: vi.fn(async () => { throw cleanupError }),
         }
 
         await expect(activatePreparedNativeModuleContent(
@@ -200,7 +202,7 @@ describe('native RISUM module activation', () => {
                 append,
             },
             controller.signal,
-        )).rejects.toMatchObject({ name: 'AbortError' })
+        )).rejects.toBe(reason)
 
         expect(lifecycle.abortPreparedContent).toHaveBeenCalledOnce()
         expect(append).not.toHaveBeenCalled()
@@ -236,13 +238,14 @@ describe('native RISUM module activation', () => {
     })
 
     it('aborts the sealed native session when the atomic revision commit loses its CAS', async () => {
+        const rejection = new PersistentRootModuleAppendRejectedError('revision conflict')
         const receipt = {
             jobId: 'content-job',
             content: risumContent(undefined),
             warningCodes: [],
             prepareOwnerManifestAndSeal: vi.fn(),
             sealPreparedContent: vi.fn(async () => undefined),
-            abortPreparedContent: vi.fn(async () => undefined),
+            abortPreparedContent: vi.fn(async () => { throw new Error('native cleanup unavailable') }),
             confirmActivated: vi.fn(async () => undefined),
             cancel: vi.fn(async () => undefined),
         }
@@ -260,12 +263,12 @@ describe('native RISUM module activation', () => {
                         confirmLowLevelAccess: vi.fn(async () => true),
                         createId: () => 'new-id',
                         append: vi.fn(async () => {
-                            throw new PersistentRootModuleAppendRejectedError('revision conflict')
+                            throw rejection
                         }),
                     },
                 ),
             },
-        )).rejects.toThrow('revision conflict')
+        )).rejects.toBe(rejection)
 
         expect(receipt.sealPreparedContent).toHaveBeenCalledOnce()
         expect(receipt.abortPreparedContent).toHaveBeenCalledOnce()
