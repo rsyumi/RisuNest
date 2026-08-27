@@ -4070,7 +4070,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolution.apply, vec![]);
-        assert_eq!(resolution.preserve_local_keys, vec![]);
+        assert_eq!(resolution.preserve_local_keys, Vec::<String>::new());
         assert_eq!(
             resolution.conflicts,
             vec![

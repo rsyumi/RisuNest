@@ -883,7 +883,9 @@ impl LanCloneHost {
     pub fn manifest(&self) -> &super::CloneManifest {
         match &self.shared.session {
             LanSession::Clone(session) => session.manifest(),
-            LanSession::Logical(_) => panic!("logical LAN session has no clone manifest"),
+            LanSession::Logical(_) | LanSession::BidirectionalLogical(_) => {
+                panic!("logical LAN session has no clone manifest")
+            }
         }
     }
 
