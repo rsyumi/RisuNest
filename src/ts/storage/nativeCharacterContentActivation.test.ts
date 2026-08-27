@@ -17,13 +17,17 @@ import {
     UnsupportedPreparedNativeCharacterCardError,
     type NativeCharacterContentActivationDependencies,
 } from './nativeCharacterContentActivation'
-import type { PreparedNativeContent } from './nativeFileJobs'
+import type {
+    PreparedNativeContent,
+    PreparedNativeContentActivationLifecycle,
+} from './nativeFileJobs'
 import { decodeOwnerManifest, ownerManifestIdentity } from './ownerManifestCodec'
 
 const firstHash = '11'.repeat(32)
 const secondHash = '22'.repeat(32)
 
 const content: PreparedNativeContent = {
+    casSessionId: 'content-1',
     format: 'json-card',
     metadata: {
         spec: 'chara_card_v3',
@@ -82,30 +86,68 @@ function dependencies(
 ): NativeCharacterContentActivationDependencies {
     return {
         map: vi.fn(async () => mappedCharacter()),
-        prepareManifest: vi.fn(async (bytes): Promise<PreparedImmutablePayload> => ({
-            contentHash: await ownerManifestIdentity(bytes),
-            byteSize: bytes.byteLength,
-            physicalKey: 'unused-by-activation',
-            deduplicated: false,
-        })),
         upsert: vi.fn(async () => true),
         ...overrides,
     }
 }
 
+function lifecycle(
+    overrides: Partial<PreparedNativeContentActivationLifecycle> = {},
+): PreparedNativeContentActivationLifecycle {
+    return {
+        prepareOwnerManifest: vi.fn(async (bytes): Promise<PreparedImmutablePayload> => ({
+            contentHash: await ownerManifestIdentity(bytes),
+            byteSize: bytes.byteLength,
+            physicalKey: 'unused-by-activation',
+            deduplicated: false,
+        })),
+        sealForActivation: vi.fn(async () => undefined),
+        ...overrides,
+    }
+}
+
 describe('prepared native character content activation', () => {
+    it('seals the owner manifest session before the atomic character upsert', async () => {
+        const events: string[] = []
+        const deps = dependencies({
+            upsert: vi.fn(async () => {
+                events.push('upsert')
+                return true
+            }),
+        })
+        const session = lifecycle({
+            prepareOwnerManifest: vi.fn(async (bytes) => {
+                events.push('prepare-owner-manifest')
+                return {
+                    contentHash: await ownerManifestIdentity(bytes),
+                    byteSize: bytes.byteLength,
+                    physicalKey: 'unused-by-activation',
+                    deduplicated: false,
+                }
+            }),
+            sealForActivation: vi.fn(async () => {
+                events.push('seal')
+            }),
+        })
+
+        await activatePreparedNativeCharacterContent(content, session, deps)
+
+        expect(events).toEqual(['prepare-owner-manifest', 'seal', 'upsert'])
+    })
+
     it('commits ordinary aliases and the exact ordered owner manifest with the character', async () => {
         const deps = dependencies()
+        const session = lifecycle()
 
-        const result = await activatePreparedNativeCharacterContent(content, deps)
+        const result = await activatePreparedNativeCharacterContent(content, session, deps)
 
         expect(result).toEqual({ characterId: 'character-1' })
         expect(deps.map).toHaveBeenCalledWith({
             card: content.metadata,
             assets: content.assets.map(({ token, logicalId }) => ({ token, logicalId })),
         })
-        expect(deps.prepareManifest).toHaveBeenCalledOnce()
-        const manifestBytes = vi.mocked(deps.prepareManifest).mock.calls[0][0]
+        expect(session.prepareOwnerManifest).toHaveBeenCalledOnce()
+        const manifestBytes = vi.mocked(session.prepareOwnerManifest).mock.calls[0][0]
         expect(decodeOwnerManifest(manifestBytes)).toEqual([
             {
                 tuple: ['config', `assets/${secondHash}.json`, 'json'],
@@ -117,6 +159,7 @@ describe('prepared native character content activation', () => {
             },
         ])
         const expectedManifestHash = await ownerManifestIdentity(manifestBytes)
+        expect(session.sealForActivation).toHaveBeenCalledOnce()
         expect(deps.upsert).toHaveBeenCalledWith(
             'character-1',
             'native-content-import',
@@ -165,8 +208,9 @@ describe('prepared native character content activation', () => {
             module: { trigger: [], regex: [], lorebook: [] },
         } as PreparedNativeContent
         const deps = dependencies()
+        const session = lifecycle()
 
-        await activatePreparedNativeCharacterContent(charxContent, deps)
+        await activatePreparedNativeCharacterContent(charxContent, session, deps)
 
         expect(deps.map).toHaveBeenCalledWith({
             card: content.metadata,
@@ -214,8 +258,9 @@ describe('prepared native character content activation', () => {
         const character = mappedCharacter()
         character.additionalAssets = []
         const deps = dependencies({ map: vi.fn(async () => character) })
+        const session = lifecycle()
 
-        await activatePreparedNativeCharacterContent(appendedCharxContent, deps)
+        await activatePreparedNativeCharacterContent(appendedCharxContent, session, deps)
 
         expect(deps.map).toHaveBeenCalledWith({
             card: content.metadata,
@@ -237,28 +282,32 @@ describe('prepared native character content activation', () => {
 
     it('returns a normal declined outcome without preparing or publishing anything', async () => {
         const deps = dependencies({ map: vi.fn(async (): Promise<false> => false) })
+        const session = lifecycle()
 
-        await expect(activatePreparedNativeCharacterContent(content, deps)).resolves.toBeNull()
+        await expect(activatePreparedNativeCharacterContent(content, session, deps)).resolves.toBeNull()
 
-        expect(deps.prepareManifest).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifest).not.toHaveBeenCalled()
+        expect(session.sealForActivation).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
     it('classifies off-spec JSON before calling the character card mapper', async () => {
         const deps = dependencies()
+        const session = lifecycle()
 
         await expect(activatePreparedNativeCharacterContent({
             ...content,
             metadata: { name: 'Legacy Tavern Card' },
-        }, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
+        }, session, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
 
         expect(deps.map).not.toHaveBeenCalled()
-        expect(deps.prepareManifest).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifest).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
     it('keeps v2 JSON on the compatibility importer until native v2 payload extraction exists', async () => {
         const deps = dependencies()
+        const session = lifecycle()
 
         await expect(activatePreparedNativeCharacterContent({
             ...content,
@@ -267,7 +316,7 @@ describe('prepared native character content activation', () => {
                 spec_version: '2.0',
                 data: { extensions: {} },
             },
-        }, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
+        }, session, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
 
         expect(deps.map).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
@@ -277,10 +326,11 @@ describe('prepared native character content activation', () => {
         const character = mappedCharacter()
         character.additionalAssets = []
         const deps = dependencies({ map: vi.fn(async () => character) })
+        const session = lifecycle()
 
-        await activatePreparedNativeCharacterContent(content, deps)
+        await activatePreparedNativeCharacterContent(content, session, deps)
 
-        const manifestBytes = vi.mocked(deps.prepareManifest).mock.calls[0][0]
+        const manifestBytes = vi.mocked(session.prepareOwnerManifest).mock.calls[0][0]
         expect(decodeOwnerManifest(manifestBytes)).toEqual([])
         expect(deps.upsert).toHaveBeenCalledWith(
             'character-1',
@@ -299,17 +349,19 @@ describe('prepared native character content activation', () => {
         const character = mappedCharacter()
         character.additionalAssets = [['missing', 'assets/missing.bin', 'bin']]
         const deps = dependencies({ map: vi.fn(async () => character) })
+        const session = lifecycle()
 
-        await expect(activatePreparedNativeCharacterContent(content, deps))
+        await expect(activatePreparedNativeCharacterContent(content, session, deps))
             .rejects.toThrow(/missing prepared asset alias/i)
 
-        expect(deps.prepareManifest).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifest).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
     it('rejects a manifest CAS identity mismatch before the database commit', async () => {
-        const deps = dependencies({
-            prepareManifest: vi.fn(async (bytes) => ({
+        const deps = dependencies()
+        const session = lifecycle({
+            prepareOwnerManifest: vi.fn(async (bytes) => ({
                 contentHash: 'ff'.repeat(32),
                 byteSize: bytes.byteLength,
                 physicalKey: 'wrong-object',
@@ -317,9 +369,10 @@ describe('prepared native character content activation', () => {
             })),
         })
 
-        await expect(activatePreparedNativeCharacterContent(content, deps))
+        await expect(activatePreparedNativeCharacterContent(content, session, deps))
             .rejects.toThrow(/manifest CAS identity mismatch/i)
 
+        expect(session.sealForActivation).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
     })
 
@@ -329,8 +382,11 @@ describe('prepared native character content activation', () => {
                 throw new Error('revision conflict')
             }),
         })
+        const session = lifecycle()
 
-        await expect(activatePreparedNativeCharacterContent(content, deps))
+        await expect(activatePreparedNativeCharacterContent(content, session, deps))
             .rejects.toThrow('revision conflict')
+
+        expect(session.sealForActivation).toHaveBeenCalledOnce()
     })
 })

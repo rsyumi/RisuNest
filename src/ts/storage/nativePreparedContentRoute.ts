@@ -13,7 +13,7 @@ export interface NativePreparedContentRouteDependencies<TMapped, TResult> {
         options?: NativeFileJobOptions,
     ): Promise<PreparedNativeContentReceipt>
     map(content: PreparedNativeContent): Promise<TMapped>
-    activate(mapped: TMapped): Promise<TResult>
+    activate(mapped: TMapped, lifecycle: PreparedNativeContentReceipt): Promise<TResult>
     onCleanupWarning?(error: unknown): void
 }
 
@@ -37,7 +37,11 @@ export async function runNativePreparedContentRoute<TMapped, TResult>(
         if (options.signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
         const mapped = await dependencies.map(receipt.content)
         if (options.signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
-        result = await dependencies.activate(mapped)
+        result = await dependencies.activate(mapped, receipt)
+        if (result === null) {
+            await receipt.cancel()
+            return result
+        }
     }
     catch (error) {
         try {

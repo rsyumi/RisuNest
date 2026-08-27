@@ -3,6 +3,12 @@ import { invoke } from '@tauri-apps/api/core'
 import { isTauri } from '../platform'
 import type { PreparedNativeCharacterCardModule } from '../characterCards'
 import {
+    prepareCasObject,
+    releaseCasJob,
+    sealCasJob,
+} from './nativeAssetRepository'
+import type { PreparedImmutablePayload } from './payloadCas'
+import {
     copyNativeExportToAndroidSaf,
     type AndroidSafDestinationRequest,
     type AndroidSafDestinationResult,
@@ -44,6 +50,7 @@ export interface PreparedContentAssetDescriptor {
 }
 
 export interface PreparedNativeContent {
+    casSessionId: string
     format: 'json-card' | 'charx-card' | 'appended-charx-jpeg'
     metadata: Record<string, unknown>
     assets: PreparedContentAssetDescriptor[]
@@ -108,7 +115,12 @@ export interface NativeFileJobOptions {
     onStatus?(status: NativeFileJobStatus): void
 }
 
-export interface PreparedNativeContentReceipt {
+export interface PreparedNativeContentActivationLifecycle {
+    prepareOwnerManifest(bytes: Uint8Array): Promise<PreparedImmutablePayload>
+    sealForActivation(): Promise<void>
+}
+
+export interface PreparedNativeContentReceipt extends PreparedNativeContentActivationLifecycle {
     readonly jobId: string
     readonly content: PreparedNativeContent
     readonly warningCodes: string[]
@@ -196,7 +208,7 @@ function requiredDescriptorString(
     return value
 }
 
-function validatePreparedContent(value: unknown): PreparedNativeContent {
+function validatePreparedContent(value: unknown, expectedCasSessionId: string): PreparedNativeContent {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
         throw preparedContentError('Prepared content must be an object')
     }
@@ -218,7 +230,11 @@ function validatePreparedContent(value: unknown): PreparedNativeContent {
     if (!Array.isArray(content.assets)) {
         throw preparedContentError('Prepared content assets must be an array')
     }
-    const expectedContentFields = ['assets', 'format', 'metadata']
+    const casSessionId = requiredDescriptorString(content.casSessionId, 'casSessionId')
+    if (casSessionId !== expectedCasSessionId) {
+        throw preparedContentError('Prepared content casSessionId must match its native job')
+    }
+    const expectedContentFields = ['assets', 'casSessionId', 'format', 'metadata']
     if (content.portraitLogicalId !== undefined) expectedContentFields.push('portraitLogicalId')
     if (content.module !== undefined) expectedContentFields.push('module')
     if (Object.keys(content).sort().join('\0') !== expectedContentFields.sort().join('\0')) {
@@ -311,6 +327,7 @@ function validatePreparedContent(value: unknown): PreparedNativeContent {
         }
     }
     return {
+        casSessionId,
         format: content.format,
         metadata: content.metadata as Record<string, unknown>,
         assets,
@@ -779,6 +796,15 @@ export async function prepareNativeContentImport(
         }
         catch {}
     }
+    const abortAndForgetBestEffort = async (): Promise<void> => {
+        try {
+            await releaseCasJob(started.jobId, 'aborted', dependencies.invoke)
+        }
+        catch {
+            return
+        }
+        await forgetBestEffort()
+    }
     const cancelAndDrain = async (reportStatus = true): Promise<void> => {
         if (!cancellationRequested) {
             cancellationRequested = true
@@ -792,7 +818,7 @@ export async function prepareNativeContentImport(
             if (isTerminalJob(status)) break
             await dependencies.wait(options.pollIntervalMs ?? 100)
         }
-        await forgetBestEffort()
+        await abortAndForgetBestEffort()
     }
 
     let lastStatus: NativeFileJobStatus | undefined
@@ -810,7 +836,7 @@ export async function prepareNativeContentImport(
             lastStatus = status
             options.onStatus?.(status)
             if (options.signal?.aborted) {
-                if (isTerminalJob(status)) await forgetBestEffort()
+                if (isTerminalJob(status)) await abortAndForgetBestEffort()
                 else await cancelAndDrain()
                 cleanupAttempted = true
                 throw abortError()
@@ -820,7 +846,7 @@ export async function prepareNativeContentImport(
                 continue
             }
             if (status.state === 'cancelled') {
-                await forgetBestEffort()
+                await abortAndForgetBestEffort()
                 cleanupAttempted = true
                 throw abortError()
             }
@@ -829,17 +855,52 @@ export async function prepareNativeContentImport(
                     status.error?.code ?? 'content-prepare-failed',
                     status.error?.message ?? 'Native content preparation failed',
                 )
-                await forgetBestEffort()
+                await abortAndForgetBestEffort()
                 cleanupAttempted = true
                 throw error
             }
 
-            const content = validatePreparedContent(status.preparedContent)
-            let forgotten = false
-            const acknowledge = async (): Promise<void> => {
-                if (forgotten) return
+            const content = validatePreparedContent(status.preparedContent, started.jobId)
+            let lifecycleState: 'unsealed' | 'sealing' | 'sealed' | 'releasing' | 'released' = 'unsealed'
+            let ownerManifestPrepared = false
+            const prepareOwnerManifest = async (bytes: Uint8Array): Promise<PreparedImmutablePayload> => {
+                if (lifecycleState !== 'unsealed' || ownerManifestPrepared) {
+                    throw new Error('Native content owner manifest can only be prepared once before sealing')
+                }
+                const prepared = await prepareCasObject(
+                    started.jobId,
+                    bytes,
+                    'owner-manifest',
+                    dependencies.invoke,
+                )
+                ownerManifestPrepared = true
+                return prepared
+            }
+            const sealForActivation = async (): Promise<void> => {
+                if (lifecycleState !== 'unsealed' || !ownerManifestPrepared) {
+                    throw new Error('Native content must prepare one owner manifest before sealing')
+                }
+                lifecycleState = 'sealing'
+                await sealCasJob(started.jobId, dependencies.invoke)
+                lifecycleState = 'sealed'
+            }
+            const confirmActivated = async (): Promise<void> => {
+                if (lifecycleState === 'released') return
+                if (lifecycleState !== 'sealed') {
+                    throw new Error('Native content activation cannot be confirmed before sealing')
+                }
+                lifecycleState = 'releasing'
+                await releaseCasJob(started.jobId, 'committed', dependencies.invoke)
+                lifecycleState = 'released'
                 await forget()
-                forgotten = true
+            }
+            const cancel = async (): Promise<void> => {
+                if (lifecycleState === 'released') return
+                if (lifecycleState !== 'unsealed') return
+                lifecycleState = 'releasing'
+                await releaseCasJob(started.jobId, 'aborted', dependencies.invoke)
+                lifecycleState = 'released'
+                await forget()
             }
             return {
                 jobId: started.jobId,
@@ -848,15 +909,17 @@ export async function prepareNativeContentImport(
                     ...(started.warningCodes ?? []),
                     ...(status.warningCodes ?? []),
                 ])].slice(0, 16),
-                confirmActivated: acknowledge,
-                cancel: acknowledge,
+                prepareOwnerManifest,
+                sealForActivation,
+                confirmActivated,
+                cancel,
             }
         }
     }
     catch (error) {
         if (!cleanupAttempted) {
             if (lastStatus && isTerminalJob(lastStatus)) {
-                await forgetBestEffort()
+                await abortAndForgetBestEffort()
             }
             else {
                 try {

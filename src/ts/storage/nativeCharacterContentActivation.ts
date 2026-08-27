@@ -4,10 +4,11 @@ import {
     type PreparedNativeCharacterCardMetadata,
 } from '../characterCards'
 import type { character } from './database.svelte'
-import { createNativeImmutablePayloadCas } from './nativeAssetRepository'
-import type { PreparedNativeContent } from './nativeFileJobs'
+import type {
+    PreparedNativeContent,
+    PreparedNativeContentActivationLifecycle,
+} from './nativeFileJobs'
 import { encodeOwnerManifest, ownerManifestIdentity } from './ownerManifestCodec'
-import type { PreparedImmutablePayload } from './payloadCas'
 import { upsertPersistentCompleteCharacter } from './persistentDataRuntime.svelte'
 import type {
     PersistentCharacterAssetAlias,
@@ -18,7 +19,6 @@ import type {
 
 export interface NativeCharacterContentActivationDependencies {
     map(input: PreparedNativeCharacterCardInput): Promise<character | false>
-    prepareManifest(bytes: Uint8Array): Promise<PreparedImmutablePayload>
     upsert(
         characterId: string,
         reason: string,
@@ -106,7 +106,7 @@ function preparedAliases(
 async function prepareAdditionalAssetOwnerHead(
     character: character,
     aliases: readonly PersistentCharacterAssetAlias[],
-    prepareManifest: NativeCharacterContentActivationDependencies['prepareManifest'],
+    prepareManifest: PreparedNativeContentActivationLifecycle['prepareOwnerManifest'],
 ): Promise<PersistentCharacterAssetOwnerHead> {
     const aliasesByKey = new Map(aliases.map((alias) => [alias.key, alias]))
     const additionalAssets = character.additionalAssets ?? []
@@ -144,12 +144,12 @@ async function prepareAdditionalAssetOwnerHead(
 
 const productionDependencies: NativeCharacterContentActivationDependencies = {
     map: mapPreparedNativeCharacterCard,
-    prepareManifest: (bytes) => createNativeImmutablePayloadCas().prepare(bytes),
     upsert: upsertPersistentCompleteCharacter,
 }
 
 export async function activatePreparedNativeCharacterContent(
     content: PreparedNativeContent,
+    lifecycle: PreparedNativeContentActivationLifecycle,
     dependencies: NativeCharacterContentActivationDependencies = productionDependencies,
 ): Promise<NativeCharacterContentActivationResult | null> {
     const card = requireCharacterCardMetadata(content.metadata)
@@ -167,8 +167,9 @@ export async function activatePreparedNativeCharacterContent(
     const assetOwnerHead = await prepareAdditionalAssetOwnerHead(
         character,
         assetAliases,
-        dependencies.prepareManifest,
+        lifecycle.prepareOwnerManifest,
     )
+    await lifecycle.sealForActivation()
     await dependencies.upsert(
         character.chaId,
         'native-content-import',
