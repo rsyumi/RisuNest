@@ -42,6 +42,9 @@ private val MANAGED_EXPORT_NAME = Regex(
 private val MANAGED_LEGACY_BACKUP_NAME = Regex(
   "risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.bin",
 )
+private val MANAGED_CHARACTER_CHARX_NAME = Regex(
+  "risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.charx",
+)
 private const val MANAGED_SCREENSHOT_FILE = "archive.zip.part"
 private const val MANAGED_SCREENSHOT_OWNERSHIP = "ownership"
 private const val MANAGED_SCREENSHOT_READY = "ready"
@@ -462,6 +465,7 @@ internal suspend fun copySafDestinationOnIo(
 internal fun resolveManagedExportSource(appDataRoot: File, sourcePath: String): File? {
   resolveManagedRisuSaveSource(appDataRoot, sourcePath)?.let { return it }
   resolveManagedLegacyBackupSource(appDataRoot, sourcePath)?.let { return it }
+  resolveManagedCharacterCharxSource(appDataRoot, sourcePath)?.let { return it }
   return resolveManagedScreenshotSource(appDataRoot, sourcePath)
 }
 
@@ -509,6 +513,17 @@ private fun resolveManagedScreenshotSource(appDataRoot: File, sourcePath: String
   return source
 }
 
+private fun resolveManagedCharacterCharxSource(appDataRoot: File, sourcePath: String): File? {
+  val handoffsRoot = runCatching {
+    appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
+  }.getOrNull() ?: return null
+  if (!handoffsRoot.isDirectory) return null
+  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
+  if (!source.isFile || source.parentFile != handoffsRoot) return null
+  if (MANAGED_CHARACTER_CHARX_NAME.matchEntire(source.name) == null) return null
+  return source
+}
+
 private fun readExactOwner(marker: File): String? {
   if (!marker.isFile || marker.length() > 64) return null
   return runCatching { marker.readText(Charsets.UTF_8) }.getOrNull()
@@ -517,6 +532,7 @@ private fun readExactOwner(marker: File): String? {
 internal fun managedExportId(source: File): String? {
   MANAGED_EXPORT_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
   MANAGED_LEGACY_BACKUP_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
+  MANAGED_CHARACTER_CHARX_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
   if (source.name != MANAGED_SCREENSHOT_FILE) return null
   return source.parentFile?.name?.takeIf(::isCanonicalUuidV4)
 }
@@ -534,6 +550,10 @@ internal fun resolveManagedExportById(appDataRoot: File, exportId: String): File
   resolveManagedRisuSaveSource(appDataRoot, source.absolutePath)?.let { return it }
   val legacyBackup = appDataRoot.resolve("native-file-jobs/handoffs/risu-backup-$exportId.bin")
   resolveManagedLegacyBackupSource(appDataRoot, legacyBackup.absolutePath)?.let { return it }
+  val characterCharx = appDataRoot.resolve(
+    "native-file-jobs/handoffs/risu-charx-$exportId.charx",
+  )
+  resolveManagedCharacterCharxSource(appDataRoot, characterCharx.absolutePath)?.let { return it }
   val screenshot = appDataRoot.resolve(
     "native-file-jobs/screenshot-output/$exportId/$MANAGED_SCREENSHOT_FILE",
   )

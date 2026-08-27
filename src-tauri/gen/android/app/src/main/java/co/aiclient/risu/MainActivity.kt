@@ -860,6 +860,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
 
     @JavascriptInterface
+    fun getExportSourceId(): String? = loadSafDestinationState()?.exportId
+
+    @JavascriptInterface
     fun acknowledgeExport(requestId: String): Boolean {
       if (!isCanonicalUuidV4(requestId)) return false
       val record = loadSafDestinationState()

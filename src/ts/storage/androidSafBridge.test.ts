@@ -6,6 +6,7 @@ import {
     copyNativeExportToAndroidSaf,
     discardAndroidSafSource,
     getActiveAndroidSafSourceRequestIds,
+    getAndroidSafExportSourceId,
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
     pickAndroidLegacyBackupSource,
@@ -17,6 +18,17 @@ describe('Android SAF bridge', () => {
     it('reports SAF file jobs enabled only when the native bridge is installed', () => {
         expect(isAndroidSafFileJobsEnabled(undefined)).toBe(false)
         expect(isAndroidSafFileJobsEnabled({})).toBe(true)
+    })
+
+    it('accepts only canonical persisted destination export IDs', () => {
+        expect(getAndroidSafExportSourceId({
+            copyExport: vi.fn(),
+            getExportSourceId: () => '123e4567-e89b-42d3-a456-426614174004',
+        })).toBe('123e4567-e89b-42d3-a456-426614174004')
+        expect(getAndroidSafExportSourceId({
+            copyExport: vi.fn(),
+            getExportSourceId: () => 'not-owned',
+        })).toBeNull()
     })
 
     it('subscribes before consuming the replayed ready batch and removes the listener', async () => {

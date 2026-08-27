@@ -1,10 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 
+import { getAndroidSafExportSourceId } from './androidSafBridge'
 import type { NativeFileJobStatus } from './nativeFileJobs'
 
 export interface NativeFileJobRecoveryDependencies {
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
     wait(milliseconds: number): Promise<void>
+    androidSafExportId?(): string | null
 }
 
 export interface NativeFileJobRecoveryResult {
@@ -19,6 +21,12 @@ export interface NativeFileJobRecoveryOptions {
 const productionDependencies: NativeFileJobRecoveryDependencies = {
     invoke: (command, args) => args === undefined ? invoke(command) : invoke(command, args),
     wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    androidSafExportId: () => getAndroidSafExportSourceId(),
+}
+
+function characterCharxHandoffId(path: string): string | null {
+    return /(?:^|[\\/])risu-charx-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.charx$/
+        .exec(path)?.[1] ?? null
 }
 
 export function shouldReconcileNativeFileJobs(
@@ -83,9 +91,12 @@ async function reconcileExportInBackground(
             })
         }
         else if (status.kind === 'export-character-charx' && status.result?.handoffPath) {
-            await dependencies.invoke('native_character_charx_handoff_cleanup', {
-                path: status.result.handoffPath,
-            })
+            const handoffId = characterCharxHandoffId(status.result.handoffPath)
+            if (!handoffId || dependencies.androidSafExportId?.() !== handoffId) {
+                await dependencies.invoke('native_character_charx_handoff_cleanup', {
+                    path: status.result.handoffPath,
+                })
+            }
         }
     }
     finally {
