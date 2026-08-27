@@ -8,6 +8,7 @@ import {
     getActiveAndroidSafSourceRequestIds,
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
+    pickAndroidLegacyBackupSource,
     pickAndroidLosslessBackupSource,
     type AndroidSafDestinationEvent,
 } from './androidSafBridge'
@@ -247,6 +248,39 @@ describe('Android SAF bridge', () => {
         }
 
         await expect(pending).rejects.toMatchObject({ code: 'cleanup-failed' })
+        expect(listeners.size).toBe(0)
+    })
+
+    it('picks a legacy backup into an owned spool and returns only its token', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const pickLegacyBackupSource = vi.fn((requestId: string) => queueMicrotask(() => {
+            for (const listener of listeners) {
+                listener(new CustomEvent('risu-android-legacy-backup-source-picked', { detail: {
+                    requestId,
+                    ready: [{
+                        token: '11111111-1111-4111-8111-111111111111',
+                        displayName: 'backup.bin',
+                        bytes: 4_294_967_296,
+                        totalBytes: 4_294_967_296,
+                    }],
+                    failures: [],
+                } }))
+            }
+        }))
+
+        const source = await pickAndroidLegacyBackupSource({}, {
+            createRequestId: () => 'source-picker-1',
+            bridge: { copyExport: vi.fn(), pickLegacyBackupSource },
+            addEventListener: (_name, listener) => listeners.add(listener),
+            removeEventListener: (_name, listener) => listeners.delete(listener),
+        })
+
+        expect(source).toEqual({
+            type: 'androidSpool',
+            token: '11111111-1111-4111-8111-111111111111',
+        })
+        expect(pickLegacyBackupSource).toHaveBeenCalledExactlyOnceWith('source-picker-1')
+        expect(JSON.stringify(source)).not.toContain('Uint8Array')
         expect(listeners.size).toBe(0)
     })
 

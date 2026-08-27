@@ -65,7 +65,7 @@ const productionDependencies: LosslessBackupFileRouteDependencies = {
     runNativeRestore: runNativeLosslessBackupRestore,
     runNativeExport: runNativeLosslessBackupExport,
     reloadPluginsAfterRestore: loadPluginsAfterAuthoritativeRestore,
-    saveLegacyBackup: SaveLocalBackup,
+    saveLegacyBackup: async () => { await SaveLocalBackup() },
     loadLegacyBackup: LoadLocalBackup,
 }
 

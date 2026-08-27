@@ -612,6 +612,7 @@ pub fn run() {
             native_file_jobs::native_file_job_official_publication_retry,
             native_file_jobs::native_file_job_forget,
             native_file_jobs::native_lossless_handoff_cleanup,
+            native_file_jobs::native_legacy_backup_handoff_cleanup,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_start,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_append,
             native_file_jobs::screenshot_output::native_file_job_screenshot_output_publish,

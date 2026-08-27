@@ -20,8 +20,14 @@ function dependencies(): LegacyLocalBackupFileRouteDependencies {
                 release: vi.fn(),
             })),
         }),
-        chooseImport: vi.fn(async () => 'C:\\chosen\\backup.bin'),
-        chooseExport: vi.fn(async () => 'C:\\chosen\\backup.bin'),
+        chooseImport: vi.fn(async () => ({
+            type: 'desktopPath' as const,
+            path: 'C:\\chosen\\backup.bin',
+        })),
+        chooseExport: vi.fn(async () => ({
+            type: 'desktopPath' as const,
+            path: 'C:\\chosen\\backup.bin',
+        })),
         runImport: vi.fn(async (_runtime, _source, options) => {
             await options.afterRefresh?.()
             return {
@@ -69,7 +75,7 @@ describe('legacy local backup native file route', () => {
         expect(result?.sourceBytes).toBe(8192)
         expect(deps.runExport).toHaveBeenCalledWith(
             expect.objectContaining({ revision: 7 }),
-            'C:\\chosen\\backup.bin',
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
             expect.objectContaining({ signal: undefined }),
         )
         expect(JSON.stringify(vi.mocked(deps.runExport).mock.calls)).not.toContain('Uint8Array')

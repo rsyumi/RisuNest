@@ -454,6 +454,38 @@ class MainActivityBehaviorTest {
   }
 
   @Test
+  fun `restored legacy backup picker result uses the general replayable spool event`() {
+    val batch = SafSpoolBatch(
+      ready = listOf(
+        SafSpoolReady(
+          token = "22222222-2222-4222-8222-222222222222",
+          displayName = "backup.bin",
+          bytes = 9,
+          totalBytes = 9,
+        ),
+      ),
+      failures = emptyList(),
+    )
+
+    val restored = androidLegacyBackupSourceResultScript(
+      "11111111-1111-4111-8111-111111111111",
+      batch,
+      restored = true,
+    )
+    val live = androidLegacyBackupSourceResultScript(
+      "11111111-1111-4111-8111-111111111111",
+      batch,
+      restored = false,
+    )
+
+    assertEquals(true, restored.contains("risu-android-spool-ready"))
+    assertEquals(true, restored.contains("tauriOpenedFileSpools"))
+    assertEquals(false, restored.contains("risu-android-legacy-backup-source-picked"))
+    assertEquals(true, live.contains("risu-android-legacy-backup-source-picked"))
+    assertEquals(false, live.contains("risu-android-spool-ready"))
+  }
+
+  @Test
   fun `SAF progress script uses one bounded event shape for source and destination`() {
     val source = androidSafProgressScript(
       requestId = "source-1",
@@ -477,6 +509,30 @@ class MainActivityBehaviorTest {
     assertEquals(true, destination.contains("\"operation\":\"destination-copy\""))
     assertEquals(true, destination.contains("\"totalBytes\":256"))
     assertEquals(true, destination.contains("\"token\":null"))
+  }
+
+  @Test
+  fun `legacy backup picker result uses a dedicated token-only event`() {
+    val script = androidLegacyBackupSourcePickedScript(
+      requestId = "11111111-1111-4111-8111-111111111111",
+      batch = SafSpoolBatch(
+        ready = listOf(
+          SafSpoolReady(
+            token = "22222222-2222-4222-8222-222222222222",
+            displayName = "backup.bin",
+            bytes = 4_294_967_296,
+            totalBytes = 4_294_967_296,
+          ),
+        ),
+        failures = emptyList(),
+      ),
+    )
+
+    assertEquals(true, script.contains("risu-android-legacy-backup-source-picked"))
+    assertEquals(true, script.contains("backup.bin"))
+    assertEquals(false, script.contains("tauriOpenedFileSpools"))
+    assertEquals(false, script.contains("risu-android-spool-ready"))
+    assertEquals(false, script.contains("Uint8Array"))
   }
 
   @Test

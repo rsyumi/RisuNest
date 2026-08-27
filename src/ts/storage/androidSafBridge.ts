@@ -2,6 +2,7 @@ import type { NativeFileJobSource } from './nativeFileJobs'
 
 const SPOOL_EVENT = 'risu-android-spool-ready'
 const LOSSLESS_SOURCE_EVENT = 'risu-android-lossless-source-picked'
+const LEGACY_BACKUP_SOURCE_EVENT = 'risu-android-legacy-backup-source-picked'
 const DESTINATION_EVENT = 'risu-android-saf-destination'
 const PROGRESS_EVENT = 'risu-android-saf-progress'
 const activeDestinationRequestIds = new Set<string>()
@@ -112,7 +113,7 @@ export interface AndroidSafDestinationResult {
 export interface AndroidSafDestinationEvent {
     requestId: string
     exportId?: string
-    sourceKind?: 'risuSave' | 'screenshot'
+    sourceKind?: 'risuSave' | 'legacyBackup' | 'screenshot'
     state: 'succeeded' | 'failed' | 'cancelled'
     bytes?: number | null
     code?: string | null
@@ -129,10 +130,23 @@ export interface AndroidSafJavascriptBridge {
     cancelExport?(requestId: string): boolean | void
     cancelSource?(requestId: string): void
     pickLosslessSource?(requestId: string): void
+    pickLegacyBackupSource?(requestId: string): void
     discardSource?(token: string): boolean
     getActiveSourceRequestIds?(): string
     getExportStatus?(): string | null
     acknowledgeExport?(requestId: string): boolean
+}
+
+export interface AndroidLegacyBackupSourcePickerOptions {
+    signal?: AbortSignal
+    onProgress?(progress: AndroidSafProgress): void
+}
+
+export interface AndroidLegacyBackupSourcePickerDependencies {
+    createRequestId(): string
+    bridge: AndroidSafJavascriptBridge
+    addEventListener(name: string, listener: (event: Event) => void): void
+    removeEventListener(name: string, listener: (event: Event) => void): void
 }
 
 export interface AndroidSafDestinationDependencies {
@@ -291,6 +305,101 @@ export function pickAndroidLosslessBackupSource(
         try {
             const pick = dependencies.bridge.pickLosslessSource
             if (!pick) throw new Error('Android lossless backup picker is unavailable')
+            pick.call(dependencies.bridge, requestId)
+        }
+        catch (error) {
+            finish(() => reject(error))
+        }
+    })
+}
+
+export function pickAndroidLegacyBackupSource(
+    options: AndroidLegacyBackupSourcePickerOptions = {},
+    dependencies: AndroidLegacyBackupSourcePickerDependencies = productionDependencies,
+): Promise<NativeFileJobSource | null> {
+    if (options.signal?.aborted) {
+        return Promise.reject(new DOMException(
+            'Android legacy backup selection was cancelled',
+            'AbortError',
+        ))
+    }
+    const requestId = dependencies.createRequestId()
+    return new Promise((resolve, reject) => {
+        let settled = false
+        let aborted = false
+        const cleanup = () => {
+            options.signal?.removeEventListener('abort', onAbort)
+            dependencies.removeEventListener(LEGACY_BACKUP_SOURCE_EVENT, onEvent)
+            if (options.onProgress) dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
+        }
+        const finish = (callback: () => void) => {
+            if (settled) return
+            settled = true
+            cleanup()
+            callback()
+        }
+        const onAbort = () => {
+            if (settled) return
+            aborted = true
+            options.signal?.removeEventListener('abort', onAbort)
+            if (options.onProgress) dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
+            dependencies.bridge.cancelSource?.(requestId)
+        }
+        const onEvent = (event: Event) => {
+            const batch = (event as CustomEvent<AndroidSpoolBatch>).detail
+            if (!batch || batch.requestId !== requestId) return
+            if (aborted) {
+                let cleanupFailed = false
+                for (const source of batch.ready) {
+                    if (dependencies.bridge.discardSource?.(source.token) !== true) {
+                        cleanupFailed = true
+                    }
+                }
+                finish(() => cleanupFailed
+                    ? reject(new AndroidSafSourceError(
+                        'cleanup-failed',
+                        'Cancelled Android backup source could not be cleaned up',
+                    ))
+                    : reject(new DOMException(
+                        'Android legacy backup selection was cancelled',
+                        'AbortError',
+                    )))
+                return
+            }
+            const failure = batch.failures[0]
+            if (failure) {
+                finish(() => reject(new AndroidSafSourceError(
+                    failure.code,
+                    `${failure.displayName}: ${failure.code}`,
+                )))
+                return
+            }
+            const source = batch.ready[0]
+            if (!source) {
+                finish(() => resolve(null))
+                return
+            }
+            if (!source.displayName.toLocaleLowerCase('en-US').endsWith('.bin')) {
+                finish(() => reject(new AndroidSafSourceError(
+                    'unsupported-format',
+                    `${source.displayName}: unsupported-format`,
+                )))
+                return
+            }
+            finish(() => resolve({ type: 'androidSpool', token: source.token }))
+        }
+        const onProgress = (event: Event) => {
+            const progress = (event as CustomEvent<AndroidSafProgress>).detail
+            if (progress?.requestId === requestId && progress.operation === 'source-copy') {
+                options.onProgress?.(progress)
+            }
+        }
+        dependencies.addEventListener(LEGACY_BACKUP_SOURCE_EVENT, onEvent)
+        if (options.onProgress) dependencies.addEventListener(PROGRESS_EVENT, onProgress)
+        options.signal?.addEventListener('abort', onAbort, { once: true })
+        try {
+            const pick = dependencies.bridge.pickLegacyBackupSource
+            if (!pick) throw new Error('Android legacy backup picker is unavailable')
             pick.call(dependencies.bridge, requestId)
         }
         catch (error) {

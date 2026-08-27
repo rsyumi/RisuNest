@@ -1,6 +1,8 @@
 import { open, save } from '@tauri-apps/plugin-dialog'
 
 import { loadPluginsAfterAuthoritativeRestore } from '../plugins/plugins.svelte'
+import { isTauriAndroid } from '../platform'
+import { pickAndroidLegacyBackupSource } from '../storage/androidSafBridge'
 import { runSharedNativeFileOperation } from '../storage/nativeFileJobManager'
 import {
     runNativeLegacyLocalBackupExport,
@@ -17,18 +19,29 @@ import {
 
 const productionDependencies: LegacyLocalBackupFileRouteDependencies = {
     runtime: getPersistentDataRuntime,
-    chooseImport: async () => {
+    chooseImport: async (options) => {
+        if (isTauriAndroid) {
+            return pickAndroidLegacyBackupSource({ signal: options.signal })
+        }
         const selected = await open({
             multiple: false,
             directory: false,
             filters: [{ name: 'RisuAI Backup', extensions: ['bin'] }],
         })
-        return typeof selected === 'string' ? selected : null
+        return typeof selected === 'string'
+            ? { type: 'desktopPath', path: selected }
+            : null
     },
-    chooseExport: () => save({
-        defaultPath: 'risu-backup.bin',
-        filters: [{ name: 'RisuAI Backup', extensions: ['bin'] }],
-    }),
+    chooseExport: async () => {
+        if (isTauriAndroid) {
+            return { type: 'androidSaf', suggestedName: 'risu-backup.bin' }
+        }
+        const path = await save({
+            defaultPath: 'risu-backup.bin',
+            filters: [{ name: 'RisuAI Backup', extensions: ['bin'] }],
+        })
+        return path ? { type: 'desktopPath', path } : null
+    },
     runImport: runNativeLegacyLocalBackupRestore,
     runExport: runNativeLegacyLocalBackupExport,
     reloadPluginsAfterRestore: loadPluginsAfterAuthoritativeRestore,
@@ -36,7 +49,7 @@ const productionDependencies: LegacyLocalBackupFileRouteDependencies = {
 
 export const importLegacyLocalBackupFromSystemPicker = (
     options: NativeFileRestoreJobOptions = {},
-) => runSharedNativeFileOperation('import', ({ signal, onStatus, setBlocking }) =>
+) => runSharedNativeFileOperation('import', 'legacy-local-backup-import', ({ signal, onStatus, setBlocking }) =>
     importLegacyLocalBackupFromPicker({
         ...options,
         signal,
@@ -52,7 +65,7 @@ export const importLegacyLocalBackupFromSystemPicker = (
 
 export const exportLegacyLocalBackupFromSystemPicker = (
     options: NativeFileJobOptions = {},
-) => runSharedNativeFileOperation('export', ({ signal, onStatus }) =>
+) => runSharedNativeFileOperation('export', 'legacy-local-backup-export', ({ signal, onStatus }) =>
     exportLegacyLocalBackupFromPicker({
         ...options,
         signal,

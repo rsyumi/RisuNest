@@ -265,7 +265,7 @@ describe('native file jobs', () => {
                     calls.push([`flush:${reason}`, undefined])
                 },
             },
-            'C:\\chosen\\backup.bin',
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
             {},
             {
                 isTauri: () => true,
@@ -293,6 +293,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
             },
         )
 
@@ -309,6 +310,57 @@ describe('native file jobs', () => {
             ['native_file_job_status', { jobId: 'legacy-export' }],
             ['native_file_job_forget', { jobId: 'legacy-export' }],
         ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
+    it('publishes a native legacy backup handoff through Android SAF without archive bytes over IPC', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const copyToAndroidSaf = vi.fn(async () => ({ bytes: 4096, warningCodes: [] }))
+
+        const result = await runNativeLegacyLocalBackupExport(
+            { revision: 21, flushPendingData: async () => undefined },
+            { type: 'androidSaf', suggestedName: 'risu-backup.bin' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'legacy-export' }
+                    if (command === 'native_file_job_status') {
+                        return {
+                            jobId: 'legacy-export',
+                            kind: 'export-legacy-local-backup',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: { completedBytes: 4096, completedItems: 3 },
+                            result: {
+                                revision: 21,
+                                sourceBytes: 4096,
+                                sourceSha256: 'd'.repeat(64),
+                                characterCount: 2,
+                                presetCount: 1,
+                                warningCodes: [],
+                                handoffPath: 'C:\\app\\handoffs\\risu-backup.bin',
+                            },
+                        } satisfies NativeFileJobStatus
+                    }
+                    if (command === 'native_legacy_backup_handoff_cleanup') return true
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf,
+            },
+        )
+
+        expect(result.handoffPath).toBeUndefined()
+        expect(copyToAndroidSaf).toHaveBeenCalledWith(expect.objectContaining({
+            sourcePath: 'C:\\app\\handoffs\\risu-backup.bin',
+            suggestedName: 'risu-backup.bin',
+        }))
+        expect(calls[0]).toEqual(['native_file_job_start', {
+            request: { kind: 'export-legacy-local-backup', expectedRevision: 21 },
+        }])
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 

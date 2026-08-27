@@ -77,6 +77,11 @@ async function reconcileExportInBackground(
                 path: status.result.handoffPath,
             })
         }
+        else if (status.kind === 'export-legacy-local-backup' && status.result?.handoffPath) {
+            await dependencies.invoke('native_legacy_backup_handoff_cleanup', {
+                path: status.result.handoffPath,
+            })
+        }
     }
     finally {
         await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
@@ -116,7 +121,8 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
         switch (kind) {
             case 'restore-block-risu-save':
             case 'restore-lossless-backup':
-            case 'restore-official-account-snapshot': {
+            case 'restore-official-account-snapshot':
+            case 'restore-legacy-local-backup': {
                 if (options.reconcileRestores === false) break
                 const terminal = isTerminal(job) ? job : await reconcileRestore(job, dependencies)
                 if (terminal.state === 'succeeded') {
@@ -131,6 +137,7 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
             }
             case 'export-block-risu-save':
             case 'export-lossless-backup':
+            case 'export-legacy-local-backup':
             case 'kei-backup-upload':
                 void reconcileExportInBackground(job, dependencies).catch((error) => {
                     console.error('Native export reconciliation failed', error)

@@ -628,6 +628,26 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `destination source accepts only exact legacy backup handoffs`() {
+    val appData = temporaryDirectory()
+    val handoffs = appData.resolve("native-file-jobs/handoffs")
+    handoffs.mkdirs()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val source = handoffs.resolve("risu-backup-$id.bin").apply {
+      writeBytes(byteArrayOf(1, 2, 3))
+    }
+    val unrelated = handoffs.resolve("backup-$id.bin").apply {
+      writeBytes(byteArrayOf(9))
+    }
+
+    assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
+    assertEquals(id, managedExportId(source))
+    assertEquals(SafDestinationSourceKind.LEGACY_BACKUP, managedExportSourceKind(source))
+    assertEquals(source.canonicalFile, resolveManagedExportById(appData, id))
+    assertNull(resolveManagedExportSource(appData, unrelated.path))
+  }
+
+  @Test
   fun `acknowledged screenshot cleanup removes only the matching owned handoff`() {
     val appData = temporaryDirectory()
     val id = "99999999-9999-4999-8999-999999999999"

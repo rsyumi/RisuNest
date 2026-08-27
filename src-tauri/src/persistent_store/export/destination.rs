@@ -114,6 +114,28 @@ pub(crate) fn write_lossless_destination_controlled(
     )
 }
 
+pub(crate) fn write_legacy_backup_destination_controlled(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(DestinationProgress),
+    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
+) -> Result<DestinationWriteResult, DestinationWriteError> {
+    write_desktop_destination_with_commit_kind(
+        &RealFileSystem,
+        SourceKind::LegacyBackup,
+        source_root,
+        source,
+        destination_root,
+        destination,
+        is_cancelled,
+        on_progress,
+        before_replace,
+    )
+}
+
 trait DestinationFileSystem {
     type Source: Read;
     type Destination: Write;
@@ -220,6 +242,7 @@ enum SourceKind {
     RisuSave,
     ScreenshotOutput,
     LosslessBackup,
+    LegacyBackup,
 }
 
 fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
@@ -237,6 +260,7 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
         SourceKind::RisuSave => validated_source(source_root, source)?,
         SourceKind::ScreenshotOutput => validated_screenshot_source(source_root, source)?,
         SourceKind::LosslessBackup => validated_lossless_source(source_root, source)?,
+        SourceKind::LegacyBackup => validated_legacy_backup_source(source_root, source)?,
     };
     let destination = validated_destination(destination_root, destination)?;
     if source.parent() == destination.parent() {
@@ -361,6 +385,21 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
         bytes: copied_bytes,
         sha256: hex::encode(hasher.finalize()),
     })
+}
+
+fn validated_legacy_backup_source(
+    source_root: &Path,
+    source: &Path,
+) -> Result<PathBuf, DestinationWriteError> {
+    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
+    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
+    if source.parent() != Some(root.as_path())
+        || source.file_name().and_then(|name| name.to_str()) != Some("archive.bin.part")
+        || !source.is_file()
+    {
+        return Err(DestinationWriteError::InvalidSource);
+    }
+    Ok(source)
 }
 
 fn validated_lossless_source(
@@ -1003,6 +1042,34 @@ mod tests {
 
         assert!(matches!(error, DestinationWriteError::Cancelled));
         assert_eq!(fs::read(&destination).unwrap(), b"previous export");
+        assert!(sibling_temporary_files(&destination_root).is_empty());
+    }
+
+    #[test]
+    fn legacy_backup_failure_preserves_the_existing_destination() {
+        let directory = TempDir::new().unwrap();
+        let source_root = directory.path().join("jobs");
+        let destination_root = directory.path().join("chosen");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        let source = source_root.join("archive.bin.part");
+        let destination = destination_root.join("risu-backup.bin");
+        fs::write(&source, vec![13; COPY_BUFFER_BYTES * 2]).unwrap();
+        fs::write(&destination, b"previous backup").unwrap();
+
+        let error = write_legacy_backup_destination_controlled(
+            &source_root,
+            &source,
+            &destination_root,
+            &destination,
+            || false,
+            |_| {},
+            || Err(DestinationWriteError::Cancelled),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DestinationWriteError::Cancelled));
+        assert_eq!(fs::read(&destination).unwrap(), b"previous backup");
         assert!(sibling_temporary_files(&destination_root).is_empty());
     }
 

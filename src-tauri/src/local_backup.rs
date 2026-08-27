@@ -29,6 +29,8 @@ pub(crate) enum LocalBackupErrorCode {
     Cancelled,
     Io,
     DatabaseRestore,
+    UnsupportedEncryption,
+    UnsupportedFormat,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -38,7 +40,7 @@ pub(crate) struct LocalBackupError {
 }
 
 impl LocalBackupError {
-    fn new(code: LocalBackupErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: LocalBackupErrorCode, message: impl Into<String>) -> Self {
         let mut message = message.into();
         if message.len() > MAX_ERROR_BYTES {
             let mut end = MAX_ERROR_BYTES;
@@ -105,7 +107,11 @@ pub(crate) struct StagedLocalBackupEntry {
 }
 
 pub(crate) trait StrictLocalBackupDatabaseRestore {
-    fn restore_database(&mut self, entry: &StagedLocalBackupEntry) -> Result<(), LocalBackupError>;
+    fn restore_database(
+        &mut self,
+        entry: &StagedLocalBackupEntry,
+        entries: &[StagedLocalBackupEntry],
+    ) -> Result<(), LocalBackupError>;
 }
 
 pub(crate) enum PayloadTarget<'a> {
@@ -212,7 +218,7 @@ pub(crate) fn parse_legacy_local_backup_v1(
         )
     })?;
     check_cancelled(cancellation)?;
-    database_restore.restore_database(&entries[database_index])?;
+    database_restore.restore_database(&entries[database_index], &entries)?;
     staging_ownership.release();
 
     Ok(LegacyLocalBackupParseReport {
@@ -789,6 +795,7 @@ mod tests {
         fn restore_database(
             &mut self,
             entry: &StagedLocalBackupEntry,
+            _entries: &[StagedLocalBackupEntry],
         ) -> Result<(), LocalBackupError> {
             self.calls += 1;
             self.bytes = fs::read(
@@ -947,6 +954,7 @@ mod tests {
             fn restore_database(
                 &mut self,
                 _entry: &StagedLocalBackupEntry,
+                _entries: &[StagedLocalBackupEntry],
             ) -> Result<(), LocalBackupError> {
                 Err(LocalBackupError::database_restore(
                     "strict database rejection",
@@ -1005,6 +1013,7 @@ mod tests {
             fn restore_database(
                 &mut self,
                 _entry: &StagedLocalBackupEntry,
+                _entries: &[StagedLocalBackupEntry],
             ) -> Result<(), LocalBackupError> {
                 Err(LocalBackupError::database_restore(
                     "strict database rejection",
@@ -1169,6 +1178,7 @@ mod tests {
             fn restore_database(
                 &mut self,
                 _entry: &StagedLocalBackupEntry,
+                _entries: &[StagedLocalBackupEntry],
             ) -> Result<(), LocalBackupError> {
                 self.cancelled.store(true, Ordering::SeqCst);
                 Ok(())

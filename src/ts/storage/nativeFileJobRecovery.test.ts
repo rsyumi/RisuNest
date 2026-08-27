@@ -91,24 +91,27 @@ describe('native file job bootstrap reconciliation', () => {
         expect(forgotten).toEqual(['restore-failed'])
     })
 
-    it('retains a successful official account restore for post-bootstrap acknowledgement', async () => {
+    it.each([
+        ['restore-official-account-snapshot', 'official-restore'],
+        ['restore-legacy-local-backup', 'legacy-restore'],
+    ] as const)('retains a successful %s for post-bootstrap acknowledgement', async (kind, jobId) => {
         const calls: string[] = []
-        const officialRestore = {
-            ...restoreStatus('official-restore', 'succeeded', 'complete'),
-            kind: 'restore-official-account-snapshot' as const,
+        const completedRestore = {
+            ...restoreStatus(jobId, 'succeeded', 'complete'),
+            kind,
         }
 
         const result = await reconcileNativeFileJobsBeforeBootstrap({
             invoke: vi.fn(async (command) => {
                 calls.push(command)
-                if (command === 'native_file_job_list') return [officialRestore]
+                if (command === 'native_file_job_list') return [completedRestore]
                 throw new Error(`Unexpected command: ${command}`)
             }),
             wait: vi.fn(async () => undefined),
         })
 
         expect(result).toEqual({
-            pendingRestoreAcknowledgements: ['official-restore'],
+            pendingRestoreAcknowledgements: [jobId],
             pendingOfficialPublications: [],
         })
         expect(calls).toEqual(['native_file_job_list'])
@@ -165,6 +168,7 @@ describe('native file job bootstrap reconciliation', () => {
 
     it.each([
         ['export-block-risu-save', 'export-1'],
+        ['export-legacy-local-backup', 'legacy-export-1'],
         ['kei-backup-upload', 'kei-1'],
     ] as const)('returns without waiting for an active %s job and cleans it up in the background', async (kind, jobId) => {
         let resumePolling!: () => void
@@ -237,6 +241,47 @@ describe('native file job bootstrap reconciliation', () => {
                 ['native_file_job_status', { jobId: 'lossless-export' }],
                 ['native_lossless_handoff_cleanup', { path: handoffPath }],
                 ['native_file_job_forget', { jobId: 'lossless-export' }],
+            ])
+        })
+    })
+
+    it('cleans an abandoned Android legacy backup handoff before forgetting its terminal job', async () => {
+        let resumePolling!: () => void
+        const pollingGate = new Promise<void>((resolve) => resumePolling = resolve)
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-backup-123e4567-e89b-42d3-a456-426614174004.bin'
+        const dependencies = {
+            invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('legacy-export', 'running', 'writing-export'),
+                    kind: 'export-legacy-local-backup' as const,
+                }]
+                if (command === 'native_file_job_status') return {
+                    ...restoreStatus('legacy-export', 'succeeded', 'complete'),
+                    kind: 'export-legacy-local-backup' as const,
+                    result: {
+                        ...restoreStatus('legacy-export', 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }
+                if (command === 'native_legacy_backup_handoff_cleanup') return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => pollingGate),
+        }
+
+        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+        expect(calls).toEqual([['native_file_job_list', undefined]])
+
+        resumePolling()
+        await vi.waitFor(() => {
+            expect(calls).toEqual([
+                ['native_file_job_list', undefined],
+                ['native_file_job_status', { jobId: 'legacy-export' }],
+                ['native_legacy_backup_handoff_cleanup', { path: handoffPath }],
+                ['native_file_job_forget', { jobId: 'legacy-export' }],
             ])
         })
     })

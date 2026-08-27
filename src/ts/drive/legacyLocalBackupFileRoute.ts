@@ -1,4 +1,8 @@
-import type { NativeFileJobResult, NativeFileJobSource } from '../storage/nativeFileJobs'
+import type {
+    NativeFileJobResult,
+    NativeFileJobSource,
+    NativeLegacyLocalBackupDestination,
+} from '../storage/nativeFileJobs'
 import type {
     NativeBlockRestoreRuntime,
     NativeFileJobOptions,
@@ -12,8 +16,8 @@ interface LegacyLocalBackupExportRuntime {
 
 export interface LegacyLocalBackupFileRouteDependencies {
     runtime(): NativeBlockRestoreRuntime & LegacyLocalBackupExportRuntime
-    chooseImport(): Promise<string | null>
-    chooseExport(): Promise<string | null>
+    chooseImport(options: NativeFileRestoreJobOptions): Promise<NativeFileJobSource | null>
+    chooseExport(options: NativeFileJobOptions): Promise<NativeLegacyLocalBackupDestination | null>
     runImport(
         runtime: NativeBlockRestoreRuntime,
         source: NativeFileJobSource,
@@ -21,7 +25,7 @@ export interface LegacyLocalBackupFileRouteDependencies {
     ): Promise<NativeFileJobResult>
     runExport(
         runtime: LegacyLocalBackupExportRuntime,
-        destination: string,
+        destination: NativeLegacyLocalBackupDestination,
         options?: NativeFileJobOptions,
     ): Promise<NativeFileJobResult>
     reloadPluginsAfterRestore(): void | Promise<void>
@@ -31,11 +35,11 @@ export async function importLegacyLocalBackupFromPicker(
     options: NativeFileRestoreJobOptions,
     dependencies: LegacyLocalBackupFileRouteDependencies,
 ): Promise<NativeFileJobResult | null> {
-    const path = await dependencies.chooseImport()
-    if (!path) return null
+    const source = await dependencies.chooseImport(options)
+    if (!source) return null
     return dependencies.runImport(
         dependencies.runtime(),
-        { type: 'desktopPath', path },
+        source,
         { ...options, afterRefresh: dependencies.reloadPluginsAfterRestore },
     )
 }
@@ -44,9 +48,9 @@ export async function exportLegacyLocalBackupFromPicker(
     options: NativeFileJobOptions,
     dependencies: LegacyLocalBackupFileRouteDependencies,
 ): Promise<NativeFileJobResult | null> {
-    const path = await dependencies.chooseExport()
-    if (!path) return null
-    return dependencies.runExport(dependencies.runtime(), path, {
+    const destination = await dependencies.chooseExport(options)
+    if (!destination) return null
+    return dependencies.runExport(dependencies.runtime(), destination, {
         ...options,
         signal: options.signal,
     })

@@ -39,6 +39,9 @@ internal fun shouldUseNativeFileJobSpool(displayName: String): Boolean =
 private val MANAGED_EXPORT_NAME = Regex(
   "risusave-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risudat",
 )
+private val MANAGED_LEGACY_BACKUP_NAME = Regex(
+  "risu-backup-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.bin",
+)
 private const val MANAGED_SCREENSHOT_FILE = "archive.zip.part"
 private const val MANAGED_SCREENSHOT_OWNERSHIP = "ownership"
 private const val MANAGED_SCREENSHOT_READY = "ready"
@@ -458,7 +461,19 @@ internal suspend fun copySafDestinationOnIo(
 
 internal fun resolveManagedExportSource(appDataRoot: File, sourcePath: String): File? {
   resolveManagedRisuSaveSource(appDataRoot, sourcePath)?.let { return it }
+  resolveManagedLegacyBackupSource(appDataRoot, sourcePath)?.let { return it }
   return resolveManagedScreenshotSource(appDataRoot, sourcePath)
+}
+
+private fun resolveManagedLegacyBackupSource(appDataRoot: File, sourcePath: String): File? {
+  val handoffsRoot = runCatching {
+    appDataRoot.resolve("native-file-jobs/handoffs").canonicalFile
+  }.getOrNull() ?: return null
+  if (!handoffsRoot.isDirectory) return null
+  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
+  if (!source.isFile || source.parentFile != handoffsRoot) return null
+  if (MANAGED_LEGACY_BACKUP_NAME.matchEntire(source.name) == null) return null
+  return source
 }
 
 private fun resolveManagedRisuSaveSource(appDataRoot: File, sourcePath: String): File? {
@@ -501,21 +516,24 @@ private fun readExactOwner(marker: File): String? {
 
 internal fun managedExportId(source: File): String? {
   MANAGED_EXPORT_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
+  MANAGED_LEGACY_BACKUP_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
   if (source.name != MANAGED_SCREENSHOT_FILE) return null
   return source.parentFile?.name?.takeIf(::isCanonicalUuidV4)
 }
 
 internal fun managedExportSourceKind(source: File): SafDestinationSourceKind =
-  if (source.name == MANAGED_SCREENSHOT_FILE) {
-    SafDestinationSourceKind.SCREENSHOT
-  } else {
-    SafDestinationSourceKind.RISU_SAVE
+  when {
+    source.name == MANAGED_SCREENSHOT_FILE -> SafDestinationSourceKind.SCREENSHOT
+    MANAGED_LEGACY_BACKUP_NAME.matches(source.name) -> SafDestinationSourceKind.LEGACY_BACKUP
+    else -> SafDestinationSourceKind.RISU_SAVE
   }
 
 internal fun resolveManagedExportById(appDataRoot: File, exportId: String): File? {
   if (!isCanonicalUuidV4(exportId)) return null
   val source = appDataRoot.resolve("persistent/exports/risusave-$exportId.risudat")
   resolveManagedRisuSaveSource(appDataRoot, source.absolutePath)?.let { return it }
+  val legacyBackup = appDataRoot.resolve("native-file-jobs/handoffs/risu-backup-$exportId.bin")
+  resolveManagedLegacyBackupSource(appDataRoot, legacyBackup.absolutePath)?.let { return it }
   val screenshot = appDataRoot.resolve(
     "native-file-jobs/screenshot-output/$exportId/$MANAGED_SCREENSHOT_FILE",
   )
@@ -702,6 +720,35 @@ internal fun androidLosslessSourceResultScript(
   androidSpoolBatchScript(requestId, batch)
 } else {
   androidLosslessSourcePickedScript(requestId, batch)
+}
+
+internal fun androidLegacyBackupSourcePickedScript(
+  requestId: String,
+  batch: SafSpoolBatch,
+): String {
+  val ready = batch.ready.joinToString(",") { source ->
+    "{" +
+      "\"token\":${jsonString(source.token)}," +
+      "\"displayName\":${jsonString(source.displayName)}," +
+      "\"bytes\":${source.bytes}," +
+      (source.totalBytes?.let { "\"totalBytes\":$it" } ?: "\"totalBytes\":null") +
+      "}"
+  }
+  val failures = batch.failures.joinToString(",") { failure ->
+    "{\"displayName\":${jsonString(failure.displayName)},\"code\":${jsonString(failure.code)}}"
+  }
+  val detail = "{\"requestId\":${jsonString(requestId)},\"ready\":[$ready],\"failures\":[$failures]}"
+  return "window.dispatchEvent(new CustomEvent('risu-android-legacy-backup-source-picked',{detail:$detail}));"
+}
+
+internal fun androidLegacyBackupSourceResultScript(
+  requestId: String,
+  batch: SafSpoolBatch,
+  restored: Boolean,
+): String = if (restored) {
+  androidSpoolBatchScript(requestId, batch)
+} else {
+  androidLegacyBackupSourcePickedScript(requestId, batch)
 }
 
 internal fun androidSafProgressScript(

@@ -222,6 +222,8 @@ export type NativeLosslessBackupDestination =
     | { type: 'desktopPath'; path: string }
     | { type: 'androidSaf'; suggestedName: string }
 
+export type NativeLegacyLocalBackupDestination = NativeLosslessBackupDestination
+
 export interface NativeFileJobDependencies {
     isTauri(): boolean
     invoke(command: string, args?: Record<string, unknown>): Promise<unknown>
@@ -905,14 +907,15 @@ export function runNativeLegacyLocalBackupExport(
         readonly revision: number
         flushPendingData(reason: string): Promise<void>
     },
-    destination: string,
+    destination: NativeLegacyLocalBackupDestination,
     options: NativeFileJobOptions = {},
-    dependencies: NativeFileJobDependencies = productionDependencies,
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
-    return runNativePathExport(
+    return runNativePortableBackupExport(
         'export-legacy-local-backup',
         'native-legacy-local-backup-export',
         'Native legacy local backup export',
+        'native_legacy_backup_handoff_cleanup',
         runtime,
         destination,
         options,
@@ -920,7 +923,11 @@ export function runNativeLegacyLocalBackupExport(
     )
 }
 
-export async function runNativeLosslessBackupExport(
+async function runNativePortableBackupExport(
+    kind: 'export-lossless-backup' | 'export-legacy-local-backup',
+    flushReason: string,
+    operation: string,
+    handoffCleanupCommand: string,
     runtime: {
         readonly revision: number
         flushPendingData(reason: string): Promise<void>
@@ -930,21 +937,21 @@ export async function runNativeLosslessBackupExport(
     dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
     if (!dependencies.isTauri()) {
-        throw new Error('Native lossless backup export requires Tauri')
+        throw new Error(`${operation} requires Tauri`)
     }
     if (options.signal?.aborted) throw abortError()
 
-    await runtime.flushPendingData('native-lossless-backup-export')
+    await runtime.flushPendingData(flushReason)
     if (options.signal?.aborted) throw abortError()
     const expectedRevision = runtime.revision
     const request = destination.type === 'desktopPath'
         ? {
-            kind: 'export-lossless-backup',
+            kind,
             destination: destination.path,
             expectedRevision,
         }
         : {
-            kind: 'export-lossless-backup',
+            kind,
             expectedRevision,
         }
     const started = await invokeNative(dependencies, 'native_file_job_start', {
@@ -977,11 +984,11 @@ export async function runNativeLosslessBackupExport(
         if (terminal.state !== 'succeeded') {
             throw new NativeFileJobError(
                 terminal.error?.code ?? 'export-failed',
-                terminal.error?.message ?? 'Native lossless backup export failed',
+                terminal.error?.message ?? `${operation} failed`,
             )
         }
         if (!terminal.result) {
-            throw new NativeFileJobError('missing-result', 'Native lossless backup export returned no result')
+            throw new NativeFileJobError('missing-result', `${operation} returned no result`)
         }
         committedResult = {
             ...terminal.result,
@@ -995,7 +1002,7 @@ export async function runNativeLosslessBackupExport(
             if (!managedSource) {
                 throw new NativeFileJobError(
                     'missing-handoff',
-                    'Native lossless backup export returned no Android handoff path',
+                    `${operation} returned no Android handoff path`,
                 )
             }
             const published = await dependencies.copyToAndroidSaf({
@@ -1019,7 +1026,7 @@ export async function runNativeLosslessBackupExport(
             if (published.bytes !== committedResult.sourceBytes) {
                 throw new NativeFileJobError(
                     'length-mismatch',
-                    'Android SAF lossless backup length differs from its native source',
+                    `Android SAF ${operation} length differs from its native source`,
                 )
             }
             const { handoffPath: _handoffPath, ...publishedResult } = committedResult
@@ -1040,7 +1047,7 @@ export async function runNativeLosslessBackupExport(
     finally {
         if (managedSource) {
             try {
-                await invokeNative(dependencies, 'native_lossless_handoff_cleanup', {
+                await invokeNative(dependencies, handoffCleanupCommand, {
                     path: managedSource,
                 })
             }
@@ -1070,6 +1077,27 @@ export async function runNativeLosslessBackupExport(
             else if (!outcomeFailed) throw error
         }
     }
+}
+
+export function runNativeLosslessBackupExport(
+    runtime: {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    destination: NativeLosslessBackupDestination,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativePortableBackupExport(
+        'export-lossless-backup',
+        'native-lossless-backup-export',
+        'Native lossless backup export',
+        'native_lossless_handoff_cleanup',
+        runtime,
+        destination,
+        options,
+        dependencies,
+    )
 }
 
 export async function prepareNativeContentImport(

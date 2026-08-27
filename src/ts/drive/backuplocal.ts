@@ -98,7 +98,7 @@ function getBasename(data:string){
 }
 
 export async function SaveLocalBackup(){
-    if (isTauriDesktop) {
+    if (isTauri) {
         try {
             const { exportLegacyLocalBackupFromSystemPicker } = await import(
                 './legacyLocalBackupFileRouteProduction.svelte'
@@ -365,7 +365,7 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
 }
 
 export function LoadLocalBackup(){
-    if (isTauriDesktop) {
+    if (isTauri) {
         void loadLocalBackupNativeFirst()
         return
     }
