@@ -23,6 +23,76 @@ const INPUT_FILE: &str = "input.risulossless";
 const ARCHIVE_FILE: &str = "archive.risulossless.part";
 const RECOVERY_FILE: &str = "recovery.risulossless.part";
 
+pub(crate) fn create_official_snapshot_recovery(
+    owned_directory: &Path,
+    mut store: PersistentStore,
+    expected_revision: i64,
+    job: &JobControl,
+) -> Result<PathBuf, NativeJobError> {
+    let cancellation = JobCancellation(job);
+    let repository_root = store.repository_root().to_path_buf();
+    let cas = PayloadCas::new(&repository_root).map_err(io_store_error)?;
+    let recovery_source = owned_directory.join(RECOVERY_FILE);
+    let recovery_directory = repository_root.join("persistent").join("recovery");
+    fs::create_dir_all(&recovery_directory).map_err(io_store_error)?;
+    let recovery_destination = recovery_directory.join(format!(
+        "risulossless-recovery-{}.risulossless",
+        Uuid::new_v4()
+    ));
+    let mut durable = DurableCasJob::begin(
+        &repository_root,
+        &job.id(),
+        CasJobKind::OfficialPublicationOrExportPreparation,
+        now_millis(),
+    )
+    .map_err(io_store_error)?;
+    let created = create_and_verify_lossless_backup_v1_durable_report(
+        &recovery_source,
+        owned_directory,
+        &cas,
+        &mut store,
+        expected_revision,
+        &mut durable,
+        now_millis(),
+        &cancellation,
+    )
+    .map_err(lossless_operation_error);
+    let outcome = created.and_then(|_| {
+        let phase_failure = RefCell::new(None);
+        publish_owned_package(
+            owned_directory,
+            &recovery_source,
+            &recovery_directory,
+            &recovery_destination,
+            job,
+            &phase_failure,
+            None,
+            || Ok(()),
+        )?;
+        Ok(recovery_destination.clone())
+    });
+    let release = durable.release(if outcome.is_ok() {
+        CasReleaseOutcome::Committed
+    } else {
+        CasReleaseOutcome::Aborted
+    });
+    match (outcome, release) {
+        (Ok(path), Ok(())) => Ok(path),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(NativeJobError::new(
+            "cleanup-failed",
+            format!("official restore recovery pin release failed: {error}"),
+        )),
+        (Err(error), Err(cleanup)) => Err(NativeJobError::new(
+            "cleanup-failed",
+            format!(
+                "{}; official restore recovery pin release failed: {cleanup}",
+                error.message
+            ),
+        )),
+    }
+}
+
 struct JobCancellation<'a>(&'a JobControl);
 
 impl CancellationProbe for JobCancellation<'_> {

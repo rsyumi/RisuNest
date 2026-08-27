@@ -3,6 +3,7 @@ mod content;
 pub mod screenshot_output;
 
 mod lossless;
+mod official_snapshot;
 
 #[cfg(test)]
 mod screenshot_output_test;
@@ -109,6 +110,11 @@ pub(crate) enum NativeFileJobStartRequest {
     },
     RestoreLosslessBackup {
         source: JobSource,
+        expected_revision: i64,
+    },
+    RestoreOfficialAccountSnapshot {
+        base_url: String,
+        credential: official_snapshot::OfficialSnapshotCredential,
         expected_revision: i64,
     },
     ExportBlockRisuSave {
@@ -954,6 +960,26 @@ impl NativeFileJobState {
                     store,
                 }
             }
+            NativeFileJobStartRequest::RestoreOfficialAccountSnapshot {
+                base_url,
+                credential,
+                expected_revision,
+            } => {
+                let store =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.open_native_job_store()
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::RestoreOfficialSnapshot {
+                    request: official_snapshot::OfficialSnapshotRestoreRequest {
+                        base_url,
+                        credential,
+                    },
+                    expected_revision,
+                    store,
+                    app,
+                }
+            }
             NativeFileJobStartRequest::ExportLosslessBackup {
                 destination,
                 expected_revision,
@@ -1179,7 +1205,9 @@ impl NativeFileJobState {
                 require_restore_finalization
                     && matches!(
                         kind,
-                        JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+                        JobKind::RestoreBlockRisuSave
+                            | JobKind::RestoreLosslessBackup
+                            | JobKind::RestoreOfficialAccountSnapshot
                     ),
             )
             .map_err(|error| NativeJobError::new("store-error", error))?;
@@ -1293,6 +1321,19 @@ impl NativeFileJobState {
                         "native lossless job source was not prepared",
                     )),
                 },
+                NativeFileJobTask::RestoreOfficialSnapshot {
+                    request,
+                    expected_revision,
+                    store,
+                    app,
+                } => official_snapshot::restore_official_snapshot(
+                    request,
+                    expected_revision,
+                    &owned_directory,
+                    store,
+                    &job,
+                    &PersistentReplacementSink { app },
+                ),
                 NativeFileJobTask::ExportLossless {
                     destination,
                     expected_revision,
@@ -1499,6 +1540,12 @@ enum NativeFileJobTask {
         expected_revision: i64,
         store: crate::persistent_store::PersistentStore,
     },
+    RestoreOfficialSnapshot {
+        request: official_snapshot::OfficialSnapshotRestoreRequest,
+        expected_revision: i64,
+        store: crate::persistent_store::PersistentStore,
+        app: AppHandle,
+    },
     ExportLossless {
         destination: Option<PathBuf>,
         expected_revision: i64,
@@ -1516,6 +1563,7 @@ impl NativeFileJobTask {
             Self::Restore { .. } => JobKind::RestoreBlockRisuSave,
             Self::Export { .. } => JobKind::ExportBlockRisuSave,
             Self::RestoreLossless { .. } => JobKind::RestoreLosslessBackup,
+            Self::RestoreOfficialSnapshot { .. } => JobKind::RestoreOfficialAccountSnapshot,
             Self::ExportLossless { .. } => JobKind::ExportLosslessBackup,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
@@ -1531,6 +1579,9 @@ impl NativeFileJobTask {
                 expected_revision, ..
             }
             | Self::RestoreLossless {
+                expected_revision, ..
+            }
+            | Self::RestoreOfficialSnapshot {
                 expected_revision, ..
             }
             | Self::ExportLossless {
@@ -1768,6 +1819,7 @@ pub(crate) fn native_lossless_handoff_cleanup(
 pub(crate) enum JobKind {
     RestoreBlockRisuSave,
     RestoreLosslessBackup,
+    RestoreOfficialAccountSnapshot,
     ExportBlockRisuSave,
     ExportLosslessBackup,
     PrepareContentImport,
@@ -1911,7 +1963,9 @@ impl JobRegistry {
             warning_codes,
             matches!(
                 kind,
-                JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+                JobKind::RestoreBlockRisuSave
+                    | JobKind::RestoreLosslessBackup
+                    | JobKind::RestoreOfficialAccountSnapshot
             ),
         )
     }
@@ -2118,7 +2172,9 @@ impl JobControl {
         }
         if !matches!(
             status.kind,
-            JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+            JobKind::RestoreBlockRisuSave
+                | JobKind::RestoreLosslessBackup
+                | JobKind::RestoreOfficialAccountSnapshot
         ) {
             return Ok(FinalizeOutcome::TooEarly);
         }
@@ -2159,7 +2215,9 @@ impl JobControl {
                 .map_err(|error| format!("native job status mutex poisoned: {error}"))?;
             if !matches!(
                 status.kind,
-                JobKind::RestoreBlockRisuSave | JobKind::RestoreLosslessBackup
+                JobKind::RestoreBlockRisuSave
+                    | JobKind::RestoreLosslessBackup
+                    | JobKind::RestoreOfficialAccountSnapshot
             ) || status.state != JobState::Running
                 || status.phase != JobPhase::StagingDatabase
             {
@@ -2202,6 +2260,7 @@ impl JobControl {
         let expected = match status.kind {
             JobKind::RestoreBlockRisuSave => JobPhase::ReadingSource,
             JobKind::RestoreLosslessBackup => JobPhase::ReadingSource,
+            JobKind::RestoreOfficialAccountSnapshot => JobPhase::ReadingSource,
             JobKind::ExportBlockRisuSave => JobPhase::WritingExport,
             JobKind::ExportLosslessBackup => JobPhase::WritingExport,
             JobKind::PrepareContentImport => JobPhase::ReadingSource,

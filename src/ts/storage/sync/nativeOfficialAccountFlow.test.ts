@@ -10,7 +10,7 @@ import {
     nativeOfficialAccountKeys,
 } from './nativeOfficialAccountFlow'
 
-function createHarness(loggedIn = false) {
+function createHarness(loggedIn = false, useNativeRestore = false) {
     const values = new Map<string, unknown>()
     const events: string[] = []
     const appKv: NativeAppKv = {
@@ -42,6 +42,12 @@ function createHarness(loggedIn = false) {
     const flushMetadata = vi.fn(async () => { events.push('metadata:flush') })
     const resetMetadata = vi.fn(() => events.push('metadata:reset'))
     const resetAccountSession = vi.fn(() => events.push('session:reset'))
+    const nativeRestore = vi.fn(async (): Promise<
+        OfficialPullResult | { kind: 'compatibility-fallback' }
+    > => ({
+        kind: 'activated',
+        revision: 8,
+    }))
     const flow = createNativeOfficialAccountFlow({
         appKv,
         adapter,
@@ -58,6 +64,7 @@ function createHarness(loggedIn = false) {
         flushMetadata,
         resetMetadata,
         resetAccountSession,
+        ...(useNativeRestore ? { nativeRestore } : {}),
     })
     return {
         adapter,
@@ -68,6 +75,7 @@ function createHarness(loggedIn = false) {
         flushMetadata,
         flushPendingData,
         publication,
+        nativeRestore,
         restart,
         setRouting,
         values,
@@ -251,6 +259,38 @@ describe('explicit native official account flow', () => {
         expect(loggedIn.adapter.pull).toHaveBeenCalledOnce()
         expect(loggedIn.adapter.pin).not.toHaveBeenCalled()
         expect(loggedIn.restart).not.toHaveBeenCalled()
+    })
+
+    it('uses the bounded native snapshot restore when it is configured', async () => {
+        const harness = createHarness(true, true)
+
+        await expect(harness.flow.restore()).resolves.toEqual({
+            kind: 'activated',
+            revision: 8,
+        })
+
+        expect(harness.nativeRestore).toHaveBeenCalledWith({
+            id: 'account-1',
+            token: 'legacy-token',
+            data: {},
+        })
+        expect(harness.adapter.pull).not.toHaveBeenCalled()
+        expect(harness.events).toEqual(['flush', 'metadata:flush', 'restart'])
+    })
+
+    it('uses the existing prepared Web restore only for a native compatibility fallback', async () => {
+        const harness = createHarness(true, true)
+        harness.nativeRestore.mockResolvedValueOnce({ kind: 'compatibility-fallback' })
+        harness.adapter.pull.mockResolvedValueOnce({ kind: 'activated', revision: 9 })
+
+        await expect(harness.flow.restore()).resolves.toEqual({
+            kind: 'activated',
+            revision: 9,
+        })
+
+        expect(harness.nativeRestore).toHaveBeenCalledOnce()
+        expect(harness.adapter.pull).toHaveBeenCalledOnce()
+        expect(harness.events).toEqual(['flush', 'metadata:flush', 'restart'])
     })
 
     it('serializes concurrent restore, publish, and logout operations', async () => {

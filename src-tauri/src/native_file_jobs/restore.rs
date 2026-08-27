@@ -70,13 +70,60 @@ pub(crate) fn restore_block_risu_save(
     job: &JobControl,
     sink: &dyn ReplacementSink,
 ) -> Result<JobResultSummary, NativeJobError> {
-    restore_risu_save_reader(
+    restore_risu_save_reader_with_pre_activation(
         source.file,
         source.total_bytes,
         expected_revision,
         job,
         sink,
         RestoreLimits::default(),
+        true,
+        || Ok(None),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn restore_risu_save_with_pre_activation<F>(
+    source: OpenedJobSource,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    before_activation: F,
+) -> Result<JobResultSummary, NativeJobError>
+where
+    F: FnOnce() -> Result<Option<String>, NativeJobError>,
+{
+    restore_risu_save_reader_with_pre_activation(
+        source.file,
+        source.total_bytes,
+        expected_revision,
+        job,
+        sink,
+        RestoreLimits::default(),
+        true,
+        before_activation,
+    )
+}
+
+pub(crate) fn restore_started_risu_save_with_pre_activation<F>(
+    source: OpenedJobSource,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    before_activation: F,
+) -> Result<JobResultSummary, NativeJobError>
+where
+    F: FnOnce() -> Result<Option<String>, NativeJobError>,
+{
+    restore_risu_save_reader_with_pre_activation(
+        source.file,
+        source.total_bytes,
+        expected_revision,
+        job,
+        sink,
+        RestoreLimits::default(),
+        false,
+        before_activation,
     )
 }
 
@@ -170,6 +217,7 @@ fn restore_block_risu_save_reader<R: Read>(
     restore_risu_save_reader(source, total_bytes, expected_revision, job, sink, limits)
 }
 
+#[cfg(test)]
 fn restore_risu_save_reader<R: Read>(
     source: R,
     total_bytes: u64,
@@ -178,14 +226,42 @@ fn restore_risu_save_reader<R: Read>(
     sink: &dyn ReplacementSink,
     limits: RestoreLimits,
 ) -> Result<JobResultSummary, NativeJobError> {
+    restore_risu_save_reader_with_pre_activation(
+        source,
+        total_bytes,
+        expected_revision,
+        job,
+        sink,
+        limits,
+        true,
+        || Ok(None),
+    )
+}
+
+fn restore_risu_save_reader_with_pre_activation<R, F>(
+    source: R,
+    total_bytes: u64,
+    expected_revision: i64,
+    job: &JobControl,
+    sink: &dyn ReplacementSink,
+    limits: RestoreLimits,
+    start_job: bool,
+    before_activation: F,
+) -> Result<JobResultSummary, NativeJobError>
+where
+    R: Read,
+    F: FnOnce() -> Result<Option<String>, NativeJobError>,
+{
     if job.is_cancel_requested() {
         return Err(cancelled("restore cancelled before staging"));
     }
     if total_bytes < RISU_SAVE_HEADER.len() as u64 {
         return Err(truncated("truncated block RisuSave header"));
     }
-    job.start(JobPhase::ReadingSource)
-        .map_err(|error| job_error(job, error))?;
+    if start_job {
+        job.start(JobPhase::ReadingSource)
+            .map_err(|error| job_error(job, error))?;
+    }
     let mut reader = TrackedReader::new(source, total_bytes, job);
     let format = read_risu_save_format(&mut reader)?;
 
@@ -210,6 +286,10 @@ fn restore_risu_save_reader<R: Read>(
         if job.is_cancel_requested() {
             return Err(cancelled("restore cancelled before activation"));
         }
+        let recovery_path = before_activation()?;
+        if job.is_cancel_requested() {
+            return Err(cancelled("restore cancelled before activation"));
+        }
         job.wait_for_restore_finalization()
             .map_err(|error| job_error(job, error))?;
         let revision = sink
@@ -224,7 +304,7 @@ fn restore_risu_save_reader<R: Read>(
             preset_count: parsed.preset_count,
             warning_codes: Vec::new(),
             handoff_path: None,
-            recovery_path: None,
+            recovery_path,
         })
     })();
     match outcome {
@@ -1554,6 +1634,50 @@ mod tests {
         assert_eq!(restored["modules"][0]["name"], "Module");
         assert_eq!(restored["pluginCustomStorage"]["plugin"]["enabled"], true);
         assert_eq!(restored["characters"][0]["chaId"], "char-1");
+    }
+
+    #[test]
+    fn pre_activation_backup_failure_aborts_the_staged_snapshot() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("valid.risudat");
+        valid_save(&source);
+        let opened = super::super::open_regular_file_no_follow(&source).unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+
+        let error = restore_risu_save_with_pre_activation(opened, 1, &job, &sink, || {
+            Err(NativeJobError::new(
+                "backup-failed",
+                "recovery backup failed",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.code, "backup-failed");
+        let store = sink.store.lock().unwrap();
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(Some(1)).unwrap()["username"], "Old");
+    }
+
+    #[test]
+    fn pre_activation_backup_path_is_returned_after_commit() {
+        let (directory, sink) = fixture();
+        let source = directory.path().join("valid.risudat");
+        valid_save(&source);
+        let opened = super::super::open_regular_file_no_follow(&source).unwrap();
+        let registry = JobRegistry::default();
+        let job = registry.create(JobKind::RestoreBlockRisuSave).unwrap();
+
+        let result = restore_risu_save_with_pre_activation(opened, 1, &job, &sink, || {
+            Ok(Some("recovery.risulossless".to_owned()))
+        })
+        .unwrap();
+
+        assert_eq!(result.revision, 2);
+        assert_eq!(
+            result.recovery_path.as_deref(),
+            Some("recovery.risulossless")
+        );
     }
 
     #[test]

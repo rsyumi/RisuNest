@@ -15,9 +15,9 @@ import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
 import { loadPlugins, pluginCompatibility } from "./plugins/plugins.svelte";
 import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
-import { alertConfirm, alertError, alertInput, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
+import { alertConfirm, alertError, alertInput, alertLogin, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
-import { characterURLImport } from "./characterCards";
+import { characterURLImport, hubURL } from "./characterCards";
 import { loadRisuAccountData } from "./drive/accounter";
 import { decodeRisuSave } from "./storage/risuSave";
 import { updateAnimationSpeed } from "./gui/animation";
@@ -119,6 +119,10 @@ import {
     nativeOfficialAccountKeys,
     normalizeNativeOfficialAccountCredential,
 } from "./storage/sync/nativeOfficialAccountFlow";
+import {
+    NativeFileJobError,
+    runNativeOfficialAccountSnapshotRestore,
+} from "./storage/nativeFileJobs";
 export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
@@ -429,6 +433,44 @@ export async function loadData() {
                     officialAssetLedger.reset()
                 },
                 resetAccountSession: resetAccountStorageSession,
+                nativeRestore: async (initialCredential) => {
+                    let credential = initialCredential
+                    for (let attempt = 0; attempt < 3; attempt += 1) {
+                        try {
+                            const result = await runNativeOfficialAccountSnapshotRestore(
+                                runtime,
+                                {
+                                    baseUrl: hubURL,
+                                    credential: {
+                                        kind: 'risu-auth',
+                                        token: credential.token,
+                                    },
+                                },
+                                { afterRefresh: loadPlugins },
+                            )
+                            if (result.kind !== 'activated') return result
+                            officialAdapter.rememberNativeActivation(
+                                credential.id,
+                                result.revision,
+                                result.sourceSha256,
+                            )
+                            return { kind: 'activated', revision: result.revision }
+                        } catch (error) {
+                            if (
+                                !(error instanceof NativeFileJobError)
+                                || error.code !== 'reauthentication-needed'
+                                || attempt >= 2
+                            ) throw error
+                            if (!snapshotRequestReauthentication) {
+                                throw new Error('Native snapshot reauthentication is not configured')
+                            }
+                            credential = await snapshotRequestReauthentication.reauthenticate(
+                                await alertLogin(),
+                            )
+                        }
+                    }
+                    throw new Error('Native official account restore did not complete')
+                },
             })
             nativeOfficialFlow = service.flow
             snapshotRequestReauthentication = service.snapshotRequestReauthentication

@@ -38,6 +38,24 @@ export interface NativeFileJobResult {
     recoveryPath?: string
 }
 
+export interface NativeOfficialAccountSnapshotRestoreRequest {
+    baseUrl: string
+    credential:
+        | { kind: 'risu-auth'; token: string }
+        | { kind: 'bearer'; token: string }
+}
+
+export type NativeOfficialAccountSnapshotRestoreResult =
+    | { kind: 'missing' }
+    | { kind: 'compatibility-fallback' }
+    | {
+        kind: 'activated'
+        revision: number
+        sourceSha256: string
+        recoveryPath?: string
+        warningCodes: string[]
+    }
+
 export interface PreparedContentAssetDescriptor {
     referenceKey: string
     token: string
@@ -67,6 +85,7 @@ export interface NativeFileJobStatus {
         | 'export-lossless-backup'
         | 'prepare-content-import'
         | 'kei-backup-upload'
+        | 'restore-official-account-snapshot'
     expectedRevision?: number
     warningCodes?: string[]
     state: NativeFileJobState
@@ -422,9 +441,10 @@ async function invokeNative(
 }
 
 function abortBeforeNativeRestoreStart(
-    source: NativeFileJobSource,
+    source: NativeFileJobSource | NativeOfficialAccountSnapshotRestoreRequest,
     dependencies: NativeFileJobDependencies,
 ): never {
+    if (!('type' in source)) throw abortError()
     let discarded = source.type !== 'androidSpool'
     if (source.type === 'androidSpool') {
         try {
@@ -442,16 +462,21 @@ function abortBeforeNativeRestoreStart(
 }
 
 async function runNativeReplacementRestore(
-    kind: 'restore-block-risu-save' | 'restore-lossless-backup',
+    kind:
+        | 'restore-block-risu-save'
+        | 'restore-lossless-backup'
+        | 'restore-official-account-snapshot',
     mutationReason: string,
     runtime: NativeBlockRestoreRuntime,
-    source: NativeFileJobSource,
+    source: NativeFileJobSource | NativeOfficialAccountSnapshotRestoreRequest,
     options: NativeFileRestoreJobOptions = {},
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
     const operation = kind === 'restore-lossless-backup'
         ? 'Native lossless backup restore'
-        : 'Native block RisuSave restore'
+        : kind === 'restore-official-account-snapshot'
+            ? 'Native official account snapshot restore'
+            : 'Native block RisuSave restore'
     if (!dependencies.isTauri()) {
         throw new Error(`${operation} requires Tauri`)
     }
@@ -465,13 +490,21 @@ async function runNativeReplacementRestore(
     if (options.signal?.aborted) {
         abortBeforeNativeRestoreStart(source, dependencies)
     }
-    const started = await invokeNative(dependencies, 'native_file_job_start', {
-        request: {
+    const request = kind === 'restore-official-account-snapshot'
+        ? {
             kind,
-            source,
+            ...(source as NativeOfficialAccountSnapshotRestoreRequest),
             expectedRevision: mutationToken.revision,
-        },
-    }) as { jobId: string; warningCodes?: string[] }
+        }
+        : {
+            kind,
+            source: source as NativeFileJobSource,
+            expectedRevision: mutationToken.revision,
+        }
+    const started = await invokeNative(dependencies, 'native_file_job_start', { request }) as {
+        jobId: string
+        warningCodes?: string[]
+    }
     let cancellationRequested = false
     let terminal: NativeFileJobStatus | undefined
     let mutationConflict: NativeFileJobError | undefined
@@ -623,6 +656,41 @@ export function runNativeLosslessBackupRestore(
         options,
         dependencies,
     )
+}
+
+export async function runNativeOfficialAccountSnapshotRestore(
+    runtime: NativeBlockRestoreRuntime,
+    request: NativeOfficialAccountSnapshotRestoreRequest,
+    options: NativeFileRestoreJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeOfficialAccountSnapshotRestoreResult> {
+    let result: NativeFileJobResult
+    try {
+        result = await runNativeReplacementRestore(
+            'restore-official-account-snapshot',
+            'native-official-account-snapshot-restore',
+            runtime,
+            request,
+            options,
+            dependencies,
+        )
+    }
+    catch (error) {
+        if (error instanceof NativeFileJobError && error.code === 'remote-missing') {
+            return { kind: 'missing' }
+        }
+        if (error instanceof NativeFileJobError && error.code === 'compatibility-required') {
+            return { kind: 'compatibility-fallback' }
+        }
+        throw error
+    }
+    return {
+        kind: 'activated',
+        revision: result.revision,
+        sourceSha256: result.sourceSha256,
+        recoveryPath: result.recoveryPath,
+        warningCodes: result.warningCodes,
+    }
 }
 
 export async function runNativeBlockRisuSaveExport(

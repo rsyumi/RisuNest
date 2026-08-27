@@ -365,6 +365,18 @@ export class OfficialAccountSnapshotAdapter implements OfficialRevisionPublisher
         this.unavailableRemoteAssets.clear()
     }
 
+    rememberNativeActivation(
+        accountId: string,
+        revision: DataRevision,
+        databaseFingerprint: string,
+    ): void {
+        this.rememberAssociation(accountId, {
+            revision,
+            databaseFingerprint,
+            syncedAt: this.stampTime(),
+        })
+    }
+
     private resolveAssociation(accountId: string | undefined): OfficialAssociationRecord | null {
         const resolvedAccountId = accountId ?? null
         if (resolvedAccountId !== this.associatedAccountId) {

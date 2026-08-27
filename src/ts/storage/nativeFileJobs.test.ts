@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
     NativeFileJobActivationCommittedError,
+    runNativeOfficialAccountSnapshotRestore,
     runNativeBlockRisuSaveRestore,
     runNativeBlockRisuSaveExport,
     runNativeLosslessBackupExport,
@@ -54,6 +55,150 @@ function restoreRuntime(
 }
 
 describe('native file jobs', () => {
+    it('restores an official snapshot without transferring its database bytes through IPC', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const events: string[] = []
+        const statuses: NativeFileJobStatus[] = [
+            {
+                ...status('waitingForInput'),
+                kind: 'restore-official-account-snapshot',
+                phase: 'awaiting-activation',
+            },
+            {
+                ...status('succeeded', {
+                    revision: 12,
+                    sourceBytes: 16_384,
+                    sourceSha256: 'b'.repeat(64),
+                    characterCount: 4,
+                    presetCount: 2,
+                    warningCodes: [],
+                    recoveryPath: 'C:\\app\\persistent\\recovery\\risulossless-recovery-official.risulossless',
+                }),
+                kind: 'restore-official-account-snapshot',
+            },
+        ]
+
+        const result = await runNativeOfficialAccountSnapshotRestore(
+            restoreRuntime(11, {
+                acquire: () => { events.push('fence-acquired') },
+                refresh: () => { events.push('refreshed') },
+                release: () => { events.push('fence-released') },
+            }),
+            {
+                baseUrl: 'https://hub.example',
+                credential: { kind: 'risu-auth', token: 'secret-token' },
+            },
+            { afterRefresh: () => { events.push('plugins-reloaded') } },
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'official-restore' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result).toMatchObject({
+            kind: 'activated',
+            revision: 12,
+            recoveryPath: expect.stringContaining('risulossless-recovery-official'),
+        })
+        expect(events).toEqual([
+            'fence-acquired',
+            'refreshed',
+            'plugins-reloaded',
+            'fence-released',
+        ])
+        expect(calls[0]).toEqual(['native_file_job_start', {
+            request: {
+                kind: 'restore-official-account-snapshot',
+                baseUrl: 'https://hub.example',
+                credential: { kind: 'risu-auth', token: 'secret-token' },
+                expectedRevision: 11,
+            },
+        }])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+        expect(JSON.stringify(calls)).not.toContain('databaseBytes')
+    })
+
+    it('returns a missing official snapshot without taking the replacement fence', async () => {
+        const acquire = vi.fn()
+        const commands: string[] = []
+
+        const result = await runNativeOfficialAccountSnapshotRestore(
+            restoreRuntime(11, { acquire }),
+            {
+                baseUrl: 'https://hub.example',
+                credential: { kind: 'risu-auth', token: 'secret-token' },
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'official-missing' }
+                    if (command === 'native_file_job_status') return {
+                        ...status('failed'),
+                        kind: 'restore-official-account-snapshot',
+                        state: 'failed',
+                        phase: 'complete',
+                        error: {
+                            code: 'remote-missing',
+                            message: 'No official account snapshot exists',
+                        },
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result).toEqual({ kind: 'missing' })
+        expect(acquire).not.toHaveBeenCalled()
+        expect(commands).not.toContain('native_file_job_finalize')
+    })
+
+    it('maps a legacy compatibility result without taking the replacement fence', async () => {
+        const acquire = vi.fn()
+
+        const result = await runNativeOfficialAccountSnapshotRestore(
+            restoreRuntime(11, { acquire }),
+            {
+                baseUrl: 'https://hub.example',
+                credential: { kind: 'risu-auth', token: 'secret-token' },
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    if (command === 'native_file_job_start') return { jobId: 'official-legacy' }
+                    if (command === 'native_file_job_status') return {
+                        ...status('failed'),
+                        kind: 'restore-official-account-snapshot',
+                        state: 'failed',
+                        phase: 'complete',
+                        error: {
+                            code: 'compatibility-required',
+                            message: 'Legacy snapshot requires preparation',
+                        },
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result).toEqual({ kind: 'compatibility-fallback' })
+        expect(acquire).not.toHaveBeenCalled()
+    })
+
     it('keeps unavailable lossless backup capability as a structured native error', async () => {
         const calls: string[] = []
 

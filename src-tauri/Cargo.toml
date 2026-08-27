@@ -88,10 +88,10 @@ libc = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21.1"
-reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.11.16", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.11.16", features = ["json"] }
+reqwest = { version = "0.11.16", features = ["json", "stream"] }
 
 [dev-dependencies]
 regex = "1.13.1"

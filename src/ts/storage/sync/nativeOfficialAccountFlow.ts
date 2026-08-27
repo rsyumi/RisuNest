@@ -30,6 +30,9 @@ export interface NativeOfficialAccountFlowDependencies {
     flushMetadata(): Promise<void>
     resetMetadata(): void
     resetAccountSession(): void
+    nativeRestore?(credential: NativeOfficialAccountCredential): Promise<
+        OfficialPullResult | { kind: 'compatibility-fallback' }
+    >
 }
 
 export interface NativeOfficialAccountFlow {
@@ -150,7 +153,12 @@ export function createNativeOfficialAccountFlowService(
             return serialize(async () => {
                 if (!credential) throw new Error('Native official account login is required')
                 await dependencies.flushPendingData('native-official-restore')
-                const result = await dependencies.adapter.pull()
+                const nativeResult = dependencies.nativeRestore
+                    ? await dependencies.nativeRestore(credential)
+                    : await dependencies.adapter.pull()
+                const result = nativeResult.kind === 'compatibility-fallback'
+                    ? await dependencies.adapter.pull()
+                    : nativeResult
                 if (result.kind === 'activated') {
                     let failed = false
                     let originalError: unknown
