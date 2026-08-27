@@ -7,6 +7,8 @@ import type {
 } from './storage/persistentDataStore'
 import { openChatScreenshotSourceLease } from './chatScreenshotSourceLease'
 import type { ChatScreenshotRenderContext } from './chatScreenshotRange'
+import type { SelectedConversationTarget } from './storage/activeWorkingSet.svelte'
+import type { WindowedConversationPersistenceAuthority } from './storage/saveCoordinator'
 
 function chat(messages: Message[]): Chat {
     return {
@@ -113,11 +115,19 @@ function harness(messages: Message[]) {
     } as unknown as PersistentDataStore
     let activeSession: ActiveConversationSession | null = session
     let navigationGeneration = 1
+    const target = {
+        characterId: owner.chaId,
+        conversationId: conversation.id!,
+        navigationGeneration,
+        storeRevision: session.storeRevision,
+    } as SelectedConversationTarget
     const dependencies = {
         store,
         flushPendingData: vi.fn(async () => undefined),
         getNavigationGeneration: () => navigationGeneration,
         getActiveConversationSession: () => activeSession,
+        captureSelectedConversationTarget: () => activeSession ? target : null,
+        captureSelectedConversationAuthority: () => null,
     }
     return {
         owner,
@@ -136,7 +146,103 @@ function harness(messages: Message[]) {
     }
 }
 
+function windowedHarness(messages: Message[]) {
+    const source = harness(messages)
+    source.replaceSession(null)
+    let current = true
+    const target = {
+        characterId: source.owner.chaId,
+        conversationId: source.conversation.id!,
+        navigationGeneration: 1,
+        storeRevision: 7,
+    } as SelectedConversationTarget
+    const authority: WindowedConversationPersistenceAuthority = {
+        kind: 'windowed',
+        characterId: target.characterId,
+        conversationId: target.conversationId,
+        sessionToken: source.session.sessionToken,
+        storeRevision: target.storeRevision,
+        persistedSessionVersion: 4,
+        sessionVersion: 4,
+        totalMessages: messages.length,
+    }
+    const readConversation = vi.fn()
+    Object.assign(source.dependencies.store, { readConversation })
+    Object.assign(source.dependencies, {
+        captureSelectedConversationTarget: () => current ? target : null,
+        captureSelectedConversationAuthority: () => current ? authority : null,
+    })
+    return {
+        ...source,
+        target,
+        authority,
+        readConversation,
+        invalidateTarget() {
+            current = false
+        },
+    }
+}
+
 describe('chat screenshot source lease', () => {
+    it('opens a windowed selected conversation from its exact bounded authority', async () => {
+        const source = windowedHarness([
+            { role: 'user', data: 'one' },
+            { role: 'char', data: 'two' },
+            { role: 'user', data: 'three' },
+        ])
+
+        const screenshot = await openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)
+        const job = await screenshot.createJob(2, 3)
+
+        expect(job.messages.map((message) => message.data)).toEqual(['two', 'three'])
+        expect(screenshot.snapshot).toMatchObject({
+            revision: 7,
+            sessionVersion: 4,
+            totalTurns: 3,
+        })
+        expect(source.dependencies.store.acquireRevision).toHaveBeenCalledWith(7)
+        expect(source.readConversation).not.toHaveBeenCalled()
+        expect(source.reads).toContainEqual({ startIndex: 0, limit: 1 })
+        expect(source.reads).toContainEqual({ startIndex: 1, limit: 2 })
+        expect(source.reads.every(({ limit }) => limit <= 2)).toBe(true)
+    })
+
+    it('rejects a windowed target that changes during the flush', async () => {
+        const source = windowedHarness([{ role: 'user', data: 'one' }])
+        source.dependencies.flushPendingData.mockImplementation(async () => {
+            source.invalidateTarget()
+        })
+
+        await expect(openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)).rejects.toThrow('Screenshot conversation changed while opening')
+
+        expect(source.dependencies.store.acquireRevision).not.toHaveBeenCalled()
+    })
+
+    it('releases a windowed lease when the exact target changes during pinning', async () => {
+        const source = windowedHarness([{ role: 'user', data: 'one' }])
+        const acquire = source.dependencies.store.acquireRevision as ReturnType<typeof vi.fn>
+        acquire.mockImplementation(async () => {
+            source.invalidateTarget()
+            return source.lease
+        })
+
+        await expect(openChatScreenshotSourceLease({
+            characterId: source.owner.chaId,
+            chatId: source.conversation.id!,
+            renderContext: renderContext(source.owner),
+        }, source.dependencies)).rejects.toThrow('Screenshot conversation changed while opening')
+
+        expect(source.release).toHaveBeenCalledTimes(1)
+    })
+
     it('reads the exact open-time revision after the live session changes', async () => {
         const source = harness([
             { role: 'user', data: 'open one', chatId: 'one' },

@@ -727,6 +727,10 @@
                 flushPendingData: (reason) => runtime.flushPendingData(reason),
                 getNavigationGeneration: () => runtime.getNavigationGeneration(),
                 getActiveConversationSession: () => runtime.getActiveConversationSession(),
+                captureSelectedConversationTarget: () =>
+                    runtime.captureSelectedConversationTarget(),
+                captureSelectedConversationAuthority: () =>
+                    runtime.captureSelectedConversationAuthority(),
             })
             if (openGeneration !== screenshotOpenGeneration) {
                 await lease.close()

@@ -98,6 +98,17 @@ export interface SelectedConversationTarget {
     readonly [selectedConversationTargetBrand]: symbol
 }
 
+export function isSameSelectedConversationTarget(
+    left: SelectedConversationTarget,
+    right: SelectedConversationTarget,
+): boolean {
+    return left.characterId === right.characterId &&
+        left.conversationId === right.conversationId &&
+        left.navigationGeneration === right.navigationGeneration &&
+        left.storeRevision === right.storeRevision &&
+        left[selectedConversationTargetBrand] === right[selectedConversationTargetBrand]
+}
+
 export interface CompleteConversationLease {
     readonly reason: string
     readonly session: ActiveConversationSession
