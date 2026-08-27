@@ -1,6 +1,12 @@
 use super::{
-    lan::validate_lan_endpoint, DownloadReport, LanCloneClient, LoopbackCloneClient, PeerSyncError,
+    activate_downloaded_clone, lan::validate_lan_endpoint, CloneTargetAdapter, CloneValidator,
+    DownloadReport, LanCloneClient, LoopbackCloneClient, LosslessCloneTargetAdapter, PeerSyncError,
     TransferCancellation,
+};
+use crate::{
+    asset_repository::PayloadCas,
+    local_backup::CancellationProbe,
+    persistent_store::{PersistentStore, StoreError},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -71,6 +77,8 @@ pub enum AndroidCloneJobPhase {
     Downloading,
     #[serde(rename = "awaitingActivation")]
     VerifiedAwaitingActivation,
+    #[serde(rename = "cancelled")]
+    Cancelled,
     #[serde(rename = "failed")]
     Failed,
 }
@@ -635,9 +643,9 @@ impl AndroidCloneJobRegistry {
         }
         let job = AndroidResumableCloneJob::open(job_root)?;
         if job.cancel_requested()? {
-            job.discard()?;
-            self.remove_current_id()?;
-            return Ok(None);
+            let mut status = job.status()?;
+            status.phase = AndroidCloneJobPhase::Cancelled;
+            return Ok(Some(status));
         }
         Ok(Some(job.status()?))
     }
@@ -656,21 +664,57 @@ impl AndroidCloneJobRegistry {
         AndroidResumableCloneJob::request_cancel_at(root)
     }
 
-    pub(crate) fn open_activation_client(
+    pub(crate) fn finalize(
         &self,
         job_id: &str,
-    ) -> Result<LoopbackCloneClient, PeerSyncError> {
-        let root = self.owned_job_root(job_id)?;
-        AndroidResumableCloneJob::open(root)?.into_activation_client()
-    }
-
-    pub(crate) fn mark_committed(
-        &self,
-        job_id: &str,
-        committed_revision: u64,
-    ) -> Result<AndroidCloneJobStatus, PeerSyncError> {
-        let root = self.owned_job_root(job_id)?;
-        AndroidResumableCloneJob::open(root)?.mark_committed(committed_revision)
+        store: &mut PersistentStore,
+        cas: &PayloadCas,
+        activation_root: &Path,
+        expected_revision: i64,
+        cancellation: &dyn CancellationProbe,
+    ) -> Result<u64, PeerSyncError> {
+        let state = self.lock()?;
+        let root = self.owned_job_root_locked(job_id, &state)?;
+        let job = AndroidResumableCloneJob::open(&root)?;
+        let status = job.status()?;
+        if let Some(committed_revision) = status.committed_revision {
+            return Ok(committed_revision);
+        }
+        if status.phase != AndroidCloneJobPhase::VerifiedAwaitingActivation {
+            return Err(PeerSyncError::Validation(
+                "Android clone job is not awaiting activation".to_owned(),
+            ));
+        }
+        let manifest_id = status.manifest_id;
+        let mut client = job.into_activation_client()?;
+        let mut target = LosslessCloneTargetAdapter::new(
+            store,
+            cas,
+            activation_root,
+            expected_revision,
+            cancellation,
+        )?;
+        let mut validator = AndroidVerifiedCloneValidator;
+        let activation = activate_downloaded_clone(&mut client, &mut target, &mut validator);
+        match activation {
+            Ok(()) | Err(PeerSyncError::AlreadyActivated) => {}
+            Err(error) => match target.active_manifest_id() {
+                Ok(Some(active)) if active == manifest_id => {}
+                Ok(_) => return Err(error),
+                Err(reconcile) => {
+                    return Err(PeerSyncError::Storage(format!(
+                        "{error}; failed to reconcile Android clone activation: {reconcile}"
+                    )))
+                }
+            },
+        }
+        drop(target);
+        let committed_revision =
+            u64::try_from(store.revision().map_err(store_error)?).map_err(|_| {
+                PeerSyncError::Storage("Android clone committed revision is negative".to_owned())
+            })?;
+        AndroidResumableCloneJob::open(root)?.mark_committed(committed_revision)?;
+        Ok(committed_revision)
     }
 
     pub(crate) fn release(&self, job_id: &str) -> Result<(), PeerSyncError> {
@@ -742,7 +786,7 @@ impl AndroidCloneJobRegistry {
                 }
                 Err(error) => return Err(error),
             };
-            if job.cancel_requested()? {
+            if pause_interrupted_downloads && job.cancel_requested()? {
                 job.discard()?;
                 continue;
             }
@@ -806,6 +850,22 @@ impl AndroidCloneJobRegistry {
             .lock()
             .map_err(|_| PeerSyncError::Storage("Android clone registry lock failed".to_owned()))
     }
+}
+
+struct AndroidVerifiedCloneValidator;
+
+impl<S> CloneValidator<S> for AndroidVerifiedCloneValidator {
+    fn validate(
+        &mut self,
+        _manifest: &super::CloneManifest,
+        _stage: &S,
+    ) -> Result<(), PeerSyncError> {
+        Ok(())
+    }
+}
+
+fn store_error(error: StoreError) -> PeerSyncError {
+    PeerSyncError::Storage(error.to_string())
 }
 
 fn write_cancel_marker(root: &Path, manifest_id: &str) -> Result<(), PeerSyncError> {

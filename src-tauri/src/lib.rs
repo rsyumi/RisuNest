@@ -480,6 +480,12 @@ pub fn run() {
             );
             #[cfg(desktop)]
             app.manage(peer_sync::commands::PeerCloneCommandState::default());
+            #[cfg(target_os = "android")]
+            app.manage(
+                peer_sync::android_commands::AndroidPeerCloneCommandState::initialize(
+                    app_data_dir.clone(),
+                ),
+            );
             #[cfg(any(target_os = "windows", target_os = "android"))]
             app.manage(regex_shadow::RegexCancellationRegistry::default());
             Ok(())
@@ -551,6 +557,22 @@ pub fn run() {
             peer_sync::commands::peer_clone_release_target,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_finalize,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_capabilities,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_claim,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_current,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_download,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_request_cancel,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_cancel_foreground,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_finalize,
+            #[cfg(target_os = "android")]
+            peer_sync::android_commands::peer_clone_android_release,
             oauth_login,
             native_tokenizer::tokenize_batch,
             native_media::native_media_write_inlay_image,

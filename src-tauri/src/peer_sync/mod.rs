@@ -1,4 +1,7 @@
+#[cfg(any(target_os = "android", test))]
 mod android_client;
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod android_commands;
 #[cfg(any(target_os = "android", test))]
 mod android_jni;
 mod client;
@@ -10,7 +13,7 @@ mod http_stream;
 mod lan;
 pub(crate) mod logical_delta;
 mod logical_delta_transfer;
-#[cfg(desktop)]
+#[cfg(any(desktop, target_os = "android", test))]
 mod production;
 mod protocol;
 mod session;
@@ -21,6 +24,7 @@ mod tunnel;
 #[cfg(all(test, desktop))]
 mod tests;
 
+#[cfg(any(target_os = "android", test))]
 pub use android_client::{AndroidCloneJobPhase, AndroidResumableCloneJob};
 pub use client::{
     activate_downloaded_clone, CloneActivation, CloneTargetAdapter, CloneValidator, DownloadReport,
@@ -37,7 +41,9 @@ pub use logical_delta_transfer::{
     LogicalDeltaStagedTarget, LogicalDeltaTransferSelection, ReadyLogicalDeltaPlan,
 };
 #[cfg(desktop)]
-pub(crate) use production::{prepare_lossless_clone_session, LosslessCloneTargetAdapter};
+pub(crate) use production::prepare_lossless_clone_session;
+#[cfg(any(desktop, target_os = "android", test))]
+pub(crate) use production::LosslessCloneTargetAdapter;
 pub use protocol::{
     CloneDatabase, CloneManifest, CloneObjectKind, ClonePayload, ObjectDescriptor, VerifiedChunk,
     CLONE_CHUNK_SIZE, CLONE_LOSSLESS_DATABASE_FORMAT,

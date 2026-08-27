@@ -1390,6 +1390,45 @@ fn android_clone_registry_reclaims_a_durable_cancel_marker_during_restart() {
 }
 
 #[test]
+fn android_clone_registry_retains_live_cancelled_ownership_until_native_cleanup() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let app_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let pairing = host.start().unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", host.address().unwrap().port());
+    let registry =
+        super::android_client::AndroidCloneJobRegistry::initialize(app_root.path()).unwrap();
+    let claimed = registry
+        .claim(
+            &endpoint,
+            &pairing.session_id,
+            &pairing.manifest_id,
+            &pairing.claim,
+        )
+        .unwrap();
+
+    registry.request_cancel(&claimed.job_id).unwrap();
+
+    assert_eq!(
+        registry.current().unwrap().unwrap().phase,
+        AndroidCloneJobPhase::Cancelled
+    );
+    assert!(app_root
+        .path()
+        .join("peer-clone-jobs")
+        .join(&claimed.job_id)
+        .exists());
+    assert!(super::android_jni::cancel_and_cleanup_job(
+        &claimed.job_id,
+        app_root.path().to_str().unwrap(),
+    ));
+    assert!(registry.current().unwrap().is_none());
+    host.stop().unwrap();
+}
+
+#[test]
 fn android_clone_registry_waits_for_explicit_lossless_activation_and_cleans_after_commit() {
     let source_root = tempfile::tempdir().unwrap();
     let target_root = tempfile::tempdir().unwrap();
@@ -1512,6 +1551,24 @@ fn seed_android_product_store(
         .unwrap();
     store
         .replace_put_presets(&staging, &[json!({ "name": "preset" })])
+        .unwrap();
+    store
+        .replace_put_asset_repository_authority(
+            &staging,
+            &crate::persistent_store::AssetRepositoryAuthorityState::V2 {
+                migration_id: "android-peer-clone-test-assets".to_owned(),
+                compatibility_hash: "ab".repeat(32),
+            },
+        )
+        .unwrap();
+    store
+        .replace_put_cold_payload_authority(
+            &staging,
+            &crate::persistent_store::ColdPayloadAuthorityState::V2 {
+                migration_id: "android-peer-clone-test-cold".to_owned(),
+                compatibility_hash: "cd".repeat(32),
+            },
+        )
         .unwrap();
     store.replace_commit(&staging, Some(0)).unwrap();
 }

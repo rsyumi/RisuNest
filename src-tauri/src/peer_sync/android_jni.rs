@@ -2,22 +2,24 @@ use super::{
     android_client::{AndroidCloneStopReason, AndroidCloneStopState},
     AndroidResumableCloneJob, PeerSyncError, TransferCancellation,
 };
+#[cfg(target_os = "android")]
 use jni::{
     objects::{JClass, JObject, JString, JValue},
     sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE},
     JNIEnv,
 };
+#[cfg(target_os = "android")]
+use std::panic::AssertUnwindSafe;
 use std::{
     collections::HashMap,
-    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 
-pub(crate) const RESULT_RETRYABLE_INTERRUPTION: jint = 1;
-pub(crate) const RESULT_VERIFIED_AWAITING_ACTIVATION: jint = 2;
-pub(crate) const RESULT_CANCELLED: jint = 3;
-pub(crate) const RESULT_TERMINAL_FAILURE: jint = 4;
+pub(crate) const RESULT_RETRYABLE_INTERRUPTION: i32 = 1;
+pub(crate) const RESULT_VERIFIED_AWAITING_ACTIVATION: i32 = 2;
+pub(crate) const RESULT_CANCELLED: i32 = 3;
+pub(crate) const RESULT_TERMINAL_FAILURE: i32 = 4;
 const NOTIFICATION_PROGRESS_STEP_BYTES: u64 = 4 * 1024 * 1024;
 
 struct ActiveAndroidClone {
@@ -131,7 +133,7 @@ fn resolve_job_root(files_root: &str, job_id: &str) -> Result<PathBuf, PeerSyncE
     }
 }
 
-pub(crate) fn resume_job(job_id: &str, app_data_root: &str, mut progress: impl FnMut(u64)) -> jint {
+pub(crate) fn resume_job(job_id: &str, app_data_root: &str, mut progress: impl FnMut(u64)) -> i32 {
     resume_job_with_mode(job_id, app_data_root, false, &mut progress)
 }
 
@@ -139,7 +141,7 @@ pub(crate) fn resume_foreground_job(
     job_id: &str,
     app_data_root: &str,
     mut progress: impl FnMut(u64),
-) -> jint {
+) -> i32 {
     resume_job_with_mode(job_id, app_data_root, true, &mut progress)
 }
 
@@ -148,7 +150,7 @@ fn resume_job_with_mode(
     app_data_root: &str,
     requires_foreground: bool,
     progress: &mut impl FnMut(u64),
-) -> jint {
+) -> i32 {
     let root = match resolve_job_root(app_data_root, job_id) {
         Ok(root) => root,
         Err(_) => return RESULT_TERMINAL_FAILURE,
@@ -300,10 +302,12 @@ fn cleanup_completed_job(job_id: &str, app_data_root: &str) -> bool {
     AndroidResumableCloneJob::discard_at(root).is_ok()
 }
 
+#[cfg(target_os = "android")]
 fn java_string(environment: &mut JNIEnv<'_>, value: &JString<'_>) -> Option<String> {
     environment.get_string(value).ok().map(Into::into)
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_resume(
     mut environment: JNIEnv,
@@ -345,6 +349,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_resume(
     .unwrap_or(RESULT_TERMINAL_FAILURE)
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_pause(
     mut environment: JNIEnv,
@@ -361,6 +366,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_pause(
     }
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_setForegroundAllowed(
     _environment: JNIEnv,
@@ -374,6 +380,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_setForeground
     }
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_requestCancel(
     mut environment: JNIEnv,
@@ -394,6 +401,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_requestCancel
     }
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_cancelAndCleanup(
     mut environment: JNIEnv,
@@ -414,6 +422,7 @@ pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_cancelAndClea
     }
 }
 
+#[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "system" fn Java_co_aiclient_risu_PeerCloneNativeBridge_cleanupCompleted(
     mut environment: JNIEnv,
