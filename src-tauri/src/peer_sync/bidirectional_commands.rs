@@ -95,6 +95,7 @@ pub(crate) enum PeerBidirectionalDurableOperation {
         context: PeerBidirectionalOperationContext,
         committed_revision: i64,
         shared_generation: SyncGenerationIdentity,
+        changed: bool,
         transferred_objects: u64,
         transferred_bytes: u64,
         backups: Vec<PeerBidirectionalBackupReceipt>,
@@ -330,6 +331,61 @@ impl Read for MeasuredLogicalDeltaReader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn retain_bidirectional_local_activation(
+    store: &mut PersistentStore,
+    cas: &PayloadCas,
+    app_root: &Path,
+    context: PeerBidirectionalOperationContext,
+    job: &RefCell<DurableCasJob>,
+    expected_revision: i64,
+    activation: Result<LogicalDeltaActivation, PeerSyncError>,
+    changed: bool,
+    transferred_objects: u64,
+    transferred_bytes: u64,
+    backups: Vec<PeerBidirectionalBackupReceipt>,
+) -> Result<LocalMergeOutcome, PeerSyncError> {
+    let committed_revision = match activation {
+        Ok(LogicalDeltaActivation::Activated { revision })
+        | Ok(LogicalDeltaActivation::AlreadyActive { revision }) => revision,
+        Ok(LogicalDeltaActivation::Conflict {
+            actual_revision,
+            actual_base_manifest_hash,
+        }) => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(PeerSyncError::ActivationConflict {
+                expected: Some(expected_revision.to_string()),
+                actual: Some(format!("{actual_revision}:{actual_base_manifest_hash}")),
+            });
+        }
+        Err(error) => {
+            let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
+            return Err(error);
+        }
+    };
+    let shared = store
+        .seal_or_initialize_active_logical_generation(cas)
+        .map_err(store_error)?;
+    PeerBidirectionalOperationJournal::new(app_root).store(
+        &PeerBidirectionalDurableOperation::LocalCommitted {
+            schema: OPERATION_SCHEMA.to_owned(),
+            context,
+            committed_revision,
+            shared_generation: SyncGenerationIdentity {
+                generation_id: shared.manifest.generation,
+                manifest_hash: shared.manifest_hash,
+                generation_sequence: shared.manifest.generation_sequence,
+            },
+            changed,
+            transferred_objects: if changed { transferred_objects } else { 0 },
+            transferred_bytes: if changed { transferred_bytes } else { 0 },
+            backups,
+        },
+    )?;
+    job.borrow_mut().release(CasReleaseOutcome::Committed)?;
+    Ok(LocalMergeOutcome::LocalCommitted)
+}
+
 fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
     store: &mut PersistentStore,
     cas: &PayloadCas,
@@ -474,43 +530,19 @@ fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
             );
             let (transferred_objects, transferred_bytes) = measured_source.totals();
             drop(target);
-            let committed_revision = match activation {
-                Ok(LogicalDeltaActivation::Activated { revision })
-                | Ok(LogicalDeltaActivation::AlreadyActive { revision }) => revision,
-                Ok(LogicalDeltaActivation::Conflict {
-                    actual_revision,
-                    actual_base_manifest_hash,
-                }) => {
-                    let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
-                    return Err(PeerSyncError::ActivationConflict {
-                        expected: Some(expected_revision.to_string()),
-                        actual: Some(format!("{actual_revision}:{actual_base_manifest_hash}")),
-                    });
-                }
-                Err(error) => {
-                    let _ = job.borrow_mut().release(CasReleaseOutcome::Aborted);
-                    return Err(error);
-                }
-            };
-            let shared = store
-                .seal_or_initialize_active_logical_generation(cas)
-                .map_err(store_error)?;
-            let durable = PeerBidirectionalDurableOperation::LocalCommitted {
-                schema: OPERATION_SCHEMA.to_owned(),
+            retain_bidirectional_local_activation(
+                store,
+                cas,
+                app_root,
                 context,
-                committed_revision,
-                shared_generation: SyncGenerationIdentity {
-                    generation_id: shared.manifest.generation,
-                    manifest_hash: shared.manifest_hash,
-                    generation_sequence: shared.manifest.generation_sequence,
-                },
-                transferred_objects: if changed { transferred_objects } else { 0 },
-                transferred_bytes: if changed { transferred_bytes } else { 0 },
-                backups: vec![],
-            };
-            journal.store(&durable)?;
-            job.borrow_mut().release(CasReleaseOutcome::Committed)?;
-            Ok(LocalMergeOutcome::LocalCommitted)
+                &job,
+                expected_revision,
+                activation,
+                changed,
+                transferred_objects,
+                transferred_bytes,
+                vec![],
+            )
         }
         Err(error) => {
             drop(target);
@@ -688,6 +720,7 @@ fn complete_bidirectional_local_after_remote_apply(
         context,
         committed_revision,
         shared_generation,
+        changed,
         local_transferred_objects,
         local_transferred_bytes,
         mut backups,
@@ -696,6 +729,7 @@ fn complete_bidirectional_local_after_remote_apply(
             context,
             committed_revision,
             shared_generation,
+            changed,
             transferred_objects,
             transferred_bytes,
             backups,
@@ -704,6 +738,7 @@ fn complete_bidirectional_local_after_remote_apply(
             context,
             committed_revision,
             shared_generation,
+            changed,
             transferred_objects,
             transferred_bytes,
             backups,
@@ -780,7 +815,7 @@ fn complete_bidirectional_local_after_remote_apply(
             PeerSyncError::Validation("bidirectional transfer byte count overflow".to_owned())
         })?;
     let result = PeerBidirectionalCompletedResult {
-        kind: if transferred_objects == 0 {
+        kind: if !changed && transferred_objects == 0 {
             "noChanges".to_owned()
         } else {
             "updated".to_owned()
@@ -1230,6 +1265,7 @@ mod tests {
             context: context(operation_id),
             committed_revision: 8,
             shared_generation: generation("local-a", "3", 'e'),
+            changed: true,
             transferred_objects: 2,
             transferred_bytes: 19,
             backups: vec![backup(PeerBidirectionalBackupSide::Local)],
@@ -1299,6 +1335,7 @@ mod tests {
             context: retained_context,
             committed_revision: 0,
             shared_generation: shared.clone(),
+            changed: false,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: vec![],
@@ -1369,6 +1406,7 @@ mod tests {
                     manifest_hash: base.manifest_hash,
                     generation_sequence: base.manifest.generation_sequence,
                 },
+                changed: false,
                 transferred_objects: 0,
                 transferred_bytes: 0,
                 backups: vec![],
@@ -1414,6 +1452,70 @@ mod tests {
             .is_none());
         assert_eq!(
             DurableCasJob::open(directory.path(), &durable_job_id)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn deferred_already_active_is_retained_as_a_changed_local_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let operation_id = "123e4567-e89b-42d3-a456-426614174015";
+        let retained_context = context(operation_id);
+        let job = RefCell::new(
+            DurableCasJob::begin(
+                directory.path(),
+                &retained_context.durable_job_id,
+                CasJobKind::LogicalDeltaTarget,
+                0,
+            )
+            .unwrap(),
+        );
+        job.borrow_mut().seal(&mut store, 0).unwrap();
+
+        assert_eq!(
+            retain_bidirectional_local_activation(
+                &mut store,
+                &cas,
+                directory.path(),
+                retained_context,
+                &job,
+                0,
+                Ok(LogicalDeltaActivation::AlreadyActive { revision: 0 }),
+                true,
+                0,
+                0,
+                vec![],
+            )
+            .unwrap(),
+            LocalMergeOutcome::LocalCommitted
+        );
+
+        let retained = PeerBidirectionalOperationJournal::new(directory.path())
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&retained).unwrap()["changed"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(matches!(
+            retained,
+            PeerBidirectionalDurableOperation::LocalCommitted {
+                committed_revision: 0,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            DurableCasJob::open(directory.path(), "123e4567-e89b-42d3-a456-426614174003")
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::NotFound
@@ -1480,6 +1582,7 @@ mod tests {
             context: context(operation_id),
             committed_revision: 8,
             shared_generation: generation("local-a", "3", 'e'),
+            changed: true,
             transferred_objects: 2,
             transferred_bytes: 19,
             backups: vec![backup(PeerBidirectionalBackupSide::Local)],
