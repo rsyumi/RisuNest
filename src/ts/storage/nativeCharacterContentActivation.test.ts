@@ -194,6 +194,47 @@ describe('prepared native character content activation', () => {
         }
     })
 
+    it('keeps an appended CharX JPEG portrait byte-exact as an ordinary asset alias', async () => {
+        const portrait = {
+            referenceKey: 'portrait',
+            token: 'native-appended-portrait',
+            logicalId: `assets/${firstHash}.jpeg`,
+            objectHash: firstHash,
+            byteSize: 10_485_763,
+            mime: 'image/jpeg',
+            name: 'original portrait',
+            ext: 'jpeg',
+        }
+        const appendedCharxContent = {
+            ...content,
+            format: 'appended-charx-jpeg',
+            assets: [portrait],
+            portraitLogicalId: portrait.logicalId,
+        } as PreparedNativeContent
+        const character = mappedCharacter()
+        character.additionalAssets = []
+        const deps = dependencies({ map: vi.fn(async () => character) })
+
+        await activatePreparedNativeCharacterContent(appendedCharxContent, deps)
+
+        expect(deps.map).toHaveBeenCalledWith({
+            card: content.metadata,
+            assets: [{ token: portrait.token, logicalId: portrait.logicalId }],
+            portraitLogicalId: portrait.logicalId,
+        })
+        const options = vi.mocked(deps.upsert).mock.calls[0][3]
+        expect(options?.assetAliases).toEqual([{
+            kind: 'asset',
+            key: portrait.logicalId,
+            objectHash: portrait.objectHash,
+            size: portrait.byteSize,
+            mime: portrait.mime,
+            name: portrait.name,
+            ext: portrait.ext,
+        }])
+        expect(JSON.stringify(options?.assetAliases)).not.toMatch(/inlay|webp|resize/i)
+    })
+
     it('returns a normal declined outcome without preparing or publishing anything', async () => {
         const deps = dependencies({ map: vi.fn(async (): Promise<false> => false) })
 
