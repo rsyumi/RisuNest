@@ -940,6 +940,11 @@ mod tests {
                 stream.write_all(head.as_bytes()).unwrap();
                 stream.write_all(&response.body).unwrap();
                 stream.flush().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut closed = [0u8; 1];
+                let _ = stream.read(&mut closed);
             }
             requests
         });
@@ -1225,7 +1230,7 @@ mod tests {
     #[test]
     fn same_length_payload_mutation_is_rejected_before_any_upload() {
         let (directory, payload) = publication_payload();
-        let payload_path = std::fs::read_dir(directory.path().join("exports"))
+        let payload_path = std::fs::read_dir(directory.path().join("persistent").join("exports"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .find(|path| {
@@ -1272,7 +1277,7 @@ mod tests {
         let (base_url, server) = mock_server(vec![
             MockResponse {
                 status: 403,
-                headers: vec![("Content-Length", (8 * 1024 * 1024).to_string())],
+                headers: Vec::new(),
                 body: Vec::new(),
             },
             MockResponse {

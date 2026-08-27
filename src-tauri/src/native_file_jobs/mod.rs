@@ -3221,12 +3221,12 @@ mod tests {
             worker.wait_for_official_publication_retry(reauthentication("account-1"))
         });
 
-        for _ in 0..100 {
-            if job.status().state == JobState::WaitingForInput {
-                break;
-            }
-            thread::yield_now();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.status().state != JobState::WaitingForInput && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(job.status().state, JobState::WaitingForInput);
+        assert_eq!(job.status().phase, JobPhase::AwaitingPublicationRetry);
         let mut retry = publication_retry("account-1", "fresh-secret");
         retry.job_id = job.id();
         assert_eq!(registry.retry_official_publication(retry), Ok(()));
@@ -3255,12 +3255,12 @@ mod tests {
             worker.wait_for_official_publication_retry(reauthentication("account-1"))
         });
 
-        for _ in 0..100 {
-            if job.status().state == JobState::WaitingForInput {
-                break;
-            }
-            thread::yield_now();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while job.status().state != JobState::WaitingForInput && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(job.status().state, JobState::WaitingForInput);
+        assert_eq!(job.status().phase, JobPhase::AwaitingPublicationRetry);
         assert_eq!(job.request_cancel().unwrap(), CancelOutcome::Requested);
         let error = waiting.join().unwrap().expect_err("cancel waiting retry");
         assert_eq!(error.code, "cancelled");

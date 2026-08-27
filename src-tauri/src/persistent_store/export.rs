@@ -1447,14 +1447,17 @@ mod tests {
         .expect_err("reject a mismatched pinned account");
         assert!(matches!(mismatch, StoreError::Validation { .. }));
 
-        let (_directory, mut store, _revision, lease) = fixture();
+        let (_directory, mut store, _revision, _lease) = fixture();
         let staging = store.replace_begin().unwrap().staging_id;
         store
             .replace_put_root(
                 &staging,
                 &json!({
                     "account": { "id": "account-1", "token": "not-pinned" },
-                    "customBackground": "old"
+                    "customBackground": "old",
+                    "modules": [],
+                    "loadouts": [],
+                    "plugins": []
                 }),
             )
             .unwrap();
