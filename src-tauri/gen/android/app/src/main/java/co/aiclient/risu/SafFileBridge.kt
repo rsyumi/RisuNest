@@ -17,11 +17,24 @@ private const val MAX_DISPLAY_NAME_CHARS = 180
 private const val SPOOL_OWNERSHIP_FORMAT = "risunest-android-saf-spool"
 private const val SPOOL_STAGING_PREFIX = ".spooling-"
 private const val SPOOL_CLEANUP_PREFIX = ".cleanup-"
+private val NATIVE_FILE_JOB_SPOOL_SUFFIXES = listOf(
+  ".risudat",
+  ".charx",
+  ".json",
+  ".jpeg",
+  ".jpg",
+)
 private val CANONICAL_TOKEN = Regex(
   "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
 )
 
 internal fun isCanonicalUuidV4(value: String): Boolean = CANONICAL_TOKEN.matches(value)
+
+internal fun shouldUseNativeFileJobSpool(displayName: String): Boolean =
+  NATIVE_FILE_JOB_SPOOL_SUFFIXES.any { suffix ->
+    displayName.endsWith(suffix, ignoreCase = true)
+  }
+
 private val MANAGED_EXPORT_NAME = Regex(
   "risusave-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risudat",
 )
@@ -573,8 +586,17 @@ private class SafSpoolException(
 
 internal fun safeSafDisplayName(name: String): String {
   val leaf = name.substringAfterLast('/').substringAfterLast('\\')
-  val safe = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_").take(MAX_DISPLAY_NAME_CHARS)
-  return safe.ifBlank { "opened-file" }
+  val safe = leaf.replace(Regex("[^A-Za-z0-9._-]"), "_")
+  if (safe.isBlank()) return "opened-file"
+  if (safe.length <= MAX_DISPLAY_NAME_CHARS) return safe
+  val suffix = NATIVE_FILE_JOB_SPOOL_SUFFIXES.firstOrNull { extension ->
+    safe.endsWith(extension, ignoreCase = true)
+  }?.let { extension -> safe.takeLast(extension.length) }
+  return if (suffix == null) {
+    safe.take(MAX_DISPLAY_NAME_CHARS)
+  } else {
+    safe.take(MAX_DISPLAY_NAME_CHARS - suffix.length) + suffix
+  }
 }
 
 internal fun safeSafDestinationName(name: String): String {

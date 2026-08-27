@@ -72,7 +72,12 @@ describe('Android opened spool production route', () => {
             reportCharacterError: vi.fn(),
             reportDestinationRequired: vi.fn(),
         }
-        const ready = ['card.json', 'card.charx', 'card.jpg', 'card.JPEG'].map((displayName, index) => ({
+        const ready = [
+            `${'a'.repeat(174)}.charx`,
+            'card.json',
+            'card.jpg',
+            'card.JPEG',
+        ].map((displayName, index) => ({
             token: `00000000-0000-4000-8000-00000000000${index + 1}`,
             displayName,
             bytes: 10,

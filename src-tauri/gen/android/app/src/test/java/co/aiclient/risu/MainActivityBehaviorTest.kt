@@ -26,6 +26,19 @@ class MainActivityBehaviorTest {
   }
 
   @Test
+  fun `long native SAF candidate names preserve their persisted extension for dispatch`() {
+    val character = safeSafDisplayName("a".repeat(181) + ".charx")
+    val risuSave = safeSafDisplayName("b".repeat(181) + ".risudat")
+
+    assertEquals(180, character.length)
+    assertEquals(true, character.endsWith(".charx"))
+    assertEquals(true, shouldUseNativeFileJobSpool(character))
+    assertEquals(180, risuSave.length)
+    assertEquals(true, risuSave.endsWith(".risudat"))
+    assertEquals(true, shouldUseNativeFileJobSpool(risuSave))
+  }
+
+  @Test
   fun `disabled SAF jobs retain the legacy tauri opened files contract`() {
     assertEquals(
       "window.tauriOpenedFiles=[\"C:\\\\opened\\u000afile.risudat\"];",

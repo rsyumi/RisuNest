@@ -223,12 +223,11 @@ internal fun openedFilesScript(paths: List<String>): String {
   return "window.tauriOpenedFiles=[$values];"
 }
 
-internal fun shouldUseNativeFileJobSpool(displayName: String): Boolean =
-  displayName.endsWith(".risudat", ignoreCase = true) ||
-    displayName.endsWith(".json", ignoreCase = true) ||
-    displayName.endsWith(".charx", ignoreCase = true) ||
-    displayName.endsWith(".jpg", ignoreCase = true) ||
-    displayName.endsWith(".jpeg", ignoreCase = true)
+private data class OpenedFileSource(
+  val uri: Uri,
+  val displayName: String,
+  val totalBytes: Long?,
+)
 
 internal class RestoredIntentConsumptionMarker(
   private val isConsumed: () -> Boolean,
@@ -1191,13 +1190,18 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   ) {
     val uris = claimOpenedFileUris(openedIntent)
     if (uris.isEmpty()) return
-    val (nativeJobUris, legacyUris) = uris.partition { uri ->
-      val displayName = runCatching { resolveLegacyDisplayName(uri) }
-        .getOrElse { sanitizeOpenedFileName(uri.lastPathSegment ?: "opened-file") }
-      shouldUseNativeFileJobSpool(displayName)
+    val openedSources = uris.map { uri ->
+      val (displayName, totalBytes) = runCatching { resolveSourceMetadata(uri) }
+        .getOrElse {
+          safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null
+        }
+      OpenedFileSource(uri, displayName, totalBytes)
     }
-    if (includeLegacyFiles) injectLegacyOpenedFiles(webView, legacyUris)
-    if (nativeJobUris.isEmpty()) return
+    val (nativeJobSources, legacySources) = openedSources.partition { source ->
+      shouldUseNativeFileJobSpool(source.displayName)
+    }
+    if (includeLegacyFiles) injectLegacyOpenedFiles(webView, legacySources.map { it.uri })
+    if (nativeJobSources.isEmpty()) return
     val requestId = UUID.randomUUID().toString()
     val cancellation = AtomicBoolean(false)
     safSourceCancellations[requestId] = cancellation
@@ -1206,7 +1210,9 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         val store = safSpoolStore()
         val sources = withContext(Dispatchers.IO) {
           store.cleanupStale()
-          nativeJobUris.map(::contentResolverSource)
+          nativeJobSources.map { source ->
+            contentResolverSource(source.uri, source.displayName, source.totalBytes)
+          }
         }
         val copyContext = currentCoroutineContext()
         val batch = spoolOpenedFilesOnIo(
@@ -1412,12 +1418,11 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     }
   }
 
-  private fun contentResolverSource(uri: Uri): SafInputSource {
-    val (displayName, totalBytes) = try {
-      resolveSourceMetadata(uri)
-    } catch (error: Exception) {
-      safeSafDisplayName(uri.lastPathSegment ?: "opened-file") to null
-    }
+  private fun contentResolverSource(
+    uri: Uri,
+    displayName: String,
+    totalBytes: Long?,
+  ): SafInputSource {
     return object : SafInputSource {
       override val displayName = displayName
       override val totalBytes = totalBytes
