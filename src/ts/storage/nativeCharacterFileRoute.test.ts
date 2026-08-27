@@ -150,4 +150,36 @@ describe('native character file route', () => {
         })
         expect(deps.readDesktopPath).not.toHaveBeenCalled()
     })
+
+    it('returns a capability fallback before claiming an inactive Android spool', async () => {
+        const deps = dependencies({ nativeEnabled: () => false })
+
+        await expect(importAndroidNativeCharacterSpool({
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'card.charx',
+        }, deps)).resolves.toEqual({ kind: 'capability-unavailable' })
+
+        expect(deps.nativeImport).not.toHaveBeenCalled()
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
+
+    it('keeps an Android spool intact when the native start gate is unavailable', async () => {
+        const deps = dependencies({
+            nativeImport: vi.fn(async () => {
+                throw new NativeFileJobError(
+                    'capability-unavailable',
+                    'Native content import is unavailable',
+                )
+            }),
+        })
+
+        await expect(importAndroidNativeCharacterSpool({
+            token: '11111111-1111-4111-8111-111111111111',
+            displayName: 'card.charx',
+        }, deps)).resolves.toEqual({ kind: 'capability-unavailable' })
+
+        expect(deps.readDesktopPath).not.toHaveBeenCalled()
+        expect(deps.legacyImport).not.toHaveBeenCalled()
+    })
 })

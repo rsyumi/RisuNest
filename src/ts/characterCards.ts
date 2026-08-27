@@ -23,6 +23,7 @@ import { fetchRealmResource, isRealmAccessDisabled } from "./realmAccess"
 import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
 import { publishPeerCloneUri } from "./storage/sync/peerCloneDeepLink"
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
+import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -35,10 +36,14 @@ export const hubURL = isNodeServer
 
 const nativeCharacterContentImportEnabled = false
 
-async function importPreparedNativeCharacterContent(input: {
-    source: { type: 'desktopPath'; path: string }
+export function isNativeCharacterContentImportEnabled(): boolean {
+    return nativeCharacterContentImportEnabled
+}
+
+export async function importPreparedNativeCharacterContent(input: {
+    source: NativeFileJobSource
     displayName: string
-}): Promise<{ kind: 'declined' } | { kind: 'imported'; value: string }> {
+}, options: NativeFileJobOptions = {}): Promise<{ kind: 'declined' } | { kind: 'imported'; value: string }> {
     const [{ runNativePreparedContentRoute }, { activatePreparedNativeCharacterContent }] = await Promise.all([
         import('./storage/nativePreparedContentRoute'),
         import('./storage/nativeCharacterContentActivation'),
@@ -50,6 +55,7 @@ async function importPreparedNativeCharacterContent(input: {
             map: async (content) => content,
             activate: activatePreparedNativeCharacterContent,
         },
+        options,
     )
     return result ? { kind: 'imported', value: result.characterId } : { kind: 'declined' }
 }

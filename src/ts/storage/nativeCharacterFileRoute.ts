@@ -13,6 +13,11 @@ export type NativeCharacterImportResult<T> =
     | { kind: 'declined' }
     | { kind: 'imported'; value: T }
 
+export type NativeAndroidCharacterSpoolResult<T> =
+    | NativeCharacterImportResult<T>
+    | { kind: 'destination-required' }
+    | { kind: 'capability-unavailable' }
+
 export interface NativeCharacterFileRouteDependencies<T> {
     chooseDesktopPath(): Promise<string | null>
     readDesktopPath(path: string): Promise<Uint8Array>
@@ -69,6 +74,11 @@ function mayUseLegacyFallback(error: unknown): boolean {
 function isDestinationRequired(error: unknown): boolean {
     return error instanceof NativeFileJobError
         && nativeErrorCode(error) === 'destination-required'
+}
+
+function isCapabilityUnavailable(error: unknown): boolean {
+    return error instanceof NativeFileJobError
+        && nativeErrorCode(error) === 'capability-unavailable'
 }
 
 async function importLegacy<T>(
@@ -128,7 +138,8 @@ export async function importDesktopNativeCharacterPath<T>(
 export async function importAndroidNativeCharacterSpool<T>(
     input: { token: string; displayName: string },
     dependencies: NativeCharacterFileRouteDependencies<T>,
-): Promise<NativeCharacterImportResult<T> | { kind: 'destination-required' }> {
+): Promise<NativeAndroidCharacterSpoolResult<T>> {
+    if (!dependencies.nativeEnabled()) return { kind: 'capability-unavailable' }
     try {
         return await dependencies.nativeImport({
             source: { type: 'androidSpool', token: input.token },
@@ -137,6 +148,7 @@ export async function importAndroidNativeCharacterSpool<T>(
     }
     catch (error) {
         if (isDestinationRequired(error)) return { kind: 'destination-required' }
+        if (isCapabilityUnavailable(error)) return { kind: 'capability-unavailable' }
         throw error
     }
 }

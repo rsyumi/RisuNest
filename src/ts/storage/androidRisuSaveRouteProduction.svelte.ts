@@ -7,11 +7,13 @@ import {
     discardAndroidSafSource,
     isAndroidSafFileJobsEnabled,
     listenAndroidSpoolBatches,
+    type AndroidSpoolBatch,
     type AndroidSpoolFailure,
     type AndroidSpoolReady,
 } from './androidSafBridge'
 import { createAndroidRisuSaveSpoolRoute } from './androidRisuSaveRoute'
 import { runExternalAndroidNativeFileOperation } from './nativeFileJobManager'
+import type { NativeAndroidCharacterSpoolResult } from './nativeCharacterFileRoute'
 import {
     NativeFileJobActivationCommittedError,
     NativeFileJobError,
@@ -20,6 +22,90 @@ import {
 import { getPersistentDataRuntime } from './persistentDataRuntime.svelte'
 
 let disposeSpoolListener: (() => void) | undefined
+let androidOpenedSpoolTail: Promise<void> = Promise.resolve()
+
+export interface AndroidOpenedSpoolDispatchDependencies {
+    enqueueRestore(batch: AndroidSpoolBatch): Promise<void>
+    importCharacter(source: AndroidSpoolReady): Promise<NativeAndroidCharacterSpoolResult<string>>
+    reportCharacterError(source: AndroidSpoolReady, error: unknown): void
+    reportDestinationRequired(source: AndroidSpoolReady): void
+}
+
+function isAndroidNativeCharacterSpool(source: AndroidSpoolReady): boolean {
+    const displayName = source.displayName.toLocaleLowerCase('en-US')
+    return displayName.endsWith('.json')
+        || displayName.endsWith('.charx')
+        || displayName.endsWith('.jpg')
+        || displayName.endsWith('.jpeg')
+}
+
+export async function dispatchAndroidOpenedSpoolBatch(
+    batch: AndroidSpoolBatch,
+    dependencies: AndroidOpenedSpoolDispatchDependencies,
+): Promise<void> {
+    const characterSources = batch.ready.filter(isAndroidNativeCharacterSpool)
+    await dependencies.enqueueRestore({
+        ...batch,
+        ready: batch.ready.filter((source) => !isAndroidNativeCharacterSpool(source)),
+    })
+    for (const source of characterSources) {
+        try {
+            const result = await dependencies.importCharacter(source)
+            if (result.kind === 'destination-required') {
+                dependencies.reportDestinationRequired(source)
+            }
+        }
+        catch (error) {
+            dependencies.reportCharacterError(source, error)
+        }
+    }
+}
+
+function enqueueAndroidOpenedSpoolBatch(
+    batch: AndroidSpoolBatch,
+    dependencies: AndroidOpenedSpoolDispatchDependencies,
+): Promise<void> {
+    const queued = androidOpenedSpoolTail.then(async () => {
+        await dispatchAndroidOpenedSpoolBatch(batch, dependencies)
+    })
+    androidOpenedSpoolTail = queued.then(
+        () => undefined,
+        () => undefined,
+    )
+    return queued
+}
+
+async function importAndroidCharacterSpool(
+    source: AndroidSpoolReady,
+): Promise<NativeAndroidCharacterSpoolResult<string>> {
+    const [
+        { importAndroidNativeCharacterSpool },
+        {
+            importPreparedNativeCharacterContent,
+            isNativeCharacterContentImportEnabled,
+        },
+    ] = await Promise.all([
+        import('./nativeCharacterFileRoute'),
+        import('../characterCards'),
+    ])
+    return await importAndroidNativeCharacterSpool(source, {
+        chooseDesktopPath: async () => null,
+        readDesktopPath: async () => {
+            throw new Error('Android spool character import cannot read source bytes in TypeScript')
+        },
+        nativeEnabled: isNativeCharacterContentImportEnabled,
+        nativeImport: async (input) => await runExternalAndroidNativeFileOperation(
+            'import',
+            ({ signal, onStatus }) => importPreparedNativeCharacterContent(input, {
+                signal,
+                onStatus,
+            }),
+        ),
+        legacyImport: async () => {
+            throw new Error('Android spool character import has no legacy byte fallback')
+        },
+    })
+}
 
 function showRestoreError(error: unknown): void {
     if (error instanceof DOMException && error.name === 'AbortError') return
@@ -40,6 +126,10 @@ function showSpoolFailure(failure: AndroidSpoolFailure): void {
 
 function showUnsupportedSpool(source: AndroidSpoolReady): void {
     alertError(`${source.displayName}: unsupported-format`)
+}
+
+function showDestinationRequired(source: AndroidSpoolReady): void {
+    alertError(`${source.displayName}: destination-required`)
 }
 
 export function registerAndroidRisuSaveRoute(): void {
@@ -77,6 +167,11 @@ export function registerAndroidRisuSaveRoute(): void {
         onError: (_source, error) => showRestoreError(error),
     })
     disposeSpoolListener = listenAndroidSpoolBatches((batch) => {
-        void route.enqueue(batch)
+        void enqueueAndroidOpenedSpoolBatch(batch, {
+            enqueueRestore: route.enqueue,
+            importCharacter: importAndroidCharacterSpool,
+            reportCharacterError: (_source, error) => showRestoreError(error),
+            reportDestinationRequired: showDestinationRequired,
+        })
     })
 }
