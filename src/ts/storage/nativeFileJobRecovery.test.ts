@@ -117,19 +117,22 @@ describe('native file job bootstrap reconciliation', () => {
         expect(calls).toEqual(['native_file_job_list'])
     })
 
-    it('cancels and drains a nonterminal content preparation without restore finalization', async () => {
+    it.each([
+        'prepare-content-import',
+        'import-jpeg-asset',
+    ] as const)('cancels and drains a nonterminal %s job without restore finalization', async (kind) => {
         const calls: string[] = []
         const pending = await reconcileNativeRestoresBeforeBootstrap({
             invoke: vi.fn(async (command) => {
                 calls.push(command)
                 if (command === 'native_file_job_list') return [{
                     ...restoreStatus('content-1', 'waitingForInput', 'awaiting-content-mapping'),
-                    kind: 'prepare-content-import' as const,
+                    kind,
                 }]
                 if (command === 'native_file_job_cancel') return 'requested'
                 if (command === 'native_file_job_status') return {
                     ...restoreStatus('content-1', 'cancelled', 'complete'),
-                    kind: 'prepare-content-import' as const,
+                    kind,
                 }
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)
