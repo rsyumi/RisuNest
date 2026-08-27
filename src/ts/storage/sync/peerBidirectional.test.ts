@@ -60,6 +60,290 @@ describe('peer bidirectional facade', () => {
         await expect(facade.sync(pairingUri)).rejects.toThrow(`Peer sync is unsupported on ${platform}`)
     })
 
+    it('flushes and fences the source revision from prepare until stop completes', async () => {
+        const events: string[] = []
+        const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+            events.push(`invoke:${command}:${String(args?.expectedRevision ?? '')}`)
+            if (command === 'peer_bidirectional_prepare') {
+                return { phase: 'prepared', sessionId: 'session-source', devices: [] }
+            }
+            if (command === 'peer_bidirectional_start') {
+                return { phase: 'running', sessionId: 'session-source', devices: [] }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: runtime(events),
+        })
+
+        await facade.prepare()
+        await facade.start('session-source')
+        expect(events).toEqual([
+            'flush:peer-bidirectional-source-prepare',
+            'capture:peer-bidirectional-source-prepare',
+            'acquire:7:11',
+            'invoke:peer_bidirectional_prepare:7',
+            'invoke:peer_bidirectional_start:',
+        ])
+
+        await facade.stop('session-source')
+        expect(events.slice(-2)).toEqual([
+            'invoke:peer_bidirectional_stop:',
+            'release',
+        ])
+    })
+
+    it('rejects a target mutation while source preparation is in flight', async () => {
+        const events: string[] = []
+        let finishPrepare!: (value: unknown) => void
+        const invoke = vi.fn((command: string) => {
+            if (command === 'peer_bidirectional_prepare') {
+                return new Promise((resolve) => {
+                    finishPrepare = resolve
+                })
+            }
+            return Promise.resolve(undefined)
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: runtime(events),
+        })
+
+        const preparing = facade.prepare()
+        await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith(
+            'peer_bidirectional_prepare',
+            { expectedRevision: 7 },
+        ))
+        await expect(facade.sync(pairingUri)).rejects.toThrow('peer sync source is active')
+        finishPrepare({ phase: 'prepared', sessionId: 'session-source', devices: [] })
+        await preparing
+    })
+
+    it('rejects source preparation while a target mutation is in flight', async () => {
+        const events: string[] = []
+        let finishSync!: (value: unknown) => void
+        const invoke = vi.fn((command: string) => {
+            if (command === 'peer_bidirectional_sync') {
+                return new Promise((resolve) => {
+                    finishSync = resolve
+                })
+            }
+            return Promise.resolve(undefined)
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: runtime(events),
+        })
+
+        const syncing = facade.sync(pairingUri)
+        await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith(
+            'peer_bidirectional_sync',
+            expect.objectContaining({ expectedRevision: 7 }),
+        ))
+        await expect(facade.prepare()).rejects.toThrow('source or target is already active')
+        finishSync({
+            kind: 'noChanges',
+            operationId: 'operation-target-active',
+            revision: 7,
+            remoteRevision: 7,
+            transferredObjects: 0,
+            transferredBytes: 0,
+            backups: [],
+        })
+        await syncing
+    })
+
+    it('does not start a source host without its prepared mutation fence', async () => {
+        const invoke = vi.fn(async () => ({
+            phase: 'running' as const,
+            sessionId: 'session-unfenced',
+            devices: [],
+        }))
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: runtime([]),
+        })
+
+        await expect(facade.start('session-unfenced')).rejects.toThrow('not prepared')
+        expect(invoke).not.toHaveBeenCalled()
+    })
+
+    it('refreshes a source-side committed revision once and retains its fence until stop', async () => {
+        const events: string[] = []
+        const completed = {
+            phase: 'completed' as const,
+            result: {
+                kind: 'updated' as const,
+                operationId: 'operation-source-complete',
+                revision: 8,
+                remoteRevision: 9,
+                transferredObjects: 2,
+                transferredBytes: 12,
+                backups: [{ packageId: 'backup-source', side: 'local' as const, path: 'source.risulossless' }],
+            },
+        }
+        const invoke = vi.fn(async (command: string) => {
+            events.push(`invoke:${command}`)
+            if (command === 'peer_bidirectional_prepare') {
+                return { phase: 'prepared', sessionId: 'session-source', devices: [] }
+            }
+            if (command === 'peer_bidirectional_status') {
+                return {
+                    source: { phase: 'running', sessionId: 'session-source', devices: [] },
+                    operation: completed,
+                }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: runtime(events),
+        })
+
+        await facade.prepare()
+        await facade.status()
+        await facade.status()
+        expect(events.filter((event) => event === 'refresh:8')).toHaveLength(1)
+        expect(events).not.toContain('release')
+
+        await facade.stop('session-source')
+        expect(events.at(-1)).toBe('release')
+    })
+
+    it('retries only a failed source refresh before polling native status again', async () => {
+        const events: string[] = []
+        let failRefresh = true
+        const base = runtime(events)
+        const invoke = vi.fn(async (command: string) => {
+            if (command === 'peer_bidirectional_prepare') {
+                return { phase: 'prepared', sessionId: 'session-source', devices: [] }
+            }
+            if (command === 'peer_bidirectional_status') {
+                return {
+                    source: { phase: 'running', sessionId: 'session-source', devices: [] },
+                    operation: {
+                        phase: 'completed',
+                        result: {
+                            kind: 'noChanges',
+                            operationId: 'operation-source-refresh',
+                            revision: 7,
+                            remoteRevision: 7,
+                            transferredObjects: 0,
+                            transferredBytes: 0,
+                            backups: [],
+                        },
+                    },
+                }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: {
+                ...base,
+                async acquirePersistentMutationFence(token) {
+                    const fence = await base.acquirePersistentMutationFence(token)
+                    return {
+                        ...fence,
+                        async refreshCommittedWorkingSet(revision) {
+                            events.push(`refresh:${revision}`)
+                            if (failRefresh) {
+                                failRefresh = false
+                                throw new Error('source renderer refresh failed')
+                            }
+                        },
+                    }
+                },
+            },
+        })
+
+        await facade.prepare()
+        await expect(facade.status()).rejects.toThrow('source renderer refresh failed')
+        await expect(facade.status()).resolves.toMatchObject({ operation: { phase: 'completed' } })
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_bidirectional_status')).toHaveLength(1)
+        expect(events.filter((event) => event === 'refresh:7')).toHaveLength(2)
+        expect(events).not.toContain('release')
+    })
+
+    it('closes the source host before finishing a pending refresh and releasing its fence', async () => {
+        const events: string[] = []
+        let failRefresh = true
+        const base = runtime(events)
+        const invoke = vi.fn(async (command: string) => {
+            events.push(`invoke:${command}`)
+            if (command === 'peer_bidirectional_prepare') {
+                return { phase: 'prepared', sessionId: 'session-source', devices: [] }
+            }
+            if (command === 'peer_bidirectional_status') {
+                return {
+                    source: { phase: 'running', sessionId: 'session-source', devices: [] },
+                    operation: {
+                        phase: 'completed',
+                        result: {
+                            kind: 'updated',
+                            operationId: 'operation-stop-refresh',
+                            revision: 8,
+                            remoteRevision: 9,
+                            transferredObjects: 1,
+                            transferredBytes: 12,
+                            backups: [],
+                        },
+                    },
+                }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+            runtime: {
+                ...base,
+                async acquirePersistentMutationFence(token) {
+                    const fence = await base.acquirePersistentMutationFence(token)
+                    return {
+                        ...fence,
+                        async refreshCommittedWorkingSet(revision) {
+                            events.push(`refresh:${revision}`)
+                            if (failRefresh) {
+                                failRefresh = false
+                                throw new Error('source refresh failed')
+                            }
+                        },
+                    }
+                },
+            },
+        })
+
+        await facade.prepare()
+        await expect(facade.status()).rejects.toThrow('source refresh failed')
+        await facade.stop('session-source')
+        expect(events.slice(-3)).toEqual([
+            'invoke:peer_bidirectional_stop',
+            'refresh:8',
+            'release',
+        ])
+    })
+
+    it('keeps production disabled unless every native readiness field is true', async () => {
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            invoke: (async () => ({
+                desktop: true,
+                sourceReady: true,
+                atomicActivationReady: true,
+                authenticatedTransportReady: false,
+                losslessBackupReady: true,
+                durableStateReady: true,
+                productionEnabled: true,
+            })) as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.capabilities()).resolves.toMatchObject({ productionEnabled: false })
+    })
+
     it('holds the mutation fence through native completion and renderer refresh', async () => {
         const events: string[] = []
         const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
@@ -86,6 +370,60 @@ describe('peer bidirectional facade', () => {
             'capture:peer-bidirectional-sync',
             'acquire:7:11',
             'invoke:peer_bidirectional_sync:7',
+            'refresh:8',
+            'release',
+        ])
+    })
+
+    it.each([
+        {
+            kind: 'resumeRequired' as const,
+            operationId: 'operation-local-committed',
+            phase: 'localCommitted' as const,
+            committedRevision: 8,
+        },
+        {
+            kind: 'sourceUnavailable' as const,
+            operationId: 'operation-source-unavailable',
+            committedRevision: 8,
+        },
+    ])('refreshes the committed working set before returning $kind', async (result) => {
+        const events: string[] = []
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime(events),
+            invoke: (async () => result) as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.resume(result.operationId)).resolves.toBe(result)
+        expect(events.slice(-2)).toEqual(['refresh:8', 'release'])
+    })
+
+    it('refreshes a durable local commit before surfacing a lost native response', async () => {
+        const events: string[] = []
+        const invoke = vi.fn(async (command: string) => {
+            events.push(`invoke:${command}`)
+            if (command === 'peer_bidirectional_sync') throw new Error('native response lost')
+            if (command === 'peer_bidirectional_status') {
+                return {
+                    source: { phase: 'idle', devices: [] },
+                    operation: {
+                        phase: 'localCommitted',
+                        operationId: 'operation-response-loss',
+                        committedRevision: 8,
+                    },
+                }
+            }
+        })
+        const facade = createPeerBidirectionalFacade({
+            platform: 'desktop',
+            runtime: runtime(events),
+            invoke: invoke as unknown as PeerBidirectionalInvoke,
+        })
+
+        await expect(facade.sync(pairingUri)).rejects.toThrow('native response lost')
+        expect(events.slice(-3)).toEqual([
+            'invoke:peer_bidirectional_status',
             'refresh:8',
             'release',
         ])

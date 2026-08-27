@@ -194,12 +194,18 @@ function completed(
 }
 
 export class PeerBidirectionalRefreshError extends Error {
-    readonly result: PeerBidirectionalCompletedResult
+    readonly result: PeerBidirectionalSyncResult
+    readonly status?: PeerBidirectionalStatus
 
-    constructor(result: PeerBidirectionalCompletedResult, cause: unknown) {
+    constructor(
+        result: PeerBidirectionalSyncResult,
+        cause: unknown,
+        status?: PeerBidirectionalStatus,
+    ) {
         super(cause instanceof Error ? cause.message : String(cause))
         this.name = 'PeerBidirectionalRefreshError'
         this.result = result
+        this.status = status
     }
 }
 
@@ -209,13 +215,58 @@ export function createPeerBidirectionalFacade(options: {
     runtime?: PeerBidirectionalMutationRuntime
 }): PeerBidirectionalFacade {
     const nativeInvoke = options.invoke ?? invoke
+    type MutationFence = Awaited<ReturnType<PeerBidirectionalMutationRuntime['acquirePersistentMutationFence']>>
     let pendingRefresh: {
         key: string
-        result: PeerBidirectionalCompletedResult
-        fence: Awaited<ReturnType<PeerBidirectionalMutationRuntime['acquirePersistentMutationFence']>>
+        result: PeerBidirectionalSyncResult
+        revision: number
+        fence: MutationFence
     } | undefined
+    let sourceFence: MutationFence | undefined
+    let pendingSourceRefresh: {
+        key: string
+        revision: number
+        status: PeerBidirectionalStatus
+    } | undefined
+    let refreshedSourceOperation = ''
+    let sourcePrepareActive = false
+    let targetMutationActive = false
     const requireDesktop = (): void => {
         if (options.platform !== 'desktop') unsupported(options.platform)
+    }
+    const committedRevision = (result: PeerBidirectionalSyncResult): number | undefined => {
+        if (completed(result)) return result.revision
+        if (result.kind === 'resumeRequired' || result.kind === 'sourceUnavailable') {
+            return result.committedRevision
+        }
+        return undefined
+    }
+    const projectOperation = (
+        operation: PeerBidirectionalDurableOperation,
+    ): PeerBidirectionalSyncResult => {
+        if (operation.phase === 'awaitingConflict' || operation.phase === 'completed') {
+            return operation.result
+        }
+        return {
+            kind: 'resumeRequired',
+            operationId: operation.operationId,
+            phase: 'localCommitted',
+            committedRevision: operation.committedRevision,
+        }
+    }
+    const refreshTargetResult = async (
+        key: string,
+        result: PeerBidirectionalSyncResult,
+        revision: number,
+        fence: MutationFence,
+    ): Promise<void> => {
+        pendingRefresh = { key, result, revision, fence }
+        try {
+            await fence.refreshCommittedWorkingSet(revision)
+        } catch (cause) {
+            throw new PeerBidirectionalRefreshError(result, cause)
+        }
+        pendingRefresh = undefined
     }
     const runMutation = async (
         reason: string,
@@ -224,6 +275,8 @@ export function createPeerBidirectionalFacade(options: {
         args: Record<string, unknown>,
     ): Promise<PeerBidirectionalSyncResult> => {
         requireDesktop()
+        if (sourceFence || sourcePrepareActive) throw new Error('A peer sync source is active')
+        if (targetMutationActive) throw new Error('A peer sync target is active')
         const runtime = options.runtime
         if (!runtime) throw new Error('Peer sync mutation runtime is unavailable')
         if (pendingRefresh) {
@@ -232,7 +285,7 @@ export function createPeerBidirectionalFacade(options: {
             }
             const pending = pendingRefresh
             try {
-                await pending.fence.refreshCommittedWorkingSet(pending.result.revision)
+                await pending.fence.refreshCommittedWorkingSet(pending.revision)
             } catch (cause) {
                 throw new PeerBidirectionalRefreshError(pending.result, cause)
             }
@@ -240,49 +293,146 @@ export function createPeerBidirectionalFacade(options: {
             pending.fence.release()
             return pending.result
         }
-        await runtime.flushPendingData(reason)
-        const token = await runtime.capturePersistentMutationToken(reason)
-        const fence = await runtime.acquirePersistentMutationFence(token)
+        targetMutationActive = true
+        let fence: MutationFence | undefined
         try {
-            const result = await nativeInvoke<PeerBidirectionalSyncResult>(command, {
-                ...args,
-                expectedRevision: token.revision,
-            })
-            if (completed(result)) {
-                pendingRefresh = { key, result, fence }
+            await runtime.flushPendingData(reason)
+            const token = await runtime.capturePersistentMutationToken(reason)
+            fence = await runtime.acquirePersistentMutationFence(token)
+            let result: PeerBidirectionalSyncResult
+            try {
+                result = await nativeInvoke<PeerBidirectionalSyncResult>(command, {
+                    ...args,
+                    expectedRevision: token.revision,
+                })
+            } catch (cause) {
+                let status: PeerBidirectionalStatus
                 try {
-                    await fence.refreshCommittedWorkingSet(result.revision)
-                } catch (cause) {
-                    throw new PeerBidirectionalRefreshError(result, cause)
+                    status = await nativeInvoke<PeerBidirectionalStatus>('peer_bidirectional_status')
+                } catch {
+                    throw cause
                 }
-                pendingRefresh = undefined
+                if (status.operation) {
+                    const recovered = projectOperation(status.operation)
+                    const revision = committedRevision(recovered)
+                    if (revision !== undefined) {
+                        await refreshTargetResult(key, recovered, revision, fence)
+                    }
+                }
+                throw cause
+            }
+            const revision = committedRevision(result)
+            if (revision !== undefined) {
+                await refreshTargetResult(key, result, revision, fence)
             }
             return result
         } finally {
-            if (pendingRefresh?.fence !== fence) fence.release()
+            targetMutationActive = false
+            if (fence && pendingRefresh?.fence !== fence) fence.release()
         }
+    }
+
+    const refreshSourceStatus = async (
+        status: PeerBidirectionalStatus,
+        key: string,
+        revision: number,
+    ): Promise<PeerBidirectionalStatus> => {
+        const fence = sourceFence
+        if (!fence || refreshedSourceOperation === key) return status
+        pendingSourceRefresh = { key, revision, status }
+        try {
+            await fence.refreshCommittedWorkingSet(revision)
+        } catch (cause) {
+            const operation = status.operation
+            if (operation?.phase !== 'completed') throw cause
+            throw new PeerBidirectionalRefreshError(operation.result, cause, status)
+        }
+        refreshedSourceOperation = key
+        pendingSourceRefresh = undefined
+        return status
+    }
+
+    const committedSourceOperation = (
+        status: PeerBidirectionalStatus,
+    ): { key: string; revision: number } | undefined => {
+        if (status.operation?.phase === 'completed') {
+            return {
+                key: `${status.operation.result.operationId}:${status.operation.result.revision}`,
+                revision: status.operation.result.revision,
+            }
+        }
+        return undefined
     }
 
     return {
         async capabilities() {
             requireDesktop()
-            return nativeInvoke('peer_bidirectional_capabilities')
+            const capabilities = await nativeInvoke<PeerBidirectionalCapabilities>('peer_bidirectional_capabilities')
+            return {
+                ...capabilities,
+                productionEnabled: capabilities.productionEnabled
+                    && capabilities.sourceReady
+                    && capabilities.atomicActivationReady
+                    && capabilities.authenticatedTransportReady
+                    && capabilities.losslessBackupReady
+                    && capabilities.durableStateReady,
+            }
         },
         async prepare() {
             requireDesktop()
-            return nativeInvoke('peer_bidirectional_prepare')
+            if (sourceFence || sourcePrepareActive || targetMutationActive || pendingRefresh) {
+                throw new Error('A peer sync source or target is already active')
+            }
+            const runtime = options.runtime
+            if (!runtime) throw new Error('Peer sync mutation runtime is unavailable')
+            sourcePrepareActive = true
+            let fence: MutationFence | undefined
+            try {
+                await runtime.flushPendingData('peer-bidirectional-source-prepare')
+                const token = await runtime.capturePersistentMutationToken('peer-bidirectional-source-prepare')
+                fence = await runtime.acquirePersistentMutationFence(token)
+                const status = await nativeInvoke<PeerBidirectionalSourceStatus>('peer_bidirectional_prepare', {
+                    expectedRevision: token.revision,
+                })
+                sourceFence = fence
+                refreshedSourceOperation = ''
+                return status
+            } catch (cause) {
+                fence?.release()
+                throw cause
+            } finally {
+                sourcePrepareActive = false
+            }
         },
         async start(sessionId) {
             requireDesktop()
+            if (!sourceFence) throw new Error('Peer sync source is not prepared')
             return nativeInvoke('peer_bidirectional_start', { sessionId })
         },
         async status() {
             requireDesktop()
-            return nativeInvoke('peer_bidirectional_status')
+            if (pendingSourceRefresh) {
+                const pending = pendingSourceRefresh
+                return refreshSourceStatus(pending.status, pending.key, pending.revision)
+            }
+            const status = await nativeInvoke<PeerBidirectionalStatus>('peer_bidirectional_status')
+            const committed = committedSourceOperation(status)
+            return committed
+                ? refreshSourceStatus(status, committed.key, committed.revision)
+                : status
         },
         async stop(sessionId) {
             requireDesktop()
             await nativeInvoke('peer_bidirectional_stop', { sessionId })
+            if (pendingSourceRefresh) {
+                const pending = pendingSourceRefresh
+                await refreshSourceStatus(pending.status, pending.key, pending.revision)
+            }
+            const fence = sourceFence
+            sourceFence = undefined
+            pendingSourceRefresh = undefined
+            refreshedSourceOperation = ''
+            fence?.release()
         },
         async revoke(sessionId, deviceId) {
             requireDesktop()
