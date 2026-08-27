@@ -469,6 +469,63 @@ fn schema_v13_migration_backfills_active_and_revoked_proofs_only() {
 }
 
 #[test]
+fn schema_v13_migration_preserves_p4_common_base_without_device_or_proof() {
+    let directory = tempfile::tempdir().expect("create P4-only v13 migration fixture");
+    let store = PersistentStore::open(directory.path()).expect("open current store");
+    let common = proof_manifest("common-c", "1", None, 0, EMPTY_HASH, "1");
+    let identity = seed_indexed_manifest(&store, &common);
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_peer_common_bases (
+                peer_id, library_id, generation_id, manifest_hash,
+                generation_sequence, updated_at
+             ) VALUES ('p4-peer', 'library', ?1, ?2, ?3, 10)",
+            rusqlite::params![
+                identity.generation_id,
+                identity.manifest_hash,
+                identity.generation_sequence
+            ],
+        )
+        .expect("seed P4-only common base");
+    store
+        .connection
+        .execute_batch(
+            "DROP INDEX logical_sync_device_ack_proofs_local_generation;
+             DROP TABLE logical_sync_device_ack_proofs;
+             PRAGMA user_version = 13;",
+        )
+        .expect("downgrade P4-only fixture to v13");
+    drop(store);
+
+    let migrated = PersistentStore::open(directory.path()).expect("migrate P4-only v13 store");
+    assert_eq!(
+        migrated
+            .connection
+            .query_row(
+                "SELECT generation_id FROM logical_peer_common_bases
+                 WHERE peer_id = 'p4-peer' AND library_id = 'library'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read preserved P4 common base"),
+        "common-c"
+    );
+    for table in ["logical_sync_devices", "logical_sync_device_ack_proofs"] {
+        assert_eq!(
+            migrated
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count P5 registry rows"),
+            0,
+            "P4-only migration must not invent {table} rows"
+        );
+    }
+}
+
+#[test]
 fn v13_snapshot_restore_migrates_shared_ack_proofs_before_activation() {
     let directory = tempfile::tempdir().expect("create v13 snapshot fixture");
     let mut store = PersistentStore::open(directory.path()).expect("open current store");

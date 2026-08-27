@@ -410,8 +410,7 @@ fn migrate_v13_to_v14(connection: &mut Connection) -> StoreResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_v13_schema(&transaction)?;
     let invalid_count: i64 = transaction.query_row(
-        "SELECT (
-         SELECT COUNT(*)
+        "SELECT COUNT(*)
          FROM logical_sync_devices AS device
          LEFT JOIN logical_peer_common_bases AS common_base
            ON common_base.library_id = device.library_id
@@ -434,13 +433,6 @@ fn migrate_v13_to_v14(connection: &mut Connection) -> StoreResult<()> {
             )
          ) OR (
             device.status = 'forgotten' AND common_base.peer_id IS NOT NULL
-         )) + (
-         SELECT COUNT(*)
-         FROM logical_peer_common_bases AS common_base
-         LEFT JOIN logical_sync_devices AS device
-           ON device.library_id = common_base.library_id
-          AND device.device_id = common_base.peer_id
-         WHERE device.device_id IS NULL
          )",
         [],
         |row| row.get(0),
