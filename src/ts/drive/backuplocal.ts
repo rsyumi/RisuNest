@@ -98,6 +98,28 @@ function getBasename(data:string){
 }
 
 export async function SaveLocalBackup(){
+    if (isTauriDesktop) {
+        try {
+            const { exportLegacyLocalBackupFromSystemPicker } = await import(
+                './legacyLocalBackupFileRouteProduction.svelte'
+            )
+            const result = await exportLegacyLocalBackupFromSystemPicker()
+            if (result) alertNormal('Success')
+            return result
+        } catch (error) {
+            if (error instanceof DOMException && error.name === 'AbortError') return
+            if (!isNativeLegacyBackupFallback(error)) throw error
+        }
+    }
+    return saveLocalBackupWithWebView()
+}
+
+function isNativeLegacyBackupFallback(error: unknown): boolean {
+    if (typeof error !== 'object' || error === null || !('code' in error)) return false
+    return error.code === 'capability-unavailable' || error.code === 'unsupported-format'
+}
+
+async function saveLocalBackupWithWebView(){
     if (!isTauri) await forageStorage.Init()
     const blobStore = await resolveBlobStore()
     alertWait("Saving local backup...")
@@ -343,6 +365,32 @@ async function savePartialLocalBackupSnapshot(blobStore: BlobStore, pinned: Pinn
 }
 
 export function LoadLocalBackup(){
+    if (isTauriDesktop) {
+        void loadLocalBackupNativeFirst()
+        return
+    }
+    loadLocalBackupWithWebView()
+}
+
+async function loadLocalBackupNativeFirst(): Promise<void> {
+    try {
+        const { importLegacyLocalBackupFromSystemPicker } = await import(
+            './legacyLocalBackupFileRouteProduction.svelte'
+        )
+        const result = await importLegacyLocalBackupFromSystemPicker()
+        if (result) alertNormal('Success')
+    } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        if (isNativeLegacyBackupFallback(error)) {
+            loadLocalBackupWithWebView()
+            return
+        }
+        console.error(error)
+        alertError('Failed, Is file corrupted?')
+    }
+}
+
+function loadLocalBackupWithWebView(){
     try {
         const input = document.createElement('input');
         const encryptionMeta:{

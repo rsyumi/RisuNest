@@ -6,6 +6,8 @@ import {
     runNativeOfficialAccountSnapshotRestore,
     runNativeBlockRisuSaveRestore,
     runNativeBlockRisuSaveExport,
+    runNativeLegacyLocalBackupExport,
+    runNativeLegacyLocalBackupRestore,
     runNativeLosslessBackupExport,
     runNativeLosslessBackupRestore,
     runNativeOfficialPublicationAttempt,
@@ -202,6 +204,112 @@ describe('native file jobs', () => {
 
         expect(result).toEqual({ kind: 'compatibility-fallback' })
         expect(acquire).not.toHaveBeenCalled()
+    })
+
+    it('restores a legacy local backup through the destructive replacement fence without payload IPC', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const statuses: NativeFileJobStatus[] = [
+            {
+                ...status('waitingForInput'),
+                kind: 'restore-legacy-local-backup',
+                phase: 'awaiting-activation',
+            },
+            {
+                ...status('succeeded', {
+                    revision: 12,
+                    sourceBytes: 8192,
+                    sourceSha256: 'c'.repeat(64),
+                    characterCount: 4,
+                    presetCount: 2,
+                    warningCodes: [],
+                }),
+                kind: 'restore-legacy-local-backup',
+            },
+        ]
+
+        const result = await runNativeLegacyLocalBackupRestore(
+            restoreRuntime(11),
+            { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'legacy-restore' }
+                    if (command === 'native_file_job_status') return statuses.shift()
+                    if (command === 'native_file_job_finalize') return 'requested'
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result.revision).toBe(12)
+        expect(calls[0]).toEqual(['native_file_job_start', {
+            request: {
+                kind: 'restore-legacy-local-backup',
+                source: { type: 'desktopPath', path: 'C:\\chosen\\backup.bin' },
+                expectedRevision: 11,
+            },
+        }])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
+    it('exports a legacy local backup using only a destination path and revision over IPC', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const result = await runNativeLegacyLocalBackupExport(
+            {
+                revision: 21,
+                flushPendingData: async (reason) => {
+                    calls.push([`flush:${reason}`, undefined])
+                },
+            },
+            'C:\\chosen\\backup.bin',
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    calls.push([command, args])
+                    if (command === 'native_file_job_start') return { jobId: 'legacy-export' }
+                    if (command === 'native_file_job_status') {
+                        return {
+                            jobId: 'legacy-export',
+                            kind: 'export-legacy-local-backup',
+                            state: 'succeeded',
+                            phase: 'complete',
+                            progress: { completedBytes: 4096, completedItems: 3 },
+                            result: {
+                                revision: 21,
+                                sourceBytes: 4096,
+                                sourceSha256: 'd'.repeat(64),
+                                characterCount: 2,
+                                presetCount: 1,
+                                warningCodes: [],
+                            },
+                        } satisfies NativeFileJobStatus
+                    }
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+            },
+        )
+
+        expect(result.sourceBytes).toBe(4096)
+        expect(calls).toEqual([
+            ['flush:native-legacy-local-backup-export', undefined],
+            ['native_file_job_start', {
+                request: {
+                    kind: 'export-legacy-local-backup',
+                    destination: 'C:\\chosen\\backup.bin',
+                    expectedRevision: 21,
+                },
+            }],
+            ['native_file_job_status', { jobId: 'legacy-export' }],
+            ['native_file_job_forget', { jobId: 'legacy-export' }],
+        ])
+        expect(JSON.stringify(calls)).not.toContain('Uint8Array')
     })
 
     it('keeps unavailable lossless backup capability as a structured native error', async () => {

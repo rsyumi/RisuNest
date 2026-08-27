@@ -132,6 +132,14 @@ vi.mock('@tauri-apps/plugin-fs', () => ({
 }))
 
 vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: vi.fn() }))
+vi.mock('./legacyLocalBackupFileRouteProduction.svelte', () => ({
+    exportLegacyLocalBackupFromSystemPicker: vi.fn(async () => {
+        throw { code: 'capability-unavailable' }
+    }),
+    importLegacyLocalBackupFromSystemPicker: vi.fn(async () => {
+        throw { code: 'capability-unavailable' }
+    }),
+}))
 vi.mock('../util', () => ({
     decryptBuffer: vi.fn(),
     encryptBuffer: vi.fn(),
@@ -229,6 +237,7 @@ describe('local backup persistent snapshot', () => {
         const { LoadLocalBackup } = await import('./backuplocal')
 
         LoadLocalBackup()
+        await vi.waitFor(() => expect(input.onchange).not.toBeNull())
         await input.onchange?.()
         createElement.mockRestore()
 

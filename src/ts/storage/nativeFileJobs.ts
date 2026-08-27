@@ -139,6 +139,8 @@ export interface NativeFileJobStatus {
         | 'export-block-risu-save'
         | 'restore-lossless-backup'
         | 'export-lossless-backup'
+        | 'restore-legacy-local-backup'
+        | 'export-legacy-local-backup'
         | 'prepare-content-import'
         | 'kei-backup-upload'
         | 'restore-official-account-snapshot'
@@ -536,6 +538,7 @@ async function runNativeReplacementRestore(
     kind:
         | 'restore-block-risu-save'
         | 'restore-lossless-backup'
+        | 'restore-legacy-local-backup'
         | 'restore-official-account-snapshot',
     mutationReason: string,
     runtime: NativeBlockRestoreRuntime,
@@ -547,7 +550,9 @@ async function runNativeReplacementRestore(
         ? 'Native lossless backup restore'
         : kind === 'restore-official-account-snapshot'
             ? 'Native official account snapshot restore'
-            : 'Native block RisuSave restore'
+        : kind === 'restore-legacy-local-backup'
+            ? 'Native legacy local backup restore'
+        : 'Native block RisuSave restore'
     if (!dependencies.isTauri()) {
         throw new Error(`${operation} requires Tauri`)
     }
@@ -764,7 +769,26 @@ export async function runNativeOfficialAccountSnapshotRestore(
     }
 }
 
-export async function runNativeBlockRisuSaveExport(
+export function runNativeLegacyLocalBackupRestore(
+    runtime: NativeBlockRestoreRuntime,
+    source: NativeFileJobSource,
+    options: NativeFileRestoreJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativeReplacementRestore(
+        'restore-legacy-local-backup',
+        'native-legacy-local-backup-restore',
+        runtime,
+        source,
+        options,
+        dependencies,
+    )
+}
+
+async function runNativePathExport(
+    kind: 'export-block-risu-save' | 'export-legacy-local-backup',
+    flushReason: string,
+    operation: string,
     runtime: {
         readonly revision: number
         flushPendingData(reason: string): Promise<void>
@@ -774,19 +798,21 @@ export async function runNativeBlockRisuSaveExport(
     dependencies: NativeFileJobDependencies = productionDependencies,
 ): Promise<NativeFileJobResult> {
     if (!dependencies.isTauri()) {
-        throw new Error('Native block RisuSave export requires Tauri')
+        throw new Error(`${operation} requires Tauri`)
     }
     if (options.signal?.aborted) throw abortError()
 
-    await runtime.flushPendingData('native-block-risu-save-export')
+    await runtime.flushPendingData(flushReason)
     if (options.signal?.aborted) throw abortError()
     const expectedRevision = runtime.revision
     const started = await invokeNative(dependencies, 'native_file_job_start', {
         request: {
-            kind: 'export-block-risu-save',
+            kind,
             destination,
             expectedRevision,
-            omitAccount: options.omitAccount ?? false,
+            ...(kind === 'export-block-risu-save'
+                ? { omitAccount: options.omitAccount ?? false }
+                : {}),
         },
     }) as { jobId: string; warningCodes?: string[] }
     let cancellationRequested = false
@@ -851,6 +877,47 @@ export async function runNativeBlockRisuSaveExport(
             else if (!outcomeFailed) throw error
         }
     }
+}
+
+
+export function runNativeBlockRisuSaveExport(
+    runtime: {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    destination: string,
+    options: NativeFileExportJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativePathExport(
+        'export-block-risu-save',
+        'native-block-risu-save-export',
+        'Native block RisuSave export',
+        runtime,
+        destination,
+        options,
+        dependencies,
+    )
+}
+
+export function runNativeLegacyLocalBackupExport(
+    runtime: {
+        readonly revision: number
+        flushPendingData(reason: string): Promise<void>
+    },
+    destination: string,
+    options: NativeFileJobOptions = {},
+    dependencies: NativeFileJobDependencies = productionDependencies,
+): Promise<NativeFileJobResult> {
+    return runNativePathExport(
+        'export-legacy-local-backup',
+        'native-legacy-local-backup-export',
+        'Native legacy local backup export',
+        runtime,
+        destination,
+        options,
+        dependencies,
+    )
 }
 
 export async function runNativeLosslessBackupExport(
