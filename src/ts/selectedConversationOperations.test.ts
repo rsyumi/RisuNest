@@ -130,7 +130,8 @@ function makeHarness(options: {
 describe('selected conversation complete-operation gateway', () => {
     it('runs an operation against an already-complete exact session and releases once', async () => {
         const harness = makeHarness()
-        const operation = vi.fn(({ character, conversation, session, selection }) => {
+        const operation = vi.fn((context) => {
+            const { character, conversation, session, selection } = context.requireCurrent()
             expect(character).toBe(harness.current.character)
             expect(conversation).toBe(harness.current.conversation)
             expect(session).toBe(harness.current.session)
@@ -171,16 +172,24 @@ describe('selected conversation complete-operation gateway', () => {
             },
         }
         const operations = createSelectedConversationOperations(dependencies)
+        let capturedCharacter: Database['characters'][number] | null = null
+        let capturedConversation: Chat | null = null
 
-        const captured = await operations.withCompleteSelectedConversation(
+        const result = await operations.withCompleteSelectedConversation(
             'promote-windowed',
-            (target) => target,
+            (context) => {
+                const currentAuthority = context.requireCurrent()
+                capturedCharacter = currentAuthority.character
+                capturedConversation = currentAuthority.conversation
+                return 'done'
+            },
         )
 
-        expect(captured?.character).toBe(complete.character)
-        expect(captured?.conversation).toBe(complete.conversation)
-        expect(captured?.character).not.toBe(windowed.character)
-        expect(captured?.conversation).not.toBe(windowed.conversation)
+        expect(result).toBe('done')
+        expect(capturedCharacter).toBe(complete.character)
+        expect(capturedConversation).toBe(complete.conversation)
+        expect(capturedCharacter).not.toBe(windowed.character)
+        expect(capturedConversation).not.toBe(windowed.conversation)
         expect(lease.release).toHaveBeenCalledOnce()
     })
 
@@ -315,6 +324,67 @@ describe('selected conversation complete-operation gateway', () => {
         expect(harness.defaultLease.release).not.toHaveBeenCalled()
         acquired?.release()
         acquired?.release()
+        expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+    })
+
+    it('invokes the operation before a queued post-acquire navigation invalidates authority', async () => {
+        const harness = makeHarness()
+        const operation = vi.fn((context) => {
+            const current = context.requireCurrent()
+            expect(current.session.isActive).toBe(true)
+            return current.conversation.id
+        })
+
+        const pending = harness.operations.withCompleteSelectedConversation(
+            'post-acquire-navigation',
+            operation,
+        )
+        queueMicrotask(() => {
+            harness.current.session.invalidate()
+            harness.setSession(null)
+            harness.setSelection(makeSelection('character-b', 'conversation-b', 2))
+        })
+
+        await expect(pending).resolves.toBe('conversation-a')
+        expect(operation).toHaveBeenCalledOnce()
+        expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+    })
+
+    it('releases exactly once when message count inspection fails', async () => {
+        const harness = makeHarness()
+        vi.spyOn(harness.current.session, 'totalMessages', 'get').mockImplementation(() => {
+            throw new Error('message count unavailable')
+        })
+
+        await expect(harness.operations.acquireCompleteMessageTarget(
+            1,
+            'message-count-failure',
+        )).rejects.toThrow('message count unavailable')
+        expect(harness.defaultLease.release).toHaveBeenCalledOnce()
+    })
+
+    it('requires fresh authority before mutating after an async suspension', async () => {
+        const harness = makeHarness()
+        const operationStarted = deferred<void>()
+        const resumeOperation = deferred<void>()
+        const originalMessage = harness.current.conversation.message[0].data
+
+        const pending = harness.operations.withCompleteSelectedConversation(
+            'async-freshness',
+            async (context) => {
+                operationStarted.resolve()
+                await resumeOperation.promise
+                context.requireCurrent().conversation.message[0].data = 'stale mutation'
+            },
+        )
+        await operationStarted.promise
+        harness.current.session.invalidate()
+        harness.setSession(null)
+        harness.setSelection(makeSelection('character-b', 'conversation-b', 2))
+        resumeOperation.resolve()
+
+        await expect(pending).rejects.toBeInstanceOf(SelectedConversationPromotionStaleError)
+        expect(harness.current.conversation.message[0].data).toBe(originalMessage)
         expect(harness.defaultLease.release).toHaveBeenCalledOnce()
     })
 })
