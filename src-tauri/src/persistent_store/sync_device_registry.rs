@@ -57,6 +57,26 @@ pub(crate) struct VerifiedSyncDeviceRegistration {
 }
 
 impl VerifiedSyncDeviceRegistration {
+    pub(crate) fn from_authenticated_p5_receipt(
+        library_id: &str,
+        device_id: &str,
+        acknowledged_generation: SyncGenerationIdentity,
+        registered_at: i64,
+    ) -> StoreResult<Self> {
+        validate_library_id(library_id)?;
+        validate_device_id(device_id)?;
+        validate_identity(&acknowledged_generation)?;
+        if registered_at < 0 {
+            return validation("sync device registration timestamp must be nonnegative");
+        }
+        Ok(Self {
+            library_id: library_id.to_owned(),
+            device_id: device_id.to_owned(),
+            acknowledged_generation,
+            registered_at,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn for_test(
         library_id: &str,
@@ -186,6 +206,76 @@ impl PersistentStore {
         Ok(registered)
     }
 
+    pub(crate) fn attach_verified_sync_device_at_common_base(
+        &mut self,
+        receipt: VerifiedSyncDeviceRegistration,
+        expected_local_revision: i64,
+    ) -> StoreResult<RegisteredSyncDevice> {
+        validate_library_id(&receipt.library_id)?;
+        validate_device_id(&receipt.device_id)?;
+        validate_identity(&receipt.acknowledged_generation)?;
+        if receipt.registered_at < 0 {
+            return validation("sync device registration timestamp must be nonnegative");
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual_revision = current_revision(&transaction)?;
+        if actual_revision != expected_local_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_local_revision,
+                actual: actual_revision,
+            });
+        }
+        require_complete_generation(
+            &transaction,
+            &receipt.library_id,
+            &receipt.acknowledged_generation,
+        )?;
+        if let Some(existing) = load_device(&transaction, &receipt.library_id, &receipt.device_id)?
+        {
+            require_device_and_common_base(
+                &transaction,
+                &receipt.library_id,
+                &receipt.device_id,
+                &receipt.acknowledged_generation,
+            )?;
+            if existing.status != RegisteredSyncDeviceStatus::Active {
+                return sync_conflict("inactive sync device cannot be registered for P5");
+            }
+            return Ok(existing);
+        }
+        require_common_base_identity(
+            &transaction,
+            &receipt.library_id,
+            &receipt.device_id,
+            &receipt.acknowledged_generation,
+        )?;
+        transaction.execute(
+            "INSERT INTO logical_sync_devices (
+                library_id, device_id, status,
+                acknowledged_generation_id, acknowledged_manifest_hash,
+                acknowledged_generation_sequence,
+                registered_at, acknowledged_at, revoked_at, forgotten_at
+             ) VALUES (?1, ?2, 'active', ?3, ?4, ?5, ?6, ?6, NULL, NULL)",
+            params![
+                receipt.library_id,
+                receipt.device_id,
+                receipt.acknowledged_generation.generation_id,
+                receipt.acknowledged_generation.manifest_hash,
+                receipt.acknowledged_generation.generation_sequence,
+                receipt.registered_at,
+            ],
+        )?;
+        let attached = load_device(&transaction, &receipt.library_id, &receipt.device_id)?
+            .ok_or_else(|| StoreError::Store {
+                message: "attached sync device disappeared before commit".to_owned(),
+            })?;
+        transaction.commit()?;
+        Ok(attached)
+    }
+
     pub(crate) fn advance_sync_device_ack(
         &mut self,
         library_id: &str,
@@ -200,89 +290,13 @@ impl PersistentStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current =
-            require_device_and_common_base(&transaction, library_id, device_id, expected_previous)?;
-        match current.status {
-            RegisteredSyncDeviceStatus::Active => {}
-            RegisteredSyncDeviceStatus::Revoked => {
-                return sync_conflict("revoked sync device cannot acknowledge a generation")
-            }
-            RegisteredSyncDeviceStatus::Forgotten => {
-                return sync_conflict("forgotten sync device cannot acknowledge a generation")
-            }
-        }
-
-        let sequence_order = compare_sequences(
-            &next.generation_sequence,
-            &current.acknowledged_generation.generation_sequence,
-        );
-        if sequence_order == std::cmp::Ordering::Less {
-            return sync_conflict("sync device acknowledgement cannot regress");
-        }
-        if sequence_order == std::cmp::Ordering::Equal && next != &current.acknowledged_generation {
-            return sync_conflict("sync device acknowledgement cannot fork at the same sequence");
-        }
-        if next.generation_id == current.acknowledged_generation.generation_id
-            && next != &current.acknowledged_generation
-        {
-            return sync_conflict("sync device generation id cannot change identity");
-        }
-        require_complete_generation(&transaction, library_id, next)?;
-        if sequence_order == std::cmp::Ordering::Equal {
-            return Ok(current);
-        }
-        let acknowledged_at = current
-            .acknowledged_at
-            .max(current.registered_at)
-            .max(now_millis()?);
-        let common_updated = transaction.execute(
-            "UPDATE logical_peer_common_bases
-             SET generation_id = ?1, manifest_hash = ?2,
-                 generation_sequence = ?3, updated_at = ?4
-             WHERE peer_id = ?5 AND library_id = ?6
-               AND generation_id = ?7 AND manifest_hash = ?8
-               AND generation_sequence = ?9",
-            params![
-                next.generation_id,
-                next.manifest_hash,
-                next.generation_sequence,
-                acknowledged_at,
-                device_id,
-                library_id,
-                expected_previous.generation_id,
-                expected_previous.manifest_hash,
-                expected_previous.generation_sequence,
-            ],
+        let updated = advance_sync_device_ack_in_transaction(
+            &transaction,
+            library_id,
+            device_id,
+            expected_previous,
+            next,
         )?;
-        let device_updated = transaction.execute(
-            "UPDATE logical_sync_devices
-             SET acknowledged_generation_id = ?1,
-                 acknowledged_manifest_hash = ?2,
-                 acknowledged_generation_sequence = ?3,
-                 acknowledged_at = ?4
-             WHERE library_id = ?5 AND device_id = ?6 AND status = 'active'
-               AND acknowledged_generation_id = ?7
-               AND acknowledged_manifest_hash = ?8
-               AND acknowledged_generation_sequence = ?9",
-            params![
-                next.generation_id,
-                next.manifest_hash,
-                next.generation_sequence,
-                acknowledged_at,
-                library_id,
-                device_id,
-                expected_previous.generation_id,
-                expected_previous.manifest_hash,
-                expected_previous.generation_sequence,
-            ],
-        )?;
-        if common_updated != 1 || device_updated != 1 {
-            return sync_conflict("sync device acknowledgement state changed concurrently");
-        }
-        let updated =
-            load_device(&transaction, library_id, device_id)?.ok_or_else(|| StoreError::Store {
-                message: "acknowledged sync device disappeared before commit".to_owned(),
-            })?;
         transaction.commit()?;
         Ok(updated)
     }
@@ -531,6 +545,101 @@ impl PersistentStore {
     }
 }
 
+pub(super) fn advance_sync_device_ack_in_transaction(
+    connection: &Connection,
+    library_id: &str,
+    device_id: &str,
+    expected_previous: &SyncGenerationIdentity,
+    next: &SyncGenerationIdentity,
+) -> StoreResult<RegisteredSyncDevice> {
+    validate_library_id(library_id)?;
+    validate_device_id(device_id)?;
+    validate_identity(expected_previous)?;
+    validate_identity(next)?;
+    let current =
+        require_device_and_common_base(connection, library_id, device_id, expected_previous)?;
+    match current.status {
+        RegisteredSyncDeviceStatus::Active => {}
+        RegisteredSyncDeviceStatus::Revoked => {
+            return sync_conflict("revoked sync device cannot acknowledge a generation")
+        }
+        RegisteredSyncDeviceStatus::Forgotten => {
+            return sync_conflict("forgotten sync device cannot acknowledge a generation")
+        }
+    }
+
+    let sequence_order = compare_sequences(
+        &next.generation_sequence,
+        &current.acknowledged_generation.generation_sequence,
+    );
+    if sequence_order == std::cmp::Ordering::Less {
+        return sync_conflict("sync device acknowledgement cannot regress");
+    }
+    if sequence_order == std::cmp::Ordering::Equal && next != &current.acknowledged_generation {
+        return sync_conflict("sync device acknowledgement cannot fork at the same sequence");
+    }
+    if next.generation_id == current.acknowledged_generation.generation_id
+        && next != &current.acknowledged_generation
+    {
+        return sync_conflict("sync device generation id cannot change identity");
+    }
+    require_complete_generation(connection, library_id, next)?;
+    if sequence_order == std::cmp::Ordering::Equal {
+        return Ok(current);
+    }
+    let acknowledged_at = current
+        .acknowledged_at
+        .max(current.registered_at)
+        .max(now_millis()?);
+    let common_updated = connection.execute(
+        "UPDATE logical_peer_common_bases
+         SET generation_id = ?1, manifest_hash = ?2,
+             generation_sequence = ?3, updated_at = ?4
+         WHERE peer_id = ?5 AND library_id = ?6
+           AND generation_id = ?7 AND manifest_hash = ?8
+           AND generation_sequence = ?9",
+        params![
+            next.generation_id,
+            next.manifest_hash,
+            next.generation_sequence,
+            acknowledged_at,
+            device_id,
+            library_id,
+            expected_previous.generation_id,
+            expected_previous.manifest_hash,
+            expected_previous.generation_sequence,
+        ],
+    )?;
+    let device_updated = connection.execute(
+        "UPDATE logical_sync_devices
+         SET acknowledged_generation_id = ?1,
+             acknowledged_manifest_hash = ?2,
+             acknowledged_generation_sequence = ?3,
+             acknowledged_at = ?4
+         WHERE library_id = ?5 AND device_id = ?6 AND status = 'active'
+           AND acknowledged_generation_id = ?7
+           AND acknowledged_manifest_hash = ?8
+           AND acknowledged_generation_sequence = ?9",
+        params![
+            next.generation_id,
+            next.manifest_hash,
+            next.generation_sequence,
+            acknowledged_at,
+            library_id,
+            device_id,
+            expected_previous.generation_id,
+            expected_previous.manifest_hash,
+            expected_previous.generation_sequence,
+        ],
+    )?;
+    if common_updated != 1 || device_updated != 1 {
+        return sync_conflict("sync device acknowledgement state changed concurrently");
+    }
+    load_device(connection, library_id, device_id)?.ok_or_else(|| StoreError::Store {
+        message: "acknowledged sync device disappeared before commit".to_owned(),
+    })
+}
+
 fn load_device(
     connection: &Connection,
     library_id: &str,
@@ -632,6 +741,33 @@ fn require_device_and_common_base(
         return sync_conflict("sync device common base does not match expected state");
     }
     Ok(device)
+}
+
+fn require_common_base_identity(
+    connection: &Connection,
+    library_id: &str,
+    device_id: &str,
+    expected: &SyncGenerationIdentity,
+) -> StoreResult<()> {
+    let common_base = connection
+        .query_row(
+            "SELECT generation_id, manifest_hash, generation_sequence
+             FROM logical_peer_common_bases
+             WHERE peer_id = ?1 AND library_id = ?2",
+            params![device_id, library_id],
+            |row| {
+                Ok(SyncGenerationIdentity {
+                    generation_id: row.get(0)?,
+                    manifest_hash: row.get(1)?,
+                    generation_sequence: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    if common_base.as_ref() != Some(expected) {
+        return sync_conflict("sync device common base does not match expected state");
+    }
+    Ok(())
 }
 
 fn require_complete_generation(

@@ -95,6 +95,199 @@ fn verified_registration_and_ack_commit_exact_identity_with_common_base() {
 }
 
 #[test]
+fn authenticated_p5_registration_attaches_to_an_exact_p4_common_base_idempotently() {
+    let directory = tempfile::tempdir().expect("create P5 attachment fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    seed_complete_generation(&store, "library", "generation-1", "1", HASH_A);
+    let identity = SyncGenerationIdentity {
+        generation_id: "generation-1".to_owned(),
+        manifest_hash: HASH_A.to_owned(),
+        generation_sequence: "1".to_owned(),
+    };
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_peer_common_bases (
+                peer_id, library_id, generation_id, manifest_hash,
+                generation_sequence, updated_at
+             ) VALUES ('device-a', 'library', 'generation-1', ?1, '1', 10)",
+            [HASH_A],
+        )
+        .expect("seed existing P4 common base");
+    let receipt = VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+        "library",
+        "device-a",
+        identity.clone(),
+        10,
+    )
+    .expect("construct authenticated P5 receipt");
+
+    let attached = store
+        .attach_verified_sync_device_at_common_base(receipt.clone(), 0)
+        .expect("attach P5 registry row to P4 common base");
+    let retried = store
+        .attach_verified_sync_device_at_common_base(receipt, 0)
+        .expect("return exact active registration on retry");
+
+    assert_eq!(attached, retried);
+    assert_eq!(attached.status, RegisteredSyncDeviceStatus::Active);
+    assert_eq!(attached.acknowledged_generation, identity);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM logical_sync_devices", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count attached registry rows"),
+        1
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_peer_common_bases",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .expect("preserve existing P4 common base"),
+        1
+    );
+}
+
+#[test]
+fn authenticated_p5_registration_rejects_mismatched_common_base_without_mutation() {
+    let directory = tempfile::tempdir().expect("create mismatched attachment fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    seed_complete_generation(&store, "library", "generation-1", "1", HASH_A);
+    seed_complete_generation(&store, "library", "generation-2", "2", HASH_A);
+    store
+        .connection
+        .execute(
+            "INSERT INTO logical_peer_common_bases (
+                peer_id, library_id, generation_id, manifest_hash,
+                generation_sequence, updated_at
+             ) VALUES ('device-a', 'library', 'generation-1', ?1, '1', 10)",
+            [HASH_A],
+        )
+        .expect("seed P4 common base");
+    let stale = SyncGenerationIdentity {
+        generation_id: "generation-2".to_owned(),
+        manifest_hash: HASH_A.to_owned(),
+        generation_sequence: "2".to_owned(),
+    };
+
+    assert!(store
+        .attach_verified_sync_device_at_common_base(
+            VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                "library", "device-a", stale, 20,
+            )
+            .expect("construct authenticated P5 receipt"),
+            0,
+        )
+        .is_err());
+    assert!(store
+        .list_sync_devices("library")
+        .expect("list unchanged registry")
+        .is_empty());
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT generation_id FROM logical_peer_common_bases
+                 WHERE peer_id = 'device-a' AND library_id = 'library'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read unchanged P4 common base"),
+        "generation-1"
+    );
+}
+
+#[test]
+fn authenticated_p5_registration_rejects_revoked_forgotten_and_stale_devices_without_mutation() {
+    let directory = tempfile::tempdir().expect("create lifecycle attachment fixture");
+    let mut store = PersistentStore::open(directory.path()).expect("open store");
+    seed_complete_generation(&store, "library", "generation-1", "1", HASH_A);
+    seed_complete_generation(&store, "library", "generation-2", "2", HASH_A);
+    let first = SyncGenerationIdentity {
+        generation_id: "generation-1".to_owned(),
+        manifest_hash: HASH_A.to_owned(),
+        generation_sequence: "1".to_owned(),
+    };
+    let second = SyncGenerationIdentity {
+        generation_id: "generation-2".to_owned(),
+        manifest_hash: HASH_A.to_owned(),
+        generation_sequence: "2".to_owned(),
+    };
+    for device_id in ["revoked", "forgotten", "stale"] {
+        store
+            .connection
+            .execute(
+                "INSERT INTO logical_peer_common_bases (
+                    peer_id, library_id, generation_id, manifest_hash,
+                    generation_sequence, updated_at
+                 ) VALUES (?1, 'library', 'generation-1', ?2, '1', 10)",
+                params![device_id, HASH_A],
+            )
+            .expect("seed P4 common base");
+        store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    "library",
+                    device_id,
+                    first.clone(),
+                    10,
+                )
+                .expect("construct authenticated P5 receipt"),
+                0,
+            )
+            .expect("attach active device");
+    }
+    store
+        .revoke_sync_device("library", "revoked", &first)
+        .expect("revoke device");
+    store
+        .forget_sync_device("library", "forgotten", &first)
+        .expect("forget device");
+
+    for (device_id, identity) in [
+        ("revoked", first.clone()),
+        ("forgotten", first.clone()),
+        ("stale", second),
+    ] {
+        assert!(store
+            .attach_verified_sync_device_at_common_base(
+                VerifiedSyncDeviceRegistration::from_authenticated_p5_receipt(
+                    "library", device_id, identity, 20,
+                )
+                .expect("construct authenticated P5 retry receipt"),
+                0,
+            )
+            .is_err());
+    }
+
+    let devices = store
+        .list_sync_devices("library")
+        .expect("list unchanged lifecycle registry");
+    assert_eq!(devices[0].status, RegisteredSyncDeviceStatus::Forgotten);
+    assert_eq!(devices[1].status, RegisteredSyncDeviceStatus::Revoked);
+    assert_eq!(devices[2].status, RegisteredSyncDeviceStatus::Active);
+    assert_eq!(devices[2].acknowledged_generation, first);
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM logical_peer_common_bases
+                 WHERE library_id = 'library'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count unchanged common bases"),
+        2
+    );
+}
+
+#[test]
 fn device_id_limit_counts_unicode_characters_and_generation_id_is_unbounded() {
     let directory = tempfile::tempdir().expect("create identifier fixture");
     let mut store = PersistentStore::open(directory.path()).expect("open store");
