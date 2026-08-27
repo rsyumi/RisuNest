@@ -17,10 +17,18 @@ mod owner_projection;
 mod query;
 mod schema;
 mod snapshot;
+mod sync_device_registry;
+#[cfg(test)]
+mod sync_device_registry_tests;
 
 pub(crate) use asset_object_catalog::{AssetObjectCatalog, AssetObjectCatalogPage};
 pub(crate) use commands::PersistentStoreState;
 pub(crate) use snapshot::RevisionReadLease;
+#[allow(unused_imports)]
+pub(crate) use sync_device_registry::{
+    RegisteredSyncDevice, RegisteredSyncDeviceStatus, SyncGenerationIdentity,
+    TombstoneCollectionItem, TombstoneCollectionPage, VerifiedSyncDeviceRegistration,
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};

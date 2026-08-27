@@ -4,20 +4,20 @@ import {
     type LogicalManifestRecord,
 } from './logicalManifest'
 
-const MAX_DEVICE_ID_BYTES = 1024
-const textEncoder = new TextEncoder()
+const MAX_DEVICE_ID_CHARACTERS = 1024
+const SHA256_PATTERN = /^[0-9a-f]{64}$/
 
-export type RegisteredSyncDevice =
-    | {
-          deviceId: string
-          status: 'active'
-          acknowledgedGenerationSequence: string
-      }
-    | {
-          deviceId: string
-          status: 'forgotten'
-          forgottenGenerationSequence: string
-      }
+export interface SyncGenerationIdentity {
+    generationId: string
+    manifestHash: string
+    generationSequence: string
+}
+
+export type RegisteredSyncDevice = {
+    deviceId: string
+    status: 'active' | 'revoked' | 'forgotten'
+    acknowledgedGeneration: SyncGenerationIdentity
+}
 
 export interface TombstoneCollectionPlan {
     retain: Array<{
@@ -36,42 +36,60 @@ function compareSequences(left: string, right: string): number {
     return left < right ? -1 : left > right ? 1 : 0
 }
 
-function validateDeviceId(value: unknown): string {
-    if (
-        typeof value !== 'string'
-        || value.length === 0
-        || textEncoder.encode(value).byteLength > MAX_DEVICE_ID_BYTES
-    ) {
-        throw new TypeError('Registered sync device id must be a bounded nonempty string')
+function validateNonemptyId(value: unknown, description: string): string {
+    if (typeof value !== 'string' || value.length === 0) {
+        throw new TypeError(`${description} must be a nonempty string`)
     }
     return value
+}
+
+function validateDeviceId(value: unknown): string {
+    const deviceId = validateNonemptyId(value, 'Registered sync device id')
+    if ([...deviceId].length > MAX_DEVICE_ID_CHARACTERS) {
+        throw new TypeError('Registered sync device id must contain at most 1024 characters')
+    }
+    return deviceId
+}
+
+function validateGenerationIdentity(
+    value: SyncGenerationIdentity,
+    description: string,
+): SyncGenerationIdentity {
+    const generationId = validateNonemptyId(value?.generationId, `${description} generation id`)
+    if (typeof value?.manifestHash !== 'string' || !SHA256_PATTERN.test(value.manifestHash)) {
+        throw new TypeError(`${description} manifest hash must be a lowercase SHA-256`)
+    }
+    return {
+        generationId,
+        manifestHash: value.manifestHash,
+        generationSequence: validateGenerationSequence(
+            value.generationSequence,
+            `${description} generation sequence`,
+        ),
+    }
+}
+
+function sameIdentity(left: SyncGenerationIdentity, right: SyncGenerationIdentity): boolean {
+    return left.generationId === right.generationId
+        && left.manifestHash === right.manifestHash
+        && left.generationSequence === right.generationSequence
 }
 
 function normalizeDevices(devices: readonly RegisteredSyncDevice[]): RegisteredSyncDevice[] {
     if (!Array.isArray(devices)) throw new TypeError('Registered sync devices must be an array')
     const normalized = devices.map((device): RegisteredSyncDevice => {
         const deviceId = validateDeviceId(device?.deviceId)
-        if (device?.status === 'active') {
-            return {
-                deviceId,
-                status: 'active',
-                acknowledgedGenerationSequence: validateGenerationSequence(
-                    device.acknowledgedGenerationSequence,
-                    'Registered sync device acknowledgement',
-                ),
-            }
+        if (!['active', 'revoked', 'forgotten'].includes(device?.status)) {
+            throw new TypeError('Registered sync device status is invalid')
         }
-        if (device?.status === 'forgotten') {
-            return {
-                deviceId,
-                status: 'forgotten',
-                forgottenGenerationSequence: validateGenerationSequence(
-                    device.forgottenGenerationSequence,
-                    'Registered sync device forgotten generation',
-                ),
-            }
+        return {
+            deviceId,
+            status: device.status,
+            acknowledgedGeneration: validateGenerationIdentity(
+                device.acknowledgedGeneration,
+                'Registered sync device acknowledgement',
+            ),
         }
-        throw new TypeError('Registered sync device status is invalid')
     }).sort((left, right) => left.deviceId < right.deviceId ? -1 : left.deviceId > right.deviceId ? 1 : 0)
     for (let index = 1; index < normalized.length; index++) {
         if (normalized[index - 1].deviceId === normalized[index].deviceId) {
@@ -84,62 +102,65 @@ function normalizeDevices(devices: readonly RegisteredSyncDevice[]): RegisteredS
 export function acknowledgeDeviceGeneration(
     devices: readonly RegisteredSyncDevice[],
     deviceId: string,
-    generationSequence: string,
+    generation: SyncGenerationIdentity,
 ): RegisteredSyncDevice[] {
     const normalized = normalizeDevices(devices)
     const id = validateDeviceId(deviceId)
-    const nextSequence = validateGenerationSequence(
-        generationSequence,
-        'Registered sync device acknowledgement',
+    const next = validateGenerationIdentity(generation, 'Registered sync device acknowledgement')
+    const index = normalized.findIndex((device) => device.deviceId === id)
+    if (index < 0) throw new TypeError(`Registered sync device is unknown: ${id}`)
+    const current = normalized[index]
+    if (current.status === 'revoked') {
+        throw new TypeError(`Registered sync device is revoked: ${id}`)
+    }
+    if (current.status === 'forgotten') {
+        throw new TypeError(`Registered sync device is forgotten: ${id}`)
+    }
+    const sequenceOrder = compareSequences(
+        next.generationSequence,
+        current.acknowledgedGeneration.generationSequence,
     )
+    if (sequenceOrder < 0) {
+        throw new TypeError(`Registered sync device acknowledgement cannot regress: ${id}`)
+    }
+    if (sequenceOrder === 0 && !sameIdentity(next, current.acknowledgedGeneration)) {
+        throw new TypeError(`Registered sync device acknowledgement cannot fork at the same sequence: ${id}`)
+    }
+    if (
+        next.generationId === current.acknowledgedGeneration.generationId
+        && !sameIdentity(next, current.acknowledgedGeneration)
+    ) {
+        throw new TypeError(`Registered sync device generation id cannot change identity: ${id}`)
+    }
+    normalized[index] = { deviceId: id, status: 'active', acknowledgedGeneration: next }
+    return normalized
+}
+
+export function revokeRegisteredDevice(
+    devices: readonly RegisteredSyncDevice[],
+    deviceId: string,
+): RegisteredSyncDevice[] {
+    const normalized = normalizeDevices(devices)
+    const id = validateDeviceId(deviceId)
     const index = normalized.findIndex((device) => device.deviceId === id)
     if (index < 0) throw new TypeError(`Registered sync device is unknown: ${id}`)
     const current = normalized[index]
     if (current.status === 'forgotten') {
         throw new TypeError(`Registered sync device is forgotten: ${id}`)
     }
-    if (compareSequences(nextSequence, current.acknowledgedGenerationSequence) < 0) {
-        throw new TypeError(`Registered sync device acknowledgement cannot regress: ${id}`)
-    }
-    normalized[index] = {
-        deviceId: id,
-        status: 'active',
-        acknowledgedGenerationSequence: nextSequence,
-    }
+    normalized[index] = { ...current, status: 'revoked' }
     return normalized
 }
 
 export function forgetRegisteredDevice(
     devices: readonly RegisteredSyncDevice[],
     deviceId: string,
-    forgottenGenerationSequence: string,
 ): RegisteredSyncDevice[] {
     const normalized = normalizeDevices(devices)
     const id = validateDeviceId(deviceId)
-    const forgottenAt = validateGenerationSequence(
-        forgottenGenerationSequence,
-        'Registered sync device forgotten generation',
-    )
     const index = normalized.findIndex((device) => device.deviceId === id)
     if (index < 0) throw new TypeError(`Registered sync device is unknown: ${id}`)
-    const current = normalized[index]
-    if (
-        current.status === 'active'
-        && compareSequences(forgottenAt, current.acknowledgedGenerationSequence) < 0
-    ) {
-        throw new TypeError(`Registered sync device forgotten generation predates acknowledgement: ${id}`)
-    }
-    if (
-        current.status === 'forgotten'
-        && compareSequences(forgottenAt, current.forgottenGenerationSequence) < 0
-    ) {
-        throw new TypeError(`Registered sync device forgotten generation cannot regress: ${id}`)
-    }
-    normalized[index] = {
-        deviceId: id,
-        status: 'forgotten',
-        forgottenGenerationSequence: forgottenAt,
-    }
+    normalized[index] = { ...normalized[index], status: 'forgotten' }
     return normalized
 }
 
@@ -173,11 +194,13 @@ export function planTombstoneCollection(input: {
     const plan: TombstoneCollectionPlan = { retain: [], collectible: [] }
     for (const tombstone of tombstones) {
         const blockingDeviceIds = devices
-            .filter((device) => device.status === 'active')
-            .filter((device) => compareSequences(
-                device.acknowledgedGenerationSequence,
-                tombstone.deletedGenerationSequence,
-            ) <= 0)
+            .filter((device) => device.status === 'revoked' || (
+                device.status === 'active'
+                && compareSequences(
+                    device.acknowledgedGeneration.generationSequence,
+                    tombstone.deletedGenerationSequence,
+                ) <= 0
+            ))
             .map((device) => device.deviceId)
         if (blockingDeviceIds.length > 0) {
             plan.retain.push({ ...tombstone, blockingDeviceIds })

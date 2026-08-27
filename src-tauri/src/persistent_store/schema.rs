@@ -1,8 +1,57 @@
 use super::{logical_schema, StoreError, StoreResult};
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 
-pub(super) const SCHEMA_VERSION: u32 = 12;
+pub(super) const SCHEMA_VERSION: u32 = 13;
+
+const SYNC_DEVICE_TABLE_SQL: &str = r#"
+CREATE TABLE logical_sync_devices (
+    library_id TEXT NOT NULL CHECK (length(library_id) > 0),
+    device_id TEXT NOT NULL CHECK (length(device_id) BETWEEN 1 AND 1024),
+    status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'forgotten')),
+    acknowledged_generation_id TEXT NOT NULL CHECK (
+        length(acknowledged_generation_id) > 0
+    ),
+    acknowledged_manifest_hash TEXT NOT NULL CHECK (
+        length(acknowledged_manifest_hash) = 64
+        AND acknowledged_manifest_hash NOT GLOB '*[^0-9a-f]*'
+    ),
+    acknowledged_generation_sequence TEXT NOT NULL CHECK (
+        length(acknowledged_generation_sequence) BETWEEN 1 AND 64
+        AND acknowledged_generation_sequence NOT GLOB '*[^0-9]*'
+        AND (
+            acknowledged_generation_sequence = '0'
+            OR substr(acknowledged_generation_sequence, 1, 1) != '0'
+        )
+    ),
+    registered_at INTEGER NOT NULL CHECK (registered_at >= 0),
+    acknowledged_at INTEGER NOT NULL CHECK (acknowledged_at >= registered_at),
+    revoked_at INTEGER CHECK (revoked_at IS NULL OR revoked_at >= registered_at),
+    forgotten_at INTEGER CHECK (forgotten_at IS NULL OR forgotten_at >= registered_at),
+    CHECK (
+        (
+            status = 'active'
+            AND revoked_at IS NULL
+            AND forgotten_at IS NULL
+        )
+        OR (
+            status = 'revoked'
+            AND revoked_at IS NOT NULL
+            AND forgotten_at IS NULL
+        )
+        OR (
+            status = 'forgotten'
+            AND forgotten_at IS NOT NULL
+        )
+    ),
+    PRIMARY KEY (library_id, device_id)
+)
+"#;
+
+const SYNC_DEVICE_INDEX_SQL: &str = r#"
+CREATE INDEX logical_sync_devices_status
+    ON logical_sync_devices (library_id, status, device_id)
+"#;
 
 pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
     connection.execute_batch(
@@ -30,8 +79,12 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
         8 => migrate_v8_to_v10(connection)?,
         9 => migrate_v9_to_v10(connection)?,
         10 => {}
-        11 => return migrate_v11_to_v12(connection),
-        SCHEMA_VERSION => return Ok(()),
+        11 => {
+            migrate_v11_to_v12(connection)?;
+            return migrate_v12_to_v13(connection);
+        }
+        12 => return migrate_v12_to_v13(connection),
+        SCHEMA_VERSION => return validate_v13_schema(connection),
         _ => {
             return Err(StoreError::Store {
                 message: format!("unsupported persistent schema version {version}"),
@@ -39,7 +92,8 @@ pub(super) fn initialize(connection: &mut Connection) -> StoreResult<()> {
         }
     }
     migrate_v10_to_v11(connection)?;
-    migrate_v11_to_v12(connection)
+    migrate_v11_to_v12(connection)?;
+    migrate_v12_to_v13(connection)
 }
 
 fn create_v10(connection: &mut Connection) -> StoreResult<()> {
@@ -255,9 +309,98 @@ fn migrate_v11_to_v12(connection: &mut Connection) -> StoreResult<()> {
             ON asset_objects (created_at_ms, object_hash);
         ",
     )?;
+    transaction.pragma_update(None, "user_version", 12)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v12_to_v13(connection: &mut Connection) -> StoreResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(SYNC_DEVICE_TABLE_SQL)?;
+    transaction.execute_batch(SYNC_DEVICE_INDEX_SQL)?;
+
+    let invalid_common_base_count: i64 = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM logical_peer_common_bases AS common_base
+         LEFT JOIN logical_sync_generations AS generation
+           ON generation.library_id = common_base.library_id
+          AND generation.generation_id = common_base.generation_id
+          AND generation.manifest_hash = common_base.manifest_hash
+          AND generation.generation_sequence = common_base.generation_sequence
+          AND generation.state = 'complete'
+          AND generation.completed_at IS NOT NULL
+         WHERE generation.generation_id IS NULL
+            OR length(common_base.peer_id) NOT BETWEEN 1 AND 1024",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_common_base_count != 0 {
+        return Err(StoreError::Validation {
+            message: "logical common base does not identify an exact complete generation"
+                .to_owned(),
+        });
+    }
+
+    transaction.execute_batch(
+        "
+        INSERT INTO logical_sync_devices (
+            library_id, device_id, status,
+            acknowledged_generation_id, acknowledged_manifest_hash,
+            acknowledged_generation_sequence,
+            registered_at, acknowledged_at, revoked_at, forgotten_at
+        )
+        SELECT library_id, peer_id, 'revoked', generation_id, manifest_hash,
+               generation_sequence, updated_at, updated_at, updated_at, NULL
+        FROM logical_peer_common_bases;
+        ",
+    )?;
+    validate_v13_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn validate_v13_schema(connection: &Connection) -> StoreResult<()> {
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'logical_sync_devices'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(SYNC_DEVICE_TABLE_SQL))
+    {
+        return Err(StoreError::Validation {
+            message: "sync device registry table definition is invalid".to_owned(),
+        });
+    }
+    let index_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'logical_sync_devices_status'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if index_sql.as_deref().map(normalize_schema_sql)
+        != Some(normalize_schema_sql(SYNC_DEVICE_INDEX_SQL))
+    {
+        return Err(StoreError::Validation {
+            message: "sync device registry status index definition is invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn normalize_schema_sql(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_end_matches(';')
+        .to_owned()
 }
 
 fn migrate_v5(connection: &mut Connection) -> StoreResult<()> {

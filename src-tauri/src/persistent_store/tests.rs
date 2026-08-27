@@ -4650,7 +4650,7 @@ fn pilot_mutated_database_supports_generation_cow_compatible_reopen_read_and_com
         compatibility
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        12
+        13
     );
     assert_eq!(
         super::current_revision(&compatibility).expect("read pilot revision through COW path"),
@@ -5602,16 +5602,16 @@ fn assert_logical_schema_fixture(connection: &rusqlite::Connection) {
 }
 
 #[test]
-fn fresh_schema_v12_contains_dual_authority_and_empty_p4_logical_tables() {
-    let directory = tempfile::tempdir().expect("create fresh v12 directory");
-    let store = PersistentStore::open(directory.path()).expect("open fresh v12 store");
+fn fresh_schema_v13_contains_dual_authority_and_empty_p4_logical_tables() {
+    let directory = tempfile::tempdir().expect("create fresh v13 directory");
+    let store = PersistentStore::open(directory.path()).expect("open fresh v13 store");
 
     assert_eq!(
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read fresh schema version"),
-        12
+        13
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -5654,6 +5654,8 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
             INSERT INTO snapshot_leases (lease, generation, revision, created_at)
                 VALUES ('snapshot-v10-cold', 'snapshot-v10-cold', 0, 4102444800000);
             DROP TABLE cold_payload_authority;
+            DROP INDEX logical_sync_devices_status;
+            DROP TABLE logical_sync_devices;
             DROP TABLE asset_objects;
             PRAGMA user_version = 10;
             "#,
@@ -5669,7 +5671,7 @@ fn schema_v11_backfills_cold_authority_for_active_and_leased_v10_generations() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated cold schema version"),
-        12
+        13
     );
     assert_cold_v11_authority_schema(&connection, 2);
     for generation in ["revision-0", "snapshot-v10-cold"] {
@@ -5738,6 +5740,8 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             DROP TABLE logical_sync_generations;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP INDEX logical_sync_devices_status;
+            DROP TABLE logical_sync_devices;
             DROP TABLE asset_objects;
             PRAGMA user_version = 8;
             "#,
@@ -5759,7 +5763,7 @@ fn schema_v10_migrates_v8_through_m4_v9_and_preserves_j2_data() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated schema version"),
-        12
+        13
     );
     assert_j2_v8_payload_schema(&store.connection);
     assert_m4_v9_authority_schema(&store.connection, 1);
@@ -5888,6 +5892,8 @@ fn schema_v10_migration_collision_preserves_completed_m4_v9_and_v8_rows() {
             DROP TABLE logical_sync_generations;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP INDEX logical_sync_devices_status;
+            DROP TABLE logical_sync_devices;
             DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 8;
@@ -5991,6 +5997,8 @@ fn schema_v10_migration_collision_rolls_back_v9_logical_ddl_only() {
             DROP TABLE logical_record_heads;
             DROP TABLE logical_sync_generations;
             DROP TABLE cold_payload_authority;
+            DROP INDEX logical_sync_devices_status;
+            DROP TABLE logical_sync_devices;
             DROP TABLE asset_objects;
             CREATE TABLE logical_record_heads (collision_marker TEXT NOT NULL);
             PRAGMA user_version = 9;
@@ -6065,7 +6073,7 @@ fn schema_v10_logical_rows_survive_snapshot_restore_and_reopen() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read restored schema version"),
-        12
+        13
     );
     assert_logical_schema_fixture(&restored.connection);
     drop(restored);
@@ -6088,6 +6096,8 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
              DROP TABLE cold_aliases;
              DROP TABLE cold_payload_authority;
              DROP TABLE asset_repository_authority;
+             DROP INDEX logical_sync_devices_status;
+             DROP TABLE logical_sync_devices;
              DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
@@ -6117,7 +6127,7 @@ fn schema_v8_adds_empty_payload_alias_tables_to_v5() {
         })
         .expect("count migrated owner heads");
 
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert_eq!(alias_count, 0);
     assert_eq!(head_count, 0);
     assert_eq!(
@@ -6135,6 +6145,8 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .execute_batch(
             "DROP TABLE cold_payload_authority;
              DROP TABLE asset_repository_authority;
+             DROP INDEX logical_sync_devices_status;
+             DROP TABLE logical_sync_devices;
              DROP TABLE asset_objects;
              DROP TABLE logical_generation_session_pins;
              DROP TABLE logical_library_head;
@@ -6153,7 +6165,7 @@ fn schema_v10_chains_m4_authority_and_p4_logical_migrations_from_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert_eq!(
         store
             .read_asset_repository_authority(None)
@@ -6259,6 +6271,8 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
             DROP TABLE cold_aliases;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP INDEX logical_sync_devices_status;
+            DROP TABLE logical_sync_devices;
             DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
@@ -6278,7 +6292,7 @@ fn schema_v8_migrates_v6_alias_without_changing_its_value() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert_eq!(
         store
             .read_asset_alias("asset", &alias.key, None)
@@ -6350,6 +6364,8 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
             DROP TABLE cold_aliases;
             DROP TABLE cold_payload_authority;
             DROP TABLE asset_repository_authority;
+            DROP INDEX logical_sync_devices_status;
+            DROP TABLE logical_sync_devices;
             DROP TABLE asset_objects;
             DROP TABLE logical_generation_session_pins;
             DROP TABLE logical_library_head;
@@ -6380,7 +6396,7 @@ fn schema_v8_preserves_m5_v7_owner_heads_through_cow_and_pinned_reads() {
         )
         .expect("query migrated cold table");
 
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(cold_table_exists);
     let owner = AssetOwnerLocator::RootModuleAssets { index: 0 };
     let head = AssetOwnerHead::present(owner.clone(), "83".repeat(32), 1);
@@ -6470,7 +6486,7 @@ fn schema_v8_migrates_v2_snapshot_lease_and_plugin_records() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let snapshot_rows: i64 = store
         .connection
@@ -6611,7 +6627,7 @@ fn schema_v8_migrates_snapshot_v3_without_plugin_table() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read snapshot v3 migrated version"),
-        12
+        13
     );
     assert_eq!(
         store
@@ -6639,7 +6655,7 @@ fn schema_v8_migrates_task4_v4_lease_with_plugin_ordinal() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read Task 4 v4 migrated version"),
-        12
+        13
     );
     assert_eq!(
         store
@@ -6680,7 +6696,7 @@ fn schema_v8_migrates_existing_v2_plugin_storage() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read v2 migrated version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -6705,7 +6721,7 @@ fn schema_v8_adds_durable_plugin_ordinals_to_task4_v3() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated v3 version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -6843,7 +6859,7 @@ fn schema_v8_migrates_records_for_every_v1_generation() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -6985,7 +7001,7 @@ fn pending_v1_snapshot_restores_then_migrates_to_v8() {
         .connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read restored version");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -7131,7 +7147,7 @@ fn schema_configures_the_documented_sqlite_profile() {
     assert_eq!(integer_pragma("temp_store"), 2);
     assert_eq!(integer_pragma("journal_size_limit"), 67_108_864);
     assert_eq!(integer_pragma("foreign_keys"), 0);
-    assert_eq!(integer_pragma("user_version"), 12);
+    assert_eq!(integer_pragma("user_version"), 13);
 }
 
 #[test]
@@ -7942,7 +7958,7 @@ fn invalid_restore_candidates_preserve_current_data_and_marker() {
             let connection =
                 rusqlite::Connection::open(&candidate).expect("create wrong-version database");
             connection
-                .execute_batch("PRAGMA user_version = 13;")
+                .execute_batch("PRAGMA user_version = 14;")
                 .expect("set wrong schema version");
         } else {
             fs::write(&candidate, b"not a sqlite database").expect("write corrupt database");
@@ -7974,8 +7990,8 @@ fn schema_v12_adds_only_the_global_empty_asset_object_catalog_after_cold_v11() {
         store
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .expect("read v12 version"),
-        12
+            .expect("read current version"),
+        13
     );
     assert_eq!(
         table_columns(&store.connection, "asset_objects")
@@ -8011,7 +8027,12 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
     let store = PersistentStore::open(directory.path()).expect("create current store");
     store
         .connection
-        .execute_batch("DROP TABLE asset_objects; PRAGMA user_version = 11;")
+        .execute_batch(
+            "DROP INDEX logical_sync_devices_status;
+             DROP TABLE logical_sync_devices;
+             DROP TABLE asset_objects;
+             PRAGMA user_version = 11;",
+        )
         .expect("create v11 fixture");
     drop(store);
     let sentinel = directory
@@ -8027,7 +8048,7 @@ fn schema_v12_migrates_v11_without_scanning_or_backfilling_cas_objects() {
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read migrated version"),
-        12
+        13
     );
     assert_eq!(
         migrated
@@ -8051,7 +8072,9 @@ fn schema_v12_catalog_collision_rolls_back_without_advancing_v11() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE asset_objects;
+            "DROP INDEX logical_sync_devices_status;
+             DROP TABLE logical_sync_devices;
+             DROP TABLE asset_objects;
              CREATE TABLE asset_objects (collision_marker TEXT NOT NULL);
              PRAGMA user_version = 11;",
         )
