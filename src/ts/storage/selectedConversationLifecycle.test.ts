@@ -729,6 +729,85 @@ describe('selected conversation lifecycle', () => {
         expect(runtime.tryDemoteSelectedConversation()).toBe(true)
     })
 
+    it('keeps a windowed selected conversation authoritative across a root module append', async () => {
+        const database = {
+            username: 'Windowed module append fixture',
+            modules: [],
+            characters: [makeCharacter(makeChat(10_000))],
+        } as unknown as Database
+        let workingCopy = structuredClone(database)
+        const store = new IndexedDbPersistentDataStore(
+            `selected-windowed-module-append-${crypto.randomUUID()}`,
+            indexedDB,
+            IDBKeyRange,
+        )
+        await store.open()
+        const initial = await store.replaceFromDatabase(database)
+        const state: PersistentDataRuntimeStateAdapter = {
+            captureRoot: () => capturePersistentRoot(workingCopy),
+            captureSelectedCharacter: () => workingCopy.characters[0] ?? null,
+            captureCharacter: (id) =>
+                workingCopy.characters.find((character) => character.chaId === id) ?? null,
+            getSelectedCharacterId: () => workingCopy.characters[0]?.chaId,
+            getSelectedConversationId: () => workingCopy.characters[0]?.chats[0]?.id,
+            replaceDatabase: (next) => {
+                workingCopy = next
+            },
+            publishRootWorkingSet: (root) => {
+                Object.assign(workingCopy, root)
+            },
+            publishCharacter: (next) => {
+                workingCopy.characters[0] = next
+            },
+            publishConversation: (_characterId, conversation, nextCharacter) => {
+                if (nextCharacter) workingCopy.characters[0] = nextCharacter
+                else workingCopy.characters[0].chats[0] = conversation
+            },
+            canUseWindowedSelectedConversation: () => true,
+            isMaximumCompatibilityMode: () => false,
+            isConversationOperationActive: () => false,
+        }
+        const runtime = createPersistentDataRuntime({
+            store,
+            state,
+            prepareDatabase: async (candidate) => candidate,
+        })
+        await runtime.initializeActiveWorkingSet(workingCopy)
+        expect(runtime.tryDemoteSelectedConversation()).toBe(true)
+
+        await runtime.appendPersistentRootModule('windowed-module-append', {
+            module: {
+                id: 'module-a',
+                name: 'Imported module',
+                description: '',
+            },
+            assetAliases: [],
+            ownerHead: {
+                present: false,
+                manifestHash: null,
+                entryCount: 0,
+            },
+        })
+
+        const expectedRevision = initial.revision + 1
+        expect(runtime.revision).toBe(expectedRevision)
+        expect(runtime.getActiveConversationViewportSource()?.snapshot()).toMatchObject({
+            storeRevision: expectedRevision,
+            totalMessages: 10_000,
+        })
+        expect(runtime.captureSelectedConversationAuthority()).toMatchObject({
+            characterId: 'char-a',
+            conversationId: 'chat-a',
+            storeRevision: expectedRevision,
+            totalMessages: 10_000,
+        })
+        expect(runtime.getSelectedConversationMode()).toBe('windowed')
+        expect(workingCopy.modules).toEqual([
+            expect.objectContaining({ id: 'module-a', name: 'Imported module' }),
+        ])
+        expect((await store.readRoot()).value.modules).toEqual(workingCopy.modules)
+    })
+
     it('fails persistence closed after both demotion publication and rollback diverge', async () => {
         const database = {
             username: 'Demotion rollback fixture',

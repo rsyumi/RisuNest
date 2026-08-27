@@ -105,6 +105,8 @@ vi.mock('src/ts/process/files/inlayRenderSource', () => ({
 }))
 vi.mock('src/ts/process/files/chatCopyInlays', () => ({ copyImageSourceToDataUrl: vi.fn() }))
 vi.mock('../../ts/storage/persistentDataRuntime.svelte', () => ({
+    acquireDestructiveReplacementFence: vi.fn(),
+    capturePersistentMutationToken: vi.fn(),
     getActiveConversationSession: () => runtime.activeSession,
     getPersistentDataRuntime: () => runtime.persistent,
 }))
