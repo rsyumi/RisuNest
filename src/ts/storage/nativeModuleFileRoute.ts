@@ -3,6 +3,7 @@ import type { NativeFileJobOptions, NativeFileJobSource } from './nativeFileJobs
 export type NativeModuleFileRouteResult<T> =
     | { kind: 'declined' }
     | { kind: 'imported'; value: T }
+    | { kind: 'failed' }
 
 export type NativeModulePathImporter<T> = (
     input: {
@@ -20,10 +21,20 @@ export async function importDesktopNativeModulePath<T>(
     path: string,
     nativeImport: NativeModulePathImporter<T>,
     options: NativeFileJobOptions = {},
+    onError?: (error: unknown) => void,
 ): Promise<NativeModuleFileRouteResult<T>> {
     const displayName = fileNameFromPath(path)
-    return nativeImport({
-        source: { type: 'desktopPath', path },
-        displayName,
-    }, options)
+    try {
+        return await nativeImport({
+            source: { type: 'desktopPath', path },
+            displayName,
+        }, options)
+    }
+    catch (error) {
+        try {
+            onError?.(error)
+        }
+        catch {}
+        return { kind: 'failed' }
+    }
 }

@@ -353,11 +353,78 @@ describe('SaveCoordinator', () => {
         expect(scheduled).toHaveLength(1)
     })
 
-    it('classifies revision rejection as a known uncommitted module append', async () => {
+    it.each([
+        {
+            name: 'revision acquisition',
+            acquireRevision: async () => { throw new Error('lease unavailable') },
+        },
+        {
+            name: 'root read',
+            acquireRevision: async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => { throw new Error('root unavailable') }),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias: vi.fn(async () => null),
+                release: vi.fn(async () => undefined),
+            }),
+        },
+        {
+            name: 'revision release',
+            acquireRevision: async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(makeDatabase()) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias: vi.fn(async () => null),
+                release: vi.fn(async () => { throw new Error('release unavailable') }),
+            }),
+        },
+    ])('classifies $name failure before commit as a known rejected module append', async ({
+        acquireRevision,
+    }) => {
         const database = makeDatabase()
         database.modules = []
+        const commit = vi.fn()
+        const coordinator = new SaveCoordinator({
+            store: { commit, acquireRevision } as unknown as PersistentDataStore,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7, database)
+
+        await expect(coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })).rejects.toBeInstanceOf(PersistentRootModuleAppendRejectedError)
+
+        expect(commit).not.toHaveBeenCalled()
+        expect(coordinator.revision).toBe(7)
+        expect(database.modules).toEqual([])
+    })
+
+    it('classifies a synchronous precondition failure before queueing as a rejected module append', () => {
+        const database = makeDatabase()
+        const coordinator = new SaveCoordinator({
+            store: makeStore(),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+
+        expect(() => coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })).toThrow(PersistentRootModuleAppendRejectedError)
+    })
+
+    it('retains ambiguous roots when commit invocation rejects', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const commitError = new RevisionConflictError(7, 8)
         const store = {
-            commit: vi.fn(async () => { throw new RevisionConflictError(7, 8) }),
+            commit: vi.fn(async () => { throw commitError }),
             acquireRevision: vi.fn(async () => ({
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
@@ -378,7 +445,7 @@ describe('SaveCoordinator', () => {
             module: { id: 'new-id', name: 'Imported', description: '' },
             assetAliases: [],
             ownerHead: { present: false, manifestHash: null, entryCount: 0 },
-        })).rejects.toBeInstanceOf(PersistentRootModuleAppendRejectedError)
+        })).rejects.toBe(commitError)
 
         expect(coordinator.revision).toBe(7)
         expect(database.modules).toEqual([])

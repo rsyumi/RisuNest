@@ -4,7 +4,7 @@ use crate::asset_repository::owner_manifest_codec::{
     decode_owner_manifest, encode_owner_manifest, OWNER_MANIFEST_V1_MAX_CANONICAL_BYTES,
 };
 use crate::native_file_jobs::NativeFileJobState;
-use crate::persistent_store::{self, PersistentStoreState, StoreError};
+use crate::persistent_store::{self, PersistentStore, PersistentStoreState, StoreError};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Cursor, ErrorKind};
@@ -427,14 +427,16 @@ pub(crate) async fn asset_cas_job_finalize_content(
     .map_err(|error| format!("failed to join content CAS finalization: {error}"))?
 }
 
-#[tauri::command(async)]
-pub(crate) async fn asset_cas_job_seal_prepared_content(
-    app: AppHandle,
-    native_jobs: State<'_, NativeFileJobState>,
-    session_id: String,
+fn seal_prepared_content_job_by_id(
+    native_jobs: &NativeFileJobState,
+    repository_root: &std::path::Path,
+    jobs: &mut HashMap<String, DurableCasJob>,
+    store: &mut PersistentStore,
+    session_id: &str,
+    created_at_ms: i64,
 ) -> Result<(), String> {
     let content = native_jobs
-        .prepared_content_receipt(&session_id)
+        .prepared_content_receipt(session_id)
         .map_err(|error| format!("{}: {}", error.code, error.message))?;
     if content.format != crate::native_file_jobs::PreparedContentFormat::RisuModule {
         return Err("prepared content does not own native RISUM roots".to_owned());
@@ -462,8 +464,7 @@ pub(crate) async fn asset_cas_job_seal_prepared_content(
             .manifest_hash
             .as_ref()
             .ok_or_else(|| "prepared RISUM owner head has no manifest hash".to_owned())?;
-        let root = repository_root(&app)?;
-        let cas = PayloadCas::new(&root).map_err(|error| error.to_string())?;
+        let cas = PayloadCas::new(repository_root).map_err(|error| error.to_string())?;
         let manifest_size = cas
             .stat_object(manifest_hash)
             .map_err(|error| error.to_string())?
@@ -479,6 +480,32 @@ pub(crate) async fn asset_cas_job_seal_prepared_content(
     {
         return Err("absent RISUM owner head is inconsistent".to_owned());
     }
+    if !jobs.contains_key(session_id) {
+        let recovered =
+            DurableCasJob::open(repository_root, session_id).map_err(|error| error.to_string())?;
+        jobs.insert(session_id.to_owned(), recovered);
+    }
+    let job = jobs
+        .get_mut(session_id)
+        .expect("recovered CAS job session must be present");
+    if job.kind() != CasJobKind::CardOrModuleContentImport
+        || job.is_sealed()
+        || job.is_released()
+        || !job.has_exact_pins(&expected)
+    {
+        return Err("prepared RISUM CAS pin set does not match its receipt".to_owned());
+    }
+    job.seal(store, created_at_ms)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(async)]
+pub(crate) async fn asset_cas_job_seal_prepared_content(
+    app: AppHandle,
+    native_jobs: State<'_, NativeFileJobState>,
+    session_id: String,
+) -> Result<(), String> {
+    let native_jobs = NativeFileJobState::clone(&native_jobs);
     tauri::async_runtime::spawn_blocking(move || {
         let root = repository_root(&app)?;
         let state = app.state::<DurableCasJobState>();
@@ -486,27 +513,16 @@ pub(crate) async fn asset_cas_job_seal_prepared_content(
             .jobs
             .lock()
             .map_err(|error| format!("CAS job session mutex poisoned: {error}"))?;
-        if !jobs.contains_key(&session_id) {
-            let recovered =
-                DurableCasJob::open(&root, &session_id).map_err(|error| error.to_string())?;
-            jobs.insert(session_id.clone(), recovered);
-        }
-        let job = jobs
-            .get_mut(&session_id)
-            .expect("recovered CAS job session must be present");
-        if job.kind() != CasJobKind::CardOrModuleContentImport
-            || job.is_sealed()
-            || job.is_released()
-            || !job.has_exact_pins(&expected)
-        {
-            return Err("prepared RISUM CAS pin set does not match its receipt".to_owned());
-        }
         persistent_store::commands::with_store_mut(app.state::<PersistentStoreState>(), |store| {
-            job.seal(
+            seal_prepared_content_job_by_id(
+                &native_jobs,
+                &root,
+                &mut jobs,
                 store,
+                &session_id,
                 now_ms().map_err(|message| StoreError::Store { message })?,
             )
-            .map_err(StoreError::from)
+            .map_err(|message| StoreError::Store { message })
         })
         .map_err(|error| error.to_string())
     })
@@ -523,7 +539,13 @@ mod tests {
     use crate::asset_repository::owner_manifest_codec::{
         encode_owner_manifest, OwnerManifestEntry,
     };
+    use crate::native_file_jobs::{
+        JobSource, JobState, NativeFileJobStartRequest, PreparedContent,
+    };
     use crate::persistent_store::PersistentStore;
+    use serde_json::{json, Value};
+    use std::thread;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     fn owner_manifest() -> Vec<u8> {
@@ -553,6 +575,78 @@ mod tests {
 
     fn begin_content_job(root: &std::path::Path, id: &str) -> DurableCasJob {
         DurableCasJob::begin(root, id, CasJobKind::CardOrModuleContentImport, 1).unwrap()
+    }
+
+    fn risum_fixture(module: Value, assets: &[&[u8]]) -> Vec<u8> {
+        let map = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
+        let encode = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| map[*byte as usize])
+                .collect::<Vec<_>>()
+        };
+        let metadata = encode(
+            serde_json::to_string(&json!({ "type": "risuModule", "module": module }))
+                .unwrap()
+                .as_bytes(),
+        );
+        let mut bytes = vec![111, 0];
+        bytes.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&metadata);
+        for asset in assets {
+            let encoded = encode(asset);
+            bytes.push(1);
+            bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&encoded);
+        }
+        bytes.push(0);
+        bytes
+    }
+
+    fn prepare_risum_job(
+        repository_root: &std::path::Path,
+        native_jobs: &NativeFileJobState,
+        name: &str,
+        assets: &[&[u8]],
+    ) -> (String, PreparedContent) {
+        let source = repository_root.join(name);
+        let tuples = assets
+            .iter()
+            .enumerate()
+            .map(|(index, _)| json!([format!("asset-{index}"), "", "bin"]))
+            .collect::<Vec<_>>();
+        std::fs::write(
+            &source,
+            risum_fixture(json!({ "name": name, "assets": tuples }), assets),
+        )
+        .unwrap();
+        let started = native_jobs
+            .start_content_for_test(NativeFileJobStartRequest::PrepareContentImport {
+                source: JobSource::DesktopPath {
+                    path: source.to_string_lossy().into_owned(),
+                },
+                display_name: name.to_owned(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = native_jobs.status(&started.job_id).unwrap();
+            if status.state == JobState::Succeeded {
+                return (
+                    started.job_id.clone(),
+                    native_jobs
+                        .prepared_content_receipt(&started.job_id)
+                        .unwrap(),
+                );
+            }
+            assert!(
+                !matches!(status.state, JobState::Failed | JobState::Cancelled),
+                "RISUM preparation failed: {:?}",
+                status.error,
+            );
+            assert!(Instant::now() < deadline, "RISUM preparation timed out");
+            thread::yield_now();
+        }
     }
 
     #[test]
@@ -747,5 +841,88 @@ mod tests {
             .items
             .iter()
             .any(|item| item.object_hash == direct.content_hash));
+    }
+
+    #[test]
+    fn prepared_risum_seal_recovers_exact_job_roots_by_id_and_rejects_mismatch_or_reuse() {
+        let directory = TempDir::new().unwrap();
+        let native_jobs = NativeFileJobState::initialize(directory.path().join("native-file-jobs"));
+        let (job_id, content) = prepare_risum_job(
+            directory.path(),
+            &native_jobs,
+            "exact.risum",
+            &[b"first exact asset", b"second exact asset"],
+        );
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let mut recovered_jobs = HashMap::new();
+
+        seal_prepared_content_job_by_id(
+            &native_jobs,
+            directory.path(),
+            &mut recovered_jobs,
+            &mut store,
+            &job_id,
+            7,
+        )
+        .unwrap();
+
+        let sealed = recovered_jobs.get(&job_id).unwrap();
+        assert!(sealed.is_sealed());
+        assert_eq!(sealed.pin_count(), 3);
+        let roots = sealed.root_set().unwrap();
+        assert_eq!(
+            roots.object_hashes,
+            content
+                .assets
+                .iter()
+                .map(|asset| asset.object_hash.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        assert_eq!(
+            roots.manifest_hashes,
+            [content
+                .owner_head
+                .as_ref()
+                .and_then(|head| head.manifest_hash.clone())
+                .unwrap()]
+            .into(),
+        );
+
+        let reuse = seal_prepared_content_job_by_id(
+            &native_jobs,
+            directory.path(),
+            &mut recovered_jobs,
+            &mut store,
+            &job_id,
+            8,
+        )
+        .unwrap_err();
+        assert!(reuse.contains("pin set does not match"));
+        assert!(recovered_jobs.get(&job_id).unwrap().is_sealed());
+
+        let (mismatch_id, _) = prepare_risum_job(
+            directory.path(),
+            &native_jobs,
+            "mismatch.risum",
+            &[b"expected asset"],
+        );
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let mut mismatched = DurableCasJob::open(directory.path(), &mismatch_id).unwrap();
+        mismatched
+            .prepare_bytes(&cas, b"unlisted extra pin", CasObjectRole::DirectObject)
+            .unwrap();
+        drop(mismatched);
+
+        let mismatch = seal_prepared_content_job_by_id(
+            &native_jobs,
+            directory.path(),
+            &mut recovered_jobs,
+            &mut store,
+            &mismatch_id,
+            9,
+        )
+        .unwrap_err();
+        assert!(mismatch.contains("pin set does not match"));
+        assert!(!recovered_jobs.get(&mismatch_id).unwrap().is_sealed());
     }
 }

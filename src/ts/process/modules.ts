@@ -298,6 +298,11 @@ export async function importModule(){
             const result = await importDesktopNativeModulePath(
                 selected,
                 importPreparedNativeModuleContent,
+                {},
+                (error) => {
+                    console.error(error)
+                    alertError(language.errors.noData)
+                },
             )
             if(result.kind === 'imported') alertNormal(language.successImport)
             return

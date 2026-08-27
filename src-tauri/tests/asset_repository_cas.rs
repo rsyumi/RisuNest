@@ -1,7 +1,7 @@
-#[path = "../src/asset_repository/mod.rs"]
-mod asset_repository;
+#[path = "../src/asset_repository/payload_cas.rs"]
+mod payload_cas;
 
-use asset_repository::{PayloadCas, PreparedPayload};
+use payload_cas::{PayloadCas, PreparedPayload};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};

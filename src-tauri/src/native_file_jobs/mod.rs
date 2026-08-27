@@ -970,6 +970,7 @@ fn cleanup_errors_result(errors: Vec<String>) -> Result<(), String> {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeFileJobState {
     root: PathBuf,
     registry: Arc<JobRegistry>,

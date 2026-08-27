@@ -19,12 +19,19 @@ describe('native RISUM desktop route', () => {
         }, { signal: controller.signal })
     })
 
-    it('does not retry through JavaScript after native preparation or CAS fails', async () => {
-        const nativeImport = vi.fn(async () => { throw new Error('revision conflict') })
+    it('reports native preparation or commit failures without rejecting the UI handler', async () => {
+        const error = new Error('revision conflict')
+        const nativeImport = vi.fn(async () => { throw error })
+        const reportError = vi.fn()
 
         await expect(importDesktopNativeModulePath(
             'C:\\chosen\\module.risum',
             nativeImport,
-        )).rejects.toThrow('revision conflict')
+            {},
+            reportError,
+        )).resolves.toEqual({ kind: 'failed' })
+
+        expect(reportError).toHaveBeenCalledWith(error)
+        expect(nativeImport).toHaveBeenCalledOnce()
     })
 })

@@ -713,6 +713,13 @@ export class PersistentRootModuleAppendRejectedError extends Error {
     }
 }
 
+function persistentRootModuleAppendRejected(error: unknown): PersistentRootModuleAppendRejectedError {
+    if (error instanceof PersistentRootModuleAppendRejectedError) return error
+    return new PersistentRootModuleAppendRejectedError(
+        error instanceof Error ? error.message : String(error),
+    )
+}
+
 function defaultClock(): SaveCoordinatorClock {
     return {
         setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay),
@@ -1199,9 +1206,15 @@ export class SaveCoordinator {
         reason: string,
         input: PersistentRootModuleAppend,
     ): Promise<void> {
-        this.assertInitialized()
-        this.assertPersistentMutationAllowed()
-        this.cancelDebounce()
+        try {
+            this.assertInitialized()
+            this.assertPersistentMutationAllowed()
+            this.cancelDebounce()
+        }
+        catch (error) {
+            throw persistentRootModuleAppendRejected(error)
+        }
+        let commitStarted = false
         return this.enqueue(async () => {
             await this.flushIterations(reason, true)
             const revision = this.revision
@@ -1281,21 +1294,13 @@ export class SaveCoordinator {
                 ...canonicalClone(input.ownerHead),
             } as AssetOwnerHead
             const liveBeforeCommit = this.capture()
-            let committed: { revision: DataRevision }
-            try {
-                committed = await this.dependencies.store.commit({
-                    expectedRevision: revision,
-                    root: snapshot.root,
-                    assetAliases: snapshot.aliases,
-                    assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
-                })
-            }
-            catch (error) {
-                if (error instanceof RevisionConflictError) {
-                    throw new PersistentRootModuleAppendRejectedError(error.message)
-                }
-                throw error
-            }
+            commitStarted = true
+            const committed = await this.dependencies.store.commit({
+                expectedRevision: revision,
+                root: snapshot.root,
+                assetAliases: snapshot.aliases,
+                assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
+            })
             const liveAfterCommit = this.capture()
             const publishedRoot = rebaseRootMutation(
                 liveBeforeCommit.root,
@@ -1314,10 +1319,8 @@ export class SaveCoordinator {
                 this.armOfficialPublishRetry(this.officialPublishDelayMs())
             }
         }).catch((error) => {
-            if (error instanceof RevisionConflictError) {
-                throw new PersistentRootModuleAppendRejectedError(error.message)
-            }
-            throw error
+            if (commitStarted) throw error
+            throw persistentRootModuleAppendRejected(error)
         })
     }
 
