@@ -91,6 +91,29 @@ describe('native file job bootstrap reconciliation', () => {
         expect(forgotten).toEqual(['restore-failed'])
     })
 
+    it('retains a successful official account restore for post-bootstrap acknowledgement', async () => {
+        const calls: string[] = []
+        const officialRestore = {
+            ...restoreStatus('official-restore', 'succeeded', 'complete'),
+            kind: 'restore-official-account-snapshot' as const,
+        }
+
+        const result = await reconcileNativeFileJobsBeforeBootstrap({
+            invoke: vi.fn(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_list') return [officialRestore]
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => undefined),
+        })
+
+        expect(result).toEqual({
+            pendingRestoreAcknowledgements: ['official-restore'],
+            pendingOfficialPublications: [],
+        })
+        expect(calls).toEqual(['native_file_job_list'])
+    })
+
     it('cancels and drains a nonterminal content preparation without restore finalization', async () => {
         const calls: string[] = []
         const pending = await reconcileNativeRestoresBeforeBootstrap({

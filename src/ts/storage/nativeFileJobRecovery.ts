@@ -115,7 +115,8 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
         const kind = job.kind
         switch (kind) {
             case 'restore-block-risu-save':
-            case 'restore-lossless-backup': {
+            case 'restore-lossless-backup':
+            case 'restore-official-account-snapshot': {
                 if (options.reconcileRestores === false) break
                 const terminal = isTerminal(job) ? job : await reconcileRestore(job, dependencies)
                 if (terminal.state === 'succeeded') {
