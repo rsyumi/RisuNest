@@ -653,6 +653,11 @@ export class SegmentedConversationResidency {
     }
 
     evictToBudget(): number {
+        if (
+            this.dirtyRecords.length > 0 ||
+            this.pendingSaveAttempts.size > 0 ||
+            this.streamingOverlay !== null
+        ) return 0
         if (this.residentBytes <= this.maxResidentBytes) return 0
         const candidates = [...this.entries.entries()]
             .filter(([absoluteIndex]) => !this.isProtected(absoluteIndex))

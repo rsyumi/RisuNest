@@ -140,6 +140,54 @@ describe('SegmentedConversationResidency', () => {
         expect(residency.readRange(1, 1)).toBeNull()
     })
 
+    it('blocks every eviction while dirty, pending-save, or streaming state is active', () => {
+        const residency = createResidency({ totalMessages: 3, maxResidentBytes: 1 })
+        const initialPin = residency.pinRange(0, 3, 'viewport')
+        residency.storeRange({
+            revision: 7,
+            startIndex: 0,
+            totalMessages: 3,
+            messages: [message('zero'), message('one'), message('two')],
+        })
+        residency.recordReplaceRange({
+            start: 2,
+            deleteCount: 1,
+            messages: [message('dirty')],
+            sessionVersion: 1,
+        })
+
+        initialPin.release()
+        expect(residency.readRange(0, 3)).toEqual([
+            message('zero'),
+            message('one'),
+            message('dirty'),
+        ])
+
+        const staleSave = residency.beginPersistence(1)
+        const successfulSave = residency.beginPersistence(1)
+        successfulSave.acknowledge(8)
+        expect(residency.pinCount('dirty')).toBe(0)
+        expect(residency.pinCount('pending-save')).toBe(1)
+        expect(residency.readRange(0, 3)).toEqual([
+            message('zero'),
+            message('one'),
+            message('dirty'),
+        ])
+
+        residency.setStreamingOverlay(2, message('streaming'), 1)
+        staleSave.release()
+        expect(residency.pinCount('pending-save')).toBe(0)
+        expect(residency.pinCount('streaming')).toBe(1)
+        expect(residency.readRange(0, 3)).toEqual([
+            message('zero'),
+            message('one'),
+            message('streaming'),
+        ])
+
+        residency.clearStreamingOverlay(1)
+        expect(residency.residentBytes).toBeLessThanOrEqual(1)
+    })
+
     it('accounts for superseded dirty payloads until their persisted version is acknowledged', () => {
         const residency = createResidency({ totalMessages: 1, maxResidentBytes: 0 })
 
