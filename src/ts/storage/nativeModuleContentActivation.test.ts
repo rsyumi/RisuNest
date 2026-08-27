@@ -8,8 +8,12 @@ import type {
     PreparedNativeContent,
     PreparedNativeContentActivationLifecycle,
 } from './nativeFileJobs'
-import { activatePreparedNativeModuleContent } from './nativeModuleContentActivation'
+import {
+    activatePreparedNativeModuleContent,
+    type PreparedRootModuleAppend,
+} from './nativeModuleContentActivation'
 import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
+import { PersistentRootModuleAppendRejectedError } from './saveCoordinator'
 
 const hash = (byte: string) => byte.repeat(64)
 
@@ -116,6 +120,47 @@ describe('native RISUM module activation', () => {
         expect(result).toEqual({ moduleId: 'new-module-id' })
     })
 
+    it('preserves tuple trailing fields and deduplicates identical logical aliases', async () => {
+        const content = risumContent([
+            ['same', '', '.unsafe/path', { future: true }],
+            ['same', '', '.unsafe/path', 'tail'],
+        ])
+        content.assets[0] = {
+            ...content.assets[0],
+            logicalId: `assets/${hash('a')}.bin`,
+            ext: '.unsafe/path',
+        }
+        content.assets[1] = {
+            ...content.assets[0],
+            position: 1,
+        }
+        const append = vi.fn(async (_input: PreparedRootModuleAppend) => undefined)
+
+        await activatePreparedNativeModuleContent(content, {
+            prepareOwnerManifestAndSeal: vi.fn(),
+            sealPreparedContent: vi.fn(async () => undefined),
+        }, {
+            confirmLowLevelAccess: vi.fn(async () => true),
+            createId: () => 'new-id',
+            append,
+        })
+
+        const input = append.mock.calls[0][0]
+        expect(input.module.assets).toEqual([
+            ['same', `assets/${hash('a')}.bin`, '.unsafe/path', { future: true }],
+            ['same', `assets/${hash('a')}.bin`, '.unsafe/path', 'tail'],
+        ])
+        expect(input.assetAliases).toEqual([{
+            kind: 'asset',
+            key: `assets/${hash('a')}.bin`,
+            objectHash: hash('a'),
+            size: 4,
+            mime: '',
+            name: '',
+            ext: '.unsafe/path',
+        }])
+    })
+
     it('preserves an absent assets property and does not seal after rejected confirmation', async () => {
         const lifecycle: PreparedNativeContentActivationLifecycle = {
             prepareOwnerManifestAndSeal: vi.fn(),
@@ -137,6 +182,30 @@ describe('native RISUM module activation', () => {
         expect(append).not.toHaveBeenCalled()
     })
 
+    it('releases sealed roots and does not append when cancellation arrives during sealing', async () => {
+        const controller = new AbortController()
+        const append = vi.fn()
+        const lifecycle: PreparedNativeContentActivationLifecycle = {
+            prepareOwnerManifestAndSeal: vi.fn(),
+            sealPreparedContent: vi.fn(async () => controller.abort()),
+            abortPreparedContent: vi.fn(async () => undefined),
+        }
+
+        await expect(activatePreparedNativeModuleContent(
+            risumContent(undefined),
+            lifecycle,
+            {
+                confirmLowLevelAccess: vi.fn(async () => true),
+                createId: () => 'unused',
+                append,
+            },
+            controller.signal,
+        )).rejects.toMatchObject({ name: 'AbortError' })
+
+        expect(lifecycle.abortPreparedContent).toHaveBeenCalledOnce()
+        expect(append).not.toHaveBeenCalled()
+    })
+
     it('aborts the sealed native session when the atomic revision commit loses its CAS', async () => {
         const receipt = {
             jobId: 'content-job',
@@ -144,6 +213,7 @@ describe('native RISUM module activation', () => {
             warningCodes: [],
             prepareOwnerManifestAndSeal: vi.fn(),
             sealPreparedContent: vi.fn(async () => undefined),
+            abortPreparedContent: vi.fn(async () => undefined),
             confirmActivated: vi.fn(async () => undefined),
             cancel: vi.fn(async () => undefined),
         }
@@ -160,14 +230,37 @@ describe('native RISUM module activation', () => {
                     {
                         confirmLowLevelAccess: vi.fn(async () => true),
                         createId: () => 'new-id',
-                        append: vi.fn(async () => { throw new Error('revision conflict') }),
+                        append: vi.fn(async () => {
+                            throw new PersistentRootModuleAppendRejectedError('revision conflict')
+                        }),
                     },
                 ),
             },
         )).rejects.toThrow('revision conflict')
 
         expect(receipt.sealPreparedContent).toHaveBeenCalledOnce()
+        expect(receipt.abortPreparedContent).toHaveBeenCalledOnce()
         expect(receipt.cancel).toHaveBeenCalledOnce()
         expect(receipt.confirmActivated).not.toHaveBeenCalled()
+    })
+
+    it('retains sealed roots when the append response is ambiguous', async () => {
+        const lifecycle: PreparedNativeContentActivationLifecycle = {
+            prepareOwnerManifestAndSeal: vi.fn(),
+            sealPreparedContent: vi.fn(async () => undefined),
+            abortPreparedContent: vi.fn(async () => undefined),
+        }
+
+        await expect(activatePreparedNativeModuleContent(
+            risumContent(undefined),
+            lifecycle,
+            {
+                confirmLowLevelAccess: vi.fn(async () => true),
+                createId: () => 'new-id',
+                append: vi.fn(async () => { throw new Error('commit response lost') }),
+            },
+        )).rejects.toThrow('commit response lost')
+
+        expect(lifecycle.abortPreparedContent).not.toHaveBeenCalled()
     })
 })

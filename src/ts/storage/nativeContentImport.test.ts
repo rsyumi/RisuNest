@@ -36,7 +36,7 @@ const preparedRisumContent = {
         name: 'Native module',
         unknownFutureField: { retained: true },
         assets: [
-            ['duplicate', '', 'PNG'],
+            ['duplicate', '', '.unsafe/path', { future: true }],
             ['duplicate', '', 'bin'],
         ],
     },
@@ -48,7 +48,7 @@ const preparedRisumContent = {
             byteSize: 4,
             mime: '',
             name: '',
-            ext: 'PNG',
+            ext: '.unsafe/path',
         },
         {
             position: 1,
@@ -127,6 +127,37 @@ describe('native prepared content import', () => {
         expect(JSON.stringify(calls)).not.toContain('ownerManifest')
         expect(JSON.stringify(calls)).not.toContain('contentAssets')
         expect(JSON.stringify(calls.slice(2))).not.toContain('path')
+    })
+
+    it('releases a sealed prepared session when activation proves it was not committed', async () => {
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const receipt = await prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\module.risum' },
+            'module.risum',
+            {},
+            nativeDependencies(async (command, args) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', preparedRisumContent as unknown as PreparedNativeContent)
+                }
+                if (
+                    command === 'asset_cas_job_seal_prepared_content'
+                    || command === 'asset_cas_job_release'
+                    || command === 'native_file_job_forget'
+                ) return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )
+
+        await receipt.sealPreparedContent()
+        await receipt.abortPreparedContent!()
+
+        expect(calls.slice(2)).toEqual([
+            ['asset_cas_job_seal_prepared_content', { sessionId: 'content-1' }],
+            ['asset_cas_job_release', { sessionId: 'content-1', outcome: 'aborted' }],
+            ['native_file_job_forget', { jobId: 'content-1' }],
+        ])
     })
 
     it('returns a validated metadata-only receipt and retains the native job', async () => {

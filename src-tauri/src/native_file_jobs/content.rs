@@ -516,12 +516,9 @@ fn prepare_risum_content(
         .seek(SeekFrom::Start(0))
         .map_err(|error| NativeJobError::new("invalid-source", error.to_string()))?;
     let staging = JobStaging::open(owned_directory).map_err(native_format_error)?;
-    let parsed = parse_risum(
-        &mut source.file,
-        &staging,
-        &content_import_limits(),
-        &|| job.is_cancel_requested(),
-    )
+    let parsed = parse_risum(&mut source.file, &staging, &risum_import_limits(), &|| {
+        job.is_cancel_requested()
+    })
     .map_err(native_format_error)?;
     let mut module = parsed
         .metadata
@@ -553,7 +550,7 @@ fn prepare_risum_content(
         if job.is_cancel_requested() {
             return Err(content_cancelled());
         }
-        let extension = validate_risum_extension(&asset.declared_extension)?;
+        let extension = asset.declared_extension;
         let staged_path = owned_directory.join(&asset.payload.staged_name);
         let staged = open_regular_file_no_follow(&staged_path)?;
         if staged.total_bytes != asset.payload.byte_size {
@@ -583,7 +580,11 @@ fn prepare_risum_content(
                 "staged Risu module asset changed before CAS preparation",
             ));
         }
-        let logical_id = format!("assets/{}.{}", prepared.content_hash, extension);
+        let logical_id = format!(
+            "assets/{}.{}",
+            prepared.content_hash,
+            storage_suffix(Some(&extension))
+        );
         let tuple = module
             .get("assets")
             .and_then(Value::as_array)
@@ -592,35 +593,37 @@ fn prepare_risum_content(
             .ok_or_else(|| {
                 NativeJobError::new("invalid-input", "Risu module asset tuple is invalid")
             })?;
-        manifest_entries.push(crate::owner_manifest_codec::OwnerManifestEntry {
-            tuple: [
-                tuple[0]
-                    .as_str()
-                    .ok_or_else(|| {
-                        NativeJobError::new(
-                            "invalid-input",
-                            "Risu module asset name must be a string",
-                        )
-                    })?
-                    .to_owned(),
-                logical_id.clone(),
-                tuple[2]
-                    .as_str()
-                    .ok_or_else(|| {
-                        NativeJobError::new(
-                            "invalid-input",
-                            "Risu module asset extension must be a string",
-                        )
-                    })?
-                    .to_owned(),
-            ],
-            payload_hash: Some(
-                hex::decode(&prepared.content_hash)
-                    .expect("prepared payload hash is hexadecimal")
-                    .try_into()
-                    .expect("prepared payload hash is SHA-256"),
-            ),
-        });
+        manifest_entries.push(
+            crate::asset_repository::owner_manifest_codec::OwnerManifestEntry {
+                tuple: [
+                    tuple[0]
+                        .as_str()
+                        .ok_or_else(|| {
+                            NativeJobError::new(
+                                "invalid-input",
+                                "Risu module asset name must be a string",
+                            )
+                        })?
+                        .to_owned(),
+                    logical_id.clone(),
+                    tuple[2]
+                        .as_str()
+                        .ok_or_else(|| {
+                            NativeJobError::new(
+                                "invalid-input",
+                                "Risu module asset extension must be a string",
+                            )
+                        })?
+                        .to_owned(),
+                ],
+                payload_hash: Some(
+                    hex::decode(&prepared.content_hash)
+                        .expect("prepared payload hash is hexadecimal")
+                        .try_into()
+                        .expect("prepared payload hash is SHA-256"),
+                ),
+            },
+        );
         assets.push(PreparedContentAsset {
             reference_key: String::new(),
             token: String::new(),
@@ -630,12 +633,13 @@ fn prepare_risum_content(
             byte_size: prepared.byte_size,
             mime: String::new(),
             name: String::new(),
-            ext: extension.to_owned(),
+            ext: extension,
         });
     }
     let owner_head = if assets_present {
-        let bytes = crate::owner_manifest_codec::encode_owner_manifest(&manifest_entries)
-            .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
+        let bytes =
+            crate::asset_repository::owner_manifest_codec::encode_owner_manifest(&manifest_entries)
+                .map_err(|error| NativeJobError::new("invalid-input", error.to_string()))?;
         let prepared = cas_session
             .prepare_bytes(cas, &bytes, CasObjectRole::OwnerManifest)
             .map_err(|error| NativeJobError::new("store-error", error.to_string()))?;
@@ -667,21 +671,6 @@ fn prepare_risum_content(
         module: None,
         owner_head: Some(owner_head),
     })
-}
-
-fn validate_risum_extension(extension: &str) -> Result<&str, NativeJobError> {
-    if extension.is_empty()
-        || extension.len() > 32
-        || !extension
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'-'))
-    {
-        return Err(NativeJobError::new(
-            "invalid-input",
-            "Risu module asset extension is invalid",
-        ));
-    }
-    Ok(extension)
 }
 
 fn promote_archive_asset_occurrences(
@@ -1005,6 +994,14 @@ fn content_import_limits() -> ImportLimits {
         max_container_entries: 4096,
         max_container_directory_bytes: 32 * 1024 * 1024,
         charx_probe_metadata_bytes: 8 * 1024 * 1024,
+    }
+}
+
+pub(super) fn risum_import_limits() -> ImportLimits {
+    ImportLimits {
+        max_aggregate_payload_bytes: 10 * 1024 * 1024 * 1024,
+        max_payload_count: 50_000,
+        ..content_import_limits()
     }
 }
 

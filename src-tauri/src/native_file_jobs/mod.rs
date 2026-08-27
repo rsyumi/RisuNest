@@ -4600,7 +4600,7 @@ mod tests {
                     "name": "Native module",
                     "unknownFutureField": { "retained": true },
                     "assets": [
-                        ["duplicate", "legacy-a", "PNG"],
+                        ["duplicate", "legacy-a", ".unsafe/path", { "future": true }],
                         ["duplicate", "legacy-b", "bin"]
                     ]
                 }),
@@ -4630,8 +4630,28 @@ mod tests {
         );
         assert_eq!(serialized.pointer("/assets/0/position"), Some(&json!(0)));
         assert_eq!(serialized.pointer("/assets/1/position"), Some(&json!(1)));
-        assert_eq!(serialized.pointer("/assets/0/ext"), Some(&json!("PNG")));
+        assert_eq!(
+            serialized.pointer("/assets/0/ext"),
+            Some(&json!(".unsafe/path"))
+        );
+        let expected_logical_id = format!(
+            "assets/{}.bin",
+            serialized
+                .pointer("/assets/0/objectHash")
+                .and_then(Value::as_str)
+                .unwrap()
+        );
+        assert_eq!(
+            serialized
+                .pointer("/assets/0/logicalId")
+                .and_then(Value::as_str),
+            Some(expected_logical_id.as_str())
+        );
         assert_eq!(serialized.pointer("/assets/1/ext"), Some(&json!("bin")));
+        assert_eq!(
+            serialized.pointer("/metadata/assets/0/3/future"),
+            Some(&json!(true))
+        );
         assert!(serialized.pointer("/assets/0/token").is_none());
         assert!(serialized.pointer("/assets/0/referenceKey").is_none());
         assert_eq!(serialized.pointer("/ownerHead/present"), Some(&json!(true)));
@@ -4707,6 +4727,13 @@ mod tests {
             assert_eq!(session.pin_count(), expected_pins);
             assert!(!session.is_sealed());
         }
+    }
+
+    #[test]
+    fn risum_import_limits_support_large_module_libraries() {
+        let limits = super::content::risum_import_limits();
+        assert_eq!(limits.max_payload_count, 50_000);
+        assert_eq!(limits.max_aggregate_payload_bytes, 10 * 1024 * 1024 * 1024);
     }
 
     #[test]

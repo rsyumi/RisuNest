@@ -56,7 +56,7 @@ export type NativeOfficialAccountSnapshotRestoreResult =
         sourceSha256: string
         recoveryPath?: string
         warningCodes: string[]
-}
+    }
 
 interface PreparedContentAssetDescriptorBase {
     referenceKey?: string
@@ -228,6 +228,7 @@ export interface NativeFileJobOptions {
 export interface PreparedNativeContentActivationLifecycle {
     prepareOwnerManifestAndSeal(bytes: Uint8Array): Promise<PreparedImmutablePayload>
     sealPreparedContent?(): Promise<void>
+    abortPreparedContent?(): Promise<void>
 }
 
 export interface PreparedNativeContentReceipt extends PreparedNativeContentActivationLifecycle {
@@ -414,8 +415,10 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
             }
             tokens.add(token)
         }
-        const ext = requiredDescriptorString(asset.ext, 'ext')
-        if (ext.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(ext)) {
+        const ext = risum && typeof asset.ext === 'string'
+            ? asset.ext
+            : requiredDescriptorString(asset.ext, 'ext')
+        if (!risum && (ext.length > 32 || !/^[A-Za-z0-9+_-]+$/.test(ext))) {
             throw preparedContentError(`Prepared content asset ${index} ext is invalid`)
         }
         const logicalId = requiredDescriptorString(asset.logicalId, 'logicalId')
@@ -1542,6 +1545,22 @@ export async function prepareNativeContentImport(
                 }
                 await settle(() => releaseAndForget('committed'))
             }
+            const abortPreparedContent = async (): Promise<void> => {
+                if (lifecycleState === 'settled') return
+                if (settlement) return settlement
+                if (lifecycleState === 'finalizing') {
+                    cancellationDuringFinalize = true
+                    await settle(async () => {
+                        try {
+                            await finalizerOperation
+                        }
+                        catch {}
+                        await releaseAndForget('aborted')
+                    })
+                    return
+                }
+                await settle(() => releaseAndForget('aborted'))
+            }
             const cancel = async (): Promise<void> => {
                 if (lifecycleState === 'settled') return
                 if (settlement) return settlement
@@ -1571,6 +1590,7 @@ export async function prepareNativeContentImport(
                 ])].slice(0, 16),
                 prepareOwnerManifestAndSeal,
                 sealPreparedContent,
+                abortPreparedContent,
                 confirmActivated,
                 cancel,
             }

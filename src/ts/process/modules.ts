@@ -54,8 +54,8 @@ export async function importPreparedNativeModuleContent(input: {
         input.displayName,
         {
             map: async (content) => content,
-            activate: (content, lifecycle) =>
-                activatePreparedNativeModuleContent(content, lifecycle),
+            activate: (content, lifecycle, signal) =>
+                activatePreparedNativeModuleContent(content, lifecycle, undefined, signal),
         },
         options,
     )
@@ -295,13 +295,10 @@ export async function importModule(){
         if(typeof selected !== 'string') return
         const displayName = selected.split(/[\\/]/).at(-1) || selected
         if(displayName.split('.').at(-1)?.toLocaleLowerCase('en-US') === 'risum'){
-            const result = await importDesktopNativeModulePath(selected, {
-                readDesktopPath: readFile,
-                nativeImport: importPreparedNativeModuleContent,
-                legacyImport: async () => {
-                    throw new Error('Desktop RISUM legacy import is not reachable')
-                },
-            })
+            const result = await importDesktopNativeModulePath(
+                selected,
+                importPreparedNativeModuleContent,
+            )
             if(result.kind === 'imported') alertNormal(language.successImport)
             return
         }

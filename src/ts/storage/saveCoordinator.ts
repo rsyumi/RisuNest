@@ -706,6 +706,13 @@ export interface PersistentRootModuleAppend {
     ownerHead: Omit<AssetOwnerHead, 'owner'>
 }
 
+export class PersistentRootModuleAppendRejectedError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'PersistentRootModuleAppendRejectedError'
+    }
+}
+
 function defaultClock(): SaveCoordinatorClock {
     return {
         setTimeout: (callback, delay) => globalThis.setTimeout(callback, delay),
@@ -1206,6 +1213,36 @@ export class SaveCoordinator {
                 this.assertReadRevision(revision, rootValue.revision)
                 const root = canonicalClone(rootValue.value)
                 const ownerHeads: AssetOwnerHead[] = []
+                const aliases: Extract<AssetAlias, { kind: 'asset' }>[] = []
+                const uniqueAliases = new Map<string, Extract<AssetAlias, { kind: 'asset' }>>()
+                for (const alias of input.assetAliases) {
+                    const previous = uniqueAliases.get(alias.key)
+                    if (
+                        previous
+                        && (previous.objectHash !== alias.objectHash || previous.size !== alias.size)
+                    ) {
+                        throw new PersistentRootModuleAppendRejectedError(
+                            `Imported module alias conflicts with duplicate ${alias.key}`,
+                        )
+                    }
+                    if (!previous) uniqueAliases.set(alias.key, canonicalClone(alias))
+                }
+                for (const alias of uniqueAliases.values()) {
+                    const existing = await reader.readAssetAlias({ kind: 'asset', key: alias.key })
+                    if (!existing) {
+                        aliases.push(alias)
+                        continue
+                    }
+                    this.assertReadRevision(revision, existing.revision)
+                    if (
+                        existing.value.objectHash !== alias.objectHash
+                        || existing.value.size !== alias.size
+                    ) {
+                        throw new PersistentRootModuleAppendRejectedError(
+                            `Imported module alias conflicts with existing ${alias.key}`,
+                        )
+                    }
+                }
                 const modules = Array.isArray(root.modules) ? root.modules : []
                 for (let index = 0; index < modules.length; index++) {
                     const value = await reader.readAssetOwnerHead({
@@ -1227,10 +1264,12 @@ export class SaveCoordinator {
                     this.assertReadRevision(revision, value.revision)
                     ownerHeads.push(canonicalClone(value.value))
                 }
-                return { root, ownerHeads }
+                return { root, ownerHeads, aliases }
             })
             if (this.capture().rootCanonical !== operationStart.rootCanonical) {
-                throw new Error('Persistent root changed during module import')
+                throw new PersistentRootModuleAppendRejectedError(
+                    'Persistent root changed during module import',
+                )
             }
             const modules = Array.isArray(snapshot.root.modules)
                 ? snapshot.root.modules
@@ -1241,20 +1280,44 @@ export class SaveCoordinator {
                 owner: { kind: 'root-module-assets', index: moduleIndex },
                 ...canonicalClone(input.ownerHead),
             } as AssetOwnerHead
-            const committed = await this.dependencies.store.commit({
-                expectedRevision: revision,
-                root: snapshot.root,
-                assetAliases: [...canonicalClone(input.assetAliases)],
-                assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
-            })
+            const liveBeforeCommit = this.capture()
+            let committed: { revision: DataRevision }
+            try {
+                committed = await this.dependencies.store.commit({
+                    expectedRevision: revision,
+                    root: snapshot.root,
+                    assetAliases: snapshot.aliases,
+                    assetOwnerHeads: [...snapshot.ownerHeads, ownerHead],
+                })
+            }
+            catch (error) {
+                if (error instanceof RevisionConflictError) {
+                    throw new PersistentRootModuleAppendRejectedError(error.message)
+                }
+                throw error
+            }
+            const liveAfterCommit = this.capture()
+            const publishedRoot = rebaseRootMutation(
+                liveBeforeCommit.root,
+                liveAfterCommit.root,
+                snapshot.root,
+            )
             this.currentRevision = committed.revision
             this.dirtyGeneration++
             this.rootBaseline = canonicalJson(snapshot.root)
-            this.dependencies.publishRootWorkingSet?.(snapshot.root)
+            this.dependencies.publishRootWorkingSet?.(publishedRoot)
             this.dependencies.onLocalRevision?.(committed.revision)
             this.pendingByteCount = 0
             this.lastBackgroundErrorMessage = null
-            await this.finishExplicitCommit(committed.revision)
+            if (this.dependencies.officialPublisher) {
+                this.deferPublication(committed.revision)
+                this.armOfficialPublishRetry(this.officialPublishDelayMs())
+            }
+        }).catch((error) => {
+            if (error instanceof RevisionConflictError) {
+                throw new PersistentRootModuleAppendRejectedError(error.message)
+            }
+            throw error
         })
     }
 

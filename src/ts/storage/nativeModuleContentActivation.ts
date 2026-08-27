@@ -11,6 +11,7 @@ import type {
     PreparedRisumOwnerHead,
 } from './nativeFileJobs'
 import { appendPersistentRootModule } from './persistentDataRuntime.svelte'
+import { PersistentRootModuleAppendRejectedError } from './saveCoordinator'
 
 export interface PreparedRootModuleAppend {
     module: RisuModule
@@ -39,6 +40,7 @@ export async function activatePreparedNativeModuleContent(
     prepared: PreparedNativeContent,
     lifecycle: PreparedNativeContentActivationLifecycle,
     dependencies: NativeModuleContentActivationDependencies = productionDependencies,
+    signal?: AbortSignal,
 ): Promise<{ moduleId: string } | null> {
     const content = requireRisum(prepared)
     const module = structuredClone(content.metadata) as unknown as RisuModule
@@ -54,23 +56,47 @@ export async function activatePreparedNativeModuleContent(
             if (!Array.isArray(tuple) || tuple.length < 3) {
                 throw new TypeError(`Prepared RISUM asset tuple ${position} is invalid`)
             }
-            return [tuple[0], content.assets[position].logicalId, tuple[2]]
+            const retained = structuredClone(tuple)
+            retained[1] = content.assets[position].logicalId
+            return retained
         })
     }
 
-    const assetAliases: Extract<AssetAlias, { kind: 'asset' }>[] = content.assets.map((asset) => ({
-        kind: 'asset',
-        key: asset.logicalId,
-        objectHash: asset.objectHash,
-        size: asset.byteSize,
-        mime: asset.mime,
-        name: asset.name,
-        ext: asset.ext,
-    }))
+    const assetAliasesByKey = new Map<string, Extract<AssetAlias, { kind: 'asset' }>>()
+    for (const asset of content.assets) {
+        const alias: Extract<AssetAlias, { kind: 'asset' }> = {
+            kind: 'asset',
+            key: asset.logicalId,
+            objectHash: asset.objectHash,
+            size: asset.byteSize,
+            mime: asset.mime,
+            name: asset.name,
+            ext: asset.ext,
+        }
+        const previous = assetAliasesByKey.get(alias.key)
+        if (previous && (previous.objectHash !== alias.objectHash || previous.size !== alias.size)) {
+            throw new TypeError(`Prepared RISUM alias ${alias.key} has conflicting payloads`)
+        }
+        if (!previous) assetAliasesByKey.set(alias.key, alias)
+    }
+    const assetAliases = [...assetAliasesByKey.values()]
     if (!lifecycle.sealPreparedContent) {
         throw new TypeError('Prepared RISUM content cannot seal its native roots')
     }
+    if (signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
     await lifecycle.sealPreparedContent()
-    await dependencies.append({ module, assetAliases, ownerHead: content.ownerHead })
+    if (signal?.aborted) {
+        await lifecycle.abortPreparedContent?.()
+        throw new DOMException('Native file job was cancelled', 'AbortError')
+    }
+    try {
+        await dependencies.append({ module, assetAliases, ownerHead: content.ownerHead })
+    }
+    catch (error) {
+        if (error instanceof PersistentRootModuleAppendRejectedError) {
+            await lifecycle.abortPreparedContent?.()
+        }
+        throw error
+    }
     return { moduleId }
 }

@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+    PersistentRootModuleAppendRejectedError,
     SaveCoordinator as ProductionSaveCoordinator,
     canonicalJson,
     type SaveCoordinatorDependencies,
 } from './saveCoordinator'
 import type { Chat, Database, character, groupChat } from './database.svelte'
-import type { PersistentDataStore } from './persistentDataStore'
+import type { PersistentDataStore, WorkingSetCommit } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
 import { createPluginStorageStore } from '../plugins/pluginStorageStore'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
@@ -178,7 +179,7 @@ describe('SaveCoordinator', () => {
             return head ? { revision: 7, value: structuredClone(head) } : null
         })
         const release = vi.fn(async () => undefined)
-        const commit = vi.fn(async () => ({ revision: 8 }))
+        const commit = vi.fn(async (_input: WorkingSetCommit) => ({ revision: 8 }))
         const publishRootWorkingSet = vi.fn((root) => Object.assign(database, root))
         const store = {
             commit,
@@ -186,6 +187,7 @@ describe('SaveCoordinator', () => {
                 revision: 7,
                 readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
                 readAssetOwnerHead,
+                readAssetAlias: vi.fn(async () => null),
                 release,
             })),
         } as unknown as PersistentDataStore
@@ -263,6 +265,192 @@ describe('SaveCoordinator', () => {
             assets: [['same', alias.key, 'PNG']],
         })
         expect(coordinator.revision).toBe(8)
+    })
+
+    it('retains a concurrent live root mutation while the module commit awaits', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        let resolveCommit!: (value: { revision: number }) => void
+        const commit = vi.fn(() => new Promise<{ revision: number }>((resolve) => {
+            resolveCommit = resolve
+        }))
+        const publishRootWorkingSet = vi.fn((root) => Object.assign(database, root))
+        const store = {
+            commit,
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias: vi.fn(async () => null),
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishRootWorkingSet,
+        })
+        coordinator.initialize(7, database)
+
+        const append = coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })
+        await vi.waitFor(() => expect(commit).toHaveBeenCalledOnce())
+        database.username = 'Concurrent username'
+        resolveCommit({ revision: 8 })
+        await append
+
+        expect(database.username).toBe('Concurrent username')
+        expect(database.modules.at(-1)?.id).toBe('new-id')
+    })
+
+    it('returns local module commit success before deferred official publication', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const scheduled: Array<() => void> = []
+        const clock = {
+            setTimeout: (callback: () => void) => {
+                scheduled.push(callback)
+                return callback
+            },
+            clearTimeout: vi.fn(),
+        }
+        const pin = vi.fn(async () => { throw new Error('offline') })
+        const store = {
+            commit: vi.fn(async () => ({ revision: 8 })),
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias: vi.fn(async () => null),
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            publishRootWorkingSet: (root) => Object.assign(database, root),
+            officialPublisher: { pin },
+            clock,
+        })
+        coordinator.initialize(7, database)
+
+        await expect(coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })).resolves.toBeUndefined()
+
+        expect(coordinator.revision).toBe(8)
+        expect(database.modules.at(-1)?.id).toBe('new-id')
+        expect(pin).not.toHaveBeenCalled()
+        expect(scheduled).toHaveLength(1)
+    })
+
+    it('classifies revision rejection as a known uncommitted module append', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const store = {
+            commit: vi.fn(async () => { throw new RevisionConflictError(7, 8) }),
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias: vi.fn(async () => null),
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7, database)
+
+        await expect(coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })).rejects.toBeInstanceOf(PersistentRootModuleAppendRejectedError)
+
+        expect(coordinator.revision).toBe(7)
+        expect(database.modules).toEqual([])
+    })
+
+    it('omits matching aliases to retain metadata and rejects conflicting identities', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const existing = {
+            kind: 'asset' as const,
+            key: `assets/${'a'.repeat(64)}.bin`,
+            objectHash: 'a'.repeat(64),
+            size: 4,
+            mime: 'application/octet-stream',
+            name: 'retained.bin',
+            ext: 'future-extension-metadata',
+        }
+        const commit = vi.fn(async (_input: WorkingSetCommit) => ({ revision: 8 }))
+        const readAssetAlias = vi.fn(async () => ({ revision: 7, value: existing }))
+        const store = {
+            commit,
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias,
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7, database)
+        const incoming = { ...existing, mime: '', name: '', ext: '.unsafe/path' }
+
+        await coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [incoming, incoming],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })
+
+        expect(readAssetAlias).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0].assetAliases).toEqual([])
+
+        const conflictingCoordinator = new SaveCoordinator({
+            store: {
+                ...store,
+                acquireRevision: vi.fn(async () => ({
+                    revision: 7,
+                    readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                    readAssetOwnerHead: vi.fn(async () => null),
+                    readAssetAlias: vi.fn(async () => ({
+                        revision: 7,
+                        value: { ...existing, objectHash: 'b'.repeat(64) },
+                    })),
+                    release: vi.fn(async () => undefined),
+                })),
+            } as unknown as PersistentDataStore,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        conflictingCoordinator.initialize(7, database)
+
+        await expect(conflictingCoordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'conflict', name: 'Conflict', description: '' },
+            assetAliases: [incoming],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })).rejects.toThrow(/alias conflicts/i)
     })
 
     it('adopts a successful storage-only revision without changing dirty state or baselines', async () => {
