@@ -1,8 +1,13 @@
 import {
+    decodePreparedNativePngCharacterCard,
     mapPreparedNativeCharacterCard,
     type PreparedNativeCharacterCardInput,
     type PreparedNativeCharacterCardMetadata,
 } from '../characterCards'
+import {
+    UnsupportedPreparedNativeCharacterCardError,
+    type PreparedNativePngCardMetadata,
+} from './nativePngCardAdapter'
 import type { character } from './database.svelte'
 import type {
     PreparedNativeContent,
@@ -18,6 +23,7 @@ import type {
 } from './saveCoordinator'
 
 export interface NativeCharacterContentActivationDependencies {
+    decodePng(metadata: PreparedNativePngCardMetadata): Promise<PreparedNativeCharacterCardMetadata | null>
     map(input: PreparedNativeCharacterCardInput): Promise<character | false>
     upsert(
         characterId: string,
@@ -31,14 +37,7 @@ export interface NativeCharacterContentActivationResult {
     characterId: string
 }
 
-export class UnsupportedPreparedNativeCharacterCardError extends TypeError {
-    readonly code = 'unsupported-character-card'
-
-    constructor() {
-        super('Prepared JSON is not a supported character card')
-        this.name = 'UnsupportedPreparedNativeCharacterCardError'
-    }
-}
+export { UnsupportedPreparedNativeCharacterCardError } from './nativePngCardAdapter'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -91,11 +90,14 @@ function preparedAliases(
             if (
                 existing.objectHash !== alias.objectHash
                 || existing.size !== alias.size
-                || existing.mime !== alias.mime
                 || existing.ext !== alias.ext
             ) {
                 throw new TypeError(`Conflicting prepared asset alias: ${alias.key}`)
             }
+            if (existing.mime !== alias.mime && existing.mime !== '' && alias.mime !== '') {
+                throw new TypeError(`Conflicting prepared asset alias: ${alias.key}`)
+            }
+            if (existing.mime === '' && alias.mime !== '') existing.mime = alias.mime
             continue
         }
         aliases.set(alias.key, alias)
@@ -143,6 +145,7 @@ async function prepareAdditionalAssetOwnerHead(
 }
 
 const productionDependencies: NativeCharacterContentActivationDependencies = {
+    decodePng: decodePreparedNativePngCharacterCard,
     map: mapPreparedNativeCharacterCard,
     upsert: upsertPersistentCompleteCharacter,
 }
@@ -152,7 +155,10 @@ export async function activatePreparedNativeCharacterContent(
     lifecycle: PreparedNativeContentActivationLifecycle,
     dependencies: NativeCharacterContentActivationDependencies = productionDependencies,
 ): Promise<NativeCharacterContentActivationResult | null> {
-    const card = requireCharacterCardMetadata(content.metadata)
+    const card = content.format === 'png-card'
+        ? await dependencies.decodePng(content.metadata as PreparedNativePngCardMetadata)
+        : requireCharacterCardMetadata(content.metadata)
+    if (!card) return null
     const character = await dependencies.map({
         card,
         assets: content.assets.map(({ token, logicalId }) => ({ token, logicalId })),

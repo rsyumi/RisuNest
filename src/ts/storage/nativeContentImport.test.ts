@@ -515,6 +515,125 @@ describe('native prepared content import', () => {
         expect(receipt.content).toEqual(charxContent)
     })
 
+    it('accepts the bounded PNG metadata wrapper, ordinary portrait, and opaque chunk aliases', async () => {
+        const portraitHash = '31'.repeat(32)
+        const chunkHash = '32'.repeat(32)
+        const pngContent = {
+            casSessionId: 'content-1',
+            format: 'png-card',
+            metadata: {
+                chara: Buffer.from('{"name":"old"}').toString('base64'),
+                ccv3: Buffer.from('{"name":"new"}').toString('base64'),
+            },
+            portraitLogicalId: `assets/${portraitHash}.png`,
+            assets: [
+                {
+                    referenceKey: 'native-png-portrait',
+                    token: 'native-png-portrait',
+                    logicalId: `assets/${portraitHash}.png`,
+                    objectHash: portraitHash,
+                    byteSize: 25,
+                    mime: 'image/png',
+                    name: `${portraitHash}.png`,
+                    ext: 'png',
+                },
+                {
+                    referenceKey: '007',
+                    token: '007',
+                    logicalId: `assets/${chunkHash}.png`,
+                    objectHash: chunkHash,
+                    byteSize: 4,
+                    mime: '',
+                    name: `${chunkHash}.png`,
+                    ext: 'png',
+                },
+            ],
+        } as PreparedNativeContent
+
+        const receipt = await prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.png' },
+            'card.png',
+            {},
+            nativeDependencies(async (command) => {
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', pngContent)
+                }
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )
+
+        expect(receipt.content).toEqual(pngContent)
+        expect(receipt.content.assets[1].mime).toBe('')
+        expect(JSON.stringify(receipt.content)).not.toMatch(/staged|payload|path/i)
+    })
+
+    const invalidPngContentCases: Array<[
+        string,
+        Record<string, unknown>,
+        string,
+    ]> = [
+        ['missing portrait', { portraitLogicalId: undefined }, 'portraitLogicalId is required'],
+        ['portrait after a chunk', { assets: undefined }, 'portrait must be the first asset'],
+        ['nonempty chunk MIME', { chunkMime: 'image/png' }, 'mime must be empty'],
+        ['renamed chunk token', { chunkToken: 'different' }, 'token must equal referenceKey'],
+        ['oversized selected metadata', { ccv3: 'x'.repeat(5 * 1024 * 1024 + 1) }, 'metadata exceeds'],
+    ]
+
+    it.each(invalidPngContentCases)('rejects PNG content with %s', async (_case, change, expectedMessage) => {
+        const portraitHash = '41'.repeat(32)
+        const chunkHash = '42'.repeat(32)
+        const portrait = {
+            referenceKey: 'native-png-portrait',
+            token: 'native-png-portrait',
+            logicalId: `assets/${portraitHash}.png`,
+            objectHash: portraitHash,
+            byteSize: 25,
+            mime: 'image/png',
+            name: `${portraitHash}.png`,
+            ext: 'png',
+        }
+        const chunk = {
+            referenceKey: '007',
+            token: typeof change.chunkToken === 'string' ? change.chunkToken : '007',
+            logicalId: `assets/${chunkHash}.png`,
+            objectHash: chunkHash,
+            byteSize: 4,
+            mime: typeof change.chunkMime === 'string' ? change.chunkMime : '',
+            name: `${chunkHash}.png`,
+            ext: 'png',
+        }
+        const invalidContent = {
+            casSessionId: 'content-1',
+            format: 'png-card',
+            metadata: {
+                ccv3: typeof change.ccv3 === 'string'
+                    ? change.ccv3
+                    : Buffer.from('{}').toString('base64'),
+            },
+            ...(change.portraitLogicalId === undefined && Object.hasOwn(change, 'portraitLogicalId')
+                ? {}
+                : { portraitLogicalId: `assets/${portraitHash}.png` }),
+            assets: change.assets === undefined && Object.hasOwn(change, 'assets')
+                ? [chunk, portrait]
+                : [portrait, chunk],
+        }
+
+        await expect(prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.png' },
+            'card.png',
+            {},
+            nativeDependencies(async (command) => {
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', invalidContent as PreparedNativeContent)
+                }
+                if (command === 'asset_cas_job_release' || command === 'native_file_job_forget') return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )).rejects.toThrow(expectedMessage)
+    })
+
     it.each([
         ['non-member portrait', { portraitLogicalId: `assets/${'cd'.repeat(32)}.portrait` }, 'portraitLogicalId must reference a prepared asset'],
         ['non-array module field', { module: { trigger: {} } }, 'module trigger must be an array'],
@@ -751,6 +870,11 @@ describe('native prepared content import', () => {
             'uncorrelated logical ID',
             [{ ...preparedContent.assets[0], logicalId: 'assets/wrong.png' }],
             'logicalId does not match',
+        ],
+        [
+            'empty MIME outside PNG',
+            [{ ...preparedContent.assets[0], mime: '' }],
+            'mime must be a nonempty string',
         ],
         [
             'duplicate token',

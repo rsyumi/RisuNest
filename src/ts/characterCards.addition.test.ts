@@ -409,6 +409,79 @@ describe('character card additions', () => {
         expect(mocks.saveAsset).not.toHaveBeenCalled()
     })
 
+    it('maps a prepared native v2 card through logical PNG chunk aliases', async () => {
+        const card:CharacterCardV2Risu = {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: {
+                name: 'Legacy native card',
+                description: 'Description',
+                personality: '',
+                scenario: '',
+                first_mes: 'Hello',
+                mes_example: '',
+                creator_notes: '',
+                system_prompt: '',
+                post_history_instructions: '',
+                alternate_greetings: [],
+                tags: [],
+                creator: '',
+                character_version: '7',
+                extensions: {
+                    risuai: {
+                        emotions: [['happy', '__asset:emotion']],
+                        additionalAssets: [['file', '__asset:007', 'png']],
+                    },
+                },
+            },
+        }
+
+        const mapped = await mapPreparedNativeCharacterCard({
+            card,
+            assets: [
+                { token: 'emotion', logicalId: 'assets/emotion.png' },
+                { token: '007', logicalId: 'assets/chunk.png' },
+            ],
+            portraitLogicalId: 'assets/portrait.png',
+        })
+
+        expect(mapped).toMatchObject({
+            image: 'assets/portrait.png',
+            emotionImages: [['happy', 'assets/emotion.png']],
+            additionalAssets: [['file', 'assets/chunk.png', 'png']],
+            characterVersion: '7',
+        })
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+    })
+
+    it('maps an off-spec prepared PNG card without saving its portrait bytes', async () => {
+        const mapped = await mapPreparedNativeCharacterCard({
+            card: {
+                avatar: 'none',
+                chat: '',
+                create_date: '',
+                description: 'Description',
+                first_mes: 'Hello',
+                mes_example: '',
+                name: 'Tavern',
+                personality: '',
+                scenario: '',
+                talkativeness: '0.5',
+            },
+            assets: [],
+            portraitLogicalId: 'assets/portrait.png',
+        })
+
+        expect(mapped).toMatchObject({
+            name: 'Tavern',
+            image: 'assets/portrait.png',
+            firstMessage: 'Hello',
+        })
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
+        expect(mocks.commitDetachedCharacter).not.toHaveBeenCalled()
+    })
+
     it('rejects duplicate prepared native asset tokens', async () => {
         const card = JSON.parse(goldenCardJson)
 

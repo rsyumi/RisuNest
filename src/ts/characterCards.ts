@@ -24,6 +24,10 @@ import { dispatchRisuLocalUrl } from "./deepLinkDispatcher"
 import { publishPeerCloneUri } from "./storage/sync/peerCloneDeepLink"
 import { importDesktopNativeCharacterPath } from './storage/nativeCharacterFileRoute'
 import type { NativeFileJobOptions, NativeFileJobSource } from './storage/nativeFileJobs'
+import {
+    decodePreparedNativePngCardMetadata,
+    type PreparedNativePngCardMetadata,
+} from './storage/nativePngCardAdapter'
 
 
 const EXTERNAL_HUB_URL = 'https://sv.risuai.xyz';
@@ -759,7 +763,7 @@ export async function exportChar(charaID:number):Promise<string> {
 }
 
 
-export type PreparedNativeCharacterCardMetadata = CharacterCardV2Risu | CharacterCardV3
+export type PreparedNativeCharacterCardMetadata = CharacterCardV2Risu | CharacterCardV3 | OldTavernChar
 
 export interface PreparedNativeCharacterCardAsset {
     token: string
@@ -779,6 +783,16 @@ export interface PreparedNativeCharacterCardInput {
     module?: PreparedNativeCharacterCardModule
 }
 
+export async function decodePreparedNativePngCharacterCard(
+    metadata: PreparedNativePngCardMetadata,
+): Promise<PreparedNativeCharacterCardMetadata | null> {
+    return await decodePreparedNativePngCardMetadata(metadata, {
+        hash: hasher,
+        decrypt: async (bytes, password) => new Uint8Array(await decryptBuffer(bytes, password)),
+        requestPassword: async () => (await alertInput(language.inputCardPassword)) || null,
+    }) as PreparedNativeCharacterCardMetadata | null
+}
+
 interface CardAssetImportPolicy {
     initialImage?: string
     rejectPayload(reference: string): never
@@ -788,6 +802,10 @@ export async function mapPreparedNativeCharacterCard(input: PreparedNativeCharac
     const assetDict = createPreparedNativeAssetDict(input.assets)
     if(input.portraitLogicalId !== undefined && input.portraitLogicalId.trim().length === 0){
         throw new Error('Prepared native portrait logical ID must not be empty')
+    }
+
+    if (!isPreparedNativeSpecificationCard(input.card)) {
+        return convertOffSpecCards(input.card, input.portraitLogicalId)
     }
 
     preflightPreparedNativeCard(input.card, assetDict, input.portraitLogicalId)
@@ -823,6 +841,13 @@ export async function mapPreparedNativeCharacterCard(input: PreparedNativeCharac
     )
 }
 
+function isPreparedNativeSpecificationCard(
+    card: PreparedNativeCharacterCardMetadata,
+): card is CharacterCardV2Risu | CharacterCardV3 {
+    return 'spec' in card
+        && (card.spec === 'chara_card_v2' || card.spec === 'chara_card_v3')
+}
+
 function createPreparedNativeAssetDict(assets: readonly PreparedNativeCharacterCardAsset[]): Record<string, string> {
     const assetDict:Record<string, string> = Object.create(null)
     for(const asset of assets){
@@ -837,7 +862,7 @@ function createPreparedNativeAssetDict(assets: readonly PreparedNativeCharacterC
     return assetDict
 }
 
-function preflightPreparedNativeCard(card: PreparedNativeCharacterCardMetadata, assetDict: Record<string, string>, portraitLogicalId?: string): void {
+function preflightPreparedNativeCard(card: CharacterCardV2Risu | CharacterCardV3, assetDict: Record<string, string>, portraitLogicalId?: string): void {
     if(card.spec === 'chara_card_v3'){
         for(const asset of card.data.assets ?? []){
             if(asset.uri.startsWith('data:')){

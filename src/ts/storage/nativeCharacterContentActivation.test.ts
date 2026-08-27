@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 vi.mock('../characterCards', () => ({
+    decodePreparedNativePngCharacterCard: vi.fn(),
     mapPreparedNativeCharacterCard: vi.fn(),
 }))
 vi.mock('./nativeAssetRepository', () => ({
@@ -85,6 +86,7 @@ function dependencies(
     overrides: Partial<NativeCharacterContentActivationDependencies> = {},
 ): NativeCharacterContentActivationDependencies {
     return {
+        decodePng: vi.fn(async () => content.metadata as any),
         map: vi.fn(async () => mappedCharacter()),
         upsert: vi.fn(async () => true),
         ...overrides,
@@ -273,6 +275,180 @@ describe('prepared native character content activation', () => {
             ext: portrait.ext,
         }])
         expect(JSON.stringify(options?.assetAliases)).not.toMatch(/inlay|webp|resize/i)
+    })
+
+    it('decodes and activates PNG metadata using only logical portrait and chunk aliases', async () => {
+        const portraitHash = '33'.repeat(32)
+        const chunkHash = '44'.repeat(32)
+        const decodedCard = {
+            spec: 'chara_card_v2',
+            spec_version: '2.0',
+            data: {
+                name: 'PNG Card',
+                extensions: {
+                    risuai: {
+                        additionalAssets: [['chunk', '__asset:007', 'png']],
+                    },
+                },
+            },
+        }
+        const pngContent = {
+            casSessionId: 'content-1',
+            format: 'png-card',
+            metadata: { chara: 'encoded-v2', ccv3: 'encoded-v3' },
+            portraitLogicalId: `assets/${portraitHash}.png`,
+            assets: [
+                {
+                    referenceKey: 'native-png-portrait',
+                    token: 'native-png-portrait',
+                    logicalId: `assets/${portraitHash}.png`,
+                    objectHash: portraitHash,
+                    byteSize: 100,
+                    mime: 'image/png',
+                    name: `${portraitHash}.png`,
+                    ext: 'png',
+                },
+                {
+                    referenceKey: '007',
+                    token: '007',
+                    logicalId: `assets/${chunkHash}.png`,
+                    objectHash: chunkHash,
+                    byteSize: 4,
+                    mime: '',
+                    name: `${chunkHash}.png`,
+                    ext: 'png',
+                },
+            ],
+        } as PreparedNativeContent
+        const character = mappedCharacter()
+        character.image = pngContent.portraitLogicalId
+        character.additionalAssets = [['chunk', pngContent.assets[1].logicalId, 'png']]
+        const deps = dependencies({
+            decodePng: vi.fn(async () => decodedCard as any),
+            map: vi.fn(async () => character),
+        })
+        const session = lifecycle()
+
+        await activatePreparedNativeCharacterContent(pngContent, session, deps)
+
+        expect(deps.decodePng).toHaveBeenCalledWith(pngContent.metadata)
+        expect(deps.map).toHaveBeenCalledWith({
+            card: decodedCard,
+            assets: [
+                { token: 'native-png-portrait', logicalId: pngContent.assets[0].logicalId },
+                { token: '007', logicalId: pngContent.assets[1].logicalId },
+            ],
+            portraitLogicalId: pngContent.portraitLogicalId,
+        })
+        const options = vi.mocked(deps.upsert).mock.calls[0][3]
+        expect(options?.assetAliases).toEqual([
+            expect.objectContaining({
+                kind: 'asset',
+                key: pngContent.assets[0].logicalId,
+                mime: 'image/png',
+            }),
+            expect.objectContaining({
+                kind: 'asset',
+                key: pngContent.assets[1].logicalId,
+                mime: '',
+            }),
+        ])
+        expect(options?.assetAliases).not.toEqual(expect.arrayContaining([
+            expect.objectContaining({ kind: 'inlay' }),
+        ]))
+        const manifestBytes = vi.mocked(session.prepareOwnerManifestAndSeal).mock.calls[0][0]
+        expect(decodeOwnerManifest(manifestBytes)).toEqual([{
+            tuple: ['chunk', pngContent.assets[1].logicalId, 'png'],
+            payloadHash: Uint8Array.from({ length: 32 }, () => 0x44),
+        }])
+        expect(JSON.stringify(vi.mocked(deps.map).mock.calls)).not.toMatch(/payload|staged|path|Uint8Array/i)
+    })
+
+    it('declines a cancelled PNG password prompt before finalizing', async () => {
+        const deps = dependencies({ decodePng: vi.fn(async () => null) })
+        const session = lifecycle()
+
+        await expect(activatePreparedNativeCharacterContent({
+            ...content,
+            format: 'png-card',
+            metadata: { chara: 'rcc-envelope' },
+            portraitLogicalId: content.assets[0].logicalId,
+        }, session, deps)).resolves.toBeNull()
+
+        expect(deps.map).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('deduplicates a PNG portrait and opaque chunk with the same exact bytes', async () => {
+        const sharedHash = '55'.repeat(32)
+        const logicalId = `assets/${sharedHash}.png`
+        const pngContent = {
+            ...content,
+            format: 'png-card',
+            metadata: { ccv3: 'encoded-card' },
+            portraitLogicalId: logicalId,
+            assets: [
+                {
+                    referenceKey: 'native-png-portrait',
+                    token: 'native-png-portrait',
+                    logicalId,
+                    objectHash: sharedHash,
+                    byteSize: 100,
+                    mime: 'image/png',
+                    name: `${sharedHash}.png`,
+                    ext: 'png',
+                },
+                {
+                    referenceKey: 'same',
+                    token: 'same',
+                    logicalId,
+                    objectHash: sharedHash,
+                    byteSize: 100,
+                    mime: '',
+                    name: `${sharedHash}.png`,
+                    ext: 'png',
+                },
+            ],
+        } as PreparedNativeContent
+        const character = mappedCharacter()
+        character.additionalAssets = [['same', logicalId, 'png']]
+        const deps = dependencies({
+            decodePng: vi.fn(async () => content.metadata as any),
+            map: vi.fn(async () => character),
+        })
+
+        await activatePreparedNativeCharacterContent(pngContent, lifecycle(), deps)
+
+        expect(vi.mocked(deps.upsert).mock.calls[0][3]?.assetAliases).toEqual([{
+            kind: 'asset',
+            key: logicalId,
+            objectHash: sharedHash,
+            size: 100,
+            mime: 'image/png',
+            name: `${sharedHash}.png`,
+            ext: 'png',
+        }])
+    })
+
+    it('rejects unsupported PNG inline payloads before finalizing', async () => {
+        const deps = dependencies({
+            decodePng: vi.fn(async () => {
+                throw new UnsupportedPreparedNativeCharacterCardError('inline payload')
+            }),
+        })
+        const session = lifecycle()
+
+        await expect(activatePreparedNativeCharacterContent({
+            ...content,
+            format: 'png-card',
+            metadata: { ccv3: 'encoded-inline-card' },
+            portraitLogicalId: content.assets[0].logicalId,
+        }, session, deps)).rejects.toBeInstanceOf(UnsupportedPreparedNativeCharacterCardError)
+
+        expect(deps.map).not.toHaveBeenCalled()
+        expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
     })
 
     it('returns a normal declined outcome without preparing or publishing anything', async () => {

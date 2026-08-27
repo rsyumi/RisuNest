@@ -50,7 +50,7 @@ export interface PreparedContentAssetDescriptor {
 
 export interface PreparedNativeContent {
     casSessionId: string
-    format: 'json-card' | 'charx-card' | 'appended-charx-jpeg'
+    format: 'json-card' | 'png-card' | 'charx-card' | 'appended-charx-jpeg'
     metadata: Record<string, unknown>
     assets: PreparedContentAssetDescriptor[]
     portraitLogicalId?: string
@@ -213,6 +213,7 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
     const content = value as Record<string, unknown>
     if (
         content.format !== 'json-card'
+        && content.format !== 'png-card'
         && content.format !== 'charx-card'
         && content.format !== 'appended-charx-jpeg'
     ) {
@@ -285,13 +286,20 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         if (typeof asset.name !== 'string') {
             throw preparedContentError(`Prepared content asset ${index} name must be a string`)
         }
+        if (typeof asset.mime !== 'string') {
+            throw preparedContentError(`Prepared content asset ${index} mime must be a string`)
+        }
+        const mime = asset.mime
+        if (mime.length === 0 && content.format !== 'png-card') {
+            throw preparedContentError(`Prepared content asset ${index} mime must be a nonempty string`)
+        }
         return {
             referenceKey: requiredDescriptorString(asset.referenceKey, 'referenceKey'),
             token,
             logicalId,
             objectHash,
             byteSize: asset.byteSize as number,
-            mime: requiredDescriptorString(asset.mime, 'mime'),
+            mime,
             name: asset.name,
             ext,
         }
@@ -301,6 +309,59 @@ function validatePreparedContent(value: unknown, expectedCasSessionId: string): 
         portraitLogicalId = requiredDescriptorString(content.portraitLogicalId, 'portraitLogicalId')
         if (!assets.some((asset) => asset.logicalId === portraitLogicalId)) {
             throw preparedContentError('Prepared content portraitLogicalId must reference a prepared asset')
+        }
+    }
+    if (content.format === 'png-card') {
+        const metadata = content.metadata as Record<string, unknown>
+        if (!Object.keys(metadata).every((field) => field === 'chara' || field === 'ccv3')) {
+            throw preparedContentError('Prepared PNG metadata fields are invalid')
+        }
+        const encodedMetadata = [metadata.chara, metadata.ccv3]
+        if (!encodedMetadata.some((value) => typeof value === 'string' && value.length > 0)) {
+            throw preparedContentError('Prepared PNG card metadata is missing')
+        }
+        for (const value of encodedMetadata) {
+            if (value !== undefined && (typeof value !== 'string' || value.length === 0)) {
+                throw preparedContentError('Prepared PNG card metadata must be a nonempty string')
+            }
+            if (typeof value === 'string' && value.length > 5 * 1024 * 1024) {
+                throw preparedContentError('Prepared PNG card metadata exceeds the 5 MiB limit')
+            }
+        }
+        if (content.module !== undefined) {
+            throw preparedContentError('Prepared PNG content cannot contain a module')
+        }
+        if (!portraitLogicalId) {
+            throw preparedContentError('Prepared PNG portraitLogicalId is required')
+        }
+        const portrait = assets[0]
+        if (!portrait || portrait.logicalId !== portraitLogicalId) {
+            throw preparedContentError('Prepared PNG portrait must be the first asset')
+        }
+        if (
+            !/^native-png-portrait(?:-[1-9][0-9]*)?$/.test(portrait.token)
+            || portrait.referenceKey !== portrait.token
+            || portrait.mime !== 'image/png'
+            || portrait.ext !== 'png'
+            || portrait.logicalId !== `assets/${portrait.objectHash}.png`
+            || portrait.name !== `${portrait.objectHash}.png`
+        ) {
+            throw preparedContentError('Prepared PNG portrait descriptor is invalid')
+        }
+        for (const [index, asset] of assets.slice(1).entries()) {
+            if (asset.token !== asset.referenceKey) {
+                throw preparedContentError(`Prepared PNG embedded asset ${index} token must equal referenceKey`)
+            }
+            if (asset.mime !== '') {
+                throw preparedContentError(`Prepared PNG embedded asset ${index} mime must be empty`)
+            }
+            if (
+                asset.ext !== 'png'
+                || asset.logicalId !== `assets/${asset.objectHash}.png`
+                || asset.name !== `${asset.objectHash}.png`
+            ) {
+                throw preparedContentError(`Prepared PNG embedded asset ${index} descriptor is invalid`)
+            }
         }
     }
     let module: PreparedNativeCharacterCardModule | undefined
