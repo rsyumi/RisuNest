@@ -579,10 +579,26 @@ describe('character card additions', () => {
         const input = mocks.exportNativeCharacterCharxFromPicker.mock.calls[0][0]
         expect(input.characterId).toBe('native-card')
         expect(input.suggestedName).toBe('Native card.charx')
-        const projected = input.projectCharacter(character)
+        const leasedCharacter = {
+            ...character,
+            desc: 'Leased description',
+            firstMessage: 'Leased greeting',
+            alternateGreetings: ['Second leased greeting'],
+            globalLore: [{ key: 'leased lore' }],
+            extentions: { futureField: { kept: true } },
+        }
+        const projected = input.projectCharacter(leasedCharacter)
         expect(projected.card).toMatchObject({
             spec: 'chara_card_v3',
-            data: { extensions: { risuai: {} } },
+            data: {
+                description: 'Leased description',
+                first_mes: 'Leased greeting',
+                alternate_greetings: ['Second leased greeting'],
+                extensions: {
+                    risuai: {},
+                    futureField: { kept: true },
+                },
+            },
         })
         expect(projected.card.data.extensions.risuai).not.toHaveProperty('triggerscript')
         expect(projected.card.data.extensions.risuai).not.toHaveProperty('customScripts')
@@ -590,10 +606,38 @@ describe('character card additions', () => {
             name: 'Native card Module',
             trigger: character.triggerscript,
             regex: character.customscript,
-            lorebook: character.globalLore,
+            lorebook: leasedCharacter.globalLore,
         })
         expect(mocks.readImage).not.toHaveBeenCalled()
         expect(mocks.charxWrites).toEqual([])
+    })
+
+    it('does not create a persistent fallback portrait before native CharX export', async () => {
+        const fetchMock = vi.fn(async () => ({
+            arrayBuffer: async () => new Uint8Array([9, 8, 7]).buffer,
+        }))
+        const originalFetch = globalThis.fetch
+        globalThis.fetch = fetchMock as unknown as typeof fetch
+        mocks.database.characters = [{
+            type: 'character',
+            name: 'Image-less card',
+            image: '',
+            chats: [],
+            chaId: 'image-less-card',
+            globalLore: [],
+        }]
+        mocks.alertCardExport.mockResolvedValue({ type: '', type2: 'charx' } as any)
+
+        try {
+            await exportChar(0)
+        }
+        finally {
+            globalThis.fetch = originalFetch
+        }
+
+        expect(mocks.exportNativeCharacterCharxFromPicker).toHaveBeenCalledOnce()
+        expect(fetchMock).not.toHaveBeenCalled()
+        expect(mocks.saveAsset).not.toHaveBeenCalled()
     })
 
     it('shows the established export error alert when native CharX export fails', async () => {

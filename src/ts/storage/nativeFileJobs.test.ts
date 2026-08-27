@@ -106,7 +106,7 @@ describe('native file jobs', () => {
         const result = await runNativeCharacterCharxExport(
             {
                 characterId: 'character-id',
-                destination: 'C:\\chosen\\Leased.charx',
+                destination: { type: 'desktopPath', path: 'C:\\chosen\\Leased.charx' },
                 expectedRevision: 31,
                 card,
                 module,
@@ -122,6 +122,7 @@ describe('native file jobs', () => {
                     throw new Error(`Unexpected command: ${command}`)
                 },
                 wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 0, warningCodes: [] }),
             },
         )
 
@@ -141,6 +142,118 @@ describe('native file jobs', () => {
             ['native_file_job_forget', { jobId: 'character-export' }],
         ])
         expect(JSON.stringify(calls)).not.toContain('Uint8Array')
+    })
+
+    it('hands a managed character CharX export to Android SAF and cleans the native source', async () => {
+        const events: string[] = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174002.charx'
+        const terminal: NativeFileJobStatus = {
+            jobId: 'character-export',
+            kind: 'export-character-charx',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 4096, completedItems: 3 },
+            result: {
+                revision: 31,
+                sourceBytes: 4096,
+                sourceSha256: 'c'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+
+        const result = await runNativeCharacterCharxExport(
+            {
+                characterId: 'character-id',
+                destination: { type: 'androidSaf', suggestedName: 'Leased.charx' },
+                expectedRevision: 31,
+                card: { spec: 'chara_card_v3' },
+                module: {},
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command, args) => {
+                    events.push(`${command}:${JSON.stringify(args ?? {})}`)
+                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'native_character_charx_handoff_cleanup') return undefined
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async (request) => {
+                    events.push(`saf:${request.sourcePath}:${request.suggestedName}`)
+                    return {
+                        bytes: 4096,
+                        warningCodes: ['android-saf-provider-not-atomic'],
+                    }
+                },
+            },
+        )
+
+        expect(result.handoffPath).toBeUndefined()
+        expect(result.warningCodes).toEqual(['android-saf-provider-not-atomic'])
+        expect(events).toEqual([
+            'native_file_job_start:{"request":{"kind":"export-character-charx","expectedRevision":31,"characterId":"character-id","card":{"spec":"chara_card_v3"},"module":{}}}',
+            'native_file_job_status:{"jobId":"character-export"}',
+            `saf:${handoffPath}:Leased.charx`,
+            `native_character_charx_handoff_cleanup:{"path":"${handoffPath.replaceAll('\\', '\\\\')}"}`,
+            'native_file_job_forget:{"jobId":"character-export"}',
+        ])
+    })
+
+    it('rejects a short Android CharX handoff and still cleans both native receipts', async () => {
+        const commands: string[] = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174003.charx'
+        const terminal: NativeFileJobStatus = {
+            jobId: 'character-export',
+            kind: 'export-character-charx',
+            state: 'succeeded',
+            phase: 'complete',
+            progress: { completedBytes: 4096, completedItems: 3 },
+            result: {
+                revision: 31,
+                sourceBytes: 4096,
+                sourceSha256: 'c'.repeat(64),
+                characterCount: 1,
+                presetCount: 0,
+                warningCodes: [],
+                handoffPath,
+            },
+        }
+
+        await expect(runNativeCharacterCharxExport(
+            {
+                characterId: 'character-id',
+                destination: { type: 'androidSaf', suggestedName: 'Leased.charx' },
+                expectedRevision: 31,
+                card: { spec: 'chara_card_v3' },
+                module: {},
+            },
+            {},
+            {
+                isTauri: () => true,
+                invoke: async (command) => {
+                    commands.push(command)
+                    if (command === 'native_file_job_start') return { jobId: 'character-export' }
+                    if (command === 'native_file_job_status') return terminal
+                    if (command === 'native_character_charx_handoff_cleanup') return undefined
+                    if (command === 'native_file_job_forget') return true
+                    throw new Error(`Unexpected command: ${command}`)
+                },
+                wait: async () => undefined,
+                copyToAndroidSaf: async () => ({ bytes: 2048, warningCodes: [] }),
+            },
+        )).rejects.toMatchObject({ code: 'length-mismatch' })
+        expect(commands).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'native_character_charx_handoff_cleanup',
+            'native_file_job_forget',
+        ])
     })
 
     it('restores an official snapshot without transferring its database bytes through IPC', async () => {

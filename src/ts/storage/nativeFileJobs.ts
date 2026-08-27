@@ -222,11 +222,15 @@ export interface NativeFileExportJobOptions extends NativeFileJobOptions {
 
 export interface NativeCharacterCharxExportInput {
     characterId: string
-    destination: string
+    destination: NativeCharacterCharxExportDestination
     expectedRevision: number
     card: Record<string, unknown>
     module: Record<string, unknown>
 }
+
+export type NativeCharacterCharxExportDestination =
+    | { type: 'desktopPath'; path: string }
+    | { type: 'androidSaf'; suggestedName: string }
 
 export type NativeLosslessBackupDestination =
     | { type: 'desktopPath'; path: string }
@@ -915,7 +919,7 @@ export function runNativeBlockRisuSaveExport(
 export async function runNativeCharacterCharxExport(
     input: NativeCharacterCharxExportInput,
     options: NativeFileJobOptions = {},
-    dependencies: NativeFileJobDependencies = productionDependencies,
+    dependencies: NativeLosslessBackupDependencies = productionLosslessDependencies,
 ): Promise<NativeFileJobResult> {
     if (!dependencies.isTauri()) {
         throw new Error('Native character CharX export requires Tauri')
@@ -924,7 +928,9 @@ export async function runNativeCharacterCharxExport(
     const started = await invokeNative(dependencies, 'native_file_job_start', {
         request: {
             kind: 'export-character-charx',
-            destination: input.destination,
+            ...(input.destination.type === 'desktopPath'
+                ? { destination: input.destination.path }
+                : {}),
             expectedRevision: input.expectedRevision,
             characterId: input.characterId,
             card: input.card,
@@ -949,6 +955,7 @@ export async function runNativeCharacterCharxExport(
 
     let outcomeFailed = false
     let result: NativeFileJobResult | undefined
+    let managedSource: string | undefined
     try {
         if (terminal.state === 'cancelled') throw abortError()
         if (terminal.state !== 'succeeded') {
@@ -970,6 +977,34 @@ export async function runNativeCharacterCharxExport(
                 ...terminal.result.warningCodes,
             ])].slice(0, 16),
         }
+        if (input.destination.type === 'androidSaf') {
+            managedSource = result.handoffPath
+            if (!managedSource) {
+                throw new NativeFileJobError(
+                    'missing-handoff',
+                    'Native character CharX export returned no Android handoff path',
+                )
+            }
+            const published = await dependencies.copyToAndroidSaf({
+                sourcePath: managedSource,
+                suggestedName: input.destination.suggestedName,
+                signal: options.signal,
+            })
+            if (published.bytes !== result.sourceBytes) {
+                throw new NativeFileJobError(
+                    'length-mismatch',
+                    'Android SAF character CharX length differs from its native source',
+                )
+            }
+            const { handoffPath: _handoffPath, ...publishedResult } = result
+            result = {
+                ...publishedResult,
+                warningCodes: [...new Set([
+                    ...publishedResult.warningCodes,
+                    ...published.warningCodes,
+                ])].slice(0, 16),
+            }
+        }
         return result
     }
     catch (error) {
@@ -977,6 +1012,23 @@ export async function runNativeCharacterCharxExport(
         throw error
     }
     finally {
+        if (managedSource) {
+            try {
+                await invokeNative(dependencies, 'native_character_charx_handoff_cleanup', {
+                    path: managedSource,
+                })
+            }
+            catch {
+                if (result && !outcomeFailed) {
+                    result.warningCodes = [
+                        ...result.warningCodes
+                            .filter((code) => code !== 'cleanup-failed')
+                            .slice(0, 15),
+                        'cleanup-failed',
+                    ]
+                }
+            }
+        }
         try {
             await invokeNative(dependencies, 'native_file_job_forget', { jobId: started.jobId })
         }

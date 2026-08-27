@@ -74,7 +74,7 @@ impl OwnerManifestProjector {
                 .ok_or_else(|| validation("owner manifest projection requires a character ID"))?
                 .to_owned();
             character_ids.insert(character_id.clone());
-            self.project_character(&character_id, character)?;
+            let _ = self.project_character(&character_id, character)?;
         }
         self.validate_character_owners(&character_ids)
     }
@@ -117,7 +117,7 @@ impl OwnerManifestProjector {
                 }
                 AssetOwnerLocator::CharacterAdditionalAssets { .. } => continue,
             };
-            self.apply_head(head, parent, property)?;
+            let _ = self.apply_head(head, parent, property)?;
         }
         Ok(())
     }
@@ -126,14 +126,16 @@ impl OwnerManifestProjector {
         &self,
         character_id: &str,
         character: &mut Map<String, Value>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<Option<Vec<owner_manifest_codec::OwnerManifestEntry>>> {
         let owner = AssetOwnerLocator::CharacterAdditionalAssets {
             character_id: character_id.to_owned(),
         };
         if let Some(head) = self.heads.get(&owner) {
-            self.apply_head(head, character, "additionalAssets")?;
+            return self
+                .apply_head(head, character, "additionalAssets")
+                .map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
     pub(super) fn validate_character_owners(
@@ -157,14 +159,14 @@ impl OwnerManifestProjector {
         head: &AssetOwnerHead,
         parent: &mut Map<String, Value>,
         property: &str,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<Vec<owner_manifest_codec::OwnerManifestEntry>> {
         if parent.contains_key(property) != head.present {
             return Err(validation(
                 "owner manifest property presence does not match pinned legacy data",
             ));
         }
         if !head.present {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let manifest_hash = head
@@ -199,8 +201,8 @@ impl OwnerManifestProjector {
         }
         let tuples = Value::Array(
             entries
-                .into_iter()
-                .map(|entry| Value::Array(entry.tuple.into_iter().map(Value::String).collect()))
+                .iter()
+                .map(|entry| Value::Array(entry.tuple.iter().cloned().map(Value::String).collect()))
                 .collect(),
         );
         if parent.get(property) != Some(&tuples) {
@@ -209,7 +211,7 @@ impl OwnerManifestProjector {
             ));
         }
         parent.insert(property.to_owned(), tuples);
-        Ok(())
+        Ok(entries)
     }
 }
 

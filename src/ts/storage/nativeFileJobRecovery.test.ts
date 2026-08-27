@@ -172,6 +172,7 @@ describe('native file job bootstrap reconciliation', () => {
     it.each([
         ['export-block-risu-save', 'export-1'],
         ['export-legacy-local-backup', 'legacy-export-1'],
+        ['export-character-charx', 'charx-export-1'],
         ['kei-backup-upload', 'kei-1'],
     ] as const)('returns without waiting for an active %s job and cleans it up in the background', async (kind, jobId) => {
         let resumePolling!: () => void
@@ -285,6 +286,47 @@ describe('native file job bootstrap reconciliation', () => {
                 ['native_file_job_status', { jobId: 'legacy-export' }],
                 ['native_legacy_backup_handoff_cleanup', { path: handoffPath }],
                 ['native_file_job_forget', { jobId: 'legacy-export' }],
+            ])
+        })
+    })
+
+    it('cleans an abandoned Android character CharX handoff before forgetting its terminal job', async () => {
+        let resumePolling!: () => void
+        const pollingGate = new Promise<void>((resolve) => resumePolling = resolve)
+        const calls: Array<[string, Record<string, unknown> | undefined]> = []
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risu-charx-123e4567-e89b-42d3-a456-426614174004.charx'
+        const dependencies = {
+            invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
+                calls.push([command, args])
+                if (command === 'native_file_job_list') return [{
+                    ...restoreStatus('charx-export', 'running', 'writing-export'),
+                    kind: 'export-character-charx' as const,
+                }]
+                if (command === 'native_file_job_status') return {
+                    ...restoreStatus('charx-export', 'succeeded', 'complete'),
+                    kind: 'export-character-charx' as const,
+                    result: {
+                        ...restoreStatus('charx-export', 'succeeded', 'complete').result!,
+                        handoffPath,
+                    },
+                }
+                if (command === 'native_character_charx_handoff_cleanup') return undefined
+                if (command === 'native_file_job_forget') return true
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+            wait: vi.fn(async () => pollingGate),
+        }
+
+        await expect(reconcileNativeRestoresBeforeBootstrap(dependencies)).resolves.toEqual([])
+        expect(calls).toEqual([['native_file_job_list', undefined]])
+
+        resumePolling()
+        await vi.waitFor(() => {
+            expect(calls).toEqual([
+                ['native_file_job_list', undefined],
+                ['native_file_job_status', { jobId: 'charx-export' }],
+                ['native_character_charx_handoff_cleanup', { path: handoffPath }],
+                ['native_file_job_forget', { jobId: 'charx-export' }],
             ])
         })
     })

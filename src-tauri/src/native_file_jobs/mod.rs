@@ -212,7 +212,7 @@ pub(crate) enum NativeFileJobStartRequest {
         expected_revision: i64,
     },
     ExportCharacterCharx {
-        destination: String,
+        destination: Option<String>,
         expected_revision: i64,
         character_id: String,
         card: Value,
@@ -754,6 +754,10 @@ fn cleanup_legacy_backup_handoff_path(root: &Path, path: &Path) -> Result<bool, 
     cleanup_handoff_path(root, path, "risu-backup-", ".bin", "legacy backup")
 }
 
+fn cleanup_character_charx_handoff_path(root: &Path, path: &Path) -> Result<bool, NativeJobError> {
+    cleanup_handoff_path(root, path, "risu-charx-", ".charx", "character CharX")
+}
+
 fn cleanup_spool_directories_at(
     sources_root: &Path,
     now_millis: u64,
@@ -1170,8 +1174,10 @@ impl NativeFileJobState {
                 card,
                 module,
             } => {
-                let destination = PathBuf::from(destination);
-                validate_desktop_destination(&destination)?;
+                let destination = destination.map(PathBuf::from);
+                if let Some(destination) = destination.as_deref() {
+                    validate_desktop_destination(destination)?;
+                }
                 if character_id.is_empty() || character_id.len() > 512 {
                     return Err(NativeJobError::new(
                         "invalid-input",
@@ -1683,7 +1689,8 @@ impl NativeFileJobState {
                     card,
                     module,
                     &owned_directory,
-                    &destination,
+                    &root.join("handoffs"),
+                    destination.as_deref(),
                     &job,
                 ),
                 NativeFileJobTask::ImportJpegAsset {
@@ -2013,7 +2020,7 @@ enum NativeFileJobTask {
         store: crate::persistent_store::PersistentStore,
     },
     ExportCharacterCharx {
-        destination: PathBuf,
+        destination: Option<PathBuf>,
         character_id: String,
         card: Value,
         module: Value,
@@ -2327,6 +2334,14 @@ pub(crate) fn native_legacy_backup_handoff_cleanup(
     path: String,
 ) -> Result<bool, NativeJobError> {
     cleanup_legacy_backup_handoff_path(&state.root, Path::new(&path))
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_character_charx_handoff_cleanup(
+    state: State<'_, NativeFileJobState>,
+    path: String,
+) -> Result<bool, NativeJobError> {
+    cleanup_character_charx_handoff_path(&state.root, Path::new(&path))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -5873,6 +5888,28 @@ mod tests {
         assert!(unrelated.exists());
         assert_eq!(
             cleanup_legacy_backup_handoff_path(root, &unrelated)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+    }
+
+    #[test]
+    fn character_charx_handoff_cleanup_removes_only_exact_owned_files_and_is_idempotent() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("native-file-jobs");
+        let handoffs = root.join("handoffs");
+        fs::create_dir_all(&handoffs).unwrap();
+        let owned = handoffs.join(format!("risu-charx-{}.charx", Uuid::new_v4()));
+        let unrelated = handoffs.join("keep.charx");
+        fs::write(&owned, b"owned").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        assert!(cleanup_character_charx_handoff_path(&root, &owned).unwrap());
+        assert!(!cleanup_character_charx_handoff_path(&root, &owned).unwrap());
+        assert!(unrelated.is_file());
+        assert_eq!(
+            cleanup_character_charx_handoff_path(&root, &unrelated)
                 .unwrap_err()
                 .code,
             "invalid-input"

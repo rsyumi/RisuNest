@@ -30,6 +30,7 @@ describe('native character CharX export route', () => {
             {},
             {
                 isDesktop: () => true,
+                isAndroid: () => false,
                 chooseDestination: async (name) => {
                     calls.push(['pick', name])
                     persistentCharacter = leasedCharacter
@@ -65,7 +66,7 @@ describe('native character CharX export route', () => {
             ['project', leasedCharacter],
             ['export', {
                 characterId: 'current-character',
-                destination: 'C:\\chosen\\Current.charx',
+                destination: { type: 'desktopPath', path: 'C:\\chosen\\Current.charx' },
                 expectedRevision: 9,
                 card: { spec: 'chara_card_v3', data: { ...leasedCharacter } },
                 module: { name: 'After picker Module', id: 'module-id' },
@@ -88,6 +89,7 @@ describe('native character CharX export route', () => {
 
         await expect(exportNativeCharacterCharxFromPicker(input, {}, {
             isDesktop: () => false,
+            isAndroid: () => false,
             chooseDestination: async () => 'unused',
             runtime: () => ({ revision: 1, flushPendingData: async () => undefined }),
             readCharacter: async () => { throw new Error('must not read') },
@@ -96,10 +98,62 @@ describe('native character CharX export route', () => {
 
         await expect(exportNativeCharacterCharxFromPicker(input, {}, {
             isDesktop: () => true,
+            isAndroid: () => false,
             chooseDestination: async () => null,
             runtime: () => ({ revision: 1, flushPendingData: async () => undefined }),
             readCharacter: async () => { throw new Error('must not read') },
             runExport,
         })).resolves.toBeNull()
+    })
+
+    it('routes Android directly to the SAF handoff without opening a desktop picker', async () => {
+        const calls: unknown[] = []
+        const leasedCharacter = { name: 'Android character', desc: 'leased' }
+
+        await exportNativeCharacterCharxFromPicker(
+            {
+                characterId: 'android-character',
+                suggestedName: 'Android character.charx',
+                projectCharacter: (character) => ({
+                    card: { spec: 'chara_card_v3', data: { ...character } },
+                    module: {},
+                }),
+            },
+            {},
+            {
+                isDesktop: () => false,
+                isAndroid: () => true,
+                chooseDestination: async () => {
+                    throw new Error('desktop picker must not run')
+                },
+                runtime: () => ({
+                    revision: 12,
+                    flushPendingData: async (reason) => { calls.push(['flush', reason]) },
+                }),
+                readCharacter: async () => leasedCharacter as never,
+                runExport: async (input) => {
+                    calls.push(['export', input])
+                    return {
+                        revision: 12,
+                        sourceBytes: 10,
+                        sourceSha256: 'a'.repeat(64),
+                        characterCount: 1,
+                        presetCount: 0,
+                        warningCodes: [],
+                    }
+                },
+            },
+        )
+
+        expect(calls).toEqual([
+            ['flush', 'native-character-charx-export'],
+            ['export', {
+                characterId: 'android-character',
+                destination: { type: 'androidSaf', suggestedName: 'Android character.charx' },
+                expectedRevision: 12,
+                card: { spec: 'chara_card_v3', data: leasedCharacter },
+                module: {},
+            }],
+        ])
     })
 })

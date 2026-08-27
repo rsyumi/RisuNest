@@ -1,5 +1,6 @@
 use super::owner_projection::OwnerManifestProjector;
 use super::{compare_plugin_storage_keys, ReadTarget, StoreError, StoreResult};
+use crate::asset_repository::owner_manifest_codec::OwnerManifestEntry;
 use flate2::{Compression, GzBuilder};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -17,12 +18,17 @@ pub(crate) mod destination;
 
 pub(crate) const EXPORT_CANCELLED_MESSAGE: &str = "native RisuSave export cancelled";
 
+pub(crate) struct ProjectedCharacter {
+    pub(crate) value: Value,
+    pub(crate) additional_asset_entries: Option<Vec<OwnerManifestEntry>>,
+}
+
 pub(crate) fn projected_character(
     connection: &Connection,
     snapshots_dir: &Path,
     target: &ReadTarget,
     character_id: &str,
-) -> StoreResult<Value> {
+) -> StoreResult<ProjectedCharacter> {
     let mut character = super::query::read_character(connection, character_id, target)?
         .ok_or_else(|| StoreError::Validation {
             message: "pinned character does not exist".to_owned(),
@@ -33,9 +39,13 @@ pub(crate) fn projected_character(
         .ok_or_else(|| StoreError::Validation {
             message: "pinned character must be an object".to_owned(),
         })?;
-    OwnerManifestProjector::from_snapshots_dir(connection, target, snapshots_dir)?
-        .project_character(character_id, object)?;
-    Ok(character)
+    let additional_asset_entries =
+        OwnerManifestProjector::from_snapshots_dir(connection, target, snapshots_dir)?
+            .project_character(character_id, object)?;
+    Ok(ProjectedCharacter {
+        value: character,
+        additional_asset_entries,
+    })
 }
 
 pub(crate) fn pinned_asset_alias(

@@ -1,6 +1,6 @@
 use super::charx::CharXLimits;
 use super::{JobControl, JobPhase, JobProgress, JobResultSummary, NativeJobError};
-use crate::asset_repository::PayloadCas;
+use crate::asset_repository::{owner_manifest_codec::OwnerManifestEntry, PayloadCas};
 use crate::persistent_store::export::{self, destination};
 use crate::persistent_store::{PreparedRisuSaveExport, RevisionReadLease, StoreError};
 use serde_json::{json, Map, Value};
@@ -9,11 +9,19 @@ use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
+use uuid::Uuid;
 use zip::write::FileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const RPACK_MAP: &[u8; 512] = include_bytes!("../../../src/ts/rpack/rpack_map.bin");
+const FALLBACK_PORTRAIT: &[u8] = include_bytes!("../../../public/none.webp");
+
+enum EmbeddedAssetSource {
+    Alias(String),
+    ManifestOccurrence { key: String, hash: String },
+    FallbackPortrait,
+}
 
 pub(crate) fn export_character_charx(
     mut prepared: PreparedRisuSaveExport,
@@ -21,7 +29,8 @@ pub(crate) fn export_character_charx(
     card: Value,
     module: Value,
     owned_directory: &Path,
-    destination_path: &Path,
+    handoff_directory: &Path,
+    destination_path: Option<&Path>,
     job: &JobControl,
 ) -> Result<JobResultSummary, NativeJobError> {
     let reader = prepared.take_reader().map_err(store_error)?;
@@ -32,6 +41,7 @@ pub(crate) fn export_character_charx(
         card,
         module,
         owned_directory,
+        handoff_directory,
         destination_path,
         job,
         CharXLimits::default(),
@@ -46,7 +56,8 @@ fn export_character_charx_with_reader(
     mut card: Value,
     module: Value,
     owned_directory: &Path,
-    destination_path: &Path,
+    handoff_directory: &Path,
+    destination_path: Option<&Path>,
     job: &JobControl,
     limits: CharXLimits,
 ) -> Result<JobResultSummary, NativeJobError> {
@@ -56,24 +67,28 @@ fn export_character_charx_with_reader(
         ));
     }
     job.start(JobPhase::WritingExport).map_err(job_error)?;
-    let character = export::projected_character(
+    let projected = export::projected_character(
         &reader.connection,
         &prepared.snapshots_dir,
         &reader.target,
         character_id,
     )
     .map_err(store_error)?;
+    let character = projected.value;
+    let additional_asset_entries = projected.additional_asset_entries;
     validate_character_identity(&character, character_id, &card)?;
     validate_module_overlay(&character, &card, &module)?;
     let assets = card_assets_mut(&mut card)?;
     let asset_count = assets.len();
     let embedded_asset_count = assets.iter().try_fold(0_usize, |count, asset| {
-        embedded_asset_key(asset, &character).and_then(|key| {
-            key.map_or(Ok(count), |_| {
+        asset_is_embedded(asset).and_then(|embedded| {
+            if embedded {
                 count
                     .checked_add(1)
                     .ok_or_else(|| invalid_input("character CharX entry count overflowed"))
-            })
+            } else {
+                Ok(count)
+            }
         })
     })?;
     let entry_count = embedded_asset_count
@@ -111,6 +126,21 @@ fn export_character_charx_with_reader(
     let mut completed_bytes = 0_u64;
     let mut completed_items = 0_u64;
     let mut decoded_bytes = 0_u64;
+    let cc_asset_count = character
+        .get("ccAssets")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let additional_asset_count = character
+        .get("additionalAssets")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if let Some(entries) = &additional_asset_entries {
+        if entries.len() != additional_asset_count {
+            return Err(invalid_input(
+                "pinned character owner manifest occurrence count changed",
+            ));
+        }
+    }
 
     let assets = card_assets_mut(&mut card)?;
     for (index, asset) in assets.iter_mut().enumerate() {
@@ -119,7 +149,15 @@ fn export_character_charx_with_reader(
                 "character CharX export cancelled while writing assets",
             ));
         }
-        let Some(key) = embedded_asset_key(asset, &character)? else {
+        let occurrence = index
+            .checked_sub(cc_asset_count)
+            .filter(|offset| *offset < additional_asset_count)
+            .and_then(|offset| {
+                additional_asset_entries
+                    .as_ref()
+                    .and_then(|entries| entries.get(offset))
+            });
+        let Some(source_identity) = embedded_asset_source(asset, &character, occurrence)? else {
             completed_items += 1;
             job.set_progress(JobProgress {
                 completed_bytes,
@@ -130,20 +168,35 @@ fn export_character_charx_with_reader(
             .map_err(job_error)?;
             continue;
         };
-        let alias = export::pinned_asset_alias(&reader.connection, &reader.target, &key)
-            .map_err(store_error)?;
-        reserve_decoded_entry(
-            &mut decoded_bytes,
-            u64::try_from(alias.size)
-                .map_err(|_| invalid_input("pinned character asset size is invalid"))?,
-            "character asset",
-            limits,
-        )?;
-        let hash = alias.object_hash.as_deref().ok_or_else(|| {
-            invalid_input(format!(
-                "pinned character asset has no native payload: {key}"
-            ))
-        })?;
+        let (hash, size, key) = match &source_identity {
+            EmbeddedAssetSource::Alias(key) => {
+                let alias = export::pinned_asset_alias(&reader.connection, &reader.target, key)
+                    .map_err(store_error)?;
+                let hash = alias.object_hash.ok_or_else(|| {
+                    invalid_input(format!(
+                        "pinned character asset has no native payload: {key}"
+                    ))
+                })?;
+                let size = u64::try_from(alias.size)
+                    .map_err(|_| invalid_input("pinned character asset size is invalid"))?;
+                (Some(hash), size, key.as_str())
+            }
+            EmbeddedAssetSource::ManifestOccurrence { key, hash } => {
+                let size = repository
+                    .stat_object(hash)
+                    .map_err(io_error)?
+                    .ok_or_else(|| {
+                        invalid_input(format!("pinned character asset is missing: {key}"))
+                    })?;
+                (Some(hash.clone()), size, key.as_str())
+            }
+            EmbeddedAssetSource::FallbackPortrait => (
+                None,
+                FALLBACK_PORTRAIT.len() as u64,
+                "built-in fallback portrait",
+            ),
+        };
+        reserve_decoded_entry(&mut decoded_bytes, size, "character asset", limits)?;
         let extension = asset
             .get("ext")
             .and_then(Value::as_str)
@@ -162,19 +215,25 @@ fn export_character_charx_with_reader(
             .expect("validated card asset object")
             .insert("ext".to_owned(), Value::String(extension));
 
-        let source_file = repository
-            .open_object(hash)
-            .map_err(io_error)?
-            .ok_or_else(|| invalid_input(format!("pinned character asset is missing: {key}")))?;
         archive
             .start_file(
                 archive_path,
                 FileOptions::default()
                     .compression_method(CompressionMethod::Stored)
-                    .large_file(alias.size >= i64::from(u32::MAX)),
+                    .large_file(size >= u64::from(u32::MAX)),
             )
             .map_err(zip_error)?;
-        let copied = copy_verified_object(&mut archive, source_file, hash, alias.size, job)?;
+        let copied = if let Some(hash) = hash {
+            let source_file = repository
+                .open_object(&hash)
+                .map_err(io_error)?
+                .ok_or_else(|| {
+                    invalid_input(format!("pinned character asset is missing: {key}"))
+                })?;
+            copy_verified_object(&mut archive, source_file, &hash, size, job)?
+        } else {
+            copy_fallback_portrait(&mut archive, job)?
+        };
         completed_bytes = completed_bytes.saturating_add(copied);
         completed_items += 1;
         job.set_progress(JobProgress {
@@ -217,18 +276,33 @@ fn export_character_charx_with_reader(
     }
     job.set_phase(JobPhase::PublishingDestination)
         .map_err(job_error)?;
-    let destination_root = destination_path.parent().ok_or_else(|| {
-        NativeJobError::new(
-            "invalid-destination",
-            "character CharX destination directory is unavailable",
-        )
-    })?;
+    let (destination_root, destination_path, handoff_path) = match destination_path {
+        Some(destination_path) => (
+            destination_path.parent().ok_or_else(|| {
+                NativeJobError::new(
+                    "invalid-destination",
+                    "character CharX destination directory is unavailable",
+                )
+            })?,
+            destination_path.to_owned(),
+            None,
+        ),
+        None => {
+            fs::create_dir_all(handoff_directory).map_err(io_error)?;
+            let path = handoff_directory.join(format!("risu-charx-{}.charx", Uuid::new_v4()));
+            (
+                handoff_directory,
+                path.clone(),
+                Some(path.to_string_lossy().into_owned()),
+            )
+        }
+    };
     let phase_failure = RefCell::new(None);
     let published = destination::write_charx_destination_controlled(
         owned_directory,
         &source,
         destination_root,
-        destination_path,
+        &destination_path,
         || job.is_cancel_requested() || phase_failure.borrow().is_some(),
         |progress| {
             if let Err(error) = job.set_progress(JobProgress {
@@ -264,7 +338,7 @@ fn export_character_charx_with_reader(
         character_count: 1,
         preset_count: 0,
         warning_codes: Vec::new(),
-        handoff_path: None,
+        handoff_path,
         recovery_path: None,
     })
 }
@@ -403,7 +477,28 @@ fn card_assets_mut(card: &mut Value) -> Result<&mut Vec<Value>, NativeJobError> 
         .ok_or_else(|| invalid_input("CCv3 assets must be an array"))
 }
 
-fn embedded_asset_key(asset: &Value, character: &Value) -> Result<Option<String>, NativeJobError> {
+fn asset_is_embedded(asset: &Value) -> Result<bool, NativeJobError> {
+    let uri = asset
+        .as_object()
+        .and_then(|asset| asset.get("uri"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_input("CCv3 asset URI must be a string"))?;
+    if uri.starts_with("embeded://") {
+        return Err(invalid_input(
+            "live character metadata cannot reference an unleased embedded path",
+        ));
+    }
+    if uri.is_empty() {
+        return Err(invalid_input("CCv3 asset URI must not be empty"));
+    }
+    Ok(!uri.starts_with("http://") && !uri.starts_with("https://"))
+}
+
+fn embedded_asset_source(
+    asset: &Value,
+    character: &Value,
+    occurrence: Option<&OwnerManifestEntry>,
+) -> Result<Option<EmbeddedAssetSource>, NativeJobError> {
     let asset = asset
         .as_object()
         .ok_or_else(|| invalid_input("CCv3 asset must be an object"))?;
@@ -412,13 +507,13 @@ fn embedded_asset_key(asset: &Value, character: &Value) -> Result<Option<String>
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_input("CCv3 asset URI must be a string"))?;
     if uri == "ccdefault:" {
-        return character
+        return Ok(character
             .get("image")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .map(Some)
-            .ok_or_else(|| invalid_input("pinned character portrait is missing"));
+            .map(EmbeddedAssetSource::Alias)
+            .or(Some(EmbeddedAssetSource::FallbackPortrait)));
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
         return Ok(None);
@@ -431,7 +526,18 @@ fn embedded_asset_key(asset: &Value, character: &Value) -> Result<Option<String>
     if uri.is_empty() {
         return Err(invalid_input("CCv3 asset URI must not be empty"));
     }
-    Ok(Some(uri.to_owned()))
+    if let Some(occurrence) = occurrence {
+        let hash = occurrence.payload_hash.ok_or_else(|| {
+            invalid_input(format!(
+                "pinned character owner occurrence has no native payload: {uri}"
+            ))
+        })?;
+        return Ok(Some(EmbeddedAssetSource::ManifestOccurrence {
+            key: uri.to_owned(),
+            hash: hex::encode(hash),
+        }));
+    }
+    Ok(Some(EmbeddedAssetSource::Alias(uri.to_owned())))
 }
 
 fn validate_extension(extension: &str) -> Result<&str, NativeJobError> {
@@ -489,11 +595,9 @@ fn copy_verified_object(
     archive: &mut ZipWriter<BufWriter<File>>,
     mut source: File,
     expected_hash: &str,
-    expected_size: i64,
+    expected_size: u64,
     job: &JobControl,
 ) -> Result<u64, NativeJobError> {
-    let expected_size = u64::try_from(expected_size)
-        .map_err(|_| invalid_input("pinned character asset size is invalid"))?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
@@ -518,6 +622,25 @@ fn copy_verified_object(
             "hash-mismatch",
             "pinned character asset differs from its leased CAS identity",
         ));
+    }
+    Ok(copied)
+}
+
+fn copy_fallback_portrait(
+    archive: &mut ZipWriter<BufWriter<File>>,
+    job: &JobControl,
+) -> Result<u64, NativeJobError> {
+    let mut copied = 0_u64;
+    for chunk in FALLBACK_PORTRAIT.chunks(COPY_BUFFER_BYTES) {
+        if job.is_cancel_requested() {
+            return Err(cancelled(
+                "character CharX export cancelled while reading the fallback portrait",
+            ));
+        }
+        archive.write_all(chunk).map_err(io_error)?;
+        copied = copied
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| invalid_input("fallback portrait size overflowed"))?;
     }
     Ok(copied)
 }
@@ -590,7 +713,7 @@ fn write_card_metadata(
     archive
         .start_file(
             "card.json",
-            FileOptions::default().compression_method(CompressionMethod::Deflated),
+            FileOptions::default().compression_method(CompressionMethod::Stored),
         )
         .map_err(zip_error)?;
     for chunk in metadata.chunks(COPY_BUFFER_BYTES) {
@@ -688,6 +811,7 @@ mod tests {
     };
     use serde_json::json;
     use tempfile::TempDir;
+    use zip::ZipArchive;
 
     struct Fixture {
         directory: TempDir,
@@ -716,10 +840,15 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_portrait(true)
+    }
+
+    fn fixture_with_portrait(has_portrait: bool) -> Fixture {
         let directory = TempDir::new().unwrap();
         let mut store = PersistentStore::open(directory.path()).unwrap();
         let cas = PayloadCas::new(directory.path()).unwrap();
         let shared = alias("assets/shared.bin", b"shared-original", "BIN", &cas);
+        let second_occurrence = cas.prepare_bytes(b"second-occurrence").unwrap();
         let emotion = alias("assets/emotion.webp", b"emotion-original", "WEBP", &cas);
         let portrait = alias("assets/portrait.png", b"portrait-original", "PNG", &cas);
         let cc = alias("assets/cc.dat", b"cc-original", "DAT", &cas);
@@ -736,7 +865,7 @@ mod tests {
             owner_manifest_codec::OwnerManifestEntry {
                 tuple: ["second".to_owned(), shared.key.clone(), "bIn".to_owned()],
                 payload_hash: Some(
-                    hex::decode(shared.object_hash.as_ref().unwrap())
+                    hex::decode(&second_occurrence.content_hash)
                         .unwrap()
                         .try_into()
                         .unwrap(),
@@ -745,11 +874,16 @@ mod tests {
         ])
         .unwrap();
         let manifest = cas.prepare_bytes(&manifest_bytes).unwrap();
+        let portrait_key = if has_portrait {
+            portrait.key.clone()
+        } else {
+            String::new()
+        };
         let character = json!({
             "type": "character",
             "chaId": "current-character",
             "name": "Current",
-            "image": portrait.key.clone(),
+            "image": portrait_key,
             "ccAssets": [{
                 "type": "x-custom",
                 "uri": cc.key.clone(),
@@ -774,16 +908,12 @@ mod tests {
         store
             .replace_add_characters(&staging.staging_id, &[character])
             .unwrap();
+        let mut aliases = vec![shared.clone(), emotion.clone(), cc.clone()];
+        if has_portrait {
+            aliases.push(portrait.clone());
+        }
         store
-            .replace_put_asset_aliases(
-                &staging.staging_id,
-                &[
-                    shared.clone(),
-                    emotion.clone(),
-                    portrait.clone(),
-                    cc.clone(),
-                ],
-            )
+            .replace_put_asset_aliases(&staging.staging_id, &aliases)
             .unwrap();
         store
             .replace_put_asset_owner_heads(
@@ -842,9 +972,13 @@ mod tests {
             payload_hashes: vec![
                 cc.object_hash.unwrap(),
                 shared.object_hash.clone().unwrap(),
-                shared.object_hash.unwrap(),
+                second_occurrence.content_hash,
                 emotion.object_hash.unwrap(),
-                portrait.object_hash.unwrap(),
+                if has_portrait {
+                    portrait.object_hash.unwrap()
+                } else {
+                    hex::encode(Sha256::digest(FALLBACK_PORTRAIT))
+                },
             ],
         }
     }
@@ -871,7 +1005,8 @@ mod tests {
             fixture.card,
             fixture.module,
             &owned,
-            &destination,
+            &fixture.directory.path().join("handoffs"),
+            Some(&destination),
             &job,
         )
         .unwrap();
@@ -944,13 +1079,150 @@ mod tests {
             fixture.card,
             fixture.module,
             &owned,
-            &destination,
+            &fixture.directory.path().join("handoffs"),
+            Some(&destination),
             &job,
         )
         .unwrap_err();
 
         assert_eq!(error.code, "cancelled");
         assert_eq!(fs::read(destination).unwrap(), b"previous CharX");
+    }
+
+    #[test]
+    fn image_less_character_reimports_with_the_exact_built_in_fallback_portrait() {
+        let mut fixture = fixture_with_portrait(false);
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        let chosen = fixture.directory.path().join("chosen");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("image-less.charx");
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCharx)
+            .unwrap();
+
+        export_character_charx(
+            prepared,
+            "current-character",
+            fixture.card,
+            fixture.module,
+            &owned,
+            &fixture.directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap();
+
+        let parsed_root = fixture.directory.path().join("parsed-image-less");
+        fs::create_dir(&parsed_root).unwrap();
+        let CharXInspection::Card(parsed) = inspect_charx_file(
+            &destination,
+            "image-less.charx",
+            &parsed_root,
+            CharXLimits::default(),
+            || false,
+        )
+        .unwrap() else {
+            panic!("exported file must be a CharX card")
+        };
+        let portrait = parsed
+            .payloads
+            .iter()
+            .find(|payload| payload.original_name.starts_with("assets/icon/"))
+            .unwrap();
+        assert_eq!(
+            portrait.sha256,
+            hex::encode(Sha256::digest(FALLBACK_PORTRAIT))
+        );
+        assert_eq!(fs::read(&portrait.staged_path).unwrap(), FALLBACK_PORTRAIT);
+    }
+
+    #[test]
+    fn highly_compressible_card_metadata_is_stored_and_roundtrips() {
+        let mut fixture = fixture();
+        let repeated = "x".repeat(2 * 1024 * 1024);
+        fixture.card["data"]["description"] = Value::String(repeated.clone());
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        let chosen = fixture.directory.path().join("chosen");
+        fs::create_dir(&owned).unwrap();
+        fs::create_dir(&chosen).unwrap();
+        let destination = chosen.join("compressible.charx");
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCharx)
+            .unwrap();
+
+        export_character_charx(
+            prepared,
+            "current-character",
+            fixture.card,
+            fixture.module,
+            &owned,
+            &fixture.directory.path().join("handoffs"),
+            Some(&destination),
+            &job,
+        )
+        .unwrap();
+
+        let mut zip = ZipArchive::new(File::open(&destination).unwrap()).unwrap();
+        assert_eq!(
+            zip.by_name("card.json").unwrap().compression(),
+            CompressionMethod::Stored
+        );
+        drop(zip);
+        let parsed_root = fixture.directory.path().join("parsed-compressible");
+        fs::create_dir(&parsed_root).unwrap();
+        let CharXInspection::Card(parsed) = inspect_charx_file(
+            &destination,
+            "compressible.charx",
+            &parsed_root,
+            CharXLimits::default(),
+            || false,
+        )
+        .unwrap() else {
+            panic!("exported file must be a CharX card")
+        };
+        let card: Value = serde_json::from_str(&parsed.card_json).unwrap();
+        assert_eq!(card["data"]["description"], repeated);
+    }
+
+    #[test]
+    fn portable_character_charx_export_returns_an_app_owned_handoff() {
+        let mut fixture = fixture();
+        let prepared = fixture
+            .store
+            .prepare_risu_save_export(fixture.revision)
+            .unwrap();
+        let owned = fixture.directory.path().join("owned");
+        let handoffs = fixture.directory.path().join("handoffs");
+        fs::create_dir(&owned).unwrap();
+        let job = JobRegistry::default()
+            .create(JobKind::ExportCharacterCharx)
+            .unwrap();
+
+        let result = export_character_charx(
+            prepared,
+            "current-character",
+            fixture.card,
+            fixture.module,
+            &owned,
+            &handoffs,
+            None,
+            &job,
+        )
+        .unwrap();
+
+        let handoff = result.handoff_path.map(std::path::PathBuf::from).unwrap();
+        assert_eq!(handoff.parent(), Some(handoffs.as_path()));
+        assert!(handoff.is_file());
+        assert_eq!(fs::metadata(handoff).unwrap().len(), result.source_bytes);
     }
 
     #[test]
@@ -1009,7 +1281,8 @@ mod tests {
                 fixture.card,
                 fixture.module,
                 &owned,
-                &destination,
+                &fixture.directory.path().join("handoffs"),
+                Some(&destination),
                 &job,
                 limits,
             )

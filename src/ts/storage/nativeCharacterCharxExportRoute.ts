@@ -1,6 +1,6 @@
 import { save } from '@tauri-apps/plugin-dialog'
 
-import { isTauriDesktop } from '../platform'
+import { isTauriAndroid, isTauriDesktop } from '../platform'
 import type { CharacterDetail, DataRevision } from './persistentDataStore'
 import { getPersistentDataStore } from './persistentDataStoreFactory'
 import { assertPinnedRevision, withPersistentRevisionLease } from './persistentRecordIterator'
@@ -28,6 +28,7 @@ interface NativeCharacterCharxExportRuntime {
 
 interface NativeCharacterCharxExportRouteDependencies {
     isDesktop(): boolean
+    isAndroid(): boolean
     chooseDestination(suggestedName: string): Promise<string | null>
     runtime(): NativeCharacterCharxExportRuntime
     readCharacter(characterId: string, revision: DataRevision): Promise<CharacterDetail>
@@ -39,6 +40,7 @@ interface NativeCharacterCharxExportRouteDependencies {
 
 const productionDependencies: NativeCharacterCharxExportRouteDependencies = {
     isDesktop: () => isTauriDesktop,
+    isAndroid: () => isTauriAndroid,
     chooseDestination: (suggestedName) => save({
         defaultPath: suggestedName,
         filters: [{ name: 'CharX', extensions: ['charx'] }],
@@ -61,9 +63,11 @@ export async function exportNativeCharacterCharxFromPicker(
     options: NativeFileJobOptions = {},
     dependencies: NativeCharacterCharxExportRouteDependencies = productionDependencies,
 ): Promise<NativeFileJobResult | null | undefined> {
-    if (!dependencies.isDesktop()) return undefined
-    const destination = await dependencies.chooseDestination(input.suggestedName)
-    if (!destination) return null
+    if (!dependencies.isDesktop() && !dependencies.isAndroid()) return undefined
+    const destination = dependencies.isDesktop()
+        ? await dependencies.chooseDestination(input.suggestedName)
+        : undefined
+    if (dependencies.isDesktop() && !destination) return null
     const runtime = dependencies.runtime()
     await runtime.flushPendingData('native-character-charx-export')
     if (options.signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
@@ -73,7 +77,9 @@ export async function exportNativeCharacterCharxFromPicker(
     return dependencies.runExport(
         {
             characterId: input.characterId,
-            destination,
+            destination: destination
+                ? { type: 'desktopPath', path: destination }
+                : { type: 'androidSaf', suggestedName: input.suggestedName },
             expectedRevision,
             card: projected.card,
             module: projected.module,

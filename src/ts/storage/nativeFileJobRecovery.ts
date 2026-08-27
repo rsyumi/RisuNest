@@ -82,6 +82,11 @@ async function reconcileExportInBackground(
                 path: status.result.handoffPath,
             })
         }
+        else if (status.kind === 'export-character-charx' && status.result?.handoffPath) {
+            await dependencies.invoke('native_character_charx_handoff_cleanup', {
+                path: status.result.handoffPath,
+            })
+        }
     }
     finally {
         await dependencies.invoke('native_file_job_forget', { jobId: status.jobId })
@@ -138,6 +143,7 @@ export async function reconcileNativeFileJobsBeforeBootstrap(
             case 'export-block-risu-save':
             case 'export-lossless-backup':
             case 'export-legacy-local-backup':
+            case 'export-character-charx':
             case 'kei-backup-upload':
                 void reconcileExportInBackground(job, dependencies).catch((error) => {
                     console.error('Native export reconciliation failed', error)

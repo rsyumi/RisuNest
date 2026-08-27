@@ -742,12 +742,6 @@ export async function exportChar(charaID:number):Promise<string> {
         return ''
     }
 
-    if(!char.image){
-        const res = await fetch('/none.webp')
-        const data = new Uint8Array(await res.arrayBuffer())
-        char.image = await saveAsset(data)
-    }
-
     const option = await alertCardExport()
     if(option.type === ''){
         if(option.type2 === 'charx'){
@@ -787,9 +781,19 @@ export async function exportChar(charaID:number):Promise<string> {
                 return ''
             }
         }
+        if(!char.image){
+            const res = await fetch('/none.webp')
+            const data = new Uint8Array(await res.arrayBuffer())
+            char.image = await saveAsset(data)
+        }
         await exportCharacterCard(char, option.type2 === 'json' ? 'json' : (option.type2 === 'charx' ? 'charx' : option.type2 === 'charxJpeg' ? 'charxJpeg' : 'png'), {spec: 'v3'})
     }
     else if(option.type === 'ccv2'){
+        if(!char.image){
+            const res = await fetch('/none.webp')
+            const data = new Uint8Array(await res.arrayBuffer())
+            char.image = await saveAsset(data)
+        }
         exportCharacterCard(char,'png', {spec: 'v2'})
     }
     else if(option.type === 'realm'){
