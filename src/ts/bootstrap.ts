@@ -15,7 +15,7 @@ import { checkRisuUpdate } from "./update";
 import { MobileGUI, botMakerMode, selectedCharID, loadedStore, DBState, LoadingStatusState } from "./stores.svelte";
 import { loadPlugins, pluginCompatibility } from "./plugins/plugins.svelte";
 import { shouldProjectScalableWorkingSet } from "./plugins/pluginCompatibility";
-import { alertConfirm, alertError, alertInput, alertMd, alertSelect, alertTOS, waitAlert } from "./alert";
+import { alertConfirm, alertError, alertInput, alertMd, alertNormal, alertSelect, alertTOS, waitAlert } from "./alert";
 import { checkDriverInit } from "./drive/drive";
 import { characterURLImport } from "./characterCards";
 import { loadRisuAccountData } from "./drive/accounter";
@@ -93,6 +93,10 @@ import {
 } from "./storage/nativeFileJobRecovery";
 import { registerAndroidRisuSaveRoute } from "./storage/androidRisuSaveRouteProduction.svelte";
 import { isAndroidSafFileJobsEnabled } from "./storage/androidSafBridge";
+import {
+    describeScreenshotPublicationError,
+    listenRecoveredAndroidScreenshotPublications,
+} from "./nativeScreenshotArchiveWriter";
 import { restartNativeApp, schedulePeriodicNativeSnapshot } from "./storage/nativePersistentMaintenance";
 import {
     initializeOfficialAccountBootstrap,
@@ -119,6 +123,38 @@ export { assignIds } from "./storage/databasePreparation";
 
 const appWindow = isTauri ? getCurrentWebviewWindow() : null
 let disposeLifecycleCommitListeners: (() => void) | undefined
+let disposeAndroidScreenshotRecovery: (() => void) | undefined
+
+function registerAndroidScreenshotPublicationRecovery() {
+    if (
+        disposeAndroidScreenshotRecovery
+        || !isTauriAndroid
+        || !isAndroidSafFileJobsEnabled()
+    ) return
+    disposeAndroidScreenshotRecovery = listenRecoveredAndroidScreenshotPublications((terminal) => {
+        const partialDestinationMayRemain = terminal.warningCodes
+            .includes('partial-destination-may-remain')
+        if (terminal.state === 'cancelled' && !partialDestinationMayRemain) return
+        if (terminal.state === 'succeeded') {
+            alertNormal(language.screenshotSaved)
+            return
+        }
+        const error = Object.assign(
+            new Error(terminal.message ?? terminal.code ?? 'Android screenshot publication failed'),
+            { warningCodes: terminal.warningCodes },
+        )
+        alertError(language.screenshotFailed.replace(
+            '{error}',
+            describeScreenshotPublicationError(
+                error,
+                language.screenshotPartialDestinationMayRemain,
+            ),
+        ))
+    }, (error) => alertError(language.screenshotFailed.replace(
+        '{error}',
+        error instanceof Error ? error.message : String(error),
+    )))
+}
 
 /**
  * Loads the application data.
@@ -494,6 +530,7 @@ export async function loadData() {
             initMobileGesture()
             MobileGUI.set(true)
         }
+        registerAndroidScreenshotPublicationRecovery()
         loadedStore.set(true)
         performance.mark('boot:interactive')
         selectedCharID.set(-1)

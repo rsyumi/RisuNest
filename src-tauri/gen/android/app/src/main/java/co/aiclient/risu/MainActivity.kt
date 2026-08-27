@@ -251,6 +251,7 @@ internal fun openedFileIntentFingerprint(action: String?, uris: List<String>): S
 private data class PendingSafDestination(
   val requestId: String,
   val exportId: String,
+  val sourceKind: SafDestinationSourceKind,
   val source: File?,
   val cancellation: AtomicBoolean,
 )
@@ -573,6 +574,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
         var terminalRecord: SafDestinationRecord? = null
         var terminalMessage: String? = null
         var ownsPersistedState = false
+        var sourceKind = SafDestinationSourceKind.RISU_SAVE
         try {
           val source = withContext(Dispatchers.IO) {
             resolveManagedExportSource(dataDir, sourcePath)
@@ -586,6 +588,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             emptyList(),
             "Android SAF export source is not an owned native export",
           )
+          sourceKind = managedExportSourceKind(source)
           if (cancellation.get()) {
             throw SafDestinationException(
               "cancelled",
@@ -602,6 +605,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             code = null,
             warningCodes = emptyList(),
             updatedAtMillis = System.currentTimeMillis(),
+            sourceKind = sourceKind,
           )
           withContext(Dispatchers.IO) { saveSafDestinationState(state) }
           ownsPersistedState = true
@@ -615,6 +619,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           pendingSafDestination = PendingSafDestination(
             requestId,
             exportId,
+            sourceKind,
             source,
             cancellation,
           )
@@ -630,6 +635,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             },
             code = error.code,
             warningCodes = error.warningCodes,
+            sourceKind = sourceKind,
           )
           terminalMessage = error.message
         } catch (error: Exception) {
@@ -639,6 +645,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
             phase = SafDestinationPhase.FAILED,
             code = "destination-state-failed",
             warningCodes = emptyList(),
+            sourceKind = sourceKind,
           )
           terminalMessage = "Android SAF destination state could not be persisted"
         }
@@ -696,7 +703,14 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     @JavascriptInterface
     fun acknowledgeExport(requestId: String): Boolean {
       if (!isCanonicalUuidV4(requestId)) return false
-      return clearSafDestinationState(requestId)
+      val record = loadSafDestinationState()
+        ?.takeIf { it.requestId == requestId && it.isTerminal() }
+        ?: return false
+      if (!prepareManagedExportAcknowledgement(dataDir, record.exportId, record.sourceKind)) {
+        return false
+      }
+      if (!clearSafDestinationState(requestId)) return false
+      return true
     }
   }
 
@@ -721,6 +735,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           phase = SafDestinationPhase.FAILED,
           code = "destination-state-failed",
           warningCodes = warnings,
+          sourceKind = pending.sourceKind,
         )
         val persisted = withContext(Dispatchers.IO) {
           persistPendingSafDestinationFailure(failure)
@@ -786,6 +801,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           phase = SafDestinationPhase.SUCCEEDED,
           bytes = result.bytes,
           warningCodes = result.warningCodes,
+          sourceKind = pending.sourceKind,
         )
       } catch (error: SafDestinationException) {
         terminalMessage = error.message
@@ -799,6 +815,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           },
           code = error.code,
           warningCodes = error.warningCodes,
+          sourceKind = pending.sourceKind,
         )
       } catch (error: Exception) {
         terminalMessage = "Android SAF destination copy failed"
@@ -817,6 +834,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
           phase = SafDestinationPhase.FAILED,
           code = "destination-write-failed",
           warningCodes = warnings,
+          sourceKind = pending.sourceKind,
         )
       } finally {
         safDestinationCancellations.remove(pending.requestId, pending.cancellation)
@@ -881,6 +899,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
       phase = SafDestinationPhase.FAILED,
       code = "destination-state-failed",
       warningCodes = cleanupWarnings,
+      sourceKind = record.sourceKind,
     )
     persistTerminalIfPossible(failed)
     return failed to "Android SAF destination result could not be persisted"
@@ -896,6 +915,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     bytes: Long? = null,
     code: String? = null,
     warningCodes: List<String>,
+    sourceKind: SafDestinationSourceKind = SafDestinationSourceKind.RISU_SAVE,
   ) = SafDestinationRecord(
     requestId = requestId,
     exportId = exportId,
@@ -905,6 +925,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     code = code,
     warningCodes = warningCodes,
     updatedAtMillis = System.currentTimeMillis(),
+    sourceKind = sourceKind,
   )
 
   private suspend fun persistTerminalIfPossible(record: SafDestinationRecord): Boolean =
@@ -1009,6 +1030,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     return PendingSafDestination(
       requestId = record.requestId,
       exportId = record.exportId,
+      sourceKind = record.sourceKind,
       source = resolveManagedExportById(dataDir, record.exportId),
       cancellation = cancellation,
     )
@@ -1045,6 +1067,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
               },
               code = if (wasCancelling) "cancelled" else "destination-interrupted",
               warningCodes = warnings,
+              sourceKind = record.sourceKind,
             )
             persistTerminalIfPossible(terminal)
             dispatchSafDestination(terminal, destinationMessage(terminal))
@@ -1068,6 +1091,7 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
               },
               code = if (wasCancelling) "cancelled" else "destination-interrupted",
               warningCodes = emptyList(),
+              sourceKind = record.sourceKind,
             )
             persistTerminalIfPossible(terminal)
             dispatchSafDestination(terminal, destinationMessage(terminal))
@@ -1125,6 +1149,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
     message: String?,
   ) = androidSafDestinationScript(
     requestId = record.requestId,
+    exportId = record.exportId,
+    sourceKind = record.sourceKind,
     state = record.phase.wireName,
     bytes = record.bytes,
     code = record.code,
@@ -1135,6 +1161,8 @@ class MainActivity : TauriActivity(), RendererRecoveryHost {
   private fun destinationJson(record: SafDestinationRecord, message: String?) =
     androidSafDestinationJson(
       requestId = record.requestId,
+      exportId = record.exportId,
+      sourceKind = record.sourceKind,
       state = record.phase.wireName,
       bytes = record.bytes,
       code = record.code,

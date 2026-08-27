@@ -135,10 +135,11 @@ function harness(options: { height?: number; encodeError?: Error } = {}) {
 }
 
 describe('bounded chat screenshot capture', () => {
-    it('allows long archives on Web and Tauri desktop while Android SAF stays gated', () => {
-        expect(canExportLongScreenshotArchive(false, false)).toBe(true)
-        expect(canExportLongScreenshotArchive(true, true)).toBe(true)
-        expect(canExportLongScreenshotArchive(true, false)).toBe(false)
+    it('allows long archives on Web, Tauri desktop, and Android with SAF', () => {
+        expect(canExportLongScreenshotArchive(false, false, false)).toBe(true)
+        expect(canExportLongScreenshotArchive(true, true, false)).toBe(true)
+        expect(canExportLongScreenshotArchive(true, false, true)).toBe(true)
+        expect(canExportLongScreenshotArchive(true, false, false)).toBe(false)
     })
     it('exports a short bounded batch as one PNG in chronological order', async () => {
         const deps = harness()

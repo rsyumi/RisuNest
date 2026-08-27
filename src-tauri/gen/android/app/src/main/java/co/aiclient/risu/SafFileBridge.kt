@@ -25,6 +25,9 @@ internal fun isCanonicalUuidV4(value: String): Boolean = CANONICAL_TOKEN.matches
 private val MANAGED_EXPORT_NAME = Regex(
   "risusave-([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\\.risudat",
 )
+private const val MANAGED_SCREENSHOT_FILE = "archive.zip.part"
+private const val MANAGED_SCREENSHOT_OWNERSHIP = "ownership"
+private const val MANAGED_SCREENSHOT_READY = "ready"
 
 internal interface SafInputSource {
   val displayName: String
@@ -440,6 +443,11 @@ internal suspend fun copySafDestinationOnIo(
 }
 
 internal fun resolveManagedExportSource(appDataRoot: File, sourcePath: String): File? {
+  resolveManagedRisuSaveSource(appDataRoot, sourcePath)?.let { return it }
+  return resolveManagedScreenshotSource(appDataRoot, sourcePath)
+}
+
+private fun resolveManagedRisuSaveSource(appDataRoot: File, sourcePath: String): File? {
   val exportsRoot = runCatching {
     appDataRoot.resolve("persistent/exports").canonicalFile
   }.getOrNull() ?: return null
@@ -458,13 +466,66 @@ internal fun resolveManagedExportSource(appDataRoot: File, sourcePath: String): 
   return source
 }
 
-internal fun managedExportId(source: File): String? =
-  MANAGED_EXPORT_NAME.matchEntire(source.name)?.groupValues?.get(1)
+private fun resolveManagedScreenshotSource(appDataRoot: File, sourcePath: String): File? {
+  val screenshotRoot = runCatching {
+    appDataRoot.resolve("native-file-jobs/screenshot-output").canonicalFile
+  }.getOrNull() ?: return null
+  if (!screenshotRoot.isDirectory) return null
+  val source = runCatching { File(sourcePath).canonicalFile }.getOrNull() ?: return null
+  if (!source.isFile || source.name != MANAGED_SCREENSHOT_FILE) return null
+  val directory = source.parentFile ?: return null
+  if (directory.parentFile != screenshotRoot || !isCanonicalUuidV4(directory.name)) return null
+  if (readExactOwner(directory.resolve(MANAGED_SCREENSHOT_OWNERSHIP)) != directory.name) return null
+  if (readExactOwner(directory.resolve(MANAGED_SCREENSHOT_READY)) != directory.name) return null
+  return source
+}
+
+private fun readExactOwner(marker: File): String? {
+  if (!marker.isFile || marker.length() > 64) return null
+  return runCatching { marker.readText(Charsets.UTF_8) }.getOrNull()
+}
+
+internal fun managedExportId(source: File): String? {
+  MANAGED_EXPORT_NAME.matchEntire(source.name)?.groupValues?.get(1)?.let { return it }
+  if (source.name != MANAGED_SCREENSHOT_FILE) return null
+  return source.parentFile?.name?.takeIf(::isCanonicalUuidV4)
+}
+
+internal fun managedExportSourceKind(source: File): SafDestinationSourceKind =
+  if (source.name == MANAGED_SCREENSHOT_FILE) {
+    SafDestinationSourceKind.SCREENSHOT
+  } else {
+    SafDestinationSourceKind.RISU_SAVE
+  }
 
 internal fun resolveManagedExportById(appDataRoot: File, exportId: String): File? {
   if (!isCanonicalUuidV4(exportId)) return null
   val source = appDataRoot.resolve("persistent/exports/risusave-$exportId.risudat")
-  return resolveManagedExportSource(appDataRoot, source.absolutePath)
+  resolveManagedRisuSaveSource(appDataRoot, source.absolutePath)?.let { return it }
+  val screenshot = appDataRoot.resolve(
+    "native-file-jobs/screenshot-output/$exportId/$MANAGED_SCREENSHOT_FILE",
+  )
+  return resolveManagedScreenshotSource(appDataRoot, screenshot.absolutePath)
+}
+
+internal fun discardManagedScreenshotSource(appDataRoot: File, exportId: String): Boolean {
+  if (!isCanonicalUuidV4(exportId)) return false
+  val source = appDataRoot.resolve(
+    "native-file-jobs/screenshot-output/$exportId/$MANAGED_SCREENSHOT_FILE",
+  )
+  val owned = resolveManagedScreenshotSource(appDataRoot, source.absolutePath) ?: return false
+  return runCatching { owned.parentFile?.deleteRecursively() == true }.getOrDefault(false)
+}
+
+internal fun prepareManagedExportAcknowledgement(
+  appDataRoot: File,
+  exportId: String,
+  sourceKind: SafDestinationSourceKind,
+): Boolean {
+  if (sourceKind != SafDestinationSourceKind.SCREENSHOT) return true
+  val directory = appDataRoot.resolve("native-file-jobs/screenshot-output/$exportId")
+  if (!directory.exists()) return true
+  return discardManagedScreenshotSource(appDataRoot, exportId)
 }
 
 private fun withPartialCleanup(
@@ -518,7 +579,10 @@ internal fun safeSafDisplayName(name: String): String {
 
 internal fun safeSafDestinationName(name: String): String {
   val safe = safeSafDisplayName(name)
-  return if (safe.endsWith(".risudat", ignoreCase = true)) safe else "$safe.risudat"
+  return if (
+    safe.endsWith(".risudat", ignoreCase = true)
+    || safe.endsWith(".zip", ignoreCase = true)
+  ) safe else "$safe.risudat"
 }
 
 private fun readSpoolOwnership(file: File): SafSpoolOwnership? {
@@ -610,6 +674,8 @@ internal fun androidSafProgressScript(
 
 internal fun androidSafDestinationScript(
   requestId: String,
+  exportId: String = requestId,
+  sourceKind: SafDestinationSourceKind = SafDestinationSourceKind.RISU_SAVE,
   state: String,
   bytes: Long? = null,
   code: String? = null,
@@ -618,6 +684,8 @@ internal fun androidSafDestinationScript(
 ): String {
   val detail = androidSafDestinationJson(
     requestId,
+    exportId,
+    sourceKind,
     state,
     bytes,
     code,
@@ -630,6 +698,8 @@ internal fun androidSafDestinationScript(
 
 internal fun androidSafDestinationJson(
   requestId: String,
+  exportId: String = requestId,
+  sourceKind: SafDestinationSourceKind = SafDestinationSourceKind.RISU_SAVE,
   state: String,
   bytes: Long? = null,
   code: String? = null,
@@ -639,6 +709,8 @@ internal fun androidSafDestinationJson(
   val warnings = warningCodes.joinToString(",") { jsonString(it) }
   return "{" +
     "\"requestId\":${jsonString(requestId)}," +
+    "\"exportId\":${jsonString(exportId)}," +
+    "\"sourceKind\":${jsonString(sourceKind.wireName)}," +
     "\"state\":${jsonString(state)}," +
     "\"bytes\":${bytes ?: "null"}," +
     "\"code\":${code?.let(::jsonString) ?: "null"}," +

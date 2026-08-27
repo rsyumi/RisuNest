@@ -356,12 +356,14 @@ class SafFileBridgeTest {
       code = null,
       warningCodes = listOf("android-saf-provider-not-atomic"),
       updatedAtMillis = 1_000,
+      sourceKind = SafDestinationSourceKind.SCREENSHOT,
     )
 
     first.save(record)
     val restored = SafDestinationStateStore(stateFile, testAtomicPublisher).load()
 
     assertEquals(record, restored)
+    assertTrue(stateFile.readText().contains("\"sourceKind\":\"screenshot\""))
     assertFalse(stateFile.readText().contains("/persistent/exports/"))
 
     val cancelledPicker = record.copy(
@@ -603,16 +605,94 @@ class SafFileBridgeTest {
   }
 
   @Test
+  fun `destination source accepts an owned ready screenshot ZIP without exposing other files`() {
+    val appData = temporaryDirectory()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val owned = appData.resolve("native-file-jobs/screenshot-output/$id")
+    owned.mkdirs()
+    owned.resolve("ownership").writeText(id)
+    owned.resolve("ready").writeText(id)
+    val source = owned.resolve("archive.zip.part")
+    source.writeBytes(byteArrayOf(1, 2, 3))
+    val unrelated = appData.resolve("native-file-jobs/screenshot-output/unrelated/archive.zip.part")
+    unrelated.parentFile!!.mkdirs()
+    unrelated.writeBytes(byteArrayOf(9))
+
+    assertEquals(source.canonicalFile, resolveManagedExportSource(appData, source.path))
+    assertEquals(id, managedExportId(source))
+    assertEquals(source.canonicalFile, resolveManagedExportById(appData, id))
+    assertNull(resolveManagedExportSource(appData, unrelated.path))
+
+    owned.resolve("ready").writeText("different-owner")
+    assertNull(resolveManagedExportSource(appData, source.path))
+  }
+
+  @Test
+  fun `acknowledged screenshot cleanup removes only the matching owned handoff`() {
+    val appData = temporaryDirectory()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val otherId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    fun screenshot(owner: String): File {
+      val directory = appData.resolve("native-file-jobs/screenshot-output/$owner")
+      directory.mkdirs()
+      directory.resolve("ownership").writeText(owner)
+      directory.resolve("ready").writeText(owner)
+      return directory.resolve("archive.zip.part").apply { writeBytes(byteArrayOf(1)) }
+    }
+    val source = screenshot(id)
+    val other = screenshot(otherId)
+
+    assertTrue(discardManagedScreenshotSource(appData, id))
+    assertFalse(source.exists())
+    assertTrue(other.exists())
+    assertFalse(discardManagedScreenshotSource(appData, id))
+  }
+
+  @Test
+  fun `screenshot acknowledgement requires cleanup before terminal state can be cleared`() {
+    val appData = temporaryDirectory()
+    val id = "99999999-9999-4999-8999-999999999999"
+    val directory = appData.resolve("native-file-jobs/screenshot-output/$id")
+    directory.mkdirs()
+    directory.resolve("ownership").writeText(id)
+    directory.resolve("ready").writeText("different-owner")
+    directory.resolve("archive.zip.part").writeBytes(byteArrayOf(1))
+
+    assertFalse(prepareManagedExportAcknowledgement(
+      appData,
+      id,
+      SafDestinationSourceKind.SCREENSHOT,
+    ))
+    assertTrue(directory.exists())
+
+    directory.resolve("ready").writeText(id)
+    assertTrue(prepareManagedExportAcknowledgement(
+      appData,
+      id,
+      SafDestinationSourceKind.SCREENSHOT,
+    ))
+    assertFalse(directory.exists())
+    assertTrue(prepareManagedExportAcknowledgement(
+      appData,
+      id,
+      SafDestinationSourceKind.SCREENSHOT,
+    ))
+  }
+
+  @Test
   fun `destination picker receives a safe risudat display name`() {
     assertEquals("backup.risudat", safeSafDestinationName("folder/backup.risudat"))
     assertEquals("backup_file.risudat", safeSafDestinationName("backup file"))
     assertEquals("opened-file.risudat", safeSafDestinationName("///"))
+    assertEquals("chat.zip", safeSafDestinationName("folder/chat.zip"))
   }
 
   @Test
   fun `destination terminal script keeps a replayable bounded result`() {
     val script = androidSafDestinationScript(
       requestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      exportId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      sourceKind = SafDestinationSourceKind.SCREENSHOT,
       state = "failed",
       code = "destination-interrupted",
       message = "copy interrupted",
@@ -624,6 +704,8 @@ class SafFileBridgeTest {
 
     assertTrue(script.startsWith("window.tauriAndroidSafDestinationResult="))
     assertTrue(script.contains("risu-android-saf-destination"))
+    assertTrue(script.contains("\"exportId\":\"dddddddd-dddd-4ddd-8ddd-dddddddddddd\""))
+    assertTrue(script.contains("\"sourceKind\":\"screenshot\""))
     assertFalse(script.contains("content://"))
     assertFalse(script.contains("persistent/exports"))
   }

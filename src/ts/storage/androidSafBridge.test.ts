@@ -138,6 +138,7 @@ describe('Android SAF bridge', () => {
             'backup.risudat',
         )
         expect(result).toEqual({
+            requestId: 'request-1',
             bytes: 4_294_967_296,
             warningCodes: ['android-saf-provider-not-atomic'],
         })
@@ -184,7 +185,7 @@ describe('Android SAF bridge', () => {
         expect(listeners.size).toBe(0)
     })
 
-    it('forwards cancellation to Kotlin and releases its event listener', async () => {
+    it('waits for the native cancelled terminal after forwarding cancellation', async () => {
         const listeners = new Set<(event: Event) => void>()
         const controller = new AbortController()
         const cancelExport = vi.fn()
@@ -200,9 +201,116 @@ describe('Android SAF bridge', () => {
         })
 
         controller.abort()
+        expect(listeners.size).toBe(1)
+        for (const listener of listeners) {
+            listener(new CustomEvent('risu-android-saf-destination', { detail: {
+                requestId: 'request-3',
+                exportId: '11111111-1111-4111-8111-111111111111',
+                sourceKind: 'risuSave',
+                state: 'cancelled',
+                code: 'cancelled',
+                warningCodes: [],
+            } satisfies AndroidSafDestinationEvent }))
+        }
 
         await expect(promise).rejects.toMatchObject({ name: 'AbortError' })
         expect(cancelExport).toHaveBeenCalledExactlyOnceWith('request-3')
+        expect(listeners.size).toBe(0)
+    })
+
+    it('can defer terminal acknowledgement until an owned screenshot source is released', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const acknowledgeExport = vi.fn(() => true)
+        const copyExport = vi.fn((requestId: string) => queueMicrotask(() => {
+            for (const listener of listeners) {
+                listener(new CustomEvent('risu-android-saf-destination', { detail: {
+                    requestId,
+                    exportId: '11111111-1111-4111-8111-111111111111',
+                    sourceKind: 'screenshot',
+                    state: 'succeeded',
+                    bytes: 3,
+                    warningCodes: [],
+                } satisfies AndroidSafDestinationEvent }))
+            }
+        }))
+
+        const result = await copyNativeExportToAndroidSaf({
+            sourcePath: '/data/user/0/co.aiclient.risu/native-file-jobs/screenshot-output/11111111-1111-4111-8111-111111111111/archive.zip.part',
+            suggestedName: 'chat.zip',
+            deferAcknowledgement: true,
+        }, {
+            createRequestId: () => 'request-screenshot',
+            bridge: { copyExport, acknowledgeExport },
+            addEventListener: (_name, listener) => listeners.add(listener),
+            removeEventListener: (_name, listener) => listeners.delete(listener),
+        })
+
+        expect(result.requestId).toBe('request-screenshot')
+        expect(acknowledgeExport).not.toHaveBeenCalled()
+    })
+
+    it('accepts a completed native publication when cancellation arrives too late', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const controller = new AbortController()
+        const promise = copyNativeExportToAndroidSaf({
+            sourcePath: '/data/user/0/co.aiclient.risu/persistent/exports/risusave-a.risudat',
+            suggestedName: 'backup.risudat',
+            signal: controller.signal,
+        }, {
+            createRequestId: () => 'request-4',
+            bridge: { copyExport: vi.fn(), cancelExport: vi.fn(() => false) },
+            addEventListener: (_name, listener) => listeners.add(listener),
+            removeEventListener: (_name, listener) => listeners.delete(listener),
+        })
+
+        controller.abort()
+        for (const listener of listeners) {
+            listener(new CustomEvent('risu-android-saf-destination', { detail: {
+                requestId: 'request-4',
+                exportId: '11111111-1111-4111-8111-111111111111',
+                sourceKind: 'risuSave',
+                state: 'succeeded',
+                bytes: 12,
+                warningCodes: ['android-saf-provider-not-atomic'],
+            } satisfies AndroidSafDestinationEvent }))
+        }
+
+        await expect(promise).resolves.toMatchObject({ bytes: 12, requestId: 'request-4' })
+        expect(listeners.size).toBe(0)
+    })
+
+    it('preserves a partial destination warning reported after cancellation', async () => {
+        const listeners = new Set<(event: Event) => void>()
+        const controller = new AbortController()
+        const promise = copyNativeExportToAndroidSaf({
+            sourcePath: '/data/user/0/co.aiclient.risu/persistent/exports/risusave-a.risudat',
+            suggestedName: 'backup.risudat',
+            signal: controller.signal,
+        }, {
+            createRequestId: () => 'request-5',
+            bridge: { copyExport: vi.fn(), cancelExport: vi.fn(() => true) },
+            addEventListener: (_name, listener) => listeners.add(listener),
+            removeEventListener: (_name, listener) => listeners.delete(listener),
+        })
+
+        controller.abort()
+        for (const listener of listeners) {
+            listener(new CustomEvent('risu-android-saf-destination', { detail: {
+                requestId: 'request-5',
+                exportId: '11111111-1111-4111-8111-111111111111',
+                sourceKind: 'risuSave',
+                state: 'cancelled',
+                code: 'cancelled',
+                message: 'copy cancelled',
+                warningCodes: ['partial-destination-may-remain'],
+            } satisfies AndroidSafDestinationEvent }))
+        }
+
+        await expect(promise).rejects.toMatchObject({
+            name: 'AbortError',
+            requestId: 'request-5',
+            warningCodes: ['partial-destination-may-remain'],
+        })
         expect(listeners.size).toBe(0)
     })
 

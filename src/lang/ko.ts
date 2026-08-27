@@ -1562,6 +1562,7 @@ export const languageKorean = {
     screenshotConversationStartNote: "첫 인사말은 턴 수에 포함되지 않습니다.",
     screenshotFailed: "스크린샷 실패: {error}",
     screenshotLongNativeUnavailable: "긴 스크린샷 ZIP 내보내기는 아직 네이티브 앱에서 사용할 수 없습니다.",
+    screenshotPartialDestinationMayRemain: "선택한 위치에 일부 파일이 남아 있을 수 있습니다.",
 
     nanoGPTSelectFromList: "목록에서 선택",
     nanoGPTManualInput: "수동 입력",

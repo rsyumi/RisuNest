@@ -49,8 +49,12 @@ function throwIfAborted(signal: AbortSignal) {
     if (signal.aborted) throw new DOMException('Screenshot capture was cancelled', 'AbortError')
 }
 
-export function canExportLongScreenshotArchive(isNative: boolean, isNativeDesktop: boolean) {
-    return !isNative || isNativeDesktop
+export function canExportLongScreenshotArchive(
+    isNative: boolean,
+    isNativeDesktop: boolean,
+    isAndroidSafReady = false,
+) {
+    return !isNative || isNativeDesktop || isAndroidSafReady
 }
 
 export async function captureChatScreenshot(

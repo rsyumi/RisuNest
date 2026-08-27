@@ -54,7 +54,14 @@ export function createStreamingScreenshotArchive(
         if (state === 'aborted') return true
         if (state === 'closed') return false
         zip.terminate()
-        const aborted = await writer.abort()
+        let aborted: void | boolean
+        try {
+            aborted = await writer.abort()
+        }
+        catch (error) {
+            state = 'aborted'
+            throw error
+        }
         if (aborted === false) {
             state = 'closed'
             return false

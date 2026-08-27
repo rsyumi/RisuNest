@@ -3,6 +3,7 @@ import type { NativeFileJobSource } from './nativeFileJobs'
 const SPOOL_EVENT = 'risu-android-spool-ready'
 const DESTINATION_EVENT = 'risu-android-saf-destination'
 const PROGRESS_EVENT = 'risu-android-saf-progress'
+const activeDestinationRequestIds = new Set<string>()
 
 export interface AndroidSpoolReady {
     token: string
@@ -89,6 +90,7 @@ export interface AndroidSafDestinationRequest {
     suggestedName: string
     signal?: AbortSignal
     onProgress?(progress: AndroidSafProgress): void
+    deferAcknowledgement?: boolean
 }
 
 export interface AndroidSafProgress {
@@ -100,12 +102,15 @@ export interface AndroidSafProgress {
 }
 
 export interface AndroidSafDestinationResult {
+    requestId?: string
     bytes: number
     warningCodes: string[]
 }
 
 export interface AndroidSafDestinationEvent {
     requestId: string
+    exportId?: string
+    sourceKind?: 'risuSave' | 'screenshot'
     state: 'succeeded' | 'failed' | 'cancelled'
     bytes?: number | null
     code?: string | null
@@ -161,6 +166,7 @@ const productionDependencies: AndroidSafDestinationDependencies = {
 
 export class AndroidSafDestinationError extends Error {
     constructor(
+        readonly requestId: string,
         readonly code: string,
         readonly warningCodes: string[],
         message: string,
@@ -168,6 +174,56 @@ export class AndroidSafDestinationError extends Error {
         super(message)
         this.name = 'AndroidSafDestinationError'
     }
+}
+
+function androidSafAbortError(
+    requestId: string,
+    detail?: Pick<AndroidSafDestinationEvent, 'code' | 'message' | 'warningCodes'>,
+): DOMException & {
+    requestId: string
+    code?: string | null
+    warningCodes: string[]
+} {
+    return Object.assign(
+        new DOMException(
+            detail?.message ?? 'Android SAF export was cancelled',
+            'AbortError',
+        ),
+        {
+            requestId,
+            code: detail?.code,
+            warningCodes: detail?.warningCodes ?? [],
+        },
+    )
+}
+
+export function isAndroidSafDestinationRequestActive(requestId: string): boolean {
+    return activeDestinationRequestIds.has(requestId)
+}
+
+export function listenAndroidSafDestinationEvents(
+    listener: (event: AndroidSafDestinationEvent) => void,
+    dependencies: Pick<AndroidSafDestinationDependencies, 'addEventListener' | 'removeEventListener'> = productionDependencies,
+): () => void {
+    const onDestination = (event: Event) => {
+        const detail = (event as CustomEvent<AndroidSafDestinationEvent>).detail
+        if (detail) listener(detail)
+    }
+    dependencies.addEventListener(DESTINATION_EVENT, onDestination)
+    return () => dependencies.removeEventListener(DESTINATION_EVENT, onDestination)
+}
+
+export function acknowledgeAndroidSafExport(
+    requestId: string,
+    bridge: AndroidSafJavascriptBridge = productionBridge(),
+): boolean {
+    return bridge.acknowledgeExport?.(requestId) === true
+}
+
+export function getAndroidSafExportStatus(
+    bridge: AndroidSafJavascriptBridge = productionBridge(),
+): string | null {
+    return bridge.getExportStatus?.() ?? null
 }
 
 export function cancelAndroidSafSource(
@@ -222,11 +278,13 @@ export function copyNativeExportToAndroidSaf(
         return Promise.reject(new DOMException('Android SAF export was cancelled', 'AbortError'))
     }
     const requestId = dependencies.createRequestId()
+    activeDestinationRequestIds.add(requestId)
     return new Promise((resolve, reject) => {
         let settled = false
         const cleanup = () => {
             request.signal?.removeEventListener('abort', onAbort)
             dependencies.removeEventListener(DESTINATION_EVENT, onEvent)
+            queueMicrotask(() => activeDestinationRequestIds.delete(requestId))
             if (request.onProgress) {
                 dependencies.removeEventListener(PROGRESS_EVENT, onProgress)
             }
@@ -239,24 +297,27 @@ export function copyNativeExportToAndroidSaf(
         }
         const onAbort = () => {
             dependencies.bridge.cancelExport?.(requestId)
-            finish(() => reject(new DOMException('Android SAF export was cancelled', 'AbortError')))
         }
         const onEvent = (event: Event) => {
             const detail = (event as CustomEvent<AndroidSafDestinationEvent>).detail
             if (!detail || detail.requestId !== requestId) return
-            dependencies.bridge.acknowledgeExport?.(requestId)
+            if (!request.deferAcknowledgement) {
+                dependencies.bridge.acknowledgeExport?.(requestId)
+            }
             if (detail.state === 'succeeded' && typeof detail.bytes === 'number') {
                 finish(() => resolve({
+                    requestId,
                     bytes: detail.bytes as number,
                     warningCodes: detail.warningCodes,
                 }))
                 return
             }
             if (detail.state === 'cancelled') {
-                finish(() => reject(new DOMException('Android SAF export was cancelled', 'AbortError')))
+                finish(() => reject(androidSafAbortError(requestId, detail)))
                 return
             }
             finish(() => reject(new AndroidSafDestinationError(
+                requestId,
                 detail.code ?? 'destination-write-failed',
                 detail.warningCodes,
                 detail.message ?? 'Android SAF destination copy failed',

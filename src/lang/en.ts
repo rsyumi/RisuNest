@@ -1005,6 +1005,7 @@ export const languageEnglish = {
     screenshotConversationStartNote: "The greeting is not counted as a turn.",
     screenshotFailed: "Screenshot failed: {error}",
     screenshotLongNativeUnavailable: "Long screenshot ZIP export is not available in native apps yet.",
+    screenshotPartialDestinationMayRemain: "A partial file may remain at the selected destination.",
     createBotwithAI: "Create Bot from AI",
     changeFolderName: "Input the new folder name (blank to cancel)",
     cancel: "Cancel",

@@ -68,8 +68,9 @@
     } from 'src/ts/chatScreenshotSourceLease';
     import { canExportLongScreenshotArchive, captureChatScreenshot, createDomScreenshotEncoder, type ChatScreenshotSurface } from 'src/ts/chatScreenshotCapture';
     import { createStreamingScreenshotArchive } from 'src/ts/chatScreenshotArchive';
-    import { createNativeScreenshotArchiveWriter } from 'src/ts/nativeScreenshotArchiveWriter';
-    import { isTauri, isTauriDesktop } from 'src/ts/platform';
+    import { createAndroidScreenshotArchiveWriter, createNativeScreenshotArchiveWriter, describeScreenshotPublicationError } from 'src/ts/nativeScreenshotArchiveWriter';
+    import { isTauri, isTauriAndroid, isTauriDesktop } from 'src/ts/platform';
+    import { isAndroidSafFileJobsEnabled } from 'src/ts/storage/androidSafBridge';
     import { getModuleAssets, getModuleLorebooks, getModuleRegexScripts, getModules } from 'src/ts/process/modules';
     import { ColorSchemeTypeStore } from 'src/ts/gui/colorscheme';
     import { HideIconStore } from 'src/ts/stores.svelte';
@@ -758,11 +759,20 @@
                         return downloadFile(`${fileBase}.png`, new Uint8Array(await page.arrayBuffer()))
                     },
                     async createArchive() {
-                        if (!canExportLongScreenshotArchive(isTauri, isTauriDesktop)) {
+                        const androidSafReady = isTauriAndroid && isAndroidSafFileJobsEnabled()
+                        if (!canExportLongScreenshotArchive(
+                            isTauri,
+                            isTauriDesktop,
+                            androidSafReady,
+                        )) {
                             throw new Error(language.screenshotLongNativeUnavailable)
                         }
                         if (isTauriDesktop) {
                             const writer = await createNativeScreenshotArchiveWriter(`${fileBase}.zip`)
+                            return createStreamingScreenshotArchive(writer)
+                        }
+                        if (androidSafReady) {
+                            const writer = await createAndroidScreenshotArchiveWriter(`${fileBase}.zip`)
                             return createStreamingScreenshotArchive(writer)
                         }
                         const writer = new LocalWriter()
@@ -772,9 +782,6 @@
                     },
                 },
             })
-            if (controller.signal.aborted) {
-                throw new DOMException('Screenshot capture was cancelled', 'AbortError')
-            }
             alertNormal(language.screenshotSaved)
             screenshotDialogOpen = false
             screenshotDialogSnapshot = null
@@ -783,9 +790,23 @@
             await sourceLease.close().catch(console.error)
             screenshotDialogOpen = false
             screenshotDialogSnapshot = null
-            if (!(error instanceof DOMException && error.name === 'AbortError')) {
+            const partialDestinationMayRemain = !!(
+                error
+                && typeof error === 'object'
+                && 'warningCodes' in error
+                && Array.isArray((error as { warningCodes?: unknown }).warningCodes)
+                && (error as { warningCodes: unknown[] }).warningCodes
+                    .includes('partial-destination-may-remain')
+            )
+            if (
+                !(error instanceof DOMException && error.name === 'AbortError')
+                || partialDestinationMayRemain
+            ) {
                 console.error(error)
-                const detail = error instanceof Error ? error.message : String(error)
+                const detail = describeScreenshotPublicationError(
+                    error,
+                    language.screenshotPartialDestinationMayRemain,
+                )
                 screenshotError = language.screenshotFailed.replace('{error}', detail)
                 alertError(screenshotError)
             }

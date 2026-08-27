@@ -4,7 +4,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
-private const val DESTINATION_STATE_VERSION = 1
+private const val DESTINATION_STATE_VERSION = 2
 private const val MAX_DESTINATION_STATE_BYTES = 8_192L
 private const val MAX_DESTINATION_URI_CHARS = 2_048
 internal const val DESTINATION_PICKER_STALE_MILLIS = 60 * 60 * 1_000L
@@ -20,6 +20,16 @@ internal enum class SafDestinationPhase(val wireName: String) {
 
   companion object {
     fun fromWireName(value: String): SafDestinationPhase? = entries.find { it.wireName == value }
+  }
+}
+
+internal enum class SafDestinationSourceKind(val wireName: String) {
+  RISU_SAVE("risuSave"),
+  SCREENSHOT("screenshot");
+
+  companion object {
+    fun fromWireName(value: String): SafDestinationSourceKind? =
+      entries.find { it.wireName == value }
   }
 }
 
@@ -142,6 +152,7 @@ internal data class SafDestinationRecord(
   val code: String?,
   val warningCodes: List<String>,
   val updatedAtMillis: Long,
+  val sourceKind: SafDestinationSourceKind = SafDestinationSourceKind.RISU_SAVE,
 ) {
   fun isTerminal() = phase in setOf(
     SafDestinationPhase.SUCCEEDED,
@@ -157,7 +168,8 @@ internal class SafDestinationStateStore(
   fun load(): SafDestinationRecord? {
     if (!stateFile.isFile || stateFile.length() > MAX_DESTINATION_STATE_BYTES) return null
     val json = runCatching { stateFile.readText(Charsets.UTF_8) }.getOrNull() ?: return null
-    if (numberField(json, "version") != DESTINATION_STATE_VERSION.toLong()) return null
+    val version = numberField(json, "version") ?: return null
+    if (version !in 1L..DESTINATION_STATE_VERSION.toLong()) return null
     val requestId = stringField(json, "requestId") ?: return null
     val exportId = stringField(json, "exportId") ?: return null
     val phase = stringField(json, "phase")?.let(SafDestinationPhase::fromWireName) ?: return null
@@ -166,15 +178,21 @@ internal class SafDestinationStateStore(
     val code = nullableStringField(json, "code") ?: return null
     val warningCodes = warningCodesField(json) ?: return null
     val updatedAtMillis = numberField(json, "updatedAtMillis") ?: return null
+    val sourceKind = if (version == 1L) {
+      SafDestinationSourceKind.RISU_SAVE
+    } else {
+      stringField(json, "sourceKind")?.let(SafDestinationSourceKind::fromWireName) ?: return null
+    }
     val record = SafDestinationRecord(
-      requestId,
-      exportId,
-      phase,
-      destinationUri.value,
-      bytes.value,
-      code.value,
-      warningCodes,
-      updatedAtMillis,
+      requestId = requestId,
+      exportId = exportId,
+      phase = phase,
+      destinationUri = destinationUri.value,
+      bytes = bytes.value,
+      code = code.value,
+      warningCodes = warningCodes,
+      updatedAtMillis = updatedAtMillis,
+      sourceKind = sourceKind,
     )
     return record.takeIf(::isValidRecord)
   }
@@ -190,6 +208,7 @@ internal class SafDestinationStateStore(
       "\"version\":$DESTINATION_STATE_VERSION," +
       "\"requestId\":\"${record.requestId}\"," +
       "\"exportId\":\"${record.exportId}\"," +
+      "\"sourceKind\":\"${record.sourceKind.wireName}\"," +
       "\"phase\":\"${record.phase.wireName}\"," +
       "\"destinationUri\":${record.destinationUri?.let { "\"$it\"" } ?: "null"}," +
       "\"bytes\":${record.bytes ?: "null"}," +
