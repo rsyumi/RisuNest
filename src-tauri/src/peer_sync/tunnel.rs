@@ -259,6 +259,9 @@ impl TunnelMode {
         {
             return Err(TunnelError::InvalidNamedConfiguration);
         }
+        if has_explicit_authority_port(expected_public_base_url) {
+            return Err(TunnelError::InvalidNamedConfiguration);
+        }
         let expected_public_base_url = Url::parse(expected_public_base_url)
             .map_err(|_| TunnelError::InvalidNamedConfiguration)?;
         let is_public_domain = matches!(
@@ -692,6 +695,29 @@ impl<P: TunnelProcess, S: PeerSession> TunnelStartFailure<P, S> {
             Err(self)
         }
     }
+
+    pub(crate) fn retry_into_peer_session(mut self) -> Result<S, Self> {
+        for _ in 0..DROP_CLEANUP_ATTEMPTS {
+            if self.retry_process_stop(DEFAULT_STOP_TIMEOUT).is_ok() {
+                break;
+            }
+        }
+        self.into_peer_session()
+    }
+}
+
+fn has_explicit_authority_port(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    remainder
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .contains(':')
 }
 
 impl<P: TunnelProcess, S: PeerSession> Drop for TunnelStartFailure<P, S> {
@@ -737,6 +763,29 @@ where
         self.process = None;
         self.process_cleanup_error = None;
         Ok(())
+    }
+
+    pub(crate) fn retry_cleanup(&mut self) -> Result<(), TunnelError> {
+        let process_error = self.retry_process_stop(DEFAULT_STOP_TIMEOUT).err();
+        let peer_session_error = if let Some(peer_session) = self.peer_session.as_mut() {
+            match peer_session.revoke() {
+                Ok(()) => {
+                    self.peer_session = None;
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+        if process_error.is_none() && peer_session_error.is_none() {
+            Ok(())
+        } else {
+            Err(TunnelError::Stop {
+                process: process_error,
+                peer_session: peer_session_error,
+            })
+        }
     }
 }
 
@@ -937,6 +986,20 @@ pub(crate) fn start_named_desktop_tunnel(
     TunnelAdapter::system().start(mode, origin, peer_session)
 }
 
+pub(crate) fn start_quick_desktop_tunnel(
+    peer_session: super::LanCloneHost,
+) -> Result<RunningTunnel, TunnelStartFailure<SystemTunnelProcess, super::LanCloneHost>> {
+    let Some(origin) = peer_session.address() else {
+        return Err(TunnelStartFailure {
+            error: TunnelError::InvalidOrigin,
+            process: None,
+            peer_session: Some(peer_session),
+            process_cleanup_error: None,
+        });
+    };
+    TunnelAdapter::system().start(TunnelMode::Quick, origin, peer_session)
+}
+
 enum SupervisorCommand {
     Stop {
         timeout: Duration,
@@ -947,6 +1010,7 @@ enum SupervisorCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TerminalReason {
     ProcessExited(Option<i32>),
+    ProcessExitedCleanupPending(Option<i32>),
     ProcessMonitorFailed {
         error: String,
         process_cleanup_error: Option<String>,
@@ -971,6 +1035,7 @@ impl TerminalReason {
                 process_cleanup_error,
                 peer_session_cleanup_error,
             } => process_cleanup_error.is_none() && peer_session_cleanup_error.is_none(),
+            Self::ProcessExitedCleanupPending(_) => false,
             Self::ProcessExited(_) | Self::Stopped => true,
         }
     }
@@ -981,6 +1046,14 @@ pub(crate) struct RunningTunnel {
     command_tx: Option<Sender<SupervisorCommand>>,
     terminal_rx: Receiver<TerminalReason>,
     thread: Option<JoinHandle<()>>,
+    lifecycle: RunningTunnelLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunningTunnelLifecycle {
+    Running,
+    CleanupPending,
+    Stopped,
 }
 
 impl RunningTunnel {
@@ -998,6 +1071,7 @@ impl RunningTunnel {
             command_tx: Some(command_tx),
             terminal_rx,
             thread: Some(thread),
+            lifecycle: RunningTunnelLifecycle::Running,
         }
     }
 
@@ -1006,20 +1080,34 @@ impl RunningTunnel {
     }
 
     pub(crate) fn stop(&mut self, timeout: Duration) -> Result<(), TunnelError> {
+        if self.poll_lifecycle()? == RunningTunnelLifecycle::Stopped {
+            return Ok(());
+        }
         let (response, result) = mpsc::channel();
-        self.command_tx
+        let sent = self
+            .command_tx
             .as_ref()
             .ok_or(TunnelError::SupervisorUnavailable)?
-            .send(SupervisorCommand::Stop { timeout, response })
-            .map_err(|_| TunnelError::SupervisorUnavailable)?;
+            .send(SupervisorCommand::Stop { timeout, response });
+        if sent.is_err() {
+            return self.finish_natural_stop_or_unavailable();
+        }
         match result.recv_timeout(timeout.saturating_add(DEFAULT_STOP_TIMEOUT)) {
             Ok(Ok(())) => {
+                self.lifecycle = RunningTunnelLifecycle::Stopped;
                 self.join_supervisor();
                 Ok(())
             }
             Ok(Err(error)) => Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(TunnelError::SupervisorTimeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TunnelError::SupervisorUnavailable),
+            Err(mpsc::RecvTimeoutError::Disconnected) => self.finish_natural_stop_or_unavailable(),
+        }
+    }
+
+    fn finish_natural_stop_or_unavailable(&mut self) -> Result<(), TunnelError> {
+        match self.poll_lifecycle() {
+            Ok(RunningTunnelLifecycle::Stopped) => Ok(()),
+            _ => Err(TunnelError::SupervisorUnavailable),
         }
     }
 
@@ -1031,10 +1119,39 @@ impl RunningTunnel {
                 mpsc::RecvTimeoutError::Timeout => TunnelError::SupervisorTimeout,
                 mpsc::RecvTimeoutError::Disconnected => TunnelError::SupervisorUnavailable,
             })?;
-        if reason.cleanup_complete() {
+        self.record_terminal(&reason);
+        Ok(reason)
+    }
+
+    pub(crate) fn poll_lifecycle(&mut self) -> Result<RunningTunnelLifecycle, TunnelError> {
+        if self.lifecycle == RunningTunnelLifecycle::Stopped {
+            return Ok(RunningTunnelLifecycle::Stopped);
+        }
+        match self.terminal_rx.try_recv() {
+            Ok(reason) => self.record_terminal(&reason),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) if self.thread.is_none() => {
+                self.lifecycle = RunningTunnelLifecycle::Stopped;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(TunnelError::SupervisorUnavailable);
+            }
+        }
+        Ok(self.lifecycle)
+    }
+
+    fn record_terminal(&mut self, reason: &TerminalReason) {
+        if self.lifecycle == RunningTunnelLifecycle::Stopped {
+            return;
+        }
+        self.lifecycle = if reason.cleanup_complete() {
+            RunningTunnelLifecycle::Stopped
+        } else {
+            RunningTunnelLifecycle::CleanupPending
+        };
+        if self.lifecycle == RunningTunnelLifecycle::Stopped {
             self.join_supervisor();
         }
-        Ok(reason)
     }
 
     fn join_supervisor(&mut self) {
@@ -1174,6 +1291,8 @@ fn supervise<P, S>(
                         let _ = terminal_tx.send(TerminalReason::ProcessExited(status.code()));
                         return;
                     }
+                    let _ = terminal_tx
+                        .send(TerminalReason::ProcessExitedCleanupPending(status.code()));
                 }
                 Ok(None) => {}
                 Err(error) => {

@@ -18,7 +18,7 @@ use std::{
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     thread::{self, JoinHandle},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -32,6 +32,13 @@ use std::{
 
 #[cfg(desktop)]
 const CLAIM_TTL: Duration = Duration::from_secs(10 * 60);
+#[cfg(desktop)]
+pub(crate) const NAMED_TUNNEL_ORIGIN_PORT: u16 = 32145;
+#[cfg(desktop)]
+pub(crate) const NAMED_TUNNEL_ORIGIN_UNAVAILABLE: &str =
+    "Named Tunnel cannot bind loopback port 32145. Stop the app using that port, or use Quick Tunnel / Trusted LAN.";
+#[cfg(all(test, desktop))]
+pub(crate) static NAMED_TUNNEL_TEST_LOCK: Mutex<()> = Mutex::new(());
 const MAX_URL_BYTES: usize = 512;
 #[cfg(desktop)]
 const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -544,6 +551,45 @@ struct LanShared {
 }
 
 #[cfg(desktop)]
+#[derive(Clone)]
+pub(crate) struct LanCloneHostControl {
+    shared: Weak<LanShared>,
+}
+
+#[cfg(desktop)]
+impl LanCloneHostControl {
+    pub(crate) fn devices(&self) -> Vec<LanDevice> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        shared
+            .devices
+            .lock()
+            .unwrap()
+            .values()
+            .map(|device| device.info.clone())
+            .collect()
+    }
+
+    pub(crate) fn revoke(&self, device_id: &str) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut devices = shared.devices.lock().unwrap();
+        let Some(device) = devices.get_mut(device_id) else {
+            return false;
+        };
+        device.info.revoked = true;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_attached_for_test(&self) -> bool {
+        self.shared.strong_count() != 0
+    }
+}
+
+#[cfg(desktop)]
 pub struct LanCloneHost {
     shared: Arc<LanShared>,
     address: Option<SocketAddr>,
@@ -571,14 +617,18 @@ impl LanCloneHost {
     }
 
     pub fn start(&mut self) -> Result<LanPairing, PeerSyncError> {
-        self.start_on(Ipv4Addr::UNSPECIFIED)
+        self.start_on(Ipv4Addr::UNSPECIFIED, 0)
     }
 
     pub(crate) fn start_quick_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
-        self.start_on(Ipv4Addr::LOCALHOST)
+        self.start_on(Ipv4Addr::LOCALHOST, 0)
     }
 
-    fn start_on(&mut self, bind_address: Ipv4Addr) -> Result<LanPairing, PeerSyncError> {
+    pub(crate) fn start_named_tunnel_origin(&mut self) -> Result<LanPairing, PeerSyncError> {
+        self.start_on(Ipv4Addr::LOCALHOST, NAMED_TUNNEL_ORIGIN_PORT)
+    }
+
+    fn start_on(&mut self, bind_address: Ipv4Addr, port: u16) -> Result<LanPairing, PeerSyncError> {
         if self.thread.is_some() {
             return Err(PeerSyncError::Protocol(
                 "LAN clone host is already running".to_owned(),
@@ -590,7 +640,16 @@ impl LanCloneHost {
             expires_at: Instant::now() + CLAIM_TTL,
             consumed: false,
         });
-        let listener = TcpListener::bind((bind_address, 0)).map_err(transport)?;
+        let listener = TcpListener::bind((bind_address, port)).map_err(|error| {
+            if bind_address == Ipv4Addr::LOCALHOST
+                && port == NAMED_TUNNEL_ORIGIN_PORT
+                && error.kind() == io::ErrorKind::AddrInUse
+            {
+                PeerSyncError::Transport(NAMED_TUNNEL_ORIGIN_UNAVAILABLE.to_owned())
+            } else {
+                transport(error)
+            }
+        })?;
         listener.set_nonblocking(true).map_err(transport)?;
         let address = listener.local_addr().map_err(transport)?;
         if address.ip() != std::net::IpAddr::V4(bind_address) {
@@ -622,6 +681,12 @@ impl LanCloneHost {
 
     pub fn manifest(&self) -> &super::CloneManifest {
         self.shared.session.manifest()
+    }
+
+    pub(crate) fn control(&self) -> LanCloneHostControl {
+        LanCloneHostControl {
+            shared: Arc::downgrade(&self.shared),
+        }
     }
 
     pub(crate) fn issue_tunnel_probe(&self) -> Result<TunnelOriginProbe, PeerSyncError> {
@@ -658,22 +723,11 @@ impl LanCloneHost {
     }
 
     pub fn devices(&self) -> Vec<LanDevice> {
-        self.shared
-            .devices
-            .lock()
-            .unwrap()
-            .values()
-            .map(|device| device.info.clone())
-            .collect()
+        self.control().devices()
     }
 
     pub fn revoke(&self, device_id: &str) -> bool {
-        let mut devices = self.shared.devices.lock().unwrap();
-        let Some(device) = devices.get_mut(device_id) else {
-            return false;
-        };
-        device.info.revoked = true;
-        true
+        self.control().revoke(device_id)
     }
 
     pub fn stop(&mut self) -> Result<(), PeerSyncError> {
@@ -1264,31 +1318,105 @@ fn validate_object_hash(object: &str) -> Result<(), PeerSyncError> {
     }
 }
 
-fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
+pub(crate) fn validate_lan_endpoint(value: &str) -> Result<String, PeerSyncError> {
     let url = reqwest::Url::parse(value)
         .map_err(|_| PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))?;
-    let valid_ip = match url.host() {
+    let valid_lan_ip = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_private() || ip.is_link_local() || ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         _ => false,
     };
-    if url.scheme() != "http"
-        || !url.username().is_empty()
+    let valid_public_domain = matches!(
+        url.host(),
+        Some(url::Host::Domain(host))
+            if host.contains('.')
+                && !host.starts_with('.')
+                && !host.ends_with('.')
+                && !host.eq_ignore_ascii_case("localhost")
+    );
+    let invalid_shape = !url.username().is_empty()
         || url.password().is_some()
-        || url.port().is_none()
         || url.path() != "/"
         || url.query().is_some()
-        || url.fragment().is_some()
-        || !valid_ip
-    {
+        || url.fragment().is_some();
+    if invalid_shape {
         return Err(PeerSyncError::Protocol("invalid LAN endpoint".to_owned()));
     }
-    let host = match url.host() {
-        Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
-        _ => unreachable!(),
+    if url.scheme() == "http" && valid_lan_ip && has_explicit_authority_port(value) {
+        let port = url
+            .port_or_known_default()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))?;
+        let host = match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.to_string(),
+            Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+            _ => unreachable!(),
+        };
+        return Ok(format!("http://{host}:{port}"));
+    }
+    if url.scheme() == "https" && valid_public_domain && !has_explicit_authority_port(value) {
+        return Ok(format!("https://{}", url.host_str().unwrap()));
+    }
+    Err(PeerSyncError::Protocol("invalid LAN endpoint".to_owned()))
+}
+
+fn has_explicit_authority_port(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
     };
-    Ok(format!("http://{host}:{}", url.port().unwrap()))
+    let authority = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    if let Some(bracket) = authority.rfind(']') {
+        return authority[bracket + 1..].starts_with(':');
+    }
+    authority.contains(':')
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn clone_endpoint_accepts_private_http_and_bare_public_https() {
+        assert_eq!(
+            validate_lan_endpoint("http://192.168.1.8:32145").unwrap(),
+            "http://192.168.1.8:32145"
+        );
+        assert_eq!(
+            validate_lan_endpoint("http://127.0.0.1:32145/").unwrap(),
+            "http://127.0.0.1:32145"
+        );
+        assert_eq!(
+            validate_lan_endpoint("https://sync.example.com/").unwrap(),
+            "https://sync.example.com"
+        );
+        assert_eq!(
+            validate_lan_endpoint("https://quick-id.trycloudflare.com").unwrap(),
+            "https://quick-id.trycloudflare.com"
+        );
+    }
+
+    #[test]
+    fn clone_endpoint_rejects_non_bare_or_non_public_https() {
+        for endpoint in [
+            "http://sync.example.com:80",
+            "https://127.0.0.1",
+            "https://localhost",
+            "https://sync.example.com:443",
+            "https://sync.example.com:8443",
+            "https://user@sync.example.com",
+            "https://sync.example.com/path",
+            "https://sync.example.com/?query=value",
+            "https://sync.example.com/#fragment",
+        ] {
+            assert!(validate_lan_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+    }
 }
 
 fn is_lower_hex_256(value: &str) -> bool {

@@ -15,9 +15,7 @@ mod production;
 mod protocol;
 mod session;
 
-// P2 stays private until the P1 peer server provides a production route.
 #[cfg(desktop)]
-#[allow(dead_code)]
 mod tunnel;
 
 #[cfg(all(test, desktop))]

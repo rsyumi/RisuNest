@@ -5,6 +5,7 @@ import {
     type PeerCloneReplacementRuntime,
     type PeerCloneSourceStatus,
     type PeerCloneState,
+    type PeerCloneTunnelStatus,
 } from './peerClone'
 
 type PeerCloneFacade = ReturnType<typeof createPeerCloneFacade>
@@ -12,6 +13,7 @@ type PeerCloneFacade = ReturnType<typeof createPeerCloneFacade>
 export interface PeerCloneControllerSnapshot {
     capabilities?: PeerCloneNativeCapabilities
     sourceStatus: PeerCloneSourceStatus
+    tunnelStatus: PeerCloneTunnelStatus
     state: PeerCloneState
     sourcePairingUri: string
     error: string
@@ -29,6 +31,7 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
     const listeners = new Set<(snapshot: PeerCloneControllerSnapshot) => void>()
     let snapshot: PeerCloneControllerSnapshot = {
         sourceStatus: { phase: 'idle', devices: [] },
+        tunnelStatus: { phase: 'idle' },
         state: initialPeerCloneState,
         sourcePairingUri: '',
         error: '',
@@ -65,13 +68,24 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
         if (targetTimer) clearInterval(targetTimer)
         targetTimer = undefined
     }
+    const refreshSourceState = async (): Promise<PeerCloneSourceStatus> => {
+        const sourceStatus = await facade.sourceStatus()
+        const tunnelStatus = sourceStatus.tunnel
+            ? await facade.tunnelStatus()
+            : { phase: 'idle' as const }
+        snapshot = { ...snapshot, sourceStatus, tunnelStatus }
+        return sourceStatus
+    }
     const pollSource = async () => {
         if (sourcePolling) return
         sourcePolling = true
         try {
-            const sourceStatus = await facade.sourceStatus()
-            snapshot = { ...snapshot, sourceStatus, error: '' }
-            if (sourceStatus.phase !== 'running' && sourceStatus.phase !== 'stopping') {
+            const sourceStatus = await refreshSourceState()
+            snapshot = { ...snapshot, error: '' }
+            if (sourceStatus.phase !== 'running') {
+                snapshot = { ...snapshot, sourcePairingUri: '' }
+            }
+            if (sourceStatus.phase !== 'starting' && sourceStatus.phase !== 'running' && sourceStatus.phase !== 'stopping') {
                 stopSourcePolling()
             }
             publish()
@@ -136,9 +150,8 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
                 facade.capabilities().then((capabilities) => {
                     snapshot = { ...snapshot, capabilities }
                 }),
-                facade.sourceStatus().then((sourceStatus) => {
-                    snapshot = { ...snapshot, sourceStatus }
-                    if (sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
+                refreshSourceState().then((sourceStatus) => {
+                    if (sourceStatus.phase === 'starting' || sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
                         beginSourcePolling()
                     }
                 }),
@@ -171,13 +184,66 @@ export function createPeerCloneController(options: PeerCloneControllerOptions) {
             beginSourcePolling()
             return sourceStatus
         }),
+        startQuickTunnel: (sessionId: string) => run(async () => {
+            try {
+                const sourceStatus = await facade.startQuickTunnel(sessionId)
+                const tunnelStatus = await facade.tunnelStatus()
+                snapshot = {
+                    ...snapshot,
+                    sourceStatus,
+                    tunnelStatus,
+                    sourcePairingUri: sourceStatus.pairingUri ?? '',
+                }
+                beginSourcePolling()
+                return sourceStatus
+            } catch (cause) {
+                try {
+                    const sourceStatus = await refreshSourceState()
+                    snapshot = { ...snapshot, sourcePairingUri: '' }
+                    if (sourceStatus.phase === 'starting' || sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
+                        beginSourcePolling()
+                    }
+                } catch {
+                    snapshot = { ...snapshot, sourcePairingUri: '' }
+                }
+                throw cause
+            }
+        }),
+        startNamedTunnel: (sessionId: string, token: string, expectedPublicBaseUrl: string) => run(async () => {
+            try {
+                const sourceStatus = await facade.startNamedTunnel(sessionId, token, expectedPublicBaseUrl)
+                const tunnelStatus = await facade.tunnelStatus()
+                snapshot = {
+                    ...snapshot,
+                    sourceStatus,
+                    tunnelStatus,
+                    sourcePairingUri: sourceStatus.pairingUri ?? '',
+                }
+                beginSourcePolling()
+                return sourceStatus
+            } catch (cause) {
+                try {
+                    const sourceStatus = await refreshSourceState()
+                    snapshot = { ...snapshot, sourcePairingUri: '' }
+                    if (sourceStatus.phase === 'starting' || sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
+                        beginSourcePolling()
+                    }
+                } catch {
+                    snapshot = { ...snapshot, sourcePairingUri: '' }
+                }
+                throw cause
+            }
+        }),
         stop: (sessionId: string) => run(async () => {
             try {
-                await facade.stop(sessionId)
+                if (snapshot.sourceStatus.tunnel) {
+                    await facade.stopTunnel(sessionId)
+                } else {
+                    await facade.stop(sessionId)
+                }
             } finally {
-                const sourceStatus = await facade.sourceStatus()
-                snapshot = { ...snapshot, sourceStatus }
-                if (sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
+                const sourceStatus = await refreshSourceState()
+                if (sourceStatus.phase === 'starting' || sourceStatus.phase === 'running' || sourceStatus.phase === 'stopping') {
                     beginSourcePolling()
                 } else {
                     stopSourcePolling()

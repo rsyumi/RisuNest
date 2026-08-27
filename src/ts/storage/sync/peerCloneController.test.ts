@@ -173,6 +173,167 @@ describe('peer clone controller lifecycle', () => {
         expect(controller.snapshot().sourceStatus.phase).toBe('stopping')
         expect(controller.snapshot().sourcePairingUri).toBe('')
     })
+
+    it('owns Quick Tunnel polling and retries tunnel cleanup through the shared source lifecycle', async () => {
+        vi.useFakeTimers()
+        let phase: 'running' | 'stopping' | 'stopped' = 'running'
+        let stopAttempt = 0
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return capabilities() as T
+            if (command === 'peer_clone_tunnel_start') {
+                return {
+                    phase: 'running',
+                    sessionId: 'source-session',
+                    pairingUri,
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_status') {
+                return {
+                    phase,
+                    sessionId: 'source-session',
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_tunnel_status') {
+                return {
+                    phase,
+                    sessionId: 'source-session',
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                } as T
+            }
+            if (command === 'peer_clone_tunnel_stop') {
+                if (stopAttempt++ === 0) {
+                    phase = 'stopping'
+                    throw new Error('tunnel cleanup failed')
+                }
+                phase = 'stopped'
+            }
+            return undefined as T
+        })
+        const controller = createPeerCloneController({
+            facade: createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: runtime(vi.fn(async (_revision: number) => undefined), vi.fn()),
+            }),
+            sourcePollMilliseconds: 10,
+        })
+
+        await controller.startQuickTunnel('source-session')
+        expect(controller.snapshot().sourcePairingUri).toBe(pairingUri)
+        expect(controller.snapshot().tunnelStatus).toMatchObject({
+            phase: 'running',
+            tunnel: { kind: 'quick' },
+        })
+
+        await expect(controller.stop('source-session')).rejects.toThrow('tunnel cleanup failed')
+        expect(controller.snapshot().sourceStatus.phase).toBe('stopping')
+        expect(controller.snapshot().sourcePairingUri).toBe('')
+        await vi.advanceTimersByTimeAsync(10)
+        await expect(controller.stop('source-session')).resolves.toBeUndefined()
+
+        expect(controller.snapshot().sourceStatus.phase).toBe('stopped')
+        expect(invoke.mock.calls.filter(([command]) => command === 'peer_clone_tunnel_stop')).toHaveLength(2)
+        expect(invoke.mock.calls.some(([command]) => command === 'peer_clone_stop')).toBe(false)
+    })
+
+    it('clears the one-shot pairing link when a tunnel exits naturally', async () => {
+        vi.useFakeTimers()
+        let phase: 'running' | 'stopped' = 'running'
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return capabilities() as T
+            if (command === 'peer_clone_tunnel_start') {
+                return {
+                    phase: 'running',
+                    sessionId: 'source-session',
+                    pairingUri,
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_status') {
+                return {
+                    phase,
+                    sessionId: 'source-session',
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_tunnel_status') {
+                return {
+                    phase,
+                    sessionId: 'source-session',
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                } as T
+            }
+            return undefined as T
+        })
+        const controller = createPeerCloneController({
+            facade: createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: runtime(vi.fn(async (_revision: number) => undefined), vi.fn()),
+            }),
+            sourcePollMilliseconds: 10,
+        })
+
+        await controller.startQuickTunnel('source-session')
+        expect(controller.snapshot().sourcePairingUri).toBe(pairingUri)
+
+        phase = 'stopped'
+        await vi.advanceTimersByTimeAsync(10)
+
+        expect(controller.snapshot().sourceStatus.phase).toBe('stopped')
+        expect(controller.snapshot().sourcePairingUri).toBe('')
+    })
+
+    it('never retains a Named Tunnel token or reflected native failure in controller state', async () => {
+        const token = 'named-tunnel-token-that-is-at-least-32-bytes'
+        const reflected = `${token} https://sync.example.com/v1/sessions/id/tunnel-check/probe-secret`
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return capabilities() as T
+            if (command === 'peer_clone_tunnel_start') throw new Error(reflected)
+            if (command === 'peer_clone_status') {
+                return {
+                    phase: 'stopping',
+                    sessionId: 'source-session',
+                    tunnel: { kind: 'named', experimental: false, oneShot: false },
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_tunnel_status') {
+                return {
+                    phase: 'stopping',
+                    sessionId: 'source-session',
+                    tunnel: { kind: 'named', experimental: false, oneShot: false },
+                } as T
+            }
+            return undefined as T
+        })
+        const controller = createPeerCloneController({
+            facade: createPeerCloneFacade({
+                platform: 'desktop',
+                invoke: invoke as unknown as PeerCloneInvoke,
+                runtime: runtime(vi.fn(async (_revision: number) => undefined), vi.fn()),
+            }),
+        })
+
+        await expect(
+            controller.startNamedTunnel('source-session', token, 'https://sync.example.com'),
+        ).rejects.toThrow('Named tunnel failed to start')
+
+        expect(controller.snapshot().error).toBe('Named tunnel failed to start')
+        expect(controller.snapshot().sourceStatus).toMatchObject({
+            phase: 'stopping',
+            tunnel: { kind: 'named' },
+        })
+        expect(controller.snapshot().tunnelStatus.phase).toBe('stopping')
+        expect(JSON.stringify(controller.snapshot())).not.toContain(token)
+        expect(JSON.stringify(controller.snapshot())).not.toContain('tunnel-check')
+    })
 })
 
 function capabilities() {

@@ -543,6 +543,78 @@ fn named_tunnel_public_seam_refuses_to_launch_before_loopback_source_start() {
 }
 
 #[test]
+fn quick_tunnel_public_seam_refuses_to_launch_before_loopback_source_start() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+
+    let failure = match super::tunnel::start_quick_desktop_tunnel(host) {
+        Ok(_) => panic!("quick tunnel started before its source host"),
+        Err(failure) => failure,
+    };
+    assert_eq!(
+        failure.error_message(),
+        "tunnel origin must be 127.0.0.1 with a nonzero port"
+    );
+    let host = match failure.into_peer_session() {
+        Ok(host) => host,
+        Err(_) => panic!("source ownership was not recoverable"),
+    };
+    assert_eq!(host.address(), None);
+}
+
+#[test]
+fn named_tunnel_origin_uses_the_documented_fixed_loopback_port() {
+    let _port = super::lan::NAMED_TUNNEL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let mut host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let occupied = TcpListener::bind((
+        std::net::Ipv4Addr::LOCALHOST,
+        super::lan::NAMED_TUNNEL_ORIGIN_PORT,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        host.start_named_tunnel_origin().unwrap_err().to_string(),
+        format!(
+            "Transport(\"{}\")",
+            super::lan::NAMED_TUNNEL_ORIGIN_UNAVAILABLE
+        )
+    );
+    drop(occupied);
+
+    host.start_named_tunnel_origin().unwrap();
+    assert_eq!(
+        host.address().unwrap(),
+        std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            super::lan::NAMED_TUNNEL_ORIGIN_PORT,
+        ))
+    );
+    host.stop().unwrap();
+}
+
+#[test]
+fn host_control_does_not_retain_the_prepared_clone_after_owner_drop() {
+    let source_root = tempfile::tempdir().unwrap();
+    let session_root = tempfile::tempdir().unwrap();
+    let source = fixture_source(source_root.path(), &[64]);
+    let host = LanCloneHost::prepare(prepare(&source, session_root.path()));
+    let control = host.control();
+
+    assert!(control.is_attached_for_test());
+    drop(host);
+
+    assert!(!control.is_attached_for_test());
+    assert!(control.devices().is_empty());
+}
+
+#[test]
 fn lan_claim_bearer_progress_and_revoke_are_enforced_over_http() {
     let source_root = tempfile::tempdir().unwrap();
     let session_root = tempfile::tempdir().unwrap();

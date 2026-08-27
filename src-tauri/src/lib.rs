@@ -525,9 +525,15 @@ pub fn run() {
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_start,
             #[cfg(desktop)]
+            peer_sync::commands::peer_clone_tunnel_start,
+            #[cfg(desktop)]
             peer_sync::commands::peer_clone_status,
             #[cfg(desktop)]
+            peer_sync::commands::peer_clone_tunnel_status,
+            #[cfg(desktop)]
             peer_sync::commands::peer_clone_stop,
+            #[cfg(desktop)]
+            peer_sync::commands::peer_clone_tunnel_stop,
             #[cfg(desktop)]
             peer_sync::commands::peer_clone_revoke,
             #[cfg(desktop)]

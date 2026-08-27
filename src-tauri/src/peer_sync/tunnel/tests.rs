@@ -288,6 +288,10 @@ fn named_tunnel_accepts_only_bounded_tokens_and_bare_public_https_urls() {
             "eyJ-remotely-managed-tunnel-token",
             "https://sync.example.com/path",
         ),
+        (
+            "eyJ-remotely-managed-tunnel-token",
+            "https://sync.example.com:443",
+        ),
         ("eyJ-remotely-managed-tunnel-token", "https://127.0.0.1"),
     ] {
         assert!(matches!(
@@ -782,6 +786,30 @@ fn natural_process_exit_revokes_peer_session() {
 }
 
 #[test]
+fn nonblocking_lifecycle_poll_reaps_a_natural_exit() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let mut process = fake_process(&state, Ok(ready()));
+    process.polls = VecDeque::from([Ok(Some(7))]);
+    let mut running = expect_running(adapter(&state, process).start(
+        TunnelMode::Quick,
+        loopback_origin(),
+        peer(&state, 57),
+    ));
+
+    let mut lifecycle = RunningTunnelLifecycle::Running;
+    for _ in 0..100 {
+        lifecycle = running.poll_lifecycle().unwrap();
+        if lifecycle == RunningTunnelLifecycle::Stopped {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(lifecycle, RunningTunnelLifecycle::Stopped);
+    assert_eq!(state.lock().unwrap().session_revokes, 1);
+}
+
+#[test]
 fn process_stop_failure_keeps_supervisor_state_for_retry() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let mut process = fake_process(&state, Ok(ready()));
@@ -845,6 +873,87 @@ fn natural_exit_revoke_failure_can_be_retried_without_restarting_process() {
     let state = state.lock().unwrap();
     assert!(state.stop_timeouts.is_empty());
     assert_eq!(state.session_revokes, 2);
+}
+
+#[test]
+fn natural_exit_revoke_failure_reports_cleanup_pending_until_stop_retry() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let mut process = fake_process(&state, Ok(ready()));
+    process.polls = VecDeque::from([Ok(Some(9))]);
+    let mut peer = peer(&state, 59);
+    peer.revoke_results = VecDeque::from([Err("revoke failed".into()), Ok(())]);
+    let mut running =
+        expect_running(adapter(&state, process).start(TunnelMode::Quick, loopback_origin(), peer));
+
+    let mut lifecycle = RunningTunnelLifecycle::Running;
+    for _ in 0..100 {
+        lifecycle = running.poll_lifecycle().unwrap();
+        if lifecycle == RunningTunnelLifecycle::CleanupPending {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(lifecycle, RunningTunnelLifecycle::CleanupPending);
+
+    running.stop(Duration::from_millis(20)).unwrap();
+    assert_eq!(
+        running.poll_lifecycle().unwrap(),
+        RunningTunnelLifecycle::Stopped
+    );
+}
+
+#[test]
+fn successful_stop_does_not_regress_to_an_older_cleanup_pending_terminal() {
+    let (command_tx, command_rx) = mpsc::channel();
+    let (terminal_tx, terminal_rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let SupervisorCommand::Stop { response, .. } = command_rx.recv().unwrap();
+        terminal_tx
+            .send(TerminalReason::ProcessExitedCleanupPending(Some(9)))
+            .unwrap();
+        response.send(Ok(())).unwrap();
+    });
+    let mut running = RunningTunnel {
+        ready: ready(),
+        command_tx: Some(command_tx),
+        terminal_rx,
+        thread: Some(thread),
+        lifecycle: RunningTunnelLifecycle::Running,
+    };
+
+    running.stop(Duration::from_millis(20)).unwrap();
+
+    assert_eq!(
+        running.poll_lifecycle().unwrap(),
+        RunningTunnelLifecycle::Stopped
+    );
+}
+
+#[test]
+fn stop_succeeds_when_natural_exit_wins_the_command_response_race() {
+    let (command_tx, command_rx) = mpsc::channel();
+    let (terminal_tx, terminal_rx) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        let SupervisorCommand::Stop { response, .. } = command_rx.recv().unwrap();
+        terminal_tx
+            .send(TerminalReason::ProcessExited(Some(0)))
+            .unwrap();
+        drop(response);
+    });
+    let mut running = RunningTunnel {
+        ready: ready(),
+        command_tx: Some(command_tx),
+        terminal_rx,
+        thread: Some(thread),
+        lifecycle: RunningTunnelLifecycle::Running,
+    };
+
+    running.stop(Duration::from_millis(20)).unwrap();
+
+    assert_eq!(
+        running.poll_lifecycle().unwrap(),
+        RunningTunnelLifecycle::Stopped
+    );
 }
 
 #[test]
@@ -934,6 +1043,35 @@ fn poll_error_stops_process_and_revokes_peer_before_reporting_terminal_reason() 
         [DEFAULT_STOP_TIMEOUT, Duration::from_millis(20)]
     );
     assert_eq!(state.session_revokes, 1);
+}
+
+#[test]
+fn nonblocking_lifecycle_reports_cleanup_pending_until_stop_retry() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let mut process = fake_process(&state, Ok(ready()));
+    process.polls = VecDeque::from([Err("wait failed".into())]);
+    process.stop_results = VecDeque::from([Err("monitor cleanup timed out".into()), Ok(())]);
+    let mut running = expect_running(adapter(&state, process).start(
+        TunnelMode::Quick,
+        loopback_origin(),
+        peer(&state, 58),
+    ));
+
+    let mut lifecycle = RunningTunnelLifecycle::Running;
+    for _ in 0..100 {
+        lifecycle = running.poll_lifecycle().unwrap();
+        if lifecycle == RunningTunnelLifecycle::CleanupPending {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(lifecycle, RunningTunnelLifecycle::CleanupPending);
+
+    running.stop(Duration::from_millis(20)).unwrap();
+    assert_eq!(
+        running.poll_lifecycle().unwrap(),
+        RunningTunnelLifecycle::Stopped
+    );
 }
 
 #[cfg(windows)]

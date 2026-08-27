@@ -42,7 +42,8 @@ export interface PeerCloneSourceStatus {
     sessionId?: string
     manifestId?: string
     pairingUri?: string
-    phase: 'idle' | 'prepared' | 'running' | 'stopping' | 'stopped'
+    phase: 'idle' | 'prepared' | 'starting' | 'running' | 'stopping' | 'stopped'
+    tunnel?: PeerCloneTunnelMetadata
     devices: readonly {
         deviceId: string
         verifiedBytes: number
@@ -50,6 +51,18 @@ export interface PeerCloneSourceStatus {
         lastSeenAt: number
         revoked?: boolean
     }[]
+}
+
+export interface PeerCloneTunnelMetadata {
+    kind: 'quick' | 'named'
+    experimental: boolean
+    oneShot: boolean
+}
+
+export interface PeerCloneTunnelStatus {
+    sessionId?: string
+    phase: 'idle' | 'starting' | 'running' | 'stopping' | 'stopped'
+    tunnel?: PeerCloneTunnelMetadata
 }
 
 export interface PeerCloneTargetStatus {
@@ -159,6 +172,7 @@ const claimPattern = /^[0-9a-f]{64}$/
 const maximumPairingUriLength = 8192
 const maximumEndpointLength = 2048
 const maximumClaimLength = 512
+const namedTunnelOriginUnavailableMessage = 'Named Tunnel cannot bind loopback port 32145. Stop the app using that port, or use Quick Tunnel / Trusted LAN.'
 
 function invalidPairingUri(): never {
     throw new Error('Invalid peer clone pairing URI')
@@ -177,6 +191,11 @@ function hasExplicitValidPort(value: string): boolean {
     return Number.isInteger(port) && port >= 1 && port <= 65535
 }
 
+function hasExplicitAuthorityPort(value: string): boolean {
+    const authority = value.slice(value.indexOf('://') + 3).split(/[/?#]/, 1)[0]
+    return authority.slice(authority.lastIndexOf('@') + 1).includes(':')
+}
+
 function isAllowedLanHost(hostname: string): boolean {
     const ipv4 = parseIpv4(hostname)
     if (!ipv4) return false
@@ -186,8 +205,14 @@ function isAllowedLanHost(hostname: string): boolean {
         || (ipv4[0] === 169 && ipv4[1] === 254)
 }
 
+function isAllowedPublicHttpsHost(hostname: string): boolean {
+    if (parseIpv4(hostname) || /^\d+(?:\.\d+){3}$/.test(hostname)) return false
+    return /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(hostname)
+        && hostname.toLowerCase() !== 'localhost'
+}
+
 function endpointFor(sessionId: string, value: string): string {
-    if (value.length === 0 || value.length > maximumEndpointLength || !hasExplicitValidPort(value)) {
+    if (value.length === 0 || value.length > maximumEndpointLength) {
         return invalidPairingUri()
     }
     let endpoint: URL
@@ -196,19 +221,20 @@ function endpointFor(sessionId: string, value: string): string {
     } catch {
         return invalidPairingUri()
     }
-    const ipv4 = parseIpv4(endpoint.hostname)
-    const ipv4Shaped = /^\d+(?:\.\d+){3}$/.test(endpoint.hostname)
-    if (
-        endpoint.protocol !== 'http:'
-        || endpoint.username
+    if (endpoint.username
         || endpoint.password
         || endpoint.hash
         || endpoint.search
-        || (ipv4Shaped && !ipv4)
-        || !isAllowedLanHost(endpoint.hostname)
+        || endpoint.pathname !== '/'
     ) return invalidPairingUri()
 
-    if (endpoint.pathname !== '/') return invalidPairingUri()
+    const lan = endpoint.protocol === 'http:'
+        && hasExplicitValidPort(value)
+        && isAllowedLanHost(endpoint.hostname)
+    const tunnel = endpoint.protocol === 'https:'
+        && !hasExplicitAuthorityPort(value)
+        && isAllowedPublicHttpsHost(endpoint.hostname)
+    if (!lan && !tunnel) return invalidPairingUri()
     return endpoint.toString()
 }
 
@@ -425,13 +451,56 @@ export function createPeerCloneFacade(options: PeerCloneFacadeOptions) {
             state = reducePeerCloneState(state, { type: 'source-started' })
             return result
         },
+        async startQuickTunnel(sessionId: string): Promise<PeerCloneSourceStatus> {
+            supported()
+            await requireSourceReady()
+            const result = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_tunnel_start', {
+                sessionId,
+                tunnel: { kind: 'quick' },
+            })
+            state = reducePeerCloneState(state, { type: 'source-started' })
+            return result
+        },
+        async startNamedTunnel(
+            sessionId: string,
+            token: string,
+            expectedPublicBaseUrl: string,
+        ): Promise<PeerCloneSourceStatus> {
+            supported()
+            await requireSourceReady()
+            try {
+                const result = await nativeInvoke<PeerCloneSourceStatus>('peer_clone_tunnel_start', {
+                    sessionId,
+                    tunnel: { kind: 'named', token, expectedPublicBaseUrl },
+                })
+                state = reducePeerCloneState(state, { type: 'source-started' })
+                return result
+            } catch (cause) {
+                const message = cause instanceof Error
+                    ? cause.message
+                    : typeof cause === 'string' ? cause : ''
+                if (message === namedTunnelOriginUnavailableMessage) {
+                    throw new Error(namedTunnelOriginUnavailableMessage)
+                }
+                throw new Error('Named tunnel failed to start')
+            }
+        },
         async sourceStatus(): Promise<PeerCloneSourceStatus> {
             supported()
             return nativeInvoke('peer_clone_status')
         },
+        async tunnelStatus(): Promise<PeerCloneTunnelStatus> {
+            supported()
+            return nativeInvoke('peer_clone_tunnel_status')
+        },
         async stop(sessionId: string): Promise<void> {
             supported()
             await nativeInvoke('peer_clone_stop', { sessionId })
+            state = reducePeerCloneState(state, { type: 'source-stopped' })
+        },
+        async stopTunnel(sessionId: string): Promise<void> {
+            supported()
+            await nativeInvoke('peer_clone_tunnel_stop', { sessionId })
             state = reducePeerCloneState(state, { type: 'source-stopped' })
         },
         async revoke(sessionId: string, deviceId: string): Promise<void> {

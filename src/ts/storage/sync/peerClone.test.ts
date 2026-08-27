@@ -11,6 +11,8 @@ import type { PeerCloneInvoke, PeerCloneReplacementRuntime } from './peerClone'
 
 const claim = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 const pairingUri = `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`
+const quickTunnelPairingUri = `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fexample-id.trycloudflare.com&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`
+const namedTunnelPairingUri = `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`
 
 describe('parsePeerCloneUri', () => {
     it('parses the strict v1 LAN pairing URI and preserves the fragment claim separately', () => {
@@ -21,6 +23,18 @@ describe('parsePeerCloneUri', () => {
             claim,
         })
         expect(pairingUriForQr(pairingUri)).toBe(pairingUri)
+    })
+
+    it.each([
+        [quickTunnelPairingUri, 'https://example-id.trycloudflare.com/'],
+        [namedTunnelPairingUri, 'https://sync.example.com/'],
+    ])('accepts a bare public HTTPS tunnel endpoint', (uri, endpoint) => {
+        expect(parsePeerCloneUri(uri)).toEqual({
+            endpoint,
+            sessionId: '123e4567-e89b-12d3-a456-426614174000',
+            manifestId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            claim,
+        })
     })
 
     it.each([
@@ -41,6 +55,12 @@ describe('parsePeerCloneUri', () => {
         `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F8.8.8.8%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
         `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2Fexample.com%3A43123&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
         `risuailocal://peer-clone/v1?endpoint=http%3A%2F%2F192.168.1.4%3A0&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
+        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%3A8443&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
+        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%3A443&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
+        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fsync.example.com%2Fclone&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
+        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Fuser%40sync.example.com&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
+        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2Flocalhost&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
+        `risuailocal://peer-clone/v1?endpoint=https%3A%2F%2F127.0.0.1&session=123e4567-e89b-12d3-a456-426614174000&manifest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#claim=${claim}`,
     ])('rejects malformed or unsafe pairing URI %s', (uri) => {
         expect(() => parsePeerCloneUri(uri)).toThrow()
     })
@@ -233,6 +253,120 @@ describe('PeerClone facade', () => {
 
         expect(status.pairingUri).toBeUndefined()
         expect(JSON.stringify(status)).not.toContain(claim)
+    })
+
+    it('starts Quick Tunnel through the one-shot tunnel command and exposes no persistent endpoint metadata', async () => {
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
+            if (command === 'peer_clone_tunnel_start') {
+                return {
+                    phase: 'running',
+                    sessionId: 'source-session',
+                    manifestId: 'a'.repeat(64),
+                    pairingUri: quickTunnelPairingUri,
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                    devices: [],
+                } as T
+            }
+            if (command === 'peer_clone_tunnel_status') {
+                return {
+                    phase: 'running',
+                    sessionId: 'source-session',
+                    tunnel: { kind: 'quick', experimental: true, oneShot: true },
+                } as T
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(),
+        })
+
+        const started = await facade.startQuickTunnel('source-session')
+        const status = await facade.tunnelStatus()
+
+        expect(invoke).toHaveBeenCalledWith('peer_clone_tunnel_start', {
+            sessionId: 'source-session',
+            tunnel: { kind: 'quick' },
+        })
+        expect(started).toMatchObject({
+            pairingUri: quickTunnelPairingUri,
+            tunnel: { kind: 'quick', experimental: true, oneShot: true },
+        })
+        expect(status).toEqual({
+            phase: 'running',
+            sessionId: 'source-session',
+            tunnel: { kind: 'quick', experimental: true, oneShot: true },
+        })
+        expect(JSON.stringify(status)).not.toContain('trycloudflare.com')
+    })
+
+    it('submits a Named Tunnel token once without retaining or reflecting it in state and errors', async () => {
+        const token = 'named-tunnel-token-that-is-at-least-32-bytes'
+        const probeUrl = 'https://sync.example.com/v1/sessions/id/tunnel-check/probe-secret'
+        let fail = false
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
+            if (command === 'peer_clone_tunnel_start') {
+                if (fail) throw new Error(`${token} ${probeUrl}`)
+                return {
+                    phase: 'running',
+                    sessionId: 'source-session',
+                    manifestId: 'a'.repeat(64),
+                    pairingUri: namedTunnelPairingUri,
+                    tunnel: { kind: 'named', experimental: false, oneShot: false },
+                    devices: [],
+                } as T
+            }
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(),
+        })
+
+        await facade.startNamedTunnel('source-session', token, 'https://sync.example.com')
+        expect(invoke).toHaveBeenCalledWith('peer_clone_tunnel_start', {
+            sessionId: 'source-session',
+            tunnel: {
+                kind: 'named',
+                token,
+                expectedPublicBaseUrl: 'https://sync.example.com',
+            },
+        })
+        expect(JSON.stringify(facade.getState())).not.toContain(token)
+        expect(JSON.stringify(facade.getState())).not.toContain(probeUrl)
+
+        fail = true
+        const failed = facade.startNamedTunnel('source-session', token, 'https://sync.example.com')
+        await expect(failed).rejects.toThrow('Named tunnel failed to start')
+        await expect(failed).rejects.not.toThrow(token)
+        await expect(failed).rejects.not.toThrow(probeUrl)
+        expect(JSON.stringify(facade.getState())).not.toContain(token)
+    })
+
+    it('preserves only the native fixed-port recovery guidance for Named Tunnel', async () => {
+        const message = 'Named Tunnel cannot bind loopback port 32145. Stop the app using that port, or use Quick Tunnel / Trusted LAN.'
+        const invoke = vi.fn<PeerCloneInvoke>(async <T>(command: string): Promise<T> => {
+            if (command === 'peer_clone_capabilities') return productionCapabilities() as T
+            if (command === 'peer_clone_tunnel_start') throw new Error(message)
+            return undefined as T
+        })
+        const facade = createPeerCloneFacade({
+            platform: 'desktop',
+            invoke: invoke as unknown as PeerCloneInvoke,
+            runtime: replacementRuntime(),
+        })
+
+        await expect(
+            facade.startNamedTunnel(
+                'source-session',
+                'named-tunnel-token-that-is-at-least-32-bytes',
+                'https://sync.example.com',
+            ),
+        ).rejects.toThrow(message)
     })
 
     it('finalizes only after native download reaches the activation barrier', async () => {
