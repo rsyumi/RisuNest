@@ -53,7 +53,7 @@ export function createPeerDeltaController(options: {
             update({
                 sourceStatus,
                 sourcePairingUri: sourceStatus.phase === 'running'
-                    ? snapshot.sourcePairingUri
+                    ? sourceStatus.pairingUri ?? snapshot.sourcePairingUri
                     : '',
                 error: '',
             })
@@ -97,7 +97,14 @@ export function createPeerDeltaController(options: {
                 options.facade.capabilities(),
                 options.facade.status(),
             ]).then(([capabilities, sourceStatus]) => {
-                update({ capabilities, sourceStatus, error: '' })
+                update({
+                    capabilities,
+                    sourceStatus,
+                    sourcePairingUri: sourceStatus.phase === 'running'
+                        ? sourceStatus.pairingUri ?? ''
+                        : '',
+                    error: '',
+                })
                 if (sourceStatus.phase === 'running') beginSourcePolling()
             }).catch((cause) => {
                 update({ error: cause instanceof Error ? cause.message : String(cause) })

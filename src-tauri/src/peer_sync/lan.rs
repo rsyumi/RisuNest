@@ -2186,6 +2186,10 @@ mod timeout_tests {
         let mut received = Vec::new();
         reader.read_to_end(&mut received).unwrap();
         assert_eq!(received, record_bytes);
+        let devices = host.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].verified_bytes, received.len() as u64);
+        assert_eq!(devices[0].current_object, None);
 
         assert!(host.revoke(&client.device_id));
         assert!(matches!(
@@ -2193,6 +2197,18 @@ mod timeout_tests {
             Err(PeerSyncError::Transport(_))
         ));
         host.stop().unwrap();
+    }
+
+    #[test]
+    fn logical_object_stream_is_not_bound_by_the_short_control_timeout() {
+        assert_eq!(
+            logical_request_timeout(LogicalRequestKind::Control, Duration::from_secs(5)),
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(
+            logical_request_timeout(LogicalRequestKind::Object, Duration::from_secs(5)),
+            None,
+        );
     }
 }
 

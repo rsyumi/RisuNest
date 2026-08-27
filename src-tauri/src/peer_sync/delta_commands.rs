@@ -698,6 +698,67 @@ fn as_store_error(error: PeerSyncError) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        peer_sync::{
+            logical_delta::{
+                build_logical_manifest, BuiltLogicalManifest, LogicalManifest,
+                LogicalManifestBuilderInput, LogicalRecordEnvelope, LogicalRecordLocator,
+                ProjectedLogicalRecord,
+            },
+            LogicalDeltaObjectSource,
+        },
+        persistent_store::WorkingSetCommit,
+    };
+    use serde_json::json;
+    use std::io::{Cursor, Read};
+
+    struct FixtureSource {
+        objects: BTreeMap<String, Vec<u8>>,
+        reads: usize,
+    }
+
+    impl LogicalDeltaObjectSource for FixtureSource {
+        fn open_object(
+            &mut self,
+            object: &LogicalDeltaObject,
+        ) -> Result<Box<dyn Read>, PeerSyncError> {
+            self.reads += 1;
+            let bytes = self.objects.get(&object.hash).ok_or_else(|| {
+                PeerSyncError::Transport(format!("fixture object {} is absent", object.hash))
+            })?;
+            Ok(Box::new(Cursor::new(bytes.clone())))
+        }
+    }
+
+    fn empty_source() -> FixtureSource {
+        FixtureSource {
+            objects: BTreeMap::new(),
+            reads: 0,
+        }
+    }
+
+    fn remote_root_manifest(
+        base: &LogicalManifest,
+        generation: &str,
+        value: serde_json::Value,
+    ) -> BuiltLogicalManifest {
+        build_logical_manifest(LogicalManifestBuilderInput {
+            library_id: base.library_id.clone(),
+            generation: generation.to_owned(),
+            generation_sequence: "1".to_owned(),
+            parent_generation: Some(base.generation.clone()),
+            source_revision: 1,
+            records: vec![ProjectedLogicalRecord::live(
+                LogicalRecordLocator::Root,
+                LogicalRecordEnvelope::Root {
+                    value,
+                    owner_heads: vec![],
+                },
+                vec![],
+            )],
+        })
+        .unwrap()
+    }
 
     #[test]
     fn source_device_identity_is_stable_and_outside_the_persistent_store() {
@@ -736,5 +797,220 @@ mod tests {
 
         assert!(uri.starts_with("risuailocal://peer-delta/v1?"));
         assert!(uri.ends_with(&format!("#claim={}", pairing.claim)));
+    }
+
+    #[test]
+    fn typed_merge_conflict_projects_to_the_product_conflict_result() {
+        assert_eq!(
+            classify_plan_error(PeerSyncError::LogicalMergeConflict {
+                record: "plugin:shared".to_owned(),
+            })
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "localAndRemoteChanged",
+            }
+        );
+    }
+
+    #[test]
+    fn coordinator_bootstraps_only_an_exact_peer_and_preserves_stale_or_divergent_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let mut source = empty_source();
+
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                "00000000-0000-4000-8000-000000000001",
+                0,
+                &local.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::NoChanges {
+                revision: 0,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+            }
+        );
+        assert_eq!(source.reads, 0);
+        assert_eq!(store.revision().unwrap(), 0);
+
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                "00000000-0000-4000-8000-000000000001",
+                0,
+                &local.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::NoChanges {
+                revision: 0,
+                transferred_objects: 0,
+                transferred_bytes: 0,
+            }
+        );
+        assert_eq!(source.reads, 0);
+        assert_eq!(store.revision().unwrap(), 0);
+
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                "00000000-0000-4000-8000-000000000001",
+                1,
+                &local.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "staleRevision",
+            }
+        );
+        assert_eq!(store.revision().unwrap(), 0);
+        assert_eq!(source.reads, 0);
+
+        let other = remote_root_manifest(&local.manifest, "remote-other", json!({"side":"remote"}));
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                "00000000-0000-4000-8000-000000000002",
+                0,
+                &other.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::FullCloneRequired {
+                reason: "noExactCommonBase",
+            }
+        );
+        assert_eq!(store.revision().unwrap(), 0);
+        assert_eq!(source.reads, 0);
+    }
+
+    #[test]
+    fn coordinator_fetches_only_changed_objects_and_activates_the_exact_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let local = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer = "00000000-0000-4000-8000-000000000003";
+        let mut source = empty_source();
+        pull_logical_delta(
+            &mut store,
+            &cas,
+            directory.path(),
+            peer,
+            0,
+            &local.manifest_bytes,
+            &mut source,
+        )
+        .unwrap();
+        let remote =
+            remote_root_manifest(&local.manifest, "remote-updated", json!({"side":"remote"}));
+        source.objects = remote
+            .record_objects
+            .iter()
+            .map(|record| (record.object.hash.clone(), record.object.bytes.clone()))
+            .collect();
+
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                peer,
+                0,
+                &remote.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Updated {
+                revision: 1,
+                transferred_objects: 1,
+                transferred_bytes: remote.record_objects[0].object.size,
+            }
+        );
+        assert_eq!(source.reads, 1);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.read_root(None).unwrap().value,
+            json!({"side":"remote"})
+        );
+    }
+
+    #[test]
+    fn coordinator_returns_a_structured_same_record_conflict_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let base = store
+            .seal_or_initialize_active_logical_generation(&cas)
+            .unwrap();
+        let peer = "00000000-0000-4000-8000-000000000004";
+        let mut source = empty_source();
+        pull_logical_delta(
+            &mut store,
+            &cas,
+            directory.path(),
+            peer,
+            0,
+            &base.manifest_bytes,
+            &mut source,
+        )
+        .unwrap();
+        store
+            .commit(&WorkingSetCommit {
+                expected_revision: 0,
+                root: Some(json!({"side":"local"})),
+                replace_presets: None,
+                character: None,
+                character_details: None,
+                replace_character: None,
+                add_character: None,
+                conversations: None,
+                delete_character_id: None,
+                plugin_storage: None,
+                asset_owner_heads: None,
+            })
+            .unwrap();
+        let remote =
+            remote_root_manifest(&base.manifest, "remote-conflict", json!({"side":"remote"}));
+
+        assert_eq!(
+            pull_logical_delta(
+                &mut store,
+                &cas,
+                directory.path(),
+                peer,
+                1,
+                &remote.manifest_bytes,
+                &mut source,
+            )
+            .unwrap(),
+            PeerDeltaPullResult::Conflict {
+                reason: "localAndRemoteChanged",
+            }
+        );
+        assert_eq!(source.reads, 0);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(
+            store.read_root(None).unwrap().value,
+            json!({"side":"local"})
+        );
     }
 }

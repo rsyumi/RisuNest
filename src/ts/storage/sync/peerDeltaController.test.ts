@@ -92,4 +92,25 @@ describe('peer delta controller', () => {
         expect(controller.snapshot().pullPhase).toBe('fullCloneRequired')
         expect(controller.snapshot().error).toBe('')
     })
+
+    test('recovers the native-owned source pairing link during initialization', async () => {
+        const sourceStatus = {
+            phase: 'running',
+            sessionId: 'session',
+            manifestId: 'a'.repeat(64),
+            pairingUri: 'risuailocal://peer-delta/v1?recovered=1',
+            devices: [],
+        } as const
+        const controller = createPeerDeltaController({
+            facade: facadeFixture({ status: vi.fn(async () => sourceStatus) }),
+            sourcePollMilliseconds: 60_000,
+        })
+
+        await controller.initialize()
+
+        expect(controller.snapshot()).toMatchObject({
+            sourceStatus,
+            sourcePairingUri: sourceStatus.pairingUri,
+        })
+    })
 })

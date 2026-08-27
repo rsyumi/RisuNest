@@ -69,6 +69,11 @@ export type PeerDeltaPullResult =
           reason: 'localAndRemoteChanged' | 'staleRevision'
       }
 
+type CommittedPeerDeltaPullResult = Extract<
+    PeerDeltaPullResult,
+    { kind: 'noChanges' | 'updated' }
+>
+
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const sha256Pattern = /^[0-9a-f]{64}$/
 const maximumPairingUriLength = 8192
@@ -113,12 +118,24 @@ function unsupported(platform: Exclude<PeerClonePlatform, 'desktop'>): never {
     throw new Error(`Peer delta is unsupported on ${platform}`)
 }
 
+function samePairing(left: PeerDeltaPairing, right: PeerDeltaPairing): boolean {
+    return left.endpoint === right.endpoint
+        && left.sessionId === right.sessionId
+        && left.manifestId === right.manifestId
+        && left.claim === right.claim
+}
+
 export function createPeerDeltaFacade(options: {
     platform: PeerClonePlatform
     invoke?: PeerDeltaInvoke
     runtime?: PeerDeltaMutationRuntime
 }) {
     const nativeInvoke = options.invoke ?? invoke
+    let pendingRefresh: {
+        pairing: PeerDeltaPairing
+        result: CommittedPeerDeltaPullResult
+        fence: Awaited<ReturnType<PeerDeltaMutationRuntime['acquirePersistentMutationFence']>>
+    } | undefined
     const requireDesktop = (): void => {
         if (options.platform !== 'desktop') unsupported(options.platform)
     }
@@ -152,6 +169,16 @@ export function createPeerDeltaFacade(options: {
             const runtime = options.runtime
             if (!runtime) throw new Error('Peer delta mutation runtime is unavailable')
             const pairing = parsePeerDeltaUri(pairingUri)
+            if (pendingRefresh) {
+                const pending = pendingRefresh
+                if (!samePairing(pending.pairing, pairing)) {
+                    throw new Error('Another peer delta pull is awaiting renderer refresh')
+                }
+                await pending.fence.refreshCommittedWorkingSet(pending.result.revision)
+                pendingRefresh = undefined
+                pending.fence.release()
+                return pending.result
+            }
             await runtime.flushPendingData('peer-delta-pull')
             const token = await runtime.capturePersistentMutationToken('peer-delta-pull')
             const fence = await runtime.acquirePersistentMutationFence(token)
@@ -161,11 +188,13 @@ export function createPeerDeltaFacade(options: {
                     expectedRevision: token.revision,
                 })
                 if (result.kind === 'updated' || result.kind === 'noChanges') {
+                    pendingRefresh = { pairing, result, fence }
                     await fence.refreshCommittedWorkingSet(result.revision)
+                    pendingRefresh = undefined
                 }
                 return result
             } finally {
-                fence.release()
+                if (pendingRefresh?.fence !== fence) fence.release()
             }
         },
     }

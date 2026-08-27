@@ -128,4 +128,38 @@ describe('peer logical delta product facade', () => {
         await expect(facade.pull(pairing)).rejects.toThrow('stale revision')
         expect(release).toHaveBeenCalledOnce()
     })
+
+    test('retains a committed revision fence and retries only renderer refresh', async () => {
+        const release = vi.fn()
+        const refresh = vi.fn()
+            .mockRejectedValueOnce(new Error('renderer refresh failed'))
+            .mockResolvedValueOnce(undefined)
+        const runtime: PeerDeltaMutationRuntime = {
+            flushPendingData: vi.fn(async () => undefined),
+            capturePersistentMutationToken: vi.fn(async () => ({ revision: 8, mutationGeneration: 2 })),
+            acquirePersistentMutationFence: vi.fn(async () => ({
+                refreshCommittedWorkingSet: refresh,
+                release,
+            })),
+        }
+        const result = {
+            kind: 'updated',
+            revision: 9,
+            transferredObjects: 1,
+            transferredBytes: 32,
+        } as const
+        const invoke = vi.fn(async <T>(): Promise<T> => result as T) as PeerDeltaInvoke
+        const facade = createPeerDeltaFacade({ platform: 'desktop', invoke, runtime })
+
+        await expect(facade.pull(pairing)).rejects.toThrow('renderer refresh failed')
+        expect(release).not.toHaveBeenCalled()
+
+        await expect(facade.pull(pairing)).resolves.toEqual(result)
+        expect(invoke).toHaveBeenCalledOnce()
+        expect(runtime.flushPendingData).toHaveBeenCalledOnce()
+        expect(runtime.capturePersistentMutationToken).toHaveBeenCalledOnce()
+        expect(runtime.acquirePersistentMutationFence).toHaveBeenCalledOnce()
+        expect(refresh).toHaveBeenCalledTimes(2)
+        expect(release).toHaveBeenCalledOnce()
+    })
 })
