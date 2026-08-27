@@ -354,9 +354,11 @@ export const mutatePersistentPresets = (
 ): Promise<void> => getPersistentDataRuntime().mutatePersistentPresets(reason, mutate)
 export const appendPersistentRootModule = (
     input: import('./saveCoordinator').PersistentRootModuleAppend,
+    signal?: AbortSignal,
 ): Promise<void> => getPersistentDataRuntime().appendPersistentRootModule(
     'native-risum-import',
     input,
+    signal,
 )
 export const mutatePersistentCharacterDetail = (
     characterId: string,

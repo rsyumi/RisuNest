@@ -419,7 +419,7 @@ describe('SaveCoordinator', () => {
         })).toThrow(PersistentRootModuleAppendRejectedError)
     })
 
-    it('retains ambiguous roots when commit invocation rejects', async () => {
+    it('classifies a revision conflict from commit as a rejected module append', async () => {
         const database = makeDatabase()
         database.modules = []
         const commitError = new RevisionConflictError(7, 8)
@@ -445,8 +445,92 @@ describe('SaveCoordinator', () => {
             module: { id: 'new-id', name: 'Imported', description: '' },
             assetAliases: [],
             ownerHead: { present: false, manifestHash: null, entryCount: 0 },
+        })).rejects.toMatchObject({
+            name: 'PersistentRootModuleAppendRejectedError',
+            message: commitError.message,
+        })
+
+        expect(coordinator.revision).toBe(7)
+        expect(database.modules).toEqual([])
+    })
+
+    it('retains the exact ambiguous error when commit invocation rejects generically', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const commitError = new Error('commit response lost')
+        const store = {
+            commit: vi.fn(async () => { throw commitError }),
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias: vi.fn(async () => null),
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7, database)
+
+        await expect(coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [],
+            ownerHead: { present: false, manifestHash: null, entryCount: 0 },
         })).rejects.toBe(commitError)
 
+        expect(coordinator.revision).toBe(7)
+        expect(database.modules).toEqual([])
+    })
+
+    it('preserves cancellation during an alias read and never starts commit', async () => {
+        const database = makeDatabase()
+        database.modules = []
+        const aliasRead = deferred<null>()
+        const readAssetAlias = vi.fn(() => aliasRead.promise)
+        const commit = vi.fn()
+        const store = {
+            commit,
+            acquireRevision: vi.fn(async () => ({
+                revision: 7,
+                readRoot: vi.fn(async () => ({ revision: 7, value: captureRoot(database) })),
+                readAssetOwnerHead: vi.fn(async () => null),
+                readAssetAlias,
+                release: vi.fn(async () => undefined),
+            })),
+        } as unknown as PersistentDataStore
+        const coordinator = new SaveCoordinator({
+            store,
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+        })
+        coordinator.initialize(7, database)
+        const controller = new AbortController()
+        const reason = new DOMException('cancelled during alias read', 'AbortError')
+
+        const append = coordinator.appendPersistentRootModule('native-risum-import', {
+            module: { id: 'new-id', name: 'Imported', description: '' },
+            assetAliases: [{
+                kind: 'asset',
+                key: `assets/${'a'.repeat(64)}.bin`,
+                objectHash: 'a'.repeat(64),
+                size: 4,
+                mime: '',
+                name: '',
+                ext: 'bin',
+            }],
+            ownerHead: { present: true, manifestHash: 'b'.repeat(64), entryCount: 1 },
+        }, controller.signal)
+        await vi.waitFor(() => expect(readAssetAlias).toHaveBeenCalledOnce())
+        controller.abort(reason)
+        aliasRead.resolve(null)
+
+        await expect(append).rejects.toBe(reason)
+        expect(commit).not.toHaveBeenCalled()
         expect(coordinator.revision).toBe(7)
         expect(database.modules).toEqual([])
     })

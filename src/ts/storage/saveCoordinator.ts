@@ -1205,6 +1205,7 @@ export class SaveCoordinator {
     appendPersistentRootModule(
         reason: string,
         input: PersistentRootModuleAppend,
+        signal?: AbortSignal,
     ): Promise<void> {
         try {
             this.assertInitialized()
@@ -1216,19 +1217,24 @@ export class SaveCoordinator {
         }
         let commitStarted = false
         return this.enqueue(async () => {
+            signal?.throwIfAborted()
             await this.flushIterations(reason, true)
+            signal?.throwIfAborted()
             const revision = this.revision
             const operationStart = this.capture()
             const lease = await this.dependencies.store.acquireRevision(revision)
             const snapshot = await withPersistentRevisionLease(lease, async (reader) => {
+                signal?.throwIfAborted()
                 this.assertReadRevision(revision, reader.revision)
                 const rootValue = await reader.readRoot()
+                signal?.throwIfAborted()
                 this.assertReadRevision(revision, rootValue.revision)
                 const root = canonicalClone(rootValue.value)
                 const ownerHeads: AssetOwnerHead[] = []
                 const aliases: Extract<AssetAlias, { kind: 'asset' }>[] = []
                 const uniqueAliases = new Map<string, Extract<AssetAlias, { kind: 'asset' }>>()
                 for (const alias of input.assetAliases) {
+                    signal?.throwIfAborted()
                     const previous = uniqueAliases.get(alias.key)
                     if (
                         previous
@@ -1241,7 +1247,9 @@ export class SaveCoordinator {
                     if (!previous) uniqueAliases.set(alias.key, canonicalClone(alias))
                 }
                 for (const alias of uniqueAliases.values()) {
+                    signal?.throwIfAborted()
                     const existing = await reader.readAssetAlias({ kind: 'asset', key: alias.key })
+                    signal?.throwIfAborted()
                     if (!existing) {
                         aliases.push(alias)
                         continue
@@ -1258,27 +1266,32 @@ export class SaveCoordinator {
                 }
                 const modules = Array.isArray(root.modules) ? root.modules : []
                 for (let index = 0; index < modules.length; index++) {
+                    signal?.throwIfAborted()
                     const value = await reader.readAssetOwnerHead({
                         kind: 'root-module-assets',
                         index,
                     })
+                    signal?.throwIfAborted()
                     if (!value) continue
                     this.assertReadRevision(revision, value.revision)
                     ownerHeads.push(canonicalClone(value.value))
                 }
                 const personas = Array.isArray(root.personas) ? root.personas : []
                 for (let index = 0; index < personas.length; index++) {
+                    signal?.throwIfAborted()
                     if (!personas[index]?.embeddedModule) continue
                     const value = await reader.readAssetOwnerHead({
                         kind: 'persona-embedded-module-assets',
                         index,
                     })
+                    signal?.throwIfAborted()
                     if (!value) continue
                     this.assertReadRevision(revision, value.revision)
                     ownerHeads.push(canonicalClone(value.value))
                 }
                 return { root, ownerHeads, aliases }
             })
+            signal?.throwIfAborted()
             if (this.capture().rootCanonical !== operationStart.rootCanonical) {
                 throw new PersistentRootModuleAppendRejectedError(
                     'Persistent root changed during module import',
@@ -1294,6 +1307,7 @@ export class SaveCoordinator {
                 ...canonicalClone(input.ownerHead),
             } as AssetOwnerHead
             const liveBeforeCommit = this.capture()
+            signal?.throwIfAborted()
             commitStarted = true
             const committed = await this.dependencies.store.commit({
                 expectedRevision: revision,
@@ -1319,7 +1333,11 @@ export class SaveCoordinator {
                 this.armOfficialPublishRetry(this.officialPublishDelayMs())
             }
         }).catch((error) => {
+            if (error instanceof RevisionConflictError) {
+                throw persistentRootModuleAppendRejected(error)
+            }
             if (commitStarted) throw error
+            if (signal?.aborted && error === signal.reason) throw error
             throw persistentRootModuleAppendRejected(error)
         })
     }

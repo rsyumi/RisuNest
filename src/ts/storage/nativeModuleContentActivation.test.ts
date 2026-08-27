@@ -116,7 +116,7 @@ describe('native RISUM module activation', () => {
                 manifestHash: hash('c'),
                 entryCount: 2,
             },
-        })
+        }, undefined)
         expect(result).toEqual({ moduleId: 'new-module-id' })
     })
 
@@ -204,6 +204,35 @@ describe('native RISUM module activation', () => {
 
         expect(lifecycle.abortPreparedContent).toHaveBeenCalledOnce()
         expect(append).not.toHaveBeenCalled()
+    })
+
+    it('threads cancellation into the persistent append and releases sealed roots', async () => {
+        const controller = new AbortController()
+        const reason = new DOMException('cancelled during alias read', 'AbortError')
+        const lifecycle: PreparedNativeContentActivationLifecycle = {
+            prepareOwnerManifestAndSeal: vi.fn(),
+            sealPreparedContent: vi.fn(async () => undefined),
+            abortPreparedContent: vi.fn(async () => undefined),
+        }
+        const append = vi.fn(async (_input: PreparedRootModuleAppend, signal?: AbortSignal) => {
+            expect(signal).toBe(controller.signal)
+            controller.abort(reason)
+            signal?.throwIfAborted()
+        })
+
+        await expect(activatePreparedNativeModuleContent(
+            risumContent(undefined),
+            lifecycle,
+            {
+                confirmLowLevelAccess: vi.fn(async () => true),
+                createId: () => 'new-id',
+                append,
+            },
+            controller.signal,
+        )).rejects.toBe(reason)
+
+        expect(lifecycle.sealPreparedContent).toHaveBeenCalledOnce()
+        expect(lifecycle.abortPreparedContent).toHaveBeenCalledOnce()
     })
 
     it('aborts the sealed native session when the atomic revision commit loses its CAS', async () => {

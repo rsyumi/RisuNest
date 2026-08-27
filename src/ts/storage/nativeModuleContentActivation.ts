@@ -22,7 +22,7 @@ export interface PreparedRootModuleAppend {
 export interface NativeModuleContentActivationDependencies {
     confirmLowLevelAccess(): Promise<boolean>
     createId(): string
-    append(input: PreparedRootModuleAppend): Promise<void>
+    append(input: PreparedRootModuleAppend, signal?: AbortSignal): Promise<void>
 }
 
 const productionDependencies: NativeModuleContentActivationDependencies = {
@@ -83,17 +83,20 @@ export async function activatePreparedNativeModuleContent(
     if (!lifecycle.sealPreparedContent) {
         throw new TypeError('Prepared RISUM content cannot seal its native roots')
     }
-    if (signal?.aborted) throw new DOMException('Native file job was cancelled', 'AbortError')
+    signal?.throwIfAborted()
     await lifecycle.sealPreparedContent()
     if (signal?.aborted) {
         await lifecycle.abortPreparedContent?.()
-        throw new DOMException('Native file job was cancelled', 'AbortError')
+        signal.throwIfAborted()
     }
     try {
-        await dependencies.append({ module, assetAliases, ownerHead: content.ownerHead })
+        await dependencies.append({ module, assetAliases, ownerHead: content.ownerHead }, signal)
     }
     catch (error) {
-        if (error instanceof PersistentRootModuleAppendRejectedError) {
+        if (
+            error instanceof PersistentRootModuleAppendRejectedError
+            || (signal?.aborted && error === signal.reason)
+        ) {
             await lifecycle.abortPreparedContent?.()
         }
         throw error

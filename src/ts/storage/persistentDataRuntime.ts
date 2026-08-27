@@ -287,6 +287,7 @@ export interface PersistentDataRuntime {
     appendPersistentRootModule(
         reason: string,
         input: import('./saveCoordinator').PersistentRootModuleAppend,
+        signal?: AbortSignal,
     ): Promise<void>
     mutatePersistentCharacterDetail(
         characterId: string,
@@ -614,8 +615,8 @@ export function createPersistentDataRuntime(
             coordinator.mutatePersistentPluginStorage(reason, mutations),
         mutatePersistentPresets: (reason, mutate) =>
             coordinator.mutatePersistentPresets(reason, mutate),
-        appendPersistentRootModule: (reason, input) =>
-            coordinator.appendPersistentRootModule(reason, input),
+        appendPersistentRootModule: (reason, input, signal) =>
+            coordinator.appendPersistentRootModule(reason, input, signal),
         mutatePersistentCharacterDetail: (characterId, reason, mutate) =>
             coordinator.mutatePersistentCharacterDetail(characterId, reason, mutate),
         deletePersistentCharacterWithGroupReferences: (characterId, reason) =>
