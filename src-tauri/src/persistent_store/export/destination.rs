@@ -92,6 +92,28 @@ pub(crate) fn write_screenshot_destination_controlled(
     )
 }
 
+pub(crate) fn write_lossless_destination_controlled(
+    source_root: &Path,
+    source: &Path,
+    destination_root: &Path,
+    destination: &Path,
+    is_cancelled: impl Fn() -> bool,
+    on_progress: impl FnMut(DestinationProgress),
+    before_replace: impl FnOnce() -> Result<(), DestinationWriteError>,
+) -> Result<DestinationWriteResult, DestinationWriteError> {
+    write_desktop_destination_with_commit_kind(
+        &RealFileSystem,
+        SourceKind::LosslessBackup,
+        source_root,
+        source,
+        destination_root,
+        destination,
+        is_cancelled,
+        on_progress,
+        before_replace,
+    )
+}
+
 trait DestinationFileSystem {
     type Source: Read;
     type Destination: Write;
@@ -197,6 +219,7 @@ fn write_desktop_destination_with_commit<F: DestinationFileSystem>(
 enum SourceKind {
     RisuSave,
     ScreenshotOutput,
+    LosslessBackup,
 }
 
 fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
@@ -213,6 +236,7 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
     let source = match source_kind {
         SourceKind::RisuSave => validated_source(source_root, source)?,
         SourceKind::ScreenshotOutput => validated_screenshot_source(source_root, source)?,
+        SourceKind::LosslessBackup => validated_lossless_source(source_root, source)?,
     };
     let destination = validated_destination(destination_root, destination)?;
     if source.parent() == destination.parent() {
@@ -337,6 +361,25 @@ fn write_desktop_destination_with_commit_kind<F: DestinationFileSystem>(
         bytes: copied_bytes,
         sha256: hex::encode(hasher.finalize()),
     })
+}
+
+fn validated_lossless_source(
+    source_root: &Path,
+    source: &Path,
+) -> Result<PathBuf, DestinationWriteError> {
+    let root = fs::canonicalize(source_root).map_err(|_| DestinationWriteError::InvalidSource)?;
+    let source = fs::canonicalize(source).map_err(|_| DestinationWriteError::InvalidSource)?;
+    let name = source.file_name().and_then(|name| name.to_str());
+    if source.parent() != Some(root.as_path())
+        || !matches!(
+            name,
+            Some("archive.risulossless.part" | "recovery.risulossless.part")
+        )
+        || !source.is_file()
+    {
+        return Err(DestinationWriteError::InvalidSource);
+    }
+    Ok(source)
 }
 
 fn validated_screenshot_source(

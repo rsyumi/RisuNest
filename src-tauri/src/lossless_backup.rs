@@ -1,5 +1,6 @@
 use crate::{
     asset_repository::{
+        job_pins::{CasObjectRole, DurableCasJob},
         owner_manifest_codec::{decode_owner_manifest, OwnerManifestEntry},
         PayloadCas, PreparedPayload,
     },
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -367,6 +368,28 @@ fn cold_payload_authority_extension(
         ))
     })?;
     Ok(Some(authority))
+}
+
+fn require_lossless_v2_authorities(
+    manifest: &LosslessManifest,
+) -> Result<(AssetRepositoryAuthorityState, ColdPayloadAuthorityState), LosslessError> {
+    let asset = asset_repository_authority_extension(manifest)?.ok_or_else(|| {
+        invalid_manifest("production lossless package requires asset repository authority")
+    })?;
+    if !matches!(asset, AssetRepositoryAuthorityState::V2 { .. }) {
+        return Err(invalid_manifest(
+            "production lossless package requires v2 asset repository authority",
+        ));
+    }
+    let cold = cold_payload_authority_extension(manifest)?.ok_or_else(|| {
+        invalid_manifest("production lossless package requires cold payload authority")
+    })?;
+    if !matches!(cold, ColdPayloadAuthorityState::V2 { .. }) {
+        return Err(invalid_manifest(
+            "production lossless package requires v2 cold payload authority",
+        ));
+    }
+    Ok((asset, cold))
 }
 
 fn parse_owner_head_entry(entry: &StagedLosslessEntry) -> Result<AssetOwnerHead, LosslessError> {
@@ -758,14 +781,60 @@ pub(crate) fn read_lossless_package_v1(
     cas: &PayloadCas,
     cancellation: &dyn CancellationProbe,
 ) -> Result<LosslessReadReport, LosslessError> {
+    read_lossless_package_v1_inner(reader, job_staging_root, cas, None, None, cancellation)
+}
+
+fn read_lossless_package_v1_durable(
+    reader: &mut impl Read,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    durable_job: &mut DurableCasJob,
+    job_owner_manifest_hashes: Option<&HashSet<String>>,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LosslessReadReport, LosslessError> {
+    read_lossless_package_v1_inner(
+        reader,
+        job_staging_root,
+        cas,
+        Some(durable_job),
+        job_owner_manifest_hashes,
+        cancellation,
+    )
+}
+
+fn read_lossless_package_v1_inner(
+    reader: &mut impl Read,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    mut durable_job: Option<&mut DurableCasJob>,
+    job_owner_manifest_hashes: Option<&HashSet<String>>,
+    cancellation: &dyn CancellationProbe,
+) -> Result<LosslessReadReport, LosslessError> {
     check_cancelled(cancellation)?;
     let mut source = CountingReader::new(reader);
     let manifest = read_manifest(&mut source, cancellation)?;
+    let durable_roles = match durable_job.as_ref() {
+        Some(_) => {
+            require_lossless_v2_authorities(&manifest)?;
+            Some(durable_object_roles(&manifest, job_owner_manifest_hashes)?)
+        }
+        None => None,
+    };
     let staging_directory = prepare_staging_directory(job_staging_root)?;
     let mut entries = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
         let staged = if entry.kind == PayloadKind::Database {
             stage_database_entry(&mut source, entry, &staging_directory, cancellation)?
+        } else if let Some(job) = durable_job.as_deref_mut() {
+            match durable_roles
+                .as_ref()
+                .and_then(|roles| roles.get(&entry.sha256))
+            {
+                Some(role) => {
+                    stage_payload_entry_durable(&mut source, entry, cas, job, *role, cancellation)?
+                }
+                None => stage_payload_entry(&mut source, entry, cas, cancellation)?,
+            }
         } else {
             stage_payload_entry(&mut source, entry, cas, cancellation)?
         };
@@ -785,6 +854,54 @@ pub(crate) fn read_lossless_package_v1(
         archive_bytes: source.bytes_read,
         archive_sha256: source.sha256(),
     })
+}
+
+fn durable_object_roles(
+    manifest: &LosslessManifest,
+    job_owner_manifest_hashes: Option<&HashSet<String>>,
+) -> Result<HashMap<String, CasObjectRole>, LosslessError> {
+    let mut roles = HashMap::new();
+    for entry in &manifest.entries {
+        if entry.kind == PayloadKind::Database {
+            continue;
+        }
+        let mut role = match entry.kind {
+            PayloadKind::OwnerManifest => {
+                if !parse_owner_head_manifest_entry(entry)?.present {
+                    continue;
+                }
+                CasObjectRole::OwnerManifest
+            }
+            _ => CasObjectRole::DirectObject,
+        };
+        if job_owner_manifest_hashes.is_some_and(|hashes| hashes.contains(&entry.sha256)) {
+            role = CasObjectRole::OwnerManifest;
+        }
+        roles
+            .entry(entry.sha256.clone())
+            .and_modify(|current| {
+                if role == CasObjectRole::OwnerManifest {
+                    *current = role;
+                }
+            })
+            .or_insert(role);
+    }
+    Ok(roles)
+}
+
+fn present_owner_manifest_hashes(
+    manifest: &LosslessManifest,
+) -> Result<HashSet<String>, LosslessError> {
+    manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == PayloadKind::OwnerManifest)
+        .filter_map(|entry| match parse_owner_head_manifest_entry(entry) {
+            Ok(head) if head.present => Some(Ok(entry.sha256.clone())),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
 }
 
 pub(crate) fn verify_lossless_package_v1(
@@ -814,6 +931,15 @@ pub(crate) fn verify_lossless_package_v1(
     })
 }
 
+pub(crate) fn verify_lossless_package_v1_for_production(
+    reader: &mut impl Read,
+    cancellation: &dyn CancellationProbe,
+) -> Result<VerifiedLosslessBackup, LosslessError> {
+    let verified = verify_lossless_package_v1(reader, cancellation)?;
+    require_lossless_v2_authorities(&verified.manifest)?;
+    Ok(verified)
+}
+
 pub(crate) fn restore_lossless_package_v1(
     reader: &mut impl Read,
     job_staging_root: &Path,
@@ -830,6 +956,10 @@ pub(crate) fn restore_lossless_package_v1(
         store,
         expected_revision,
         pre_replacement_backup,
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         cancellation,
@@ -856,6 +986,10 @@ pub(crate) fn restore_lossless_package_v1_with_app_kv(
         pre_replacement_backup,
         Some((app_kv_key, app_kv_value)),
         None,
+        None,
+        None,
+        None,
+        None,
         cancellation,
     )
 }
@@ -879,6 +1013,43 @@ pub(crate) fn restore_lossless_package_v1_controlled(
         pre_replacement_backup,
         None,
         Some(before_activation),
+        None,
+        None,
+        None,
+        None,
+        cancellation,
+    )
+}
+
+pub(crate) fn restore_verified_lossless_package_v1_durable_controlled(
+    reader: &mut impl Read,
+    verified: &VerifiedLosslessBackup,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    store: &mut PersistentStore,
+    expected_revision: i64,
+    pre_replacement_backup: &Path,
+    app_kv: Option<(&str, &Value)>,
+    durable_job: &mut DurableCasJob,
+    sealed_at_ms: i64,
+    before_activation: &dyn Fn() -> Result<(), String>,
+    before_commit_attempt: &dyn Fn(),
+    cancellation: &dyn CancellationProbe,
+) -> Result<LosslessRestoreReport, LosslessError> {
+    require_lossless_v2_authorities(&verified.manifest)?;
+    restore_lossless_package_v1_inner(
+        reader,
+        job_staging_root,
+        cas,
+        store,
+        expected_revision,
+        pre_replacement_backup,
+        app_kv,
+        Some(before_activation),
+        Some(before_commit_attempt),
+        Some(verified),
+        Some(durable_job),
+        Some(sealed_at_ms),
         cancellation,
     )
 }
@@ -892,15 +1063,107 @@ fn restore_lossless_package_v1_inner(
     pre_replacement_backup: &Path,
     app_kv: Option<(&str, &Value)>,
     before_activation: Option<&dyn Fn() -> Result<(), String>>,
+    before_commit_attempt: Option<&dyn Fn()>,
+    expected_verified: Option<&VerifiedLosslessBackup>,
+    mut durable_job: Option<&mut DurableCasJob>,
+    sealed_at_ms: Option<i64>,
     cancellation: &dyn CancellationProbe,
 ) -> Result<LosslessRestoreReport, LosslessError> {
-    let incoming = read_lossless_package_v1(reader, job_staging_root, cas, cancellation)?;
-    let asset_repository_authority = asset_repository_authority_extension(&incoming.manifest)?;
-    let cold_payload_authority = cold_payload_authority_extension(&incoming.manifest)?;
-    let lease = store
-        .acquire_revision(expected_revision)
-        .map_err(store_error)?
-        .lease;
+    let mut early_lease = None;
+    let job_owner_manifest_hashes = if durable_job.is_some() {
+        let lease = store
+            .acquire_revision(expected_revision)
+            .map_err(store_error)?
+            .lease;
+        let owner_heads = match store
+            .list_asset_owner_heads(Some(&lease))
+            .map_err(store_error)
+        {
+            Ok(owner_heads) => owner_heads,
+            Err(error) => return Err(release_lease_after_error(store, &lease, error)),
+        };
+        if owner_heads.revision != expected_revision {
+            return Err(release_lease_after_error(
+                store,
+                &lease,
+                LosslessError::new(
+                    LosslessErrorCode::RevisionConflict,
+                    "pre-replacement owner inventory is not pinned to the expected revision",
+                ),
+            ));
+        }
+        let mut hashes = match present_owner_manifest_hashes(
+            &expected_verified
+                .expect("durable restore has a preverified manifest")
+                .manifest,
+        ) {
+            Ok(hashes) => hashes,
+            Err(error) => return Err(release_lease_after_error(store, &lease, error)),
+        };
+        hashes.extend(
+            owner_heads
+                .value
+                .iter()
+                .filter(|head| head.present)
+                .filter_map(|head| head.manifest_hash.clone()),
+        );
+        early_lease = Some(lease);
+        Some(hashes)
+    } else {
+        None
+    };
+    let incoming_result = (|| {
+        let incoming = match durable_job.as_deref_mut() {
+            Some(job) => read_lossless_package_v1_durable(
+                reader,
+                job_staging_root,
+                cas,
+                job,
+                job_owner_manifest_hashes.as_ref(),
+                cancellation,
+            )?,
+            None => read_lossless_package_v1(reader, job_staging_root, cas, cancellation)?,
+        };
+        if let Some(expected) = expected_verified {
+            if incoming.manifest != expected.manifest
+                || incoming.archive_bytes != expected.archive_bytes
+                || incoming.archive_sha256 != expected.archive_sha256
+            {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::HashMismatch,
+                    "lossless package changed after preverification",
+                ));
+            }
+        }
+        let authorities = if durable_job.is_some() {
+            let (asset, cold) = require_lossless_v2_authorities(&incoming.manifest)?;
+            (Some(asset), Some(cold))
+        } else {
+            (
+                asset_repository_authority_extension(&incoming.manifest)?,
+                cold_payload_authority_extension(&incoming.manifest)?,
+            )
+        };
+        Ok((incoming, authorities))
+    })();
+    let (incoming, (asset_repository_authority, cold_payload_authority)) = match incoming_result {
+        Ok(incoming) => incoming,
+        Err(error) => {
+            return match early_lease.as_deref() {
+                Some(lease) => Err(release_lease_after_error(store, lease, error)),
+                None => Err(error),
+            }
+        }
+    };
+    let lease = match early_lease {
+        Some(lease) => lease,
+        None => {
+            store
+                .acquire_revision(expected_revision)
+                .map_err(store_error)?
+                .lease
+        }
+    };
     let database = incoming
         .entries
         .iter()
@@ -953,6 +1216,7 @@ fn restore_lossless_package_v1_inner(
             .map_or(0, |presets| presets.len() as u64);
         validate_staged_f0(&incoming.manifest, &incoming.entries, &staged_database, cas)?;
         check_cancelled(cancellation)?;
+        let require_v2 = durable_job.is_some();
         let backup = create_and_verify_pre_replacement_backup(
             pre_replacement_backup,
             job_staging_root,
@@ -960,6 +1224,9 @@ fn restore_lossless_package_v1_inner(
             store,
             &lease,
             expected_revision,
+            durable_job.as_deref_mut(),
+            job_owner_manifest_hashes.as_ref(),
+            require_v2,
             cancellation,
         )?;
         Ok((backup, character_count, preset_count))
@@ -978,6 +1245,14 @@ fn restore_lossless_package_v1_inner(
         }
     };
     check_cancelled(cancellation).or_else(|error| abort_restore(store, &staging_id, error))?;
+    if let Some(job) = durable_job.as_deref_mut() {
+        job.seal(
+            store,
+            sealed_at_ms.expect("durable restore has a seal timestamp"),
+        )
+        .map_err(LosslessError::io)
+        .or_else(|error| abort_restore(store, &staging_id, error))?;
+    }
     if let Some(before_activation) = before_activation {
         before_activation()
             .map_err(|message| {
@@ -1004,6 +1279,9 @@ fn restore_lossless_package_v1_inner(
         Err(error) => return abort_restore(store, &staging_id, error),
     };
     check_cancelled(cancellation).or_else(|error| abort_restore(store, &staging_id, error))?;
+    if let Some(before_commit_attempt) = before_commit_attempt {
+        before_commit_attempt();
+    }
     let committed = match app_kv {
         Some((key, value)) => store.finish_prepared_replace_with_app_kv(authorized, key, value),
         None => store.finish_prepared_replace(authorized),
@@ -1350,6 +1628,17 @@ fn cleanup_error(primary: LosslessError, action: &str, cleanup: LosslessError) -
     )
 }
 
+fn release_lease_after_error(
+    store: &mut PersistentStore,
+    lease: &str,
+    error: LosslessError,
+) -> LosslessError {
+    match store.release_revision(lease).map_err(store_error) {
+        Ok(()) => error,
+        Err(cleanup) => cleanup_error(error, "revision lease release", cleanup),
+    }
+}
+
 fn create_and_verify_pre_replacement_backup(
     output_path: &Path,
     job_staging_root: &Path,
@@ -1357,6 +1646,9 @@ fn create_and_verify_pre_replacement_backup(
     store: &mut PersistentStore,
     lease: &str,
     expected_revision: i64,
+    mut durable_job: Option<&mut DurableCasJob>,
+    job_owner_manifest_hashes: Option<&HashSet<String>>,
+    require_v2: bool,
     cancellation: &dyn CancellationProbe,
 ) -> Result<CreatedLosslessBackup, LosslessError> {
     check_cancelled(cancellation)?;
@@ -1383,6 +1675,19 @@ fn create_and_verify_pre_replacement_backup(
             "pre-replacement inventory is not pinned to the expected revision",
         ));
     }
+    if require_v2
+        && (!matches!(
+            &asset_repository_authority.value,
+            AssetRepositoryAuthorityState::V2 { .. }
+        ) || !matches!(
+            &cold_payload_authority.value,
+            ColdPayloadAuthorityState::V2 { .. }
+        ))
+    {
+        return Err(invalid_manifest(
+            "production lossless backup requires v2 asset and cold authority",
+        ));
+    }
     let exported = store.export_risu_save(lease, false).map_err(store_error)?;
     let export_path = PathBuf::from(&exported.path);
     let outcome = (|| {
@@ -1394,6 +1699,8 @@ fn create_and_verify_pre_replacement_backup(
             &cold.value,
             absent_owner_marker.as_ref(),
             cas,
+            durable_job.as_deref_mut(),
+            job_owner_manifest_hashes,
             cancellation,
         )?;
         let diagnostic = rebuild_f0_v1(&database, &payloads, &[]).map_err(f0_error)?;
@@ -1442,6 +1749,8 @@ fn create_and_verify_pre_replacement_backup(
             job_staging_root,
             cas,
             store,
+            durable_job.as_deref_mut(),
+            job_owner_manifest_hashes,
             cancellation,
         )?;
         if verified.archive_bytes != written.archive_bytes {
@@ -1511,6 +1820,9 @@ pub(crate) fn create_and_verify_lossless_backup_v1_report(
         store,
         &lease,
         expected_revision,
+        None,
+        None,
+        false,
         cancellation,
     );
     let released = store.release_revision(&lease).map_err(store_error);
@@ -1522,6 +1834,54 @@ pub(crate) fn create_and_verify_lossless_backup_v1_report(
     }
 }
 
+pub(crate) fn create_and_verify_lossless_backup_v1_durable_report(
+    output_path: &Path,
+    job_staging_root: &Path,
+    cas: &PayloadCas,
+    store: &mut PersistentStore,
+    expected_revision: i64,
+    durable_job: &mut DurableCasJob,
+    sealed_at_ms: i64,
+    cancellation: &dyn CancellationProbe,
+) -> Result<CreatedLosslessBackup, LosslessError> {
+    let lease = store
+        .acquire_revision(expected_revision)
+        .map_err(store_error)?
+        .lease;
+    let exported = create_and_verify_pre_replacement_backup(
+        output_path,
+        job_staging_root,
+        cas,
+        store,
+        &lease,
+        expected_revision,
+        Some(durable_job),
+        None,
+        true,
+        cancellation,
+    );
+    let released = store.release_revision(&lease).map_err(store_error);
+    let report = match (exported, released) {
+        (Ok(report), Ok(())) => report,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(cleanup)) => {
+            let _ = fs::remove_file(output_path);
+            return Err(cleanup);
+        }
+        (Err(error), Err(cleanup)) => {
+            return Err(cleanup_error(error, "revision lease release", cleanup));
+        }
+    };
+    if let Err(error) = durable_job
+        .seal(store, sealed_at_ms)
+        .map_err(LosslessError::io)
+    {
+        let _ = fs::remove_file(output_path);
+        return Err(error);
+    }
+    Ok(report)
+}
+
 fn pinned_backup_entries(
     database_path: &Path,
     assets: &[AssetAlias],
@@ -1529,11 +1889,14 @@ fn pinned_backup_entries(
     cold: &[ColdAlias],
     absent_owner_marker: &Path,
     cas: &PayloadCas,
+    mut durable_job: Option<&mut DurableCasJob>,
+    job_owner_manifest_hashes: Option<&HashSet<String>>,
     cancellation: &dyn CancellationProbe,
 ) -> Result<(Vec<LosslessWriteEntry>, Vec<F0PayloadDescriptor>), LosslessError> {
     let mut entries = Vec::with_capacity(1 + assets.len() + owner_heads.len() + cold.len());
     let mut payloads = Vec::with_capacity(assets.len() + cold.len());
     let mut packaged_hashes = HashSet::new();
+    let mut durable_pins = BTreeMap::new();
     entries.push(LosslessWriteEntry {
         logical_path: DATABASE_PATH.to_owned(),
         logical_key: None,
@@ -1556,6 +1919,12 @@ fn pinned_backup_entries(
         let hash = required_backup_object_hash(alias.object_hash.as_deref(), &alias.key)?;
         packaged_hashes.insert(hash.to_owned());
         let (source, byte_length) = pinned_object(cas, hash, alias.size, &alias.key)?;
+        remember_durable_pin(
+            &mut durable_pins,
+            hash,
+            byte_length,
+            effective_durable_role(hash, CasObjectRole::DirectObject, job_owner_manifest_hashes),
+        )?;
         let metadata = lossless_asset_metadata(alias)?;
         entries.push(LosslessWriteEntry {
             logical_path: backup_logical_path(kind, &alias.key),
@@ -1578,6 +1947,12 @@ fn pinned_backup_entries(
         let hash = required_backup_object_hash(alias.object_hash.as_deref(), &alias.key)?;
         packaged_hashes.insert(hash.to_owned());
         let (source, byte_length) = pinned_object(cas, hash, alias.size, &alias.key)?;
+        remember_durable_pin(
+            &mut durable_pins,
+            hash,
+            byte_length,
+            effective_durable_role(hash, CasObjectRole::DirectObject, job_owner_manifest_hashes),
+        )?;
         entries.push(LosslessWriteEntry {
             logical_path: backup_logical_path(PayloadKind::Cold, &alias.key),
             logical_key: Some(alias.key.clone()),
@@ -1633,6 +2008,12 @@ fn pinned_backup_entries(
                         ),
                     ));
                 }
+                remember_durable_pin(
+                    &mut durable_pins,
+                    hash,
+                    fs::metadata(&source).map_err(LosslessError::io)?.len(),
+                    CasObjectRole::OwnerManifest,
+                )?;
                 (source, decoded)
             }
             (false, None) => (absent_owner_marker.to_path_buf(), Vec::new()),
@@ -1687,6 +2068,16 @@ fn pinned_backup_entries(
                     ),
                 ));
             }
+            remember_durable_pin(
+                &mut durable_pins,
+                &payload_hash,
+                byte_length,
+                effective_durable_role(
+                    &payload_hash,
+                    CasObjectRole::DirectObject,
+                    job_owner_manifest_hashes,
+                ),
+            )?;
             entries.push(LosslessWriteEntry {
                 logical_path: backup_logical_path(PayloadKind::OwnerPayload, &payload_hash),
                 logical_key: Some(payload_hash),
@@ -1702,7 +2093,50 @@ fn pinned_backup_entries(
             "pre-replacement inventory exceeds the package entry limit",
         ));
     }
+    if let Some(job) = durable_job.as_deref_mut() {
+        for (hash, (byte_size, role)) in durable_pins {
+            job.pin_existing(cas, &hash, byte_size, role)
+                .map_err(LosslessError::io)?;
+        }
+    }
     Ok((entries, payloads))
+}
+
+fn effective_durable_role(
+    hash: &str,
+    default_role: CasObjectRole,
+    job_owner_manifest_hashes: Option<&HashSet<String>>,
+) -> CasObjectRole {
+    if job_owner_manifest_hashes.is_some_and(|hashes| hashes.contains(hash)) {
+        CasObjectRole::OwnerManifest
+    } else {
+        default_role
+    }
+}
+
+fn remember_durable_pin(
+    pins: &mut BTreeMap<String, (u64, CasObjectRole)>,
+    hash: &str,
+    byte_size: u64,
+    role: CasObjectRole,
+) -> Result<(), LosslessError> {
+    match pins.get_mut(hash) {
+        Some((existing_size, existing_role)) => {
+            if *existing_size != byte_size {
+                return Err(LosslessError::new(
+                    LosslessErrorCode::BackupIncomplete,
+                    "lossless CAS pin has conflicting byte sizes",
+                ));
+            }
+            if role == CasObjectRole::OwnerManifest {
+                *existing_role = role;
+            }
+        }
+        None => {
+            pins.insert(hash.to_owned(), (byte_size, role));
+        }
+    }
+    Ok(())
 }
 
 fn lossless_asset_metadata(alias: &AssetAlias) -> Result<Value, LosslessError> {
@@ -1878,6 +2312,8 @@ fn verify_pre_replacement_backup(
     job_staging_root: &Path,
     cas: &PayloadCas,
     store: &mut PersistentStore,
+    durable_job: Option<&mut DurableCasJob>,
+    job_owner_manifest_hashes: Option<&HashSet<String>>,
     cancellation: &dyn CancellationProbe,
 ) -> Result<VerifiedLosslessBackup, LosslessError> {
     let mut raw = File::open(backup_path).map_err(LosslessError::io)?;
@@ -1896,7 +2332,17 @@ fn verify_pre_replacement_backup(
         .collect::<Result<Vec<_>, _>>()?;
     let verification_root = JobOwnedDirectory::create(job_staging_root)?;
     let mut raw = File::open(backup_path).map_err(LosslessError::io)?;
-    let staged = read_lossless_package_v1(&mut raw, verification_root.as_ref(), cas, cancellation)?;
+    let staged = match durable_job {
+        Some(job) => read_lossless_package_v1_durable(
+            &mut raw,
+            verification_root.as_ref(),
+            cas,
+            job,
+            job_owner_manifest_hashes,
+            cancellation,
+        )?,
+        None => read_lossless_package_v1(&mut raw, verification_root.as_ref(), cas, cancellation)?,
+    };
     let database_entry = staged
         .entries
         .iter()
@@ -2399,6 +2845,46 @@ fn stage_payload_entry(
     Ok(staged_entry(entry, None, Some(prepared)))
 }
 
+fn stage_payload_entry_durable(
+    source: &mut impl Read,
+    entry: &LosslessManifestEntry,
+    cas: &PayloadCas,
+    durable_job: &mut DurableCasJob,
+    role: CasObjectRole,
+    cancellation: &dyn CancellationProbe,
+) -> Result<StagedLosslessEntry, LosslessError> {
+    let mut declared = DeclaredReader {
+        source,
+        remaining: entry.byte_length,
+        cancellation,
+    };
+    let prepared = durable_job
+        .prepare_reader(cas, &mut declared, role)
+        .map_err(|error| {
+            if cancellation.is_cancelled() {
+                cancelled_error()
+            } else if error.kind() == io::ErrorKind::UnexpectedEof {
+                LosslessError::new(
+                    LosslessErrorCode::TruncatedInput,
+                    format!("truncated lossless package payload: {}", entry.logical_path),
+                )
+            } else {
+                LosslessError::io(error)
+            }
+        })?;
+    if prepared.byte_size != entry.byte_length {
+        return Err(LosslessError::new(
+            LosslessErrorCode::LengthMismatch,
+            format!(
+                "lossless package payload length mismatch: {}",
+                entry.logical_path
+            ),
+        ));
+    }
+    require_entry_hash(entry, &prepared.content_hash)?;
+    Ok(staged_entry(entry, None, Some(prepared)))
+}
+
 fn staged_entry(
     entry: &LosslessManifestEntry,
     staged_path: Option<JobOwnedFile>,
@@ -2761,7 +3247,10 @@ impl Drop for JobOwnedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asset_repository::owner_manifest_codec::encode_owner_manifest;
+    use crate::asset_repository::{
+        job_pins::{collect_durable_cas_job_roots, CasJobKind, CasReleaseOutcome, DurableCasJob},
+        owner_manifest_codec::encode_owner_manifest,
+    };
     use crate::local_backup::NeverCancelled;
     use crate::peer_sync::{
         prepare_lossless_clone_session, CloneActivation, CloneObjectKind, CloneTargetAdapter,
@@ -2771,6 +3260,7 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     use std::{
+        collections::BTreeSet,
         fs,
         io::Cursor,
         sync::{
@@ -3368,6 +3858,399 @@ mod tests {
     }
 
     #[test]
+    fn durable_export_seals_every_lossless_cas_root_until_publication_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("source-staging");
+        fs::create_dir(&staging).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Source", b"source");
+        let output = directory.path().join("managed-source.lossless");
+        let mut durable = DurableCasJob::begin(
+            directory.path(),
+            "lossless-export-test",
+            CasJobKind::OfficialPublicationOrExportPreparation,
+            1,
+        )
+        .unwrap();
+
+        let report = create_and_verify_lossless_backup_v1_durable_report(
+            &output,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &mut durable,
+            2,
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(report.archive_bytes, fs::metadata(&output).unwrap().len());
+        let verified =
+            verify_lossless_package_v1(&mut File::open(&output).unwrap(), &NeverCancelled).unwrap();
+        let expected_direct = verified
+            .manifest
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.kind,
+                    PayloadKind::Asset
+                        | PayloadKind::Inlay
+                        | PayloadKind::Cold
+                        | PayloadKind::OwnerPayload
+                )
+            })
+            .map(|entry| entry.sha256.clone())
+            .collect();
+        let expected_manifests = verified
+            .manifest
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == PayloadKind::OwnerManifest
+                    && parse_owner_head_manifest_entry(entry).unwrap().present
+            })
+            .map(|entry| entry.sha256.clone())
+            .collect();
+        let roots = durable.root_set().unwrap();
+        assert_eq!(roots.object_hashes, expected_direct);
+        assert_eq!(roots.manifest_hashes, expected_manifests);
+        let collected = collect_durable_cas_job_roots(directory.path());
+        assert_eq!(collected, roots);
+        durable.release(CasReleaseOutcome::Committed).unwrap();
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn durable_export_rejects_a_non_v2_authority_before_sealing() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("source-staging");
+        fs::create_dir(&staging).unwrap();
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        let output = directory.path().join("managed-source.lossless");
+        let mut durable = DurableCasJob::begin(
+            directory.path(),
+            "lossless-export-legacy",
+            CasJobKind::OfficialPublicationOrExportPreparation,
+            1,
+        )
+        .unwrap();
+
+        let error = create_and_verify_lossless_backup_v1_durable_report(
+            &output,
+            &staging,
+            &cas,
+            &mut store,
+            0,
+            &mut durable,
+            2,
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::InvalidManifest);
+        assert!(!durable.is_sealed());
+        assert!(!output.exists());
+        durable.release(CasReleaseOutcome::Aborted).unwrap();
+    }
+
+    #[test]
+    fn durable_restore_promotes_only_the_preverified_package_and_seals_before_finalize() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        fs::create_dir(&staging).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let verified =
+            verify_lossless_package_v1(&mut Cursor::new(&incoming), &NeverCancelled).unwrap();
+        let recovery = directory.path().join("pre-replacement.lossless.part");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let mut durable = DurableCasJob::begin(
+            directory.path(),
+            "lossless-restore-test",
+            CasJobKind::LosslessImport,
+            1,
+        )
+        .unwrap();
+        let finalized = AtomicBool::new(false);
+        let commit_attempted = AtomicBool::new(false);
+
+        let report = restore_verified_lossless_package_v1_durable_controlled(
+            &mut Cursor::new(&incoming),
+            &verified,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &recovery,
+            None,
+            &mut durable,
+            2,
+            &|| {
+                assert!(recovery.is_file());
+                let recovery_verified = verify_lossless_package_v1(
+                    &mut File::open(&recovery).unwrap(),
+                    &NeverCancelled,
+                )
+                .unwrap();
+                let mut expected_direct = BTreeSet::new();
+                let mut expected_manifests = BTreeSet::new();
+                for manifest in [&verified.manifest, &recovery_verified.manifest] {
+                    for entry in &manifest.entries {
+                        match entry.kind {
+                            PayloadKind::Asset
+                            | PayloadKind::Inlay
+                            | PayloadKind::Cold
+                            | PayloadKind::OwnerPayload => {
+                                expected_direct.insert(entry.sha256.clone());
+                            }
+                            PayloadKind::OwnerManifest
+                                if parse_owner_head_manifest_entry(entry).unwrap().present =>
+                            {
+                                expected_manifests.insert(entry.sha256.clone());
+                            }
+                            PayloadKind::Database | PayloadKind::OwnerManifest => {}
+                        }
+                    }
+                }
+                for hash in &expected_manifests {
+                    expected_direct.remove(hash);
+                }
+                let roots = collect_durable_cas_job_roots(directory.path());
+                assert_eq!(roots.object_hashes, expected_direct);
+                assert_eq!(roots.manifest_hashes, expected_manifests);
+                assert!(roots.blockers.is_empty());
+                finalized.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            &|| commit_attempted.store(true, Ordering::SeqCst),
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert!(finalized.load(Ordering::SeqCst));
+        assert!(commit_attempted.load(Ordering::SeqCst));
+        assert_eq!(report.revision, 2);
+        assert_eq!(report.source_sha256, verified.archive_sha256);
+        assert_eq!(store.materialize(None).unwrap()["username"], "New");
+        durable.release(CasReleaseOutcome::Committed).unwrap();
+        assert_eq!(
+            collect_durable_cas_job_roots(directory.path()),
+            Default::default()
+        );
+    }
+
+    #[test]
+    fn durable_restore_rejects_bytes_that_changed_after_verification_before_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        fs::create_dir(&staging).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let verified =
+            verify_lossless_package_v1(&mut Cursor::new(&incoming), &NeverCancelled).unwrap();
+        let changed = production_package(directory.path(), "Changed", b"changed");
+        let recovery = directory.path().join("pre-replacement.lossless.part");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let mut durable = DurableCasJob::begin(
+            directory.path(),
+            "lossless-restore-changed",
+            CasJobKind::LosslessImport,
+            1,
+        )
+        .unwrap();
+
+        let error = restore_verified_lossless_package_v1_durable_controlled(
+            &mut Cursor::new(changed),
+            &verified,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &recovery,
+            None,
+            &mut durable,
+            2,
+            &|| panic!("changed package must not reach finalization"),
+            &|| panic!("changed package must not reach commit"),
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, LosslessErrorCode::HashMismatch);
+        assert_eq!(store.revision().unwrap(), 1);
+        assert!(!recovery.exists());
+        durable.release(CasReleaseOutcome::Aborted).unwrap();
+    }
+
+    #[test]
+    fn durable_restore_uses_job_wide_owner_manifest_role_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        fs::create_dir(&staging).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let incoming_manifest = encode_owner_manifest(&[OwnerManifestEntry {
+            tuple: ["shared".to_owned(), "shared".to_owned(), "BIN".to_owned()],
+            payload_hash: Some(Sha256::digest(b"new-asset").into()),
+        }])
+        .unwrap();
+        let verified =
+            verify_lossless_package_v1(&mut Cursor::new(&incoming), &NeverCancelled).unwrap();
+        let recovery = directory.path().join("pre-replacement.lossless.part");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store_with_asset_bytes(
+            &mut store,
+            &cas,
+            "Old",
+            b"old",
+            &incoming_manifest,
+            b"old-owner-history",
+        );
+        let mut durable = DurableCasJob::begin(
+            directory.path(),
+            "lossless-restore-role-precedence",
+            CasJobKind::LosslessImport,
+            1,
+        )
+        .unwrap();
+
+        let report = restore_verified_lossless_package_v1_durable_controlled(
+            &mut Cursor::new(incoming),
+            &verified,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &recovery,
+            None,
+            &mut durable,
+            2,
+            &|| Ok(()),
+            &|| {},
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(report.revision, 2);
+        let collision_hash = hex::encode(Sha256::digest(&incoming_manifest));
+        let roots = durable.root_set().unwrap();
+        assert!(roots.manifest_hashes.contains(&collision_hash));
+        assert!(!roots.object_hashes.contains(&collision_hash));
+        durable.release(CasReleaseOutcome::Committed).unwrap();
+    }
+
+    #[test]
+    fn durable_restore_commits_app_kv_with_the_replacement_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        fs::create_dir(&staging).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let verified =
+            verify_lossless_package_v1(&mut Cursor::new(&incoming), &NeverCancelled).unwrap();
+        let recovery = directory.path().join("pre-replacement.lossless.part");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        let mut durable = DurableCasJob::begin(
+            directory.path(),
+            "lossless-restore-app-kv",
+            CasJobKind::LosslessImport,
+            1,
+        )
+        .unwrap();
+        let marker = json!({ "manifestId": "manifest-2", "revision": 2 });
+
+        let report = restore_verified_lossless_package_v1_durable_controlled(
+            &mut Cursor::new(incoming),
+            &verified,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &recovery,
+            Some(("peerCloneActiveManifest", &marker)),
+            &mut durable,
+            2,
+            &|| Ok(()),
+            &|| {},
+            &NeverCancelled,
+        )
+        .unwrap();
+
+        assert_eq!(report.revision, 2);
+        assert_eq!(
+            store.get_app_kv("peerCloneActiveManifest").unwrap(),
+            Some(marker)
+        );
+        assert_eq!(store.materialize(None).unwrap()["username"], "New");
+        durable.release(CasReleaseOutcome::Committed).unwrap();
+    }
+
+    #[test]
+    fn durable_restore_rolls_back_when_the_atomic_app_kv_write_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("job-staging");
+        fs::create_dir(&staging).unwrap();
+        let incoming = production_package(directory.path(), "New", b"new");
+        let verified =
+            verify_lossless_package_v1(&mut Cursor::new(&incoming), &NeverCancelled).unwrap();
+        let recovery = directory.path().join("pre-replacement.lossless.part");
+        let mut store = PersistentStore::open(directory.path()).unwrap();
+        let cas = PayloadCas::new(directory.path()).unwrap();
+        seed_active_store(&mut store, &cas, "Old", b"old");
+        rusqlite::Connection::open(directory.path().join("persistent/persistent.db"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_peer_clone_marker
+                 BEFORE INSERT ON app_kv
+                 WHEN NEW.key = 'peerCloneActiveManifest'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'marker rejected');
+                 END;",
+            )
+            .unwrap();
+        let mut durable = DurableCasJob::begin(
+            directory.path(),
+            "lossless-restore-app-kv-rollback",
+            CasJobKind::LosslessImport,
+            1,
+        )
+        .unwrap();
+        let marker = json!({ "manifestId": "manifest-2", "revision": 2 });
+
+        restore_verified_lossless_package_v1_durable_controlled(
+            &mut Cursor::new(incoming),
+            &verified,
+            &staging,
+            &cas,
+            &mut store,
+            1,
+            &recovery,
+            Some(("peerCloneActiveManifest", &marker)),
+            &mut durable,
+            2,
+            &|| Ok(()),
+            &|| {},
+            &NeverCancelled,
+        )
+        .unwrap_err();
+
+        assert_eq!(store.revision().unwrap(), 1);
+        assert_eq!(store.materialize(None).unwrap()["username"], "Old");
+        assert_eq!(store.get_app_kv("peerCloneActiveManifest").unwrap(), None);
+        durable.release(CasReleaseOutcome::Aborted).unwrap();
+    }
+
+    #[test]
     fn managed_restore_activation_fence_aborts_staging_and_keeps_the_backup() {
         let directory = tempfile::tempdir().unwrap();
         let staging = directory.path().join("job-staging");
@@ -3489,11 +4372,8 @@ mod tests {
                 extension,
             );
 
-            let error = verify_lossless_package_v1(
-                &mut Cursor::new(incoming),
-                &NeverCancelled,
-            )
-            .unwrap_err();
+            let error = verify_lossless_package_v1(&mut Cursor::new(incoming), &NeverCancelled)
+                .unwrap_err();
 
             assert_eq!(error.code, LosslessErrorCode::InvalidManifest);
         }
@@ -5276,11 +6156,29 @@ mod tests {
         owner_history: &[u8],
     ) {
         let asset_bytes = [payload_prefix, b"-asset"].concat();
+        seed_active_store_with_asset_bytes(
+            store,
+            cas,
+            username,
+            payload_prefix,
+            &asset_bytes,
+            owner_history,
+        );
+    }
+
+    fn seed_active_store_with_asset_bytes(
+        store: &mut PersistentStore,
+        cas: &PayloadCas,
+        username: &str,
+        payload_prefix: &[u8],
+        asset_bytes: &[u8],
+        owner_history: &[u8],
+    ) {
         let inlay_bytes = [payload_prefix, b"-inlay"].concat();
         let cold_bytes = cold_payload(&json!({
             "message": [{ "data": format!("{}-cold", username) }]
         }));
-        let asset = cas.prepare_bytes(&asset_bytes).unwrap();
+        let asset = cas.prepare_bytes(asset_bytes).unwrap();
         let inlay = cas.prepare_bytes(&inlay_bytes).unwrap();
         let cold = cas.prepare_bytes(&cold_bytes).unwrap();
         let historical = cas.prepare_bytes(owner_history).unwrap();

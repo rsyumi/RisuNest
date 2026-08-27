@@ -180,7 +180,7 @@ describe('native restore bootstrap reconciliation', () => {
         let resumePolling!: () => void
         const pollingGate = new Promise<void>((resolve) => resumePolling = resolve)
         const calls: Array<[string, Record<string, unknown> | undefined]> = []
-        const handoffPath = 'C:\\app\\persistent\\exports\\risusave-lossless.risudat'
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174004.risulossless'
         const dependencies = {
             invoke: vi.fn(async (command: string, args?: Record<string, unknown>) => {
                 calls.push([command, args])
@@ -196,7 +196,7 @@ describe('native restore bootstrap reconciliation', () => {
                         handoffPath,
                     },
                 }
-                if (command === 'pds_export_risu_save_cleanup') return undefined
+                if (command === 'native_lossless_handoff_cleanup') return undefined
                 if (command === 'native_file_job_forget') return true
                 throw new Error(`Unexpected command: ${command}`)
             }),
@@ -211,7 +211,7 @@ describe('native restore bootstrap reconciliation', () => {
             expect(calls).toEqual([
                 ['native_file_job_list', undefined],
                 ['native_file_job_status', { jobId: 'lossless-export' }],
-                ['pds_export_risu_save_cleanup', { path: handoffPath }],
+                ['native_lossless_handoff_cleanup', { path: handoffPath }],
                 ['native_file_job_forget', { jobId: 'lossless-export' }],
             ])
         })

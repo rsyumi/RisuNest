@@ -100,7 +100,7 @@ describe('native file jobs', () => {
                     characterCount: 3,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath: 'C:\\app\\persistent\\exports\\risusave-recovery.risudat',
+                    recoveryPath: 'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174000.risulossless',
                 }),
                 kind: 'restore-lossless-backup',
             },
@@ -129,7 +129,7 @@ describe('native file jobs', () => {
         )
 
         expect(result.revision).toBe(18)
-        expect(result.recoveryPath).toContain('risusave-recovery.risudat')
+        expect(result.recoveryPath).toContain('risulossless-recovery-')
         expect(events).toEqual([
             'fence-acquired',
             'refreshed',
@@ -171,7 +171,7 @@ describe('native file jobs', () => {
                     characterCount: 3,
                     presetCount: 2,
                     warningCodes: [],
-                    recoveryPath: 'C:\\app\\persistent\\exports\\risusave-recovery.risudat',
+                    recoveryPath: 'C:\\app\\persistent\\recovery\\risulossless-recovery-123e4567-e89b-42d3-a456-426614174001.risulossless',
                 }),
                 kind: 'restore-lossless-backup',
             },
@@ -267,7 +267,7 @@ describe('native file jobs', () => {
 
     it('hands a managed lossless export to Android SAF and cleans the native source', async () => {
         const events: string[] = []
-        const handoffPath = 'C:\\app\\persistent\\exports\\risusave-123.risudat'
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174002.risulossless'
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
             kind: 'export-lossless-backup',
@@ -298,7 +298,7 @@ describe('native file jobs', () => {
                     events.push(`${command}:${JSON.stringify(args ?? {})}`)
                     if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
                     if (command === 'native_file_job_status') return terminal
-                    if (command === 'pds_export_risu_save_cleanup') return undefined
+                    if (command === 'native_lossless_handoff_cleanup') return undefined
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -319,14 +319,14 @@ describe('native file jobs', () => {
             'native_file_job_start:{"request":{"kind":"export-lossless-backup","expectedRevision":22}}',
             'native_file_job_status:{"jobId":"lossless-export"}',
             `saf:${handoffPath}:backup.risulossless`,
-            `pds_export_risu_save_cleanup:{"path":"${handoffPath.replaceAll('\\', '\\\\')}"}`,
+            `native_lossless_handoff_cleanup:{"path":"${handoffPath.replaceAll('\\', '\\\\')}"}`,
             'native_file_job_forget:{"jobId":"lossless-export"}',
         ])
     })
 
     it('rejects a short Android SAF handoff and still cleans both native receipts', async () => {
         const commands: string[] = []
-        const handoffPath = 'C:\\app\\persistent\\exports\\risusave-short.risudat'
+        const handoffPath = 'C:\\app\\native-file-jobs\\handoffs\\risulossless-123e4567-e89b-42d3-a456-426614174003.risulossless'
         const terminal: NativeFileJobStatus = {
             jobId: 'lossless-export',
             kind: 'export-lossless-backup',
@@ -354,7 +354,7 @@ describe('native file jobs', () => {
                     commands.push(command)
                     if (command === 'native_file_job_start') return { jobId: 'lossless-export' }
                     if (command === 'native_file_job_status') return terminal
-                    if (command === 'pds_export_risu_save_cleanup') return undefined
+                    if (command === 'native_lossless_handoff_cleanup') return undefined
                     if (command === 'native_file_job_forget') return true
                     throw new Error(`Unexpected command: ${command}`)
                 },
@@ -365,7 +365,7 @@ describe('native file jobs', () => {
         expect(commands).toEqual([
             'native_file_job_start',
             'native_file_job_status',
-            'pds_export_risu_save_cleanup',
+            'native_lossless_handoff_cleanup',
             'native_file_job_forget',
         ])
     })

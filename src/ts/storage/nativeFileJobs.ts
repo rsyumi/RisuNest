@@ -670,7 +670,7 @@ export async function runNativeLosslessBackupExport(
     finally {
         if (managedSource) {
             try {
-                await invokeNative(dependencies, 'pds_export_risu_save_cleanup', {
+                await invokeNative(dependencies, 'native_lossless_handoff_cleanup', {
                     path: managedSource,
                 })
             }

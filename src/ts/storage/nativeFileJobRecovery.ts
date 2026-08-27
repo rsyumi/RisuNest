@@ -64,7 +64,7 @@ async function reconcileExportInBackground(
     }
     try {
         if (status.kind === 'export-lossless-backup' && status.result?.handoffPath) {
-            await dependencies.invoke('pds_export_risu_save_cleanup', {
+            await dependencies.invoke('native_lossless_handoff_cleanup', {
                 path: status.result.handoffPath,
             })
         }

@@ -1,6 +1,8 @@
 pub mod charx;
 pub mod screenshot_output;
 
+mod lossless;
+
 #[cfg(test)]
 mod screenshot_output_test;
 
@@ -235,6 +237,22 @@ pub(crate) fn open_job_source(
             open_regular_file_no_follow(&path)
         }
     }
+}
+
+fn validate_desktop_destination(path: &Path) -> Result<(), NativeJobError> {
+    if !path.is_absolute()
+        || path.file_name().is_none()
+        || path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .is_none()
+    {
+        return Err(NativeJobError::new(
+            "invalid-destination",
+            "desktop export destination must have an available absolute parent directory",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -510,6 +528,77 @@ fn cleanup_spool_directories(sources_root: &Path) -> Result<(), String> {
     cleanup_spool_directories_at(sources_root, now_millis, ANDROID_SPOOL_STALE_MILLIS)
 }
 
+fn lossless_handoff_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(token) = name
+        .strip_prefix("risulossless-")
+        .and_then(|name| name.strip_suffix(".risulossless"))
+    else {
+        return false;
+    };
+    Uuid::parse_str(token).is_ok_and(|id| {
+        id.hyphenated().to_string() == token
+            && id.get_version() == Some(uuid::Version::Random)
+            && id.get_variant() == uuid::Variant::RFC4122
+    })
+}
+
+fn cleanup_lossless_handoff_path(root: &Path, path: &Path) -> Result<bool, NativeJobError> {
+    let handoffs_root = root.join("handoffs").canonicalize().map_err(|error| {
+        NativeJobError::new(
+            "cleanup-failed",
+            format!("lossless handoff root cannot be resolved: {error}"),
+        )
+    })?;
+    if !path.is_absolute()
+        || path.parent().and_then(|parent| parent.canonicalize().ok())
+            != Some(handoffs_root.clone())
+        || !lossless_handoff_name(path)
+    {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "lossless handoff cleanup target is not app-owned",
+        ));
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(NativeJobError::new(
+                "cleanup-failed",
+                format!("lossless handoff metadata is unavailable: {error}"),
+            ))
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(NativeJobError::new(
+            "invalid-input",
+            "lossless handoff cleanup target is not an owned regular file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(NativeJobError::new(
+                "invalid-input",
+                "lossless handoff cleanup target is a reparse point",
+            ));
+        }
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(NativeJobError::new(
+            "cleanup-failed",
+            format!("lossless handoff cannot be removed: {error}"),
+        )),
+    }
+}
+
 fn cleanup_spool_directories_at(
     sources_root: &Path,
     now_millis: u64,
@@ -724,9 +813,14 @@ impl NativeFileJobState {
     fn initialize_with_max_workers(root: PathBuf, max_concurrent_jobs: usize) -> Self {
         let jobs_root = root.join("jobs");
         let sources_root = root.join("sources");
+        let handoffs_root = root.join("handoffs");
         let mut startup_warnings = Vec::new();
         let mut capability_error = None;
-        for (path, label) in [(&jobs_root, "native job"), (&sources_root, "native source")] {
+        for (path, label) in [
+            (&jobs_root, "native job"),
+            (&sources_root, "native source"),
+            (&handoffs_root, "native lossless handoff"),
+        ] {
             if let Err(error) = fs::create_dir_all(path) {
                 let error = NativeJobError::new(
                     "capability-unavailable",
@@ -813,21 +907,43 @@ impl NativeFileJobState {
                 source,
                 expected_revision,
             } => {
-                let _ = (source, expected_revision);
-                return Err(NativeJobError::new(
-                    "capability-unavailable",
-                    "native lossless backup jobs require durable CAS pinning",
-                ));
+                let opened_source = match &source {
+                    JobSource::DesktopPath { .. } => Some(open_job_source(&self.root, &source)?),
+                    JobSource::AndroidSpool { token } => {
+                        parse_android_spool_token(token)?;
+                        None
+                    }
+                };
+                let store =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.open_native_job_store()
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::RestoreLossless {
+                    opened_source,
+                    source,
+                    expected_revision,
+                    store,
+                }
             }
             NativeFileJobStartRequest::ExportLosslessBackup {
                 destination,
                 expected_revision,
             } => {
-                let _ = (destination, expected_revision);
-                return Err(NativeJobError::new(
-                    "capability-unavailable",
-                    "native lossless backup jobs require durable CAS pinning",
-                ));
+                let destination = destination.map(PathBuf::from);
+                if let Some(destination) = destination.as_deref() {
+                    validate_desktop_destination(destination)?;
+                }
+                let store =
+                    crate::persistent_store::commands::with_store_mut(app.state(), |store| {
+                        store.open_native_job_store()
+                    })
+                    .map_err(native_store_error)?;
+                NativeFileJobTask::ExportLossless {
+                    destination,
+                    expected_revision,
+                    store,
+                }
             }
             NativeFileJobStartRequest::PrepareContentImport { .. } => {
                 return Err(NativeJobError::new(
@@ -1038,13 +1154,18 @@ impl NativeFileJobState {
             }
         };
         let source_preparation = (|| -> Result<(), NativeJobError> {
-            let NativeFileJobTask::Restore {
-                opened_source,
-                source,
-                ..
-            } = &mut task
-            else {
-                return Ok(());
+            let (opened_source, source) = match &mut task {
+                NativeFileJobTask::Restore {
+                    opened_source,
+                    source,
+                    ..
+                }
+                | NativeFileJobTask::RestoreLossless {
+                    opened_source,
+                    source,
+                    ..
+                } => (opened_source, source),
+                _ => return Ok(()),
             };
             match source {
                 JobSource::DesktopPath { .. } if opened_source.is_some() => Ok(()),
@@ -1115,6 +1236,36 @@ impl NativeFileJobState {
                 .and_then(|prepared| {
                     export::export_block_risu_save(prepared, &destination, omit_account, &job)
                 }),
+                NativeFileJobTask::RestoreLossless {
+                    opened_source,
+                    expected_revision,
+                    store,
+                    ..
+                } => match opened_source {
+                    Some(opened_source) => lossless::restore_lossless_backup(
+                        opened_source,
+                        expected_revision,
+                        &owned_directory,
+                        store,
+                        &job,
+                    ),
+                    None => Err(NativeJobError::new(
+                        "store-error",
+                        "native lossless job source was not prepared",
+                    )),
+                },
+                NativeFileJobTask::ExportLossless {
+                    destination,
+                    expected_revision,
+                    store,
+                } => lossless::export_lossless_backup(
+                    destination.as_deref(),
+                    expected_revision,
+                    &owned_directory,
+                    &root.join("handoffs"),
+                    store,
+                    &job,
+                ),
                 #[cfg(feature = "native-kei-upload-pilot")]
                 NativeFileJobTask::KeiBackup { prepared } => {
                     crate::persistent_store::kei::run_job(prepared, Arc::clone(&job))
@@ -1359,6 +1510,17 @@ enum NativeFileJobTask {
         omit_account: bool,
         app: AppHandle,
     },
+    RestoreLossless {
+        opened_source: Option<OpenedJobSource>,
+        source: JobSource,
+        expected_revision: i64,
+        store: crate::persistent_store::PersistentStore,
+    },
+    ExportLossless {
+        destination: Option<PathBuf>,
+        expected_revision: i64,
+        store: crate::persistent_store::PersistentStore,
+    },
     #[cfg(feature = "native-kei-upload-pilot")]
     KeiBackup {
         prepared: crate::persistent_store::kei::PreparedKeiUpload,
@@ -1370,6 +1532,8 @@ impl NativeFileJobTask {
         match self {
             Self::Restore { .. } => JobKind::RestoreBlockRisuSave,
             Self::Export { .. } => JobKind::ExportBlockRisuSave,
+            Self::RestoreLossless { .. } => JobKind::RestoreLosslessBackup,
+            Self::ExportLossless { .. } => JobKind::ExportLosslessBackup,
             #[cfg(feature = "native-kei-upload-pilot")]
             Self::KeiBackup { .. } => JobKind::KeiBackupUpload,
         }
@@ -1381,6 +1545,12 @@ impl NativeFileJobTask {
                 expected_revision, ..
             }
             | Self::Export {
+                expected_revision, ..
+            }
+            | Self::RestoreLossless {
+                expected_revision, ..
+            }
+            | Self::ExportLossless {
                 expected_revision, ..
             } => *expected_revision,
             #[cfg(feature = "native-kei-upload-pilot")]
@@ -1600,6 +1770,14 @@ pub(crate) fn native_file_job_forget(
     job_id: String,
 ) -> Result<bool, NativeJobError> {
     state.forget(&job_id)
+}
+
+#[tauri::command(async)]
+pub(crate) fn native_lossless_handoff_cleanup(
+    state: State<'_, NativeFileJobState>,
+    path: String,
+) -> Result<bool, NativeJobError> {
+    cleanup_lossless_handoff_path(&state.root, Path::new(&path))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -3348,6 +3526,43 @@ mod tests {
         assert!(unrelated.exists());
         assert!(mismatched.exists());
         assert!(directory.path().exists());
+    }
+
+    #[test]
+    fn lossless_handoff_cleanup_removes_only_exact_owned_files_and_is_idempotent() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("native-file-jobs");
+        let handoffs = root.join("handoffs");
+        fs::create_dir_all(&handoffs).unwrap();
+        let owned = handoffs.join(format!("risulossless-{}.risulossless", Uuid::new_v4()));
+        let unrelated = handoffs.join("keep.risulossless");
+        fs::write(&owned, b"owned").unwrap();
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        assert!(cleanup_lossless_handoff_path(&root, &owned).unwrap());
+        assert!(!cleanup_lossless_handoff_path(&root, &owned).unwrap());
+        assert!(unrelated.is_file());
+        assert_eq!(
+            cleanup_lossless_handoff_path(&root, &unrelated)
+                .unwrap_err()
+                .code,
+            "invalid-input"
+        );
+    }
+
+    #[test]
+    fn initialization_preserves_unclaimed_lossless_handoffs_for_reconciliation() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().join("native-file-jobs");
+        let handoffs = root.join("handoffs");
+        fs::create_dir_all(&handoffs).unwrap();
+        let pending = handoffs.join(format!("risulossless-{}.risulossless", Uuid::new_v4()));
+        fs::write(&pending, b"verified export awaiting SAF publication").unwrap();
+
+        let state = NativeFileJobState::initialize(root);
+
+        assert!(pending.is_file());
+        assert!(state.startup_warnings.is_empty());
     }
 
     #[test]
