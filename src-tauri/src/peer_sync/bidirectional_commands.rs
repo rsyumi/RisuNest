@@ -105,6 +105,7 @@ pub(crate) enum PeerBidirectionalDurableOperation {
         committed_revision: i64,
         shared_generation: SyncGenerationIdentity,
         changed: bool,
+        remote_backup_required: bool,
         transferred_objects: u64,
         transferred_bytes: u64,
         backups: Vec<PeerBidirectionalBackupReceipt>,
@@ -496,6 +497,7 @@ fn retain_bidirectional_local_activation(
     expected_revision: i64,
     activation: Result<LogicalDeltaActivation, PeerSyncError>,
     changed: bool,
+    remote_backup_required: bool,
     transferred_objects: u64,
     transferred_bytes: u64,
     backups: Vec<PeerBidirectionalBackupReceipt>,
@@ -532,6 +534,7 @@ fn retain_bidirectional_local_activation(
                 generation_sequence: shared.manifest.generation_sequence,
             },
             changed,
+            remote_backup_required,
             transferred_objects: if changed { transferred_objects } else { 0 },
             transferred_bytes: if changed { transferred_bytes } else { 0 },
             backups,
@@ -701,6 +704,7 @@ fn begin_bidirectional_local_merge<S: LogicalDeltaObjectSource + ?Sized>(
                 expected_revision,
                 activation,
                 changed,
+                false,
                 transferred_objects,
                 transferred_bytes,
                 vec![],
@@ -899,6 +903,7 @@ fn resolve_bidirectional_conflict<S: LogicalDeltaObjectSource + ?Sized>(
         original_local_revision,
         activation,
         changed || recovered_after_activation,
+        winner == PeerBidirectionalConflictWinner::Local,
         transferred_objects,
         transferred_bytes,
         backups,
@@ -1164,6 +1169,7 @@ fn complete_bidirectional_local_after_remote_apply(
         committed_revision,
         shared_generation,
         changed,
+        remote_backup_required,
         local_transferred_objects,
         local_transferred_bytes,
         mut backups,
@@ -1173,6 +1179,7 @@ fn complete_bidirectional_local_after_remote_apply(
             committed_revision,
             shared_generation,
             changed,
+            remote_backup_required,
             transferred_objects,
             transferred_bytes,
             backups,
@@ -1182,6 +1189,7 @@ fn complete_bidirectional_local_after_remote_apply(
             committed_revision,
             shared_generation,
             changed,
+            remote_backup_required,
             transferred_objects,
             transferred_bytes,
             backups,
@@ -1205,6 +1213,11 @@ fn complete_bidirectional_local_after_remote_apply(
     if remote_shared != shared_generation {
         return Err(PeerSyncError::Validation(
             "bidirectional remote receipt differs from shared generation".to_owned(),
+        ));
+    }
+    if remote_backup_required && remote.backup.is_none() {
+        return Err(PeerSyncError::Validation(
+            "bidirectional remote overwrite is missing its required backup".to_owned(),
         ));
     }
     let remote_changed = if remote.committed_revision == context.expected_remote_revision {
@@ -1303,21 +1316,26 @@ where
         i64,
         &SyncGenerationIdentity,
         &[u8],
+        bool,
     ) -> Result<LanBidirectionalRemoteApplyReceipt, PeerSyncError>,
 {
     let journal = PeerBidirectionalOperationJournal::new(app_root);
     let operation = journal.load()?.ok_or_else(|| {
         PeerSyncError::Validation("bidirectional operation is not retained".to_owned())
     })?;
-    let (context, committed_revision, shared_generation) = match operation {
+    let (context, committed_revision, shared_generation, remote_backup_required) = match operation {
         PeerBidirectionalDurableOperation::LocalCommitted {
             context,
             committed_revision,
             shared_generation,
+            remote_backup_required,
             ..
-        } if context.operation_id == operation_id => {
-            (context, committed_revision, shared_generation)
-        }
+        } if context.operation_id == operation_id => (
+            context,
+            committed_revision,
+            shared_generation,
+            remote_backup_required,
+        ),
         other if other.operation_id() != operation_id => {
             return Err(PeerSyncError::Validation(
                 "another bidirectional operation is retained".to_owned(),
@@ -1387,6 +1405,7 @@ where
         committed_revision,
         &shared_generation,
         &active.manifest_bytes,
+        remote_backup_required,
     ) {
         Ok(remote) => remote,
         Err(PeerSyncError::Transport(_)) => {
@@ -1802,6 +1821,7 @@ mod tests {
             committed_revision: 8,
             shared_generation: generation("local-a", "3", 'e'),
             changed: true,
+            remote_backup_required: false,
             transferred_objects: 2,
             transferred_bytes: 19,
             backups: vec![backup(PeerBidirectionalBackupSide::Local)],
@@ -1874,6 +1894,7 @@ mod tests {
             committed_revision: 0,
             shared_generation: shared.clone(),
             changed: false,
+            remote_backup_required: false,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: vec![],
@@ -1996,6 +2017,7 @@ mod tests {
             committed_revision: 0,
             shared_generation: shared.clone(),
             changed: false,
+            remote_backup_required: false,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: vec![],
@@ -2010,7 +2032,7 @@ mod tests {
             &cas,
             directory.path(),
             operation_id,
-            |_context, _revision, _shared, _manifest| {
+            |_context, _revision, _shared, _manifest, _backup_required| {
                 Err(PeerSyncError::Transport(
                     "peer source is offline".to_owned(),
                 ))
@@ -2041,7 +2063,7 @@ mod tests {
             &cas,
             directory.path(),
             operation_id,
-            |_context, _revision, _shared, _manifest| {
+            |_context, _revision, _shared, _manifest, _backup_required| {
                 Err(PeerSyncError::ActivationConflict {
                     expected: Some("before".to_owned()),
                     actual: Some("after".to_owned()),
@@ -2110,6 +2132,7 @@ mod tests {
                 committed_revision: 0,
                 shared_generation: shared.clone(),
                 changed: false,
+                remote_backup_required: false,
                 transferred_objects: 0,
                 transferred_bytes: 0,
                 backups: vec![],
@@ -2121,7 +2144,7 @@ mod tests {
                 &cas,
                 directory.path(),
                 common_base_operation_id,
-                |_context, _revision, _shared, _manifest| {
+                |_context, _revision, _shared, _manifest, _backup_required| {
                     panic!("stale common base must not contact the remote source")
                 },
             )
@@ -2154,6 +2177,7 @@ mod tests {
                 committed_revision: 0,
                 shared_generation: shared,
                 changed: false,
+                remote_backup_required: false,
                 transferred_objects: 0,
                 transferred_bytes: 0,
                 backups: vec![],
@@ -2165,7 +2189,7 @@ mod tests {
                 &cas,
                 directory.path(),
                 device_ack_operation_id,
-                |_context, _revision, _shared, _manifest| {
+                |_context, _revision, _shared, _manifest, _backup_required| {
                     panic!("stale device acknowledgement must not contact the remote source")
                 },
             )
@@ -2208,6 +2232,7 @@ mod tests {
                     generation_sequence: base.manifest.generation_sequence,
                 },
                 changed: false,
+                remote_backup_required: false,
                 transferred_objects: 0,
                 transferred_bytes: 0,
                 backups: vec![],
@@ -2234,7 +2259,7 @@ mod tests {
             &cas,
             directory.path(),
             operation_id,
-            |_context, _revision, _shared, _manifest| {
+            |_context, _revision, _shared, _manifest, _backup_required| {
                 panic!("stale local state must not contact the remote source")
             },
         )
@@ -2322,6 +2347,7 @@ mod tests {
                 0,
                 Ok(LogicalDeltaActivation::AlreadyActive { revision: 0 }),
                 true,
+                false,
                 0,
                 0,
                 vec![],
@@ -2415,6 +2441,7 @@ mod tests {
             committed_revision: 7,
             shared_generation: generation("shared-a", "2", 'e'),
             changed: true,
+            remote_backup_required: false,
             transferred_objects: 0,
             transferred_bytes: 0,
             backups: backups.clone(),
@@ -2490,6 +2517,7 @@ mod tests {
             committed_revision: 8,
             shared_generation: generation("local-a", "3", 'e'),
             changed: true,
+            remote_backup_required: false,
             transferred_objects: 2,
             transferred_bytes: 19,
             backups: vec![backup(PeerBidirectionalBackupSide::Local)],
@@ -3146,6 +3174,47 @@ mod tests {
             local_store.read_root(None).unwrap().value,
             lossless_root("Local")
         );
+        drop(local_store);
+        let mut local_store = PersistentStore::open(&local_root).unwrap();
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(&local_root)
+                .load()
+                .unwrap()
+                .unwrap(),
+            PeerBidirectionalDurableOperation::LocalCommitted {
+                remote_backup_required: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            resume_bidirectional_local_committed_with_remote(
+                &mut local_store,
+                &local_cas,
+                &local_root,
+                &conflict.operation_id,
+                |_context, _revision, _shared, _manifest, remote_backup_required| {
+                    assert!(remote_backup_required);
+                    Err(PeerSyncError::Transport(
+                        "response lost before remote backup receipt".to_owned(),
+                    ))
+                },
+            )
+            .unwrap(),
+            ResumeLocalCommittedOutcome::SourceUnavailable {
+                operation_id: conflict.operation_id.clone(),
+                committed_revision: 2,
+            }
+        );
+        assert!(matches!(
+            PeerBidirectionalOperationJournal::new(&local_root)
+                .load()
+                .unwrap()
+                .unwrap(),
+            PeerBidirectionalDurableOperation::LocalCommitted {
+                remote_backup_required: true,
+                ..
+            }
+        ));
         let mut stale_source = FixtureSource {
             objects: BTreeMap::new(),
             reads: 0,
