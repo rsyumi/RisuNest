@@ -884,17 +884,49 @@ export async function prepareNativeContentImport(
             }
 
             const content = validatePreparedContent(status.preparedContent, started.jobId)
-            let lifecycleState: 'unfinalized' | 'finalizing' | 'finalized' | 'settled' = 'unfinalized'
+            let lifecycleState: 'unfinalized' | 'finalizing' | 'finalized' | 'settling' | 'settled' = 'unfinalized'
+            let finalizerOperation: Promise<PreparedImmutablePayload> | undefined
+            let cancellationDuringFinalize = false
+            let settlement: Promise<void> | undefined
+            const settle = (operation: () => Promise<void>): Promise<void> => {
+                if (settlement) return settlement
+                lifecycleState = 'settling'
+                settlement = operation().finally(() => {
+                    lifecycleState = 'settled'
+                })
+                return settlement
+            }
             const prepareOwnerManifestAndSeal = async (bytes: Uint8Array): Promise<PreparedImmutablePayload> => {
                 if (lifecycleState !== 'unfinalized') {
                     throw new Error('Native content can only be finalized once')
                 }
                 lifecycleState = 'finalizing'
-                const prepared = await finalizeContentCasJob(
+                finalizerOperation = finalizeContentCasJob(
                     started.jobId,
                     bytes,
                     dependencies.invoke,
                 )
+                let prepared: PreparedImmutablePayload
+                try {
+                    prepared = await finalizerOperation
+                }
+                catch (error) {
+                    if (!cancellationDuringFinalize) {
+                        settle(() => releaseAndForget('aborted'))
+                    }
+                    try {
+                        await settlement
+                    }
+                    catch {}
+                    throw error
+                }
+                if (cancellationDuringFinalize) {
+                    try {
+                        await settlement
+                    }
+                    catch {}
+                    throw abortError()
+                }
                 lifecycleState = 'finalized'
                 return prepared
             }
@@ -903,15 +935,27 @@ export async function prepareNativeContentImport(
                 if (lifecycleState !== 'finalized') {
                     throw new Error('Native content activation cannot be confirmed before finalizing')
                 }
-                lifecycleState = 'settled'
-                await releaseAndForget('committed')
+                await settle(() => releaseAndForget('committed'))
             }
             const cancel = async (): Promise<void> => {
                 if (lifecycleState === 'settled') return
-                const shouldAbort = lifecycleState === 'unfinalized'
-                lifecycleState = 'settled'
-                if (shouldAbort) await releaseAndForget('aborted')
-                else await forget()
+                if (settlement) return settlement
+                if (lifecycleState === 'finalizing') {
+                    cancellationDuringFinalize = true
+                    await settle(async () => {
+                        try {
+                            await finalizerOperation
+                        }
+                        catch {}
+                        await releaseAndForget('aborted')
+                    })
+                    return
+                }
+                if (lifecycleState === 'unfinalized') {
+                    await settle(() => releaseAndForget('aborted'))
+                    return
+                }
+                await settle(forget)
             }
             return {
                 jobId: started.jobId,

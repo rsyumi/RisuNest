@@ -185,7 +185,7 @@ describe('native prepared content import', () => {
         ])
     })
 
-    it('retains the journal but forgets the native job when the finalizer response is ambiguous', async () => {
+    it('aborts and forgets when the finalizer rejects before upsert begins', async () => {
         const calls: string[] = []
         const receipt = await prepareNativeContentImport(
             { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
@@ -198,6 +198,7 @@ describe('native prepared content import', () => {
                     return contentStatus('succeeded', 'complete', preparedContent)
                 }
                 if (command === 'asset_cas_job_finalize_content') throw new Error('response lost')
+                if (command === 'asset_cas_job_release') return null
                 if (command === 'native_file_job_forget') return null
                 throw new Error(`Unexpected command: ${command}`)
             }),
@@ -205,12 +206,63 @@ describe('native prepared content import', () => {
 
         await expect(receipt.prepareOwnerManifestAndSeal(Uint8Array.of(1)))
             .rejects.toThrow('response lost')
-        await receipt.cancel()
 
         expect(calls).toEqual([
             'native_file_job_start',
             'native_file_job_status',
             'asset_cas_job_finalize_content',
+            'asset_cas_job_release',
+            'native_file_job_forget',
+        ])
+    })
+
+    it('serializes cancellation behind an in-flight finalizer and prevents activation', async () => {
+        const calls: string[] = []
+        const manifestHash = 'cd'.repeat(32)
+        let resolveFinalize!: (value: unknown) => void
+        const pendingFinalize = new Promise((resolve) => {
+            resolveFinalize = resolve
+        })
+        const receipt = await prepareNativeContentImport(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.json' },
+            'card.json',
+            {},
+            nativeDependencies(async (command) => {
+                calls.push(command)
+                if (command === 'native_file_job_start') return { jobId: 'content-1' }
+                if (command === 'native_file_job_status') {
+                    return contentStatus('succeeded', 'complete', preparedContent)
+                }
+                if (command === 'asset_cas_job_finalize_content') return pendingFinalize
+                if (command === 'asset_cas_job_release' || command === 'native_file_job_forget') return null
+                throw new Error(`Unexpected command: ${command}`)
+            }),
+        )
+
+        const activation = receipt.prepareOwnerManifestAndSeal(Uint8Array.of(1))
+        const cancellation = receipt.cancel()
+        await Promise.resolve()
+        expect(calls).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'asset_cas_job_finalize_content',
+        ])
+
+        resolveFinalize({
+            contentHash: manifestHash,
+            byteSize: 1,
+            physicalKey: `assets-v2/objects/cd/${manifestHash.slice(2)}`,
+            deduplicated: false,
+        })
+
+        await expect(activation).rejects.toMatchObject({ name: 'AbortError' })
+        await expect(cancellation).resolves.toBeUndefined()
+        await expect(receipt.confirmActivated()).resolves.toBeUndefined()
+        expect(calls).toEqual([
+            'native_file_job_start',
+            'native_file_job_status',
+            'asset_cas_job_finalize_content',
+            'asset_cas_job_release',
             'native_file_job_forget',
         ])
     })
