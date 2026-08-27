@@ -183,6 +183,7 @@
                     || !pairingInput
                     || cloneState.phase === 'paused'
                     || cloneState.phase === 'downloading'
+                    || cloneState.phase === 'failed'
                 }
                 onclick={() => acceptPairingUri(pairingInput)}
             >
@@ -198,12 +199,20 @@
             >{language.peerClone.resume}</Button>
             <Button
                 styled="danger"
-                disabled={busy || (cloneState.phase !== 'paused' && cloneState.phase !== 'downloading')}
+                disabled={
+                    busy
+                    || cloneState.activationCommitted
+                    || (
+                        cloneState.phase !== 'paused'
+                        && cloneState.phase !== 'downloading'
+                        && cloneState.phase !== 'failed'
+                    )
+                }
                 onclick={cancelClone}
             >{language.peerClone.cancel}</Button>
         </div>
 
-        {#if cloneState.phase === 'paused' || cloneState.phase === 'downloading' || cloneState.phase === 'cancelled' || cloneState.phase === 'completed'}
+        {#if cloneState.phase === 'paused' || cloneState.phase === 'downloading' || cloneState.phase === 'failed' || cloneState.phase === 'cancelled' || cloneState.phase === 'completed'}
             <label class="mt-3 block text-sm font-bold" for="android-peer-clone-progress">
                 {language.peerClone.progress}
             </label>
