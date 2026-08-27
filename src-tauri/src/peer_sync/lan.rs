@@ -562,13 +562,14 @@ impl LanCloneHostControl {
         let Some(shared) = self.shared.upgrade() else {
             return Vec::new();
         };
-        shared
+        let devices = shared
             .devices
             .lock()
             .unwrap()
             .values()
             .map(|device| device.info.clone())
-            .collect()
+            .collect();
+        devices
     }
 
     pub(crate) fn revoke(&self, device_id: &str) -> bool {
