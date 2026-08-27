@@ -1574,7 +1574,9 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             return validation("logical delta target has no durable common base for this peer");
         };
         let actual_revision = current_revision(&self.store.connection).map_err(storage_error)?;
-        if actual_base == self.remote_base() {
+        if self.activation_mode != LogicalDeltaActivationMode::DeferPeerState
+            && actual_base == self.remote_base()
+        {
             self.validate_already_active(plan, actual_revision)?;
             return Ok(PersistentLogicalDeltaStage::AlreadyActive {
                 revision: actual_revision,
@@ -5751,9 +5753,60 @@ mod tests {
         assert_eq!(
             store.sync_device_ack_state("library", "peer").unwrap(),
             SyncDeviceAckState {
-                shared_identity: shared,
-                local_identity: local,
+                shared_identity: shared.clone(),
+                local_identity: local.clone(),
             }
+        );
+
+        let mut advanced_source = EmptySource { content_gets: 0 };
+        let mut advanced_target = PersistentLogicalDeltaTarget::new_p5_deferred(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "shared-c",
+            &remote.manifest_bytes,
+            &staging_root,
+            LogicalDeltaConflictPolicy::Reject,
+        )
+        .unwrap();
+        assert!(matches!(
+            execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &remote_sizes,
+                &mut advanced_source,
+                &mut advanced_target,
+            ),
+            Err(PeerSyncError::ActivationConflict { .. })
+        ));
+        drop(advanced_target);
+        assert_eq!(advanced_source.content_gets, 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<(String, String, String), _, _>(
+                    "SELECT common_base.generation_id,
+                            device.acknowledged_generation_id,
+                            proof.local_generation_id
+                     FROM logical_peer_common_bases AS common_base
+                     JOIN logical_sync_devices AS device
+                       ON device.library_id = common_base.library_id
+                      AND device.device_id = common_base.peer_id
+                     JOIN logical_sync_device_ack_proofs AS proof
+                       ON proof.library_id = device.library_id
+                      AND proof.device_id = device.device_id
+                     WHERE common_base.peer_id = 'peer' AND common_base.library_id = 'library'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap(),
+            (
+                shared.generation_id.clone(),
+                shared.generation_id,
+                local.generation_id,
+            )
         );
     }
 
