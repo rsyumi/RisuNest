@@ -76,6 +76,7 @@ pub(crate) struct PersistentLogicalDeltaTarget<'a> {
     remote_manifest_hash: String,
     staging_root: PathBuf,
     durable_job: Option<&'a RefCell<DurableCasJob>>,
+    conflict_policy: LogicalDeltaConflictPolicy,
 }
 
 pub(crate) enum PersistentLogicalDeltaStage {
@@ -104,6 +105,43 @@ pub(crate) struct PeerBase {
     generation_id: String,
     manifest_hash: String,
     generation_sequence: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogicalDeltaConflictPolicy {
+    Reject,
+    PreferLocal,
+    PreferRemote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogicalDeltaConflictKind {
+    SameRecord,
+    DeleteVsEdit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LogicalDeltaConflict {
+    pub(crate) record: String,
+    pub(crate) kind: LogicalDeltaConflictKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LogicalDeltaPlanResolution {
+    Ready {
+        plan: ReadyLogicalDeltaPlan,
+        conflicts: Vec<LogicalDeltaConflict>,
+    },
+    Conflict {
+        conflicts: Vec<LogicalDeltaConflict>,
+    },
+}
+
+struct PolicyThreeWayPlan {
+    apply: Vec<LogicalDeltaApplyOperation>,
+    preserve_local_keys: Vec<String>,
+    candidate_object_hashes: Vec<String>,
+    conflicts: Vec<LogicalDeltaConflict>,
 }
 
 struct PreparedPut {
@@ -283,6 +321,31 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             remote_manifest_bytes,
             staging_root,
             None,
+            LogicalDeltaConflictPolicy::Reject,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_conflict_policy(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        conflict_policy: LogicalDeltaConflictPolicy,
+    ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            None,
+            conflict_policy,
         )
     }
 
@@ -306,6 +369,32 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             remote_manifest_bytes,
             staging_root,
             Some(durable_job),
+            LogicalDeltaConflictPolicy::Reject,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_durable_job_and_conflict_policy(
+        store: &'a mut PersistentStore,
+        cas: &'a PayloadCas,
+        peer_id: &str,
+        library_id: &str,
+        local_generation_id: &str,
+        remote_manifest_bytes: &[u8],
+        staging_root: &Path,
+        durable_job: &'a RefCell<DurableCasJob>,
+        conflict_policy: LogicalDeltaConflictPolicy,
+    ) -> Result<Self, PeerSyncError> {
+        Self::new_inner(
+            store,
+            cas,
+            peer_id,
+            library_id,
+            local_generation_id,
+            remote_manifest_bytes,
+            staging_root,
+            Some(durable_job),
+            conflict_policy,
         )
     }
 
@@ -319,6 +408,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         remote_manifest_bytes: &[u8],
         staging_root: &Path,
         durable_job: Option<&'a RefCell<DurableCasJob>>,
+        conflict_policy: LogicalDeltaConflictPolicy,
     ) -> Result<Self, PeerSyncError> {
         if peer_id.is_empty() || library_id.is_empty() || local_generation_id.is_empty() {
             return validation("logical delta target identities must be nonempty");
@@ -353,6 +443,7 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             remote_manifest_hash,
             staging_root: staging_root.to_path_buf(),
             durable_job,
+            conflict_policy,
         })
     }
 
@@ -489,6 +580,54 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
             candidate_object_hashes,
             next_base_manifest_hash: self.remote_manifest_hash.clone(),
             next_base_generation_sequence: self.remote_manifest.generation_sequence.clone(),
+        })
+    }
+
+    pub(crate) fn resolve_authoritative_plan(
+        &self,
+        expected_local_revision: i64,
+    ) -> Result<LogicalDeltaPlanResolution, PeerSyncError> {
+        if expected_local_revision < 0 {
+            return validation("logical delta expected local revision must be nonnegative");
+        }
+        let base = self.common_base()?.ok_or_else(|| {
+            PeerSyncError::Validation(
+                "logical delta target has no durable common base for this peer".to_owned(),
+            )
+        })?;
+        let base_manifest = self.load_common_base_manifest(&base)?;
+        let local_manifest =
+            self.load_local_manifest(&self.local_generation_id, expected_local_revision, true)?;
+        validate_manifest_object_size_parity([
+            &base_manifest,
+            &local_manifest,
+            &self.remote_manifest,
+        ])?;
+        let resolved = derive_policy_three_way_plan(
+            &base_manifest,
+            &local_manifest,
+            &self.remote_manifest,
+            self.conflict_policy,
+        )?;
+        if self.conflict_policy == LogicalDeltaConflictPolicy::Reject
+            && !resolved.conflicts.is_empty()
+        {
+            return Ok(LogicalDeltaPlanResolution::Conflict {
+                conflicts: resolved.conflicts,
+            });
+        }
+        Ok(LogicalDeltaPlanResolution::Ready {
+            plan: ReadyLogicalDeltaPlan {
+                expected_local_revision,
+                expected_base_manifest_hash: base.manifest_hash,
+                expected_remote_generation: self.remote_manifest.generation.clone(),
+                apply: resolved.apply,
+                preserve_local_keys: resolved.preserve_local_keys,
+                candidate_object_hashes: resolved.candidate_object_hashes,
+                next_base_manifest_hash: self.remote_manifest_hash.clone(),
+                next_base_generation_sequence: self.remote_manifest.generation_sequence.clone(),
+            },
+            conflicts: resolved.conflicts,
         })
     }
 
@@ -634,6 +773,67 @@ impl<'a> PersistentLogicalDeltaTarget<'a> {
         if plan.apply != apply
             || plan.preserve_local_keys != preserve_local_keys
             || plan.candidate_object_hashes != candidate_object_hashes
+        {
+            return validation("logical delta caller plan differs from the authoritative merge");
+        }
+        Ok(())
+    }
+
+    fn validate_policy_three_way_plan(
+        &self,
+        plan: &ReadyLogicalDeltaPlan,
+        base: &LogicalManifest,
+        local: &LogicalManifest,
+    ) -> Result<(), PeerSyncError> {
+        if self.conflict_policy == LogicalDeltaConflictPolicy::Reject {
+            return self.validate_exact_three_way_plan(plan, base, local);
+        }
+        let local_manifest_hash = hash_logical_manifest(local)
+            .map_err(|error| PeerSyncError::Validation(error.to_string()))?;
+        validate_same_generation_identity(
+            &base.generation,
+            &plan.expected_base_manifest_hash,
+            &base.generation_sequence,
+            &local.generation,
+            &local_manifest_hash,
+            &local.generation_sequence,
+        )?;
+        validate_same_generation_identity(
+            &base.generation,
+            &plan.expected_base_manifest_hash,
+            &base.generation_sequence,
+            &self.remote_manifest.generation,
+            &self.remote_manifest_hash,
+            &self.remote_manifest.generation_sequence,
+        )?;
+        validate_same_generation_identity(
+            &local.generation,
+            &local_manifest_hash,
+            &local.generation_sequence,
+            &self.remote_manifest.generation,
+            &self.remote_manifest_hash,
+            &self.remote_manifest.generation_sequence,
+        )?;
+        if compare_generation_sequences(
+            &self.remote_manifest.generation_sequence,
+            &base.generation_sequence,
+        )
+        .is_lt()
+        {
+            return validation("logical delta remote generation predates the common base");
+        }
+        if self.remote_manifest.generation_sequence == base.generation_sequence
+            && (self.remote_manifest.generation != base.generation
+                || self.remote_manifest_hash != plan.expected_base_manifest_hash)
+        {
+            return validation("logical delta remote generation reuses the common-base sequence");
+        }
+        validate_manifest_object_size_parity([base, local, &self.remote_manifest])?;
+        let resolved =
+            derive_policy_three_way_plan(base, local, &self.remote_manifest, self.conflict_policy)?;
+        if plan.apply != resolved.apply
+            || plan.preserve_local_keys != resolved.preserve_local_keys
+            || plan.candidate_object_hashes != resolved.candidate_object_hashes
         {
             return validation("logical delta caller plan differs from the authoritative merge");
         }
@@ -1132,7 +1332,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
             plan.expected_local_revision,
             true,
         )?;
-        self.validate_exact_three_way_plan(plan, &base_manifest, &local_manifest)?;
+        self.validate_policy_three_way_plan(plan, &base_manifest, &local_manifest)?;
         if plan.apply.is_empty() {
             return Ok(PersistentLogicalDeltaStage::NoOp {
                 expected_base: actual_base,
@@ -1273,7 +1473,7 @@ impl LogicalDeltaStagedTarget for PersistentLogicalDeltaTarget<'_> {
                 plan.expected_local_revision,
                 true,
             )?;
-            self.validate_exact_three_way_plan(plan, &base_manifest, &local_manifest)?;
+            self.validate_policy_three_way_plan(plan, &base_manifest, &local_manifest)?;
         }
         match stage {
             PersistentLogicalDeltaStage::AlreadyActive { .. } => Ok(()),
@@ -1838,6 +2038,122 @@ fn derive_exact_three_way_plan(
     }
 
     Ok((apply, preserve, candidates.into_iter().collect()))
+}
+
+fn derive_policy_three_way_plan(
+    base: &LogicalManifest,
+    local: &LogicalManifest,
+    remote: &LogicalManifest,
+    policy: LogicalDeltaConflictPolicy,
+) -> Result<PolicyThreeWayPlan, PeerSyncError> {
+    let mut positions = [0_usize; 3];
+    let manifests = [base, local, remote];
+    let mut apply = Vec::new();
+    let mut preserve = Vec::new();
+    let mut candidates = BTreeSet::new();
+    let mut conflicts = Vec::new();
+
+    while positions
+        .iter()
+        .enumerate()
+        .any(|(index, position)| *position < manifests[index].records.len())
+    {
+        let key = manifests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, manifest)| manifest.records.get(positions[index]))
+            .map(LogicalManifestRecord::key)
+            .min()
+            .expect("at least one manifest record remains");
+        let mut triple: [Option<&LogicalManifestRecord>; 3] = [None, None, None];
+        for (index, manifest) in manifests.iter().enumerate() {
+            if manifest
+                .records
+                .get(positions[index])
+                .is_some_and(|record| record.key() == key)
+            {
+                triple[index] = manifest.records.get(positions[index]);
+                positions[index] += 1;
+            }
+        }
+        let [base_record, local_record, remote_record] = triple;
+        if matches!(base_record, Some(LogicalManifestRecord::Tombstone(_)))
+            && (!matches!(local_record, Some(LogicalManifestRecord::Tombstone(_)))
+                || !matches!(remote_record, Some(LogicalManifestRecord::Tombstone(_))))
+        {
+            return validation(format!(
+                "logical delta descendant must retain base tombstone {key}"
+            ));
+        }
+        if base_record.is_some() && (local_record.is_none() || remote_record.is_none()) {
+            return validation(format!(
+                "logical delta descendant must retain or tombstone base record {key}"
+            ));
+        }
+        let local_changed = local_record != base_record;
+        let remote_changed = remote_record != base_record;
+        if !local_changed && !remote_changed {
+            continue;
+        }
+        if local_changed && remote_changed {
+            if local_record == remote_record {
+                continue;
+            }
+            let kind = match (local_record, remote_record) {
+                (
+                    Some(LogicalManifestRecord::Tombstone(_)),
+                    Some(LogicalManifestRecord::Live(_)),
+                )
+                | (
+                    Some(LogicalManifestRecord::Live(_)),
+                    Some(LogicalManifestRecord::Tombstone(_)),
+                ) => LogicalDeltaConflictKind::DeleteVsEdit,
+                _ => LogicalDeltaConflictKind::SameRecord,
+            };
+            conflicts.push(LogicalDeltaConflict {
+                record: key.to_owned(),
+                kind,
+            });
+            match policy {
+                LogicalDeltaConflictPolicy::Reject => continue,
+                LogicalDeltaConflictPolicy::PreferLocal => {
+                    preserve.push(key.to_owned());
+                    continue;
+                }
+                LogicalDeltaConflictPolicy::PreferRemote => {}
+            }
+        } else if local_changed {
+            preserve.push(key.to_owned());
+            continue;
+        } else if !remote_changed {
+            continue;
+        }
+        match remote_record {
+            Some(LogicalManifestRecord::Live(record)) => {
+                apply.push(LogicalDeltaApplyOperation::Put {
+                    key: record.key.clone(),
+                    object_hash: record.object_hash.clone(),
+                    dependencies: record.dependencies.clone(),
+                });
+                candidates.insert(record.object_hash.clone());
+                candidates.extend(record.dependencies.iter().cloned());
+            }
+            Some(LogicalManifestRecord::Tombstone(record)) => {
+                apply.push(LogicalDeltaApplyOperation::Delete {
+                    key: record.key.clone(),
+                    deleted_generation_sequence: record.deleted_generation_sequence.clone(),
+                });
+            }
+            None => {}
+        }
+    }
+
+    Ok(PolicyThreeWayPlan {
+        apply,
+        preserve_local_keys: preserve,
+        candidate_object_hashes: candidates.into_iter().collect(),
+        conflicts,
+    })
 }
 
 fn validate_locator_envelope(
@@ -3709,6 +4025,187 @@ mod tests {
     }
 
     #[test]
+    fn policy_reject_returns_sorted_typed_conflicts_without_a_plan() {
+        let plugin = |key: &str, hash: &str| {
+            LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key: encode_logical_record_key(&LogicalRecordLocator::Plugin {
+                    storage_key: key.to_owned(),
+                })
+                .unwrap(),
+                state: "live".to_owned(),
+                object_hash: hash.repeat(64),
+                dependencies: vec![],
+            })
+        };
+        let tombstone = |key: &str| {
+            LogicalManifestRecord::Tombstone(LogicalManifestTombstoneRecord {
+                key: encode_logical_record_key(&LogicalRecordLocator::Plugin {
+                    storage_key: key.to_owned(),
+                })
+                .unwrap(),
+                state: "tombstone".to_owned(),
+                deleted_generation_sequence: "2".to_owned(),
+            })
+        };
+        let manifest = |generation: &str, records| LogicalManifest {
+            schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+            library_id: "library".to_owned(),
+            generation: generation.to_owned(),
+            generation_sequence: "2".to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records,
+            objects: vec![],
+        };
+        let base = manifest("base", vec![plugin("alpha", "a"), plugin("beta", "a")]);
+        let local = manifest("local", vec![plugin("alpha", "b"), tombstone("beta")]);
+        let remote = manifest("remote", vec![plugin("alpha", "c"), plugin("beta", "c")]);
+
+        let resolution = derive_policy_three_way_plan(
+            &base,
+            &local,
+            &remote,
+            LogicalDeltaConflictPolicy::Reject,
+        )
+        .unwrap();
+
+        assert_eq!(resolution.apply, vec![]);
+        assert_eq!(resolution.preserve_local_keys, vec![]);
+        assert_eq!(
+            resolution.conflicts,
+            vec![
+                LogicalDeltaConflict {
+                    record: encode_logical_record_key(&LogicalRecordLocator::Plugin {
+                        storage_key: "alpha".to_owned(),
+                    })
+                    .unwrap(),
+                    kind: LogicalDeltaConflictKind::SameRecord,
+                },
+                LogicalDeltaConflict {
+                    record: encode_logical_record_key(&LogicalRecordLocator::Plugin {
+                        storage_key: "beta".to_owned(),
+                    })
+                    .unwrap(),
+                    kind: LogicalDeltaConflictKind::DeleteVsEdit,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn policy_prefer_local_preserves_conflicts_and_applies_remote_only_changes() {
+        let key = |storage_key: &str| {
+            encode_logical_record_key(&LogicalRecordLocator::Plugin {
+                storage_key: storage_key.to_owned(),
+            })
+            .unwrap()
+        };
+        let live = |storage_key: &str, hash: &str| {
+            LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key: key(storage_key),
+                state: "live".to_owned(),
+                object_hash: hash.repeat(64),
+                dependencies: vec![],
+            })
+        };
+        let manifest = |generation: &str, records| LogicalManifest {
+            schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+            library_id: "library".to_owned(),
+            generation: generation.to_owned(),
+            generation_sequence: "2".to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records,
+            objects: vec![],
+        };
+        let base = manifest("base", vec![live("shared", "a")]);
+        let local = manifest("local", vec![live("shared", "b")]);
+        let remote = manifest(
+            "remote",
+            vec![live("remote-only", "d"), live("shared", "c")],
+        );
+
+        let resolution = derive_policy_three_way_plan(
+            &base,
+            &local,
+            &remote,
+            LogicalDeltaConflictPolicy::PreferLocal,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution.apply,
+            vec![LogicalDeltaApplyOperation::Put {
+                key: key("remote-only"),
+                object_hash: "d".repeat(64),
+                dependencies: vec![],
+            }]
+        );
+        assert_eq!(resolution.preserve_local_keys, vec![key("shared")]);
+        assert_eq!(
+            resolution.conflicts,
+            vec![LogicalDeltaConflict {
+                record: key("shared"),
+                kind: LogicalDeltaConflictKind::SameRecord,
+            }]
+        );
+    }
+
+    #[test]
+    fn policy_prefer_remote_applies_remote_winner_for_every_conflict() {
+        let key = encode_logical_record_key(&LogicalRecordLocator::Plugin {
+            storage_key: "shared".to_owned(),
+        })
+        .unwrap();
+        let live = |hash: &str| {
+            LogicalManifestRecord::Live(LogicalManifestLiveRecord {
+                key: key.clone(),
+                state: "live".to_owned(),
+                object_hash: hash.repeat(64),
+                dependencies: vec![],
+            })
+        };
+        let manifest = |generation: &str, record| LogicalManifest {
+            schema: LOGICAL_MANIFEST_SCHEMA.to_owned(),
+            library_id: "library".to_owned(),
+            generation: generation.to_owned(),
+            generation_sequence: "2".to_owned(),
+            parent_generation: None,
+            source_revision: 1,
+            records: vec![record],
+            objects: vec![],
+        };
+        let base = manifest("base", live("a"));
+        let local = manifest("local", live("b"));
+        let remote = manifest("remote", live("c"));
+
+        let resolution = derive_policy_three_way_plan(
+            &base,
+            &local,
+            &remote,
+            LogicalDeltaConflictPolicy::PreferRemote,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolution.apply,
+            vec![LogicalDeltaApplyOperation::Put {
+                key: key.clone(),
+                object_hash: "c".repeat(64),
+                dependencies: vec![],
+            }]
+        );
+        assert!(resolution.preserve_local_keys.is_empty());
+        assert_eq!(
+            resolution.conflicts,
+            vec![LogicalDeltaConflict {
+                record: key,
+                kind: LogicalDeltaConflictKind::SameRecord,
+            }]
+        );
+    }
+
+    #[test]
     fn generation_identity_binds_the_same_id_to_hash_and_sequence() {
         assert!(matches!(
             validate_same_generation_identity(
@@ -4876,8 +5373,70 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            target.resolve_authoritative_plan(0).unwrap(),
+            LogicalDeltaPlanResolution::Conflict {
+                conflicts: vec![LogicalDeltaConflict {
+                    record: record.key.clone(),
+                    kind: LogicalDeltaConflictKind::SameRecord,
+                }],
+            }
+        );
         expect_begin_merge_conflict(&mut target, &plan);
         assert!(!staging_root.exists());
+
+        drop(target);
+        let mut target = PersistentLogicalDeltaTarget::new_with_conflict_policy(
+            &mut store,
+            &cas,
+            "peer",
+            "library",
+            "local-0",
+            &remote.manifest_bytes,
+            &staging_root,
+            LogicalDeltaConflictPolicy::PreferRemote,
+        )
+        .unwrap();
+        let resolution = target.resolve_authoritative_plan(0).unwrap();
+        let (plan, conflicts) = match resolution {
+            LogicalDeltaPlanResolution::Ready { plan, conflicts } => (plan, conflicts),
+            LogicalDeltaPlanResolution::Conflict { .. } => {
+                panic!("prefer-remote policy must produce an authoritative plan")
+            }
+        };
+        assert_eq!(
+            conflicts,
+            vec![LogicalDeltaConflict {
+                record: record.key.clone(),
+                kind: LogicalDeltaConflictKind::SameRecord,
+            }]
+        );
+        let mut source = MapSource {
+            objects: [(record.object.hash.clone(), record.object.bytes.clone())]
+                .into_iter()
+                .collect(),
+            content_gets: 0,
+        };
+        let remote_sizes = [(record.object.hash.clone(), record.object.size)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            execute_logical_delta_pull(
+                &plan,
+                &BTreeSet::new(),
+                &cas,
+                &remote_sizes,
+                &mut source,
+                &mut target,
+            )
+            .unwrap(),
+            LogicalDeltaActivation::Activated { revision: 1 }
+        );
+        drop(target);
+        assert_eq!(
+            store.read_root(None).unwrap().value,
+            json!({"theme":"remote"})
+        );
     }
 
     #[test]
