@@ -34,7 +34,10 @@ import { isConversationSummaryStub } from './storage/conversationResidency'
 import { open } from '@tauri-apps/plugin-dialog'
 import { readFile } from '@tauri-apps/plugin-fs'
 import { isTauriDesktop } from './platform'
-import { selectCharacterImageFile } from './storage/characterImageFileRoute'
+import {
+    archiveCurrentCharacterImage,
+    selectCharacterImageFile,
+} from './storage/characterImageFileRoute'
 import { importNativeJpegAsset } from './storage/nativeJpegAssetImport'
 
 export async function commitDetachedCharacter(
@@ -184,14 +187,7 @@ export function dumpCharImage(charIndex:number) {
     if(!char.image || char.image === ''){
         return
     }
-    char.ccAssets ??= []
-    char.ccAssets.push({
-        type: 'icon',
-        name: 'iconx',
-        uri: char.image,
-        ext: 'png'
-    })
-    char.image = ''
+    archiveCurrentCharacterImage(char)
     DBState.db.characters[charIndex] = char
 }
 

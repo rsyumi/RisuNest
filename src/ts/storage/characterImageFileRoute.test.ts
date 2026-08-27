@@ -1,8 +1,30 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { selectCharacterImageFile } from './characterImageFileRoute'
+import {
+    archiveCurrentCharacterImage,
+    selectCharacterImageFile,
+} from './characterImageFileRoute'
 
 describe('character image file route', () => {
+    it.each([
+        ['assets/first.JPG', 'jpg'],
+        ['assets/second.JPEG?download=1#portrait', 'jpeg'],
+    ])('preserves the previous JPEG extension when replacing %s', (uri, extension) => {
+        const character = { image: uri, ccAssets: [] }
+
+        archiveCurrentCharacterImage(character)
+
+        expect(character).toEqual({
+            image: '',
+            ccAssets: [{
+                type: 'icon',
+                name: 'iconx',
+                uri,
+                ext: extension,
+            }],
+        })
+    })
+
     it('keeps desktop JPEG bytes out of JavaScript and uses the explicit native destination', async () => {
         const nativeImport = vi.fn(async () => ({
             revision: 8,

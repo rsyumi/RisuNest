@@ -26,6 +26,40 @@ export type CharacterImageFileRouteResult =
         name?: string
     }
 
+interface MutableCharacterImage {
+    image?: string
+    ccAssets?: Array<{
+        type: string
+        uri: string
+        name: string
+        ext: string
+    }>
+}
+
+function characterImageExtension(uri: string): string {
+    const path = uri.split(/[?#]/, 1)[0]
+    const separator = path.lastIndexOf('.')
+    const extension = separator < 0
+        ? ''
+        : path.slice(separator + 1).toLocaleLowerCase('en-US')
+    return ['png', 'webp', 'gif', 'jpg', 'jpeg'].includes(extension)
+        ? extension
+        : 'png'
+}
+
+export function archiveCurrentCharacterImage(character: MutableCharacterImage): void {
+    if (!character.image) return
+    const uri = character.image
+    character.ccAssets ??= []
+    character.ccAssets.push({
+        type: 'icon',
+        name: 'iconx',
+        uri,
+        ext: characterImageExtension(uri),
+    })
+    character.image = ''
+}
+
 function fileNameFromPath(path: string): string {
     return path.split(/[\\/]/).at(-1) || path
 }
