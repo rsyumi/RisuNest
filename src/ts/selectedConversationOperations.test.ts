@@ -107,6 +107,7 @@ function makeHarness(options: {
     let viewportSnapshot: ConversationViewportSnapshot = {
         sourceToken: 'persistent-source',
         version: 3,
+        storeRevision: 7,
         totalMessages: 3,
         keyAt: (absoluteIndex: number) => absoluteIndex === 1 ? viewportRow.key : undefined,
         indexOfKey: (key: ConversationViewportKey) => key === viewportRow.key ? 1 : -1,
@@ -484,6 +485,7 @@ describe('selected conversation complete-operation gateway', () => {
         harness.setViewportSnapshot({
             sourceToken: 'sourceToken' in change ? change.sourceToken : 'persistent-source',
             version: 3,
+            storeRevision: 7,
             totalMessages: 3,
             keyAt: (absoluteIndex) => absoluteIndex === row.absoluteIndex ? row.key : undefined,
             indexOfKey: (key) => key === row.key ? row.absoluteIndex : -1,

@@ -10,7 +10,9 @@ import {
     captureConversationRerollTail,
     captureConversationRerollTransition,
     createConversationRerollHistory,
+    isConversationRerollHistoryCurrent,
     moveConversationRerollHistory,
+    refreshConversationRerollHistory,
     replaceConversationRerollLastData,
     truncateConversationForReroll,
 } from './conversationReroll'
@@ -257,6 +259,7 @@ describe('conversation reroll mutations', () => {
             history,
             currentTarget,
             captureConversationRerollTail(currentTarget, 1),
+            oldTarget,
         )
 
         character.chatPage = 1
@@ -287,7 +290,7 @@ describe('conversation reroll mutations', () => {
         ])
     })
 
-    it('rejects history after leaving and returning to the same conversation session', () => {
+    it('rebinds history after the same persisted conversation is demoted and promoted', () => {
         const conversation = createConversation(messages('user', 'old'))
         const character = createCharacter(conversation)
         const firstSession = new ActiveConversationSession({
@@ -311,28 +314,98 @@ describe('conversation reroll mutations', () => {
             history,
             currentTarget,
             captureConversationRerollTail(currentTarget, 1),
+            oldTarget,
         )
         firstSession.invalidate()
+        const returnedConversation = createConversation(
+            structuredClone(conversation.message),
+        )
+        const returnedCharacter = createCharacter(returnedConversation)
         const returnedSession = new ActiveConversationSession({
+            characterId: returnedCharacter.chaId,
+            conversationId: returnedConversation.id,
+            conversation: returnedConversation,
+            storeRevision: 1,
+        })
+        const returnedTarget = captureConversationMutationTarget(
+            returnedCharacter,
+            returnedConversation,
+            returnedSession,
+        )
+
+        expect(isConversationRerollHistoryCurrent(history, returnedTarget)).toBe(true)
+        const rebound = refreshConversationRerollHistory(history, returnedTarget)
+        const moved = moveConversationRerollHistory(
+            rebound!,
+            returnedTarget,
+            'unreroll',
+        )
+
+        expect(moved).not.toBeNull()
+        expect(returnedConversation.message.map((message) => message.data)).toEqual([
+            'user',
+            'old',
+        ])
+        expect(conversation.message.map((message) => message.data)).toEqual([
+            'user',
+            'current',
+        ])
+    })
+
+    it('invalidates rebound history after an intervening tail mutation', () => {
+        const conversation = createConversation(messages('user', 'old'))
+        const character = createCharacter(conversation)
+        const firstSession = new ActiveConversationSession({
             characterId: character.chaId,
             conversationId: conversation.id,
             conversation,
             storeRevision: 1,
         })
-        const returnedTarget = captureConversationMutationTarget(
+        const oldTarget = captureConversationMutationTarget(character, conversation, firstSession)
+        let history = createConversationRerollHistory(
+            oldTarget,
+            captureConversationRerollTail(oldTarget, 1),
+        )
+        firstSession.reroll(firstSession.positionAt(1), [{ role: 'char', data: 'current' }])
+        const currentTarget = captureConversationMutationTarget(
             character,
             conversation,
+            firstSession,
+        )
+        history = appendConversationRerollHistory(
+            history,
+            currentTarget,
+            captureConversationRerollTail(currentTarget, 1),
+            oldTarget,
+        )
+        firstSession.invalidate()
+        const returnedConversation = createConversation([
+            { role: 'user', data: 'user' },
+            { role: 'char', data: 'intervening mutation' },
+        ])
+        const returnedCharacter = createCharacter(returnedConversation)
+        const returnedSession = new ActiveConversationSession({
+            characterId: returnedCharacter.chaId,
+            conversationId: returnedConversation.id,
+            conversation: returnedConversation,
+            storeRevision: 2,
+        })
+        const returnedTarget = captureConversationMutationTarget(
+            returnedCharacter,
+            returnedConversation,
             returnedSession,
         )
 
+        expect(isConversationRerollHistoryCurrent(history, returnedTarget)).toBe(false)
+        expect(refreshConversationRerollHistory(history, returnedTarget)).toBeNull()
         expect(moveConversationRerollHistory(
             history,
             returnedTarget,
             'unreroll',
         )).toBeNull()
-        expect(conversation.message.map((message) => message.data)).toEqual([
+        expect(returnedConversation.message.map((message) => message.data)).toEqual([
             'user',
-            'current',
+            'intervening mutation',
         ])
     })
 
@@ -356,6 +429,7 @@ describe('conversation reroll mutations', () => {
             history,
             currentTarget,
             captureConversationRerollTail(currentTarget, 1),
+            oldTarget,
         )
         conversation.message[1] = { role: 'char', data: 'direct replacement' }
         const directlyMutatedTarget = captureConversationMutationTarget(
@@ -395,6 +469,7 @@ describe('conversation reroll mutations', () => {
             history,
             currentTarget,
             captureConversationRerollTail(currentTarget, 1),
+            oldTarget,
         )
         session.append({ role: 'char', data: 'newer session message' })
         const advancedTarget = captureConversationMutationTarget(character, conversation, session)
@@ -431,6 +506,7 @@ describe('conversation reroll mutations', () => {
             history,
             currentTarget,
             captureConversationRerollTail(currentTarget, 1),
+            oldTarget,
         )
         const beforeUndo = structuredClone(conversation.message)
 

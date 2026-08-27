@@ -257,10 +257,15 @@
     }
 
     function refreshRerollHistoryAfterOwnedMutation(
+        previousTarget: ConversationMutationTarget,
         target: ConversationMutationTarget,
     ): void {
         if (!rerollHistory) return
-        rerollHistory = refreshConversationRerollHistory(rerollHistory, target)
+        rerollHistory = refreshConversationRerollHistory(
+            rerollHistory,
+            target,
+            previousTarget,
+        )
     }
     let screenshotDialogOpen = $state(false)
     let screenshotTotalTurns = $state(0)
@@ -450,7 +455,12 @@
             if(r){
                 replaceConversationRerollLastData(mutationTarget, r, 'reroll')
                 const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
-                if (refreshedTarget) refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
+                if (refreshedTarget) {
+                    refreshRerollHistoryAfterOwnedMutation(
+                        mutationTarget,
+                        refreshedTarget,
+                    )
+                }
                 else rerollHistory = null
                 return
             }
@@ -477,7 +487,11 @@
             rerollHistory = null
             return
         }
-        rerollHistory = refreshConversationRerollHistory(history, truncatedTarget)
+        rerollHistory = refreshConversationRerollHistory(
+            history,
+            truncatedTarget,
+            mutationTarget,
+        )
         if (!rerollHistory) return
         openMenu = false
         await sendChatMainComplete(context)
@@ -504,7 +518,12 @@
         })
         if (result.type === 'precomputed') {
             const refreshedTarget = refreshCurrentConversationTarget(mutationTarget)
-            if (refreshedTarget) refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
+            if (refreshedTarget) {
+                refreshRerollHistoryAfterOwnedMutation(
+                    mutationTarget,
+                    refreshedTarget,
+                )
+            }
             else rerollHistory = null
             return
         }
@@ -541,13 +560,17 @@
             ) {
                 const tail = captureConversationRerollTail(refreshedTarget, previousLength)
                 const refreshedHistory = rerollHistory
-                    ? refreshConversationRerollHistory(rerollHistory, refreshedTarget)
+                    ? refreshConversationRerollHistory(
+                        rerollHistory,
+                        refreshedTarget,
+                        mutationTarget,
+                    )
                     : null
                 rerollHistory = refreshedHistory
                     ? appendConversationRerollHistory(refreshedHistory, refreshedTarget, tail)
                     : createConversationRerollHistory(refreshedTarget, tail)
             } else if (refreshedTarget) {
-                refreshRerollHistoryAfterOwnedMutation(refreshedTarget)
+                refreshRerollHistoryAfterOwnedMutation(mutationTarget, refreshedTarget)
             }
         } catch (error) {
             console.error(error)

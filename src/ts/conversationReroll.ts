@@ -3,10 +3,8 @@ import {
     ConversationSessionStaleError,
     MessageLocatorMismatchError,
     MessageLocatorNotFoundError,
-    type ActiveConversationSession,
-    type ConversationPosition,
 } from './storage/activeConversationSession'
-import type { Chat, Database, Message } from './storage/database.svelte'
+import type { Message } from './storage/database.svelte'
 import { CONVERSATION_RANGE_MAX_LIMIT } from './storage/persistentDataStore'
 import { safeStructuredClone } from './polyfill'
 import {
@@ -15,20 +13,14 @@ import {
     type ConversationMutationTarget,
 } from './conversationMutations'
 
-type ConversationCharacter = Database['characters'][number]
-
 export type ConversationRerollDirection = 'reroll' | 'unreroll'
 
 export interface ConversationRerollTransition {
     characterId: string
     conversationId: string
-    character: ConversationCharacter
-    conversation: Chat
-    session: ActiveConversationSession | null
-    sessionVersion: number | null
-    messages: Message[]
     totalMessages: number
-    position: ConversationPosition | null
+    evidenceStartIndex: number
+    evidence: readonly Message[]
     absoluteIndex: number
     overlayStartIndex: number
     replacement: readonly Message[]
@@ -38,12 +30,9 @@ export interface ConversationRerollTransition {
 export interface ConversationRerollHistory {
     characterId: string
     conversationId: string
-    character: ConversationCharacter
-    conversation: Chat
-    session: ActiveConversationSession | null
-    sessionVersion: number | null
-    messages: Message[]
     totalMessages: number
+    evidenceStartIndex: number
+    evidence: readonly Message[]
     entries: readonly Message[][]
     index: number
     backward: ConversationRerollTransition | null
@@ -66,16 +55,13 @@ export function captureConversationRerollTransition(
     const replacement = safeStructuredClone([...tail])
     const effectiveLength = Math.min(replacement.length, target.messages.length)
     const absoluteIndex = target.messages.length - effectiveLength
+    const evidence = captureRerollEvidence(target, Math.max(1, effectiveLength))
     return {
         characterId: target.character.chaId,
         conversationId: target.conversation.id,
-        character: target.character,
-        conversation: target.conversation,
-        session: target.session,
-        sessionVersion: target.sessionVersion,
-        messages: target.messages,
         totalMessages: target.messageCount,
-        position: target.session?.positionAt(absoluteIndex) ?? null,
+        evidenceStartIndex: evidence.startIndex,
+        evidence: evidence.messages,
         absoluteIndex,
         overlayStartIndex: target.messageCount - replacement.length,
         replacement,
@@ -95,11 +81,11 @@ export function applyConversationRerollTail(
         const ignored = transition.replacement.length -
             Math.min(transition.replacement.length, target.messages.length)
         const effectiveReplacement = transition.replacement.slice(ignored)
-        if (!transition.position) throw new ConversationRerollHistoryStaleError()
+        const position = target.session.positionAt(transition.absoluteIndex)
         if (transition.direction === 'reroll') {
-            target.session.reroll(transition.position, effectiveReplacement)
+            target.session.reroll(position, effectiveReplacement)
         } else {
-            target.session.replaceTail(transition.position, effectiveReplacement)
+            target.session.replaceTail(position, effectiveReplacement)
         }
         return
     }
@@ -126,8 +112,16 @@ export function appendConversationRerollHistory(
     history: ConversationRerollHistory,
     target: ConversationMutationTarget,
     tail: readonly Message[],
+    previousTarget: ConversationMutationTarget = target,
 ): ConversationRerollHistory {
-    if (!isConversationRerollHistoryOwner(history, target)) {
+    if (
+        !isConversationRerollHistoryOwner(history, target) ||
+        !isConversationRerollHistoryEvidenceCurrent(
+            history,
+            previousTarget,
+            previousTarget === target,
+        )
+    ) {
         throw new ConversationRerollHistoryStaleError()
     }
     const entries = [...history.entries, safeStructuredClone([...tail])]
@@ -137,8 +131,16 @@ export function appendConversationRerollHistory(
 export function refreshConversationRerollHistory(
     history: ConversationRerollHistory,
     target: ConversationMutationTarget,
+    previousTarget: ConversationMutationTarget = target,
 ): ConversationRerollHistory | null {
-    if (!isConversationRerollHistoryOwner(history, target)) return null
+    if (
+        !isConversationRerollHistoryOwner(history, target) ||
+        !isConversationRerollHistoryEvidenceCurrent(
+            history,
+            previousTarget,
+            previousTarget === target,
+        )
+    ) return null
     return bindConversationRerollHistory(history.entries, history.index, target)
 }
 
@@ -152,9 +154,7 @@ export function isConversationRerollHistoryCurrent(
     } catch {
         return false
     }
-    return history.sessionVersion === target.sessionVersion &&
-        history.messages === target.messages &&
-        history.totalMessages === target.messageCount
+    return isConversationRerollHistoryEvidenceCurrent(history, target)
 }
 
 export function moveConversationRerollHistory(
@@ -163,16 +163,21 @@ export function moveConversationRerollHistory(
     direction: ConversationRerollDirection,
 ): ConversationRerollHistory | null {
     if (!isConversationRerollHistoryCurrent(history, target)) return null
-    const transition = direction === 'reroll' ? history.forward : history.backward
-    if (!transition) return history
+    const available = direction === 'reroll' ? history.forward : history.backward
+    if (!available) return history
     try {
+        const nextIndex = history.index + (direction === 'reroll' ? 1 : -1)
+        const transition = captureConversationRerollTransition(
+            target,
+            history.entries[nextIndex],
+            direction,
+        )
         applyConversationRerollTail(target, transition)
         const refreshedTarget = captureConversationMutationTarget(
             target.character,
             target.conversation,
             target.session,
         )
-        const nextIndex = history.index + (direction === 'reroll' ? 1 : -1)
         return bindConversationRerollHistory(history.entries, nextIndex, refreshedTarget)
     } catch (error) {
         if (isStaleRerollError(error)) return null
@@ -252,15 +257,14 @@ function bindConversationRerollHistory(
     target: ConversationMutationTarget,
 ): ConversationRerollHistory {
     assertConversationMutationTargetCurrent(target)
+    const evidenceLength = Math.max(1, ...entries.map((entry) => entry.length))
+    const evidence = captureRerollEvidence(target, evidenceLength)
     return {
         characterId: target.character.chaId,
         conversationId: target.conversation.id,
-        character: target.character,
-        conversation: target.conversation,
-        session: target.session,
-        sessionVersion: target.sessionVersion,
-        messages: target.messages,
         totalMessages: target.messageCount,
+        evidenceStartIndex: evidence.startIndex,
+        evidence: evidence.messages,
         entries,
         index,
         backward: index > 0
@@ -277,10 +281,7 @@ function isConversationRerollHistoryOwner(
     target: ConversationMutationTarget,
 ): boolean {
     return history.characterId === target.character.chaId &&
-        history.conversationId === target.conversation.id &&
-        history.character === target.character &&
-        history.conversation === target.conversation &&
-        history.session === target.session
+        history.conversationId === target.conversation.id
 }
 
 function isConversationRerollTransitionCurrent(
@@ -289,12 +290,83 @@ function isConversationRerollTransitionCurrent(
 ): boolean {
     return transition.characterId === target.character.chaId &&
         transition.conversationId === target.conversation.id &&
-        transition.character === target.character &&
-        transition.conversation === target.conversation &&
-        transition.session === target.session &&
-        transition.sessionVersion === target.sessionVersion &&
-        transition.messages === target.messages &&
-        transition.totalMessages === target.messageCount
+        transition.totalMessages === target.messageCount &&
+        isRerollEvidenceCurrent(
+            transition.evidenceStartIndex,
+            transition.evidence,
+            target,
+        )
+}
+
+function isConversationRerollHistoryEvidenceCurrent(
+    history: ConversationRerollHistory,
+    target: ConversationMutationTarget,
+    requireCurrent = true,
+): boolean {
+    if (!isConversationRerollHistoryOwner(history, target)) return false
+    if (requireCurrent) {
+        try {
+            assertConversationMutationTargetCurrent(target)
+        } catch {
+            return false
+        }
+    }
+    return history.totalMessages === target.messageCount &&
+        isRerollEvidenceCurrent(
+            history.evidenceStartIndex,
+            history.evidence,
+            target,
+            requireCurrent,
+        )
+}
+
+function isRerollEvidenceCurrent(
+    startIndex: number,
+    evidence: readonly Message[],
+    target: ConversationMutationTarget,
+    requireCurrent = true,
+): boolean {
+    if (startIndex !== target.messageCount - evidence.length) return false
+    const current = requireCurrent
+        ? captureConversationRerollTail(target, startIndex)
+        : safeStructuredClone(target.messages.slice(startIndex))
+    return exactValueEqual(current, evidence)
+}
+
+function captureRerollEvidence(
+    target: ConversationMutationTarget,
+    requestedLength: number,
+): { startIndex: number; messages: Message[] } {
+    const length = Math.min(
+        target.messageCount,
+        CONVERSATION_RANGE_MAX_LIMIT,
+        Math.max(1, requestedLength),
+    )
+    const startIndex = target.messageCount - length
+    return {
+        startIndex,
+        messages: captureConversationRerollTail(target, startIndex),
+    }
+}
+
+function exactValueEqual(left: unknown, right: unknown): boolean {
+    if (Object.is(left, right)) return true
+    if (typeof left !== 'object' || left === null || typeof right !== 'object' || right === null) {
+        return false
+    }
+    if (Array.isArray(left) || Array.isArray(right)) {
+        if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+            return false
+        }
+        return left.every((value, index) => exactValueEqual(value, right[index]))
+    }
+    const leftRecord = left as Record<string, unknown>
+    const rightRecord = right as Record<string, unknown>
+    const leftKeys = Object.keys(leftRecord)
+    const rightKeys = Object.keys(rightRecord)
+    return leftKeys.length === rightKeys.length &&
+        leftKeys.every((key) => Object.hasOwn(rightRecord, key) &&
+            exactValueEqual(leftRecord[key], rightRecord[key]))
 }
 
 function isStaleRerollError(error: unknown): boolean {
