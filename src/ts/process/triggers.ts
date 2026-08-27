@@ -1,5 +1,6 @@
 import { parseChatML } from "../parser/chatML";
 import { risuChatParser as risuChatParserGlobal } from "../parser/parser.svelte";
+import type { ActiveConversationPin } from "../storage/activeConversationSession";
 import { getCurrentCharacter, getDatabase, setCurrentCharacter, setDatabase, type Chat, type character } from "../storage/database.svelte";
 import { tokenize } from "../tokenizer";
 import { getModuleTriggers } from "./modules";
@@ -1073,6 +1074,10 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     conversationOperation?: ConversationOperationContext
 }){
     arg.recursiveCount ??= 0
+    const moduleTriggers = getModuleTriggers()
+    if (char.triggerscript.length === 0 && moduleTriggers.length === 0) {
+        return null
+    }
     char = arg.displayMode ? char : safeStructuredClone(char)
     let varChanged = false
     let stopSending = arg.stopSending ?? false
@@ -1086,10 +1091,9 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
     const triggers = char.triggerscript.map((v) => {
         v.lowLevelAccess = CharacterlowLevelAccess
         return v
-    }).concat(getModuleTriggers())
+    }).concat(moduleTriggers)
     const db = getDatabase()
     const defaultVariables = parseKeyValue(char.defaultVariables).concat(parseKeyValue(db.templateDefaultVariables))
-    let chat = arg.displayMode ? arg.chat : safeStructuredClone(arg.chat ?? char.chats[char.chatPage])
     
     const previousTriggerId = get(CurrentTriggerIdStore)
     const shouldSetTriggerId = !arg.displayMode && mode !== 'display'
@@ -1097,13 +1101,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         CurrentTriggerIdStore.set(arg.triggerId || null)
     }
     
-    if((!triggers) || (triggers.length === 0)){
-        if (shouldSetTriggerId) {
-            CurrentTriggerIdStore.set(previousTriggerId)
-        }
-        return null
-    }
-
     let ownedConversationOperation: ConversationOperationContext | null = null
     if (!arg.displayMode && !arg.conversationOperation) {
         const activeSession = peekActiveConversationSession()
@@ -1118,7 +1115,21 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
         }
     }
     const conversationOperation = arg.conversationOperation ?? ownedConversationOperation
-    if (conversationOperation) chat = conversationOperation.chat
+    let chat = conversationOperation?.chat ?? (
+        arg.displayMode
+            ? arg.chat
+            : safeStructuredClone(arg.chat ?? char.chats[char.chatPage])
+    )
+    let displayHistoryPin: ActiveConversationPin | null = null
+    if (arg.displayMode) {
+        const activeSession = peekActiveConversationSession()
+        if (
+            activeSession?.isActive &&
+            activeSession.materializeCompatibilityArray() === arg.chat.message
+        ) {
+            displayHistoryPin = activeSession.acquirePin('compatibility')
+        }
+    }
     const operationDatabase = conversationOperation?.createDatabaseView(db) ?? db
     let operationGetChatVar: ((key: string) => string) | undefined
     let operationSetChatVar: ((key: string, value: string) => void) | undefined
@@ -2877,5 +2888,6 @@ export async function runTrigger(char:character,mode:triggerMode, arg:{
                 ownedConversationOperation.release()
             }
         }
+        displayHistoryPin?.release()
     }
 }

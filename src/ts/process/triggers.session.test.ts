@@ -3,6 +3,7 @@ import { ActiveConversationSession } from '../storage/activeConversationSession'
 import type { Chat, character } from '../storage/database.svelte'
 import { DBState, selectedCharID } from '../stores.svelte'
 import { processMultiCommand } from './command'
+import { createConversationOperationContext } from './conversationOperationContext'
 
 const runtime = vi.hoisted(() => ({
     session: null as ActiveConversationSession | null,
@@ -230,4 +231,105 @@ test('does not publish Trigger metadata to either conversation after navigation'
     } finally {
         vi.useRealTimers()
     }
+})
+
+test('does not clone conversation history when no trigger exists', async () => {
+    const { chat, char } = fixture()
+    char.triggerscript = []
+    let historyReads = 0
+    Object.defineProperty(chat, 'note', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+            historyReads += 1
+            return 'note'
+        },
+    })
+    DBState.db = {
+        characters: [char],
+        templateDefaultVariables: '',
+    } as never
+
+    await expect(runTrigger(char, 'manual', {
+        chat,
+        manualName: 'missing',
+    })).resolves.toBeNull()
+
+    expect(historyReads).toBe(0)
+})
+
+test('reuses a supplied operation chat across recursive triggers without cloning it', async () => {
+    const { chat, char, session } = fixture()
+    char.triggerscript = [
+        {
+            comment: 'outer',
+            type: 'manual',
+            conditions: [],
+            effect: [{ type: 'runtrigger', value: 'inner' }],
+        },
+        {
+            comment: 'inner',
+            type: 'manual',
+            conditions: [],
+            effect: [],
+        },
+    ] as never
+    runtime.session = session
+    DBState.db = {
+        characters: [char],
+        templateDefaultVariables: '',
+    } as never
+    const operation = createConversationOperationContext(session, chat)
+    let operationChatReads = 0
+    Object.defineProperty(operation.chat, 'note', {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+            operationChatReads += 1
+            return 'operation note'
+        },
+    })
+
+    try {
+        const result = await runTrigger(char, 'manual', {
+            chat: operation.chat,
+            manualName: 'outer',
+            conversationOperation: operation,
+        })
+
+        expect(result?.chat).toBe(operation.chat)
+        expect(operationChatReads).toBe(0)
+    } finally {
+        operation.release()
+    }
+})
+
+test('pins display history for the full awaited trigger lifetime', async () => {
+    const { chat, char, session } = fixture()
+    char.triggerscript[0].type = 'display'
+    char.triggerscript[0].conditions = [
+        { type: 'chatindex', value: '0', operator: '>' },
+    ]
+    char.triggerscript[0].effect = [
+        { type: 'v2Comment', value: '' },
+    ] as never
+    runtime.session = session
+    DBState.db = {
+        characters: [char],
+        templateDefaultVariables: '',
+    } as never
+    const pending = runTrigger(char, 'display', {
+        chat,
+        displayMode: true,
+        displayData: 'display',
+        additonalSysPrompt: {
+            start: 'awaited prompt',
+            historyend: '',
+            promptend: '',
+        },
+    })
+
+    expect(session.pinCount('compatibility')).toBe(1)
+    await pending
+    expect(session.pinCount('compatibility')).toBe(0)
 })
