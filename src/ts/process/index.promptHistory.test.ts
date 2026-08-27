@@ -297,6 +297,8 @@ describe('sendChat prompt history characterization', () => {
         expect(session.matchesConversation(selectedCharacter.chaId, liveChat)).toBe(true)
         expect(session.activePinReasons).toEqual([])
         expect(readRange.mock.calls.map(([start, limit]) => [start, limit])).toEqual([
+            [0, 128],
+            [128, 5],
             [3, 128],
             [131, 2],
         ])
@@ -316,6 +318,60 @@ describe('sendChat prompt history characterization', () => {
         expect(previewFormated[10].content).toBe('duplicate CBS_REGEX')
         expect(previewFormated[11].content).toBe('duplicate CBS_REGEX')
         expect(get(doingChat)).toBe(false)
+    })
+
+    it('commits runVar message data and ordered chat variables through the paged session pass', async () => {
+        setDatabaseLite(makeDatabase())
+        const selectedCharacter = DBState.db.characters[0] as character
+        const liveChat = selectedCharacter.chats[0]
+        liveChat.fmIndex = -1
+        liveChat.message = [
+            {
+                role: 'user',
+                data: '{{setvar::counter::1}}first',
+                chatId: 'first',
+            },
+            {
+                role: 'char',
+                data: '{{addvar::counter::1}}{{getvar::counter}}',
+                chatId: 'second',
+            },
+            { role: 'user', data: 'plain third', chatId: 'third' },
+        ]
+        const session = new ActiveConversationSession({
+            characterId: selectedCharacter.chaId,
+            conversationId: liveChat.id!,
+            conversation: liveChat,
+            storeRevision: 45,
+        })
+        const acquirePin = vi.spyOn(session, 'acquirePin')
+        const applyOperation = vi.spyOn(session, 'applyOperation')
+        testState.activeSession = session
+        mockTriggerClone()
+
+        await expect(sendChat(-1, { preview: true })).resolves.toBe(true)
+
+        expect(liveChat.message.map((message) => message.data)).toEqual([
+            'first',
+            '2',
+            'plain third',
+        ])
+        expect(liveChat.scriptstate).toEqual({ '$counter': '2' })
+        expect(acquirePin.mock.calls).toContainEqual(['compatibility'])
+        expect(applyOperation.mock.calls[0][0]).toMatchObject({
+            expectedVersion: 0,
+            metadata: expect.objectContaining({
+                scriptstate: { '$counter': '2' },
+            }),
+            ranges: [{
+                deleteCount: 2,
+                messages: [
+                    expect.objectContaining({ data: 'first' }),
+                    expect.objectContaining({ data: '2' }),
+                ],
+            }],
+        })
+        expect(session.activePinReasons).toEqual([])
     })
 
     it('shares one mutating prompt operation and exposes earlier injections to later outer CBS parsing', async () => {
@@ -369,8 +425,9 @@ describe('sendChat prompt history characterization', () => {
             [0, 3],
             [0, 3],
             [0, 3],
+            [0, 3],
         ])
-        expect(session.version).toBe(2)
+        expect(session.version).toBe(3)
         expect(session.activePinReasons).toEqual([])
     })
 
@@ -569,7 +626,10 @@ describe('sendChat prompt history characterization', () => {
         const result = await sendChat(-1, { preview: true })
 
         expect(result).toBe(true)
-        expect(readRange).not.toHaveBeenCalled()
+        expect(readRange.mock.calls.map(([start, limit]) => [start, limit])).toEqual([
+            [0, 128],
+            [128, 5],
+        ])
         expect(session.matchesConversation(selectedCharacter.chaId, liveChat)).toBe(true)
         expect(session.activePinReasons).toEqual([])
         expect(previewFormated).toHaveLength(ACTIVE_MESSAGE_COUNT)
@@ -581,7 +641,7 @@ describe('sendChat prompt history characterization', () => {
         expect(tokenizePinReasons.slice(0, ACTIVE_MESSAGE_COUNT).every(
             (reasons) => reasons.includes('compatibility'),
         )).toBe(true)
-        expect(acquirePin.mock.calls.filter(([reason]) => reason === 'compatibility')).toHaveLength(1)
+        expect(acquirePin.mock.calls.filter(([reason]) => reason === 'compatibility')).toHaveLength(2)
         expect(acquirePin.mock.calls.filter(([reason]) => reason === 'transaction')).toHaveLength(0)
     })
 

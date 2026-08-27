@@ -137,6 +137,7 @@ export type ConversationMetadata = Record<string, unknown>
 export interface ActiveConversationOperationRange {
     position: ConversationPosition
     deleteCount: number
+    expectedMessages?: readonly Message[]
     messages: readonly Message[]
 }
 
@@ -145,6 +146,7 @@ export interface ActiveConversationOperationCommit {
     expectedMetadata: ConversationMetadata
     metadata: ConversationMetadata
     range?: ActiveConversationOperationRange
+    ranges?: readonly ActiveConversationOperationRange[]
 }
 
 export interface ActiveConversationPin {
@@ -1481,11 +1483,15 @@ export class ActiveConversationSession {
                 )
             }
 
+            if (commit.range !== undefined && commit.ranges !== undefined) {
+                throw new TypeError('Conversation operation cannot include both range and ranges')
+            }
+            const ranges = commit.ranges ?? (commit.range === undefined ? [] : [commit.range])
             const metadataChanged = !conversationMetadataEqual(
                 commit.expectedMetadata,
                 commit.metadata,
             )
-            if (commit.range === undefined && !metadataChanged) return
+            if (ranges.length === 0 && !metadataChanged) return
 
             const previousVersion = this.sessionVersion
             const previousMessages = this.conversation.message
@@ -1493,35 +1499,77 @@ export class ActiveConversationSession {
             const previousLocatorRegistry = this.locatorRegistry
             let nextMessages = previousMessages
             const commands: ActiveConversationCommandName[] = []
+            const mutationRanges: ActiveConversationMutationRange[] = []
 
-            if (commit.range !== undefined) {
+            let previousRangeEnd = 0
+            const replacements = ranges.map((range, index) => {
                 validatePosition(
                     this.conversationId,
                     previousMessages,
                     previousVersion,
-                    commit.range.position,
+                    range.position,
                     previousLocatorRegistry,
                 )
                 validateIndex(
-                    commit.range.deleteCount,
+                    range.deleteCount,
                     'Conversation replace-range deleteCount',
                 )
                 if (
-                    commit.range.deleteCount >
-                    previousMessages.length - commit.range.position.absoluteIndex
+                    range.deleteCount >
+                    previousMessages.length - range.position.absoluteIndex
                 ) {
                     throw new RangeError(
                         'Conversation replace-range exceeds the current message count',
                     )
                 }
-                nextMessages = [
-                    ...previousMessages.slice(0, commit.range.position.absoluteIndex),
-                    ...safeStructuredClone(commit.range.messages),
-                    ...previousMessages.slice(
-                        commit.range.position.absoluteIndex + commit.range.deleteCount,
-                    ),
-                ]
-                commands.push('replace-range')
+                if (index > 0 && range.position.absoluteIndex < previousRangeEnd) {
+                    throw new RangeError('Conversation operation ranges must be ordered and disjoint')
+                }
+                if (ranges.length > 1 && range.messages.length !== range.deleteCount) {
+                    throw new RangeError(
+                        'Multi-range conversation operations must preserve message positions',
+                    )
+                }
+                if (
+                    range.expectedMessages !== undefined &&
+                    (
+                        range.expectedMessages.length !== range.deleteCount ||
+                        !valuesEqual(
+                            range.expectedMessages,
+                            previousMessages.slice(
+                                range.position.absoluteIndex,
+                                range.position.absoluteIndex + range.deleteCount,
+                            ),
+                        )
+                    )
+                ) {
+                    throw new MessageLocatorMismatchError(
+                        'Conversation operation message baseline changed',
+                    )
+                }
+                previousRangeEnd = range.position.absoluteIndex + range.deleteCount
+                return safeStructuredClone([...range.messages])
+            })
+            if (ranges.length > 0) {
+                nextMessages = previousMessages.slice()
+                for (let index = ranges.length - 1; index >= 0; index--) {
+                    const range = ranges[index]
+                    nextMessages.splice(
+                        range.position.absoluteIndex,
+                        range.deleteCount,
+                        ...replacements[index],
+                    )
+                }
+                for (let index = 0; index < ranges.length; index++) {
+                    const range = ranges[index]
+                    commands.push('replace-range')
+                    mutationRanges.push({
+                        start: range.position.absoluteIndex,
+                        deleteCount: range.deleteCount,
+                        messages: replacements[index],
+                        sessionVersion: previousVersion + index + 1,
+                    })
+                }
             }
             if (metadataChanged) commands.push('update-metadata')
 
@@ -1531,16 +1579,16 @@ export class ActiveConversationSession {
             if (metadataChanged) {
                 replaceConversationMetadata(this.conversation, commit.metadata)
             }
-            this.sessionVersion = previousVersion + 1
+            this.sessionVersion = previousVersion + Math.max(1, ranges.length)
             this.locatorRegistry = nextLocatorRegistry
             try {
                 this.notifyMutation(
                     previousVersion,
                     commands,
-                    [{
-                        start: commit.range?.position.absoluteIndex ?? nextMessages.length,
-                        deleteCount: commit.range?.deleteCount ?? 0,
-                        messages: safeStructuredClone([...(commit.range?.messages ?? [])]),
+                    mutationRanges.length > 0 ? mutationRanges : [{
+                        start: nextMessages.length,
+                        deleteCount: 0,
+                        messages: [],
                         sessionVersion: this.sessionVersion,
                     }],
                 )

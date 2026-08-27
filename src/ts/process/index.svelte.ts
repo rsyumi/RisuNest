@@ -65,6 +65,7 @@ import {
     selectPromptHistory,
     type PromptHistoryCompatibilitySnapshot,
 } from './promptHistory'
+import { runCurrentChatParserPass } from './currentChatParserPass'
 
 export { doingChat } from './generationState'
 
@@ -223,11 +224,14 @@ async function sendChatInternal(chatProcessIndex: number,arg:{
 
 
     function runCurrentChatFunction(chat:Chat){
-        chat.message = chat.message.map((v) => {
-            v.data = risuChatParser(v.data, {chara: currentChar, runVar: true})
-            return v
+        return runCurrentChatParserPass({
+            chat,
+            database: DBState.db,
+            ownerCharacterId: nowChatroom.chaId,
+            parserCharacter: currentChar,
+            session: getActiveConversationSession(),
+            parser: risuChatParser,
         })
-        return chat
     }
 
     function reformatContent(data:string){

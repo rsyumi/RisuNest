@@ -9,7 +9,10 @@ import type { PersistentDataStore } from './persistentDataStore'
 import { RevisionConflictError } from './persistentDataStore'
 import { createPluginStorageStore } from '../plugins/pluginStorageStore'
 import { createConversationSummaryStubFromChat } from './conversationResidency'
-import { ActiveConversationSession } from './activeConversationSession'
+import {
+    ActiveConversationSession,
+    cloneConversationMetadata,
+} from './activeConversationSession'
 
 function makeDatabase(): Database {
     return {
@@ -3362,6 +3365,90 @@ describe('SaveCoordinator', () => {
             sessionVersion: 2,
             revision: 3,
         }))
+    })
+
+    it('persists one atomic multi-range and metadata operation through one working-set commit', async () => {
+        const database = makeChattyDatabase()
+        const commit = vi.fn(async ({ expectedRevision }) => ({ revision: expectedRevision + 1 }))
+        let session!: ActiveConversationSession
+        const coordinator = new SaveCoordinator({
+            store: makeStore(commit),
+            captureRoot: () => captureRoot(database),
+            captureSelectedCharacter: () => database.characters[0],
+            replaceDatabase: () => undefined,
+            onConversationMutationPersistenceStarted: (event) =>
+                session.beginPersistence(event.sessionVersion),
+            onConversationMutationPersisted: (event) => {
+                session.acknowledgePersisted(
+                    event.sessionToken,
+                    event.sessionVersion,
+                    event.revision,
+                )
+            },
+        })
+        coordinator.initialize(2)
+        const conversation = database.characters[0].chats[1]
+        session = new ActiveConversationSession({
+            characterId: 'char-a',
+            conversationId: 'two',
+            conversation,
+            storeRevision: 2,
+            onMutation: (event) => coordinator.recordActiveConversationMutation(event),
+        })
+        const expectedMetadata = cloneConversationMetadata(conversation)
+
+        session.applyOperation({
+            expectedVersion: 0,
+            expectedMetadata,
+            metadata: {
+                ...expectedMetadata,
+                scriptstate: { '$counter': '2' },
+            },
+            ranges: [
+                {
+                    position: session.positionAt(0),
+                    deleteCount: 1,
+                    messages: [{ role: 'user', data: 'parsed first' }],
+                },
+                {
+                    position: session.positionAt(1),
+                    deleteCount: 1,
+                    messages: [{ role: 'char', data: 'parsed second' }],
+                },
+            ],
+        })
+        await coordinator.flushPendingData('atomic-multi-range')
+
+        expect(commit).toHaveBeenCalledOnce()
+        expect(commit.mock.calls[0][0]).toMatchObject({
+            expectedRevision: 2,
+            conversations: [
+                {
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'two',
+                    start: 0,
+                    deleteCount: 1,
+                    messages: [{ role: 'user', data: 'parsed first' }],
+                    conversation: expect.objectContaining({
+                        scriptstate: { '$counter': '2' },
+                    }),
+                },
+                {
+                    type: 'replace-range',
+                    characterId: 'char-a',
+                    conversationId: 'two',
+                    start: 1,
+                    deleteCount: 1,
+                    messages: [{ role: 'char', data: 'parsed second' }],
+                    conversation: expect.objectContaining({
+                        scriptstate: { '$counter': '2' },
+                    }),
+                },
+            ],
+        })
+        expect(session.persistedVersion).toBe(2)
+        expect(session.storeRevision).toBe(3)
     })
 
     it('commits and acknowledges an ordered session command whose final value is unchanged', async () => {

@@ -4,6 +4,7 @@ import { ChatRenderIdentityRegistry } from '../chatRenderIdentity'
 import type { Chat, Message } from './database.svelte'
 import {
     ActiveConversationSession,
+    cloneConversationMetadata,
     ConversationNotFoundError,
     ConversationSessionStaleError,
     MessageLocatorMismatchError,
@@ -399,6 +400,135 @@ describe('ActiveConversationSession', () => {
                 expect.objectContaining({ start: 3, deleteCount: 1, sessionVersion: 2 }),
             ],
         }))
+    })
+
+    it('atomically commits disjoint message ranges and metadata from one expected version', () => {
+        const { conversation, onMutation, session } = createSession()
+        const untouchedOne = conversation.message[1]
+        const untouchedTwo = conversation.message[2]
+        const expectedMetadata = cloneConversationMetadata(conversation)
+        const firstPosition = session.positionAt(0)
+        const lastPosition = session.positionAt(3)
+
+        session.applyOperation({
+            expectedVersion: 0,
+            expectedMetadata,
+            metadata: {
+                ...expectedMetadata,
+                name: 'Parsed conversation',
+                scriptstate: { '$counter': '2' },
+            },
+            ranges: [
+                {
+                    position: firstPosition,
+                    deleteCount: 1,
+                    expectedMessages: [message('duplicate', 'zero')],
+                    messages: [message('duplicate', 'parsed zero')],
+                },
+                {
+                    position: lastPosition,
+                    deleteCount: 1,
+                    expectedMessages: [message('tail', 'three')],
+                    messages: [message('tail', 'parsed three')],
+                },
+            ],
+        })
+
+        expect(conversation.message.map((entry) => entry.data)).toEqual([
+            'parsed zero',
+            'one',
+            'two',
+            'parsed three',
+        ])
+        expect(conversation.message[1]).toBe(untouchedOne)
+        expect(conversation.message[2]).toBe(untouchedTwo)
+        expect(conversation.name).toBe('Parsed conversation')
+        expect(conversation.scriptstate).toEqual({ '$counter': '2' })
+        expect(session.version).toBe(2)
+        expect(onMutation).toHaveBeenCalledOnce()
+        expect(onMutation).toHaveBeenCalledWith(expect.objectContaining({
+            previousVersion: 0,
+            sessionVersion: 2,
+            commands: ['replace-range', 'replace-range', 'update-metadata'],
+            mutations: [
+                expect.objectContaining({
+                    start: 0,
+                    deleteCount: 1,
+                    sessionVersion: 1,
+                }),
+                expect.objectContaining({
+                    start: 3,
+                    deleteCount: 1,
+                    sessionVersion: 2,
+                }),
+            ],
+            conversation: expect.objectContaining({
+                name: 'Parsed conversation',
+                scriptstate: { '$counter': '2' },
+            }),
+        }))
+    })
+
+    it('rejects a detached multi-range commit after its message baseline changes in place', () => {
+        const { conversation, onMutation, session } = createSession()
+        const expectedMetadata = cloneConversationMetadata(conversation)
+        const expectedMessage = session.readRange(0, 1).messages
+        const position = session.positionAt(0)
+        conversation.message[0].data = 'compatibility mutation'
+
+        expect(() => session.applyOperation({
+            expectedVersion: 0,
+            expectedMetadata,
+            metadata: expectedMetadata,
+            ranges: [{
+                position,
+                deleteCount: 1,
+                expectedMessages: expectedMessage,
+                messages: [message('duplicate', 'parsed zero')],
+            }],
+        })).toThrow(MessageLocatorMismatchError)
+
+        expect(conversation.message[0].data).toBe('compatibility mutation')
+        expect(session.version).toBe(0)
+        expect(onMutation).not.toHaveBeenCalled()
+    })
+
+    it('rolls back every disjoint range and metadata field when publication fails', () => {
+        const conversation = chat()
+        const originalMessages = conversation.message
+        const onMutation = vi.fn(() => {
+            throw new Error('publication failed')
+        })
+        const { session } = createSession(conversation, onMutation)
+        const expectedMetadata = cloneConversationMetadata(conversation)
+
+        expect(() => session.applyOperation({
+            expectedVersion: 0,
+            expectedMetadata,
+            metadata: { ...expectedMetadata, scriptstate: { '$counter': '2' } },
+            ranges: [
+                {
+                    position: session.positionAt(0),
+                    deleteCount: 1,
+                    messages: [message('duplicate', 'parsed zero')],
+                },
+                {
+                    position: session.positionAt(3),
+                    deleteCount: 1,
+                    messages: [message('tail', 'parsed three')],
+                },
+            ],
+        })).toThrow('publication failed')
+
+        expect(conversation.message).toBe(originalMessages)
+        expect(conversation.message.map((entry) => entry.data)).toEqual([
+            'zero',
+            'one',
+            'two',
+            'three',
+        ])
+        expect(conversation.scriptstate).toBeUndefined()
+        expect(session.version).toBe(0)
     })
 
     it('adopts a trigger replacement only against the captured version and message array', () => {
