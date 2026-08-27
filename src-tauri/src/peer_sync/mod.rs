@@ -4,6 +4,8 @@ mod android_client;
 pub(crate) mod android_commands;
 #[cfg(any(target_os = "android", test))]
 mod android_jni;
+#[cfg(desktop)]
+pub(crate) mod bidirectional_commands;
 mod client;
 #[cfg(desktop)]
 pub(crate) mod commands;
