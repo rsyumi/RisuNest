@@ -2,6 +2,10 @@ import type { Chat, Message, character, customscript, groupChat } from './storag
 import { CONVERSATION_RANGE_MAX_LIMIT, type DataRevision } from './storage/persistentDataStore'
 import type { simpleCharacterArgument } from './parser/parser.svelte'
 import type { ProcessScriptCaptureContext } from './process/scripts'
+import {
+    classifyChatParserHistory,
+    extendChatParserHistoryBounds,
+} from './chatParserHistory'
 import rfdc from 'rfdc'
 
 const cloneScreenshotData = rfdc()
@@ -371,22 +375,18 @@ async function deriveParserHistoryBoundsFromReader(
 ) {
     let start = selectionStartIndex
     let end = selectionEndExclusive
-    const captureText = collectCaptureText([selectedMessages, renderContext]).join('\n')
+    const classification = classifyChatParserHistory({
+        source: [selectedMessages, renderContext],
+    })
+    const classifiedBounds = extendChatParserHistoryBounds(classification, {
+        start,
+        end,
+        totalMessages: reader.totalTurns,
+    })
+    start = classifiedBounds.start
+    end = classifiedBounds.end
 
-    if (requiresFullConversationProjection(captureText)) {
-        return { start: 0, end: reader.totalTurns }
-    }
-
-    for (const match of captureText.matchAll(previousChatLogPattern())) {
-        const requestedIndex = Number(match[1])
-        if (
-            !Number.isInteger(requestedIndex)
-            || requestedIndex < 0
-            || requestedIndex >= reader.totalTurns
-        ) continue
-        start = Math.min(start, requestedIndex)
-        end = Math.max(end, requestedIndex + 1)
-    }
+    if (classification.requiresFullHistory) return { start, end }
 
     if (start === 0 || selectionStartIndex === 0) return { start, end }
 
@@ -409,14 +409,6 @@ async function deriveParserHistoryBoundsFromReader(
         cursor = batchStart
     }
     return { start, end }
-}
-
-function requiresFullConversationProjection(captureText: string): boolean {
-    return /{{\s*(?:userhistory|usermessages|user_history|charhistory|charmessages|char_history|history|messages|messageunixtimearray|message_unixtime_array|idleduration|idle_duration|lastmessage|lastmessageid|lastmessageindex|pick|rollp|rollpick)(?=\s*(?:::|}}))/i.test(captureText)
-}
-
-function previousChatLogPattern(): RegExp {
-    return /{{\s*(?:previouschatlog|previous_chat_log)\s*::\s*(\d+)/gi
 }
 
 export function createChatScreenshotJob(input: {
@@ -492,23 +484,19 @@ function deriveParserHistoryBounds(
         start = Math.min(start, previousUserIndex)
     }
 
-    const captureText = collectCaptureText([
-        messages.slice(selectionStartIndex, selectionEndExclusive),
-        renderContext,
-    ]).join('\n')
-    if (requiresFullConversationProjection(captureText)) {
-        start = 0
-        end = messages.length
-    }
-
-    for (const match of captureText.matchAll(previousChatLogPattern())) {
-        const requestedIndex = Number(match[1])
-        if (!Number.isInteger(requestedIndex) || requestedIndex < 0 || requestedIndex >= messages.length) {
-            continue
-        }
-        start = Math.min(start, requestedIndex)
-        end = Math.max(end, requestedIndex + 1)
-    }
+    const classification = classifyChatParserHistory({
+        source: [
+            messages.slice(selectionStartIndex, selectionEndExclusive),
+            renderContext,
+        ],
+    })
+    const classifiedBounds = extendChatParserHistoryBounds(classification, {
+        start,
+        end,
+        totalMessages: messages.length,
+    })
+    start = classifiedBounds.start
+    end = classifiedBounds.end
 
     return { start, end }
 }
@@ -518,13 +506,4 @@ function findPreviousRoleIndex(messages: Message[], beforeIndex: number, role: M
         if (messages[index].role === role) return index
     }
     return -1
-}
-
-function collectCaptureText(value: unknown, seen = new WeakSet<object>()): string[] {
-    if (typeof value === 'string') return [value]
-    if (!value || typeof value !== 'object' || seen.has(value)) return []
-    seen.add(value)
-    const output: string[] = []
-    for (const child of Object.values(value)) output.push(...collectCaptureText(child, seen))
-    return output
 }

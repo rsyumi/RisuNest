@@ -1,3 +1,4 @@
+import { Buffer } from 'buffer'
 import { describe, expect, it } from 'vitest'
 import {
     createChatScreenshotDialogSnapshot,
@@ -361,6 +362,40 @@ describe('chat screenshot ranges', () => {
         const messages = Array.from({ length: 100 }, (_, index) => ({
             role: index % 2 === 0 ? 'char' as const : 'user' as const,
             data: index === 99 ? macro : `turn ${index + 1}`,
+        }))
+        const { reader } = rangeReader(messages)
+        const dialogSnapshot = createChatScreenshotDialogSnapshot({
+            characterId: reader.characterId,
+            chatId: reader.chatId,
+            revision: reader.revision,
+            sessionVersion: 1,
+            totalTurns: reader.totalTurns,
+            renderContext: renderContext(),
+        })
+
+        const job = await createChatScreenshotJobFromDialogSnapshot(
+            dialogSnapshot,
+            reader,
+            100,
+            100,
+        )
+
+        expect(job.renderContext.historyStartIndex).toBe(0)
+        expect(job.renderContext.parserContext.character.chats[0].message).toHaveLength(100)
+    })
+
+    it.each([
+        ['normalized alias', '{{user-history}}'],
+        ['dynamic previouschatlog', '{{previouschatlog::{{getvar::target}}}}'],
+        [
+            'decoded risu-style CBS',
+            `<risu-style>${Buffer.from('.turn{content:"{{history}}"}').toString('hex')}</risu-style>`,
+        ],
+        ['ambiguous risu-style', '<risu-style>not-hex</risu-style>'],
+    ])('falls back to full pinned history for %s', async (_caseName, parserInput) => {
+        const messages = Array.from({ length: 100 }, (_, index) => ({
+            role: index % 2 === 0 ? 'char' as const : 'user' as const,
+            data: index === 99 ? parserInput : `turn ${index + 1}`,
         }))
         const { reader } = rangeReader(messages)
         const dialogSnapshot = createChatScreenshotDialogSnapshot({
