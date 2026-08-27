@@ -37,6 +37,9 @@ function pinnedLease(): NativePersistentRevisionLease {
         listAssetAliases: vi.fn(),
         readAssetRepositoryAuthority: vi.fn(),
         readAssetOwnerHead: vi.fn(),
+        readColdPayloadAuthority: vi.fn(),
+        readColdAlias: vi.fn(),
+        listColdAliases: vi.fn(),
         release: vi.fn(),
     }
 }

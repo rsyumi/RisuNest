@@ -329,12 +329,13 @@ class OfficialPinnedPublication implements PinnedPublication {
     private metadataFlushed = false
     private acknowledged = false
     private reloadCompleted = false
+    private nativeLeaseNeedsRefresh = false
     private inFlight: Promise<void> | null = null
     private readonly disposalController = new AbortController()
 
     constructor(
         private readonly revision: DataRevision,
-        private readonly lease: PersistentRevisionLease,
+        private lease: PersistentRevisionLease,
         private readonly blobs: BlobStore,
         private readonly assets: readonly PinnedAsset[],
         private readonly coldValues: ReadonlyMap<string, PinnedColdValue>,
@@ -398,13 +399,20 @@ class OfficialPinnedPublication implements PinnedPublication {
             }
             await this.dependencies.flushPublicationMetadata()
             throwIfAborted(signal)
-            const receipt = await this.dependencies.nativeDatabasePublisher({
-                revision: this.revision,
-                accountId: this.accountId,
-                lease: this.lease,
-                resourceReplacements: replacementRecord,
-                signal,
-            })
+            await this.refreshNativeLeaseIfNeeded()
+            let receipt: OfficialNativeDatabasePublicationReceipt | null
+            try {
+                receipt = await this.dependencies.nativeDatabasePublisher({
+                    revision: this.revision,
+                    accountId: this.accountId,
+                    lease: this.lease,
+                    resourceReplacements: replacementRecord,
+                    signal,
+                })
+            } catch (error) {
+                this.nativeLeaseNeedsRefresh = true
+                throw error
+            }
             if (receipt) {
                 this.nativeReceipt = receipt
                 this.databaseFingerprint = receipt.databaseFingerprint
@@ -426,6 +434,22 @@ class OfficialPinnedPublication implements PinnedPublication {
         requireWriteSuccess(result, databaseKey)
         this.publicationCommitted = true
         return this.finalizePublication()
+    }
+
+    private async refreshNativeLeaseIfNeeded(): Promise<void> {
+        if (!this.nativeLeaseNeedsRefresh) return
+        const previous = this.lease
+        const fresh = await this.dependencies.store.acquireRevision(this.revision)
+        try {
+            await releasePersistentRevisionLease(previous)
+        } catch (error) {
+            try {
+                await releasePersistentRevisionLease(fresh)
+            } catch {}
+            throw error
+        }
+        this.lease = fresh
+        this.nativeLeaseNeedsRefresh = false
     }
 
     private async finalizePublication(): Promise<void> {

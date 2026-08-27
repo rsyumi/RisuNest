@@ -370,6 +370,44 @@ describe('OfficialAccountSnapshotAdapter publication', () => {
         expect(noFallback.markPublished).not.toHaveBeenCalled()
     })
 
+    it('reacquires the exact current revision before retrying a consumed native lease', async () => {
+        const leases: Array<Parameters<OfficialNativeDatabasePublisher>[0]['lease']> = []
+        let attempt = 0
+        const nativeDatabasePublisher = vi.fn<OfficialNativeDatabasePublisher>(async (input) => {
+            leases.push(input.lease)
+            const root = await input.lease.readRoot()
+            expect(root.revision).toBe(input.revision)
+            if (attempt++ === 0) {
+                await input.lease.release()
+                throw new Error('native publication failed after consuming its lease')
+            }
+            return {
+                databaseFingerprint: 'd'.repeat(64),
+                acknowledge: vi.fn(async () => undefined),
+                completeReload: vi.fn(async () => undefined),
+            }
+        })
+        const harness = await makeHarness({
+            accountId: 'account-1',
+            nativeDatabasePublisher,
+            flushPublicationMetadata: vi.fn(async () => undefined),
+        })
+        const acquireRevision = vi.spyOn(harness.store, 'acquireRevision')
+        const publication = await harness.adapter.pin(harness.imported.revision)
+
+        await expect(publication.publish()).rejects.toThrow(
+            'native publication failed after consuming its lease',
+        )
+        await expect(publication.publish()).resolves.toBeUndefined()
+
+        expect(acquireRevision).toHaveBeenCalledTimes(2)
+        expect(acquireRevision).toHaveBeenNthCalledWith(1, harness.imported.revision)
+        expect(acquireRevision).toHaveBeenNthCalledWith(2, harness.imported.revision)
+        expect(leases).toHaveLength(2)
+        expect(leases[1]).not.toBe(leases[0])
+        expect(harness.markPublished).toHaveBeenCalledWith(harness.imported.revision)
+    })
+
     it('retries only local finalization after a native remote commit', async () => {
         const events: string[] = []
         const acknowledge = vi.fn(async () => { events.push('acknowledge') })
