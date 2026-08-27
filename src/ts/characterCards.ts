@@ -57,7 +57,8 @@ export async function importPreparedNativeCharacterContent(input: {
         input.displayName,
         {
             map: async (content) => content,
-            activate: activatePreparedNativeCharacterContent,
+            activate: (content, lifecycle, signal) =>
+                activatePreparedNativeCharacterContent(content, lifecycle, undefined, signal),
         },
         options,
     )

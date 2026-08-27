@@ -23,6 +23,7 @@ import type {
     PreparedNativeContentActivationLifecycle,
 } from './nativeFileJobs'
 import { decodeOwnerManifest, ownerManifestIdentity } from './ownerManifestCodec'
+import { runNativePreparedContentRoute } from './nativePreparedContentRoute'
 
 const firstHash = '11'.repeat(32)
 const secondHash = '22'.repeat(32)
@@ -105,6 +106,17 @@ function lifecycle(
         })),
         ...overrides,
     }
+}
+
+function deferred<T>(): {
+    promise: Promise<T>
+    resolve(value?: T): void
+} {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((done) => {
+        resolve = done
+    })
+    return { promise, resolve: (value) => resolve(value as T) }
 }
 
 describe('prepared native character content activation', () => {
@@ -449,6 +461,133 @@ describe('prepared native character content activation', () => {
         expect(deps.map).not.toHaveBeenCalled()
         expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
         expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('cancels the retained route when abort arrives during PNG metadata decoding', async () => {
+        const controller = new AbortController()
+        const pending = deferred<any>()
+        const decodeStarted = deferred<void>()
+        const deps = dependencies({
+            decodePng: vi.fn(async () => {
+                decodeStarted.resolve()
+                return pending.promise
+            }),
+        })
+        const session = lifecycle()
+        const receipt = {
+            jobId: 'content-1',
+            content: {
+                ...content,
+                format: 'png-card',
+                metadata: { chara: 'rcc-envelope' },
+                portraitLogicalId: content.assets[0].logicalId,
+            } as PreparedNativeContent,
+            warningCodes: [],
+            ...session,
+            confirmActivated: vi.fn(async () => undefined),
+            cancel: vi.fn(async () => undefined),
+        }
+
+        const result = runNativePreparedContentRoute(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.png' },
+            'card.png',
+            {
+                prepare: vi.fn(async () => receipt),
+                map: vi.fn(async (prepared) => prepared),
+                activate: (prepared, activeReceipt, signal) =>
+                    activatePreparedNativeCharacterContent(prepared, activeReceipt, deps, signal),
+            },
+            { signal: controller.signal },
+        )
+        await decodeStarted.promise
+        controller.abort()
+        pending.resolve(content.metadata)
+
+        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+        expect(receipt.cancel).toHaveBeenCalledOnce()
+        expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
+        expect(deps.map).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('cancels the retained route when abort arrives during semantic mapping', async () => {
+        const controller = new AbortController()
+        const pending = deferred<character | false>()
+        const mapStarted = deferred<void>()
+        const deps = dependencies({
+            decodePng: vi.fn(async () => content.metadata as any),
+            map: vi.fn(async () => {
+                mapStarted.resolve()
+                return pending.promise
+            }),
+        })
+        const session = lifecycle()
+        const receipt = {
+            jobId: 'content-1',
+            content: {
+                ...content,
+                format: 'png-card',
+                metadata: { ccv3: 'encoded-card' },
+                portraitLogicalId: content.assets[0].logicalId,
+            } as PreparedNativeContent,
+            warningCodes: [],
+            ...session,
+            confirmActivated: vi.fn(async () => undefined),
+            cancel: vi.fn(async () => undefined),
+        }
+
+        const result = runNativePreparedContentRoute(
+            { type: 'desktopPath', path: 'C:\\chosen\\card.png' },
+            'card.png',
+            {
+                prepare: vi.fn(async () => receipt),
+                map: vi.fn(async (prepared) => prepared),
+                activate: (prepared, activeReceipt, signal) =>
+                    activatePreparedNativeCharacterContent(prepared, activeReceipt, deps, signal),
+            },
+            { signal: controller.signal },
+        )
+        await mapStarted.promise
+        controller.abort()
+        pending.resolve(mappedCharacter())
+
+        await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+        expect(receipt.cancel).toHaveBeenCalledOnce()
+        expect(session.prepareOwnerManifestAndSeal).not.toHaveBeenCalled()
+        expect(deps.upsert).not.toHaveBeenCalled()
+    })
+
+    it('finishes atomic activation when abort arrives after owner-manifest sealing begins', async () => {
+        const controller = new AbortController()
+        const sealStarted = deferred<void>()
+        const allowSeal = deferred<void>()
+        const deps = dependencies()
+        const session = lifecycle({
+            prepareOwnerManifestAndSeal: vi.fn(async (bytes) => {
+                sealStarted.resolve()
+                await allowSeal.promise
+                return {
+                    contentHash: await ownerManifestIdentity(bytes),
+                    byteSize: bytes.byteLength,
+                    physicalKey: 'sealed-owner-manifest',
+                    deduplicated: false,
+                }
+            }),
+        })
+
+        const result = activatePreparedNativeCharacterContent(
+            content,
+            session,
+            deps,
+            controller.signal,
+        )
+        await sealStarted.promise
+        controller.abort()
+        allowSeal.resolve()
+
+        await expect(result).resolves.toEqual({ characterId: 'character-1' })
+        expect(session.prepareOwnerManifestAndSeal).toHaveBeenCalledOnce()
+        expect(deps.upsert).toHaveBeenCalledOnce()
     })
 
     it('returns a normal declined outcome without preparing or publishing anything', async () => {

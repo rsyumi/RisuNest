@@ -43,6 +43,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+        throw new DOMException('Native file job was cancelled', 'AbortError')
+    }
+}
+
 function requireCharacterCardMetadata(
     value: Record<string, unknown>,
 ): PreparedNativeCharacterCardMetadata {
@@ -154,10 +160,13 @@ export async function activatePreparedNativeCharacterContent(
     content: PreparedNativeContent,
     lifecycle: PreparedNativeContentActivationLifecycle,
     dependencies: NativeCharacterContentActivationDependencies = productionDependencies,
+    signal?: AbortSignal,
 ): Promise<NativeCharacterContentActivationResult | null> {
+    throwIfAborted(signal)
     const card = content.format === 'png-card'
         ? await dependencies.decodePng(content.metadata as PreparedNativePngCardMetadata)
         : requireCharacterCardMetadata(content.metadata)
+    throwIfAborted(signal)
     if (!card) return null
     const character = await dependencies.map({
         card,
@@ -167,9 +176,11 @@ export async function activatePreparedNativeCharacterContent(
             : { portraitLogicalId: content.portraitLogicalId }),
         ...(content.module === undefined ? {} : { module: content.module }),
     })
+    throwIfAborted(signal)
     if (!character) return null
 
     const assetAliases = preparedAliases(content)
+    throwIfAborted(signal)
     const assetOwnerHead = await prepareAdditionalAssetOwnerHead(
         character,
         assetAliases,
