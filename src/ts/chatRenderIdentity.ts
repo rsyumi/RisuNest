@@ -187,6 +187,14 @@ export class ChatRenderIdentityRegistry {
     resolve(scope: string, messages: readonly Message[]): string[] {
         return this.register(scope, messages).toArray()
     }
+
+    clearRegistration(): void {
+        this.registeredScope = null
+        this.registeredLength = 0
+        this.registeredKeys = []
+        this.registeredIdCounts.clear()
+        this.registeredObjectOccurrences.clear()
+    }
 }
 
 export interface ChatParserCharacterDependencies {

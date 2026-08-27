@@ -14,6 +14,13 @@ import {
     createConversationSummaryStubFromChat,
 } from './conversationResidency'
 import type { PersistedConversationMutationEvent } from './saveCoordinator'
+import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
+import {
+    PersistentConversationViewportSource,
+    SynchronousSessionConversationViewportSource,
+    type ConversationViewportSource,
+} from '../conversationViewportSource'
+import { createMetadataOnlySelectedConversation } from './selectedConversationLifecycle'
 
 type CompleteCharacter = character | groupChat
 
@@ -34,6 +41,18 @@ export interface WorkingSetCoordinator {
         mutationGeneration: number,
         character: CompleteCharacter,
     ): boolean
+    readonly hasPendingPersistenceWork?: boolean
+    adoptWindowedSelectedConversation?(
+        revision: DataRevision,
+        mutationGeneration: number,
+        character: CompleteCharacter,
+        authority: WindowedConversationPersistenceAuthority,
+    ): boolean
+    advanceWindowedSelectedConversationRevision?(
+        revision: DataRevision,
+        authority: WindowedConversationPersistenceAuthority,
+    ): boolean
+    runSelectedConversationTransition?<T>(transition: () => T): T
     recordActiveConversationMutation?(event: ActiveConversationMutationEvent): void
 }
 
@@ -63,7 +82,61 @@ export interface ActiveWorkingSetDependencies {
         conversationId: string,
         nextConversationId: string,
     ): boolean
+    canUseWindowedSelectedConversation?(): boolean
+    isMaximumCompatibilityMode?(): boolean
+    isConversationOperationActive?(): boolean
+    conversationViewportRowBudget?: number
 }
+
+const selectedConversationTargetBrand = Symbol('selectedConversationTarget')
+
+export interface SelectedConversationTarget {
+    readonly characterId: string
+    readonly conversationId: string
+    readonly navigationGeneration: number
+    readonly storeRevision: DataRevision
+    readonly [selectedConversationTargetBrand]: symbol
+}
+
+export interface CompleteConversationLease {
+    readonly reason: string
+    readonly session: ActiveConversationSession
+    readonly target: SelectedConversationTarget
+    release(): void
+}
+
+export class SelectedConversationPromotionStaleError extends Error {
+    constructor() {
+        super('Selected conversation changed during complete promotion')
+        this.name = 'SelectedConversationPromotionStaleError'
+    }
+}
+
+interface CompleteSelectedConversationState {
+    kind: 'complete'
+    stateToken: symbol
+    navigationGeneration: number
+    characterId: string
+    conversationId: string
+    conversation: Chat
+    session: ActiveConversationSession
+    viewportSource: ConversationViewportSource
+}
+
+interface WindowedSelectedConversationState {
+    kind: 'windowed'
+    stateToken: symbol
+    navigationGeneration: number
+    characterId: string
+    conversationId: string
+    conversation: Chat
+    authority: WindowedConversationPersistenceAuthority
+    viewportSource: PersistentConversationViewportSource
+}
+
+type SelectedConversationState =
+    | CompleteSelectedConversationState
+    | WindowedSelectedConversationState
 
 export class ActiveWorkingSet {
     private navigationGeneration = 0
@@ -73,6 +146,8 @@ export class ActiveWorkingSet {
         { generation: number; promise: Promise<boolean> }
     >()
     private activeSession: ActiveConversationSession | null = null
+    private selectedConversationState: SelectedConversationState | null = null
+    private promotionFlight: Promise<CompleteSelectedConversationState> | null = null
 
     constructor(private readonly dependencies: ActiveWorkingSetDependencies) {}
 
@@ -88,8 +163,235 @@ export class ActiveWorkingSet {
         return this.activeSession
     }
 
+    get selectedConversationMode(): SelectedConversationState['kind'] | null {
+        return this.selectedConversationState?.kind ?? null
+    }
+
+    get activeConversationViewportSource(): ConversationViewportSource | null {
+        return this.selectedConversationState?.viewportSource ?? null
+    }
+
+    captureSelectedConversationTarget(): SelectedConversationTarget | null {
+        const state = this.selectedConversationState
+        if (!state) return null
+        return {
+            characterId: state.characterId,
+            conversationId: state.conversationId,
+            navigationGeneration: state.navigationGeneration,
+            storeRevision: state.kind === 'complete'
+                ? state.session.storeRevision
+                : state.authority.storeRevision,
+            [selectedConversationTargetBrand]: state.stateToken,
+        }
+    }
+
+    captureSelectedConversationAuthority(): WindowedConversationPersistenceAuthority | null {
+        const state = this.selectedConversationState
+        return state?.kind === 'windowed' ? { ...state.authority } : null
+    }
+
+    async acquireCompleteConversation(
+        reason: string,
+        target = this.captureSelectedConversationTarget(),
+    ): Promise<CompleteConversationLease> {
+        const state = this.selectedConversationState
+        if (!state || !target || !this.matchesTarget(state, target)) {
+            throw new SelectedConversationPromotionStaleError()
+        }
+        let complete: CompleteSelectedConversationState
+        if (state.kind === 'complete') {
+            complete = state
+        } else {
+            let flight = this.promotionFlight
+            if (!flight) {
+                flight = this.promoteWindowedConversation(state, target, reason)
+                this.promotionFlight = flight
+                const clearFlight = () => {
+                    if (this.promotionFlight === flight) this.promotionFlight = null
+                }
+                void flight.then(clearFlight, clearFlight)
+            }
+            complete = await flight
+        }
+        const recaptured = this.captureSelectedConversationTarget()
+        if (
+            !recaptured ||
+            this.selectedConversationState !== complete ||
+            !this.matchesTarget(complete, recaptured)
+        ) {
+            throw new SelectedConversationPromotionStaleError()
+        }
+        const pin = complete.session.acquirePin('compatibility')
+        let released = false
+        return {
+            reason,
+            session: complete.session,
+            target: recaptured,
+            release() {
+                if (released) return
+                released = true
+                pin.release()
+            },
+        }
+    }
+
+    tryDemoteSelectedConversation(target = this.captureSelectedConversationTarget()): boolean {
+        const state = this.selectedConversationState
+        const transition = this.dependencies.coordinator.runSelectedConversationTransition
+        if (
+            state?.kind !== 'complete' ||
+            !target ||
+            !this.matchesTarget(state, target) ||
+            this.promotionFlight !== null ||
+            this.dependencies.canUseWindowedSelectedConversation?.() !== true ||
+            this.dependencies.isMaximumCompatibilityMode?.() === true ||
+            this.dependencies.isConversationOperationActive?.() === true ||
+            this.dependencies.coordinator.hasPendingPersistenceWork !== false ||
+            !transition ||
+            !this.dependencies.coordinator.adoptWindowedSelectedConversation ||
+            state.session.version !== state.session.persistedVersion ||
+            state.session.storeRevision !== this.dependencies.coordinator.revision ||
+            state.session.isTransactionActive ||
+            state.session.activePinReasons.length > 0 ||
+            state.conversation.isStreaming === true
+        ) return false
+
+        const resident = this.dependencies.getResidentCharacter?.(state.characterId)
+        if (!resident) return false
+        const conversationIndex = resident.chats.findIndex(
+            (conversation) => conversation === state.conversation,
+        )
+        if (conversationIndex < 0) return false
+        let prepared: {
+            shell: Chat
+            nextCharacter: CompleteCharacter
+            authority: WindowedConversationPersistenceAuthority
+            viewportSource: PersistentConversationViewportSource
+            windowedState: WindowedSelectedConversationState
+        }
+        try {
+            const shell = createMetadataOnlySelectedConversation(state.conversation)
+            const nextCharacter = {
+                ...resident,
+                chats: resident.chats.map((conversation, index) =>
+                    index === conversationIndex ? shell : conversation),
+            } as CompleteCharacter
+            const authority: WindowedConversationPersistenceAuthority = {
+                kind: 'windowed',
+                characterId: state.characterId,
+                conversationId: state.conversationId,
+                sessionToken: state.session.sessionToken,
+                storeRevision: state.session.storeRevision,
+                persistedSessionVersion: state.session.persistedVersion,
+                sessionVersion: state.session.version,
+                totalMessages: state.session.totalMessages,
+            }
+            const viewportSource = new PersistentConversationViewportSource({
+                reader: this.dependencies.store,
+                characterId: state.characterId,
+                conversationId: state.conversationId,
+                revision: authority.storeRevision,
+                totalMessages: authority.totalMessages,
+                rowBudget: this.dependencies.conversationViewportRowBudget ?? 64,
+            })
+            prepared = {
+                shell,
+                nextCharacter,
+                authority,
+                viewportSource,
+                windowedState: {
+                    kind: 'windowed',
+                    stateToken: Symbol('windowed selected conversation'),
+                    navigationGeneration: state.navigationGeneration,
+                    characterId: state.characterId,
+                    conversationId: state.conversationId,
+                    conversation: shell,
+                    authority,
+                    viewportSource,
+                },
+            }
+        } catch {
+            return false
+        }
+        const { shell, nextCharacter, authority, viewportSource, windowedState } = prepared
+        try {
+            const adopted = transition.call(this.dependencies.coordinator, () => {
+                this.selectedConversationState = windowedState
+                this.activeSession = null
+                this.dependencies.publishConversation(
+                    state.characterId,
+                    shell,
+                    nextCharacter,
+                )
+                return this.dependencies.coordinator.adoptWindowedSelectedConversation!(
+                    authority.storeRevision,
+                    this.dependencies.coordinator.mutationGeneration,
+                    nextCharacter,
+                    authority,
+                )
+            })
+            if (!adopted) throw new Error('Windowed selected conversation was not adopted')
+        } catch {
+            this.selectedConversationState = state
+            this.activeSession = state.session
+            try {
+                this.dependencies.publishConversation(
+                    state.characterId,
+                    state.conversation,
+                    resident,
+                )
+            } catch {
+                this.selectedConversationState = windowedState
+                this.activeSession = null
+                state.viewportSource.dispose()
+                state.session.invalidate()
+                return false
+            }
+            viewportSource.dispose()
+            return false
+        }
+        state.viewportSource.dispose()
+        state.session.invalidate()
+        return true
+    }
+
     advanceStoreRevision(revision: DataRevision): void {
-        this.activeSession?.advanceStoreRevision(revision)
+        const state = this.selectedConversationState
+        if (state?.kind !== 'windowed') {
+            this.activeSession?.advanceStoreRevision(revision)
+            return
+        }
+        if (revision < state.authority.storeRevision) {
+            throw new RangeError('Selected conversation store revision moved backwards')
+        }
+        if (revision === state.authority.storeRevision) return
+        const advance = this.dependencies.coordinator
+            .advanceWindowedSelectedConversationRevision
+        if (!advance) {
+            throw new Error('Windowed selected conversation revision advance is unavailable')
+        }
+        const authority = { ...state.authority, storeRevision: revision }
+        const viewportSource = new PersistentConversationViewportSource({
+            reader: this.dependencies.store,
+            characterId: state.characterId,
+            conversationId: state.conversationId,
+            revision,
+            totalMessages: authority.totalMessages,
+            rowBudget: this.dependencies.conversationViewportRowBudget ?? 64,
+        })
+        const advancedState: WindowedSelectedConversationState = {
+            ...state,
+            stateToken: Symbol('advanced windowed selected conversation'),
+            authority,
+            viewportSource,
+        }
+        this.selectedConversationState = advancedState
+        if (!advance.call(this.dependencies.coordinator, revision, authority)) {
+            this.selectedConversationState = state
+            viewportSource.dispose()
+            throw new Error('Windowed selected conversation revision was not adopted')
+        }
+        state.viewportSource.dispose()
     }
 
     beginConversationMutationPersistence(event: ActiveConversationMutationEvent) {
@@ -195,6 +497,25 @@ export class ActiveWorkingSet {
     }
 
     async activateCharacter(
+        id: string,
+        options: CharacterActivationOptions = {},
+    ): Promise<boolean> {
+        const preparation = this.prepareCompleteNavigation(
+            `activate-character:${id}`,
+        )
+        let lease: CompleteConversationLease | null = null
+        try {
+            if (preparation) lease = await preparation
+            return await this.activateCompleteCharacter(id, options)
+        } catch (error) {
+            if (error instanceof SelectedConversationPromotionStaleError) return false
+            throw error
+        } finally {
+            lease?.release()
+        }
+    }
+
+    private async activateCompleteCharacter(
         id: string,
         options: CharacterActivationOptions = {},
     ): Promise<boolean> {
@@ -317,6 +638,30 @@ export class ActiveWorkingSet {
     }
 
     activateConversation(id: string): Promise<boolean> {
+        const preparation = this.prepareCompleteNavigation(
+            `activate-conversation:${id}`,
+        )
+        if (!preparation) return this.startConversationActivation(id)
+        return this.activateConversationAfterPreparation(id, preparation)
+    }
+
+    private async activateConversationAfterPreparation(
+        id: string,
+        preparation: Promise<CompleteConversationLease>,
+    ): Promise<boolean> {
+        let lease: CompleteConversationLease | null = null
+        try {
+            lease = await preparation
+            return await this.startConversationActivation(id)
+        } catch (error) {
+            if (error instanceof SelectedConversationPromotionStaleError) return false
+            throw error
+        } finally {
+            lease?.release()
+        }
+    }
+
+    private startConversationActivation(id: string): Promise<boolean> {
         if (this.dependencies.canActivateWorkingSet?.() === false) return Promise.resolve(false)
         const characterId = this.dependencies.getSelectedCharacterId()
         if (!characterId) return Promise.reject(new Error('No character is selected'))
@@ -331,6 +676,15 @@ export class ActiveWorkingSet {
         })
         this.conversationFlights.set(key, { generation, promise: pending })
         return pending
+    }
+
+    private prepareCompleteNavigation(
+        reason: string,
+    ): Promise<CompleteConversationLease> | null {
+        if (this.selectedConversationState?.kind !== 'windowed') return null
+        const target = this.captureSelectedConversationTarget()
+        if (!target) return null
+        return this.acquireCompleteConversation(reason, target)
     }
 
     private async activateConversationOnce(
@@ -407,7 +761,118 @@ export class ActiveWorkingSet {
         const conversationId = conversation.id ?? fallbackConversation.id
         this.clearActiveConversationSession()
         if (!conversationId) return
-        this.activeSession = new ActiveConversationSession({
+        const complete = this.createCompleteSelectedConversationState(
+            characterId,
+            conversation,
+            storeRevision,
+        )
+        this.activeSession = complete.session
+        this.selectedConversationState = complete
+    }
+
+    private clearActiveConversationSession(): void {
+        this.selectedConversationState?.viewportSource.dispose()
+        this.activeSession?.invalidate()
+        this.activeSession = null
+        this.selectedConversationState = null
+        this.promotionFlight = null
+    }
+
+    private async promoteWindowedConversation(
+        state: WindowedSelectedConversationState,
+        target: SelectedConversationTarget,
+        reason: string,
+    ): Promise<CompleteSelectedConversationState> {
+        await this.dependencies.coordinator.flushPendingData(
+            `complete-selected-conversation:${reason}`,
+        )
+        this.requireCurrentWindowedState(state, target)
+        if (this.dependencies.coordinator.revision !== state.authority.storeRevision) {
+            throw new SelectedConversationPromotionStaleError()
+        }
+        const persisted = await this.dependencies.store.readConversation(
+            state.characterId,
+            state.conversationId,
+        )
+        this.requireCurrentWindowedState(state, target)
+        if (
+            !persisted ||
+            persisted.revision !== state.authority.storeRevision ||
+            persisted.value.id !== state.conversationId
+        ) throw new SelectedConversationPromotionStaleError()
+
+        const resident = this.dependencies.getResidentCharacter?.(state.characterId)
+        if (!resident) throw new SelectedConversationPromotionStaleError()
+        const conversationIndex = resident.chats.findIndex(
+            (conversation) => conversation === state.conversation,
+        )
+        if (conversationIndex < 0) throw new SelectedConversationPromotionStaleError()
+        const conversation = persisted.value
+        const nextCharacter = {
+            ...resident,
+            chats: resident.chats.map((candidate, index) =>
+                index === conversationIndex ? conversation : candidate),
+        } as CompleteCharacter
+        const complete = this.createCompleteSelectedConversationState(
+            state.characterId,
+            conversation,
+            state.authority.storeRevision,
+            state.navigationGeneration,
+        )
+        const transition = this.dependencies.coordinator.runSelectedConversationTransition
+        if (!transition) {
+            complete.viewportSource.dispose()
+            complete.session.invalidate()
+            throw new Error('Selected conversation transition is unavailable')
+        }
+        let adopted = false
+        try {
+            adopted = transition.call(this.dependencies.coordinator, () => {
+                this.selectedConversationState = complete
+                this.activeSession = complete.session
+                this.dependencies.publishConversation(
+                    state.characterId,
+                    conversation,
+                    nextCharacter,
+                )
+                return this.dependencies.coordinator.adoptHydratedCharacter(
+                    state.authority.storeRevision,
+                    this.dependencies.coordinator.mutationGeneration,
+                    nextCharacter,
+                )
+            })
+            if (!adopted) {
+                throw new Error('The complete selected conversation was not adopted')
+            }
+        } catch (error) {
+            this.selectedConversationState = state
+            this.activeSession = null
+            complete.viewportSource.dispose()
+            complete.session.invalidate()
+            try {
+                this.dependencies.publishConversation(
+                    state.characterId,
+                    state.conversation,
+                    resident,
+                )
+            } catch {
+                this.clearActiveConversationSession()
+            }
+            throw error
+        }
+        state.viewportSource.dispose()
+        return complete
+    }
+
+    private createCompleteSelectedConversationState(
+        characterId: string,
+        conversation: Chat,
+        storeRevision: DataRevision,
+        navigationGeneration = this.navigationGeneration,
+    ): CompleteSelectedConversationState {
+        const conversationId = conversation.id
+        if (!conversationId) throw new Error('Selected conversation has no ID')
+        const session = new ActiveConversationSession({
             characterId,
             conversationId,
             conversation,
@@ -416,11 +881,59 @@ export class ActiveWorkingSet {
                 ? undefined
                 : (event) => this.dependencies.coordinator.recordActiveConversationMutation!(event),
         })
+        let complete!: CompleteSelectedConversationState
+        const viewportSource = new SynchronousSessionConversationViewportSource({
+            session,
+            captureCurrent: () => {
+                const resident = this.dependencies.getResidentCharacter?.(characterId)
+                const currentConversation = resident?.chats.find(
+                    (candidate) => candidate === conversation,
+                )
+                return this.selectedConversationState === complete &&
+                    currentConversation === conversation
+                    ? { character: resident!, conversation }
+                    : null
+            },
+        })
+        complete = {
+            kind: 'complete',
+            stateToken: Symbol('complete selected conversation'),
+            navigationGeneration,
+            characterId,
+            conversationId,
+            conversation,
+            session,
+            viewportSource,
+        }
+        return complete
     }
 
-    private clearActiveConversationSession(): void {
-        this.activeSession?.invalidate()
-        this.activeSession = null
+    private requireCurrentWindowedState(
+        state: WindowedSelectedConversationState,
+        target: SelectedConversationTarget,
+    ): void {
+        if (
+            this.selectedConversationState !== state ||
+            !this.matchesTarget(state, target) ||
+            this.dependencies.getSelectedCharacterId() !== state.characterId ||
+            this.dependencies.coordinator.revision !== state.authority.storeRevision
+        ) throw new SelectedConversationPromotionStaleError()
+    }
+
+    private matchesTarget(
+        state: SelectedConversationState,
+        target: SelectedConversationTarget,
+    ): boolean {
+        return target.characterId === state.characterId &&
+            target.conversationId === state.conversationId &&
+            target.navigationGeneration === state.navigationGeneration &&
+            state.navigationGeneration === this.navigationGeneration &&
+            target.storeRevision === (
+                state.kind === 'complete'
+                    ? state.session.storeRevision
+                    : state.authority.storeRevision
+            ) &&
+            target[selectedConversationTargetBrand] === state.stateToken
     }
 
     private async hydrateCharacter(

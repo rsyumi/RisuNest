@@ -102,7 +102,7 @@ implements ConversationViewportSource {
     readonly sourceToken = createSourceToken()
 
     private readonly session: ActiveConversationSession
-    private readonly captureCurrent: () => CurrentChatMessageTarget | null
+    private captureCurrent: (() => CurrentChatMessageTarget | null) | null
     private readonly identityRegistry = new ChatRenderIdentityRegistry()
     private readonly listeners = new Set<() => void>()
     private readonly pins = new Set<ActiveConversationPin>()
@@ -206,7 +206,7 @@ implements ConversationViewportSource {
         const absoluteIndex = this.keyIndices.get(key)
         if (absoluteIndex === undefined) return null
         const version = this.currentVersion
-        const current = this.captureCurrent()
+        const current = this.captureCurrent?.() ?? null
         if (!current || !this.session.matchesConversation(current.character.chaId, current.conversation)) {
             return null
         }
@@ -240,6 +240,8 @@ implements ConversationViewportSource {
         this.keys = []
         this.keyIndices = new Map()
         this.rows = new Map()
+        this.captureCurrent = null
+        this.identityRegistry.clearRegistration()
         this.notifyListeners()
         this.listeners.clear()
     }

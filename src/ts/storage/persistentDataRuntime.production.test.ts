@@ -8,6 +8,8 @@ vi.mock('../parser/parser.svelte', () => ({
     risuChatParser: (value: string) => value,
 }))
 import { selectedCharID } from '../stores.svelte'
+import { doingChat } from '../process/generationState'
+import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile'
 import {
     createPluginStorageStore,
     registerPluginStorageLifecycle,
@@ -29,9 +31,41 @@ import { workingSetResidency } from './workingSetResidency'
 afterEach(() => {
     configurePersistentDataRuntime({ projectWorkingSet: undefined })
     workingSetResidency.clear()
+    workingSetResidency.setEvictionAllowed(true)
+    doingChat.set(false)
 })
 
 describe('production persistent working-set publication', () => {
+    it('reports selected lifecycle policy, compatibility, operation and viewport budget', () => {
+        setDatabaseLite({
+            botPresets: [],
+            characters: [],
+            plugins: [],
+        } as unknown as Database)
+        workingSetResidency.setEvictionAllowed(true)
+        doingChat.set(false)
+        const adapter = createProductionStateAdapter()
+
+        expect(adapter.canUseWindowedSelectedConversation?.()).toBe(true)
+        expect(adapter.isMaximumCompatibilityMode?.()).toBe(false)
+        expect(adapter.isConversationOperationActive?.()).toBe(false)
+        expect(adapter.conversationViewportRowBudget).toBe(
+            getRuntimePerformanceBudgets().chatMountedMessageBudget,
+        )
+
+        workingSetResidency.setEvictionAllowed(false)
+        doingChat.set(true)
+        setDatabaseLite({
+            botPresets: [],
+            characters: [],
+            plugins: [{ enabled: true, version: '2.1' }],
+        } as unknown as Database)
+
+        expect(adapter.canUseWindowedSelectedConversation?.()).toBe(false)
+        expect(adapter.isMaximumCompatibilityMode?.()).toBe(true)
+        expect(adapter.isConversationOperationActive?.()).toBe(true)
+    })
+
     it('clears old residency before the synchronous projector records the replacement', () => {
         const initial = {
             botPresetsId: 0,

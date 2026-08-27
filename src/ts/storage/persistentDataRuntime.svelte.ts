@@ -2,6 +2,11 @@ import { get } from 'svelte/store'
 import { doingChat } from '../process/generationState'
 import { ReloadGUIPointer, selectedCharID } from '../stores.svelte'
 import type { ActiveConversationSession } from './activeConversationSession'
+import type {
+    CompleteConversationLease,
+    SelectedConversationTarget,
+} from './activeWorkingSet.svelte'
+import type { ConversationViewportSource } from '../conversationViewportSource'
 import type { Chat, Database, character, groupChat } from './database.svelte'
 import { getDatabase, setDatabase } from './database.svelte'
 import { prepareDatabaseForPersistence } from './databasePreparation'
@@ -45,6 +50,9 @@ import {
     isCatalogPresetWorkingSet,
 } from './workingSetCatalog'
 import { notifyPluginStorageAuthorityReplacement } from '../plugins/pluginStorageStore'
+import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
+import { getRuntimePerformanceBudgets } from '../runtimePerformanceProfile'
+import type { WindowedConversationPersistenceAuthority } from './saveCoordinator'
 import {
     readPinnedSelectedConversationWindow,
     type PersistentSelectedConversationWindow,
@@ -236,6 +244,17 @@ export function createProductionStateAdapter(): PersistentDataRuntimeStateAdapte
                 nextConversationId,
             )
         },
+        canUseWindowedSelectedConversation() {
+            return workingSetResidency.allowsEviction
+        },
+        isMaximumCompatibilityMode() {
+            return selectPluginCompatibilityProfile(getDatabase().plugins ?? []) ===
+                'maximum-compatibility'
+        },
+        isConversationOperationActive() {
+            return get(doingChat)
+        },
+        conversationViewportRowBudget: getRuntimePerformanceBudgets().chatMountedMessageBudget,
         canActivateWorkingSet() {
             return !get(doingChat)
         },
@@ -322,6 +341,23 @@ export const activateConversation = (id: string): Promise<boolean> =>
     getPersistentDataRuntime().activateConversation(id)
 export const getActiveConversationSession = (): ActiveConversationSession | null =>
     getPersistentDataRuntime().getActiveConversationSession()
+export const getSelectedConversationMode = (): 'complete' | 'windowed' | null =>
+    getPersistentDataRuntime().getSelectedConversationMode()
+export const getActiveConversationViewportSource = (): ConversationViewportSource | null =>
+    getPersistentDataRuntime().getActiveConversationViewportSource()
+export const captureSelectedConversationTarget = (): SelectedConversationTarget | null =>
+    getPersistentDataRuntime().captureSelectedConversationTarget()
+export const captureSelectedConversationAuthority = ():
+    WindowedConversationPersistenceAuthority | null =>
+    getPersistentDataRuntime().captureSelectedConversationAuthority()
+export const acquireCompleteConversation = (
+    reason: string,
+    target?: SelectedConversationTarget | null,
+): Promise<CompleteConversationLease> =>
+    getPersistentDataRuntime().acquireCompleteConversation(reason, target)
+export const tryDemoteSelectedConversation = (
+    target?: SelectedConversationTarget | null,
+): boolean => getPersistentDataRuntime().tryDemoteSelectedConversation(target)
 export const invalidateActiveConversationSession = (): void =>
     getPersistentDataRuntime().invalidateActiveConversationSession()
 export const peekActiveConversationSession = (): ActiveConversationSession | null =>

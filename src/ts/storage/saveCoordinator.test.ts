@@ -7642,5 +7642,39 @@ describe('SaveCoordinator', () => {
                 name: 'Complete fallback restored',
             })
         })
+
+        it('blocks persistence reentry during a selected-conversation authority transition', async () => {
+            const harness = makeWindowedHarness()
+
+            expect(harness.coordinator.hasPendingPersistenceWork).toBe(false)
+            expect(harness.coordinator.isSelectedConversationTransitionActive).toBe(false)
+            expect(() => harness.coordinator.runSelectedConversationTransition(() => {
+                expect(harness.coordinator.isSelectedConversationTransitionActive).toBe(true)
+                harness.coordinator.markPersistentDataDirty(1)
+            })).toThrow(/transition/i)
+            expect(harness.coordinator.isSelectedConversationTransitionActive).toBe(false)
+            expect(() => harness.coordinator.runSelectedConversationTransition(() =>
+                harness.coordinator.flushPendingData('reentrant-transition'),
+            )).toThrow(/transition/i)
+            expect(harness.commit).not.toHaveBeenCalled()
+        })
+
+        it('advances an adopted windowed authority after a storage-only revision', async () => {
+            const harness = makeWindowedHarness()
+
+            await harness.coordinator.runStorageOnlyMutation(async () => 3)
+            const advanced = {
+                ...harness.authority()!,
+                storeRevision: 3,
+            }
+            harness.replaceAuthority(advanced)
+
+            expect(harness.coordinator.advanceWindowedSelectedConversationRevision(
+                3,
+                advanced,
+            )).toBe(true)
+            await harness.coordinator.flushPendingData('advanced-windowed-baseline')
+            expect(harness.commit).not.toHaveBeenCalled()
+        })
     })
 })

@@ -1,7 +1,13 @@
 import type { Chat, Database, botPreset, character, groupChat } from './database.svelte'
 import { selectPluginCompatibilityProfile } from '../plugins/pluginCompatibility'
-import { ActiveWorkingSet, type CharacterActivationOptions } from './activeWorkingSet.svelte'
+import {
+    ActiveWorkingSet,
+    type CharacterActivationOptions,
+    type CompleteConversationLease,
+    type SelectedConversationTarget,
+} from './activeWorkingSet.svelte'
 import type { ActiveConversationSession } from './activeConversationSession'
+import type { ConversationViewportSource } from '../conversationViewportSource'
 import type {
     CharacterDetail,
     DataRevision,
@@ -27,6 +33,7 @@ import {
     type PersistentCompleteCharacterUpsertOptions,
     type PersistentReplacementOptions,
     type SaveCoordinatorClock,
+    type WindowedConversationPersistenceAuthority,
 } from './saveCoordinator'
 import {
     type WorkingSetResidencyRegistry,
@@ -231,6 +238,10 @@ export interface PersistentDataRuntimeStateAdapter {
         conversationId: string,
         nextConversationId: string,
     ): boolean
+    canUseWindowedSelectedConversation?(): boolean
+    isMaximumCompatibilityMode?(): boolean
+    isConversationOperationActive?(): boolean
+    conversationViewportRowBudget?: number
     canActivateWorkingSet?(): boolean
     canDeactivateWorkingSet?(): boolean
     canDeactivateCharacter?(id: string): boolean
@@ -266,6 +277,15 @@ export interface PersistentDataRuntime {
     activateCharacter(id: string, options?: CharacterActivationOptions): Promise<boolean>
     activateConversation(id: string): Promise<boolean>
     getActiveConversationSession(): ActiveConversationSession | null
+    getSelectedConversationMode(): 'complete' | 'windowed' | null
+    getActiveConversationViewportSource(): ConversationViewportSource | null
+    captureSelectedConversationTarget(): SelectedConversationTarget | null
+    captureSelectedConversationAuthority(): WindowedConversationPersistenceAuthority | null
+    acquireCompleteConversation(
+        reason: string,
+        target?: SelectedConversationTarget | null,
+    ): Promise<CompleteConversationLease>
+    tryDemoteSelectedConversation(target?: SelectedConversationTarget | null): boolean
     invalidateActiveConversationSession(): void
     deactivateActiveWorkingSet(): Promise<boolean>
     reconcileActiveCharacterIds(
@@ -455,6 +475,8 @@ export function createPersistentDataRuntime(
         publishPluginStorageWorkingSet: dependencies.state.publishPluginStorageWorkingSet,
         capturePresets: dependencies.state.capturePresets,
         captureSelectedCharacter: dependencies.state.captureSelectedCharacter,
+        captureSelectedConversationAuthority: () =>
+            workingSet.captureSelectedConversationAuthority(),
         captureCharacter: dependencies.state.captureCharacter,
         replaceDatabase: (database) => {
             workingSet.invalidateActiveConversationSession()
@@ -478,8 +500,13 @@ export function createPersistentDataRuntime(
             : undefined,
         clock: dependencies.clock,
         now: dependencies.now,
-        onLocalRevision: dependencies.onLocalRevision,
+        onLocalRevision: (revision) => {
+            workingSet.advanceStoreRevision(revision)
+            dependencies.onLocalRevision?.(revision)
+        },
         onStorageOnlyRevision: (revision) => workingSet.advanceStoreRevision(revision),
+        onWindowedSelectedConversationRevision: (revision) =>
+            workingSet.advanceStoreRevision(revision),
         onConversationMutationPersistenceStarted: (event) =>
             workingSet.beginConversationMutationPersistence(event),
         onConversationMutationPersisted: (event) => {
@@ -511,6 +538,11 @@ export function createPersistentDataRuntime(
         releaseInactiveCharacter: dependencies.state.releaseInactiveCharacter,
         shouldHydrateFullCharacter: dependencies.state.shouldHydrateFullCharacter,
         canReleaseConversation: dependencies.state.canReleaseConversation,
+        canUseWindowedSelectedConversation:
+            dependencies.state.canUseWindowedSelectedConversation,
+        isMaximumCompatibilityMode: dependencies.state.isMaximumCompatibilityMode,
+        isConversationOperationActive: dependencies.state.isConversationOperationActive,
+        conversationViewportRowBudget: dependencies.state.conversationViewportRowBudget,
     })
     const activateCharacter = (
         id: string,
@@ -588,6 +620,17 @@ export function createPersistentDataRuntime(
         activateCharacter,
         activateConversation: (id) => workingSet.activateConversation(id),
         getActiveConversationSession: () => workingSet.activeConversationSession,
+        getSelectedConversationMode: () => workingSet.selectedConversationMode,
+        getActiveConversationViewportSource: () =>
+            workingSet.activeConversationViewportSource,
+        captureSelectedConversationTarget: () =>
+            workingSet.captureSelectedConversationTarget(),
+        captureSelectedConversationAuthority: () =>
+            workingSet.captureSelectedConversationAuthority(),
+        acquireCompleteConversation: (reason, target) =>
+            workingSet.acquireCompleteConversation(reason, target ?? undefined),
+        tryDemoteSelectedConversation: (target) =>
+            workingSet.tryDemoteSelectedConversation(target ?? undefined),
         invalidateActiveConversationSession: () => workingSet.invalidateActiveConversationSession(),
         deactivateActiveWorkingSet: () => workingSet.deactivate(),
         reconcileActiveCharacterIds: (database, selectedCharacterId) =>

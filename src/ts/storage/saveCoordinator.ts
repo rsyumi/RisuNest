@@ -70,6 +70,8 @@ export interface SaveCoordinatorDependencies {
     onLocalRevision?(revision: DataRevision): void
     /** Advances revision-only working-set state synchronously and must not throw. */
     onStorageOnlyRevision?(revision: DataRevision): void
+    /** Advances an adopted windowed selected-conversation authority synchronously. */
+    onWindowedSelectedConversationRevision?(revision: DataRevision): void
     onConversationMutationPersistenceStarted?(
         event: ActiveConversationMutationEvent,
     ): ConversationMutationPersistenceHandle | null | undefined
@@ -101,6 +103,13 @@ export class WindowedConversationRequiresCompatibilityError extends Error {
     constructor(reason: string) {
         super(`Windowed conversation requires complete compatibility: ${reason}`)
         this.name = 'WindowedConversationRequiresCompatibilityError'
+    }
+}
+
+export class SelectedConversationTransitionInProgressError extends Error {
+    constructor() {
+        super('Selected conversation authority transition is in progress')
+        this.name = 'SelectedConversationTransitionInProgressError'
     }
 }
 
@@ -855,6 +864,7 @@ export class SaveCoordinator {
         queuedPostPublicationDirty: boolean
         blockedPrePublicationDirty: boolean
     } | null = null
+    private selectedConversationTransitionActive = false
 
     constructor(private readonly dependencies: SaveCoordinatorDependencies) {
         this.clock = dependencies.clock ?? defaultClock()
@@ -875,6 +885,38 @@ export class SaveCoordinator {
 
     get hasDestructiveReplacementFence(): boolean {
         return this.destructiveReplacementFence !== null
+    }
+
+    get hasPendingPersistenceWork(): boolean {
+        return this.pendingByteCount > 0 ||
+            this.debounceHandle !== undefined ||
+            this.flushPromise !== null ||
+            this.localFlushPromise !== null ||
+            this.localFlushDuringPublicationPromise !== null ||
+            this.queuedOperationCount > 0 ||
+            this.additionPromise !== null ||
+            this.pendingCharacterAddition !== null ||
+            this.reservedCharacterAddition !== null ||
+            this.pendingResidentCompensations.length > 0 ||
+            this.pendingConversationMutations.length > 0
+    }
+
+    get isSelectedConversationTransitionActive(): boolean {
+        return this.selectedConversationTransitionActive
+    }
+
+    runSelectedConversationTransition<T>(transition: () => T): T {
+        this.assertInitialized()
+        this.assertPersistentMutationAllowed()
+        if (this.hasPendingPersistenceWork) {
+            throw new Error('Selected conversation authority transition has pending persistence')
+        }
+        this.selectedConversationTransitionActive = true
+        try {
+            return transition()
+        } finally {
+            this.selectedConversationTransitionActive = false
+        }
     }
 
     initialize(revision: DataRevision, database?: Database): void {
@@ -990,6 +1032,32 @@ export class SaveCoordinator {
         return true
     }
 
+    advanceWindowedSelectedConversationRevision(
+        revision: DataRevision,
+        authority: WindowedConversationPersistenceAuthority,
+    ): boolean {
+        const baseline = this.windowedCharacterBaseline
+        const current = this.dependencies.captureSelectedConversationAuthority?.() ?? null
+        if (
+            !baseline ||
+            !current ||
+            !validWindowedAuthority(authority) ||
+            !validWindowedAuthority(current) ||
+            this.currentRevision !== revision ||
+            authority.storeRevision !== revision ||
+            !sameWindowedAuthority(current, authority) ||
+            baseline.authority.characterId !== authority.characterId ||
+            baseline.authority.conversationId !== authority.conversationId ||
+            baseline.authority.sessionToken !== authority.sessionToken ||
+            baseline.authority.persistedSessionVersion !== authority.persistedSessionVersion ||
+            baseline.authority.sessionVersion !== authority.sessionVersion ||
+            baseline.authority.totalMessages !== authority.totalMessages ||
+            baseline.authority.storeRevision > revision
+        ) return false
+        baseline.authority = safeStructuredClone(authority)
+        return true
+    }
+
     adoptMaterializedDatabase(
         revision: DataRevision,
         mutationGeneration: number,
@@ -1010,6 +1078,7 @@ export class SaveCoordinator {
 
     markPersistentDataDirty(estimatedBytes: number): void {
         this.assertInitialized()
+        this.assertSelectedConversationTransitionInactive()
         const fence = this.destructiveReplacementFence
         if (fence?.state === 'held') {
             if (!fence.acceptsPostPublicationDirty) {
@@ -1120,6 +1189,7 @@ export class SaveCoordinator {
 
     flushPendingDataLocally(reason: string): Promise<void> {
         this.assertInitialized()
+        this.assertSelectedConversationTransitionInactive()
         this.cancelDebounce()
         if (this.localFlushPromise) return this.localFlushPromise
         const promise = this.runLocalFlush(reason)
@@ -2943,6 +3013,7 @@ export class SaveCoordinator {
         }
         this.characterBaseline = null
         this.characterBaselineId = null
+        this.dependencies.onWindowedSelectedConversationRevision?.(revision)
     }
 
     private requireMatchingWindowedCapture(
@@ -3840,8 +3911,15 @@ export class SaveCoordinator {
     }
 
     private assertPersistentMutationAllowed(): void {
+        this.assertSelectedConversationTransitionInactive()
         if (this.destructiveReplacementFence) {
             throw new PersistentMutationFencedError()
+        }
+    }
+
+    private assertSelectedConversationTransitionInactive(): void {
+        if (this.selectedConversationTransitionActive) {
+            throw new SelectedConversationTransitionInProgressError()
         }
     }
 

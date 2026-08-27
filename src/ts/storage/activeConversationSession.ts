@@ -1063,7 +1063,7 @@ export class ActiveConversationSession {
     readonly conversationId: string
     readonly evictionEnabled = false
 
-    private readonly conversation: Chat
+    private conversation: Chat
     private readonly onMutation?: (event: ActiveConversationMutationEvent) => void
     private readonly residency: SegmentedConversationResidency
     private readonly residentReadsEnabled: boolean
@@ -1121,6 +1121,15 @@ export class ActiveConversationSession {
 
     get persistedVersion(): number {
         return this.persistedSessionVersion
+    }
+
+    get sessionToken(): ConversationSessionToken {
+        this.assertActive()
+        return this.locatorRegistry.sessionToken
+    }
+
+    get isTransactionActive(): boolean {
+        return this.transactionActive
     }
 
     get isActive(): boolean {
@@ -1975,6 +1984,7 @@ export class ActiveConversationSession {
         this.pins.clear()
         this.residencyRangePins.clear()
         this.locatorRegistry.clear()
+        this.conversation = null as unknown as Chat
     }
 
     private populateResidentRange(startIndex: number, endIndex: number): void {
