@@ -5,12 +5,15 @@ use super::{
 use crate::asset_repository::migration_gc::{
     snapshot_asset_root_sidecar_path, write_snapshot_asset_root_sidecar, AssetRootSet,
 };
+use crate::asset_repository::PayloadCas;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -24,6 +27,9 @@ const PENDING_RESTORE_FILE: &str = "pending-restore.json";
 const DATABASE_FILE: &str = "persistent.db";
 const MAX_SNAPSHOTS: usize = 8;
 const MIN_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_COLD_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+const CAS_PHYSICAL_PREFIX: &[u8] = b"assets-v2/objects/";
+const COLD_STORAGE_HEADER: &str = "\u{ef01}COLDSTORAGE\u{ef01}";
 
 #[derive(Deserialize, Serialize)]
 struct PendingRestore {
@@ -83,6 +89,7 @@ pub(crate) struct RevisionReadLease {
     pub(crate) connection: Connection,
     pub(crate) target: ReadTarget,
     lease: String,
+    repository_root: PathBuf,
     active_readers: Arc<ActiveReaderRegistry>,
     transaction_open: bool,
     #[cfg(test)]
@@ -95,7 +102,8 @@ impl RevisionReadLease {
     }
 
     pub(crate) fn publish_detached_asset_roots(&self) -> StoreResult<()> {
-        let roots = collect_asset_roots(&self.connection)?;
+        let cas = PayloadCas::new(&self.repository_root)?;
+        let roots = collect_asset_roots(&self.connection, &cas)?;
         self.active_readers
             .publish_detached_asset_roots(&self.lease, roots)
     }
@@ -224,6 +232,7 @@ pub(super) fn acquire_revision(
     revision: i64,
     active_readers: Arc<ActiveReaderRegistry>,
 ) -> StoreResult<(String, RevisionReadLease)> {
+    let repository_root = repository_root_from_database_path(database_path)?;
     let connection = open_revision_reader(database_path)?;
     #[cfg(test)]
     let acquired_at = Instant::now();
@@ -270,6 +279,7 @@ pub(super) fn acquire_revision(
             connection,
             target,
             lease,
+            repository_root,
             active_readers,
             transaction_open: true,
             #[cfg(test)]
@@ -361,7 +371,8 @@ pub(super) fn create(
     let sidecar_result = (|| -> StoreResult<()> {
         let snapshot_connection = Connection::open(&path)?;
         let revision = current_revision(&snapshot_connection)?;
-        let roots = collect_asset_roots(&snapshot_connection)?;
+        let cas = PayloadCas::new(repository_root_from_snapshots_dir(snapshots_dir)?)?;
+        let roots = collect_asset_roots(&snapshot_connection, &cas)?;
         write_snapshot_asset_root_sidecar(&path, revision, &roots)?;
         Ok(())
     })();
@@ -500,7 +511,10 @@ fn remove_snapshot_with_sidecar(snapshot_path: &Path) -> StoreResult<()> {
     remove_file_if_exists(snapshot_path)
 }
 
-pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetRootSet> {
+pub(super) fn collect_asset_roots(
+    connection: &Connection,
+    cas: &PayloadCas,
+) -> StoreResult<AssetRootSet> {
     let mut roots = AssetRootSet::default();
 
     scan_optional_hash_column(
@@ -509,11 +523,10 @@ pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetR
         &mut roots.manifest_hashes,
     )?;
     scan_asset_alias_roots(connection, &mut roots)?;
-    scan_optional_hash_column(
-        connection,
-        "SELECT object_hash FROM cold_aliases WHERE object_hash IS NOT NULL",
-        &mut roots.object_hashes,
-    )?;
+    let cold_aliases = scan_cold_alias_roots(connection, &mut roots)?;
+    let retained_generations: i64 =
+        connection.query_row("SELECT COUNT(*) FROM root", [], |row| row.get(0))?;
+    let has_cross_generation_cold_aliases = retained_generations > 1 && !cold_aliases.is_empty();
     if table_exists(connection, "logical_sync_generations")? {
         scan_optional_hash_column(
             connection,
@@ -535,6 +548,7 @@ pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetR
         "SELECT detail FROM characters",
         "SELECT detail FROM conversations",
         "SELECT value FROM messages",
+        "SELECT value FROM plugin_storage",
     ] {
         scan_json_column(connection, query, &mut roots)?;
     }
@@ -547,12 +561,132 @@ pub(super) fn collect_asset_roots(connection: &Connection) -> StoreResult<AssetR
     let plugin_rows: i64 =
         connection.query_row("SELECT COUNT(*) FROM plugin_storage", [], |row| row.get(0))?;
     if plugin_rows > 0 {
-        roots.blockers.insert("plugin-storage-opaque".to_owned());
+        roots.retain_all_objects = true;
+    }
+    let cross_generation_cold_aliases =
+        has_cross_generation_cold_aliases && !roots.cold_keys.is_empty();
+    resolve_nested_cold_roots(cas, cold_aliases, &mut roots)?;
+    if cross_generation_cold_aliases {
+        roots.blockers.insert("cold-payload-unscanned".to_owned());
+        roots.retain_all_objects = true;
     }
     if !roots.cold_keys.is_empty() {
         roots.blockers.insert("cold-payload-unscanned".to_owned());
+        roots.retain_all_objects = true;
     }
     Ok(roots)
+}
+
+fn repository_root_from_snapshots_dir(snapshots_dir: &Path) -> StoreResult<&Path> {
+    snapshots_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| validation("snapshot directory has no repository root"))
+}
+
+fn repository_root_from_database_path(database_path: &Path) -> StoreResult<PathBuf> {
+    database_path
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| validation("persistent database has no repository root"))
+}
+
+fn scan_cold_alias_roots(
+    connection: &Connection,
+    roots: &mut AssetRootSet,
+) -> StoreResult<Vec<(String, String, u64)>> {
+    let mut statement = connection.prepare(
+        "SELECT key, object_hash, size FROM cold_aliases
+         ORDER BY generation ASC, key ASC",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut aliases = Vec::new();
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let object_hash: Option<String> = row.get(1)?;
+        let size: i64 = row.get(2)?;
+        let Ok(size) = u64::try_from(size) else {
+            roots.cold_keys.insert(key);
+            roots.retain_all_objects = true;
+            continue;
+        };
+        if let Some(object_hash) = object_hash {
+            roots.object_hashes.insert(object_hash.clone());
+            aliases.push((key, object_hash, size));
+        } else {
+            roots.cold_keys.insert(key);
+        }
+    }
+    Ok(aliases)
+}
+
+fn resolve_nested_cold_roots(
+    cas: &PayloadCas,
+    aliases: Vec<(String, String, u64)>,
+    roots: &mut AssetRootSet,
+) -> StoreResult<()> {
+    let mut resolved_keys = BTreeSet::new();
+    let mut opaque_keys = BTreeSet::new();
+    for (key, object_hash, expected_size) in aliases {
+        match decode_cold_payload(cas, &object_hash, expected_size) {
+            Ok(value) => {
+                observe_json_value(&value, None, roots);
+                resolved_keys.insert(key);
+            }
+            Err(_) => {
+                opaque_keys.insert(key);
+                roots.retain_all_objects = true;
+            }
+        }
+    }
+    roots
+        .cold_keys
+        .retain(|key| !resolved_keys.contains(key) || opaque_keys.contains(key));
+    roots.cold_keys.extend(opaque_keys);
+    Ok(())
+}
+
+fn decode_cold_payload(
+    cas: &PayloadCas,
+    object_hash: &str,
+    expected_size: u64,
+) -> StoreResult<serde_json::Value> {
+    decode_cold_payload_with_limit(cas, object_hash, expected_size, MAX_COLD_DECODED_BYTES)
+}
+
+pub(super) fn decode_cold_payload_with_limit(
+    cas: &PayloadCas,
+    object_hash: &str,
+    expected_size: u64,
+    decoded_limit: u64,
+) -> StoreResult<serde_json::Value> {
+    let mut object = cas
+        .open_object(object_hash)?
+        .ok_or_else(|| validation("cold payload CAS object is missing"))?;
+    if object.metadata()?.len() != expected_size {
+        return Err(validation("cold payload CAS object is corrupt"));
+    }
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = object.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| validation("cold payload size overflow"))?;
+    }
+    if copied != expected_size || hex::encode(hasher.finalize()) != object_hash {
+        return Err(validation("cold payload CAS object is corrupt"));
+    }
+    object.seek(SeekFrom::Start(0))?;
+    let decoded_limit = usize::try_from(decoded_limit)
+        .map_err(|_| validation("cold payload decoded limit is unsupported"))?;
+    crate::cold_payload_codec::decode_cold_json(object, decoded_limit).map_err(StoreError::from)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> StoreResult<bool> {
@@ -659,6 +793,12 @@ fn observe_text(value: &str, roots: &mut AssetRootSet) {
     if value.starts_with("assets/") {
         roots.legacy_asset_keys.insert(value.to_owned());
     }
+    if let Some(cold_key) = value.strip_prefix(COLD_STORAGE_HEADER) {
+        if !cold_key.is_empty() {
+            roots.cold_keys.insert(cold_key.to_owned());
+        }
+    }
+    observe_native_cas_paths(value, roots);
     for prefix in ["{{inlay::", "{{inlayed::", "{{inlayeddata::"] {
         let mut remainder = value;
         while let Some(start) = remainder.find(prefix) {
@@ -670,6 +810,87 @@ fn observe_text(value: &str, roots: &mut AssetRootSet) {
             remainder = &remainder[end + 2..];
         }
     }
+}
+
+fn observe_native_cas_paths(value: &str, roots: &mut AssetRootSet) {
+    let bytes = value.as_bytes();
+    let physical_len = CAS_PHYSICAL_PREFIX.len() + 65;
+    if bytes.len() >= physical_len {
+        for start in 0..=bytes.len() - physical_len {
+            let candidate = &bytes[start..start + physical_len];
+            if let Some(hash) = cas_hash_from_physical_key(candidate) {
+                if bytes
+                    .get(start + physical_len)
+                    .is_none_or(|next| !next.is_ascii_hexdigit() && *next != b'/')
+                {
+                    roots.object_hashes.insert(hash);
+                }
+            }
+        }
+    }
+
+    for (start, _) in value.char_indices() {
+        let remainder = &value[start..];
+        if !starts_with_url_scheme(remainder) {
+            continue;
+        }
+        let end = remainder.find(is_url_delimiter).unwrap_or(remainder.len());
+        let candidate = &remainder[..end];
+        let native_marker = candidate.to_ascii_lowercase().contains("risuasset");
+        let Some(physical_key) = crate::native_media::decode_physical_key(candidate) else {
+            if native_marker {
+                retain_unknown_native_url(roots);
+            }
+            continue;
+        };
+        if let Some(hash) = cas_hash_from_physical_key(physical_key.as_bytes()) {
+            roots.object_hashes.insert(hash);
+        } else {
+            retain_unknown_native_url(roots);
+        }
+    }
+}
+
+fn starts_with_url_scheme(value: &str) -> bool {
+    ["risuasset:", "http:", "https:"].iter().any(|prefix| {
+        value
+            .get(..prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+    })
+}
+
+fn is_url_delimiter(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+}
+
+fn retain_unknown_native_url(roots: &mut AssetRootSet) {
+    roots.retain_all_objects = true;
+    roots
+        .blockers
+        .insert("native-asset-url-unresolved".to_owned());
+}
+
+fn cas_hash_from_physical_key(value: &[u8]) -> Option<String> {
+    if value.len() != CAS_PHYSICAL_PREFIX.len() + 65 || !value.starts_with(CAS_PHYSICAL_PREFIX) {
+        return None;
+    }
+    let suffix = &value[CAS_PHYSICAL_PREFIX.len()..];
+    if suffix[2] != b'/'
+        || !suffix[..2]
+            .iter()
+            .chain(&suffix[3..])
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return None;
+    }
+    let mut hash = Vec::with_capacity(64);
+    hash.extend_from_slice(&suffix[..2]);
+    hash.extend_from_slice(&suffix[3..]);
+    String::from_utf8(hash).ok()
 }
 
 fn validate_restore_database(path: &Path) -> StoreResult<()> {

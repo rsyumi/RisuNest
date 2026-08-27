@@ -1,5 +1,6 @@
 #[allow(dead_code)]
 mod asset_repository;
+mod cold_payload_codec;
 pub mod import_export_jobs;
 #[allow(dead_code)]
 mod local_backup;

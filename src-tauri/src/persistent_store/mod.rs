@@ -1612,9 +1612,10 @@ impl PersistentStore {
         let repository_root = persistent_dir.parent().ok_or_else(|| StoreError::Store {
             message: "persistent directory has no repository root".to_owned(),
         })?;
-        let mut roots = vec![snapshot::collect_asset_roots(&self.connection)?];
+        let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
+        let mut roots = vec![snapshot::collect_asset_roots(&self.connection, &cas)?];
         for reader in self.revision_leases.values() {
-            roots.push(snapshot::collect_asset_roots(&reader.connection)?);
+            roots.push(snapshot::collect_asset_roots(&reader.connection, &cas)?);
         }
         roots.extend(self.active_readers.detached_asset_roots()?);
         for snapshot in snapshot::list(&self.snapshots_dir)? {
@@ -1628,7 +1629,6 @@ impl PersistentStore {
             ..Default::default()
         });
         let candidates = self.query_asset_object_catalog(limit, cursor)?;
-        let cas = crate::asset_repository::PayloadCas::new(repository_root)?;
         let report =
             dry_run_mark_and_sweep(&cas, candidates.items, roots, now_ms, minimum_grace_ms)
                 .map_err(StoreError::from)?;

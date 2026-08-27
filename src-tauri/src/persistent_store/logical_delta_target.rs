@@ -3531,7 +3531,7 @@ mod tests {
             cas.read_object(&remote_hash).unwrap().unwrap(),
             remote_bytes
         );
-        assert!(snapshot::collect_asset_roots(&store.connection)
+        assert!(snapshot::collect_asset_roots(&store.connection, &cas)
             .unwrap()
             .object_hashes
             .contains(&remote_hash));

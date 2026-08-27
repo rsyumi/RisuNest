@@ -521,6 +521,12 @@ pub struct AssetRootSet {
     pub inlay_ids: BTreeSet<String>,
     pub cold_keys: BTreeSet<String>,
     pub blockers: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retain_all_objects: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -676,8 +682,12 @@ pub fn dry_run_mark_and_sweep(
     let mut manifest_hashes = BTreeSet::new();
     let mut marked_hashes = BTreeSet::new();
     let mut blockers = BTreeSet::new();
+    let mut retain_all_objects = false;
     for roots in roots {
         validate_root_set(&roots)?;
+        retain_all_objects |= roots.retain_all_objects
+            || roots.blockers.contains("plugin-storage-opaque")
+            || roots.blockers.contains("cold-payload-unscanned");
         manifest_hashes.extend(roots.manifest_hashes);
         marked_hashes.extend(roots.object_hashes);
         blockers.extend(roots.blockers);
@@ -727,6 +737,10 @@ pub fn dry_run_mark_and_sweep(
         })?;
         if actual_size != candidate.byte_size {
             return invalid_data("asset GC candidate size mismatch");
+        }
+        if retain_all_objects {
+            marked_hashes.insert(candidate.object_hash);
+            continue;
         }
         if marked_hashes.contains(&candidate.object_hash) {
             continue;
@@ -927,6 +941,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_opaque_snapshot_blockers_retain_every_catalog_candidate() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
+        let candidate = cas.prepare_bytes(b"legacy-sidecar-candidate").unwrap();
+        let snapshot = directory.path().join("persistent-legacy.db");
+        std::fs::write(&snapshot, b"sqlite").unwrap();
+        let mut roots = AssetRootSet::default();
+        roots.blockers.insert("plugin-storage-opaque".to_owned());
+        roots.blockers.insert("cold-payload-unscanned".to_owned());
+        let sidecar_path = write_snapshot_asset_root_sidecar(&snapshot, 8, &roots).unwrap();
+        let encoded = std::fs::read_to_string(sidecar_path).unwrap();
+        assert!(!encoded.contains("retain_all_objects"));
+        let legacy_roots = read_snapshot_asset_root_sidecar(&snapshot).unwrap().roots;
+
+        let report = dry_run_mark_and_sweep(
+            &cas,
+            [AssetGcCandidate {
+                object_hash: candidate.content_hash.clone(),
+                byte_size: candidate.byte_size,
+                created_at_ms: 0,
+            }],
+            [legacy_roots],
+            100,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(report.marked_hashes, vec![candidate.content_hash]);
+        assert!(report.potential_delete_hashes.is_empty());
+        assert!(!report.deletion_enabled);
+    }
+
+    #[test]
     fn dry_run_marks_manifest_payloads_and_staged_pins_without_deleting_files() {
         let directory = tempfile::tempdir().expect("temporary repository");
         let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
@@ -1000,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_reports_conservative_plugin_and_cold_blockers() {
+    fn dry_run_retains_candidates_for_conservative_plugin_and_cold_blockers() {
         let directory = tempfile::tempdir().expect("temporary repository");
         let cas = PayloadCas::new(directory.path()).expect("open payload CAS");
         let candidate_payload = cas.prepare_bytes(b"unmarked").unwrap();
@@ -1014,10 +1061,9 @@ mod tests {
             dry_run_mark_and_sweep(&cas, [candidate(&candidate_payload, 0)], [roots], 100, 10)
                 .unwrap();
 
-        assert_eq!(
-            report.potential_delete_hashes,
-            vec![candidate_payload.content_hash]
-        );
+        assert_eq!(report.marked_hashes, vec![candidate_payload.content_hash]);
+        assert!(report.potential_delete_hashes.is_empty());
+        assert_eq!(report.potential_delete_bytes, 0);
         assert_eq!(
             report.blockers,
             vec![

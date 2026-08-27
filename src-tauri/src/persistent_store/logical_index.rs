@@ -3713,7 +3713,7 @@ mod tests {
                 [&base_manifest.content_hash],
             )
             .unwrap();
-        let roots = snapshot::collect_asset_roots(&store.connection).unwrap();
+        let roots = snapshot::collect_asset_roots(&store.connection, &cas).unwrap();
         assert!(roots.object_hashes.contains(&built.manifest_hash));
         assert!(roots.object_hashes.contains(&base_manifest.content_hash));
 
